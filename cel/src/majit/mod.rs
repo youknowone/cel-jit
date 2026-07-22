@@ -209,8 +209,33 @@ mod tests {
     }
 
     #[test]
+    fn comprehension_all_exists() {
+        // Literal-list `all`/`exists` fold to a bool over green-constant length.
+        check("[1, 2, 3, 4, 5].all(x, x > 0)", &[]);
+        check("[1, -2, 3].all(x, x > 0)", &[]);
+        check("[1, 2, 3].exists(x, x > 2)", &[]);
+        check("[1, 2, 3].exists(x, x > 9)", &[]);
+        check("[].all(x, x > 0)", &[]);
+        check("[1, 2, 3].exists_one(x, x > 2)", &[]);
+        check("[1, 2, 3].exists_one(x, x > 0)", &[]);
+        // Predicate referencing an outer slot alongside the iter var.
+        check("[1, 2, 3].all(x, x < n)", &[("n", Bind::Int(5))]);
+        check("[1, 2, 3].all(x, x < n)", &[("n", Bind::Int(2))]);
+    }
+
+    #[test]
     fn out_of_subset_bails() {
-        for expr in ["[1, 2, 3]", "'a' + 'b'", "[1, 2, 3].all(x, x > 0)", "x.size()", "1.5 + a"] {
+        // list-returning / string / double / member-fn / list-valued
+        // comprehension (`map` builds a list) all fall back to the tree-walker.
+        for expr in [
+            "[1, 2, 3]",
+            "'a' + 'b'",
+            "x.size()",
+            "1.5 + a",
+            "[1, 2, 3].map(x, x * 2)",
+            "[1, 2, 3].filter(x, x > 1)",
+            "x.all(x, x > 0)",
+        ] {
             let program = Program::compile(expr).unwrap();
             assert!(
                 lower(program.expression()).is_err(),

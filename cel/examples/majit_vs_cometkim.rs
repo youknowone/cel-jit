@@ -195,7 +195,7 @@ fn main() {
         Case { label: "list_indexing", src: "list[0] + list[5] + list[9]", shape: default_shape, cometkim_interp_ns: 61.6, cometkim_aot_ns: 74.1 },
         Case { label: "simple_arithmetic", src: "1 + 2 * 3 - 4 / 2", shape: default_shape, cometkim_interp_ns: 50.2, cometkim_aot_ns: 8.03 },
         Case { label: "nested_expr(div)", src: "((a + b) * (c - d)) / ((e + f) - (g * h))", shape: nested_shape, cometkim_interp_ns: 215.4, cometkim_aot_ns: 159.9 },
-        // out of majit's int subset (list-returning / string / custom fn / comprehension):
+        // green-length unroll: literal-list `all` folds to a constant bool.
         Case { label: "all_comprehension", src: "[1, 2, 3, 4, 5].all(x, x > 0)", shape: default_shape, cometkim_interp_ns: 478.2, cometkim_aot_ns: 197.8 },
     ];
 

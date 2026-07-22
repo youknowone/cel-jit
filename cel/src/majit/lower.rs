@@ -12,7 +12,10 @@
 //!     non-`INT_MIN`/`-1` divisor domain — the schema/domain shape guard),
 //!   * comparisons `>= > <= < == !=`,
 //!   * boolean `&& || !` (non-short-circuit, correct for the pure int/bool
-//!     domain where operands cannot raise).
+//!     domain where operands cannot raise),
+//!   * `all` / `exists` / `exists_one` comprehensions over a **literal** list
+//!     (green-constant length), unrolled into a straight-line fold. `map` /
+//!     `filter` build a list and stay out of the int subset.
 //!
 //! **Schema assumption**: every slot is assumed to carry an `int`/`bool` value.
 //! A CEL expression comparing a slot bound to a `double`/`uint`/`string` at
@@ -22,7 +25,7 @@
 
 use super::bytecode::*;
 use crate::common::ast::operators as ops;
-use crate::common::ast::{CallExpr, Expr, IdedExpr, LiteralValue};
+use crate::common::ast::{CallExpr, ComprehensionExpr, Expr, IdedExpr, LiteralValue};
 use std::collections::HashMap;
 
 /// Reason a CEL expression could not be lowered to the traceable subset.
@@ -100,6 +103,10 @@ struct LowerCtx {
     next_reg: usize,
     slots: Vec<SlotInfo>,
     slot_map: HashMap<String, usize>,
+    /// Comprehension-bound names (`iter_var`, `accu_var`) mapped to the register
+    /// holding their current value. Checked before slot resolution so a bound
+    /// variable is a computed value, not an input slot.
+    locals: HashMap<String, usize>,
 }
 
 impl LowerCtx {
@@ -127,6 +134,7 @@ pub fn lower(expr: &IdedExpr) -> Result<Lowered, LowerError> {
         next_reg: 0,
         slots: Vec::new(),
         slot_map: HashMap::new(),
+        locals: HashMap::new(),
     };
     let result_reg = compile(&mut ctx, expr)?;
     let num_regs = ctx.next_reg;
@@ -141,17 +149,75 @@ pub fn lower(expr: &IdedExpr) -> Result<Lowered, LowerError> {
 fn compile(ctx: &mut LowerCtx, e: &IdedExpr) -> Result<usize, LowerError> {
     match &e.expr {
         Expr::Literal(lit) => compile_literal(ctx, lit),
-        Expr::Ident(_) | Expr::Select(_) => {
+        Expr::Ident(name) => {
+            if let Some(&r) = ctx.locals.get(name) {
+                Ok(r)
+            } else {
+                Ok(ctx.slot(name.clone()))
+            }
+        }
+        Expr::Select(_) => {
             let path = resolve_path(e)?;
+            let root = path.split('.').next().unwrap_or_default();
+            if ctx.locals.contains_key(root) {
+                return Err(LowerError::unsupported("field access on comprehension variable"));
+            }
             Ok(ctx.slot(path))
         }
         Expr::Call(call) => compile_call(ctx, call),
-        Expr::Comprehension(_) => Err(LowerError::unsupported("comprehension")),
+        Expr::Comprehension(comp) => compile_comprehension(ctx, comp),
         Expr::List(_) => Err(LowerError::unsupported("list literal")),
         Expr::Map(_) => Err(LowerError::unsupported("map literal")),
         Expr::Struct(_) => Err(LowerError::unsupported("struct literal")),
         Expr::Unspecified => Err(LowerError::unsupported("unspecified expr")),
     }
+}
+
+/// Green-length unroll of a comprehension (`all` / `exists` / `exists_one`).
+///
+/// Only a literal-list range is lowerable: its length and elements are known at
+/// compile time (the PyPy-style green-constant trip count), so the loop unrolls
+/// into a straight-line fold. Each element binds `iter_var`; `accu_var` threads
+/// the accumulator through `loop_step`. `loop_cond`'s short-circuit is dropped —
+/// with no side effects or raising operands the eager fold has the same value.
+///
+/// `map` / `filter` accumulate a list: their `[]` `accu_init` (or list-valued
+/// `loop_step`) lowers to a list literal and bails, so they fall back naturally.
+fn compile_comprehension(
+    ctx: &mut LowerCtx,
+    comp: &ComprehensionExpr,
+) -> Result<usize, LowerError> {
+    if comp.iter_var2.is_some() {
+        return Err(LowerError::unsupported("two-variable comprehension"));
+    }
+    let elements = match &comp.iter_range.expr {
+        Expr::List(list) => list.elements.clone(),
+        _ => return Err(LowerError::unsupported("comprehension over non-literal range")),
+    };
+
+    // Shadow-safe: save any enclosing bindings, restore them on the way out.
+    let prev_iter = ctx.locals.remove(&comp.iter_var);
+    let prev_accu = ctx.locals.remove(&comp.accu_var);
+
+    let mut accu = compile(ctx, &comp.accu_init)?;
+    for elem in &elements {
+        let x_reg = compile(ctx, elem)?;
+        ctx.locals.insert(comp.iter_var.clone(), x_reg);
+        ctx.locals.insert(comp.accu_var.clone(), accu);
+        accu = compile(ctx, &comp.loop_step)?;
+    }
+    ctx.locals.insert(comp.accu_var.clone(), accu);
+    let result = compile(ctx, &comp.result)?;
+
+    ctx.locals.remove(&comp.iter_var);
+    ctx.locals.remove(&comp.accu_var);
+    if let Some(r) = prev_iter {
+        ctx.locals.insert(comp.iter_var.clone(), r);
+    }
+    if let Some(r) = prev_accu {
+        ctx.locals.insert(comp.accu_var.clone(), r);
+    }
+    Ok(result)
 }
 
 fn compile_literal(ctx: &mut LowerCtx, lit: &LiteralValue) -> Result<usize, LowerError> {
