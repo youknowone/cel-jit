@@ -42,6 +42,10 @@ harness = false
 name = "majit_ab"
 required-features = ["majit-jit"]
 
+[[example]]
+name = "majit_vs_cometkim"
+required-features = ["majit-jit"]
+
 [features]
 default = ["regex", "chrono"]
 structs = []

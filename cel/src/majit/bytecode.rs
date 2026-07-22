@@ -186,11 +186,13 @@ fn run_mainloop(program: &Code, num_regs: usize, threshold: u32) -> i64 {
                 let t = program[pc + 2] as usize;
                 let f = program[pc + 3] as usize;
                 let d = program[pc + 4] as usize;
-                state.regs[d] = if state.regs[c] != 0 {
-                    state.regs[t]
-                } else {
-                    state.regs[f]
-                };
+                // Branchless blend: the ternary condition is a bool (0/1), so
+                // `f + c*(t-f)` == `if c!=0 {t} else {f}`. Branchless keeps the
+                // ternary out of a data-dependent guard (which would deopt every
+                // time the condition flips) and off majit's virt-array blackhole
+                // resume path.
+                state.regs[d] =
+                    state.regs[f] + state.regs[c] * (state.regs[t] - state.regs[f]);
                 pc += 5;
             }
             OP_JUMP_IF_ABOVE => {
@@ -302,11 +304,10 @@ pub fn clean_interp(program: &Code, num_regs: usize) -> i64 {
                 pc += 3;
             }
             OP_SELECT => {
-                regs[program[pc + 4] as usize] = if regs[program[pc + 1] as usize] != 0 {
-                    regs[program[pc + 2] as usize]
-                } else {
-                    regs[program[pc + 3] as usize]
-                };
+                let c = regs[program[pc + 1] as usize];
+                let t = regs[program[pc + 2] as usize];
+                let f = regs[program[pc + 3] as usize];
+                regs[program[pc + 4] as usize] = f + c * (t - f);
                 pc += 5;
             }
             OP_JUMP_IF_ABOVE => {
