@@ -170,6 +170,14 @@ fn compile_literal(ctx: &mut LowerCtx, lit: &LiteralValue) -> Result<usize, Lowe
     Ok(r)
 }
 
+/// Extract a plain integer literal, if that is what `e` is.
+fn as_int_literal(e: &IdedExpr) -> Option<i64> {
+    match &e.expr {
+        Expr::Literal(LiteralValue::Int(i)) => Some(i.into_inner()),
+        _ => None,
+    }
+}
+
 /// Resolve an `Ident` or a constant `Select` chain to a dotted variable path.
 fn resolve_path(e: &IdedExpr) -> Result<String, LowerError> {
     match &e.expr {
@@ -191,6 +199,34 @@ fn compile_call(ctx: &mut LowerCtx, call: &CallExpr) -> Result<usize, LowerError
         )));
     }
     let name = call.func_name.as_str();
+
+    // ternary `c ? t : f` — the int/bool subset has no side effects or raising
+    // operands, so eager-evaluate both arms and select (matches CEL's value).
+    if name == ops::CONDITIONAL {
+        if call.args.len() != 3 {
+            return Err(LowerError::unsupported("_?_:_ arity"));
+        }
+        let c = compile(ctx, &call.args[0])?;
+        let t = compile(ctx, &call.args[1])?;
+        let f = compile(ctx, &call.args[2])?;
+        let d = ctx.fresh();
+        ctx.body
+            .extend_from_slice(&[OP_SELECT, c as i64, t as i64, f as i64, d as i64]);
+        return Ok(d);
+    }
+
+    // constant-index access `base[k]` (k an int literal) — resolves to a slot
+    // just like member access (`base[k]` path). A non-literal index is a
+    // data-dependent (red) index, outside the subset.
+    if name == ops::INDEX {
+        if call.args.len() != 2 {
+            return Err(LowerError::unsupported("_[_] arity"));
+        }
+        let base = resolve_path(&call.args[0])?;
+        let idx = as_int_literal(&call.args[1])
+            .ok_or_else(|| LowerError::unsupported("non-constant index"))?;
+        return Ok(ctx.slot(format!("{base}[{idx}]")));
+    }
 
     // n-ary boolean fold (`a && b && c` may be binary-nested or n-ary).
     if name == ops::LOGICAL_AND || name == ops::LOGICAL_OR {

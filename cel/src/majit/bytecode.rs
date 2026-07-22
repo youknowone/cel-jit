@@ -32,8 +32,9 @@ pub const OP_NE: i64 = 11; // [NE, a, b, dst]              regs[dst] = (a != b) 
 pub const OP_AND: i64 = 12; // [AND, a, b, dst]             regs[dst] = a & b  (a,b in {0,1})
 pub const OP_OR: i64 = 13; // [OR, a, b, dst]              regs[dst] = a | b  (a,b in {0,1})
 pub const OP_NOT: i64 = 14; // [NOT, a, dst]                regs[dst] = 1 - a  (a in {0,1})
-pub const OP_JUMP_IF_ABOVE: i64 = 15; // [JIA, a, b, tgt]  if regs[a] > regs[b] { pc = tgt } (loop back-edge)
-pub const OP_RETURN: i64 = 16; // [RETURN, reg]                return regs[reg]
+pub const OP_SELECT: i64 = 15; // [SELECT, c, t, f, dst]        regs[dst] = if regs[c]!=0 {regs[t]} else {regs[f]}
+pub const OP_JUMP_IF_ABOVE: i64 = 16; // [JIA, a, b, tgt]  if regs[a] > regs[b] { pc = tgt } (loop back-edge)
+pub const OP_RETURN: i64 = 17; // [RETURN, reg]                return regs[reg]
 
 /// Counts hot loops majit compiled — evidence the JIT tier traced + compiled.
 pub static COMPILES: AtomicUsize = AtomicUsize::new(0);
@@ -180,6 +181,18 @@ fn run_mainloop(program: &Code, num_regs: usize, threshold: u32) -> i64 {
                 state.regs[d] = 1 - state.regs[a];
                 pc += 3;
             }
+            OP_SELECT => {
+                let c = program[pc + 1] as usize;
+                let t = program[pc + 2] as usize;
+                let f = program[pc + 3] as usize;
+                let d = program[pc + 4] as usize;
+                state.regs[d] = if state.regs[c] != 0 {
+                    state.regs[t]
+                } else {
+                    state.regs[f]
+                };
+                pc += 5;
+            }
             OP_JUMP_IF_ABOVE => {
                 let a = program[pc + 1] as usize;
                 let b = program[pc + 2] as usize;
@@ -287,6 +300,14 @@ pub fn clean_interp(program: &Code, num_regs: usize) -> i64 {
             OP_NOT => {
                 regs[program[pc + 2] as usize] = 1 - regs[program[pc + 1] as usize];
                 pc += 3;
+            }
+            OP_SELECT => {
+                regs[program[pc + 4] as usize] = if regs[program[pc + 1] as usize] != 0 {
+                    regs[program[pc + 2] as usize]
+                } else {
+                    regs[program[pc + 3] as usize]
+                };
+                pc += 5;
             }
             OP_JUMP_IF_ABOVE => {
                 let tgt = program[pc + 3] as usize;

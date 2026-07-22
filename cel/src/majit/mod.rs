@@ -153,6 +153,32 @@ mod tests {
     }
 
     #[test]
+    fn conditional_ternary() {
+        for x in [15i64, 5, 10, 11, -3, 0] {
+            check("x > 10 ? x * 2 : x + 5", &[("x", Bind::Int(x))]);
+        }
+    }
+
+    #[test]
+    fn list_index_constant() {
+        let program = Program::compile("list[0] + list[2] + list[4]").unwrap();
+        let lowered = lower(program.expression()).expect("constant list index is lowerable");
+        let paths: Vec<&str> = lowered.slots.iter().map(|s| s.path.as_str()).collect();
+        assert_eq!(paths, ["list[0]", "list[2]", "list[4]"]);
+
+        let mut ctx = Context::default();
+        ctx.add_variable_from_value("list", vec![10i64, 20, 30, 40, 50]);
+        let cel = match program.execute(&ctx).unwrap() {
+            Value::Int(i) => i,
+            o => panic!("unexpected {o:?}"),
+        };
+        let inputs = vec![10i64, 30, 50]; // list[0], list[2], list[4]
+        let prog = lowered.program_for(&inputs);
+        assert_eq!(clean_interp(&prog, lowered.num_regs), cel);
+        assert_eq!(run_jit(&prog, lowered.num_regs, u32::MAX), cel);
+    }
+
+    #[test]
     fn select_chain_slots() {
         // Member-access policy lowers; slots resolve to the dotted paths in
         // first-encounter order (no execute — map construction is covered by
