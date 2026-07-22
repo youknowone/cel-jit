@@ -38,6 +38,10 @@ dhat = { version = "0.3.3" }
 name = "runtime"
 harness = false
 
+[[example]]
+name = "majit_ab"
+required-features = ["majit-jit"]
+
 [features]
 default = ["regex", "chrono"]
 structs = []
