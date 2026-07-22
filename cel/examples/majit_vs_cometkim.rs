@@ -2,9 +2,12 @@
 //! (per-call AOT cranelift, PR #233) on cometkim's own benchmark expressions.
 //!
 //! cometkim's `comparison.rs` measures ONE `CompiledProgram::execute(&ctx)` per
-//! criterion iteration over a FIXED context — per-call latency. His compiled
-//! numbers (median ns/call, this machine, `cargo bench --bench comparison`) are
-//! hard-coded below in `cometkim_aot_ns` / `cometkim_interp_ns`.
+//! criterion iteration over a FIXED context — per-call latency. His compiled /
+//! interpreted medians below (`cometkim_aot_ns` / `cometkim_interp_ns`) are NOT
+//! portable across machines — they were measured on THIS machine by re-running
+//! his own `cargo bench --bench comparison` in the same session as this harness
+//! (fresh, 2026-07-22). Re-measure both sides together on any other machine
+//! before trusting the ratios; the criterion medians are the moving part.
 //!
 //! majit's regime is THROUGHPUT: one traced batch loop over N rows. We report
 //! majit's compiled ns/row. The comparison is conservative — cometkim's
@@ -188,15 +191,15 @@ fn main() {
     );
 
     let cases = [
-        Case { label: "comparison(const)", src: "10 > 5 && 3 < 7 || 1 == 1", shape: default_shape, cometkim_interp_ns: 36.0, cometkim_aot_ns: 8.34 },
-        Case { label: "variable_access", src: "x", shape: default_shape, cometkim_interp_ns: 7.80, cometkim_aot_ns: 14.0 },
-        Case { label: "conditional", src: "x > 10 ? x * 2 : x + 5", shape: default_shape, cometkim_interp_ns: 44.78, cometkim_aot_ns: 22.58 },
-        Case { label: "member_access", src: "obj.nested.value + obj.other", shape: default_shape, cometkim_interp_ns: 131.3, cometkim_aot_ns: 161.9 },
-        Case { label: "list_indexing", src: "list[0] + list[5] + list[9]", shape: default_shape, cometkim_interp_ns: 61.6, cometkim_aot_ns: 74.1 },
-        Case { label: "simple_arithmetic", src: "1 + 2 * 3 - 4 / 2", shape: default_shape, cometkim_interp_ns: 50.2, cometkim_aot_ns: 8.03 },
-        Case { label: "nested_expr(div)", src: "((a + b) * (c - d)) / ((e + f) - (g * h))", shape: nested_shape, cometkim_interp_ns: 215.4, cometkim_aot_ns: 159.9 },
+        Case { label: "comparison(const)", src: "10 > 5 && 3 < 7 || 1 == 1", shape: default_shape, cometkim_interp_ns: 37.33, cometkim_aot_ns: 7.84 },
+        Case { label: "variable_access", src: "x", shape: default_shape, cometkim_interp_ns: 7.73, cometkim_aot_ns: 13.97 },
+        Case { label: "conditional", src: "x > 10 ? x * 2 : x + 5", shape: default_shape, cometkim_interp_ns: 35.14, cometkim_aot_ns: 22.25 },
+        Case { label: "member_access", src: "obj.nested.value + obj.other", shape: default_shape, cometkim_interp_ns: 133.0, cometkim_aot_ns: 164.22 },
+        Case { label: "list_indexing", src: "list[0] + list[5] + list[9]", shape: default_shape, cometkim_interp_ns: 61.80, cometkim_aot_ns: 74.27 },
+        Case { label: "simple_arithmetic", src: "1 + 2 * 3 - 4 / 2", shape: default_shape, cometkim_interp_ns: 46.11, cometkim_aot_ns: 7.97 },
+        Case { label: "nested_expr(div)", src: "((a + b) * (c - d)) / ((e + f) - (g * h))", shape: nested_shape, cometkim_interp_ns: 156.97, cometkim_aot_ns: 140.45 },
         // green-length unroll: literal-list `all` folds to a constant bool.
-        Case { label: "all_comprehension", src: "[1, 2, 3, 4, 5].all(x, x > 0)", shape: default_shape, cometkim_interp_ns: 478.2, cometkim_aot_ns: 197.8 },
+        Case { label: "all_comprehension", src: "[1, 2, 3, 4, 5].all(x, x > 0)", shape: default_shape, cometkim_interp_ns: 512.50, cometkim_aot_ns: 197.40 },
     ];
 
     for case in &cases {
