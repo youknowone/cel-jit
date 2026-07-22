@@ -42,9 +42,10 @@ pub mod smoke;
 
 #[cfg(test)]
 mod tests {
-    use super::bytecode::{clean_interp, run_jit};
+    use super::bytecode::{clean_interp, eval_batch_sum, run_jit, COMPILES};
     use super::lower::lower;
     use crate::{Context, Program, Value};
+    use core::sync::atomic::Ordering;
     use std::collections::HashMap;
 
     #[derive(Debug, Clone, Copy)]
@@ -221,6 +222,114 @@ mod tests {
         // Predicate referencing an outer slot alongside the iter var.
         check("[1, 2, 3].all(x, x < n)", &[("n", Bind::Int(5))]);
         check("[1, 2, 3].all(x, x < n)", &[("n", Bind::Int(2))]);
+    }
+
+    /// Cross-check the columnar batch evaluator. `eval_batch_sum` on both the
+    /// interpreter tier (jit-off) and the compiled tier (jit-on) must equal the
+    /// sum of the stock tree-walker's per-row result, and the jit-on run must
+    /// actually compile the hot loop. `slot_paths` pins the lowering's slot
+    /// order; `rows[i][k]` is slot `k`'s value in row `i` (int/bool as `i64`).
+    /// This exercises the real throughput path — each column is read at the red
+    /// row index via `raw_load`, not baked as a per-row constant.
+    fn check_batch(expr_src: &str, slot_paths: &[&str], bool_slots: &[bool], rows: &[Vec<i64>]) {
+        let program =
+            Program::compile(expr_src).unwrap_or_else(|e| panic!("parse `{expr_src}`: {e:?}"));
+        let lowered =
+            lower(program.expression()).unwrap_or_else(|e| panic!("lower `{expr_src}`: {e}"));
+        let paths: Vec<&str> = lowered.slots.iter().map(|s| s.path.as_str()).collect();
+        assert_eq!(paths, slot_paths, "slot order for `{expr_src}`");
+
+        // Oracle: sum the stock tree-walker's per-row result.
+        let mut expected = 0i64;
+        for row in rows {
+            let mut ctx = Context::default();
+            for ((name, &v), &is_bool) in slot_paths.iter().zip(row).zip(bool_slots) {
+                if is_bool {
+                    ctx.add_variable_from_value(*name, v != 0);
+                } else {
+                    ctx.add_variable_from_value(*name, v);
+                }
+            }
+            expected += match program
+                .execute(&ctx)
+                .unwrap_or_else(|e| panic!("execute `{expr_src}`: {e:?}"))
+            {
+                Value::Bool(b) => b as i64,
+                Value::Int(i) => i,
+                other => panic!("`{expr_src}`: unexpected {other:?}"),
+            };
+        }
+
+        // Transpose rows into per-slot i64 columns.
+        let columns: Vec<Vec<i64>> = (0..slot_paths.len())
+            .map(|k| rows.iter().map(|r| r[k]).collect())
+            .collect();
+        let col_refs: Vec<&[i64]> = columns.iter().map(|c| c.as_slice()).collect();
+
+        let off = eval_batch_sum(&lowered, &col_refs, u32::MAX);
+        assert_eq!(off, expected, "batch jit-off vs stock for `{expr_src}`");
+        COMPILES.store(0, Ordering::Relaxed);
+        let on = eval_batch_sum(&lowered, &col_refs, 8);
+        assert_eq!(on, expected, "batch jit-on vs stock for `{expr_src}`");
+        assert!(
+            COMPILES.load(Ordering::Relaxed) >= 1,
+            "batch `{expr_src}` must compile the hot loop"
+        );
+    }
+
+    /// Deterministic per-row column data: an LCG mapped into `[lo, hi]` per slot.
+    fn gen_rows(n: usize, ranges: &[(i64, i64)]) -> Vec<Vec<i64>> {
+        let mut x: u64 = 0x2545F4914F6CDD1D;
+        let mut rows = Vec::with_capacity(n);
+        for _ in 0..n {
+            let mut row = Vec::with_capacity(ranges.len());
+            for &(lo, hi) in ranges {
+                x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                let span = (hi - lo + 1) as u64;
+                row.push(lo + ((x >> 33) % span) as i64);
+            }
+            rows.push(row);
+        }
+        rows
+    }
+
+    #[test]
+    fn batch_policy_count() {
+        // Count rows where `a >= b` over real i64 columns read at the red index.
+        let rows = gen_rows(3000, &[(-50, 50), (-50, 50)]);
+        check_batch("a >= b", &["a", "b"], &[false, false], &rows);
+    }
+
+    #[test]
+    fn batch_arithmetic_sum() {
+        // Sum `(a + b) * c - d` over columns (small ranges keep it overflow-free
+        // so debug-checked arithmetic and the compiled trace agree).
+        let rows = gen_rows(3000, &[(0, 40), (0, 40), (-20, 20), (0, 100)]);
+        check_batch(
+            "(a + b) * c - d",
+            &["a", "b", "c", "d"],
+            &[false, false, false, false],
+            &rows,
+        );
+    }
+
+    #[test]
+    fn batch_conditional_sum() {
+        // Sum the ternary `x > 10 ? x * 2 : x + 5` over a single column.
+        let rows = gen_rows(3000, &[(-5, 25)]);
+        check_batch("x > 10 ? x * 2 : x + 5", &["x"], &[false], &rows);
+    }
+
+    #[test]
+    fn batch_bool_slot_policy() {
+        // A bool-typed slot column (`frozen`): `a >= b && !frozen`.
+        let rows = gen_rows(3000, &[(-30, 30), (-30, 30), (0, 1)]);
+        check_batch(
+            "a >= b && !frozen",
+            &["a", "b", "frozen"],
+            &[false, false, true],
+            &rows,
+        );
     }
 
     #[test]

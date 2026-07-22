@@ -46,6 +46,10 @@ required-features = ["majit-jit"]
 name = "majit_vs_cometkim"
 required-features = ["majit-jit"]
 
+[[example]]
+name = "majit_columnar_batch"
+required-features = ["majit-jit"]
+
 [features]
 default = ["regex", "chrono"]
 structs = []

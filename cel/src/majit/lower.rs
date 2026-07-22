@@ -96,6 +96,69 @@ impl Lowered {
         p.push(self.result_reg as i64);
         p
     }
+
+    /// Build a **columnar batch** program: for each row `i` in `0..n`, load each
+    /// slot's value `col_k[i]` from its data column via a red-index `raw_load`
+    /// (`OP_COL_LOAD`), run the body, and accumulate the result into a running
+    /// sum. `bases[k]` is the base address of slot `k`'s `i64` column buffer,
+    /// aligned to [`Lowered::slots`]. Returns `(program, total_regs)`.
+    ///
+    /// The loop machinery (`i`, `acc`, `n`, `one`, `stride`) and the per-slot
+    /// column base pointers occupy registers **above** `num_regs`, so the body's
+    /// slot/temp registers are untouched by the loop bookkeeping. Every base is
+    /// a loop-invariant loaded once into the register file — the shape a compiled
+    /// trace can read real context columns through (a scalar-state-field base
+    /// trips `VirtualStatesCantMatch` at loop close; see [`super::bytecode`]).
+    ///
+    /// The back-edge is a do-while (`OP_JUMP_IF_ABOVE` after the body), so the
+    /// body runs at least once; callers must pass `n >= 1`.
+    pub fn batch_sum_program(&self, bases: &[i64], n: i64) -> (Vec<i64>, usize) {
+        assert_eq!(
+            bases.len(),
+            self.slots.len(),
+            "batch_sum_program: base arity {} != slot count {}",
+            bases.len(),
+            self.slots.len()
+        );
+        assert!(n >= 1, "batch_sum_program: n must be >= 1 (do-while back-edge)");
+        let m = self.num_regs; // first machinery register
+        let (r_i, r_acc, r_n, r_one, r_stride, r_ea) = (m, m + 1, m + 2, m + 3, m + 4, m + 5);
+        let r_base0 = m + 6;
+        let total_regs = r_base0 + self.slots.len();
+
+        let mut p = Vec::new();
+        let load_const = |p: &mut Vec<i64>, imm: i64, dst: usize| {
+            p.extend_from_slice(&[OP_LOAD_CONST, imm, dst as i64]);
+        };
+        load_const(&mut p, 0, r_i);
+        load_const(&mut p, 0, r_acc);
+        load_const(&mut p, n, r_n);
+        load_const(&mut p, 1, r_one);
+        load_const(&mut p, 8, r_stride);
+        for (k, &base) in bases.iter().enumerate() {
+            load_const(&mut p, base, r_base0 + k);
+        }
+
+        let body_pc = p.len();
+        // ea = i * 8 (byte offset of row i in an i64 column)
+        p.extend_from_slice(&[OP_MUL, r_i as i64, r_stride as i64, r_ea as i64]);
+        // slot_k = *(base_k + ea)   — the red-index columnar read
+        for (k, slot) in self.slots.iter().enumerate() {
+            p.extend_from_slice(&[
+                OP_COL_LOAD,
+                (r_base0 + k) as i64,
+                r_ea as i64,
+                slot.reg as i64,
+            ]);
+        }
+        p.extend_from_slice(&self.body);
+        // acc += result; i += 1; if n > i goto @body
+        p.extend_from_slice(&[OP_ADD, r_acc as i64, self.result_reg as i64, r_acc as i64]);
+        p.extend_from_slice(&[OP_ADD, r_i as i64, r_one as i64, r_i as i64]);
+        p.extend_from_slice(&[OP_JUMP_IF_ABOVE, r_n as i64, r_i as i64, body_pc as i64]);
+        p.extend_from_slice(&[OP_RETURN, r_acc as i64]);
+        (p, total_regs)
+    }
 }
 
 struct LowerCtx {

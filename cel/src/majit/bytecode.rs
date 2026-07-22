@@ -37,6 +37,23 @@ pub const OP_JUMP_IF_ABOVE: i64 = 16; // [JIA, a, b, tgt]  if regs[a] > regs[b] 
 pub const OP_RETURN: i64 = 17; // [RETURN, reg]                return regs[reg]
 pub const OP_DIV: i64 = 18; // [DIV, a, b, dst]             regs[dst] = a / b   (b != 0; trunc toward zero)
 pub const OP_MOD: i64 = 19; // [MOD, a, b, dst]             regs[dst] = a % b   (b != 0)
+pub const OP_COL_LOAD: i64 = 20; // [COL_LOAD, base, ea, dst]  regs[dst] = *(regs[base] + regs[ea])
+
+/// Raw native-memory load intrinsic recognized by the `#[jit_interp]` proc
+/// macro (lowered to `raw_load_i`); at the interpreter tier this real fn runs.
+/// `base` is a column buffer's base address, `ea` a byte offset — reading
+/// `col[i]` at a data-dependent (red) row index `i` when `ea == i * 8`. The
+/// base is a loop-invariant carried in the register file (NOT a scalar state
+/// field, which would force the virtualizable frame to a Ref and trip
+/// `VirtualStatesCantMatch` at loop close), exactly as a loop-invariant `rffi`
+/// pointer is in PyPy. This is what lets a compiled trace read real context
+/// columns per row instead of baking one row's inputs as constants.
+#[inline]
+fn majit_raw_load_i64(base: i64, ea: i64) -> i64 {
+    // SAFETY: `base + ea` addresses element `ea/8` of a live `&[i64]` column
+    // whose length the batch builder guarantees covers every row index.
+    unsafe { core::ptr::read_unaligned((base as usize).wrapping_add(ea as usize) as *const i64) }
+}
 
 /// Counts hot loops majit compiled — evidence the JIT tier traced + compiled.
 pub static COMPILES: AtomicUsize = AtomicUsize::new(0);
@@ -229,6 +246,13 @@ fn run_mainloop(program: &Code, num_regs: usize, threshold: u32) -> i64 {
                     state.regs[f] + state.regs[c] * (state.regs[t] - state.regs[f]);
                 pc += 5;
             }
+            OP_COL_LOAD => {
+                let base = state.regs[program[pc + 1] as usize];
+                let ea = state.regs[program[pc + 2] as usize];
+                let d = program[pc + 3] as usize;
+                state.regs[d] = majit_raw_load_i64(base, ea);
+                pc += 4;
+            }
             OP_JUMP_IF_ABOVE => {
                 let a = program[pc + 1] as usize;
                 let b = program[pc + 2] as usize;
@@ -256,6 +280,44 @@ fn run_mainloop(program: &Code, num_regs: usize, threshold: u32) -> i64 {
 /// threshold (`u32::MAX` disables compilation, giving the interpreter tier).
 pub fn run_jit(program: &Code, num_regs: usize, threshold: u32) -> i64 {
     run_mainloop(program, num_regs, threshold)
+}
+
+/// Columnar **batch** evaluation of a lowered CEL expression: reduce
+/// `sum over rows i of expr(col_0[i], col_1[i], ..)` where `columns[k]` is
+/// slot `k`'s `i64` data column (aligned to [`super::lower::Lowered::slots`],
+/// all the same length). For a boolean predicate this counts matching rows;
+/// for an arithmetic expression it sums the per-row values. `threshold` is the
+/// JIT hot threshold (`u32::MAX` = interpreter tier).
+///
+/// This is the real throughput path: the compiled trace reads each column at
+/// the red row index via `raw_load` (base carried loop-invariant in a register)
+/// instead of re-baking one row's inputs as constants per call.
+pub fn eval_batch_sum(
+    lowered: &super::lower::Lowered,
+    columns: &[&[i64]],
+    threshold: u32,
+) -> i64 {
+    assert_eq!(
+        columns.len(),
+        lowered.slots.len(),
+        "eval_batch_sum: column count {} != slot count {}",
+        columns.len(),
+        lowered.slots.len()
+    );
+    let n = columns.first().map_or(0, |c| c.len());
+    for (k, c) in columns.iter().enumerate() {
+        assert_eq!(c.len(), n, "eval_batch_sum: column {k} length {} != {n}", c.len());
+    }
+    if n == 0 {
+        return 0;
+    }
+    let bases: Vec<i64> = columns.iter().map(|c| c.as_ptr() as i64).collect();
+    let (prog, total_regs) = lowered.batch_sum_program(&bases, n as i64);
+    let result = run_mainloop(&prog, total_regs, threshold);
+    // The raw pointers in `prog` alias `columns`; keep the borrow live across
+    // the run so the buffers cannot be dropped underneath the trace.
+    core::hint::black_box(columns);
+    result
 }
 
 /// Reference interpreter: a plain `match` over the same bytecode with no majit
@@ -353,6 +415,12 @@ pub fn clean_interp(program: &Code, num_regs: usize) -> i64 {
                 let f = regs[program[pc + 3] as usize];
                 regs[program[pc + 4] as usize] = f + c * (t - f);
                 pc += 5;
+            }
+            OP_COL_LOAD => {
+                let base = regs[program[pc + 1] as usize];
+                let ea = regs[program[pc + 2] as usize];
+                regs[program[pc + 3] as usize] = majit_raw_load_i64(base, ea);
+                pc += 4;
             }
             OP_JUMP_IF_ABOVE => {
                 let tgt = program[pc + 3] as usize;
