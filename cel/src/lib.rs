@@ -19,6 +19,9 @@ use thiserror::Error;
 
 mod macros;
 
+#[cfg(feature = "majit-jit")]
+pub mod majit;
+
 pub mod common;
 pub mod context;
 mod env;

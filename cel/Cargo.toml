@@ -23,6 +23,12 @@ bytes = { version = "1", optional = true }
 thiserror = "2"
 pastey = "0.2.1"
 
+# PoC meta-tracing JIT tier (feature `majit-jit`). The `majit` crates live in a
+# separate workspace two levels up, so these are cross-workspace path deps.
+majit-ir = { path = "../../majit/majit-ir", optional = true }
+majit-macros = { path = "../../majit/majit-macros", optional = true }
+majit-metainterp = { path = "../../majit/majit-metainterp", default-features = false, optional = true }
+
 [dev-dependencies]
 criterion = { version = "0.5.1", features = ["html_reports"] }
 serde_bytes = "0.11.14"
@@ -40,3 +46,13 @@ json = ["dep:serde_json", "dep:base64"]
 regex = ["dep:regex"]
 chrono = ["dep:chrono"]
 dhat-heap = [ ] # if you are doing heap profiling
+
+# PoC: meta-tracing JIT tier built on the in-repo `majit` framework (cell-majit,
+# issue #357). Additive and off by default. Applies majit's RPython-style
+# meta-tracer to a traceable CEL evaluation mainloop.
+majit-jit = [
+    "dep:majit-ir",
+    "dep:majit-macros",
+    "dep:majit-metainterp",
+    "majit-metainterp/cranelift",
+]
