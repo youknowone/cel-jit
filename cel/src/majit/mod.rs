@@ -24,8 +24,8 @@
 //! ## M2 — CEL AST -> traceable bytecode ([`lower`], [`bytecode`])
 //!
 //! [`lower::lower`] compiles the supported `Expr` subset (`Int`/`Boolean`
-//! literals, slot-resolved `Ident`/`Select`, arithmetic `+ - *`, unary `-`,
-//! comparisons, boolean `&& || !`) to the flat `i64`-word program of
+//! literals, slot-resolved `Ident`/`Select`, arithmetic `+ - * / %`, unary
+//! `-`, comparisons, boolean `&& || !`) to the flat `i64`-word program of
 //! [`bytecode`]. Anything outside the subset returns [`lower::LowerError`], the
 //! signal to fall back to the stock tree-walking evaluator. Correctness is
 //! pinned by cross-checking the lowered program against the real
@@ -131,6 +131,25 @@ mod tests {
             &[("a", Bind::Int(-6)), ("b", Bind::Int(7)), ("c", Bind::Int(11))],
         );
         check("-a + b", &[("a", Bind::Int(9)), ("b", Bind::Int(4))]);
+    }
+
+    #[test]
+    fn division_and_modulo() {
+        // Constant fold (cometkim's `simple_arithmetic`): 1 + 2*3 - 4/2 == 5.
+        check("1 + 2 * 3 - 4 / 2", &[]);
+        // Variable division / modulo over a nonzero, non-overflowing domain.
+        for (a, b) in [(20i64, 3i64), (-20, 3), (20, -3), (-20, -3), (7, 7), (0, 5)] {
+            check("a / b", &[("a", Bind::Int(a)), ("b", Bind::Int(b))]);
+            check("a % b", &[("a", Bind::Int(a)), ("b", Bind::Int(b))]);
+        }
+        // Nested (cometkim's `nested_expr`) on divisor-nonzero inputs.
+        check(
+            "((a + b) * (c - d)) / ((e + f) - (g * h))",
+            &[
+                ("a", Bind::Int(9)), ("b", Bind::Int(4)), ("c", Bind::Int(7)), ("d", Bind::Int(2)),
+                ("e", Bind::Int(300)), ("f", Bind::Int(211)), ("g", Bind::Int(3)), ("h", Bind::Int(5)),
+            ],
+        );
     }
 
     #[test]

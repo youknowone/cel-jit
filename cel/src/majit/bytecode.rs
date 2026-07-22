@@ -35,6 +35,8 @@ pub const OP_NOT: i64 = 14; // [NOT, a, dst]                regs[dst] = 1 - a  (
 pub const OP_SELECT: i64 = 15; // [SELECT, c, t, f, dst]        regs[dst] = if regs[c]!=0 {regs[t]} else {regs[f]}
 pub const OP_JUMP_IF_ABOVE: i64 = 16; // [JIA, a, b, tgt]  if regs[a] > regs[b] { pc = tgt } (loop back-edge)
 pub const OP_RETURN: i64 = 17; // [RETURN, reg]                return regs[reg]
+pub const OP_DIV: i64 = 18; // [DIV, a, b, dst]             regs[dst] = a / b   (b != 0; trunc toward zero)
+pub const OP_MOD: i64 = 19; // [MOD, a, b, dst]             regs[dst] = a % b   (b != 0)
 
 /// Counts hot loops majit compiled — evidence the JIT tier traced + compiled.
 pub static COMPILES: AtomicUsize = AtomicUsize::new(0);
@@ -111,6 +113,38 @@ fn run_mainloop(program: &Code, num_regs: usize, threshold: u32) -> i64 {
                 let b = program[pc + 2] as usize;
                 let d = program[pc + 3] as usize;
                 state.regs[d] = state.regs[a] * state.regs[b];
+                pc += 4;
+            }
+            OP_DIV => {
+                let a = state.regs[program[pc + 1] as usize];
+                let b = state.regs[program[pc + 2] as usize];
+                let d = program[pc + 3] as usize;
+                // Truncating (toward-zero) division = cel's `/`. majit lowers a
+                // bare `/` to Python floor division (toward -inf); floor and
+                // truncation coincide on non-negative operands, so dividing the
+                // magnitudes and reapplying the sign branchlessly stays bit-exact
+                // and lowers identically in the interpreter and compiled tiers.
+                // Inlined (not a helper call): a residual call aborts the trace.
+                let ma = a >> 63; // 0 or -1 (sign mask of a)
+                let mb = b >> 63;
+                let ua = (a ^ ma) - ma; // |a|
+                let ub = (b ^ mb) - mb; // |b|
+                let uq = ua / ub; // non-negative quotient: floor == trunc here
+                let s = ma ^ mb; // -1 iff signs differ
+                state.regs[d] = (uq ^ s) - s; // negate quotient iff signs differ
+                pc += 4;
+            }
+            OP_MOD => {
+                let a = state.regs[program[pc + 1] as usize];
+                let b = state.regs[program[pc + 2] as usize];
+                let d = program[pc + 3] as usize;
+                // Truncating remainder = cel's `%` (sign of the dividend).
+                let ma = a >> 63;
+                let mb = b >> 63;
+                let ua = (a ^ ma) - ma;
+                let ub = (b ^ mb) - mb;
+                let ur = ua % ub; // non-negative remainder
+                state.regs[d] = (ur ^ ma) - ma; // reapply the dividend's sign
                 pc += 4;
             }
             OP_NEG => {
@@ -253,6 +287,16 @@ pub fn clean_interp(program: &Code, num_regs: usize) -> i64 {
             OP_MUL => {
                 regs[program[pc + 3] as usize] =
                     regs[program[pc + 1] as usize] * regs[program[pc + 2] as usize];
+                pc += 4;
+            }
+            OP_DIV => {
+                regs[program[pc + 3] as usize] =
+                    regs[program[pc + 1] as usize] / regs[program[pc + 2] as usize];
+                pc += 4;
+            }
+            OP_MOD => {
+                regs[program[pc + 3] as usize] =
+                    regs[program[pc + 1] as usize] % regs[program[pc + 2] as usize];
                 pc += 4;
             }
             OP_NEG => {

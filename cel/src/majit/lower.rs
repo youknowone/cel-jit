@@ -8,7 +8,8 @@
 //!     each resolved to an input **slot** (a register loaded from the row's
 //!     field value) — the compile-time replacement for the runtime BTreeMap /
 //!     HashMap lookups the tree-walker performs,
-//!   * arithmetic `+ - *`, unary `-`,
+//!   * arithmetic `+ - * / %`, unary `-` (division assumes a nonzero,
+//!     non-`INT_MIN`/`-1` divisor domain — the schema/domain shape guard),
 //!   * comparisons `>= > <= < == !=`,
 //!   * boolean `&& || !` (non-short-circuit, correct for the pure int/bool
 //!     domain where operands cannot raise).
@@ -253,6 +254,8 @@ fn compile_call(ctx: &mut LowerCtx, call: &CallExpr) -> Result<usize, LowerError
         ops::ADD => Some(OP_ADD),
         ops::SUBSTRACT => Some(OP_SUB),
         ops::MULTIPLY => Some(OP_MUL),
+        ops::DIVIDE => Some(OP_DIV),
+        ops::MODULO => Some(OP_MOD),
         ops::GREATER_EQUALS => Some(OP_GE),
         ops::GREATER => Some(OP_GT),
         ops::LESS_EQUALS => Some(OP_LE),
