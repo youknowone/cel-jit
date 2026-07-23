@@ -50,6 +50,30 @@
 //! float batch path; the flagship float policy `price >= 100.0 && qty < 50.0`
 //! runs ~94x over the tree-walker, bit-exact (see
 //! `examples/majit_columnar_batch_float`).
+//!
+//! ## M5 — filling out the numeric columnar subset
+//!
+//! The two-bank machine is extended to the rest of the winnable numeric domain,
+//! each addition cross-checked bit-exact across the clean / interp / compiled
+//! tiers:
+//!   * **int↔float compares** widen the int side per row (`cast_int_to_float`),
+//!     matching the tree-walker's `int as f64` promotion.
+//!   * **float aggregates** — a float-valued top-level result sums into a float
+//!     accumulator (`OP_RETURN_F`); the running total is a loop-carried
+//!     dependency, so the compiled trace sums in row order, bit for bit.
+//!   * **float ternary** `c ? t : f` blends the two arms over their raw `f64`
+//!     bit patterns (`OP_FSELECT`, a mask select), overflow-free and without the
+//!     reassociation an arithmetic blend would need.
+//!   * **uint columns** share the int register file (the raw 64-bit pattern):
+//!     add/sub/mul and eq/ne reuse the int ops, ordering compares unsigned
+//!     (`OP_ULT`/`OP_ULE`, `>`/`>=` via an operand swap). Division/modulo bail
+//!     (the trace IR has no unsigned floordiv/mod).
+//!
+//! Everything outside this numeric/bool columnar subset — strings, bytes, maps,
+//! lists, member/method calls, `in`, timestamps, custom functions — is a
+//! structural loss for a batch JIT and returns [`lower::LowerError`], falling
+//! back to the stock tree-walker. The win is confined to what a compiled
+//! straight-line trace over aligned columns can express.
 
 pub mod bytecode;
 pub mod lower;
