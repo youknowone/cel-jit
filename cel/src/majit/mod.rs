@@ -430,29 +430,32 @@ mod tests {
         core::hint::black_box((&cola, &colb));
     }
 
-    /// One input column for a typed-lowering batch test: an int/bool column or
-    /// a `double` column. Owns its data so the test keeps the buffers alive.
+    /// One input column for a typed-lowering batch test: an int/bool column, a
+    /// `uint` column (stored as its i64 bit pattern), or a `double` column. Owns
+    /// its data so the test keeps the buffers alive.
     enum ColData {
         Int(Vec<i64>),
+        UInt(Vec<i64>),
         Float(Vec<f64>),
     }
 
     impl ColData {
         fn len(&self) -> usize {
             match self {
-                ColData::Int(c) => c.len(),
+                ColData::Int(c) | ColData::UInt(c) => c.len(),
                 ColData::Float(c) => c.len(),
             }
         }
         fn ty(&self) -> ValType {
             match self {
                 ColData::Int(_) => ValType::Int,
+                ColData::UInt(_) => ValType::UInt,
                 ColData::Float(_) => ValType::Float,
             }
         }
         fn column(&self) -> Column<'_> {
             match self {
-                ColData::Int(c) => Column::Int(c),
+                ColData::Int(c) | ColData::UInt(c) => Column::Int(c),
                 ColData::Float(c) => Column::Float(c),
             }
         }
@@ -480,6 +483,20 @@ mod tests {
             .map(|_| {
                 x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
                 lo + ((x >> 33) % span) as i64
+            })
+            .collect()
+    }
+
+    /// Deterministic full-range u64 column data returned as its i64 bit pattern.
+    /// Roughly half the values have the high bit set (u64 > i64::MAX), so a
+    /// signed comparison would order them differently from the unsigned oracle —
+    /// making the uint compare tests genuinely discriminating.
+    fn gen_u64_bits(n: usize, seed: u64) -> Vec<i64> {
+        let mut x = seed;
+        (0..n)
+            .map(|_| {
+                x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                x as i64
             })
             .collect()
     }
@@ -518,6 +535,7 @@ mod tests {
             for (name, d) in cols {
                 match d {
                     ColData::Int(c) => ctx.add_variable_from_value(*name, c[i]),
+                    ColData::UInt(c) => ctx.add_variable_from_value(*name, c[i] as u64),
                     ColData::Float(c) => ctx.add_variable_from_value(*name, c[i]),
                 }
             }
@@ -594,6 +612,7 @@ mod tests {
             for (name, d) in cols {
                 match d {
                     ColData::Int(c) => ctx.add_variable_from_value(*name, c[i]),
+                    ColData::UInt(c) => ctx.add_variable_from_value(*name, c[i] as u64),
                     ColData::Float(c) => ctx.add_variable_from_value(*name, c[i]),
                 }
             }
@@ -723,6 +742,70 @@ mod tests {
             "price >= qty ? price : qty",
             &[("price", ColData::Float(price)), ("qty", ColData::Float(qty))],
         );
+    }
+
+    #[test]
+    fn batch_uint_compare() {
+        // Full-range u64 columns compared unsigned. About half the rows have the
+        // high bit set, so a signed compare would count differently; the oracle
+        // (Value::UInt orders unsigned) pins the unsigned semantics across the
+        // clean / interp / compiled tiers.
+        let n = 3000;
+        let a = gen_u64_bits(n, 0x51ED_2701_AABB_CCDD);
+        let b = gen_u64_bits(n, 0xC0FF_EE00_1234_5678);
+        // Column vs a uint constant at the sign boundary (2^63), all four
+        // orderings (the `>`/`>=` forms exercise the operand-swap path).
+        for expr in [
+            "a >= 9223372036854775808u",
+            "a > 9223372036854775808u",
+            "a <= 9223372036854775808u",
+            "a < 9223372036854775808u",
+        ] {
+            check_batch_f(expr, &[("a", ColData::UInt(a.clone()))]);
+        }
+        // Column vs column, ordering plus eq/ne (uint eq/ne reuse the int ops).
+        for expr in ["a < b", "a <= b", "a > b", "a >= b", "a == b", "a != b"] {
+            check_batch_f(
+                expr,
+                &[("a", ColData::UInt(a.clone())), ("b", ColData::UInt(b.clone()))],
+            );
+        }
+    }
+
+    #[test]
+    fn batch_uint_arith() {
+        // uint add/mul reuse the signed opcodes (bit-identical mod 2^64). Bounded
+        // operands keep the tree-walker's checked arithmetic from overflowing, so
+        // the wrapping VM result matches; the uint result then feeds an unsigned
+        // compare.
+        let n = 3000;
+        let a = gen_i64(n, 0x1122_3344_5566_7788, 0, 1000);
+        let b = gen_i64(n, 0x8877_6655_4433_2211, 0, 1000);
+        check_batch_f(
+            "a + b >= 1500u",
+            &[("a", ColData::UInt(a.clone())), ("b", ColData::UInt(b.clone()))],
+        );
+        check_batch_f(
+            "a * b < 250000u",
+            &[("a", ColData::UInt(a)), ("b", ColData::UInt(b))],
+        );
+    }
+
+    #[test]
+    fn uint_div_mod_bails() {
+        // uint division / modulo need unsigned opcodes the trace IR lacks, so the
+        // typed lowering bails and the tree-walker handles them.
+        let schema: Schema =
+            [("a".to_string(), ValType::UInt), ("b".to_string(), ValType::UInt)]
+                .into_iter()
+                .collect();
+        for expr in ["a / b >= 1u", "a % b >= 1u"] {
+            let program = Program::compile(expr).unwrap();
+            assert!(
+                lower_typed(program.expression(), &schema).is_err(),
+                "`{expr}` must bail the typed lowering (uint div/mod)"
+            );
+        }
     }
 
     #[test]

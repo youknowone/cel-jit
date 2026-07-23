@@ -328,6 +328,10 @@ fn resolve_path(e: &IdedExpr) -> Result<String, LowerError> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValType {
     Int,
+    /// Unsigned 64-bit. Shares the int register file (the raw bit pattern), so
+    /// storage, column loads, moves, add/sub/mul and eq/ne reuse the int ops;
+    /// only ordering comparisons differ (unsigned `OP_ULT`/`OP_ULE`).
+    UInt,
     Float,
 }
 
@@ -420,7 +424,7 @@ impl LoweredF {
         // bank at the body's count. `f_acc` is unused when the result is int.
         let (f_acc, total_float_regs) = match self.result_bank {
             ValType::Float => (self.num_float_regs, self.num_float_regs + 1),
-            ValType::Int => (0, self.num_float_regs),
+            ValType::Int | ValType::UInt => (0, self.num_float_regs),
         };
 
         let mut p = Vec::new();
@@ -432,7 +436,7 @@ impl LoweredF {
         // `f64::from_bits` must stay out of the traced loop body; here it is in
         // the setup (0.0 has zero bits).
         match self.result_bank {
-            ValType::Int => load_const(&mut p, 0, r_acc),
+            ValType::Int | ValType::UInt => load_const(&mut p, 0, r_acc),
             ValType::Float => p.extend_from_slice(&[OP_LOAD_CONST_F, 0, f_acc as i64]),
         }
         load_const(&mut p, n, r_n);
@@ -450,7 +454,7 @@ impl LoweredF {
         // slot_k = *(base_k + ea)   — the red-index columnar read, per bank
         for (k, slot) in self.slots.iter().enumerate() {
             let op = match slot.ty {
-                ValType::Int => OP_COL_LOAD,
+                ValType::Int | ValType::UInt => OP_COL_LOAD,
                 ValType::Float => OP_COL_LOAD_F,
             };
             p.extend_from_slice(&[op, (r_base0 + k) as i64, r_ea as i64, slot.reg as i64]);
@@ -461,7 +465,7 @@ impl LoweredF {
         // trace cannot reassociate it — the running total sums in row order, bit
         // for bit like the interpreter tiers.
         match self.result_bank {
-            ValType::Int => {
+            ValType::Int | ValType::UInt => {
                 p.extend_from_slice(&[OP_ADD, r_acc as i64, self.result_reg as i64, r_acc as i64])
             }
             ValType::Float => {
@@ -471,7 +475,7 @@ impl LoweredF {
         p.extend_from_slice(&[OP_ADD, r_i as i64, r_one as i64, r_i as i64]);
         p.extend_from_slice(&[OP_JUMP_IF_ABOVE, r_n as i64, r_i as i64, body_pc as i64]);
         match self.result_bank {
-            ValType::Int => p.extend_from_slice(&[OP_RETURN, r_acc as i64]),
+            ValType::Int | ValType::UInt => p.extend_from_slice(&[OP_RETURN, r_acc as i64]),
             ValType::Float => p.extend_from_slice(&[OP_RETURN_F, f_acc as i64]),
         }
         (p, total_int_regs, total_float_regs)
@@ -494,7 +498,7 @@ struct LowerCtxF<'s> {
 impl LowerCtxF<'_> {
     fn fresh(&mut self, bank: ValType) -> TReg {
         let idx = match bank {
-            ValType::Int => {
+            ValType::Int | ValType::UInt => {
                 let r = self.next_int;
                 self.next_int += 1;
                 r
@@ -604,7 +608,13 @@ fn compile_literal_t(ctx: &mut LowerCtxF, lit: &LiteralValue) -> Result<TReg, Lo
             ]);
             Ok(r)
         }
-        LiteralValue::UInt(_) => Err(LowerError::unsupported("uint literal")),
+        LiteralValue::UInt(u) => {
+            let r = ctx.fresh(ValType::UInt);
+            // The u64 travels as its raw i64 bit pattern in the int register file.
+            ctx.prelude
+                .extend_from_slice(&[OP_LOAD_CONST, u.into_inner() as i64, r.idx as i64]);
+            Ok(r)
+        }
         LiteralValue::String(_) => Err(LowerError::unsupported("string literal")),
         LiteralValue::Bytes(_) => Err(LowerError::unsupported("bytes literal")),
         LiteralValue::Null => Err(LowerError::unsupported("null literal")),
@@ -760,10 +770,30 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
             return Err(LowerError::unsupported(format!("{name} arity")));
         }
         let (mut a, mut b) = compile_cmp_operands(ctx, &call.args[0], &call.args[1])?;
-        // A mixed comparison widens the int side to float (`int as f64`, the
-        // tree-walker's promotion). `compile_cmp_operands` already folded a
-        // literal int to a float constant; a data-dependent int is widened per
-        // row here via `cast_int_to_float`.
+        // Two uint operands compare unsigned: `<`/`<=` map to OP_ULT/OP_ULE and
+        // `>`/`>=` reuse them by swapping operands; eq/ne are bit-identical to
+        // the signed ops. (A uint peer is never an int literal, so
+        // `compile_cmp_operands` performs no float promotion here.)
+        if a.bank == ValType::UInt && b.bank == ValType::UInt {
+            let (op, lhs, rhs) = match name {
+                ops::LESS => (OP_ULT, a, b),
+                ops::LESS_EQUALS => (OP_ULE, a, b),
+                ops::GREATER => (OP_ULT, b, a),
+                ops::GREATER_EQUALS => (OP_ULE, b, a),
+                ops::EQUALS => (OP_EQ, a, b),
+                ops::NOT_EQUALS => (OP_NE, a, b),
+                _ => unreachable!("cmp is one of the six comparison ops"),
+            };
+            let d = ctx.fresh(ValType::Int);
+            ctx.body
+                .extend_from_slice(&[op, lhs.idx as i64, rhs.idx as i64, d.idx as i64]);
+            return Ok(d);
+        }
+        // A mixed int/float comparison widens the int side to float (`int as
+        // f64`, the tree-walker's promotion). `compile_cmp_operands` already
+        // folded a literal int to a float constant; a data-dependent int is
+        // widened per row here via `cast_int_to_float`. Any uint mixed with a
+        // different bank is a CEL type error and bails.
         let op = match (a.bank, b.bank) {
             (ValType::Int, ValType::Int) => iop,
             (ValType::Float, ValType::Float) => fop,
@@ -775,6 +805,7 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
                 b = emit_i2f(ctx, b);
                 fop
             }
+            _ => return Err(LowerError::unsupported("mixed-bank comparison")),
         };
         let d = ctx.fresh(ValType::Int);
         ctx.body
@@ -800,6 +831,17 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
         match (a.bank, b.bank) {
             (ValType::Int, ValType::Int) => {
                 let d = ctx.fresh(ValType::Int);
+                ctx.body
+                    .extend_from_slice(&[iop, a.idx as i64, b.idx as i64, d.idx as i64]);
+                Ok(d)
+            }
+            (ValType::UInt, ValType::UInt) => {
+                // add/sub/mul are bit-identical to the signed ops (mod 2^64);
+                // division/modulo need unsigned opcodes the trace IR lacks.
+                if name == ops::DIVIDE || name == ops::MODULO {
+                    return Err(LowerError::unsupported("uint division/modulo"));
+                }
+                let d = ctx.fresh(ValType::UInt);
                 ctx.body
                     .extend_from_slice(&[iop, a.idx as i64, b.idx as i64, d.idx as i64]);
                 Ok(d)

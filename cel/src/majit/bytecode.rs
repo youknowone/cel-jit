@@ -63,6 +63,8 @@ pub const OP_FNE: i64 = 34; // [fa, fb, dst]            regs[dst] = (fregs[fa] !
 pub const OP_I2F: i64 = 35; // [src, fdst]             fregs[fdst] = regs[src] as f64  (cast_int_to_float)
 pub const OP_RETURN_F: i64 = 36; // [RETURN_F, freg]        return fregs[freg].to_bits()  (float total)
 pub const OP_FSELECT: i64 = 37; // [FSELECT, c, ft, ff, fdst]  fregs[fdst] = if regs[c]!=0 {fregs[ft]} else {fregs[ff]}
+pub const OP_ULT: i64 = 38; // [a, b, dst]              regs[dst] = ((regs[a] as u64) <  (regs[b] as u64)) as 0/1
+pub const OP_ULE: i64 = 39; // [a, b, dst]              regs[dst] = ((regs[a] as u64) <= (regs[b] as u64)) as 0/1
 
 /// Raw native-memory load intrinsic recognized by the `#[jit_interp]` proc
 /// macro (lowered to `raw_load_i`); at the interpreter tier this real fn runs.
@@ -377,9 +379,11 @@ impl Column<'_> {
 
     fn matches(&self, ty: super::lower::ValType) -> bool {
         use super::lower::ValType;
+        // A `uint` slot is backed by an int-bit column (the int register file
+        // carries the raw 64-bit pattern).
         matches!(
             (self, ty),
-            (Column::Int(_), ValType::Int) | (Column::Float(_), ValType::Float)
+            (Column::Int(_), ValType::Int | ValType::UInt) | (Column::Float(_), ValType::Float)
         )
     }
 }
@@ -582,7 +586,8 @@ pub mod float_bank {
         OP_ADD, OP_AND, OP_COL_LOAD, OP_COL_LOAD_F, OP_EQ, OP_FADD, OP_FDIV, OP_FEQ, OP_FGE,
         OP_FGT, OP_FLE, OP_FLT, OP_FMOV, OP_FMUL, OP_FNE, OP_FNEG, OP_FSUB, OP_GE, OP_GT, OP_I2F,
         OP_JUMP_IF_ABOVE, OP_LE, OP_LOAD_CONST, OP_LOAD_CONST_F, OP_LT, OP_MOV, OP_MUL, OP_NE,
-        OP_FSELECT, OP_NEG, OP_NOT, OP_OR, OP_RETURN, OP_RETURN_F, OP_SELECT, OP_SUB,
+        OP_FSELECT, OP_NEG, OP_NOT, OP_OR, OP_RETURN, OP_RETURN_F, OP_SELECT, OP_SUB, OP_ULE,
+        OP_ULT,
     };
     use core::sync::atomic::Ordering;
 
@@ -607,6 +612,20 @@ pub mod float_bank {
     #[inline]
     fn majit_bits_to_f64(x: i64) -> f64 {
         f64::from_bits(x as u64)
+    }
+
+    /// Unsigned `<` on the int bank — recognized by the `#[jit_interp]` proc
+    /// macro as `uint_lt`; at the interpreter tier this real fn runs. The int
+    /// register file carries uint columns as their raw 64-bit pattern.
+    #[inline]
+    fn majit_uint_lt(a: i64, b: i64) -> i64 {
+        ((a as u64) < (b as u64)) as i64
+    }
+
+    /// Unsigned `<=` — `uint_le`.
+    #[inline]
+    fn majit_uint_le(a: i64, b: i64) -> i64 {
+        ((a as u64) <= (b as u64)) as i64
     }
 
     struct VmStateF {
@@ -713,6 +732,20 @@ pub mod float_bank {
                     let b = program[pc + 2] as usize;
                     let d = program[pc + 3] as usize;
                     state.regs[d] = (state.regs[a] < state.regs[b]) as i64;
+                    pc += 4;
+                }
+                OP_ULT => {
+                    let a = program[pc + 1] as usize;
+                    let b = program[pc + 2] as usize;
+                    let d = program[pc + 3] as usize;
+                    state.regs[d] = majit_uint_lt(state.regs[a], state.regs[b]);
+                    pc += 4;
+                }
+                OP_ULE => {
+                    let a = program[pc + 1] as usize;
+                    let b = program[pc + 2] as usize;
+                    let d = program[pc + 3] as usize;
+                    state.regs[d] = majit_uint_le(state.regs[a], state.regs[b]);
                     pc += 4;
                 }
                 OP_EQ => {
@@ -942,6 +975,16 @@ pub mod float_bank {
                 OP_LT => {
                     regs[program[pc + 3] as usize] =
                         (regs[program[pc + 1] as usize] < regs[program[pc + 2] as usize]) as i64;
+                    pc += 4;
+                }
+                OP_ULT => {
+                    regs[program[pc + 3] as usize] =
+                        majit_uint_lt(regs[program[pc + 1] as usize], regs[program[pc + 2] as usize]);
+                    pc += 4;
+                }
+                OP_ULE => {
+                    regs[program[pc + 3] as usize] =
+                        majit_uint_le(regs[program[pc + 1] as usize], regs[program[pc + 2] as usize]);
                     pc += 4;
                 }
                 OP_EQ => {
