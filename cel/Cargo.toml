@@ -58,6 +58,10 @@ required-features = ["majit-jit"]
 name = "majit_columnar_batch_uint"
 required-features = ["majit-jit"]
 
+[[example]]
+name = "majit_columnar_batch_string"
+required-features = ["majit-jit"]
+
 [features]
 default = ["regex", "chrono"]
 structs = []
