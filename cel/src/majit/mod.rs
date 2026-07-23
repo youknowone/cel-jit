@@ -769,6 +769,25 @@ mod tests {
     }
 
     #[test]
+    fn batch_float_negate() {
+        // Float unary negation (`OP_FNEG`) traces through the two-bank mainloop.
+        // `-` flips the f64 sign bit (always exact), so a negated column and a
+        // negated ternary arm stay bit-exact across the clean / interp / compiled
+        // tiers, and the compiled tier must trace the loop (the negate arm no
+        // longer aborts the trace).
+        let n = 3000;
+        let price = gen_f64(n, 0x2B3C_4D5E_6F70_8191, -200.0, 200.0);
+        let qty = gen_f64(n, 0x9182_7364_5546_3728, 0.0, 100.0);
+        // Bare float negation.
+        check_batch_float("-price", &[("price", ColData::Float(price.clone()))]);
+        // Negation inside a float ternary arm (FSELECT blends a negated value).
+        check_batch_float(
+            "price >= qty ? -price : qty",
+            &[("price", ColData::Float(price)), ("qty", ColData::Float(qty))],
+        );
+    }
+
+    #[test]
     fn batch_uint_compare() {
         // Full-range u64 columns compared unsigned. About half the rows have the
         // high bit set, so a signed compare would count differently; the oracle
