@@ -31,10 +31,25 @@
 //! pinned by cross-checking the lowered program against the real
 //! `Program::execute` on the same inputs (see the tests below).
 //!
-//! ## M3+ — batch evaluation + green-length comprehension unroll (planned)
+//! ## M3 — batch evaluation + green-length comprehension unroll
 //!
-//! Wrap the lowered body in the batch-over-rows loop (the majit merge point),
-//! add a batch API, and unroll green-length comprehensions.
+//! [`bytecode::eval_batch_sum`] wraps the lowered body in a batch-over-rows loop
+//! (the majit merge point), reading each context column at the red row index via
+//! a compiled `raw_load` (the buffer bases held loop-invariant in the register
+//! file). Green-length comprehensions unroll into the straight-line fold. The
+//! flagship int policy `balance >= amount && !frozen` runs ~119x over the stock
+//! tree-walker (see `examples/majit_columnar_batch`).
+//!
+//! ## M4 — `double` columns (the two-bank machine)
+//!
+//! [`lower::lower_typed`] lowers the same subset under a [`lower::Schema`]
+//! declaring which paths are `double`, allocating float slots/temps in a
+//! parallel `fregs` bank ([`bytecode::float_bank`]). A float comparison crosses
+//! banks (`f64` operands, an int `0`/`1` result). Loop-invariant literal loads
+//! are hoisted to a prelude that runs once. [`bytecode::eval_batch_sum_f`] is the
+//! float batch path; the flagship float policy `price >= 100.0 && qty < 50.0`
+//! runs ~94x over the tree-walker, bit-exact (see
+//! `examples/majit_columnar_batch_float`).
 
 pub mod bytecode;
 pub mod lower;
@@ -42,8 +57,8 @@ pub mod smoke;
 
 #[cfg(test)]
 mod tests {
-    use super::bytecode::{clean_interp, eval_batch_sum, run_jit, COMPILES};
-    use super::lower::lower;
+    use super::bytecode::{clean_interp, eval_batch_sum, eval_batch_sum_f, run_jit, Column, COMPILES};
+    use super::lower::{lower, lower_typed, Schema, ValType};
     use crate::{Context, Program, Value};
     use core::sync::atomic::Ordering;
     use std::collections::HashMap;
@@ -403,13 +418,219 @@ mod tests {
         let (ni, nf) = (9usize, 2usize);
         assert_eq!(clean_interp_f(&prog, ni, nf), expected, "clean vs oracle");
         assert_eq!(run_jit_f(&prog, ni, nf, u32::MAX), expected, "jit-off vs oracle");
-        COMPILES_F.store(0, Ordering::Relaxed);
+        let before = COMPILES_F.load(Ordering::Relaxed);
         assert_eq!(run_jit_f(&prog, ni, nf, 8), expected, "jit-on vs oracle");
         assert!(
-            COMPILES_F.load(Ordering::Relaxed) >= 1,
+            COMPILES_F.load(Ordering::Relaxed) > before,
             "float batch must compile the hot loop"
         );
         core::hint::black_box((&cola, &colb));
+    }
+
+    /// One input column for a typed-lowering batch test: an int/bool column or
+    /// a `double` column. Owns its data so the test keeps the buffers alive.
+    enum ColData {
+        Int(Vec<i64>),
+        Float(Vec<f64>),
+    }
+
+    impl ColData {
+        fn len(&self) -> usize {
+            match self {
+                ColData::Int(c) => c.len(),
+                ColData::Float(c) => c.len(),
+            }
+        }
+        fn ty(&self) -> ValType {
+            match self {
+                ColData::Int(_) => ValType::Int,
+                ColData::Float(_) => ValType::Float,
+            }
+        }
+        fn column(&self) -> Column<'_> {
+            match self {
+                ColData::Int(c) => Column::Int(c),
+                ColData::Float(c) => Column::Float(c),
+            }
+        }
+    }
+
+    /// Deterministic per-column f64 data in `[lo, hi)` from an LCG, exact f64
+    /// (built via `from_bits`) so the tree-walker oracle sees the same bits.
+    fn gen_f64(n: usize, seed: u64, lo: f64, hi: f64) -> Vec<f64> {
+        let mut x = seed;
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let mant = x & ((1u64 << 52) - 1);
+            let u = f64::from_bits((0x3ffu64 << 52) | mant) - 1.0; // [0, 1)
+            out.push(lo + u * (hi - lo));
+        }
+        out
+    }
+
+    /// Deterministic per-column i64 data in `[lo, hi]` from an LCG.
+    fn gen_i64(n: usize, seed: u64, lo: i64, hi: i64) -> Vec<i64> {
+        let mut x = seed;
+        let span = (hi - lo + 1) as u64;
+        (0..n)
+            .map(|_| {
+                x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                lo + ((x >> 33) % span) as i64
+            })
+            .collect()
+    }
+
+    /// Cross-check the typed (two-bank) columnar batch evaluator. The schema is
+    /// read off `cols` (int vs `double`), which also pins the lowering's slot
+    /// order. The clean two-bank interpreter, the majit interpreter tier, and
+    /// the compiled tier must all equal the stock tree-walker's per-row sum, and
+    /// the compiled run must actually trace the hot loop.
+    fn check_batch_f(expr_src: &str, cols: &[(&str, ColData)]) {
+        use super::bytecode::float_bank::{clean_interp_f, COMPILES as COMPILES_F};
+
+        let program =
+            Program::compile(expr_src).unwrap_or_else(|e| panic!("parse `{expr_src}`: {e:?}"));
+        let schema: Schema = cols.iter().map(|(n, d)| (n.to_string(), d.ty())).collect();
+        let lowered = lower_typed(program.expression(), &schema)
+            .unwrap_or_else(|e| panic!("lower_typed `{expr_src}`: {e}"));
+
+        // Slot order + bank pin.
+        let paths: Vec<&str> = lowered.slots.iter().map(|s| s.path.as_str()).collect();
+        let want_paths: Vec<&str> = cols.iter().map(|(n, _)| *n).collect();
+        assert_eq!(paths, want_paths, "slot order for `{expr_src}`");
+        for (slot, (_, d)) in lowered.slots.iter().zip(cols) {
+            assert_eq!(slot.ty, d.ty(), "slot `{}` bank for `{expr_src}`", slot.path);
+        }
+
+        let n = cols.first().map_or(0, |(_, d)| d.len());
+        for (name, d) in cols {
+            assert_eq!(d.len(), n, "column `{name}` length for `{expr_src}`");
+        }
+
+        // Oracle: sum the stock tree-walker's per-row result.
+        let mut expected = 0i64;
+        for i in 0..n {
+            let mut ctx = Context::default();
+            for (name, d) in cols {
+                match d {
+                    ColData::Int(c) => ctx.add_variable_from_value(*name, c[i]),
+                    ColData::Float(c) => ctx.add_variable_from_value(*name, c[i]),
+                }
+            }
+            expected += match program
+                .execute(&ctx)
+                .unwrap_or_else(|e| panic!("execute `{expr_src}`: {e:?}"))
+            {
+                Value::Bool(b) => b as i64,
+                Value::Int(v) => v,
+                other => panic!("`{expr_src}`: unexpected {other:?}"),
+            };
+        }
+
+        let columns: Vec<Column> = cols.iter().map(|(_, d)| d.column()).collect();
+
+        // Clean two-bank interpreter over the built batch program.
+        let bases: Vec<i64> = columns.iter().map(|c| c.base()).collect();
+        let (prog, ni, nf) = lowered.batch_sum_program(&bases, n as i64);
+        assert_eq!(clean_interp_f(&prog, ni, nf), expected, "clean vs stock for `{expr_src}`");
+        core::hint::black_box(&columns);
+
+        // majit interpreter tier, then compiled tier. The compile counter is a
+        // shared, monotonic global; asserting it *increased* across the jit-on
+        // run (rather than resetting it to 0 first) is robust to other float
+        // tests compiling concurrently.
+        let off = eval_batch_sum_f(&lowered, &columns, u32::MAX);
+        assert_eq!(off, expected, "batch jit-off vs stock for `{expr_src}`");
+        let before = COMPILES_F.load(Ordering::Relaxed);
+        let on = eval_batch_sum_f(&lowered, &columns, 8);
+        assert_eq!(on, expected, "batch jit-on vs stock for `{expr_src}`");
+        assert!(
+            COMPILES_F.load(Ordering::Relaxed) > before,
+            "float batch `{expr_src}` must compile the hot loop"
+        );
+    }
+
+    #[test]
+    fn batch_float_policy_count() {
+        // Flagship float policy: count rows where a float column clears a float
+        // constant threshold AND another stays under a float limit. Float column
+        // loads + float-vs-const compares -> int bools -> int AND -> count.
+        let n = 3000;
+        let price = gen_f64(n, 0x2545_F491_4F6C_DD1D, 0.0, 200.0);
+        let qty = gen_f64(n, 0x9E37_79B9_7F4A_7C15, 0.0, 100.0);
+        check_batch_f(
+            "price >= 100.0 && qty < 50.0",
+            &[("price", ColData::Float(price)), ("qty", ColData::Float(qty))],
+        );
+    }
+
+    #[test]
+    fn batch_float_col_vs_col() {
+        // Float column vs float column comparison driven through the lowerer.
+        let n = 3000;
+        let a = gen_f64(n, 0xAAAA_5555_AAAA_5555, -1.0, 1.0);
+        let b = gen_f64(n, 0xBBBB_4444_BBBB_4444, -1.0, 1.0);
+        check_batch_f("a >= b", &[("a", ColData::Float(a)), ("b", ColData::Float(b))]);
+    }
+
+    #[test]
+    fn batch_float_arith_policy() {
+        // Float arithmetic (FMUL) then a float-const compare.
+        let n = 3000;
+        let price = gen_f64(n, 0x1111_2222_3333_4444, 0.0, 100.0);
+        let qty = gen_f64(n, 0x5555_6666_7777_8888, 0.0, 100.0);
+        check_batch_f(
+            "price * qty >= 2500.0",
+            &[("price", ColData::Float(price)), ("qty", ColData::Float(qty))],
+        );
+    }
+
+    #[test]
+    fn batch_mixed_bank_policy() {
+        // Both banks in one policy: an int/bool column AND a float-const compare.
+        // Exercises OP_COL_LOAD (int) and OP_COL_LOAD_F (float) side by side.
+        let n = 3000;
+        let flagged = gen_i64(n, 0xCAFE_F00D_CAFE_F00D, 0, 1);
+        let price = gen_f64(n, 0xF00D_CAFE_F00D_CAFE, 0.0, 200.0);
+        check_batch_f(
+            "flagged >= 1 && price >= 100.0",
+            &[("flagged", ColData::Int(flagged)), ("price", ColData::Float(price))],
+        );
+    }
+
+    #[test]
+    fn probe_float_const_only() {
+        // Isolates a float constant (OP_LOAD_CONST_F), no AND.
+        let n = 3000;
+        let a = gen_f64(n, 0x1234_5678_9ABC_DEF0, -1.0, 1.0);
+        check_batch_f("a >= 0.0", &[("a", ColData::Float(a))]);
+    }
+
+    #[test]
+    fn probe_and_no_const() {
+        // Isolates AND over float-derived bools, no float constant.
+        let n = 3000;
+        let a = gen_f64(n, 0x1111_1111_1111_1111, -1.0, 1.0);
+        let b = gen_f64(n, 0x2222_2222_2222_2222, -1.0, 1.0);
+        check_batch_f(
+            "a >= b && b >= a",
+            &[("a", ColData::Float(a)), ("b", ColData::Float(b))],
+        );
+    }
+
+    #[test]
+    fn typed_lowering_bails() {
+        // Mixed int/float compare (no int->float cast op), float modulo, and a
+        // float-valued top-level result (no float accumulator) all bail.
+        let schema: Schema = [("p".to_string(), ValType::Float)].into_iter().collect();
+        for expr in ["p >= 1", "p % 2.0 >= 1.0", "p + 1.0"] {
+            let program = Program::compile(expr).unwrap();
+            assert!(
+                lower_typed(program.expression(), &schema).is_err(),
+                "`{expr}` must bail the typed lowering"
+            );
+        }
     }
 
     #[test]

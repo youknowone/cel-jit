@@ -321,6 +321,471 @@ fn resolve_path(e: &IdedExpr) -> Result<String, LowerError> {
     }
 }
 
+/// The bank a slot / sub-expression lives in for the two-bank machine. `Bool`
+/// shares the int bank (`0`/`1`); `Float` lives in the parallel `fregs` bank.
+/// This is the *shape* a compiled float trace guards on (the caller declares
+/// which context columns are `double` via a [`Schema`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValType {
+    Int,
+    Float,
+}
+
+/// Declared type of each input path. A path absent from the schema defaults to
+/// [`ValType::Int`] (the int/bool domain of [`lower`]). A real integration
+/// builds this from the context's variable types and guards on it before
+/// electing the float JIT.
+pub type Schema = HashMap<String, ValType>;
+
+/// A typed register: a bank plus the index within that bank.
+#[derive(Debug, Clone, Copy)]
+struct TReg {
+    bank: ValType,
+    idx: usize,
+}
+
+/// One typed input slot for the two-bank machine: a path resolved to a register
+/// in its bank, plus which bank ([`ValType`]) it is.
+#[derive(Debug, Clone)]
+pub struct SlotInfoF {
+    /// Dotted variable path, e.g. `account.balance`.
+    pub path: String,
+    /// The bank this slot's column is read into.
+    pub ty: ValType,
+    /// Register index within [`SlotInfoF::ty`]'s bank.
+    pub reg: usize,
+}
+
+/// A CEL expression compiled to two-bank bytecode. The result is always an int
+/// register (a bool/count/int-sum); a float-valued top-level result is rejected
+/// (the two-bank VM has no float accumulator). [`LoweredF::batch_sum_program`]
+/// prepends the loop-invariant [`LoweredF::prelude`] and the per-row columnar
+/// loads, then wraps [`LoweredF::body`] in the sum loop.
+#[derive(Debug, Clone)]
+pub struct LoweredF {
+    /// Loop-invariant literal loads (int and `double` constants), hoisted to run
+    /// **once** before the loop. Every literal a CEL expression references is a
+    /// loop invariant, so it belongs here, not re-evaluated per row (PyPy hoists
+    /// invariants out of the trace). Hoisting `double` constants also keeps
+    /// `OP_LOAD_CONST_F`'s `f64::from_bits` out of the traced loop body.
+    pub prelude: Vec<i64>,
+    /// Per-row straight-line ops (no literal loads, no slot loads, no return).
+    pub body: Vec<i64>,
+    /// Int-bank register holding the result.
+    pub result_reg: usize,
+    /// Int-bank register count the body uses.
+    pub num_int_regs: usize,
+    /// Float-bank register count the body uses.
+    pub num_float_regs: usize,
+    /// Input slots in first-encounter order.
+    pub slots: Vec<SlotInfoF>,
+}
+
+impl LoweredF {
+    /// Build a **columnar batch** program over the two-bank machine: for each
+    /// row `i` in `0..n`, load each slot's `col_k[i]` via a red-index `raw_load`
+    /// (`OP_COL_LOAD` for int slots, `OP_COL_LOAD_F` for float slots), run the
+    /// body, and accumulate the int result into a running sum. `bases[k]` is the
+    /// base address of slot `k`'s column buffer (an `i64` pointer regardless of
+    /// bank), aligned to [`LoweredF::slots`]. Returns
+    /// `(program, total_int_regs, total_float_regs)`.
+    ///
+    /// The loop machinery (`i`, `acc`, `n`, `one`, `stride`, `ea`) and the
+    /// per-slot base pointers live in the **int** bank above `num_int_regs`, so
+    /// the body's registers are untouched. Every base is a loop-invariant int
+    /// register (never a scalar state field, which would trip
+    /// `VirtualStatesCantMatch` at loop close). The back-edge is a do-while, so
+    /// callers must pass `n >= 1`.
+    pub fn batch_sum_program(&self, bases: &[i64], n: i64) -> (Vec<i64>, usize, usize) {
+        assert_eq!(
+            bases.len(),
+            self.slots.len(),
+            "batch_sum_program: base arity {} != slot count {}",
+            bases.len(),
+            self.slots.len()
+        );
+        assert!(n >= 1, "batch_sum_program: n must be >= 1 (do-while back-edge)");
+        let m = self.num_int_regs; // first int machinery register
+        let (r_i, r_acc, r_n, r_one, r_stride, r_ea) = (m, m + 1, m + 2, m + 3, m + 4, m + 5);
+        let r_base0 = m + 6;
+        let total_int_regs = r_base0 + self.slots.len();
+
+        let mut p = Vec::new();
+        let load_const = |p: &mut Vec<i64>, imm: i64, dst: usize| {
+            p.extend_from_slice(&[OP_LOAD_CONST, imm, dst as i64]);
+        };
+        load_const(&mut p, 0, r_i);
+        load_const(&mut p, 0, r_acc);
+        load_const(&mut p, n, r_n);
+        load_const(&mut p, 1, r_one);
+        load_const(&mut p, 8, r_stride);
+        for (k, &base) in bases.iter().enumerate() {
+            load_const(&mut p, base, r_base0 + k);
+        }
+        // Loop-invariant literal loads, run once before the merge point.
+        p.extend_from_slice(&self.prelude);
+
+        let body_pc = p.len();
+        // ea = i * 8 (byte offset of row i in an 8-byte column)
+        p.extend_from_slice(&[OP_MUL, r_i as i64, r_stride as i64, r_ea as i64]);
+        // slot_k = *(base_k + ea)   — the red-index columnar read, per bank
+        for (k, slot) in self.slots.iter().enumerate() {
+            let op = match slot.ty {
+                ValType::Int => OP_COL_LOAD,
+                ValType::Float => OP_COL_LOAD_F,
+            };
+            p.extend_from_slice(&[op, (r_base0 + k) as i64, r_ea as i64, slot.reg as i64]);
+        }
+        p.extend_from_slice(&self.body);
+        // acc += result (int); i += 1; if n > i goto @body
+        p.extend_from_slice(&[OP_ADD, r_acc as i64, self.result_reg as i64, r_acc as i64]);
+        p.extend_from_slice(&[OP_ADD, r_i as i64, r_one as i64, r_i as i64]);
+        p.extend_from_slice(&[OP_JUMP_IF_ABOVE, r_n as i64, r_i as i64, body_pc as i64]);
+        p.extend_from_slice(&[OP_RETURN, r_acc as i64]);
+        (p, total_int_regs, self.num_float_regs)
+    }
+}
+
+struct LowerCtxF<'s> {
+    /// Loop-invariant literal loads, emitted here instead of into `body` so the
+    /// batch builder can run them once before the loop.
+    prelude: Vec<i64>,
+    body: Vec<i64>,
+    next_int: usize,
+    next_float: usize,
+    slots: Vec<SlotInfoF>,
+    slot_map: HashMap<String, TReg>,
+    locals: HashMap<String, TReg>,
+    schema: &'s Schema,
+}
+
+impl LowerCtxF<'_> {
+    fn fresh(&mut self, bank: ValType) -> TReg {
+        let idx = match bank {
+            ValType::Int => {
+                let r = self.next_int;
+                self.next_int += 1;
+                r
+            }
+            ValType::Float => {
+                let r = self.next_float;
+                self.next_float += 1;
+                r
+            }
+        };
+        TReg { bank, idx }
+    }
+
+    fn slot(&mut self, path: String) -> TReg {
+        if let Some(&r) = self.slot_map.get(&path) {
+            return r;
+        }
+        let ty = self.schema.get(&path).copied().unwrap_or(ValType::Int);
+        let r = self.fresh(ty);
+        self.slot_map.insert(path.clone(), r);
+        self.slots.push(SlotInfoF { path, ty, reg: r.idx });
+        r
+    }
+}
+
+/// Lower a CEL expression to two-bank bytecode under a `schema` declaring which
+/// paths are `double`, or report why it is out of subset. Same subset as
+/// [`lower`] plus `double` literals/columns, but with per-bank register
+/// allocation. Mixed int/float arithmetic or comparison (no int->float cast op),
+/// float modulo, a float ternary arm, and a float-valued top-level result all
+/// bail (the caller falls back to the tree-walker).
+pub fn lower_typed(expr: &IdedExpr, schema: &Schema) -> Result<LoweredF, LowerError> {
+    let mut ctx = LowerCtxF {
+        prelude: Vec::new(),
+        body: Vec::new(),
+        next_int: 0,
+        next_float: 0,
+        slots: Vec::new(),
+        slot_map: HashMap::new(),
+        locals: HashMap::new(),
+        schema,
+    };
+    let result = compile_t(&mut ctx, expr)?;
+    if result.bank != ValType::Int {
+        return Err(LowerError::unsupported(
+            "float-valued top-level result (no float accumulator)",
+        ));
+    }
+    Ok(LoweredF {
+        prelude: ctx.prelude,
+        body: ctx.body,
+        result_reg: result.idx,
+        num_int_regs: ctx.next_int,
+        num_float_regs: ctx.next_float,
+        slots: ctx.slots,
+    })
+}
+
+fn compile_t(ctx: &mut LowerCtxF, e: &IdedExpr) -> Result<TReg, LowerError> {
+    match &e.expr {
+        Expr::Literal(lit) => compile_literal_t(ctx, lit),
+        Expr::Ident(name) => {
+            if let Some(&r) = ctx.locals.get(name) {
+                Ok(r)
+            } else {
+                Ok(ctx.slot(name.clone()))
+            }
+        }
+        Expr::Select(_) => {
+            let path = resolve_path(e)?;
+            let root = path.split('.').next().unwrap_or_default();
+            if ctx.locals.contains_key(root) {
+                return Err(LowerError::unsupported("field access on comprehension variable"));
+            }
+            Ok(ctx.slot(path))
+        }
+        Expr::Call(call) => compile_call_t(ctx, call),
+        Expr::Comprehension(comp) => compile_comprehension_t(ctx, comp),
+        Expr::List(_) => Err(LowerError::unsupported("list literal")),
+        Expr::Map(_) => Err(LowerError::unsupported("map literal")),
+        Expr::Struct(_) => Err(LowerError::unsupported("struct literal")),
+        Expr::Unspecified => Err(LowerError::unsupported("unspecified expr")),
+    }
+}
+
+fn compile_literal_t(ctx: &mut LowerCtxF, lit: &LiteralValue) -> Result<TReg, LowerError> {
+    // Literals are loop invariants: emit their loads into the prelude so the
+    // batch builder runs them once, not per row.
+    match lit {
+        LiteralValue::Int(i) => {
+            let r = ctx.fresh(ValType::Int);
+            ctx.prelude
+                .extend_from_slice(&[OP_LOAD_CONST, i.into_inner(), r.idx as i64]);
+            Ok(r)
+        }
+        LiteralValue::Boolean(b) => {
+            let r = ctx.fresh(ValType::Int);
+            ctx.prelude
+                .extend_from_slice(&[OP_LOAD_CONST, b.into_inner() as i64, r.idx as i64]);
+            Ok(r)
+        }
+        LiteralValue::Double(f) => {
+            let r = ctx.fresh(ValType::Float);
+            // The f64 travels as its raw i64 bits; the VM reloads with
+            // `f64::from_bits`, so the constant is bit-exact.
+            ctx.prelude.extend_from_slice(&[
+                OP_LOAD_CONST_F,
+                f.into_inner().to_bits() as i64,
+                r.idx as i64,
+            ]);
+            Ok(r)
+        }
+        LiteralValue::UInt(_) => Err(LowerError::unsupported("uint literal")),
+        LiteralValue::String(_) => Err(LowerError::unsupported("string literal")),
+        LiteralValue::Bytes(_) => Err(LowerError::unsupported("bytes literal")),
+        LiteralValue::Null => Err(LowerError::unsupported("null literal")),
+    }
+}
+
+fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerError> {
+    if call.target.is_some() {
+        return Err(LowerError::unsupported(format!(
+            "method call `{}`",
+            call.func_name
+        )));
+    }
+    let name = call.func_name.as_str();
+
+    // ternary `c ? t : f` — branchless int blend only (the two-bank VM has no
+    // float SELECT); float arms bail.
+    if name == ops::CONDITIONAL {
+        if call.args.len() != 3 {
+            return Err(LowerError::unsupported("_?_:_ arity"));
+        }
+        let c = compile_t(ctx, &call.args[0])?;
+        if c.bank != ValType::Int {
+            return Err(LowerError::unsupported("ternary condition must be int/bool"));
+        }
+        let t = compile_t(ctx, &call.args[1])?;
+        let f = compile_t(ctx, &call.args[2])?;
+        if t.bank != ValType::Int || f.bank != ValType::Int {
+            return Err(LowerError::unsupported("float ternary arm"));
+        }
+        let d = ctx.fresh(ValType::Int);
+        ctx.body.extend_from_slice(&[
+            OP_SELECT,
+            c.idx as i64,
+            t.idx as i64,
+            f.idx as i64,
+            d.idx as i64,
+        ]);
+        return Ok(d);
+    }
+
+    // constant-index access `base[k]` resolves to a typed slot.
+    if name == ops::INDEX {
+        if call.args.len() != 2 {
+            return Err(LowerError::unsupported("_[_] arity"));
+        }
+        let base = resolve_path(&call.args[0])?;
+        let idx = as_int_literal(&call.args[1])
+            .ok_or_else(|| LowerError::unsupported("non-constant index"))?;
+        return Ok(ctx.slot(format!("{base}[{idx}]")));
+    }
+
+    // n-ary boolean fold — int operands, int result.
+    if name == ops::LOGICAL_AND || name == ops::LOGICAL_OR {
+        if call.args.len() < 2 {
+            return Err(LowerError::unsupported(format!("{name} arity")));
+        }
+        let op = if name == ops::LOGICAL_AND {
+            OP_AND
+        } else {
+            OP_OR
+        };
+        let mut acc = compile_t(ctx, &call.args[0])?;
+        if acc.bank != ValType::Int {
+            return Err(LowerError::unsupported("boolean operand must be int/bool"));
+        }
+        for arg in &call.args[1..] {
+            let b = compile_t(ctx, arg)?;
+            if b.bank != ValType::Int {
+                return Err(LowerError::unsupported("boolean operand must be int/bool"));
+            }
+            let d = ctx.fresh(ValType::Int);
+            ctx.body
+                .extend_from_slice(&[op, acc.idx as i64, b.idx as i64, d.idx as i64]);
+            acc = d;
+        }
+        return Ok(acc);
+    }
+
+    // comparisons — same-bank operands, int `0`/`1` result.
+    let cmp = match name {
+        ops::GREATER_EQUALS => Some((OP_GE, OP_FGE)),
+        ops::GREATER => Some((OP_GT, OP_FGT)),
+        ops::LESS_EQUALS => Some((OP_LE, OP_FLE)),
+        ops::LESS => Some((OP_LT, OP_FLT)),
+        ops::EQUALS => Some((OP_EQ, OP_FEQ)),
+        ops::NOT_EQUALS => Some((OP_NE, OP_FNE)),
+        _ => None,
+    };
+    if let Some((iop, fop)) = cmp {
+        if call.args.len() != 2 {
+            return Err(LowerError::unsupported(format!("{name} arity")));
+        }
+        let a = compile_t(ctx, &call.args[0])?;
+        let b = compile_t(ctx, &call.args[1])?;
+        let op = match (a.bank, b.bank) {
+            (ValType::Int, ValType::Int) => iop,
+            (ValType::Float, ValType::Float) => fop,
+            _ => return Err(LowerError::unsupported("mixed int/float comparison")),
+        };
+        let d = ctx.fresh(ValType::Int);
+        ctx.body
+            .extend_from_slice(&[op, a.idx as i64, b.idx as i64, d.idx as i64]);
+        return Ok(d);
+    }
+
+    // arithmetic — same-bank operands, same-bank result. No float modulo.
+    let arith = match name {
+        ops::ADD => Some((OP_ADD, Some(OP_FADD))),
+        ops::SUBSTRACT => Some((OP_SUB, Some(OP_FSUB))),
+        ops::MULTIPLY => Some((OP_MUL, Some(OP_FMUL))),
+        ops::DIVIDE => Some((OP_DIV, Some(OP_FDIV))),
+        ops::MODULO => Some((OP_MOD, None)),
+        _ => None,
+    };
+    if let Some((iop, fop)) = arith {
+        if call.args.len() != 2 {
+            return Err(LowerError::unsupported(format!("{name} arity")));
+        }
+        let a = compile_t(ctx, &call.args[0])?;
+        let b = compile_t(ctx, &call.args[1])?;
+        match (a.bank, b.bank) {
+            (ValType::Int, ValType::Int) => {
+                let d = ctx.fresh(ValType::Int);
+                ctx.body
+                    .extend_from_slice(&[iop, a.idx as i64, b.idx as i64, d.idx as i64]);
+                Ok(d)
+            }
+            (ValType::Float, ValType::Float) => {
+                let fop = fop.ok_or_else(|| LowerError::unsupported("float modulo"))?;
+                let d = ctx.fresh(ValType::Float);
+                ctx.body
+                    .extend_from_slice(&[fop, a.idx as i64, b.idx as i64, d.idx as i64]);
+                Ok(d)
+            }
+            _ => Err(LowerError::unsupported("mixed int/float arithmetic")),
+        }
+    } else {
+        match name {
+            ops::LOGICAL_NOT => {
+                if call.args.len() != 1 {
+                    return Err(LowerError::unsupported("!_ arity"));
+                }
+                let a = compile_t(ctx, &call.args[0])?;
+                if a.bank != ValType::Int {
+                    return Err(LowerError::unsupported("! operand must be int/bool"));
+                }
+                let d = ctx.fresh(ValType::Int);
+                ctx.body
+                    .extend_from_slice(&[OP_NOT, a.idx as i64, d.idx as i64]);
+                Ok(d)
+            }
+            ops::NEGATE => {
+                if call.args.len() != 1 {
+                    return Err(LowerError::unsupported("-_ arity"));
+                }
+                let a = compile_t(ctx, &call.args[0])?;
+                let d = ctx.fresh(a.bank);
+                let op = if a.bank == ValType::Int {
+                    OP_NEG
+                } else {
+                    OP_FNEG
+                };
+                ctx.body
+                    .extend_from_slice(&[op, a.idx as i64, d.idx as i64]);
+                Ok(d)
+            }
+            _ => Err(LowerError::unsupported(format!("call `{name}`"))),
+        }
+    }
+}
+
+/// Green-length comprehension unroll for the typed path (mirrors
+/// [`compile_comprehension`], threading typed accumulator registers).
+fn compile_comprehension_t(
+    ctx: &mut LowerCtxF,
+    comp: &ComprehensionExpr,
+) -> Result<TReg, LowerError> {
+    if comp.iter_var2.is_some() {
+        return Err(LowerError::unsupported("two-variable comprehension"));
+    }
+    let elements = match &comp.iter_range.expr {
+        Expr::List(list) => list.elements.clone(),
+        _ => return Err(LowerError::unsupported("comprehension over non-literal range")),
+    };
+
+    let prev_iter = ctx.locals.remove(&comp.iter_var);
+    let prev_accu = ctx.locals.remove(&comp.accu_var);
+
+    let mut accu = compile_t(ctx, &comp.accu_init)?;
+    for elem in &elements {
+        let x_reg = compile_t(ctx, elem)?;
+        ctx.locals.insert(comp.iter_var.clone(), x_reg);
+        ctx.locals.insert(comp.accu_var.clone(), accu);
+        accu = compile_t(ctx, &comp.loop_step)?;
+    }
+    ctx.locals.insert(comp.accu_var.clone(), accu);
+    let result = compile_t(ctx, &comp.result)?;
+
+    ctx.locals.remove(&comp.iter_var);
+    ctx.locals.remove(&comp.accu_var);
+    if let Some(r) = prev_iter {
+        ctx.locals.insert(comp.iter_var.clone(), r);
+    }
+    if let Some(r) = prev_accu {
+        ctx.locals.insert(comp.accu_var.clone(), r);
+    }
+    Ok(result)
+}
+
 fn compile_call(ctx: &mut LowerCtx, call: &CallExpr) -> Result<usize, LowerError> {
     if call.target.is_some() {
         return Err(LowerError::unsupported(format!(

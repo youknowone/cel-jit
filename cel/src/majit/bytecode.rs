@@ -342,6 +342,88 @@ pub fn eval_batch_sum(
     result
 }
 
+/// One input column for the two-bank batch evaluator: an `i64` column for an
+/// int/bool slot, or an `f64` column for a `double` slot. Its base pointer (an
+/// `i64` regardless of bank) is what a compiled trace reads per row.
+pub enum Column<'a> {
+    Int(&'a [i64]),
+    Float(&'a [f64]),
+}
+
+impl Column<'_> {
+    /// Base address of the column buffer, as the `i64` a `raw_load` base holds.
+    pub fn base(&self) -> i64 {
+        match self {
+            Column::Int(c) => c.as_ptr() as i64,
+            Column::Float(c) => c.as_ptr() as i64,
+        }
+    }
+
+    /// Number of rows.
+    pub fn len(&self) -> usize {
+        match self {
+            Column::Int(c) => c.len(),
+            Column::Float(c) => c.len(),
+        }
+    }
+
+    /// True if the column is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn matches(&self, ty: super::lower::ValType) -> bool {
+        use super::lower::ValType;
+        matches!(
+            (self, ty),
+            (Column::Int(_), ValType::Int) | (Column::Float(_), ValType::Float)
+        )
+    }
+}
+
+/// Columnar **batch** evaluation of a typed (two-bank) lowered expression:
+/// reduce `sum over rows i of expr(col_0[i], ..)` where `columns[k]` is slot
+/// `k`'s data column, aligned to [`super::lower::LoweredF::slots`] and matching
+/// each slot's bank. For a boolean predicate this counts matching rows. The
+/// compiled trace reads each column at the red row index via `raw_load` (base
+/// carried loop-invariant in an int register), int columns as `i64`, float
+/// columns as `f64`. `threshold == u32::MAX` gives the interpreter tier.
+pub fn eval_batch_sum_f(
+    lowered: &super::lower::LoweredF,
+    columns: &[Column],
+    threshold: u32,
+) -> i64 {
+    assert_eq!(
+        columns.len(),
+        lowered.slots.len(),
+        "eval_batch_sum_f: column count {} != slot count {}",
+        columns.len(),
+        lowered.slots.len()
+    );
+    for (k, (col, slot)) in columns.iter().zip(&lowered.slots).enumerate() {
+        assert!(
+            col.matches(slot.ty),
+            "eval_batch_sum_f: column {k} bank mismatch vs slot `{}` ({:?})",
+            slot.path,
+            slot.ty
+        );
+    }
+    let n = columns.first().map_or(0, |c| c.len());
+    for (k, c) in columns.iter().enumerate() {
+        assert_eq!(c.len(), n, "eval_batch_sum_f: column {k} length {} != {n}", c.len());
+    }
+    if n == 0 {
+        return 0;
+    }
+    let bases: Vec<i64> = columns.iter().map(|c| c.base()).collect();
+    let (prog, num_int, num_float) = lowered.batch_sum_program(&bases, n as i64);
+    let result = float_bank::run_jit_f(&prog, num_int, num_float, threshold);
+    // The raw pointers in `prog` alias `columns`; keep the borrow live across
+    // the run so the buffers cannot be dropped underneath the trace.
+    core::hint::black_box(columns);
+    result
+}
+
 /// Reference interpreter: a plain `match` over the same bytecode with no majit
 /// machinery. The correctness oracle for the lowering and the honest baseline
 /// for "did the JIT actually speed anything up".
