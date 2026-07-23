@@ -624,22 +624,38 @@ mod tests {
 
     #[test]
     fn typed_lowering_bails() {
-        // A non-literal int (a column) compared to a float needs a per-row
-        // int->float cast the trace can't lower; float modulo; and a float-valued
-        // top-level result (no float accumulator) all bail.
-        let schema: Schema = [
-            ("p".to_string(), ValType::Float),
-            ("q".to_string(), ValType::Int),
-        ]
-        .into_iter()
-        .collect();
-        for expr in ["p >= q", "p % 2.0 >= 1.0", "p + 1.0"] {
+        // Float modulo and a float-valued top-level result (no float
+        // accumulator) still bail. A mixed int/float comparison no longer bails
+        // (the int side is widened via cast_int_to_float — see
+        // `batch_mixed_col_compare`).
+        let schema: Schema = [("p".to_string(), ValType::Float)].into_iter().collect();
+        for expr in ["p % 2.0 >= 1.0", "p + 1.0"] {
             let program = Program::compile(expr).unwrap();
             assert!(
                 lower_typed(program.expression(), &schema).is_err(),
                 "`{expr}` must bail the typed lowering"
             );
         }
+    }
+
+    #[test]
+    fn batch_mixed_col_compare() {
+        // A float column vs an int column: the int side is widened per row via
+        // cast_int_to_float, matching the tree-walker's `int as f64`. Both
+        // operand orders (int column on either side).
+        let n = 3000;
+        let price = gen_f64(n, 0x2020_2020_2020_2020, 0.0, 10.0);
+        let level = gen_i64(n, 0x3030_3030_3030_3030, 0, 10);
+        check_batch_f(
+            "price >= level",
+            &[("price", ColData::Float(price)), ("level", ColData::Int(level))],
+        );
+        let price2 = gen_f64(n, 0x4040_4040_4040_4040, 0.0, 10.0);
+        let level2 = gen_i64(n, 0x5050_5050_5050_5050, 0, 10);
+        check_batch_f(
+            "level < price",
+            &[("level", ColData::Int(level2)), ("price", ColData::Float(price2))],
+        );
     }
 
     #[test]

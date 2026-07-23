@@ -590,6 +590,17 @@ fn emit_float_const(ctx: &mut LowerCtxF, v: f64) -> TReg {
     r
 }
 
+/// Widen an int-bank value to a fresh float reg via a per-row `int as f64` cast
+/// (`OP_I2F` -> `cast_int_to_float`). Emitted into the body: unlike a literal
+/// (folded to a prelude constant), a data-dependent int is cast per row.
+fn emit_i2f(ctx: &mut LowerCtxF, src: TReg) -> TReg {
+    debug_assert_eq!(src.bank, ValType::Int, "emit_i2f: source must be int-banked");
+    let r = ctx.fresh(ValType::Float);
+    ctx.body
+        .extend_from_slice(&[OP_I2F, src.idx as i64, r.idx as i64]);
+    r
+}
+
 /// Compile the two operands of a comparison, promoting a bare `int` literal to
 /// a `double` constant when its peer is float. This constant-folds the
 /// tree-walker's `int as f64` promotion (CEL compares mixed numeric operands by
@@ -715,16 +726,21 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
         if call.args.len() != 2 {
             return Err(LowerError::unsupported(format!("{name} arity")));
         }
-        let (a, b) = compile_cmp_operands(ctx, &call.args[0], &call.args[1])?;
+        let (mut a, mut b) = compile_cmp_operands(ctx, &call.args[0], &call.args[1])?;
+        // A mixed comparison widens the int side to float (`int as f64`, the
+        // tree-walker's promotion). `compile_cmp_operands` already folded a
+        // literal int to a float constant; a data-dependent int is widened per
+        // row here via `cast_int_to_float`.
         let op = match (a.bank, b.bank) {
             (ValType::Int, ValType::Int) => iop,
             (ValType::Float, ValType::Float) => fop,
-            // A non-literal int compared to a float would need a per-row
-            // int->float cast, which the traced loop cannot lower yet.
-            _ => {
-                return Err(LowerError::unsupported(
-                    "mixed int/float comparison with a non-constant int operand",
-                ))
+            (ValType::Int, ValType::Float) => {
+                a = emit_i2f(ctx, a);
+                fop
+            }
+            (ValType::Float, ValType::Int) => {
+                b = emit_i2f(ctx, b);
+                fop
             }
         };
         let d = ctx.fresh(ValType::Int);

@@ -60,6 +60,7 @@ pub const OP_FLE: i64 = 31; // [fa, fb, dst]            regs[dst] = (fregs[fa] <
 pub const OP_FLT: i64 = 32; // [fa, fb, dst]            regs[dst] = (fregs[fa] <  fregs[fb]) as 0/1
 pub const OP_FEQ: i64 = 33; // [fa, fb, dst]            regs[dst] = (fregs[fa] == fregs[fb]) as 0/1
 pub const OP_FNE: i64 = 34; // [fa, fb, dst]            regs[dst] = (fregs[fa] != fregs[fb]) as 0/1
+pub const OP_I2F: i64 = 35; // [src, fdst]             fregs[fdst] = regs[src] as f64  (cast_int_to_float)
 
 /// Raw native-memory load intrinsic recognized by the `#[jit_interp]` proc
 /// macro (lowered to `raw_load_i`); at the interpreter tier this real fn runs.
@@ -558,7 +559,7 @@ pub mod float_bank {
 
     use super::{
         OP_ADD, OP_AND, OP_COL_LOAD, OP_COL_LOAD_F, OP_EQ, OP_FADD, OP_FDIV, OP_FEQ, OP_FGE,
-        OP_FGT, OP_FLE, OP_FLT, OP_FMOV, OP_FMUL, OP_FNE, OP_FNEG, OP_FSUB, OP_GE, OP_GT,
+        OP_FGT, OP_FLE, OP_FLT, OP_FMOV, OP_FMUL, OP_FNE, OP_FNEG, OP_FSUB, OP_GE, OP_GT, OP_I2F,
         OP_JUMP_IF_ABOVE, OP_LE, OP_LOAD_CONST, OP_LOAD_CONST_F, OP_LT, OP_MOV, OP_MUL, OP_NE,
         OP_NEG, OP_NOT, OP_OR, OP_RETURN, OP_SELECT, OP_SUB,
     };
@@ -732,6 +733,10 @@ pub mod float_bank {
                 }
                 OP_LOAD_CONST_F => {
                     state.fregs[program[pc + 2] as usize] = f64::from_bits(program[pc + 1] as u64);
+                    pc += 3;
+                }
+                OP_I2F => {
+                    state.fregs[program[pc + 2] as usize] = state.regs[program[pc + 1] as usize] as f64;
                     pc += 3;
                 }
                 OP_FMOV => {
@@ -933,6 +938,10 @@ pub mod float_bank {
                 }
                 OP_LOAD_CONST_F => {
                     fregs[program[pc + 2] as usize] = f64::from_bits(program[pc + 1] as u64);
+                    pc += 3;
+                }
+                OP_I2F => {
+                    fregs[program[pc + 2] as usize] = regs[program[pc + 1] as usize] as f64;
                     pc += 3;
                 }
                 OP_FMOV => {
