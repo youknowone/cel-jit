@@ -1,26 +1,25 @@
 //! cell-majit columnar batch evaluator vs the stock tree-walker (issue #357).
 //!
-//! The de-risk examples (`majit/examples/celcolumn`, `majit_vs_cometkim`)
-//! established the perf envelope on hand-written bytecode. This runs the REAL
-//! cel path end to end: a CEL `Program` is lowered
-//! (`cel::majit::lower::lower`) and evaluated over a batch of rows via
-//! `eval_batch_sum`, which reads each context column at the data-dependent
-//! (red) row index through a compiled `raw_load` trace — the buffer bases held
-//! loop-invariant in the register file.
+//! Runs the REAL cel path: a CEL `Program` is lowered (`cel::majit::lower::lower`)
+//! and evaluated over a batch of rows via `eval_batch_sum`, which reads each
+//! context column at the data-dependent (red) row index through a compiled
+//! `raw_load` trace, the buffer bases held loop-invariant in the register file.
 //!
-//! The honest baseline is what a cel user runs TODAY: `Program::execute` once
-//! per row against a freshly built `Context` (the tree-walker, with its
-//! per-row map inserts + trait-object dispatch + `HashMap` variable lookups).
-//! The standing goal is for the JIT batch to beat that naive per-row path.
+//! FAIR comparison = hot vs hot. Both sides receive their data already laid out
+//! (i64 columns for the JIT, a live `Context` for the walker) and are measured
+//! steady-state, with no per-row setup on either side. The baseline is therefore
+//! the tree-walker at its best: ONE reused `Context` whose variables are
+//! overwritten per row, then `Program::execute`. We deliberately do NOT compare
+//! against a fresh-`Context`-per-row walker — that pays a per-row allocation the
+//! JIT never does (cold vs hot), which would flatter the JIT dishonestly.
 //!
-//! Four measurements on identical data columns:
-//!   (a) majit batch JIT-on    — `eval_batch_sum(threshold = small)`
-//!   (b) naive cel per-row      — fresh `Context` + `Program::execute` each row
-//!   (b2) reuse-ctx cel per-row — one `Context`, overwrite vars + `execute` each row
-//!   (c) majit batch JIT-off    — `eval_batch_sum(threshold = u32::MAX)`
-//! (b) is what a cel user writes first; (b2) is the same user's obvious
-//! optimization (don't rebuild the map). The JIT must beat both. Meaningful
-//! ratios = (b)/(a) and (b2)/(a). RELEASE ONLY (i64 wrap; 3-way equality gate).
+//! Three steady-state measurements on identical data columns:
+//!   naive    stock tree-walker, reused Context  — the baseline to beat
+//!   JIT-off  majit bytecode interpreter tier    — lowering only, no compilation
+//!   JIT-on   majit compiled trace               — the win
+//! JIT-off ≈ naive is the point: the speedup comes from COMPILATION, not from
+//! lowering the expression to integer bytecode. RELEASE ONLY (i64 wrap; 3-way
+//! equality gate).
 
 use std::hint::black_box;
 use std::sync::atomic::Ordering;
@@ -70,50 +69,32 @@ fn main() {
     let frozen = make_col(n, 0, 1, 0x1000_0001);
     let columns: Vec<&[i64]> = vec![&balance, &amount, &frozen];
 
-    let fold = |v: Value| -> i64 {
-        match v {
-            Value::Bool(b) => b as i64,
-            Value::Int(v) => v,
-            other => panic!("unexpected {other:?}"),
-        }
-    };
-
-    // Honest baseline: the stock tree-walker, once per row, over a fresh Context.
+    // FAIR baseline: the stock tree-walker at its best — reuse one Context,
+    // overwrite the three variables per row (hot; no per-row Context alloc).
     let naive = || -> i64 {
-        let mut acc = 0i64;
-        for i in 0..n {
-            let mut ctx = Context::default();
-            ctx.add_variable_from_value("balance", balance[i]);
-            ctx.add_variable_from_value("amount", amount[i]);
-            ctx.add_variable_from_value("frozen", frozen[i] != 0);
-            acc += fold(program.execute(&ctx).expect("execute"));
-        }
-        acc
-    };
-
-    // Optimized baseline: reuse one Context, overwrite the three variables per row.
-    let naive_reuse = || -> i64 {
         let mut acc = 0i64;
         let mut ctx = Context::default();
         for i in 0..n {
             ctx.add_variable_from_value("balance", balance[i]);
             ctx.add_variable_from_value("amount", amount[i]);
             ctx.add_variable_from_value("frozen", frozen[i] != 0);
-            acc += fold(program.execute(&ctx).expect("execute"));
+            acc += match program.execute(&ctx).expect("execute") {
+                Value::Bool(b) => b as i64,
+                Value::Int(v) => v,
+                other => panic!("unexpected {other:?}"),
+            };
         }
         acc
     };
 
-    // Correctness gate: all four paths agree (all read the same columns).
+    // Correctness gate: naive == JIT-off == JIT-on (all read the same columns).
     COMPILES.store(0, Ordering::Relaxed);
     let base = naive();
-    let base_reuse = naive_reuse();
     let off = eval_batch_sum(&lowered, &columns, u32::MAX);
     let off_c = COMPILES.load(Ordering::Relaxed);
     COMPILES.store(0, Ordering::Relaxed);
     let on = eval_batch_sum(&lowered, &columns, 8);
     let on_c = COMPILES.load(Ordering::Relaxed);
-    assert_eq!(base, base_reuse, "naive vs reuse-ctx divergence");
     assert_eq!(base, off, "naive vs JIT-off divergence");
     assert_eq!(base, on, "naive vs JIT-on divergence -> miscompile");
     assert_eq!(off_c, 0, "JIT-off must never compile");
@@ -125,25 +106,26 @@ fn main() {
     );
 
     let rounds = 5;
-    let (mut a, mut b, mut b2, mut c) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let (mut on_t, mut off_t, mut naive_t) = (Vec::new(), Vec::new(), Vec::new());
     for _ in 0..rounds {
-        b.push(time_ns_per_row(n, naive));
-        b2.push(time_ns_per_row(n, naive_reuse));
-        c.push(time_ns_per_row(n, || eval_batch_sum(&lowered, &columns, u32::MAX)));
-        a.push(time_ns_per_row(n, || eval_batch_sum(&lowered, &columns, 8)));
+        naive_t.push(time_ns_per_row(n, naive));
+        off_t.push(time_ns_per_row(n, || eval_batch_sum(&lowered, &columns, u32::MAX)));
+        on_t.push(time_ns_per_row(n, || eval_batch_sum(&lowered, &columns, 8)));
     }
-    let (a, b, b2, c) = (median(a), median(b), median(b2), median(c));
-    println!("(a)  majit batch JIT-on    : {a:.3} ns/row");
-    println!("(b)  naive cel per-row     : {b:.3} ns/row");
-    println!("(b2) reuse-ctx cel per-row : {b2:.3} ns/row");
-    println!("(c)  majit batch JIT-off   : {c:.3} ns/row");
+    let (jit, jit_off, nv) = (median(on_t), median(off_t), median(naive_t));
     println!();
-    println!("ratio (b)/(a)  fresh-ctx naive vs JIT : {:.1}x", b / a);
-    println!("ratio (b2)/(a) reuse-ctx naive vs JIT : {:.1}x", b2 / a);
-    println!("ratio (c)/(a)  majit interp vs JIT    : {:.1}x", c / a);
+    println!("  naive   (cel tree-walk, reused ctx) : {nv:>9.2} ns/row   ← fair baseline (hot)");
+    println!("  majit   JIT-off (bytecode interp)   : {jit_off:>9.2} ns/row   ← lowering only, no compile");
     println!(
-        "goal (batch JIT beats BOTH naive paths): {}",
-        if b / a > 1.0 && b2 / a > 1.0 { "PASS" } else { "FAIL" }
+        "  majit   JIT-on  (compiled trace)    : {jit:>9.2} ns/row   ← {:.0}x faster than naive  {}",
+        nv / jit,
+        if nv / jit > 1.0 { "✅" } else { "❌" }
+    );
+    println!();
+    println!(
+        "  => JIT-off is {:.2}x of naive, so the {:.0}x win is COMPILATION, not lowering.",
+        jit_off / nv,
+        nv / jit
     );
     black_box((&balance, &amount, &frozen));
 }
