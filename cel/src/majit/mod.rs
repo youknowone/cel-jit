@@ -833,6 +833,19 @@ mod tests {
     }
 
     #[test]
+    fn uint_negate_bails() {
+        // `-uint` is NoSuchOverload in CEL (Negator is int/double only), so the
+        // typed lowering must bail rather than emit a float-bank OP_FNEG for a
+        // uint operand that lives in the int register file.
+        let schema: Schema = [("a".to_string(), ValType::UInt)].into_iter().collect();
+        let program = Program::compile("-a").unwrap();
+        assert!(
+            lower_typed(program.expression(), &schema).is_err(),
+            "`-a` on a uint column must bail the typed lowering"
+        );
+    }
+
+    #[test]
     fn probe_float_const_only() {
         // Isolates a float constant (OP_LOAD_CONST_F), no AND.
         let n = 3000;

@@ -875,12 +875,18 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
                     return Err(LowerError::unsupported("-_ arity"));
                 }
                 let a = compile_t(ctx, &call.args[0])?;
-                let d = ctx.fresh(a.bank);
-                let op = if a.bank == ValType::Int {
-                    OP_NEG
-                } else {
-                    OP_FNEG
+                // Negate is defined for int and double only. `-uint` is
+                // NoSuchOverload in the tree-walker, so it must bail (and a uint
+                // operand lives in the int bank — OP_FNEG would wrongly read the
+                // float register file).
+                let op = match a.bank {
+                    ValType::Int => OP_NEG,
+                    ValType::Float => OP_FNEG,
+                    ValType::UInt => {
+                        return Err(LowerError::unsupported("unary negate on uint"))
+                    }
                 };
+                let d = ctx.fresh(a.bank);
                 ctx.body
                     .extend_from_slice(&[op, a.idx as i64, d.idx as i64]);
                 Ok(d)
