@@ -461,6 +461,11 @@ mod tests {
         Int(Vec<i64>),
         UInt(Vec<i64>),
         Float(Vec<f64>),
+        /// A string column. Interned to an `i64` content-hash column
+        /// (`intern_hash`) by the batch harness before it reaches the machine;
+        /// [`ColData::column`] therefore refuses it (the id vec is derived, not
+        /// borrowable from here).
+        Str(Vec<String>),
     }
 
     impl ColData {
@@ -468,6 +473,7 @@ mod tests {
             match self {
                 ColData::Int(c) | ColData::UInt(c) => c.len(),
                 ColData::Float(c) => c.len(),
+                ColData::Str(c) => c.len(),
             }
         }
         fn ty(&self) -> ValType {
@@ -475,12 +481,16 @@ mod tests {
                 ColData::Int(_) => ValType::Int,
                 ColData::UInt(_) => ValType::UInt,
                 ColData::Float(_) => ValType::Float,
+                ColData::Str(_) => ValType::Str,
             }
         }
         fn column(&self) -> Column<'_> {
             match self {
                 ColData::Int(c) | ColData::UInt(c) => Column::Int(c),
                 ColData::Float(c) => Column::Float(c),
+                ColData::Str(_) => {
+                    panic!("Str column must be interned to an id column before `column()`")
+                }
             }
         }
     }
@@ -561,6 +571,7 @@ mod tests {
                     ColData::Int(c) => ctx.add_variable_from_value(*name, c[i]),
                     ColData::UInt(c) => ctx.add_variable_from_value(*name, c[i] as u64),
                     ColData::Float(c) => ctx.add_variable_from_value(*name, c[i]),
+                    ColData::Str(c) => ctx.add_variable_from_value(*name, c[i].clone()),
                 }
             }
             expected += match program
@@ -638,6 +649,7 @@ mod tests {
                     ColData::Int(c) => ctx.add_variable_from_value(*name, c[i]),
                     ColData::UInt(c) => ctx.add_variable_from_value(*name, c[i] as u64),
                     ColData::Float(c) => ctx.add_variable_from_value(*name, c[i]),
+                    ColData::Str(c) => ctx.add_variable_from_value(*name, c[i].clone()),
                 }
             }
             expected += match program
@@ -668,6 +680,195 @@ mod tests {
             COMPILES_F.load(Ordering::Relaxed) > before,
             "float aggregate `{expr_src}` must compile the hot loop"
         );
+    }
+
+    /// Deterministic per-column string data drawn from a small `choices` set via
+    /// an LCG, so the tree-walker oracle and the interned id column see the same
+    /// values.
+    fn gen_str(n: usize, seed: u64, choices: &[&str]) -> Vec<String> {
+        let mut x = seed;
+        (0..n)
+            .map(|_| {
+                x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                choices[((x >> 33) as usize) % choices.len()].to_string()
+            })
+            .collect()
+    }
+
+    /// Cross-check a typed batch containing **string** columns. Each string
+    /// column is interned to an `i64` content-hash column (`intern_hash`); the
+    /// hash is verified injective over every distinct string present (column
+    /// values + the expression's literals), so an id compare equals a content
+    /// compare bit for bit. The clean / interp / compiled tiers must all equal
+    /// the stock tree-walker's per-row bool/int sum, and the compiled run must
+    /// trace the loop.
+    fn check_batch_str(expr_src: &str, cols: &[(&str, ColData)]) {
+        use super::bytecode::float_bank::{clean_interp_f, COMPILES as COMPILES_F};
+        use super::lower::intern_hash;
+
+        let program =
+            Program::compile(expr_src).unwrap_or_else(|e| panic!("parse `{expr_src}`: {e:?}"));
+        let schema: Schema = cols.iter().map(|(n, d)| (n.to_string(), d.ty())).collect();
+        let lowered = lower_typed(program.expression(), &schema)
+            .unwrap_or_else(|e| panic!("lower_typed `{expr_src}`: {e}"));
+
+        // Slot order + bank pin.
+        let paths: Vec<&str> = lowered.slots.iter().map(|s| s.path.as_str()).collect();
+        let want_paths: Vec<&str> = cols.iter().map(|(n, _)| *n).collect();
+        assert_eq!(paths, want_paths, "slot order for `{expr_src}`");
+        for (slot, (_, d)) in lowered.slots.iter().zip(cols) {
+            assert_eq!(slot.ty, d.ty(), "slot `{}` bank for `{expr_src}`", slot.path);
+        }
+
+        let n = cols.first().map_or(0, |(_, d)| d.len());
+        for (name, d) in cols {
+            assert_eq!(d.len(), n, "column `{name}` length for `{expr_src}`");
+        }
+
+        // Intern each string column to an i64 content-hash column, and gather
+        // every (string, hash) pair (literals + column values) for the
+        // injectivity check.
+        let mut all_strs: Vec<(&str, i64)> = Vec::new();
+        for lit in &lowered.str_literals {
+            all_strs.push((lit.as_str(), intern_hash(lit)));
+        }
+        let mut id_storage: Vec<Vec<i64>> = Vec::new();
+        for (_, d) in cols {
+            if let ColData::Str(c) = d {
+                let ids: Vec<i64> = c.iter().map(|s| intern_hash(s)).collect();
+                for (s, &h) in c.iter().zip(&ids) {
+                    all_strs.push((s.as_str(), h));
+                }
+                id_storage.push(ids);
+            }
+        }
+        // Injectivity: no two distinct strings may share a hash (a real collision
+        // bails to the tree-walker in production; the test data is collision-free
+        // so the assert documents the id-compare == content-compare invariant).
+        let mut seen: std::collections::HashMap<i64, &str> = std::collections::HashMap::new();
+        for &(s, h) in &all_strs {
+            match seen.get(&h) {
+                Some(&prev) => {
+                    assert_eq!(prev, s, "hash collision for `{expr_src}`: `{prev}` vs `{s}`")
+                }
+                None => {
+                    seen.insert(h, s);
+                }
+            }
+        }
+
+        // Build columns: a Str slot reads its interned id column; others read
+        // their own buffer.
+        let mut str_idx = 0;
+        let columns: Vec<Column> = cols
+            .iter()
+            .map(|(_, d)| match d {
+                ColData::Str(_) => {
+                    let c = Column::Int(&id_storage[str_idx]);
+                    str_idx += 1;
+                    c
+                }
+                _ => d.column(),
+            })
+            .collect();
+
+        // Oracle: sum the stock tree-walker's per-row result (bool/int).
+        let mut expected = 0i64;
+        for i in 0..n {
+            let mut ctx = Context::default();
+            for (name, d) in cols {
+                match d {
+                    ColData::Int(c) => ctx.add_variable_from_value(*name, c[i]),
+                    ColData::UInt(c) => ctx.add_variable_from_value(*name, c[i] as u64),
+                    ColData::Float(c) => ctx.add_variable_from_value(*name, c[i]),
+                    ColData::Str(c) => ctx.add_variable_from_value(*name, c[i].clone()),
+                }
+            }
+            expected += match program
+                .execute(&ctx)
+                .unwrap_or_else(|e| panic!("execute `{expr_src}`: {e:?}"))
+            {
+                Value::Bool(b) => b as i64,
+                Value::Int(v) => v,
+                other => panic!("`{expr_src}`: unexpected {other:?}"),
+            };
+        }
+
+        // Clean two-bank interpreter over the built batch program.
+        let bases: Vec<i64> = columns.iter().map(|c| c.base()).collect();
+        let (prog, ni, nf) = lowered.batch_sum_program(&bases, n as i64);
+        assert_eq!(clean_interp_f(&prog, ni, nf), expected, "clean vs stock for `{expr_src}`");
+        core::hint::black_box(&columns);
+        core::hint::black_box(&id_storage);
+
+        // majit interpreter tier, then compiled tier (monotonic compile counter).
+        let off = eval_batch_sum_f(&lowered, &columns, u32::MAX);
+        assert_eq!(off, expected, "batch jit-off vs stock for `{expr_src}`");
+        let before = COMPILES_F.load(Ordering::Relaxed);
+        let on = eval_batch_sum_f(&lowered, &columns, 8);
+        assert_eq!(on, expected, "batch jit-on vs stock for `{expr_src}`");
+        assert!(
+            COMPILES_F.load(Ordering::Relaxed) > before,
+            "string batch `{expr_src}` must compile the hot loop"
+        );
+    }
+
+    #[test]
+    fn batch_string_equality() {
+        // String ==/!= lower to a content-hash compare (OP_EQ/OP_NE over the
+        // int-file ids). The oracle compares actual strings; the id compare is
+        // bit-exact against it across the clean / interp / compiled tiers.
+        let n = 3000;
+        let roles = ["admin", "user", "guest", "root", "auditor"];
+        let role = gen_str(n, 0x3A5B_7C9D_1E2F_0405, &roles);
+        // Column vs a present literal, both == and !=.
+        check_batch_str("role == \"admin\"", &[("role", ColData::Str(role.clone()))]);
+        check_batch_str("role != \"admin\"", &[("role", ColData::Str(role.clone()))]);
+        // A literal absent from the column: every row is unequal (count 0 for
+        // ==, n for !=), and it must still compile.
+        check_batch_str("role == \"superadmin\"", &[("role", ColData::Str(role.clone()))]);
+        // Column vs column.
+        let other = gen_str(n, 0x9182_7364_5A4B_3C2D, &roles);
+        check_batch_str(
+            "a == b",
+            &[("a", ColData::Str(role.clone())), ("b", ColData::Str(other.clone()))],
+        );
+        check_batch_str(
+            "a != b",
+            &[("a", ColData::Str(role)), ("b", ColData::Str(other))],
+        );
+    }
+
+    #[test]
+    fn batch_string_mixed_with_int() {
+        // A string equality combined with an int comparison via `&&` — the
+        // string id compare and the int compare share the int register file.
+        let n = 3000;
+        let roles = ["admin", "user", "guest"];
+        let role = gen_str(n, 0x1122_3344_5566_7788, &roles);
+        let age = gen_i64(n, 0x8877_6655_4433_2211, 0, 80);
+        check_batch_str(
+            "role == \"admin\" && age >= 18",
+            &[("role", ColData::Str(role)), ("age", ColData::Int(age))],
+        );
+    }
+
+    #[test]
+    fn string_ordering_bails() {
+        // Strings support only equality here; ordering (`<` etc.) needs sorted
+        // ids, so the typed lowering bails and the tree-walker handles it. A bare
+        // string result is likewise not sum-reducible and bails.
+        let schema: Schema =
+            [("a".to_string(), ValType::Str), ("b".to_string(), ValType::Str)]
+                .into_iter()
+                .collect();
+        for expr in ["a < b", "a <= b", "a > b", "a >= b", "a"] {
+            let program = Program::compile(expr).unwrap();
+            assert!(
+                lower_typed(program.expression(), &schema).is_err(),
+                "`{expr}` must bail the typed lowering (string ordering / bare result)"
+            );
+        }
     }
 
     #[test]

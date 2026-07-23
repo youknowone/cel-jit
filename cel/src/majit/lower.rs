@@ -333,6 +333,27 @@ pub enum ValType {
     /// only ordering comparisons differ (unsigned `OP_ULT`/`OP_ULE`).
     UInt,
     Float,
+    /// A string, carried as an `i64` content hash ([`intern_hash`]) in the int
+    /// register file. Only equality is defined: a hash compare (`OP_EQ`/`OP_NE`)
+    /// equals a content compare bit-for-bit once the batch builder has verified
+    /// the hash is injective over the strings present (a collision bails).
+    /// Ordering, arithmetic, and any other string op fall back to the
+    /// tree-walker.
+    Str,
+}
+
+/// Stable content hash mapping a string to the `i64` id a [`ValType::Str`]
+/// column and a string literal share. FNV-1a: deterministic across processes
+/// (unlike a randomly-seeded [`std::hash`]), so a literal hashed at lowering
+/// time and a column value hashed at batch-build time agree. Injectivity over
+/// the strings actually present is checked by the batch builder, not assumed.
+pub fn intern_hash(s: &str) -> i64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in s.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h as i64
 }
 
 /// Declared type of each input path. A path absent from the schema defaults to
@@ -388,6 +409,11 @@ pub struct LoweredF {
     pub num_float_regs: usize,
     /// Input slots in first-encounter order.
     pub slots: Vec<SlotInfoF>,
+    /// String literals the body compares against, as raw content. The batch
+    /// builder hashes these with [`intern_hash`] and includes them in the
+    /// injectivity check so a literal that collides with a distinct column
+    /// string bails rather than miscompiles.
+    pub str_literals: Vec<String>,
 }
 
 impl LoweredF {
@@ -424,7 +450,7 @@ impl LoweredF {
         // bank at the body's count. `f_acc` is unused when the result is int.
         let (f_acc, total_float_regs) = match self.result_bank {
             ValType::Float => (self.num_float_regs, self.num_float_regs + 1),
-            ValType::Int | ValType::UInt => (0, self.num_float_regs),
+            ValType::Int | ValType::UInt | ValType::Str => (0, self.num_float_regs),
         };
 
         let mut p = Vec::new();
@@ -436,7 +462,7 @@ impl LoweredF {
         // `f64::from_bits` must stay out of the traced loop body; here it is in
         // the setup (0.0 has zero bits).
         match self.result_bank {
-            ValType::Int | ValType::UInt => load_const(&mut p, 0, r_acc),
+            ValType::Int | ValType::UInt | ValType::Str => load_const(&mut p, 0, r_acc),
             ValType::Float => p.extend_from_slice(&[OP_LOAD_CONST_F, 0, f_acc as i64]),
         }
         load_const(&mut p, n, r_n);
@@ -454,7 +480,7 @@ impl LoweredF {
         // slot_k = *(base_k + ea)   — the red-index columnar read, per bank
         for (k, slot) in self.slots.iter().enumerate() {
             let op = match slot.ty {
-                ValType::Int | ValType::UInt => OP_COL_LOAD,
+                ValType::Int | ValType::UInt | ValType::Str => OP_COL_LOAD,
                 ValType::Float => OP_COL_LOAD_F,
             };
             p.extend_from_slice(&[op, (r_base0 + k) as i64, r_ea as i64, slot.reg as i64]);
@@ -465,7 +491,7 @@ impl LoweredF {
         // trace cannot reassociate it — the running total sums in row order, bit
         // for bit like the interpreter tiers.
         match self.result_bank {
-            ValType::Int | ValType::UInt => {
+            ValType::Int | ValType::UInt | ValType::Str => {
                 p.extend_from_slice(&[OP_ADD, r_acc as i64, self.result_reg as i64, r_acc as i64])
             }
             ValType::Float => {
@@ -475,7 +501,7 @@ impl LoweredF {
         p.extend_from_slice(&[OP_ADD, r_i as i64, r_one as i64, r_i as i64]);
         p.extend_from_slice(&[OP_JUMP_IF_ABOVE, r_n as i64, r_i as i64, body_pc as i64]);
         match self.result_bank {
-            ValType::Int | ValType::UInt => p.extend_from_slice(&[OP_RETURN, r_acc as i64]),
+            ValType::Int | ValType::UInt | ValType::Str => p.extend_from_slice(&[OP_RETURN, r_acc as i64]),
             ValType::Float => p.extend_from_slice(&[OP_RETURN_F, f_acc as i64]),
         }
         (p, total_int_regs, total_float_regs)
@@ -492,13 +518,18 @@ struct LowerCtxF<'s> {
     slots: Vec<SlotInfoF>,
     slot_map: HashMap<String, TReg>,
     locals: HashMap<String, TReg>,
+    /// String literals referenced by the body, in first-encounter order. The
+    /// batch builder folds these into the injectivity check alongside the
+    /// [`ValType::Str`] column values.
+    str_literals: Vec<String>,
     schema: &'s Schema,
 }
 
 impl LowerCtxF<'_> {
     fn fresh(&mut self, bank: ValType) -> TReg {
         let idx = match bank {
-            ValType::Int | ValType::UInt => {
+            // `Str` ids share the int register file (an `i64` content hash).
+            ValType::Int | ValType::UInt | ValType::Str => {
                 let r = self.next_int;
                 self.next_int += 1;
                 r
@@ -540,9 +571,16 @@ pub fn lower_typed(expr: &IdedExpr, schema: &Schema) -> Result<LoweredF, LowerEr
         slots: Vec::new(),
         slot_map: HashMap::new(),
         locals: HashMap::new(),
+        str_literals: Vec::new(),
         schema,
     };
     let result = compile_t(&mut ctx, expr)?;
+    // A string-valued top-level result is not sum-reducible (the batch loop
+    // accumulates an int count or a float total); such an expression bails to
+    // the tree-walker rather than accumulating content hashes.
+    if result.bank == ValType::Str {
+        return Err(LowerError::unsupported("string-valued top-level result"));
+    }
     Ok(LoweredF {
         prelude: ctx.prelude,
         body: ctx.body,
@@ -551,6 +589,7 @@ pub fn lower_typed(expr: &IdedExpr, schema: &Schema) -> Result<LoweredF, LowerEr
         num_int_regs: ctx.next_int,
         num_float_regs: ctx.next_float,
         slots: ctx.slots,
+        str_literals: ctx.str_literals,
     })
 }
 
@@ -615,7 +654,16 @@ fn compile_literal_t(ctx: &mut LowerCtxF, lit: &LiteralValue) -> Result<TReg, Lo
                 .extend_from_slice(&[OP_LOAD_CONST, u.into_inner() as i64, r.idx as i64]);
             Ok(r)
         }
-        LiteralValue::String(_) => Err(LowerError::unsupported("string literal")),
+        LiteralValue::String(s) => {
+            // A string literal is a loop invariant: fold it to its content hash
+            // and load that `i64` id once in the prelude. Record the raw content
+            // so the batch builder can check the hash against the column strings.
+            let r = ctx.fresh(ValType::Str);
+            ctx.prelude
+                .extend_from_slice(&[OP_LOAD_CONST, intern_hash(s.inner()), r.idx as i64]);
+            ctx.str_literals.push(s.inner().to_string());
+            Ok(r)
+        }
         LiteralValue::Bytes(_) => Err(LowerError::unsupported("bytes literal")),
         LiteralValue::Null => Err(LowerError::unsupported("null literal")),
     }
@@ -770,6 +818,24 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
             return Err(LowerError::unsupported(format!("{name} arity")));
         }
         let (mut a, mut b) = compile_cmp_operands(ctx, &call.args[0], &call.args[1])?;
+        // Strings support only equality here: a content-hash compare (OP_EQ/OP_NE
+        // over the int-file ids) equals a string compare once the batch builder
+        // has verified the hash is injective. Ordering needs sorted ids, so `<`
+        // etc. bail; a string mixed with a non-string is a CEL type error.
+        if a.bank == ValType::Str || b.bank == ValType::Str {
+            if a.bank != ValType::Str || b.bank != ValType::Str {
+                return Err(LowerError::unsupported("mixed string/non-string comparison"));
+            }
+            let op = match name {
+                ops::EQUALS => OP_EQ,
+                ops::NOT_EQUALS => OP_NE,
+                _ => return Err(LowerError::unsupported("string ordering comparison")),
+            };
+            let d = ctx.fresh(ValType::Int);
+            ctx.body
+                .extend_from_slice(&[op, a.idx as i64, b.idx as i64, d.idx as i64]);
+            return Ok(d);
+        }
         // Two uint operands compare unsigned: `<`/`<=` map to OP_ULT/OP_ULE and
         // `>`/`>=` reuse them by swapping operands; eq/ne are bit-identical to
         // the signed ops. (A uint peer is never an int literal, so
@@ -875,15 +941,18 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
                     return Err(LowerError::unsupported("-_ arity"));
                 }
                 let a = compile_t(ctx, &call.args[0])?;
-                // Negate is defined for int and double only. `-uint` is
-                // NoSuchOverload in the tree-walker, so it must bail (and a uint
-                // operand lives in the int bank — OP_FNEG would wrongly read the
-                // float register file).
+                // Negate is defined for int and double only. `-uint` / `-string`
+                // are NoSuchOverload in the tree-walker, so they bail (and a uint
+                // or string operand lives in the int bank — OP_FNEG would wrongly
+                // read the float register file).
                 let op = match a.bank {
                     ValType::Int => OP_NEG,
                     ValType::Float => OP_FNEG,
                     ValType::UInt => {
                         return Err(LowerError::unsupported("unary negate on uint"))
+                    }
+                    ValType::Str => {
+                        return Err(LowerError::unsupported("unary negate on string"))
                     }
                 };
                 let d = ctx.fresh(a.bank);
