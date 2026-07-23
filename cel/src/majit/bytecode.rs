@@ -384,7 +384,7 @@ impl Column<'_> {
         // column of content-hash ids.
         matches!(
             (self, ty),
-            (Column::Int(_), ValType::Int | ValType::UInt | ValType::Str)
+            (Column::Int(_), ValType::Int | ValType::UInt | ValType::Str | ValType::Timestamp | ValType::Duration)
                 | (Column::Float(_), ValType::Float)
         )
     }

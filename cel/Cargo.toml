@@ -79,4 +79,8 @@ majit-jit = [
     "dep:majit-macros",
     "dep:majit-metainterp",
     "majit-metainterp/cranelift",
+    # The temporal columnar subset (timestamp/duration) lowers to i64-nanos
+    # columns and constructs `Value::Timestamp`/`Value::Duration` oracles, both
+    # of which require chrono.
+    "chrono",
 ]

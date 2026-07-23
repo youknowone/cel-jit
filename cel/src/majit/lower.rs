@@ -308,6 +308,13 @@ fn as_int_literal(e: &IdedExpr) -> Option<i64> {
     }
 }
 
+fn as_string_literal(e: &IdedExpr) -> Option<&str> {
+    match &e.expr {
+        Expr::Literal(LiteralValue::String(s)) => Some(s.inner()),
+        _ => None,
+    }
+}
+
 /// Resolve an `Ident` or a constant `Select` chain to a dotted variable path.
 fn resolve_path(e: &IdedExpr) -> Result<String, LowerError> {
     match &e.expr {
@@ -340,6 +347,16 @@ pub enum ValType {
     /// Ordering, arithmetic, and any other string op fall back to the
     /// tree-walker.
     Str,
+    /// A `timestamp`, carried as `i64` nanoseconds since the Unix epoch in the
+    /// int register file. i64-nanos ordering equals the chronological order the
+    /// tree-walker compares, so all six comparisons lower to the signed int ops.
+    /// Arithmetic (ts±duration, ts−ts) and any timestamp outside the i64-nanos
+    /// range fall back to the tree-walker.
+    Timestamp,
+    /// A `duration`, carried as `i64` nanoseconds in the int register file. Like
+    /// [`ValType::Timestamp`], comparisons lower to the signed int ops; a
+    /// timestamp vs duration comparison is NoSuchOverload and bails.
+    Duration,
 }
 
 /// Stable content hash mapping a string to the `i64` id a [`ValType::Str`]
@@ -450,7 +467,7 @@ impl LoweredF {
         // bank at the body's count. `f_acc` is unused when the result is int.
         let (f_acc, total_float_regs) = match self.result_bank {
             ValType::Float => (self.num_float_regs, self.num_float_regs + 1),
-            ValType::Int | ValType::UInt | ValType::Str => (0, self.num_float_regs),
+            ValType::Int | ValType::UInt | ValType::Str | ValType::Timestamp | ValType::Duration => (0, self.num_float_regs),
         };
 
         let mut p = Vec::new();
@@ -462,7 +479,7 @@ impl LoweredF {
         // `f64::from_bits` must stay out of the traced loop body; here it is in
         // the setup (0.0 has zero bits).
         match self.result_bank {
-            ValType::Int | ValType::UInt | ValType::Str => load_const(&mut p, 0, r_acc),
+            ValType::Int | ValType::UInt | ValType::Str | ValType::Timestamp | ValType::Duration => load_const(&mut p, 0, r_acc),
             ValType::Float => p.extend_from_slice(&[OP_LOAD_CONST_F, 0, f_acc as i64]),
         }
         load_const(&mut p, n, r_n);
@@ -480,7 +497,7 @@ impl LoweredF {
         // slot_k = *(base_k + ea)   — the red-index columnar read, per bank
         for (k, slot) in self.slots.iter().enumerate() {
             let op = match slot.ty {
-                ValType::Int | ValType::UInt | ValType::Str => OP_COL_LOAD,
+                ValType::Int | ValType::UInt | ValType::Str | ValType::Timestamp | ValType::Duration => OP_COL_LOAD,
                 ValType::Float => OP_COL_LOAD_F,
             };
             p.extend_from_slice(&[op, (r_base0 + k) as i64, r_ea as i64, slot.reg as i64]);
@@ -491,7 +508,7 @@ impl LoweredF {
         // trace cannot reassociate it — the running total sums in row order, bit
         // for bit like the interpreter tiers.
         match self.result_bank {
-            ValType::Int | ValType::UInt | ValType::Str => {
+            ValType::Int | ValType::UInt | ValType::Str | ValType::Timestamp | ValType::Duration => {
                 p.extend_from_slice(&[OP_ADD, r_acc as i64, self.result_reg as i64, r_acc as i64])
             }
             ValType::Float => {
@@ -501,7 +518,7 @@ impl LoweredF {
         p.extend_from_slice(&[OP_ADD, r_i as i64, r_one as i64, r_i as i64]);
         p.extend_from_slice(&[OP_JUMP_IF_ABOVE, r_n as i64, r_i as i64, body_pc as i64]);
         match self.result_bank {
-            ValType::Int | ValType::UInt | ValType::Str => p.extend_from_slice(&[OP_RETURN, r_acc as i64]),
+            ValType::Int | ValType::UInt | ValType::Str | ValType::Timestamp | ValType::Duration => p.extend_from_slice(&[OP_RETURN, r_acc as i64]),
             ValType::Float => p.extend_from_slice(&[OP_RETURN_F, f_acc as i64]),
         }
         (p, total_int_regs, total_float_regs)
@@ -529,7 +546,7 @@ impl LowerCtxF<'_> {
     fn fresh(&mut self, bank: ValType) -> TReg {
         let idx = match bank {
             // `Str` ids share the int register file (an `i64` content hash).
-            ValType::Int | ValType::UInt | ValType::Str => {
+            ValType::Int | ValType::UInt | ValType::Str | ValType::Timestamp | ValType::Duration => {
                 let r = self.next_int;
                 self.next_int += 1;
                 r
@@ -575,11 +592,14 @@ pub fn lower_typed(expr: &IdedExpr, schema: &Schema) -> Result<LoweredF, LowerEr
         schema,
     };
     let result = compile_t(&mut ctx, expr)?;
-    // A string-valued top-level result is not sum-reducible (the batch loop
-    // accumulates an int count or a float total); such an expression bails to
-    // the tree-walker rather than accumulating content hashes.
-    if result.bank == ValType::Str {
-        return Err(LowerError::unsupported("string-valued top-level result"));
+    // A string- or temporal-valued top-level result is not sum-reducible (the
+    // batch loop accumulates an int count or a float total); such an expression
+    // bails to the tree-walker rather than accumulating content hashes / nanos.
+    if matches!(
+        result.bank,
+        ValType::Str | ValType::Timestamp | ValType::Duration
+    ) {
+        return Err(LowerError::unsupported("string/temporal-valued top-level result"));
     }
     Ok(LoweredF {
         prelude: ctx.prelude,
@@ -735,6 +755,38 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
     }
     let name = call.func_name.as_str();
 
+    // `timestamp("...")` / `duration("...")` over a string literal are green
+    // constants: parse the literal the same way the tree-walker does and fold it
+    // to an i64-nanoseconds constant in the prelude. A non-literal argument, a
+    // parse error, or a value outside the i64-nanos range bails to the
+    // tree-walker (which owns the error / wider-range case).
+    if name == "timestamp" && call.args.len() == 1 {
+        let s = as_string_literal(&call.args[0])
+            .ok_or_else(|| LowerError::unsupported("timestamp() non-literal argument"))?;
+        let dt = chrono::DateTime::parse_from_rfc3339(s)
+            .map_err(|_| LowerError::unsupported("timestamp() literal parse"))?;
+        let nanos = dt
+            .timestamp_nanos_opt()
+            .ok_or_else(|| LowerError::unsupported("timestamp outside i64-nanos range"))?;
+        let r = ctx.fresh(ValType::Timestamp);
+        ctx.prelude
+            .extend_from_slice(&[OP_LOAD_CONST, nanos, r.idx as i64]);
+        return Ok(r);
+    }
+    if name == "duration" && call.args.len() == 1 {
+        let s = as_string_literal(&call.args[0])
+            .ok_or_else(|| LowerError::unsupported("duration() non-literal argument"))?;
+        let (_, dur) = crate::duration::parse_duration(s)
+            .map_err(|_| LowerError::unsupported("duration() literal parse"))?;
+        let nanos = dur
+            .num_nanoseconds()
+            .ok_or_else(|| LowerError::unsupported("duration outside i64-nanos range"))?;
+        let r = ctx.fresh(ValType::Duration);
+        ctx.prelude
+            .extend_from_slice(&[OP_LOAD_CONST, nanos, r.idx as i64]);
+        return Ok(r);
+    }
+
     // ternary `c ? t : f` — branchless blend on an int condition. Int arms use
     // an arithmetic SELECT; float arms use a bit-mask FSELECT (bit-exact, no
     // reassociation). Mixed-bank arms bail: the tree-walker yields int-or-float
@@ -834,6 +886,22 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
             let d = ctx.fresh(ValType::Int);
             ctx.body
                 .extend_from_slice(&[op, a.idx as i64, b.idx as i64, d.idx as i64]);
+            return Ok(d);
+        }
+        // Timestamp / Duration compare as i64 nanoseconds: the signed int order
+        // equals the chronological / magnitude order the tree-walker uses, so all
+        // six comparisons use the signed int op. Both operands must be the SAME
+        // temporal type (timestamp vs duration is NoSuchOverload; temporal vs a
+        // non-temporal operand is a type error) — otherwise bail.
+        if matches!(a.bank, ValType::Timestamp | ValType::Duration)
+            || matches!(b.bank, ValType::Timestamp | ValType::Duration)
+        {
+            if a.bank != b.bank {
+                return Err(LowerError::unsupported("mixed temporal comparison"));
+            }
+            let d = ctx.fresh(ValType::Int);
+            ctx.body
+                .extend_from_slice(&[iop, a.idx as i64, b.idx as i64, d.idx as i64]);
             return Ok(d);
         }
         // Two uint operands compare unsigned: `<`/`<=` map to OP_ULT/OP_ULE and
@@ -953,6 +1021,9 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
                     }
                     ValType::Str => {
                         return Err(LowerError::unsupported("unary negate on string"))
+                    }
+                    ValType::Timestamp | ValType::Duration => {
+                        return Err(LowerError::unsupported("unary negate on temporal"))
                     }
                 };
                 let d = ctx.fresh(a.bank);

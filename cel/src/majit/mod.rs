@@ -466,12 +466,22 @@ mod tests {
         /// [`ColData::column`] therefore refuses it (the id vec is derived, not
         /// borrowable from here).
         Str(Vec<String>),
+        /// A timestamp column, as `i64` nanoseconds since the Unix epoch. Read
+        /// directly as an int column (no interning); the oracle rebuilds a
+        /// `Value::Timestamp` from each nanos value.
+        Timestamp(Vec<i64>),
+        /// A duration column, as `i64` nanoseconds. Read directly as an int
+        /// column; the oracle rebuilds a `Value::Duration` from each nanos value.
+        Duration(Vec<i64>),
     }
 
     impl ColData {
         fn len(&self) -> usize {
             match self {
-                ColData::Int(c) | ColData::UInt(c) => c.len(),
+                ColData::Int(c)
+                | ColData::UInt(c)
+                | ColData::Timestamp(c)
+                | ColData::Duration(c) => c.len(),
                 ColData::Float(c) => c.len(),
                 ColData::Str(c) => c.len(),
             }
@@ -482,11 +492,16 @@ mod tests {
                 ColData::UInt(_) => ValType::UInt,
                 ColData::Float(_) => ValType::Float,
                 ColData::Str(_) => ValType::Str,
+                ColData::Timestamp(_) => ValType::Timestamp,
+                ColData::Duration(_) => ValType::Duration,
             }
         }
         fn column(&self) -> Column<'_> {
             match self {
-                ColData::Int(c) | ColData::UInt(c) => Column::Int(c),
+                ColData::Int(c)
+                | ColData::UInt(c)
+                | ColData::Timestamp(c)
+                | ColData::Duration(c) => Column::Int(c),
                 ColData::Float(c) => Column::Float(c),
                 ColData::Str(_) => {
                     panic!("Str column must be interned to an id column before `column()`")
@@ -572,6 +587,16 @@ mod tests {
                     ColData::UInt(c) => ctx.add_variable_from_value(*name, c[i] as u64),
                     ColData::Float(c) => ctx.add_variable_from_value(*name, c[i]),
                     ColData::Str(c) => ctx.add_variable_from_value(*name, c[i].clone()),
+                    ColData::Timestamp(c) => ctx.add_variable_from_value(
+                        *name,
+                        Value::Timestamp(
+                            chrono::DateTime::from_timestamp_nanos(c[i]).fixed_offset(),
+                        ),
+                    ),
+                    ColData::Duration(c) => ctx.add_variable_from_value(
+                        *name,
+                        Value::Duration(chrono::Duration::nanoseconds(c[i])),
+                    ),
                 }
             }
             expected += match program
@@ -650,6 +675,16 @@ mod tests {
                     ColData::UInt(c) => ctx.add_variable_from_value(*name, c[i] as u64),
                     ColData::Float(c) => ctx.add_variable_from_value(*name, c[i]),
                     ColData::Str(c) => ctx.add_variable_from_value(*name, c[i].clone()),
+                    ColData::Timestamp(c) => ctx.add_variable_from_value(
+                        *name,
+                        Value::Timestamp(
+                            chrono::DateTime::from_timestamp_nanos(c[i]).fixed_offset(),
+                        ),
+                    ),
+                    ColData::Duration(c) => ctx.add_variable_from_value(
+                        *name,
+                        Value::Duration(chrono::Duration::nanoseconds(c[i])),
+                    ),
                 }
             }
             expected += match program
@@ -782,6 +817,16 @@ mod tests {
                     ColData::UInt(c) => ctx.add_variable_from_value(*name, c[i] as u64),
                     ColData::Float(c) => ctx.add_variable_from_value(*name, c[i]),
                     ColData::Str(c) => ctx.add_variable_from_value(*name, c[i].clone()),
+                    ColData::Timestamp(c) => ctx.add_variable_from_value(
+                        *name,
+                        Value::Timestamp(
+                            chrono::DateTime::from_timestamp_nanos(c[i]).fixed_offset(),
+                        ),
+                    ),
+                    ColData::Duration(c) => ctx.add_variable_from_value(
+                        *name,
+                        Value::Duration(chrono::Duration::nanoseconds(c[i])),
+                    ),
                 }
             }
             expected += match program
@@ -867,6 +912,98 @@ mod tests {
             assert!(
                 lower_typed(program.expression(), &schema).is_err(),
                 "`{expr}` must bail the typed lowering (string ordering / bare result)"
+            );
+        }
+    }
+
+    /// Deterministic i64-nanosecond column in `[base, base + span)` from an LCG,
+    /// for timestamp / duration columns.
+    fn gen_nanos(n: usize, seed: u64, base: i64, span: i64) -> Vec<i64> {
+        let mut x = seed;
+        (0..n)
+            .map(|_| {
+                x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                base + ((x >> 33) % span as u64) as i64
+            })
+            .collect()
+    }
+
+    #[test]
+    fn batch_timestamp_compare() {
+        // Timestamps are i64 nanoseconds since the epoch; the signed int order
+        // equals the chronological order, so all six comparisons are bit-exact
+        // against the tree-walker (which compares Value::Timestamp instants). The
+        // `timestamp("...")` literal folds to a nanos constant via the same
+        // parse_from_rfc3339 the walker uses.
+        let n = 3000;
+        // Column spans ~2023-11 .. ~2024-07; the literal 2024-01-01 sits inside.
+        let base = 1_700_000_000_000_000_000;
+        let span = 20_000_000_000_000_000;
+        let event = gen_nanos(n, 0x71E5_7A11_9B0C_2D3E, base, span);
+        let created = gen_nanos(n, 0xC0DE_F00D_1234_5678, base, span);
+        // Column vs a `timestamp(...)` literal — `<`, `>=`, `==`.
+        check_batch_f(
+            "event < timestamp(\"2024-01-01T00:00:00Z\")",
+            &[("event", ColData::Timestamp(event.clone()))],
+        );
+        check_batch_f(
+            "event >= timestamp(\"2024-01-01T00:00:00Z\")",
+            &[("event", ColData::Timestamp(event.clone()))],
+        );
+        // Column vs column.
+        check_batch_f(
+            "event < created",
+            &[
+                ("event", ColData::Timestamp(event.clone())),
+                ("created", ColData::Timestamp(created.clone())),
+            ],
+        );
+        check_batch_f(
+            "event == created",
+            &[
+                ("event", ColData::Timestamp(event)),
+                ("created", ColData::Timestamp(created)),
+            ],
+        );
+    }
+
+    #[test]
+    fn batch_duration_compare() {
+        // Durations are i64 nanoseconds; the same signed-int order holds, and
+        // `duration("1h")` folds to a nanos constant via the walker's parser.
+        let n = 3000;
+        let elapsed = gen_nanos(n, 0x2222_3333_4444_5555, 0, 7_200_000_000_000); // [0, 2h)
+        let budget = gen_nanos(n, 0x9999_8888_7777_6666, 0, 7_200_000_000_000);
+        check_batch_f(
+            "elapsed > duration(\"1h\")",
+            &[("elapsed", ColData::Duration(elapsed.clone()))],
+        );
+        check_batch_f(
+            "elapsed <= budget",
+            &[
+                ("elapsed", ColData::Duration(elapsed)),
+                ("budget", ColData::Duration(budget)),
+            ],
+        );
+    }
+
+    #[test]
+    fn temporal_mixed_bails() {
+        // A timestamp vs duration comparison is NoSuchOverload, a temporal vs int
+        // is a type error, temporal arithmetic is out of subset, and a bare
+        // temporal result is not sum-reducible — all bail to the tree-walker.
+        let schema: Schema = [
+            ("t".to_string(), ValType::Timestamp),
+            ("d".to_string(), ValType::Duration),
+            ("i".to_string(), ValType::Int),
+        ]
+        .into_iter()
+        .collect();
+        for expr in ["t < d", "t < i", "t - t", "t + d", "d + d", "t"] {
+            let program = Program::compile(expr).unwrap();
+            assert!(
+                lower_typed(program.expression(), &schema).is_err(),
+                "`{expr}` must bail the typed lowering (mixed/arith/bare temporal)"
             );
         }
     }
