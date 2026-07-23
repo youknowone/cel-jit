@@ -702,6 +702,30 @@ mod tests {
     }
 
     #[test]
+    fn batch_float_ternary() {
+        // Float-armed ternary lowers to a bit-mask FSELECT (int condition,
+        // float arms). The blend is over the raw f64 bit patterns, so it is
+        // bit-exact against the tree-walker across all three tiers, and the
+        // float-valued result feeds the float accumulator.
+        let n = 3000;
+        let price = gen_f64(n, 0x6E1F_2A3B_4C5D_6E7F, 0.0, 200.0);
+        let qty = gen_f64(n, 0x7F6E_5D4C_3B2A_1F0E, 0.0, 100.0);
+        // condition compares a float column, both arms are float expressions.
+        check_batch_float(
+            "price >= 100.0 ? price * 2.0 : qty",
+            &[
+                ("price", ColData::Float(price.clone())),
+                ("qty", ColData::Float(qty.clone())),
+            ],
+        );
+        // a plain float column vs float column arm selection.
+        check_batch_float(
+            "price >= qty ? price : qty",
+            &[("price", ColData::Float(price)), ("qty", ColData::Float(qty))],
+        );
+    }
+
+    #[test]
     fn probe_float_const_only() {
         // Isolates a float constant (OP_LOAD_CONST_F), no AND.
         let n = 3000;
@@ -723,14 +747,15 @@ mod tests {
 
     #[test]
     fn typed_lowering_bails() {
-        // Float modulo, mixed int/float arithmetic, and a float ternary arm
+        // Float modulo, mixed int/float arithmetic, and a mixed-bank ternary arm
         // still bail. (A float-valued top-level result now compiles into a float
-        // accumulator — see `batch_float_aggregate`; a mixed int/float
-        // comparison widens via cast_int_to_float — see `batch_mixed_col_compare`.)
+        // accumulator — see `batch_float_aggregate`; a mixed int/float comparison
+        // widens via cast_int_to_float — see `batch_mixed_col_compare`; a
+        // same-bank float ternary lowers to FSELECT — see `batch_float_ternary`.)
         let schema: Schema = [("p".to_string(), ValType::Float), ("q".to_string(), ValType::Int)]
             .into_iter()
             .collect();
-        for expr in ["p % 2.0 >= 1.0", "p + q", "p >= 1.0 ? p : p"] {
+        for expr in ["p % 2.0 >= 1.0", "p + q", "p >= 1.0 ? p : q"] {
             let program = Program::compile(expr).unwrap();
             assert!(
                 lower_typed(program.expression(), &schema).is_err(),

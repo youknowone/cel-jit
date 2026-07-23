@@ -524,9 +524,9 @@ impl LowerCtxF<'_> {
 /// paths are `double`, or report why it is out of subset. Same subset as
 /// [`lower`] plus `double` literals/columns, but with per-bank register
 /// allocation. A float-valued top-level result accumulates into a float total.
-/// Mixed int/float arithmetic (no int->float cast for arithmetic), float
-/// modulo, and a float ternary arm still bail (the caller falls back to the
-/// tree-walker).
+/// Same-bank float ternary lowers to a bit-mask FSELECT. Mixed int/float
+/// arithmetic (no int->float cast for arithmetic), float modulo, and a
+/// mixed-bank ternary still bail (the caller falls back to the tree-walker).
 pub fn lower_typed(expr: &IdedExpr, schema: &Schema) -> Result<LoweredF, LowerError> {
     let mut ctx = LowerCtxF {
         prelude: Vec::new(),
@@ -677,8 +677,10 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
     }
     let name = call.func_name.as_str();
 
-    // ternary `c ? t : f` — branchless int blend only (the two-bank VM has no
-    // float SELECT); float arms bail.
+    // ternary `c ? t : f` — branchless blend on an int condition. Int arms use
+    // an arithmetic SELECT; float arms use a bit-mask FSELECT (bit-exact, no
+    // reassociation). Mixed-bank arms bail: the tree-walker yields int-or-float
+    // per row, which no single result bank can carry.
     if name == ops::CONDITIONAL {
         if call.args.len() != 3 {
             return Err(LowerError::unsupported("_?_:_ arity"));
@@ -689,12 +691,14 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
         }
         let t = compile_t(ctx, &call.args[1])?;
         let f = compile_t(ctx, &call.args[2])?;
-        if t.bank != ValType::Int || f.bank != ValType::Int {
-            return Err(LowerError::unsupported("float ternary arm"));
-        }
-        let d = ctx.fresh(ValType::Int);
+        let (op, bank) = match (t.bank, f.bank) {
+            (ValType::Int, ValType::Int) => (OP_SELECT, ValType::Int),
+            (ValType::Float, ValType::Float) => (OP_FSELECT, ValType::Float),
+            _ => return Err(LowerError::unsupported("mixed-bank ternary arms")),
+        };
+        let d = ctx.fresh(bank);
         ctx.body.extend_from_slice(&[
-            OP_SELECT,
+            op,
             c.idx as i64,
             t.idx as i64,
             f.idx as i64,

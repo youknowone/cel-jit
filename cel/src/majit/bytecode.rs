@@ -62,6 +62,7 @@ pub const OP_FEQ: i64 = 33; // [fa, fb, dst]            regs[dst] = (fregs[fa] =
 pub const OP_FNE: i64 = 34; // [fa, fb, dst]            regs[dst] = (fregs[fa] != fregs[fb]) as 0/1
 pub const OP_I2F: i64 = 35; // [src, fdst]             fregs[fdst] = regs[src] as f64  (cast_int_to_float)
 pub const OP_RETURN_F: i64 = 36; // [RETURN_F, freg]        return fregs[freg].to_bits()  (float total)
+pub const OP_FSELECT: i64 = 37; // [FSELECT, c, ft, ff, fdst]  fregs[fdst] = if regs[c]!=0 {fregs[ft]} else {fregs[ff]}
 
 /// Raw native-memory load intrinsic recognized by the `#[jit_interp]` proc
 /// macro (lowered to `raw_load_i`); at the interpreter tier this real fn runs.
@@ -581,7 +582,7 @@ pub mod float_bank {
         OP_ADD, OP_AND, OP_COL_LOAD, OP_COL_LOAD_F, OP_EQ, OP_FADD, OP_FDIV, OP_FEQ, OP_FGE,
         OP_FGT, OP_FLE, OP_FLT, OP_FMOV, OP_FMUL, OP_FNE, OP_FNEG, OP_FSUB, OP_GE, OP_GT, OP_I2F,
         OP_JUMP_IF_ABOVE, OP_LE, OP_LOAD_CONST, OP_LOAD_CONST_F, OP_LT, OP_MOV, OP_MUL, OP_NE,
-        OP_NEG, OP_NOT, OP_OR, OP_RETURN, OP_RETURN_F, OP_SELECT, OP_SUB,
+        OP_FSELECT, OP_NEG, OP_NOT, OP_OR, OP_RETURN, OP_RETURN_F, OP_SELECT, OP_SUB,
     };
     use core::sync::atomic::Ordering;
 
@@ -592,6 +593,20 @@ pub mod float_bank {
         unsafe {
             core::ptr::read_unaligned((base as usize).wrapping_add(ea as usize) as *const f64)
         }
+    }
+
+    /// Reinterpret a float's 64-bit pattern as an int — recognized by the
+    /// `#[jit_interp]` proc macro as `convert_float_bytes_to_longlong`; at the
+    /// interpreter tier this real fn runs. Used by the branchless float select.
+    #[inline]
+    fn majit_f64_to_bits(x: f64) -> i64 {
+        x.to_bits() as i64
+    }
+
+    /// The inverse bitcast — `convert_longlong_bytes_to_float`.
+    #[inline]
+    fn majit_bits_to_f64(x: i64) -> f64 {
+        f64::from_bits(x as u64)
     }
 
     struct VmStateF {
@@ -737,6 +752,19 @@ pub mod float_bank {
                     let t = state.regs[program[pc + 2] as usize];
                     let f = state.regs[program[pc + 3] as usize];
                     state.regs[program[pc + 4] as usize] = f + c * (t - f);
+                    pc += 5;
+                }
+                OP_FSELECT => {
+                    // Branchless float select on an int/bool condition (0/1):
+                    // reinterpret each arm as i64 bits, blend with a full 0/-1
+                    // mask, reinterpret back. Bit-exact (an arithmetic float
+                    // blend is not) and overflow-free (the blend is bitwise).
+                    let c = state.regs[program[pc + 1] as usize];
+                    let tb = majit_f64_to_bits(state.fregs[program[pc + 2] as usize]);
+                    let fb = majit_f64_to_bits(state.fregs[program[pc + 3] as usize]);
+                    let m = -c; // all-ones when c==1, zero when c==0
+                    let nm = c - 1; // the complement mask (== !m for c in {0,1})
+                    state.fregs[program[pc + 4] as usize] = majit_bits_to_f64((tb & m) | (fb & nm));
                     pc += 5;
                 }
                 OP_COL_LOAD => {
@@ -945,6 +973,15 @@ pub mod float_bank {
                     let t = regs[program[pc + 2] as usize];
                     let f = regs[program[pc + 3] as usize];
                     regs[program[pc + 4] as usize] = f + c * (t - f);
+                    pc += 5;
+                }
+                OP_FSELECT => {
+                    let c = regs[program[pc + 1] as usize];
+                    let tb = majit_f64_to_bits(fregs[program[pc + 2] as usize]);
+                    let fb = majit_f64_to_bits(fregs[program[pc + 3] as usize]);
+                    let m = -c;
+                    let nm = c - 1;
+                    fregs[program[pc + 4] as usize] = majit_bits_to_f64((tb & m) | (fb & nm));
                     pc += 5;
                 }
                 OP_COL_LOAD => {
