@@ -1009,6 +1009,56 @@ mod tests {
     }
 
     #[test]
+    fn batch_int_in_set() {
+        // `x in [literals]` unrolls to an OR-chain of equalities over the int
+        // register file, bit-exact across the clean / interp / compiled tiers.
+        let n = 3000;
+        let age = gen_i64(n, 0x5151_2626_3737_4848, 0, 80);
+        check_batch_f("age in [18, 21, 65]", &[("age", ColData::Int(age.clone()))]);
+        // Two membership sets combined with `&&`.
+        let dept = gen_i64(n, 0xA1B2_C3D4_E5F6_0718, 0, 6);
+        check_batch_f(
+            "age in [18, 21] && dept in [1, 2, 3]",
+            &[("age", ColData::Int(age)), ("dept", ColData::Int(dept))],
+        );
+    }
+
+    #[test]
+    fn batch_string_in_set() {
+        // String membership: an OR-chain of content-hash equalities. Literals in
+        // the set feed the injectivity check alongside the column values.
+        let n = 3000;
+        let roles = ["admin", "user", "guest", "root", "auditor"];
+        let role = gen_str(n, 0x3131_4242_5353_6464, &roles);
+        check_batch_str(
+            "role in [\"admin\", \"root\"]",
+            &[("role", ColData::Str(role.clone()))],
+        );
+        // A set element absent from the column still compiles (never matches).
+        check_batch_str(
+            "role in [\"admin\", \"superuser\"]",
+            &[("role", ColData::Str(role))],
+        );
+    }
+
+    #[test]
+    fn in_empty_and_bails() {
+        // `x in []` is const false (still compiles the loop); a heterogeneous
+        // element or a non-literal container bails to the tree-walker.
+        let n = 3000;
+        let age = gen_i64(n, 0x1212_3434_5656_7878, 0, 80);
+        check_batch_f("age in []", &[("age", ColData::Int(age))]);
+
+        let schema: Schema = [("age".to_string(), ValType::Int)].into_iter().collect();
+        // An int column tested against a string element: bank mismatch bails.
+        let program = Program::compile("age in [\"x\"]").unwrap();
+        assert!(
+            lower_typed(program.expression(), &schema).is_err(),
+            "heterogeneous @in must bail the typed lowering"
+        );
+    }
+
+    #[test]
     fn batch_float_aggregate() {
         // Float-valued top-level result -> float accumulator (OP_RETURN_F). The
         // running total sums the per-row f64 in row order, bit-exact across the

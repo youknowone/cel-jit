@@ -787,6 +787,51 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
         return Ok(r);
     }
 
+    // `x in [e0, e1, ...]` over a LITERAL list unrolls to a constant membership
+    // set `(x == e0) || (x == e1) || ...`. Reuses the per-bank equality op
+    // (`OP_EQ` for the int-file banks incl. string ids and temporal nanos,
+    // `OP_FEQ` for floats). Every element must share `x`'s bank (a heterogeneous
+    // element is `false` in the tree-walker; bailing lets it own that); a
+    // non-literal container bails.
+    if name == ops::IN {
+        if call.args.len() != 2 {
+            return Err(LowerError::unsupported("@in arity"));
+        }
+        let elements = match &call.args[1].expr {
+            Expr::List(list) => &list.elements,
+            _ => return Err(LowerError::unsupported("@in non-literal container")),
+        };
+        let x = compile_t(ctx, &call.args[0])?;
+        if elements.is_empty() {
+            // `x in []` is always false (the operand is still evaluated above).
+            let d = ctx.fresh(ValType::Int);
+            ctx.prelude
+                .extend_from_slice(&[OP_LOAD_CONST, 0, d.idx as i64]);
+            return Ok(d);
+        }
+        let eq_op = if x.bank == ValType::Float { OP_FEQ } else { OP_EQ };
+        let mut acc: Option<TReg> = None;
+        for e in elements {
+            let ev = compile_t(ctx, e)?;
+            if ev.bank != x.bank {
+                return Err(LowerError::unsupported("@in heterogeneous element"));
+            }
+            let t = ctx.fresh(ValType::Int);
+            ctx.body
+                .extend_from_slice(&[eq_op, x.idx as i64, ev.idx as i64, t.idx as i64]);
+            acc = Some(match acc {
+                None => t,
+                Some(prev) => {
+                    let o = ctx.fresh(ValType::Int);
+                    ctx.body
+                        .extend_from_slice(&[OP_OR, prev.idx as i64, t.idx as i64, o.idx as i64]);
+                    o
+                }
+            });
+        }
+        return Ok(acc.expect("non-empty element list"));
+    }
+
     // ternary `c ? t : f` — branchless blend on an int condition. Int arms use
     // an arithmetic SELECT; float arms use a bit-mask FSELECT (bit-exact, no
     // reassociation). Mixed-bank arms bail: the tree-walker yields int-or-float
