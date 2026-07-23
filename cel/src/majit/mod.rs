@@ -332,6 +332,86 @@ mod tests {
         );
     }
 
+    /// Deterministic per-slot f64 column data in roughly [-1, 1].
+    fn gen_float_cols(n: usize, seed: u64) -> Vec<f64> {
+        let mut x = seed;
+        let mut out = Vec::with_capacity(n);
+        for k in 0..n {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let mant = x & ((1u64 << 52) - 1);
+            let v = f64::from_bits((0x3ffu64 << 52) | mant) - 1.0 + (k as f64 * 1e-12);
+            out.push(if k & 1 == 0 { v } else { -v });
+        }
+        out
+    }
+
+    /// The two-bank float VM (`float_bank`) evaluated on a hand-built float
+    /// policy: count rows where `a[i] >= b[i]` reading real `f64` columns at
+    /// the red index. Oracle is the stock tree-walker's float comparison. This
+    /// pins the float path (float column load + a bank-crossing float compare)
+    /// before the lowerer emits it. clean == jit-off == jit-on, jit-on compiles.
+    #[test]
+    fn float_vm_count_ge() {
+        use super::bytecode::float_bank::{clean_interp_f, run_jit_f, COMPILES as COMPILES_F};
+        use super::bytecode::{
+            OP_ADD, OP_COL_LOAD_F, OP_FGE, OP_JUMP_IF_ABOVE, OP_LOAD_CONST, OP_MUL, OP_RETURN,
+        };
+
+        let n = 3000usize;
+        let cola = gen_float_cols(n, 0x2545_F491_4F6C_DD1D);
+        let colb = gen_float_cols(n, 0x9E37_79B9_7F4A_7C15);
+
+        // Oracle: the stock tree-walker's `a >= b` on f64 vars, summed.
+        let program = Program::compile("a >= b").unwrap();
+        let mut expected = 0i64;
+        for i in 0..n {
+            let mut ctx = Context::default();
+            ctx.add_variable_from_value("a", cola[i]);
+            ctx.add_variable_from_value("b", colb[i]);
+            match program.execute(&ctx).unwrap() {
+                Value::Bool(b) => expected += b as i64,
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+
+        // int regs: i=0 acc=1 n=2 one=3 stride=4 ea=5 base_a=6 base_b=7 bool=8
+        // float regs: fa=0 fb=1
+        let base_a = cola.as_ptr() as i64;
+        let base_b = colb.as_ptr() as i64;
+        let mut prog: Vec<i64> = vec![
+            OP_LOAD_CONST, 0, 0,
+            OP_LOAD_CONST, 0, 1,
+            OP_LOAD_CONST, n as i64, 2,
+            OP_LOAD_CONST, 1, 3,
+            OP_LOAD_CONST, 8, 4,
+            OP_LOAD_CONST, base_a, 6,
+            OP_LOAD_CONST, base_b, 7,
+        ];
+        let body_pc = prog.len() as i64;
+        assert_eq!(body_pc, 21);
+        prog.extend_from_slice(&[
+            OP_MUL, 0, 4, 5,
+            OP_COL_LOAD_F, 6, 5, 0,
+            OP_COL_LOAD_F, 7, 5, 1,
+            OP_FGE, 0, 1, 8,
+            OP_ADD, 1, 8, 1,
+            OP_ADD, 0, 3, 0,
+            OP_JUMP_IF_ABOVE, 2, 0, body_pc,
+            OP_RETURN, 1,
+        ]);
+
+        let (ni, nf) = (9usize, 2usize);
+        assert_eq!(clean_interp_f(&prog, ni, nf), expected, "clean vs oracle");
+        assert_eq!(run_jit_f(&prog, ni, nf, u32::MAX), expected, "jit-off vs oracle");
+        COMPILES_F.store(0, Ordering::Relaxed);
+        assert_eq!(run_jit_f(&prog, ni, nf, 8), expected, "jit-on vs oracle");
+        assert!(
+            COMPILES_F.load(Ordering::Relaxed) >= 1,
+            "float batch must compile the hot loop"
+        );
+        core::hint::black_box((&cola, &colb));
+    }
+
     #[test]
     fn out_of_subset_bails() {
         // list-returning / string / double / member-fn / list-valued
