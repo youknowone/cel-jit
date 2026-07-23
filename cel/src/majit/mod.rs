@@ -283,11 +283,14 @@ mod tests {
 
         let off = eval_batch_sum(&lowered, &col_refs, u32::MAX);
         assert_eq!(off, expected, "batch jit-off vs stock for `{expr_src}`");
-        COMPILES.store(0, Ordering::Relaxed);
+        // Assert the compile counter *increased* across the jit-on run rather
+        // than resetting it to 0 first: the counter is a shared global, so a
+        // concurrent batch test's reset could otherwise mask a real compile.
+        let before = COMPILES.load(Ordering::Relaxed);
         let on = eval_batch_sum(&lowered, &col_refs, 8);
         assert_eq!(on, expected, "batch jit-on vs stock for `{expr_src}`");
         assert!(
-            COMPILES.load(Ordering::Relaxed) >= 1,
+            COMPILES.load(Ordering::Relaxed) > before,
             "batch `{expr_src}` must compile the hot loop"
         );
     }
@@ -621,16 +624,51 @@ mod tests {
 
     #[test]
     fn typed_lowering_bails() {
-        // Mixed int/float compare (no int->float cast op), float modulo, and a
-        // float-valued top-level result (no float accumulator) all bail.
-        let schema: Schema = [("p".to_string(), ValType::Float)].into_iter().collect();
-        for expr in ["p >= 1", "p % 2.0 >= 1.0", "p + 1.0"] {
+        // A non-literal int (a column) compared to a float needs a per-row
+        // int->float cast the trace can't lower; float modulo; and a float-valued
+        // top-level result (no float accumulator) all bail.
+        let schema: Schema = [
+            ("p".to_string(), ValType::Float),
+            ("q".to_string(), ValType::Int),
+        ]
+        .into_iter()
+        .collect();
+        for expr in ["p >= q", "p % 2.0 >= 1.0", "p + 1.0"] {
             let program = Program::compile(expr).unwrap();
             assert!(
                 lower_typed(program.expression(), &schema).is_err(),
                 "`{expr}` must bail the typed lowering"
             );
         }
+    }
+
+    #[test]
+    fn batch_mixed_literal_compare() {
+        // An int literal compared to a float column is promoted to a double
+        // constant (`int as f64`), matching the tree-walker. Both orders.
+        let n = 3000;
+        let price = gen_f64(n, 0x0F0F_0F0F_0F0F_0F0F, 0.0, 200.0);
+        let qty = gen_f64(n, 0xF0F0_F0F0_F0F0_F0F0, 0.0, 100.0);
+        check_batch_f(
+            "price >= 100 && qty < 50",
+            &[("price", ColData::Float(price.clone())), ("qty", ColData::Float(qty.clone()))],
+        );
+        check_batch_f(
+            "100 <= price && 50 > qty",
+            &[("price", ColData::Float(price)), ("qty", ColData::Float(qty))],
+        );
+    }
+
+    #[test]
+    fn batch_mixed_literal_equality() {
+        // int-literal equality against a float column (whole-valued rows so the
+        // predicate actually fires), promoted to a double constant.
+        let n = 3000;
+        let score = gen_i64(n, 0x1357_9BDF_2468_ACE0, 0, 5)
+            .into_iter()
+            .map(|v| v as f64)
+            .collect::<Vec<f64>>();
+        check_batch_f("score == 3", &[("score", ColData::Float(score))]);
     }
 
     #[test]

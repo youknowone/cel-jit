@@ -582,6 +582,52 @@ fn compile_literal_t(ctx: &mut LowerCtxF, lit: &LiteralValue) -> Result<TReg, Lo
     }
 }
 
+/// Emit a `double` constant load into the prelude and return its float reg.
+fn emit_float_const(ctx: &mut LowerCtxF, v: f64) -> TReg {
+    let r = ctx.fresh(ValType::Float);
+    ctx.prelude
+        .extend_from_slice(&[OP_LOAD_CONST_F, v.to_bits() as i64, r.idx as i64]);
+    r
+}
+
+/// Compile the two operands of a comparison, promoting a bare `int` literal to
+/// a `double` constant when its peer is float. This constant-folds the
+/// tree-walker's `int as f64` promotion (CEL compares mixed numeric operands by
+/// widening the int to `f64`, symmetric for either side), keeping both operands
+/// in the float bank without a per-row cast the traced loop cannot lower. A
+/// non-literal int vs float stays mixed and the caller bails.
+fn compile_cmp_operands(
+    ctx: &mut LowerCtxF,
+    e0: &IdedExpr,
+    e1: &IdedExpr,
+) -> Result<(TReg, TReg), LowerError> {
+    match (as_int_literal(e0), as_int_literal(e1)) {
+        // Both literal or neither literal: compile in source order.
+        (Some(_), Some(_)) | (None, None) => Ok((compile_t(ctx, e0)?, compile_t(ctx, e1)?)),
+        // One side is an int literal: compile the peer first to learn its bank,
+        // then widen the literal to a float constant if the peer is float. A
+        // literal contributes no slots, so peer-first preserves slot order.
+        (Some(v0), None) => {
+            let b = compile_t(ctx, e1)?;
+            let a = if b.bank == ValType::Float {
+                emit_float_const(ctx, v0 as f64)
+            } else {
+                compile_t(ctx, e0)?
+            };
+            Ok((a, b))
+        }
+        (None, Some(v1)) => {
+            let a = compile_t(ctx, e0)?;
+            let b = if a.bank == ValType::Float {
+                emit_float_const(ctx, v1 as f64)
+            } else {
+                compile_t(ctx, e1)?
+            };
+            Ok((a, b))
+        }
+    }
+}
+
 fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerError> {
     if call.target.is_some() {
         return Err(LowerError::unsupported(format!(
@@ -669,12 +715,17 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
         if call.args.len() != 2 {
             return Err(LowerError::unsupported(format!("{name} arity")));
         }
-        let a = compile_t(ctx, &call.args[0])?;
-        let b = compile_t(ctx, &call.args[1])?;
+        let (a, b) = compile_cmp_operands(ctx, &call.args[0], &call.args[1])?;
         let op = match (a.bank, b.bank) {
             (ValType::Int, ValType::Int) => iop,
             (ValType::Float, ValType::Float) => fop,
-            _ => return Err(LowerError::unsupported("mixed int/float comparison")),
+            // A non-literal int compared to a float would need a per-row
+            // int->float cast, which the traced loop cannot lower yet.
+            _ => {
+                return Err(LowerError::unsupported(
+                    "mixed int/float comparison with a non-constant int operand",
+                ))
+            }
         };
         let d = ctx.fresh(ValType::Int);
         ctx.body
