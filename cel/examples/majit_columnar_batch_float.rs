@@ -28,7 +28,7 @@ use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use cel::majit::bytecode::float_bank::COMPILES;
-use cel::majit::bytecode::{eval_batch_sum_f, Column};
+use cel::majit::bytecode::{eval_batch_sum_f, eval_batch_sum_float, Column};
 use cel::majit::lower::{lower_typed, Schema, ValType};
 use cel::{Context, Program, Value};
 
@@ -54,7 +54,7 @@ fn median(mut v: Vec<f64>) -> f64 {
     v[v.len() / 2]
 }
 
-fn time_ns_per_row<F: FnMut() -> i64>(n: usize, mut f: F) -> f64 {
+fn time_ns_per_row<T, F: FnMut() -> T>(n: usize, mut f: F) -> f64 {
     let t = Instant::now();
     black_box(f());
     t.elapsed().as_nanos() as f64 / n as f64
@@ -137,5 +137,61 @@ fn main() {
         jit_off / nv,
         nv / jit
     );
+
+    // --- Float AGGREGATE: a float-valued result summed into a float
+    // accumulator (OP_RETURN_F). `sum(price * qty)` folds the per-row FMUL into
+    // a register and carries the running total across the loop. Same columns,
+    // bit-exact (float addition is order-sensitive, so the loop and the oracle
+    // both sum left to right).
+    let agg_expr = "price * qty";
+    let agg_program = Program::compile(agg_expr).expect("compile aggregate");
+    let agg_lowered =
+        lower_typed(agg_program.expression(), &schema).expect("lower float aggregate");
+    assert_eq!(agg_lowered.result_bank, ValType::Float, "aggregate must be float-valued");
+
+    let naive_agg = || -> f64 {
+        let mut acc = 0.0f64;
+        let mut ctx = Context::default();
+        for i in 0..n {
+            ctx.add_variable_from_value("price", price[i]);
+            ctx.add_variable_from_value("qty", qty[i]);
+            acc += match agg_program.execute(&ctx).expect("execute") {
+                Value::Float(v) => v,
+                other => panic!("unexpected {other:?}"),
+            };
+        }
+        acc
+    };
+
+    let base_a = naive_agg();
+    let off_a = eval_batch_sum_float(&agg_lowered, &columns, u32::MAX);
+    COMPILES.store(0, Ordering::Relaxed);
+    let on_a = eval_batch_sum_float(&agg_lowered, &columns, 8);
+    let on_ac = COMPILES.load(Ordering::Relaxed);
+    assert_eq!(base_a.to_bits(), off_a.to_bits(), "aggregate naive vs JIT-off divergence");
+    assert_eq!(base_a.to_bits(), on_a.to_bits(), "aggregate naive vs JIT-on -> miscompile");
+    assert!(on_ac >= 1, "aggregate JIT-on must compile the batch loop");
+
+    let (mut on_a_t, mut off_a_t, mut naive_a_t) = (Vec::new(), Vec::new(), Vec::new());
+    for _ in 0..rounds {
+        naive_a_t.push(time_ns_per_row(n, || naive_agg().to_bits()));
+        off_a_t.push(time_ns_per_row(n, || {
+            eval_batch_sum_float(&agg_lowered, &columns, u32::MAX).to_bits()
+        }));
+        on_a_t.push(time_ns_per_row(n, || {
+            eval_batch_sum_float(&agg_lowered, &columns, 8).to_bits()
+        }));
+    }
+    let (jit_a, jit_off_a, nv_a) = (median(on_a_t), median(off_a_t), median(naive_a_t));
+    println!();
+    println!("aggregate: sum({agg_expr}) = {base_a:.3}  (all paths agree)  compiles on={on_ac}");
+    println!("  naive   (cel tree-walk, reused ctx) : {nv_a:>9.2} ns/row   ← fair baseline (hot)");
+    println!("  majit   JIT-off (bytecode interp)   : {jit_off_a:>9.2} ns/row");
+    println!(
+        "  majit   JIT-on  (compiled trace)    : {jit_a:>9.2} ns/row   ← {:.0}x faster than naive  {}",
+        nv_a / jit_a,
+        if nv_a / jit_a > 1.0 { "✅" } else { "❌" }
+    );
+
     black_box((&price, &qty));
 }

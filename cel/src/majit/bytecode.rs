@@ -61,6 +61,7 @@ pub const OP_FLT: i64 = 32; // [fa, fb, dst]            regs[dst] = (fregs[fa] <
 pub const OP_FEQ: i64 = 33; // [fa, fb, dst]            regs[dst] = (fregs[fa] == fregs[fb]) as 0/1
 pub const OP_FNE: i64 = 34; // [fa, fb, dst]            regs[dst] = (fregs[fa] != fregs[fb]) as 0/1
 pub const OP_I2F: i64 = 35; // [src, fdst]             fregs[fdst] = regs[src] as f64  (cast_int_to_float)
+pub const OP_RETURN_F: i64 = 36; // [RETURN_F, freg]        return fregs[freg].to_bits()  (float total)
 
 /// Raw native-memory load intrinsic recognized by the `#[jit_interp]` proc
 /// macro (lowered to `raw_load_i`); at the interpreter tier this real fn runs.
@@ -425,6 +426,25 @@ pub fn eval_batch_sum_f(
     result
 }
 
+/// Columnar batch sum for a **float-valued** lowering: the per-row result is a
+/// float and the running total is a float accumulator, so the returned `i64`
+/// bits ([`OP_RETURN_F`]) are reinterpreted as the `f64` total. The batch loop
+/// sums left to right in row order, matching the tree-walker oracle bit for bit
+/// (float addition is order-sensitive, so the order must agree). Requires
+/// `lowered.result_bank == ValType::Float`.
+pub fn eval_batch_sum_float(
+    lowered: &super::lower::LoweredF,
+    columns: &[Column],
+    threshold: u32,
+) -> f64 {
+    debug_assert_eq!(
+        lowered.result_bank,
+        super::lower::ValType::Float,
+        "eval_batch_sum_float requires a float-valued lowering"
+    );
+    f64::from_bits(eval_batch_sum_f(lowered, columns, threshold) as u64)
+}
+
 /// Reference interpreter: a plain `match` over the same bytecode with no majit
 /// machinery. The correctness oracle for the lowering and the honest baseline
 /// for "did the JIT actually speed anything up".
@@ -561,7 +581,7 @@ pub mod float_bank {
         OP_ADD, OP_AND, OP_COL_LOAD, OP_COL_LOAD_F, OP_EQ, OP_FADD, OP_FDIV, OP_FEQ, OP_FGE,
         OP_FGT, OP_FLE, OP_FLT, OP_FMOV, OP_FMUL, OP_FNE, OP_FNEG, OP_FSUB, OP_GE, OP_GT, OP_I2F,
         OP_JUMP_IF_ABOVE, OP_LE, OP_LOAD_CONST, OP_LOAD_CONST_F, OP_LT, OP_MOV, OP_MUL, OP_NE,
-        OP_NEG, OP_NOT, OP_OR, OP_RETURN, OP_SELECT, OP_SUB,
+        OP_NEG, OP_NOT, OP_OR, OP_RETURN, OP_RETURN_F, OP_SELECT, OP_SUB,
     };
     use core::sync::atomic::Ordering;
 
@@ -833,6 +853,9 @@ pub mod float_bank {
                 OP_RETURN => {
                     return state.regs[program[pc + 1] as usize];
                 }
+                OP_RETURN_F => {
+                    return state.fregs[program[pc + 1] as usize].to_bits() as i64;
+                }
                 _ => break,
             }
         }
@@ -1011,6 +1034,7 @@ pub mod float_bank {
                     }
                 }
                 OP_RETURN => return regs[program[pc + 1] as usize],
+                OP_RETURN_F => return fregs[program[pc + 1] as usize].to_bits() as i64,
                 _ => panic!("bad op {}", program[pc]),
             }
         }

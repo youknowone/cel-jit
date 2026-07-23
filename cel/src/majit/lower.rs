@@ -356,11 +356,12 @@ pub struct SlotInfoF {
     pub reg: usize,
 }
 
-/// A CEL expression compiled to two-bank bytecode. The result is always an int
-/// register (a bool/count/int-sum); a float-valued top-level result is rejected
-/// (the two-bank VM has no float accumulator). [`LoweredF::batch_sum_program`]
-/// prepends the loop-invariant [`LoweredF::prelude`] and the per-row columnar
-/// loads, then wraps [`LoweredF::body`] in the sum loop.
+/// A CEL expression compiled to two-bank bytecode. The result is an int
+/// register (a bool/count/int-sum) or a float register (a float total), tracked
+/// by [`LoweredF::result_bank`]. [`LoweredF::batch_sum_program`] prepends the
+/// loop-invariant [`LoweredF::prelude`] and the per-row columnar loads, then
+/// wraps [`LoweredF::body`] in the sum loop, accumulating into the matching
+/// bank.
 #[derive(Debug, Clone)]
 pub struct LoweredF {
     /// Loop-invariant literal loads (int and `double` constants), hoisted to run
@@ -371,7 +372,11 @@ pub struct LoweredF {
     pub prelude: Vec<i64>,
     /// Per-row straight-line ops (no literal loads, no slot loads, no return).
     pub body: Vec<i64>,
-    /// Int-bank register holding the result.
+    /// Bank the top-level result lives in. An int result accumulates into an int
+    /// count/sum (`OP_RETURN`); a float result accumulates into a float total
+    /// (`OP_RETURN_F`).
+    pub result_bank: ValType,
+    /// Register holding the result, within [`LoweredF::result_bank`].
     pub result_reg: usize,
     /// Int-bank register count the body uses.
     pub num_int_regs: usize,
@@ -385,7 +390,8 @@ impl LoweredF {
     /// Build a **columnar batch** program over the two-bank machine: for each
     /// row `i` in `0..n`, load each slot's `col_k[i]` via a red-index `raw_load`
     /// (`OP_COL_LOAD` for int slots, `OP_COL_LOAD_F` for float slots), run the
-    /// body, and accumulate the int result into a running sum. `bases[k]` is the
+    /// body, and accumulate the result into a running sum in the result's bank
+    /// (int `r_acc` -> `OP_RETURN`, or float `f_acc` -> `OP_RETURN_F`). `bases[k]` is the
     /// base address of slot `k`'s column buffer (an `i64` pointer regardless of
     /// bank), aligned to [`LoweredF::slots`]. Returns
     /// `(program, total_int_regs, total_float_regs)`.
@@ -409,13 +415,26 @@ impl LoweredF {
         let (r_i, r_acc, r_n, r_one, r_stride, r_ea) = (m, m + 1, m + 2, m + 3, m + 4, m + 5);
         let r_base0 = m + 6;
         let total_int_regs = r_base0 + self.slots.len();
+        // A float result accumulates into a float register above the body's
+        // float bank; an int result uses the int `r_acc` and leaves the float
+        // bank at the body's count. `f_acc` is unused when the result is int.
+        let (f_acc, total_float_regs) = match self.result_bank {
+            ValType::Float => (self.num_float_regs, self.num_float_regs + 1),
+            ValType::Int => (0, self.num_float_regs),
+        };
 
         let mut p = Vec::new();
         let load_const = |p: &mut Vec<i64>, imm: i64, dst: usize| {
             p.extend_from_slice(&[OP_LOAD_CONST, imm, dst as i64]);
         };
         load_const(&mut p, 0, r_i);
-        load_const(&mut p, 0, r_acc);
+        // Accumulator init, run once before the merge point. `OP_LOAD_CONST_F`'s
+        // `f64::from_bits` must stay out of the traced loop body; here it is in
+        // the setup (0.0 has zero bits).
+        match self.result_bank {
+            ValType::Int => load_const(&mut p, 0, r_acc),
+            ValType::Float => p.extend_from_slice(&[OP_LOAD_CONST_F, 0, f_acc as i64]),
+        }
         load_const(&mut p, n, r_n);
         load_const(&mut p, 1, r_one);
         load_const(&mut p, 8, r_stride);
@@ -437,12 +456,25 @@ impl LoweredF {
             p.extend_from_slice(&[op, (r_base0 + k) as i64, r_ea as i64, slot.reg as i64]);
         }
         p.extend_from_slice(&self.body);
-        // acc += result (int); i += 1; if n > i goto @body
-        p.extend_from_slice(&[OP_ADD, r_acc as i64, self.result_reg as i64, r_acc as i64]);
+        // acc += result (bank-matched); i += 1; if n > i goto @body; return acc.
+        // The float accumulate is a loop-carried dependency, so the compiled
+        // trace cannot reassociate it — the running total sums in row order, bit
+        // for bit like the interpreter tiers.
+        match self.result_bank {
+            ValType::Int => {
+                p.extend_from_slice(&[OP_ADD, r_acc as i64, self.result_reg as i64, r_acc as i64])
+            }
+            ValType::Float => {
+                p.extend_from_slice(&[OP_FADD, f_acc as i64, self.result_reg as i64, f_acc as i64])
+            }
+        }
         p.extend_from_slice(&[OP_ADD, r_i as i64, r_one as i64, r_i as i64]);
         p.extend_from_slice(&[OP_JUMP_IF_ABOVE, r_n as i64, r_i as i64, body_pc as i64]);
-        p.extend_from_slice(&[OP_RETURN, r_acc as i64]);
-        (p, total_int_regs, self.num_float_regs)
+        match self.result_bank {
+            ValType::Int => p.extend_from_slice(&[OP_RETURN, r_acc as i64]),
+            ValType::Float => p.extend_from_slice(&[OP_RETURN_F, f_acc as i64]),
+        }
+        (p, total_int_regs, total_float_regs)
     }
 }
 
@@ -491,9 +523,10 @@ impl LowerCtxF<'_> {
 /// Lower a CEL expression to two-bank bytecode under a `schema` declaring which
 /// paths are `double`, or report why it is out of subset. Same subset as
 /// [`lower`] plus `double` literals/columns, but with per-bank register
-/// allocation. Mixed int/float arithmetic or comparison (no int->float cast op),
-/// float modulo, a float ternary arm, and a float-valued top-level result all
-/// bail (the caller falls back to the tree-walker).
+/// allocation. A float-valued top-level result accumulates into a float total.
+/// Mixed int/float arithmetic (no int->float cast for arithmetic), float
+/// modulo, and a float ternary arm still bail (the caller falls back to the
+/// tree-walker).
 pub fn lower_typed(expr: &IdedExpr, schema: &Schema) -> Result<LoweredF, LowerError> {
     let mut ctx = LowerCtxF {
         prelude: Vec::new(),
@@ -506,14 +539,10 @@ pub fn lower_typed(expr: &IdedExpr, schema: &Schema) -> Result<LoweredF, LowerEr
         schema,
     };
     let result = compile_t(&mut ctx, expr)?;
-    if result.bank != ValType::Int {
-        return Err(LowerError::unsupported(
-            "float-valued top-level result (no float accumulator)",
-        ));
-    }
     Ok(LoweredF {
         prelude: ctx.prelude,
         body: ctx.body,
+        result_bank: result.bank,
         result_reg: result.idx,
         num_int_regs: ctx.next_int,
         num_float_regs: ctx.next_float,

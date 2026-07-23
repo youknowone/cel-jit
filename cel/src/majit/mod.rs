@@ -554,6 +554,105 @@ mod tests {
         );
     }
 
+    /// Cross-check a **float-valued** typed batch (a float aggregate). The oracle
+    /// sums the tree-walker's per-row `f64` in row order; the clean two-bank
+    /// interpreter, the majit interpreter tier, and the compiled tier must each
+    /// reproduce that sum bit for bit (float addition is order-sensitive, so
+    /// compare bits, never a tolerance). The compiled run must trace the loop.
+    fn check_batch_float(expr_src: &str, cols: &[(&str, ColData)]) {
+        use super::bytecode::eval_batch_sum_float;
+        use super::bytecode::float_bank::{clean_interp_f, COMPILES as COMPILES_F};
+
+        let program =
+            Program::compile(expr_src).unwrap_or_else(|e| panic!("parse `{expr_src}`: {e:?}"));
+        let schema: Schema = cols.iter().map(|(n, d)| (n.to_string(), d.ty())).collect();
+        let lowered = lower_typed(program.expression(), &schema)
+            .unwrap_or_else(|e| panic!("lower_typed `{expr_src}`: {e}"));
+        assert_eq!(
+            lowered.result_bank,
+            ValType::Float,
+            "`{expr_src}` must lower to a float result"
+        );
+
+        // Slot order + bank pin.
+        let paths: Vec<&str> = lowered.slots.iter().map(|s| s.path.as_str()).collect();
+        let want_paths: Vec<&str> = cols.iter().map(|(n, _)| *n).collect();
+        assert_eq!(paths, want_paths, "slot order for `{expr_src}`");
+        for (slot, (_, d)) in lowered.slots.iter().zip(cols) {
+            assert_eq!(slot.ty, d.ty(), "slot `{}` bank for `{expr_src}`", slot.path);
+        }
+
+        let n = cols.first().map_or(0, |(_, d)| d.len());
+        for (name, d) in cols {
+            assert_eq!(d.len(), n, "column `{name}` length for `{expr_src}`");
+        }
+
+        // Oracle: sum the stock tree-walker's per-row f64 in row order.
+        let mut expected = 0.0f64;
+        for i in 0..n {
+            let mut ctx = Context::default();
+            for (name, d) in cols {
+                match d {
+                    ColData::Int(c) => ctx.add_variable_from_value(*name, c[i]),
+                    ColData::Float(c) => ctx.add_variable_from_value(*name, c[i]),
+                }
+            }
+            expected += match program
+                .execute(&ctx)
+                .unwrap_or_else(|e| panic!("execute `{expr_src}`: {e:?}"))
+            {
+                Value::Float(v) => v,
+                other => panic!("`{expr_src}`: unexpected {other:?}"),
+            };
+        }
+
+        let columns: Vec<Column> = cols.iter().map(|(_, d)| d.column()).collect();
+
+        // Clean two-bank interpreter over the built batch program.
+        let bases: Vec<i64> = columns.iter().map(|c| c.base()).collect();
+        let (prog, ni, nf) = lowered.batch_sum_program(&bases, n as i64);
+        let clean = f64::from_bits(clean_interp_f(&prog, ni, nf) as u64);
+        assert_eq!(clean.to_bits(), expected.to_bits(), "clean vs stock for `{expr_src}`");
+        core::hint::black_box(&columns);
+
+        // majit interpreter tier, then compiled tier (monotonic compile-counter).
+        let off = eval_batch_sum_float(&lowered, &columns, u32::MAX);
+        assert_eq!(off.to_bits(), expected.to_bits(), "batch jit-off vs stock for `{expr_src}`");
+        let before = COMPILES_F.load(Ordering::Relaxed);
+        let on = eval_batch_sum_float(&lowered, &columns, 8);
+        assert_eq!(on.to_bits(), expected.to_bits(), "batch jit-on vs stock for `{expr_src}`");
+        assert!(
+            COMPILES_F.load(Ordering::Relaxed) > before,
+            "float aggregate `{expr_src}` must compile the hot loop"
+        );
+    }
+
+    #[test]
+    fn batch_float_aggregate() {
+        // Float-valued top-level result -> float accumulator (OP_RETURN_F). The
+        // running total sums the per-row f64 in row order, bit-exact across the
+        // clean/interp/compiled tiers.
+        let n = 3000;
+        let price = gen_f64(n, 0x0FED_CBA9_8765_4321, 0.0, 100.0);
+        let qty = gen_f64(n, 0x1357_9BDF_2468_ACE0, 0.0, 50.0);
+        // sum(price * qty)
+        check_batch_float(
+            "price * qty",
+            &[
+                ("price", ColData::Float(price.clone())),
+                ("qty", ColData::Float(qty.clone())),
+            ],
+        );
+        // sum(price * qty + price) — two float ops feeding the accumulator
+        check_batch_float(
+            "price * qty + price",
+            &[("price", ColData::Float(price)), ("qty", ColData::Float(qty))],
+        );
+        // sum(price * 2.0) — a hoisted float constant inside a float aggregate
+        let p2 = gen_f64(n, 0x2468_ACE0_1357_9BDF, -50.0, 50.0);
+        check_batch_float("price * 2.0", &[("price", ColData::Float(p2))]);
+    }
+
     #[test]
     fn batch_float_policy_count() {
         // Flagship float policy: count rows where a float column clears a float
@@ -624,12 +723,14 @@ mod tests {
 
     #[test]
     fn typed_lowering_bails() {
-        // Float modulo and a float-valued top-level result (no float
-        // accumulator) still bail. A mixed int/float comparison no longer bails
-        // (the int side is widened via cast_int_to_float — see
-        // `batch_mixed_col_compare`).
-        let schema: Schema = [("p".to_string(), ValType::Float)].into_iter().collect();
-        for expr in ["p % 2.0 >= 1.0", "p + 1.0"] {
+        // Float modulo, mixed int/float arithmetic, and a float ternary arm
+        // still bail. (A float-valued top-level result now compiles into a float
+        // accumulator — see `batch_float_aggregate`; a mixed int/float
+        // comparison widens via cast_int_to_float — see `batch_mixed_col_compare`.)
+        let schema: Schema = [("p".to_string(), ValType::Float), ("q".to_string(), ValType::Int)]
+            .into_iter()
+            .collect();
+        for expr in ["p % 2.0 >= 1.0", "p + q", "p >= 1.0 ? p : p"] {
             let program = Program::compile(expr).unwrap();
             assert!(
                 lower_typed(program.expression(), &schema).is_err(),
