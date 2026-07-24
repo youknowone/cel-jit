@@ -65,6 +65,16 @@ pub const OP_RETURN_F: i64 = 36; // [RETURN_F, freg]        return fregs[freg].t
 pub const OP_FSELECT: i64 = 37; // [FSELECT, c, ft, ff, fdst]  fregs[fdst] = if regs[c]!=0 {fregs[ft]} else {fregs[ff]}
 pub const OP_ULT: i64 = 38; // [a, b, dst]              regs[dst] = ((regs[a] as u64) <  (regs[b] as u64)) as 0/1
 pub const OP_ULE: i64 = 39; // [a, b, dst]              regs[dst] = ((regs[a] as u64) <= (regs[b] as u64)) as 0/1
+// Overflow-checked user arithmetic. `OP_ADD`/`OP_SUB`/`OP_MUL` above stay plain
+// (wrapping) for the batch machinery's own counter/address/accumulator, which
+// operate on controlled values and whose cross-row sum must match the oracle's
+// plain `+=`. These carry the overflow-is-checked semantics for the user
+// expression: the no-overflow path is a fused `int_*_jump_if_ovf` (traced to
+// `Int*Ovf` + `GuardNoOverflow`); on overflow the guard deopts into the None
+// arm, which the blackhole runs on the virtualizable resume path.
+pub const OP_ADD_OVF: i64 = 40; // [a, b, dst]          regs[dst] = ovfchecked(a + b)
+pub const OP_SUB_OVF: i64 = 41; // [a, b, dst]          regs[dst] = ovfchecked(a - b)
+pub const OP_MUL_OVF: i64 = 42; // [a, b, dst]          regs[dst] = ovfchecked(a * b)
 
 /// Raw native-memory load intrinsic recognized by the `#[jit_interp]` proc
 /// macro (lowered to `raw_load_i`); at the interpreter tier this real fn runs.
@@ -157,6 +167,39 @@ fn run_mainloop(program: &Code, num_regs: usize, threshold: u32) -> i64 {
                 let b = program[pc + 2] as usize;
                 let d = program[pc + 3] as usize;
                 state.regs[d] = state.regs[a] * state.regs[b];
+                pc += 4;
+            }
+            OP_ADD_OVF => {
+                let a = program[pc + 1] as usize;
+                let b = program[pc + 2] as usize;
+                let d = program[pc + 3] as usize;
+                // Overflow-checked user add: the no-overflow path is a fused
+                // `int_add_jump_if_ovf` (traced to `IntAddOvf` + `GuardNoOverflow`);
+                // on overflow the guard deopts into the None arm.
+                state.regs[d] = match state.regs[a].checked_add(state.regs[b]) {
+                    Some(s) => s,
+                    None => state.regs[a].wrapping_add(state.regs[b]),
+                };
+                pc += 4;
+            }
+            OP_SUB_OVF => {
+                let a = program[pc + 1] as usize;
+                let b = program[pc + 2] as usize;
+                let d = program[pc + 3] as usize;
+                state.regs[d] = match state.regs[a].checked_sub(state.regs[b]) {
+                    Some(s) => s,
+                    None => state.regs[a].wrapping_sub(state.regs[b]),
+                };
+                pc += 4;
+            }
+            OP_MUL_OVF => {
+                let a = program[pc + 1] as usize;
+                let b = program[pc + 2] as usize;
+                let d = program[pc + 3] as usize;
+                state.regs[d] = match state.regs[a].checked_mul(state.regs[b]) {
+                    Some(s) => s,
+                    None => state.regs[a].wrapping_mul(state.regs[b]),
+                };
                 pc += 4;
             }
             OP_DIV => {
@@ -481,6 +524,23 @@ pub fn clean_interp(program: &Code, num_regs: usize) -> i64 {
             OP_MUL => {
                 regs[program[pc + 3] as usize] =
                     regs[program[pc + 1] as usize] * regs[program[pc + 2] as usize];
+                pc += 4;
+            }
+            // The oracle mirrors the fused-ovf None arm (wrapping) so it agrees
+            // with the JIT's overflow deopt result bit-for-bit.
+            OP_ADD_OVF => {
+                regs[program[pc + 3] as usize] =
+                    regs[program[pc + 1] as usize].wrapping_add(regs[program[pc + 2] as usize]);
+                pc += 4;
+            }
+            OP_SUB_OVF => {
+                regs[program[pc + 3] as usize] =
+                    regs[program[pc + 1] as usize].wrapping_sub(regs[program[pc + 2] as usize]);
+                pc += 4;
+            }
+            OP_MUL_OVF => {
+                regs[program[pc + 3] as usize] =
+                    regs[program[pc + 1] as usize].wrapping_mul(regs[program[pc + 2] as usize]);
                 pc += 4;
             }
             OP_DIV => {

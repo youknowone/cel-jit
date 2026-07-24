@@ -143,6 +143,42 @@ mod tests {
         assert_eq!(jit, cel_i, "majit (jit-off) vs stock for `{expr_src}` {binds:?}");
     }
 
+    /// Regression: an overflow-checked op (`OP_ADD_OVF`) whose `GuardNoOverflow`
+    /// fails inside a *compiled* trace must resume through the blackhole on the
+    /// virtualizable `[int; virt]` regs. This mid-body guard is the first on
+    /// this machine to land in vable-array resume territory; before the
+    /// deopt-time vinfo seed + `token_offset==0` inert token-clear it panicked.
+    /// The wrapped result must match the oracle.
+    #[test]
+    fn overflow_deopt_on_compiled_trace() {
+        use super::bytecode::{OP_ADD, OP_ADD_OVF, OP_JUMP_IF_ABOVE, OP_LOAD_CONST, OP_RETURN};
+        // regs: i=0, n=1, acc=2, inc=3, one=4. `inc = MAX/4` makes `acc` overflow
+        // a handful of iterations in — after the threshold-3 loop has compiled,
+        // so the overflow guard fails in the compiled trace.
+        let n: i64 = 30;
+        let inc: i64 = i64::MAX / 4;
+        let prog: Vec<i64> = vec![
+            OP_LOAD_CONST, 0, 0,
+            OP_LOAD_CONST, n, 1,
+            OP_LOAD_CONST, 0, 2,
+            OP_LOAD_CONST, inc, 3,
+            OP_LOAD_CONST, 1, 4,
+            // loop_start @ pc = 15
+            OP_ADD_OVF, 2, 3, 2,        // acc = ovfchecked(acc + inc)
+            OP_ADD, 0, 4, 0,            // i = i + 1
+            OP_JUMP_IF_ABOVE, 1, 0, 15, // while n > i
+            OP_RETURN, 2,
+        ];
+        let before = COMPILES.load(Ordering::Relaxed);
+        let jit = run_jit(&prog, 5, 3);
+        let clean = clean_interp(&prog, 5);
+        assert_eq!(jit, clean, "compiled-tier overflow deopt must match wrapping oracle");
+        assert!(
+            COMPILES.load(Ordering::Relaxed) > before,
+            "loop must tier-compile so the overflow lands in the compiled trace",
+        );
+    }
+
     #[test]
     fn scalar_policy_predicate() {
         for (a, b, c) in [
