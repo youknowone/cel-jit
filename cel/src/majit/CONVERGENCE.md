@@ -150,13 +150,36 @@ abort compile: root loop entry/jump arity mismatch input=3 jump=29
 
 — the tripwire at `majit-metainterp/src/optimizeopt/optimizer.rs` (the
 `inputarg_type_at` check). The outer trace's header declares 3 inputargs while
-its closing JUMP carries 29. That guard's own comment states RPython makes the
-two shapes equal *by construction*: `reached_loop_header`
-(`pyjitpl.py:2934-2978`) builds `live_arg_boxes = reds + virtualizable_boxes[:-1]`
-for both the merge-point registration and the closing JUMP. So this is not a
-design gap in meta-tracing; it is front-end A not reproducing that
-construction when a trace is cut across a second merge point and the
-virtualizable `regs: [int; virt]` array is forced to the heap.
+its closing JUMP carries 29.
+
+**Checked against RPython source** (`rpython/jit/metainterp/`, present on this
+machine), because whether this is a design limit or a port defect decides
+everything:
+
+1. **Cutting at the second encounter of a foreign green key is orthodox.**
+   `reached_loop_header` (`pyjitpl.py:3018-3060`) scans `current_merge_points`
+   for a matching green key; on no match it *appends* the foreign merge point
+   and keeps tracing. The second encounter matches that entry and compiles the
+   INNER loop from there, peeling the outer prefix as preamble. majit's split at
+   trip count 3 is exactly this.
+2. **The arity mismatch is structurally impossible in RPython.**
+   `live_arg_boxes = greenboxes + redboxes` plus, for a virtualizable jitdriver,
+   `+= self.virtualizable_boxes; .pop()` (`pyjitpl.py:2981-2989`). That one list
+   feeds the merge-point registration (:3060), `compile_loop` (:3039) and
+   `compile_trace`'s JUMP (:3213), and line **3020 asserts
+   `len(original_boxes) == len(live_arg_boxes)`**. `virtualizable_boxes` holds
+   one box per array element (`virtualizable.py:94-98`), so an RPython header
+   for `regs: [int; virt]` carries all the element boxes — 29, never 3.
+
+⇒ So this is **not** a design gap in meta-tracing: it is front-end A building
+the merge-point live-arg list differently from the closing JUMP. majit already
+does the RPython splice on the JUMP side —
+`JitState::collect_jump_args_with_boxes`
+(`majit-metainterp/src/jit_state.rs:619-642`) splices the `[int; virt]` element
+boxes in place of the `<arr>_ptr`/`<arr>_len` placeholders, citing
+`pyjitpl.py:2982-2989`. The header side does not. The orthodox fix is to build
+both from one list, as `reached_loop_header` does — and it lives in the parent
+majit repo, not here.
 
 Consequences for this document:
 
