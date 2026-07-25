@@ -1223,6 +1223,36 @@ mod tests {
         }
     }
 
+    /// Member syntax must never reach a GLOBAL overload. The tree-walker looks
+    /// the two spellings up in disjoint namespaces (`objects.rs:1331` global vs
+    /// `:1364` member), and of the whole stdlib only `size` is registered both
+    /// ways, so `x.double()` / `"...".timestamp()` are `UndeclaredReference`
+    /// errors there. Answering them would be a JIT-only result for an expression
+    /// the walker rejects.
+    #[test]
+    fn member_syntax_cannot_reach_global_overloads() {
+        let schema: Schema = [
+            ("i".to_string(), ValType::Int),
+            ("f".to_string(), ValType::Float),
+            ("s".to_string(), ValType::Str),
+        ]
+        .into_iter()
+        .collect();
+        for expr in [
+            "i.double() > 1.0",
+            "f.int() > 1",
+            "i.uint() > 1u",
+            "\"2024-01-01T00:00:00Z\".timestamp() > timestamp(\"2020-01-01T00:00:00Z\")",
+            "\"3s\".duration() > duration(\"1s\")",
+        ] {
+            let program = Program::compile(expr).unwrap();
+            assert!(
+                lower_typed(program.expression(), &schema).is_err(),
+                "`{expr}` must bail: member syntax does not reach a global overload"
+            );
+        }
+    }
+
     #[test]
     fn temporal_mixed_bails() {
         // A timestamp vs duration comparison is NoSuchOverload, a temporal vs int

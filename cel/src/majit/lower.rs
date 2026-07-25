@@ -926,29 +926,24 @@ fn compile_cmp_operands(
 }
 
 fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerError> {
-    // CEL member syntax `x.f(a)` is sugar for `f(x, a)`: the tree-walker resolves
-    // it by inserting the target at `args[0]` and looking up a member overload
-    // (`objects.rs:1358-1375`). Desugar to that same shape so a member call
-    // reaches the same arms as its global form. An unhandled name still falls
-    // through to the `call `{name}`` bail at the end, so this only widens what
-    // lowers — it never changes which function a lowered expression runs.
+    // Member syntax `x.f(a)` is NOT sugar for `f(x, a)` in this tree-walker: the
+    // two spellings look in DISJOINT namespaces. A global call resolves through
+    // `find_overload` (`objects.rs:1331`), which sees only `add_overload`
+    // registrations; a member call resolves through `find_member_overload`
+    // (`objects.rs:1364`), which sees only `add_member_overload` ones. Of the
+    // whole stdlib exactly one name (`size`) is registered both ways, and it is
+    // out of subset anyway.
     //
-    // The one shape the tree-walker resolves differently is a bare-`Ident`
-    // target, which it first tries as the QUALIFIED global `prefix.f`
-    // (`objects.rs:1348-1356`, e.g. `optional.none()`). Such a target names a
-    // namespace, not a value: it resolves to an untyped (`Int`) slot here and so
-    // fails the bank checks of every arm below, bailing to the tree-walker
-    // instead of miscompiling. Matching a function by bare name is the same
-    // assumption `timestamp`/`duration` already make (see the module header's
-    // schema/shape-guard note).
+    // So a member call is handled here in RECEIVER form or not at all — rewriting
+    // it to the global form would make the JIT answer `"...".timestamp()` or
+    // `x.double()`, which the walker rejects as an `UndeclaredReference`.
     if let Some(target) = &call.target {
         // Receiver-only stdlib accessors are registered with
         // `add_member_overload` (`common/types/duration.rs:191-222`,
         // `common/types/timestamp.rs:278-357`), so they exist ONLY in receiver
         // form: the global spelling `getHours(d)` is an `UndeclaredReference`
-        // error in the tree-walker. Match them here, before the desugar, so the
-        // global spelling keeps bailing instead of answering where the walker
-        // raises.
+        // error in the tree-walker, and is left to fall through to the `call
+        // `{name}`` bail below.
         //
         // The receiver's bank picks the meaning. On a `duration`, `getHours` /
         // `getMinutes` / `getSeconds` / `getMilliseconds` are
@@ -1066,17 +1061,10 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
                 }
             }
         }
-        let mut args = Vec::with_capacity(call.args.len() + 1);
-        args.push((**target).clone());
-        args.extend(call.args.iter().cloned());
-        return compile_call_t(
-            ctx,
-            &CallExpr {
-                func_name: call.func_name.clone(),
-                target: None,
-                args,
-            },
-        );
+        return Err(LowerError::unsupported(format!(
+            "member call `{}`",
+            call.func_name
+        )));
     }
     let name = call.func_name.as_str();
 
