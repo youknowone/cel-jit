@@ -23,7 +23,7 @@ bytes = { version = "1", optional = true }
 thiserror = "2"
 pastey = "0.2.1"
 
-# PoC meta-tracing JIT tier (feature `majit-jit`). The `majit` crates live in a
+# PoC meta-tracing JIT tier (feature `jit`). The `majit` crates live in a
 # separate workspace two levels up, so these are cross-workspace path deps.
 majit-ir = { path = "../../majit/majit-ir", optional = true }
 majit-macros = { path = "../../majit/majit-macros", optional = true }
@@ -40,27 +40,27 @@ harness = false
 
 [[example]]
 name = "majit_ab"
-required-features = ["majit-jit"]
+required-features = ["jit"]
 
 [[example]]
 name = "majit_vs_cometkim"
-required-features = ["majit-jit"]
+required-features = ["jit"]
 
 [[example]]
 name = "majit_columnar_batch"
-required-features = ["majit-jit"]
+required-features = ["jit"]
 
 [[example]]
 name = "majit_columnar_batch_float"
-required-features = ["majit-jit"]
+required-features = ["jit"]
 
 [[example]]
 name = "majit_columnar_batch_uint"
-required-features = ["majit-jit"]
+required-features = ["jit"]
 
 [[example]]
 name = "majit_columnar_batch_string"
-required-features = ["majit-jit"]
+required-features = ["jit"]
 
 [features]
 default = ["regex", "chrono"]
@@ -74,7 +74,7 @@ dhat-heap = [ ] # if you are doing heap profiling
 # PoC: meta-tracing JIT tier built on the in-repo `majit` framework (cell-majit,
 # issue #357). Additive and off by default. Applies majit's RPython-style
 # meta-tracer to a traceable CEL evaluation mainloop.
-majit-jit = [
+jit = [
     "dep:majit-ir",
     "dep:majit-macros",
     "dep:majit-metainterp",
