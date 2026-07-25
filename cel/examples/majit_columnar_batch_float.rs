@@ -1,6 +1,11 @@
 //! cell-majit **float** columnar batch evaluator vs the stock tree-walker
 //! (issue #357). The `double` analog of `majit_columnar_batch`.
 //!
+//! This is an explicit **cross-model batch experiment**, not the default fair
+//! CEL JIT benchmark. Pre-transposed columns plus a fused row loop make the
+//! stock/JIT ratio unsuitable as a request-latency or JIT-only claim. Run
+//! `./bench.sh` for the fair request/engine/cold suite.
+//!
 //! Runs the REAL cel path: a CEL `Program` over `double` columns is lowered
 //! (`cel::majit::lower::lower_typed`, under a schema declaring the float slots)
 //! and evaluated over a batch of rows via `eval_batch_sum_f`, which reads each
@@ -15,20 +20,21 @@
 //! tree-walker at its best: ONE reused `Context` whose variables are overwritten
 //! per row, then `Program::execute`.
 //!
-//! Three steady-state measurements on identical data columns:
-//!   naive    stock tree-walker, reused Context  — the baseline to beat
-//!   JIT-off  majit bytecode interpreter tier    — lowering only, no compilation
-//!   JIT-on   majit compiled trace               — the win
-//! JIT-off ≈ naive is the point: the speedup comes from COMPILATION. The result
-//! is bit-exact (no float tolerance); the 3-way equality gate enforces it.
-//! RELEASE ONLY.
+//! Four steady-state measurements over one prebuilt batch program:
+//!   stock    stock tree-walker, reused Context
+//!   clean VM plain Rust bytecode interpreter, no tracing/JIT machinery
+//!   JIT-off  majit tracing interpreter, compilation disabled
+//!   JIT-on   majit compiled trace
+//! This separates the representation/lowering win (`stock / clean VM`) from
+//! the compilation win (`clean VM / JIT-on`). The result is bit-exact (no float
+//! tolerance); a 4-way equality gate enforces it. RELEASE ONLY.
 
 use std::hint::black_box;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
-use cel::majit::bytecode::float_bank::COMPILES;
-use cel::majit::bytecode::{eval_batch_sum_f, eval_batch_sum_float, Column};
+use cel::majit::bytecode::float_bank::{clean_interp_f, run_jit_f, COMPILES};
+use cel::majit::bytecode::Column;
 use cel::majit::lower::{lower_typed, Schema, ValType};
 use cel::{Context, Program, Value};
 
@@ -79,6 +85,8 @@ fn main() {
     let price = make_col_f(n, 0.0, 200.0, 0x2545_F491_4F6C_DD1D);
     let qty = make_col_f(n, 0.0, 100.0, 0x9E37_79B9_7F4A_7C15);
     let columns: Vec<Column> = vec![Column::Float(&price), Column::Float(&qty)];
+    let bases: Vec<i64> = columns.iter().map(Column::base).collect();
+    let (batch, num_int, num_float) = lowered.batch_sum_program(&bases, n as i64);
 
     // FAIR baseline: the stock tree-walker at its best — reuse one Context,
     // overwrite the two float variables per row (hot; no per-row Context alloc).
@@ -97,14 +105,16 @@ fn main() {
         acc
     };
 
-    // Correctness gate: naive == JIT-off == JIT-on (bit-exact; same columns).
+    // Correctness gate: stock == clean VM == JIT-off == JIT-on.
     COMPILES.store(0, Ordering::Relaxed);
     let base = naive();
-    let off = eval_batch_sum_f(&lowered, &columns, u32::MAX);
+    let clean = clean_interp_f(&batch, num_int, num_float);
+    let off = run_jit_f(&batch, num_int, num_float, u32::MAX);
     let off_c = COMPILES.load(Ordering::Relaxed);
     COMPILES.store(0, Ordering::Relaxed);
-    let on = eval_batch_sum_f(&lowered, &columns, 8);
+    let on = run_jit_f(&batch, num_int, num_float, 8);
     let on_c = COMPILES.load(Ordering::Relaxed);
+    assert_eq!(base, clean, "stock vs clean VM divergence");
     assert_eq!(base, off, "naive vs JIT-off divergence");
     assert_eq!(base, on, "naive vs JIT-on divergence -> miscompile");
     assert_eq!(off_c, 0, "JIT-off must never compile");
@@ -116,25 +126,46 @@ fn main() {
     );
 
     let rounds = 5;
-    let (mut on_t, mut off_t, mut naive_t) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut on_t, mut off_t, mut clean_t, mut naive_t) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for _ in 0..rounds {
         naive_t.push(time_ns_per_row(n, naive));
-        off_t.push(time_ns_per_row(n, || eval_batch_sum_f(&lowered, &columns, u32::MAX)));
-        on_t.push(time_ns_per_row(n, || eval_batch_sum_f(&lowered, &columns, 8)));
+        clean_t.push(time_ns_per_row(n, || {
+            clean_interp_f(&batch, num_int, num_float)
+        }));
+        off_t.push(time_ns_per_row(n, || {
+            run_jit_f(&batch, num_int, num_float, u32::MAX)
+        }));
+        on_t.push(time_ns_per_row(n, || {
+            run_jit_f(&batch, num_int, num_float, 8)
+        }));
     }
-    let (jit, jit_off, nv) = (median(on_t), median(off_t), median(naive_t));
-    println!();
-    println!("  naive   (cel tree-walk, reused ctx) : {nv:>9.2} ns/row   ← fair baseline (hot)");
-    println!("  majit   JIT-off (bytecode interp)   : {jit_off:>9.2} ns/row   ← lowering only, no compile");
-    println!(
-        "  majit   JIT-on  (compiled trace)    : {jit:>9.2} ns/row   ← {:.0}x faster than naive  {}",
-        nv / jit,
-        if nv / jit > 1.0 { "✅" } else { "❌" }
+    let (jit, jit_off, vm, nv) = (
+        median(on_t),
+        median(off_t),
+        median(clean_t),
+        median(naive_t),
     );
     println!();
+    println!("  stock   (cel tree-walk, reused ctx) : {nv:>9.2} ns/row");
+    println!("  clean VM(lowered bytecode, no JIT)  : {vm:>9.2} ns/row");
+    println!("  majit   (tracing interp, JIT off)    : {jit_off:>9.2} ns/row");
+    println!("  majit   (compiled trace, JIT on)     : {jit:>9.2} ns/row");
+    println!();
     println!(
-        "  => JIT-off is {:.2}x of naive, so the {:.0}x win is COMPILATION, not lowering.",
-        jit_off / nv,
+        "  VM/data-model effect  stock / clean VM : {:>8.2}x",
+        nv / vm
+    );
+    println!(
+        "  JIT effect          clean VM / JIT-on  : {:>8.2}x",
+        vm / jit
+    );
+    println!(
+        "  majit tier delta     JIT-off / JIT-on  : {:>8.2}x",
+        jit_off / jit
+    );
+    println!(
+        "  cross-model batch    stock / JIT-on    : {:>8.2}x",
         nv / jit
     );
 
@@ -147,7 +178,12 @@ fn main() {
     let agg_program = Program::compile(agg_expr).expect("compile aggregate");
     let agg_lowered =
         lower_typed(agg_program.expression(), &schema).expect("lower float aggregate");
-    assert_eq!(agg_lowered.result_bank, ValType::Float, "aggregate must be float-valued");
+    assert_eq!(
+        agg_lowered.result_bank,
+        ValType::Float,
+        "aggregate must be float-valued"
+    );
+    let (agg_batch, agg_num_int, agg_num_float) = agg_lowered.batch_sum_program(&bases, n as i64);
 
     let naive_agg = || -> f64 {
         let mut acc = 0.0f64;
@@ -164,33 +200,69 @@ fn main() {
     };
 
     let base_a = naive_agg();
-    let off_a = eval_batch_sum_float(&agg_lowered, &columns, u32::MAX);
+    let clean_a = f64::from_bits(clean_interp_f(&agg_batch, agg_num_int, agg_num_float) as u64);
+    let off_a = f64::from_bits(run_jit_f(&agg_batch, agg_num_int, agg_num_float, u32::MAX) as u64);
     COMPILES.store(0, Ordering::Relaxed);
-    let on_a = eval_batch_sum_float(&agg_lowered, &columns, 8);
+    let on_a = f64::from_bits(run_jit_f(&agg_batch, agg_num_int, agg_num_float, 8) as u64);
     let on_ac = COMPILES.load(Ordering::Relaxed);
-    assert_eq!(base_a.to_bits(), off_a.to_bits(), "aggregate naive vs JIT-off divergence");
-    assert_eq!(base_a.to_bits(), on_a.to_bits(), "aggregate naive vs JIT-on -> miscompile");
+    assert_eq!(
+        base_a.to_bits(),
+        clean_a.to_bits(),
+        "aggregate stock vs clean VM"
+    );
+    assert_eq!(
+        base_a.to_bits(),
+        off_a.to_bits(),
+        "aggregate naive vs JIT-off divergence"
+    );
+    assert_eq!(
+        base_a.to_bits(),
+        on_a.to_bits(),
+        "aggregate naive vs JIT-on -> miscompile"
+    );
     assert!(on_ac >= 1, "aggregate JIT-on must compile the batch loop");
 
-    let (mut on_a_t, mut off_a_t, mut naive_a_t) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut on_a_t, mut off_a_t, mut clean_a_t, mut naive_a_t) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for _ in 0..rounds {
         naive_a_t.push(time_ns_per_row(n, || naive_agg().to_bits()));
+        clean_a_t.push(time_ns_per_row(n, || {
+            clean_interp_f(&agg_batch, agg_num_int, agg_num_float)
+        }));
         off_a_t.push(time_ns_per_row(n, || {
-            eval_batch_sum_float(&agg_lowered, &columns, u32::MAX).to_bits()
+            run_jit_f(&agg_batch, agg_num_int, agg_num_float, u32::MAX)
         }));
         on_a_t.push(time_ns_per_row(n, || {
-            eval_batch_sum_float(&agg_lowered, &columns, 8).to_bits()
+            run_jit_f(&agg_batch, agg_num_int, agg_num_float, 8)
         }));
     }
-    let (jit_a, jit_off_a, nv_a) = (median(on_a_t), median(off_a_t), median(naive_a_t));
+    let (jit_a, jit_off_a, vm_a, nv_a) = (
+        median(on_a_t),
+        median(off_a_t),
+        median(clean_a_t),
+        median(naive_a_t),
+    );
     println!();
     println!("aggregate: sum({agg_expr}) = {base_a:.3}  (all paths agree)  compiles on={on_ac}");
-    println!("  naive   (cel tree-walk, reused ctx) : {nv_a:>9.2} ns/row   ← fair baseline (hot)");
-    println!("  majit   JIT-off (bytecode interp)   : {jit_off_a:>9.2} ns/row");
+    println!("  stock   (cel tree-walk, reused ctx) : {nv_a:>9.2} ns/row");
+    println!("  clean VM(lowered bytecode, no JIT)  : {vm_a:>9.2} ns/row");
+    println!("  majit   (tracing interp, JIT off)    : {jit_off_a:>9.2} ns/row");
+    println!("  majit   (compiled trace, JIT on)     : {jit_a:>9.2} ns/row");
     println!(
-        "  majit   JIT-on  (compiled trace)    : {jit_a:>9.2} ns/row   ← {:.0}x faster than naive  {}",
-        nv_a / jit_a,
-        if nv_a / jit_a > 1.0 { "✅" } else { "❌" }
+        "  VM/data-model effect  stock / clean VM : {:>8.2}x",
+        nv_a / vm_a
+    );
+    println!(
+        "  JIT effect          clean VM / JIT-on  : {:>8.2}x",
+        vm_a / jit_a
+    );
+    println!(
+        "  majit tier delta     JIT-off / JIT-on  : {:>8.2}x",
+        jit_off_a / jit_a
+    );
+    println!(
+        "  cross-model batch    stock / JIT-on    : {:>8.2}x",
+        nv_a / jit_a
     );
 
     black_box((&price, &qty));
