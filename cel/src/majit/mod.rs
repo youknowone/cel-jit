@@ -1929,36 +1929,71 @@ mod tests {
     }
 
     #[test]
-    fn uint_arith_bails() {
-        // uint `+ - *` bail; `/ %` and the comparisons lower.
-        //
-        // `+ - *` USED to reuse the signed opcodes on the grounds that they are
-        // bit-identical mod 2^64 — true of the value, false of the CHECK. The
-        // tree-walker uses `u64::checked_*` (`common/types/uint.rs:78-196`) and
-        // raises on unsigned overflow, which the signed `Int*Ovf` guard answers
-        // wrongly in both directions: `2^63 + 1` is fine unsigned but overflows
-        // signed, and `0u - 1u` is the reverse. So they fall back rather than
-        // wrap silently.
-        let schema: Schema =
-            [("a".to_string(), ValType::UInt), ("b".to_string(), ValType::UInt)]
-                .into_iter()
-                .collect();
-        for expr in ["a + b >= 1500u", "a - b >= 1500u", "a * b < 250000u"] {
-            let program = Program::compile(expr).unwrap();
-            assert!(
-                lower_typed(program.expression(), &schema).is_err(),
-                "`{expr}` must bail the typed lowering (no unsigned overflow guard)"
+    fn batch_uint_arithmetic() {
+        // uint `+ - *` are checked against the UNSIGNED bounds. Reusing the
+        // signed `Int*Ovf` guard would be wrong in BOTH directions, so both are
+        // pinned here: this test's operands are all above `i64::MAX`, where a
+        // signed guard would refuse every row, and `uint_arith_refuses` covers
+        // the reverse (`0u - 1u`, fine signed and not unsigned).
+        let n = 2000;
+        let a: Vec<i64> = gen_i64(n, 0x0bad_c0de_1234_5678, 0, 1_000_000_000)
+            .into_iter()
+            .map(|v| (v as u64 + (1u64 << 63)) as i64)
+            .collect();
+        let b = gen_i64(n, 0xfeed_face_8765_4321, 0, 1_000_000);
+        // A full-width sum would overflow the machine's plain `OP_ADD`
+        // reduction, so reduce each row first.
+        for expr in [
+            "(a + b) % 1000000007u",
+            "(a - b) % 1000000007u",
+            "a + b >= a",
+            "a - b <= a",
+        ] {
+            check_batch_f(
+                expr,
+                &[
+                    ("a", ColData::UInt(a.clone())),
+                    ("b", ColData::UInt(b.clone())),
+                ],
             );
         }
-        // Division and modulo DO lower — unsigned `/` and `%` are total once the
-        // zero divisor is guarded, and the guard is the same shape the signed
-        // ones carry.
-        for expr in ["a / b >= 1u", "a % b >= 1u"] {
-            let program = Program::compile(expr).unwrap();
-            assert!(
-                lower_typed(program.expression(), &schema).is_ok(),
-                "`{expr}` must lower (unsigned division is guarded, not refused)"
+        // Products that exceed `i64::MAX` but still fit a `u64` — the case the
+        // unsigned `uint_mul_high` test accepts and a signed one would not.
+        let c = gen_i64(n, 0x1357_9bdf_2468_ace0, 3_000_000_000, 4_000_000_000);
+        let d = gen_i64(n, 0x2468_ace0_1357_9bdf, 3_000_000_000, 4_000_000_000);
+        for expr in ["(c * d) % 1000000007u", "c * d > 9223372036854775807u"] {
+            check_batch_f(
+                expr,
+                &[
+                    ("c", ColData::UInt(c.clone())),
+                    ("d", ColData::UInt(d.clone())),
+                ],
             );
+        }
+    }
+
+    #[test]
+    fn uint_arith_refuses() {
+        // The unsigned bounds, one row each: a carry out of bit 63, a borrow
+        // below zero, and a product wider than 64 bits. `0u - 1u` is the
+        // direction a signed guard would have waved through.
+        let n = 240;
+        let ones = vec![1i64; n];
+        let filler: Vec<i64> = (0..n).map(|i| i as i64 + 10).collect();
+        let mut carries = filler.clone();
+        carries[200] = -1; // u64::MAX
+        let mut borrows = filler.clone();
+        borrows[200] = 0;
+        let mut wide = filler.clone();
+        wide[200] = 1i64 << 40;
+        let mut wide_peer = filler;
+        wide_peer[200] = 1i64 << 40;
+        for (expr, a, b) in [
+            ("a + b", carries, ones.clone()),
+            ("a - b", borrows, ones),
+            ("a * b", wide, wide_peer),
+        ] {
+            check_batch_f_refuses(expr, &[("a", ColData::UInt(a)), ("b", ColData::UInt(b))]);
         }
     }
 

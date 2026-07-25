@@ -116,6 +116,24 @@ pub const OP_MOD_CHK: i64 = 46; // [a, b, dst, trap]  regs[dst] = a % b   (sign 
 pub const OP_UDIV: i64 = 47; // [a, b, dst, trap]  regs[dst] = (a as u64) / (b as u64)
 pub const OP_UMOD: i64 = 48; // [a, b, dst, trap]  regs[dst] = (a as u64) % (b as u64)
 
+// Overflow-checked UNSIGNED arithmetic, the `uint` peers of `OP_*_OVF`. The
+// values these produce are bit-identical to the signed ops (two's complement
+// `+ - *` do not care about signedness) — the CHECK is what differs, and the
+// signed `Int*Ovf` guard answers it wrongly in both directions: `2^63 + 1` is a
+// fine `uint` but overflows signed, and `0u - 1u` is the reverse. The
+// tree-walker uses `u64::checked_*` (`common/types/uint.rs:78-196`), so the
+// unsigned condition is the one to guard.
+//
+// RPython has no unsigned overflow resop either (`int_add_ovf` is signed-only,
+// and `r_uint` arithmetic simply WRAPS in RPython — it is CEL, not RPython,
+// that makes these partial). The condition is therefore built from ops the
+// trace already has: a carry is `sum <u lhs`, a borrow is `lhs <u rhs`, and a
+// product overflows exactly when the high word of the 128-bit result is
+// nonzero, which is what `uint_mul_high` returns.
+pub const OP_UADD_OVF: i64 = 49; // [a, b, dst, trap]  regs[dst] = ovfchecked_u(a + b)
+pub const OP_USUB_OVF: i64 = 50; // [a, b, dst, trap]  regs[dst] = ovfchecked_u(a - b)
+pub const OP_UMUL_OVF: i64 = 51; // [a, b, dst, trap]  regs[dst] = ovfchecked_u(a * b)
+
 /// Raw native-memory load intrinsic recognized by the `#[jit_interp]` proc
 /// macro (lowered to `raw_load_i`); at the interpreter tier this real fn runs.
 /// `base` is a column buffer's base address, `ea` a byte offset — reading
@@ -755,7 +773,7 @@ pub mod float_bank {
         OP_FNEG, OP_FSELECT, OP_FSUB, OP_GE, OP_GT, OP_I2F, OP_JUMP_IF_ABOVE, OP_LE, OP_LOAD_CONST,
         OP_LOAD_CONST_F, OP_LT, OP_MOD, OP_MOD_CHK, OP_MOV, OP_MUL, OP_MUL_OVF, OP_NE, OP_NEG,
         OP_NOT, OP_OR, OP_RETURN, OP_RETURN_F, OP_SELECT, OP_SUB, OP_SUB_OVF, OP_TRAP_STORE,
-        OP_UDIV, OP_ULE, OP_ULT, OP_UMOD,
+        OP_UADD_OVF, OP_UDIV, OP_ULE, OP_ULT, OP_UMOD, OP_UMUL_OVF, OP_USUB_OVF,
     };
     use core::sync::atomic::Ordering;
 
@@ -828,6 +846,19 @@ pub mod float_bank {
         ((a as u64) % (b as u64)) as i64
     }
 
+    /// High 64 bits of the 128-bit unsigned product — the `uint_mul_high`
+    /// resop, reached through the mainloop's `native_int_binops` alias rather
+    /// than a hard-coded intrinsic name. It is zero exactly when `a * b` fits in
+    /// a `u64`, which is the unsigned multiply-overflow test.
+    ///
+    /// The `u128` here is interpreter-tier only: the alias rewrites the CALL to
+    /// the opcode, so the trace never looks inside this body (the backends emit
+    /// `mulhi`/`umulh` for it).
+    #[inline]
+    fn majit_uint_mul_high(a: i64, b: i64) -> i64 {
+        (((a as u64 as u128) * (b as u64 as u128)) >> 64) as u64 as i64
+    }
+
     struct VmStateF {
         regs: Vec<i64>,
         fregs: Vec<f64>,
@@ -841,6 +872,10 @@ pub mod float_bank {
             regs: [int; virt],
             fregs: [float; virt],
         },
+        // `opcode_for_binop` has no unsigned spelling and `BindingKind` carries
+        // no signedness, so the unsigned multiply-high resop is reached by
+        // aliasing the helper call to the opcode.
+        native_int_binops = { majit_uint_mul_high => UintMulHigh },
     )]
     fn run_mainloop_f(
         program: &Code,
@@ -1082,6 +1117,46 @@ pub mod float_bank {
                     } else {
                         state.regs[d] = majit_uint_mod(a, b);
                     }
+                    pc += 5;
+                }
+                OP_UADD_OVF => {
+                    let a = state.regs[program[pc + 1] as usize];
+                    let b = state.regs[program[pc + 2] as usize];
+                    let d = program[pc + 3] as usize;
+                    let t = program[pc + 4] as usize;
+                    let s = a.wrapping_add(b);
+                    // Carry out of bit 63: the wrapped sum lands strictly below
+                    // either addend exactly when the true sum did not fit.
+                    if majit_uint_lt(s, a) != 0 {
+                        state.regs[t] = 1;
+                    }
+                    state.regs[d] = s;
+                    pc += 5;
+                }
+                OP_USUB_OVF => {
+                    let a = state.regs[program[pc + 1] as usize];
+                    let b = state.regs[program[pc + 2] as usize];
+                    let d = program[pc + 3] as usize;
+                    let t = program[pc + 4] as usize;
+                    // Borrow: an unsigned difference is representable iff the
+                    // minuend is not below the subtrahend.
+                    if majit_uint_lt(a, b) != 0 {
+                        state.regs[t] = 1;
+                    }
+                    state.regs[d] = a.wrapping_sub(b);
+                    pc += 5;
+                }
+                OP_UMUL_OVF => {
+                    let a = state.regs[program[pc + 1] as usize];
+                    let b = state.regs[program[pc + 2] as usize];
+                    let d = program[pc + 3] as usize;
+                    let t = program[pc + 4] as usize;
+                    // The full product is 128 bits wide; it fits in a u64 iff
+                    // the high word is zero.
+                    if majit_uint_mul_high(a, b) != 0 {
+                        state.regs[t] = 1;
+                    }
+                    state.regs[d] = a.wrapping_mul(b);
                     pc += 5;
                 }
                 OP_NEG => {
@@ -1442,6 +1517,36 @@ pub mod float_bank {
                             regs[program[pc + 3] as usize] = 0;
                         }
                     }
+                    pc += 5;
+                }
+                // The unsigned overflow trio: the reference tier spells the
+                // condition as `u64::checked_*`, which is the tree-walker's own
+                // test, and always stores the wrapped value like the traced tier.
+                OP_UADD_OVF => {
+                    let a = regs[program[pc + 1] as usize] as u64;
+                    let b = regs[program[pc + 2] as usize] as u64;
+                    if a.checked_add(b).is_none() {
+                        regs[program[pc + 4] as usize] = 1;
+                    }
+                    regs[program[pc + 3] as usize] = a.wrapping_add(b) as i64;
+                    pc += 5;
+                }
+                OP_USUB_OVF => {
+                    let a = regs[program[pc + 1] as usize] as u64;
+                    let b = regs[program[pc + 2] as usize] as u64;
+                    if a.checked_sub(b).is_none() {
+                        regs[program[pc + 4] as usize] = 1;
+                    }
+                    regs[program[pc + 3] as usize] = a.wrapping_sub(b) as i64;
+                    pc += 5;
+                }
+                OP_UMUL_OVF => {
+                    let a = regs[program[pc + 1] as usize] as u64;
+                    let b = regs[program[pc + 2] as usize] as u64;
+                    if a.checked_mul(b).is_none() {
+                        regs[program[pc + 4] as usize] = 1;
+                    }
+                    regs[program[pc + 3] as usize] = a.wrapping_mul(b) as i64;
                     pc += 5;
                 }
                 OP_NEG => {

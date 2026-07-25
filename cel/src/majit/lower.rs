@@ -1425,11 +1425,11 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
     // `OP_MUL` stay reserved for the batch machinery's own counters and offsets
     // and for the calendar helpers, whose operands are bounded by construction.
     let arith = match name {
-        ops::ADD => Some((OP_ADD_OVF, None, Some(OP_FADD))),
-        ops::SUBSTRACT => Some((OP_SUB_OVF, None, Some(OP_FSUB))),
-        ops::MULTIPLY => Some((OP_MUL_OVF, None, Some(OP_FMUL))),
-        ops::DIVIDE => Some((OP_DIV_CHK, Some(OP_UDIV), Some(OP_FDIV))),
-        ops::MODULO => Some((OP_MOD_CHK, Some(OP_UMOD), None)),
+        ops::ADD => Some((OP_ADD_OVF, OP_UADD_OVF, Some(OP_FADD))),
+        ops::SUBSTRACT => Some((OP_SUB_OVF, OP_USUB_OVF, Some(OP_FSUB))),
+        ops::MULTIPLY => Some((OP_MUL_OVF, OP_UMUL_OVF, Some(OP_FMUL))),
+        ops::DIVIDE => Some((OP_DIV_CHK, OP_UDIV, Some(OP_FDIV))),
+        ops::MODULO => Some((OP_MOD_CHK, OP_UMOD, None)),
         _ => None,
     };
     if let Some((iop, uop, fop)) = arith {
@@ -1440,8 +1440,10 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
         let b = compile_t(ctx, &call.args[1])?;
         // Every int-bank arithmetic opcode reachable from a user expression is a
         // TRAPPING (5-word) form carrying `OVF_FLAG_REG`: each of these five
-        // operators is partial in the tree-walker, so the JIT either answers
-        // what the walker answers or records that it cannot answer at all.
+        // operators is partial in the tree-walker on BOTH integer banks, so the
+        // JIT either answers what the walker answers or records that it cannot
+        // answer at all. The signed and unsigned peers differ only in which
+        // bound they check — the values are bit-identical two's complement.
         let emit_trapping = |ctx: &mut LowerCtxF, op: i64, bank: ValType| {
             let d = ctx.fresh(bank);
             ctx.body.extend_from_slice(&[
@@ -1455,17 +1457,7 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
         };
         match (a.bank, b.bank) {
             (ValType::Int, ValType::Int) => Ok(emit_trapping(ctx, iop, ValType::Int)),
-            (ValType::UInt, ValType::UInt) => match uop {
-                Some(op) => Ok(emit_trapping(ctx, op, ValType::UInt)),
-                // uint `+ - *` are checked against the UNSIGNED bounds
-                // (`common/types/uint.rs:78-196` uses `u64::checked_*`), which
-                // the signed `Int*Ovf` guard does not answer: `2^63 + 1` is fine
-                // unsigned and overflows signed, and `0u - 1u` is the reverse.
-                // They bail rather than wrap silently.
-                None => Err(LowerError::unsupported(
-                    "uint `+ - *` (no unsigned overflow guard)",
-                )),
-            },
+            (ValType::UInt, ValType::UInt) => Ok(emit_trapping(ctx, uop, ValType::UInt)),
             (ValType::Float, ValType::Float) => {
                 let fop = fop.ok_or_else(|| LowerError::unsupported("float modulo"))?;
                 let d = ctx.fresh(ValType::Float);
