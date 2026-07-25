@@ -90,7 +90,9 @@
 //! arithmetic, and the element load is a `raw_load` at `(offset + j) * 8`
 //! exactly as a row load is one at `row * 8`. Field access on the loop variable
 //! resolves to those element columns, which is what the literal-list unroll
-//! could never do.
+//! could never do. An element column's length is the batch's flattened element
+//! count, not the row count, so the row count is a parameter of
+//! [`bytecode::eval_batch_sum_f`] rather than something read off a column.
 //!
 //! Everything outside this columnar subset — bytes, maps, lists of lists,
 //! list-valued results, member/method calls, `in`, custom functions — is a
@@ -104,7 +106,7 @@ pub mod smoke;
 
 #[cfg(test)]
 mod tests {
-    use super::bytecode::{eval_batch_sum_f, Column};
+    use super::bytecode::{clean_batch_sum_f, eval_batch_sum_f, Column};
     use super::lower::{lower_typed, size_slot_source, Schema, ValType};
     use crate::{Context, Program, Value};
     use core::sync::atomic::Ordering;
@@ -171,34 +173,10 @@ mod tests {
             "clean interp vs stock for `{expr_src}` {binds:?}"
         );
         assert_eq!(
-            majit_batch_sum_f(&lowered, &columns, 1, u32::MAX),
+            eval_batch_sum_f(&lowered, &columns, 1, u32::MAX),
             Some(cel_i),
             "majit (jit-off) vs stock for `{expr_src}` {binds:?}"
         );
-    }
-
-    /// [`super::bytecode::eval_batch_sum_f`] with an EXPLICIT row count. The
-    /// public entry point reads `n` off the first row column, which cannot work
-    /// for an expression that reads no column at all (`[1,2,3].all(x, x > 0)`
-    /// folds to a constant and has zero slots).
-    fn majit_batch_sum_f(
-        lowered: &super::lower::LoweredF,
-        columns: &[Column],
-        n: usize,
-        threshold: u32,
-    ) -> Option<i64> {
-        use super::bytecode::float_bank::run_jit_f;
-        let bases: Vec<i64> = columns.iter().map(|c| c.base()).collect();
-        let mut trap: Box<i64> = Box::new(0);
-        let trap_addr = (&mut *trap) as *mut i64 as i64;
-        let (prog, ni, nf) = lowered.batch_sum_program_trapping(&bases, n as i64, trap_addr);
-        let out = run_jit_f(&prog, ni, nf, threshold);
-        core::hint::black_box(columns);
-        if *trap != 0 {
-            None
-        } else {
-            Some(out)
-        }
     }
 
     /// Regression: an overflow-checked op (`OP_ADD_OVF`) whose `GuardNoOverflow`
@@ -372,7 +350,7 @@ mod tests {
         let (c0, c2, c4) = (vec![10i64], vec![30i64], vec![50i64]);
         let columns = [Column::Int(&c0), Column::Int(&c2), Column::Int(&c4)];
         assert_eq!(clean_batch_sum_f(&lowered, &columns, 1), Some(cel));
-        assert_eq!(eval_batch_sum_f(&lowered, &columns, u32::MAX), Some(cel));
+        assert_eq!(eval_batch_sum_f(&lowered, &columns, 1, u32::MAX), Some(cel));
     }
 
     #[test]
@@ -684,30 +662,6 @@ mod tests {
             .collect()
     }
 
-    /// Run the clean two-bank interpreter over a freshly built batch program.
-    /// Returns `None` on an int-arithmetic overflow, the same contract as
-    /// [`super::bytecode::eval_batch_sum_f`], so all three tiers are compared on
-    /// equal terms — a tier that silently wrapped where another trapped would
-    /// show up as a `Some`/`None` mismatch, not as a plausible wrong number.
-    fn clean_batch_sum_f(
-        lowered: &super::lower::LoweredF,
-        columns: &[Column],
-        n: usize,
-    ) -> Option<i64> {
-        use super::bytecode::float_bank::clean_interp_f;
-        let bases: Vec<i64> = columns.iter().map(|c| c.base()).collect();
-        let mut trap: Box<i64> = Box::new(0);
-        let trap_addr = (&mut *trap) as *mut i64 as i64;
-        let (prog, ni, nf) = lowered.batch_sum_program_trapping(&bases, n as i64, trap_addr);
-        let out = clean_interp_f(&prog, ni, nf);
-        core::hint::black_box(columns);
-        if *trap != 0 {
-            None
-        } else {
-            Some(out)
-        }
-    }
-
     /// The tree-walker's value for element `k` of a column — the oracle's view
     /// of one cell.
     fn cell_value(d: &ColData, k: usize) -> Value {
@@ -762,13 +716,13 @@ mod tests {
             "clean must refuse `{expr_src}`"
         );
         assert_eq!(
-            eval_batch_sum_f(&lowered, &columns, u32::MAX),
+            eval_batch_sum_f(&lowered, &columns, n, u32::MAX),
             None,
             "batch jit-off must refuse `{expr_src}`"
         );
         let before = COMPILES_F.load(Ordering::Relaxed);
         assert_eq!(
-            eval_batch_sum_f(&lowered, &columns, 8),
+            eval_batch_sum_f(&lowered, &columns, n, 8),
             None,
             "batch jit-on must refuse `{expr_src}`"
         );
@@ -840,14 +794,14 @@ mod tests {
         // shared, monotonic global; asserting it *increased* across the jit-on
         // run (rather than resetting it to 0 first) is robust to other float
         // tests compiling concurrently.
-        let off = eval_batch_sum_f(&lowered, &columns, u32::MAX);
+        let off = eval_batch_sum_f(&lowered, &columns, n, u32::MAX);
         assert_eq!(
             off,
             Some(expected),
             "batch jit-off vs stock for `{expr_src}`"
         );
         let before = COMPILES_F.load(Ordering::Relaxed);
-        let on = eval_batch_sum_f(&lowered, &columns, 8);
+        let on = eval_batch_sum_f(&lowered, &columns, n, 8);
         assert_eq!(on, Some(expected), "batch jit-on vs stock for `{expr_src}`");
         assert!(
             COMPILES_F.load(Ordering::Relaxed) > before,
@@ -922,7 +876,7 @@ mod tests {
         );
 
         // majit interpreter tier, then compiled tier (monotonic compile-counter).
-        let off = eval_batch_sum_float(&lowered, &columns, u32::MAX)
+        let off = eval_batch_sum_float(&lowered, &columns, n, u32::MAX)
             .unwrap_or_else(|| panic!("jit-off tier trapped on `{expr_src}`"));
         assert_eq!(
             off.to_bits(),
@@ -930,7 +884,7 @@ mod tests {
             "batch jit-off vs stock for `{expr_src}`"
         );
         let before = COMPILES_F.load(Ordering::Relaxed);
-        let on = eval_batch_sum_float(&lowered, &columns, 8)
+        let on = eval_batch_sum_float(&lowered, &columns, n, 8)
             .unwrap_or_else(|| panic!("jit-on tier trapped on `{expr_src}`"));
         assert_eq!(
             on.to_bits(),
@@ -1118,14 +1072,14 @@ mod tests {
         core::hint::black_box(&id_storage);
 
         // majit interpreter tier, then compiled tier (monotonic compile counter).
-        let off = eval_batch_sum_f(&lowered, &columns, u32::MAX);
+        let off = eval_batch_sum_f(&lowered, &columns, n, u32::MAX);
         assert_eq!(
             off,
             Some(expected),
             "batch jit-off vs stock for `{expr_src}`"
         );
         let before = COMPILES_F.load(Ordering::Relaxed);
-        let on = eval_batch_sum_f(&lowered, &columns, 8);
+        let on = eval_batch_sum_f(&lowered, &columns, n, 8);
         assert_eq!(on, Some(expected), "batch jit-on vs stock for `{expr_src}`");
         assert!(
             COMPILES_F.load(Ordering::Relaxed) > before,
@@ -1325,13 +1279,13 @@ mod tests {
             "clean vs stock for `{expr_src}`"
         );
         assert_eq!(
-            eval_batch_sum_f(&lowered, &columns, u32::MAX),
+            eval_batch_sum_f(&lowered, &columns, n, u32::MAX),
             expected,
             "batch jit-off vs stock for `{expr_src}`"
         );
         let before = COMPILES_F.load(Ordering::Relaxed);
         assert_eq!(
-            eval_batch_sum_f(&lowered, &columns, 8),
+            eval_batch_sum_f(&lowered, &columns, n, 8),
             expected,
             "batch jit-on vs stock for `{expr_src}`"
         );
@@ -2273,13 +2227,13 @@ mod tests {
                 "clean tier must refuse `{expr}`"
             );
             assert_eq!(
-                eval_batch_sum_f(&lowered, &columns, u32::MAX),
+                eval_batch_sum_f(&lowered, &columns, n, u32::MAX),
                 None,
                 "jit-off tier must refuse `{expr}`"
             );
             let before = COMPILES_F.load(Ordering::Relaxed);
             assert_eq!(
-                eval_batch_sum_f(&lowered, &columns, 8),
+                eval_batch_sum_f(&lowered, &columns, n, 8),
                 None,
                 "jit-on tier must refuse `{expr}`"
             );

@@ -213,58 +213,43 @@ impl Column<'_> {
     }
 }
 
-/// Columnar **batch** evaluation of a typed (two-bank) lowered expression:
-/// reduce `sum over rows i of expr(col_0[i], ..)` where `columns[k]` is slot
-/// `k`'s data column, aligned to [`super::lower::LoweredF::slots`] and matching
-/// each slot's bank. For a boolean predicate this counts matching rows. The
-/// compiled trace reads each column at the red row index via `raw_load` (base
-/// carried loop-invariant in an int register), int columns as `i64`, float
-/// columns as `f64`. `threshold == u32::MAX` gives the interpreter tier.
-///
-/// Returns `None` when a row's `int` arithmetic OVERFLOWED. The tree-walker
-/// raises `ExecutionError::Overflow` there, so no sum is the right answer; the
-/// caller falls back to the tree-walker, which owns the error. This is the
-/// batch transposition of PyPy's `guard_no_overflow` deopt: the guard exits to
-/// the interpreter, and the interpreter is what raises.
-pub fn eval_batch_sum_f(
+/// Build the batch program for `n` rows over `columns` and run it with `run`,
+/// which selects the tier. Shared by [`eval_batch_sum_f`] (the majit tier) and
+/// [`clean_batch_sum_f`] (the oracle tier) so the trap protocol — allocate the
+/// caller-owned word, bake its address into the program, read it back — is
+/// written once.
+fn batch_sum_with(
     lowered: &super::lower::LoweredF,
     columns: &[Column],
-    threshold: u32,
+    n: usize,
+    what: &str,
+    run: impl FnOnce(&Code, usize, usize) -> i64,
 ) -> Option<i64> {
     assert_eq!(
         columns.len(),
         lowered.slots.len(),
-        "eval_batch_sum_f: column count {} != slot count {}",
+        "{what}: column count {} != slot count {}",
         columns.len(),
         lowered.slots.len()
     );
     for (k, (col, slot)) in columns.iter().zip(&lowered.slots).enumerate() {
         assert!(
             col.matches(slot.ty),
-            "eval_batch_sum_f: column {k} bank mismatch vs slot `{}` ({:?})",
+            "{what}: column {k} bank mismatch vs slot `{}` ({:?})",
             slot.path,
             slot.ty
         );
     }
-    // The row count comes from a ROW column. A list's flattened ELEMENT column
-    // is as long as the batch's total element count, not the row count, so it
-    // neither sets `n` nor has to match it.
+    // `n` is the caller's row count, not something the columns can be asked
+    // for: a list's flattened ELEMENT column is as long as the batch's total
+    // element count, and an expression that folds to a constant has no column
+    // at all. Every ROW column must agree with it.
     use super::lower::SlotKind;
-    let n = columns
-        .iter()
-        .zip(&lowered.slots)
-        .find(|(_, s)| s.kind == SlotKind::Row)
-        .map_or(0, |(c, _)| c.len());
     for (k, (c, slot)) in columns.iter().zip(&lowered.slots).enumerate() {
         if slot.kind != SlotKind::Row {
             continue;
         }
-        assert_eq!(
-            c.len(),
-            n,
-            "eval_batch_sum_f: column {k} length {} != {n}",
-            c.len()
-        );
+        assert_eq!(c.len(), n, "{what}: column {k} length {} != {n}", c.len());
     }
     if n == 0 {
         return Some(0);
@@ -276,7 +261,7 @@ pub fn eval_batch_sum_f(
     let trap_addr = (&mut *trap) as *mut i64 as i64;
     let (prog, num_int, num_float) =
         lowered.batch_sum_program_trapping(&bases, n as i64, trap_addr);
-    let result = float_bank::run_jit_f(&prog, num_int, num_float, threshold);
+    let result = run(&prog, num_int, num_float);
     // The raw pointers in `prog` alias `columns`; keep the borrow live across
     // the run so the buffers cannot be dropped underneath the trace.
     core::hint::black_box(columns);
@@ -284,6 +269,52 @@ pub fn eval_batch_sum_f(
         return None;
     }
     Some(result)
+}
+
+/// Columnar **batch** evaluation of a typed (two-bank) lowered expression:
+/// reduce `sum over rows i of expr(col_0[i], ..)` where `columns[k]` is slot
+/// `k`'s data column, aligned to [`super::lower::LoweredF::slots`] and matching
+/// each slot's bank. For a boolean predicate this counts matching rows. The
+/// compiled trace reads each column at the red row index via `raw_load` (base
+/// carried loop-invariant in an int register), int columns as `i64`, float
+/// columns as `f64`. `threshold == u32::MAX` gives the interpreter tier.
+///
+/// `n` is the number of rows. It is the caller's to state: a lowering may have
+/// no row column to read it off (an ELEMENT column of a runtime-length list is
+/// as long as the flattened element count, and a constant-folded expression has
+/// no slots at all). Every row column must have length `n`, which is asserted.
+///
+/// Returns `None` when a row's `int` arithmetic OVERFLOWED. The tree-walker
+/// raises `ExecutionError::Overflow` there, so no sum is the right answer; the
+/// caller falls back to the tree-walker, which owns the error. This is the
+/// batch transposition of PyPy's `guard_no_overflow` deopt: the guard exits to
+/// the interpreter, and the interpreter is what raises.
+pub fn eval_batch_sum_f(
+    lowered: &super::lower::LoweredF,
+    columns: &[Column],
+    n: usize,
+    threshold: u32,
+) -> Option<i64> {
+    batch_sum_with(lowered, columns, n, "eval_batch_sum_f", |prog, ni, nf| {
+        float_bank::run_jit_f(prog, ni, nf, threshold)
+    })
+}
+
+/// [`eval_batch_sum_f`] on the oracle tier: the same batch program run by the
+/// plain-`match` [`float_bank::clean_interp_f`], with no tracing or compilation
+/// machinery in the loop. This is what a majit result is checked against.
+pub fn clean_batch_sum_f(
+    lowered: &super::lower::LoweredF,
+    columns: &[Column],
+    n: usize,
+) -> Option<i64> {
+    batch_sum_with(
+        lowered,
+        columns,
+        n,
+        "clean_batch_sum_f",
+        float_bank::clean_interp_f,
+    )
 }
 
 /// Columnar batch sum for a **float-valued** lowering: the per-row result is a
@@ -295,6 +326,7 @@ pub fn eval_batch_sum_f(
 pub fn eval_batch_sum_float(
     lowered: &super::lower::LoweredF,
     columns: &[Column],
+    n: usize,
     threshold: u32,
 ) -> Option<f64> {
     debug_assert_eq!(
@@ -302,7 +334,7 @@ pub fn eval_batch_sum_float(
         super::lower::ValType::Float,
         "eval_batch_sum_float requires a float-valued lowering"
     );
-    eval_batch_sum_f(lowered, columns, threshold).map(|bits| f64::from_bits(bits as u64))
+    eval_batch_sum_f(lowered, columns, n, threshold).map(|bits| f64::from_bits(bits as u64))
 }
 /// Two-bank machine: the same three-address VM extended with a parallel
 /// `fregs: [float; virt]` bank so a compiled trace can read `f64` context
