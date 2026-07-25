@@ -85,7 +85,7 @@ pub mod smoke;
 #[cfg(test)]
 mod tests {
     use super::bytecode::{clean_interp, eval_batch_sum, eval_batch_sum_f, run_jit, Column, COMPILES};
-    use super::lower::{lower, lower_typed, Schema, ValType};
+    use super::lower::{lower, lower_typed, size_slot_source, Schema, ValType};
     use crate::{Context, Program, Value};
     use core::sync::atomic::Ordering;
     use std::collections::HashMap;
@@ -827,12 +827,45 @@ mod tests {
         let lowered = lower_typed(program.expression(), &schema)
             .unwrap_or_else(|e| panic!("lower_typed `{expr_src}`: {e}"));
 
-        // Slot order + bank pin.
-        let paths: Vec<&str> = lowered.slots.iter().map(|s| s.path.as_str()).collect();
+        // Slot order + bank pin. A `size(<string column>)` slot is DERIVED by
+        // this harness rather than declared, so it is excluded from the order
+        // check and pinned to the int bank instead.
+        let declared: std::collections::HashMap<&str, &ColData> =
+            cols.iter().map(|(n, d)| (*n, d)).collect();
+        // The declared columns must be exactly the ones the expression reads, in
+        // first-use order — counting a `size(x)` slot as a read of `x`, since it
+        // is derived from that column and needs no separate declaration.
+        let mut referenced: Vec<&str> = Vec::new();
+        for slot in &lowered.slots {
+            let src = size_slot_source(&slot.path).unwrap_or(slot.path.as_str());
+            if !referenced.contains(&src) {
+                referenced.push(src);
+            }
+        }
         let want_paths: Vec<&str> = cols.iter().map(|(n, _)| *n).collect();
-        assert_eq!(paths, want_paths, "slot order for `{expr_src}`");
-        for (slot, (_, d)) in lowered.slots.iter().zip(cols) {
-            assert_eq!(slot.ty, d.ty(), "slot `{}` bank for `{expr_src}`", slot.path);
+        assert_eq!(referenced, want_paths, "slot order for `{expr_src}`");
+        for slot in &lowered.slots {
+            match size_slot_source(&slot.path) {
+                None => {
+                    let d = declared.get(slot.path.as_str()).unwrap_or_else(|| {
+                        panic!("slot `{}` has no declared column for `{expr_src}`", slot.path)
+                    });
+                    assert_eq!(slot.ty, d.ty(), "slot `{}` bank for `{expr_src}`", slot.path);
+                }
+                Some(src) => {
+                    assert_eq!(
+                        slot.ty,
+                        ValType::Int,
+                        "derived slot `{}` must be int-banked for `{expr_src}`",
+                        slot.path
+                    );
+                    assert!(
+                        matches!(declared.get(src), Some(ColData::Str(_))),
+                        "derived slot `{}` needs a declared string column `{src}` for `{expr_src}`",
+                        slot.path
+                    );
+                }
+            }
         }
 
         let n = cols.first().map_or(0, |(_, d)| d.len());
@@ -847,14 +880,27 @@ mod tests {
         for lit in &lowered.str_literals {
             all_strs.push((lit.as_str(), intern_hash(lit)));
         }
-        let mut id_storage: Vec<Vec<i64>> = Vec::new();
-        for (_, d) in cols {
+        let mut id_storage: std::collections::HashMap<&str, Vec<i64>> =
+            std::collections::HashMap::new();
+        for (name, d) in cols {
             if let ColData::Str(c) = d {
                 let ids: Vec<i64> = c.iter().map(|s| intern_hash(s)).collect();
                 for (s, &h) in c.iter().zip(&ids) {
                     all_strs.push((s.as_str(), h));
                 }
-                id_storage.push(ids);
+                id_storage.insert(*name, ids);
+            }
+        }
+        // Derived length columns: `str::len()` per row, exactly what
+        // `String::size` returns. Materialized from the SAME strings the ids come
+        // from, so the two columns cannot drift apart.
+        let mut len_storage: std::collections::HashMap<&str, Vec<i64>> =
+            std::collections::HashMap::new();
+        for slot in &lowered.slots {
+            if let Some(src) = size_slot_source(&slot.path) {
+                if let Some(ColData::Str(c)) = declared.get(src) {
+                    len_storage.insert(src, c.iter().map(|s| s.len() as i64).collect());
+                }
             }
         }
         // Injectivity: no two distinct strings may share a hash (a real collision
@@ -872,18 +918,18 @@ mod tests {
             }
         }
 
-        // Build columns: a Str slot reads its interned id column; others read
-        // their own buffer.
-        let mut str_idx = 0;
-        let columns: Vec<Column> = cols
+        // Build one column per SLOT, keyed by path: a `size(x)` slot reads the
+        // derived length column, a Str slot its interned id column, anything else
+        // its own buffer.
+        let columns: Vec<Column> = lowered
+            .slots
             .iter()
-            .map(|(_, d)| match d {
-                ColData::Str(_) => {
-                    let c = Column::Int(&id_storage[str_idx]);
-                    str_idx += 1;
-                    c
-                }
-                _ => d.column(),
+            .map(|slot| match size_slot_source(&slot.path) {
+                Some(src) => Column::Int(&len_storage[src]),
+                None => match declared[slot.path.as_str()] {
+                    ColData::Str(_) => Column::Int(&id_storage[slot.path.as_str()]),
+                    d => d.column(),
+                },
             })
             .collect();
 
@@ -937,6 +983,56 @@ mod tests {
             COMPILES_F.load(Ordering::Relaxed) > before,
             "string batch `{expr_src}` must compile the hot loop"
         );
+    }
+
+    #[test]
+    fn batch_size() {
+        // `size(s)` reads a DERIVED length column: the machine carries a string
+        // as a content hash and has no bytes to count, so the batch builder
+        // materializes `str::len()` per row from the same strings it interns.
+        // The walker's `String::size` is exactly `str::len()` — UTF-8 BYTES, not
+        // code points — so the multi-byte choices below are the interesting case
+        // and a code-point count would fail here.
+        let n = 3000;
+        let words = ["a", "bb", "ccc", "", "héllo", "日본어", "🎉"];
+        let s = gen_str(n, 0x5EED_1234_ABCD_9876, &words);
+        for expr in [
+            "size(s) > 2",
+            "size(s)",
+            "s.size() > 2",
+            "size(s) == 0",
+            "size(s) * 2 - 1",
+        ] {
+            check_batch_str(expr, &[("s", ColData::Str(s.clone()))]);
+        }
+        // Value and length of the same column together: two slots, one declared
+        // column, and the id/length columns must stay row-aligned.
+        check_batch_str(
+            "s == \"ccc\" || size(s) > 4",
+            &[("s", ColData::Str(s.clone()))],
+        );
+        // A literal list has a green length that folds to a constant.
+        check_batch_str("size([1, 2, 3]) + size(s)", &[("s", ColData::Str(s))]);
+    }
+
+    #[test]
+    fn size_bails() {
+        // Only a `string` column has a materialized length column. A list/map
+        // column has no representation on this machine at all, and a non-column
+        // argument has nothing to derive from.
+        let schema: Schema = [
+            ("s".to_string(), ValType::Str),
+            ("i".to_string(), ValType::Int),
+        ]
+        .into_iter()
+        .collect();
+        for expr in ["size(i) > 1", "i.size() > 1", "size(\"abc\") > 1"] {
+            let program = Program::compile(expr).unwrap();
+            assert!(
+                lower_typed(program.expression(), &schema).is_err(),
+                "`{expr}` must bail the typed lowering"
+            );
+        }
     }
 
     #[test]

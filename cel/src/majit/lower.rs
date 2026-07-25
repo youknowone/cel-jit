@@ -398,6 +398,21 @@ pub struct SlotInfoF {
     pub reg: usize,
 }
 
+/// Slot path of the DERIVED length column for the string column at `path` — the
+/// key [`LoweredF::slots`] carries for a `size(<string>)` and the one the batch
+/// builder materializes against. Spelled like the call so a lowering dump reads
+/// back as the expression that asked for it; it can never collide with a real
+/// CEL path, which is a dotted identifier chain.
+pub fn size_slot_path(path: &str) -> String {
+    format!("size({path})")
+}
+
+/// The string column path a [`size_slot_path`] key was derived from, or `None`
+/// if the key is an ordinary column.
+pub fn size_slot_source(slot_path: &str) -> Option<&str> {
+    slot_path.strip_prefix("size(")?.strip_suffix(')')
+}
+
 /// Int register reserved for the overflow trap flag of the two-bank machine
 /// (see [`OP_ADD_OVF`]). Fixed at 0 and allocated before any body register, so
 /// the overflow-checked arithmetic ops can name it while the body is still
@@ -1061,6 +1076,20 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
                 }
             }
         }
+        // `size` is the ONE stdlib name registered in both namespaces
+        // (`string.rs:292` + `:299`, and likewise for list/map/bytes), so for it
+        // alone `x.size()` and `size(x)` really are the same function and the
+        // rewrite to global form is sound.
+        if call.func_name == "size" && call.args.is_empty() {
+            return compile_call_t(
+                ctx,
+                &CallExpr {
+                    func_name: call.func_name.clone(),
+                    target: None,
+                    args: vec![(**target).clone()],
+                },
+            );
+        }
         return Err(LowerError::unsupported(format!(
             "member call `{}`",
             call.func_name
@@ -1098,6 +1127,35 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
         ctx.prelude
             .extend_from_slice(&[OP_LOAD_CONST, nanos, r.idx as i64]);
         return Ok(r);
+    }
+
+    // `size(x)`. The tree-walker's `String::size` is `str::len()` — the UTF-8
+    // BYTE length (`common/types/string.rs:93`) — and `DefaultList::size` is
+    // `Vec::len` (`list.rs:188`).
+    //
+    // A LITERAL list has a green length, so it folds to a prelude constant. A
+    // string column's length cannot be computed in the loop at all (the machine
+    // carries a string as a 64-bit content hash and has no bytes to count), so
+    // it is read from a DERIVED column under the synthetic slot path
+    // `size(<path>)`, which the batch builder materializes from the same strings
+    // it interns. That is the columnar move — a length is column metadata, the
+    // way an Arrow offsets buffer makes it O(1) — not a computation the trace
+    // skipped.
+    if name == "size" && call.args.len() == 1 {
+        if let Expr::List(list) = &call.args[0].expr {
+            return Ok(emit_int_const(ctx, list.elements.len() as i64));
+        }
+        let path = match &call.args[0].expr {
+            Expr::Ident(n) if !ctx.locals.contains_key(n) => n.clone(),
+            Expr::Select(_) => resolve_path(&call.args[0])?,
+            _ => return Err(LowerError::unsupported("size() of a non-column argument")),
+        };
+        // Only a `string` column has a materialized length. A list/map/bytes
+        // column has no representation on this machine at all.
+        if ctx.schema.get(&path).copied() != Some(ValType::Str) {
+            return Err(LowerError::unsupported("size() of a non-string column"));
+        }
+        return Ok(ctx.slot(size_slot_path(&path)));
     }
 
     // Numeric type conversions. `double`/`int`/`uint` are global (non-member)
