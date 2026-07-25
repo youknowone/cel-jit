@@ -111,11 +111,41 @@ fn float_row_loop_stays_in_compiled_code() {
     );
 }
 
-/// The nested case, and a KNOWN DEFECT pinned as it currently behaves: a
-/// comprehension over a runtime-length list column puts an inner element loop
-/// inside the row loop, each back-edge its own `can_enter_jit` point. The inner
-/// element loop compiles; the outer row loop traces to `CloseLoop` and is then
-/// REFUSED at optimize time:
+/// Build the three columns of `items.all(i, i.price > 10)` for `rows` rows of
+/// exactly `per_row` elements each, in `lowered`'s slot order.
+fn list_columns(per_row: i64, rows: usize) -> (Vec<i64>, Vec<i64>, Vec<i64>) {
+    let lens = vec![per_row; rows];
+    let mut offsets = Vec::with_capacity(rows);
+    let mut total = 0i64;
+    for &l in &lens {
+        offsets.push(total);
+        total += l;
+    }
+    // `.max(1)` keeps the buffer non-empty at `per_row == 0`, where nothing
+    // reads it but a column still has to have a base address.
+    let elems = (0..total.max(1)).map(|k| (k * 7) % 40).collect();
+    (lens, offsets, elems)
+}
+
+/// The nested case, and a KNOWN DEFECT pinned as it currently behaves.
+///
+/// A comprehension over a runtime-length list column puts an inner element loop
+/// inside the row loop, each back-edge its own `can_enter_jit` point. Sweeping
+/// the inner trip count splits the behaviour cleanly at **3**:
+///
+/// | elements/row | compiles | guard_fails | aborts |
+/// |---|---|---|---|
+/// | 0 | 1 | 1 | 0 |
+/// | 1 | 1 | 1 | 0 |
+/// | 2 | **2** | **1** | 0 |
+/// | 3 | 1 | 3996 | 1 |
+/// | 8 | 1 | 3999 | 1 |
+///
+/// At 0 and 1 the inner back-edge is never taken, so there is only one loop. At
+/// **2 both loops compile** and the whole batch still deopts once — so a
+/// compiled inner loop inside a compiled outer loop is not itself the problem.
+/// From 3 the outer row loop traces to `CloseLoop` and is then REFUSED at
+/// optimize time:
 ///
 /// ```text
 /// abort trace (InvalidLoop: next_iteration_args longer than inputargs
@@ -124,9 +154,13 @@ fn float_row_loop_stays_in_compiled_code() {
 /// ```
 ///
 /// (`majit-metainterp/src/optimizeopt/optimizer.rs`, the `inputarg_type_at`
-/// tripwire.) So every row enters the compiled inner loop and leaves it through
-/// a guard: one deopt per row instead of one per batch, which is the whole of
-/// the measured per-row cost. Reproduce the reason with `MAJIT_LOG=1`.
+/// tripwire.) Only the inner loop is then compiled, so every row enters it and
+/// leaves through a guard: one deopt per row instead of one per batch, which is
+/// the whole of the measured per-row cost. Reproduce with `MAJIT_LOG=1`.
+///
+/// The threshold at 3 — the first trip count that hits the inner merge point
+/// TWICE while the outer loop is being traced — is the sharpest fact here: the
+/// cut happens on the second encounter, not the first.
 ///
 /// If this test starts failing because `aborts` went to 0, the outer loop began
 /// compiling — replace the pins below with the `deopts <= 16` bound the flat
@@ -135,7 +169,6 @@ fn float_row_loop_stays_in_compiled_code() {
 fn nested_list_loop_deopt_census() {
     let _serial = serial();
     let rows = 4_000usize;
-    let per_row = 8i64;
     let schema: Schema = [
         ("size(items)".to_string(), ValType::Int),
         ("offset(items)".to_string(), ValType::Int),
@@ -145,45 +178,46 @@ fn nested_list_loop_deopt_census() {
     .collect();
     let lowered = lower("items.all(i, i.price > 10)", &schema);
     let order: Vec<&str> = lowered.slots.iter().map(|s| s.path.as_str()).collect();
-    eprintln!("[nested] slot order = {order:?}");
+    assert_eq!(
+        order,
+        ["size(items)", "offset(items)", "items[].price"],
+        "column order below assumes this slot order"
+    );
 
-    let lens: Vec<i64> = vec![per_row; rows];
-    let mut offsets = Vec::with_capacity(rows);
-    let mut acc = 0i64;
-    for &l in &lens {
-        offsets.push(acc);
-        acc += l;
+    for per_row in [0i64, 1, 2, 3, 8] {
+        let (lens, offsets, elems) = list_columns(per_row, rows);
+        let columns = [
+            Column::Int(&lens),
+            Column::Int(&offsets),
+            Column::Int(&elems),
+        ];
+        let (compiles, deopts, aborts, result) = measure(&lowered, &columns, rows);
+        eprintln!(
+            "[nested] per_row={per_row} rows={rows} compiles={compiles} \
+             guard_fails={deopts} aborts={aborts} result={result:?}"
+        );
+        if per_row < 3 {
+            assert_eq!(aborts, 0, "per_row={per_row}: no trace should be refused");
+            assert!(
+                deopts <= 16,
+                "per_row={per_row}: the batch should deopt a constant number of \
+                 times, got {deopts} over {rows} rows"
+            );
+        } else {
+            assert_eq!(
+                compiles, 1,
+                "per_row={per_row}: only the inner element loop compiles"
+            );
+            assert_eq!(
+                aborts, 1,
+                "per_row={per_row}: the outer row loop's trace is refused \
+                 (entry/jump arity mismatch); if this is now 0 the defect is fixed"
+            );
+            assert!(
+                deopts >= rows - 16,
+                "per_row={per_row}: the known shape is one deopt per row (the \
+                 inner loop's exit), got {deopts} over {rows} rows"
+            );
+        }
     }
-    let elems: Vec<i64> = (0..acc).map(|k| (k * 7) % 40).collect();
-
-    let columns: Vec<Column> = order
-        .iter()
-        .map(|p| match *p {
-            "size(items)" => Column::Int(&lens),
-            "offset(items)" => Column::Int(&offsets),
-            "items[].price" => Column::Int(&elems),
-            other => panic!("unexpected slot `{other}`"),
-        })
-        .collect();
-
-    let (compiles, deopts, aborts, result) = measure(&lowered, &columns, rows);
-    eprintln!(
-        "[nested] rows={rows} elems={acc} compiles={compiles} guard_fails={deopts} \
-         aborts={aborts} result={result:?}  ({:.2} deopts/row)",
-        deopts as f64 / rows as f64
-    );
-    assert_eq!(
-        compiles, 1,
-        "exactly one of the two loops compiles — the inner element loop"
-    );
-    assert_eq!(
-        aborts, 1,
-        "the outer row loop's trace is refused (entry/jump arity mismatch); if \
-         this is now 0 the defect is fixed"
-    );
-    assert!(
-        deopts >= rows - 16,
-        "the known shape is one deopt per row (the inner loop's exit), got \
-         {deopts} over {rows} rows"
-    );
 }
