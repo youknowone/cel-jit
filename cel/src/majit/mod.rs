@@ -224,6 +224,8 @@ mod tests {
         let inc: i64 = i64::MAX / 4;
         let mut trap: Box<i64> = Box::new(0);
         let trap_addr = (&mut *trap) as *mut i64 as i64;
+        // One instruction per line: the operand grouping IS the program.
+        #[rustfmt::skip]
         let prog: Vec<i64> = vec![
             OP_LOAD_CONST, 0, 0,
             OP_LOAD_CONST, n, 1,
@@ -271,7 +273,11 @@ mod tests {
         ] {
             check(
                 "a >= b && !c",
-                &[("a", Bind::Int(a)), ("b", Bind::Int(b)), ("c", Bind::Bool(c))],
+                &[
+                    ("a", Bind::Int(a)),
+                    ("b", Bind::Int(b)),
+                    ("c", Bind::Bool(c)),
+                ],
             );
         }
     }
@@ -280,11 +286,19 @@ mod tests {
     fn arithmetic() {
         check(
             "(a + b) * c - 2",
-            &[("a", Bind::Int(3)), ("b", Bind::Int(4)), ("c", Bind::Int(5))],
+            &[
+                ("a", Bind::Int(3)),
+                ("b", Bind::Int(4)),
+                ("c", Bind::Int(5)),
+            ],
         );
         check(
             "a * b + c",
-            &[("a", Bind::Int(-6)), ("b", Bind::Int(7)), ("c", Bind::Int(11))],
+            &[
+                ("a", Bind::Int(-6)),
+                ("b", Bind::Int(7)),
+                ("c", Bind::Int(11)),
+            ],
         );
         check("-a + b", &[("a", Bind::Int(9)), ("b", Bind::Int(4))]);
     }
@@ -302,8 +316,14 @@ mod tests {
         check(
             "((a + b) * (c - d)) / ((e + f) - (g * h))",
             &[
-                ("a", Bind::Int(9)), ("b", Bind::Int(4)), ("c", Bind::Int(7)), ("d", Bind::Int(2)),
-                ("e", Bind::Int(300)), ("f", Bind::Int(211)), ("g", Bind::Int(3)), ("h", Bind::Int(5)),
+                ("a", Bind::Int(9)),
+                ("b", Bind::Int(4)),
+                ("c", Bind::Int(7)),
+                ("d", Bind::Int(2)),
+                ("e", Bind::Int(300)),
+                ("f", Bind::Int(211)),
+                ("g", Bind::Int(3)),
+                ("h", Bind::Int(5)),
             ],
         );
     }
@@ -416,7 +436,9 @@ mod tests {
         for _ in 0..n {
             let mut row = Vec::with_capacity(ranges.len());
             for &(lo, hi) in ranges {
-                x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                x = x
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 let span = (hi - lo + 1) as u64;
                 row.push(lo + ((x >> 33) % span) as i64);
             }
@@ -469,7 +491,9 @@ mod tests {
         let mut x = seed;
         let mut out = Vec::with_capacity(n);
         for k in 0..n {
-            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             let mant = x & ((1u64 << 52) - 1);
             let v = f64::from_bits((0x3ffu64 << 52) | mant) - 1.0 + (k as f64 * 1e-12);
             out.push(if k & 1 == 0 { v } else { -v });
@@ -510,6 +534,8 @@ mod tests {
         // float regs: fa=0 fb=1
         let base_a = cola.as_ptr() as i64;
         let base_b = colb.as_ptr() as i64;
+        // One instruction per line: the operand grouping IS the program.
+        #[rustfmt::skip]
         let mut prog: Vec<i64> = vec![
             OP_LOAD_CONST, 0, 0,
             OP_LOAD_CONST, 0, 1,
@@ -521,6 +547,7 @@ mod tests {
         ];
         let body_pc = prog.len() as i64;
         assert_eq!(body_pc, 21);
+        #[rustfmt::skip]
         prog.extend_from_slice(&[
             OP_MUL, 0, 4, 5,
             OP_COL_LOAD_F, 6, 5, 0,
@@ -534,7 +561,11 @@ mod tests {
 
         let (ni, nf) = (9usize, 2usize);
         assert_eq!(clean_interp_f(&prog, ni, nf), expected, "clean vs oracle");
-        assert_eq!(run_jit_f(&prog, ni, nf, u32::MAX), expected, "jit-off vs oracle");
+        assert_eq!(
+            run_jit_f(&prog, ni, nf, u32::MAX),
+            expected,
+            "jit-off vs oracle"
+        );
         let before = COMPILES_F.load(Ordering::Relaxed);
         assert_eq!(run_jit_f(&prog, ni, nf, 8), expected, "jit-on vs oracle");
         assert!(
@@ -613,7 +644,9 @@ mod tests {
         let mut x = seed;
         let mut out = Vec::with_capacity(n);
         for _ in 0..n {
-            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             let mant = x & ((1u64 << 52) - 1);
             let u = f64::from_bits((0x3ffu64 << 52) | mant) - 1.0; // [0, 1)
             out.push(lo + u * (hi - lo));
@@ -627,7 +660,9 @@ mod tests {
         let span = (hi - lo + 1) as u64;
         (0..n)
             .map(|_| {
-                x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                x = x
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 lo + ((x >> 33) % span) as i64
             })
             .collect()
@@ -641,7 +676,9 @@ mod tests {
         let mut x = seed;
         (0..n)
             .map(|_| {
-                x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                x = x
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 x as i64
             })
             .collect()
@@ -760,7 +797,12 @@ mod tests {
         let want_paths: Vec<&str> = cols.iter().map(|(n, _)| *n).collect();
         assert_eq!(paths, want_paths, "slot order for `{expr_src}`");
         for (slot, (_, d)) in lowered.slots.iter().zip(cols) {
-            assert_eq!(slot.ty, d.ty(), "slot `{}` bank for `{expr_src}`", slot.path);
+            assert_eq!(
+                slot.ty,
+                d.ty(),
+                "slot `{}` bank for `{expr_src}`",
+                slot.path
+            );
         }
 
         let n = cols.first().map_or(0, |(_, d)| d.len());
@@ -799,7 +841,11 @@ mod tests {
         // run (rather than resetting it to 0 first) is robust to other float
         // tests compiling concurrently.
         let off = eval_batch_sum_f(&lowered, &columns, u32::MAX);
-        assert_eq!(off, Some(expected), "batch jit-off vs stock for `{expr_src}`");
+        assert_eq!(
+            off,
+            Some(expected),
+            "batch jit-off vs stock for `{expr_src}`"
+        );
         let before = COMPILES_F.load(Ordering::Relaxed);
         let on = eval_batch_sum_f(&lowered, &columns, 8);
         assert_eq!(on, Some(expected), "batch jit-on vs stock for `{expr_src}`");
@@ -834,7 +880,12 @@ mod tests {
         let want_paths: Vec<&str> = cols.iter().map(|(n, _)| *n).collect();
         assert_eq!(paths, want_paths, "slot order for `{expr_src}`");
         for (slot, (_, d)) in lowered.slots.iter().zip(cols) {
-            assert_eq!(slot.ty, d.ty(), "slot `{}` bank for `{expr_src}`", slot.path);
+            assert_eq!(
+                slot.ty,
+                d.ty(),
+                "slot `{}` bank for `{expr_src}`",
+                slot.path
+            );
         }
 
         let n = cols.first().map_or(0, |(_, d)| d.len());
@@ -864,16 +915,28 @@ mod tests {
         let clean = clean_batch_sum_f(&lowered, &columns, n)
             .map(|bits| f64::from_bits(bits as u64))
             .unwrap_or_else(|| panic!("clean tier trapped on `{expr_src}`"));
-        assert_eq!(clean.to_bits(), expected.to_bits(), "clean vs stock for `{expr_src}`");
+        assert_eq!(
+            clean.to_bits(),
+            expected.to_bits(),
+            "clean vs stock for `{expr_src}`"
+        );
 
         // majit interpreter tier, then compiled tier (monotonic compile-counter).
         let off = eval_batch_sum_float(&lowered, &columns, u32::MAX)
             .unwrap_or_else(|| panic!("jit-off tier trapped on `{expr_src}`"));
-        assert_eq!(off.to_bits(), expected.to_bits(), "batch jit-off vs stock for `{expr_src}`");
+        assert_eq!(
+            off.to_bits(),
+            expected.to_bits(),
+            "batch jit-off vs stock for `{expr_src}`"
+        );
         let before = COMPILES_F.load(Ordering::Relaxed);
         let on = eval_batch_sum_float(&lowered, &columns, 8)
             .unwrap_or_else(|| panic!("jit-on tier trapped on `{expr_src}`"));
-        assert_eq!(on.to_bits(), expected.to_bits(), "batch jit-on vs stock for `{expr_src}`");
+        assert_eq!(
+            on.to_bits(),
+            expected.to_bits(),
+            "batch jit-on vs stock for `{expr_src}`"
+        );
         assert!(
             COMPILES_F.load(Ordering::Relaxed) > before,
             "float aggregate `{expr_src}` must compile the hot loop"
@@ -887,7 +950,9 @@ mod tests {
         let mut x = seed;
         (0..n)
             .map(|_| {
-                x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                x = x
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 choices[((x >> 33) as usize) % choices.len()].to_string()
             })
             .collect()
@@ -931,9 +996,17 @@ mod tests {
             match size_slot_source(&slot.path) {
                 None => {
                     let d = declared.get(slot.path.as_str()).unwrap_or_else(|| {
-                        panic!("slot `{}` has no declared column for `{expr_src}`", slot.path)
+                        panic!(
+                            "slot `{}` has no declared column for `{expr_src}`",
+                            slot.path
+                        )
                     });
-                    assert_eq!(slot.ty, d.ty(), "slot `{}` bank for `{expr_src}`", slot.path);
+                    assert_eq!(
+                        slot.ty,
+                        d.ty(),
+                        "slot `{}` bank for `{expr_src}`",
+                        slot.path
+                    );
                 }
                 Some(src) => {
                     assert_eq!(
@@ -993,7 +1066,10 @@ mod tests {
         for &(s, h) in &all_strs {
             match seen.get(&h) {
                 Some(&prev) => {
-                    assert_eq!(prev, s, "hash collision for `{expr_src}`: `{prev}` vs `{s}`")
+                    assert_eq!(
+                        prev, s,
+                        "hash collision for `{expr_src}`: `{prev}` vs `{s}`"
+                    )
                 }
                 None => {
                     seen.insert(h, s);
@@ -1043,7 +1119,11 @@ mod tests {
 
         // majit interpreter tier, then compiled tier (monotonic compile counter).
         let off = eval_batch_sum_f(&lowered, &columns, u32::MAX);
-        assert_eq!(off, Some(expected), "batch jit-off vs stock for `{expr_src}`");
+        assert_eq!(
+            off,
+            Some(expected),
+            "batch jit-off vs stock for `{expr_src}`"
+        );
         let before = COMPILES_F.load(Ordering::Relaxed);
         let on = eval_batch_sum_f(&lowered, &columns, 8);
         assert_eq!(on, Some(expected), "batch jit-on vs stock for `{expr_src}`");
@@ -1345,12 +1425,18 @@ mod tests {
         check_batch_str("role != \"admin\"", &[("role", ColData::Str(role.clone()))]);
         // A literal absent from the column: every row is unequal (count 0 for
         // ==, n for !=), and it must still compile.
-        check_batch_str("role == \"superadmin\"", &[("role", ColData::Str(role.clone()))]);
+        check_batch_str(
+            "role == \"superadmin\"",
+            &[("role", ColData::Str(role.clone()))],
+        );
         // Column vs column.
         let other = gen_str(n, 0x9182_7364_5A4B_3C2D, &roles);
         check_batch_str(
             "a == b",
-            &[("a", ColData::Str(role.clone())), ("b", ColData::Str(other.clone()))],
+            &[
+                ("a", ColData::Str(role.clone())),
+                ("b", ColData::Str(other.clone())),
+            ],
         );
         check_batch_str(
             "a != b",
@@ -1377,10 +1463,12 @@ mod tests {
         // Strings support only equality here; ordering (`<` etc.) needs sorted
         // ids, so the typed lowering bails and the tree-walker handles it. A bare
         // string result is likewise not sum-reducible and bails.
-        let schema: Schema =
-            [("a".to_string(), ValType::Str), ("b".to_string(), ValType::Str)]
-                .into_iter()
-                .collect();
+        let schema: Schema = [
+            ("a".to_string(), ValType::Str),
+            ("b".to_string(), ValType::Str),
+        ]
+        .into_iter()
+        .collect();
         for expr in ["a < b", "a <= b", "a > b", "a >= b", "a"] {
             let program = Program::compile(expr).unwrap();
             assert!(
@@ -1396,7 +1484,9 @@ mod tests {
         let mut x = seed;
         (0..n)
             .map(|_| {
-                x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                x = x
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 // Keep the top 63 bits: an LCG's low bits are short-period, and
                 // `>> 33` would cap every draw at ~2^31 ns (~2.1s), collapsing a
                 // multi-year span into a single instant.
@@ -1640,7 +1730,12 @@ mod tests {
         // disagree, the exact class the `OP_DIV` sign-mask fix exists for. Both
         // the compiled and interpreter tiers must match the tree-walker oracle.
         let n = 3000;
-        let elapsed = gen_nanos(n, 0x0f1e_2d3c_4b5a_6978, -7_200_000_000_000, 14_400_000_000_000);
+        let elapsed = gen_nanos(
+            n,
+            0x0f1e_2d3c_4b5a_6978,
+            -7_200_000_000_000,
+            14_400_000_000_000,
+        );
         for expr in [
             "elapsed.getHours()",
             "elapsed.getMinutes()",
@@ -1773,14 +1868,23 @@ mod tests {
         let u: Vec<i64> = gen_i64(n, 0x1357_9bdf_2468_ace0, -5_000, 10_000)
             .into_iter()
             .enumerate()
-            .map(|(k, v)| if k % 3 == 0 { v.wrapping_add(i64::MIN) } else { v })
+            .map(|(k, v)| {
+                if k % 3 == 0 {
+                    v.wrapping_add(i64::MIN)
+                } else {
+                    v
+                }
+            })
             .collect();
 
         check_batch_f("double(i) > 100.0", &[("i", ColData::Int(i.clone()))]);
         for expr in ["double(i) + f > 0.0", "double(i) == f"] {
             check_batch_f(
                 expr,
-                &[("i", ColData::Int(i.clone())), ("f", ColData::Float(f.clone()))],
+                &[
+                    ("i", ColData::Int(i.clone())),
+                    ("f", ColData::Float(f.clone())),
+                ],
             );
         }
         for expr in ["int(u) < 0", "int(u) > 100", "uint(int(u)) > 100u"] {
@@ -1797,7 +1901,10 @@ mod tests {
         }
         check_batch_f(
             "int(f) + i > 0",
-            &[("f", ColData::Float(f.clone())), ("i", ColData::Int(i.clone()))],
+            &[
+                ("f", ColData::Float(f.clone())),
+                ("i", ColData::Int(i.clone())),
+            ],
         );
         // Identity spellings.
         check_batch_f("int(i) > 100", &[("i", ColData::Int(i.clone()))]);
@@ -1958,7 +2065,10 @@ mod tests {
         // sum(price * qty + price) — two float ops feeding the accumulator
         check_batch_float(
             "price * qty + price",
-            &[("price", ColData::Float(price)), ("qty", ColData::Float(qty))],
+            &[
+                ("price", ColData::Float(price)),
+                ("qty", ColData::Float(qty)),
+            ],
         );
         // sum(price * 2.0) — a hoisted float constant inside a float aggregate
         let p2 = gen_f64(n, 0x2468_ACE0_1357_9BDF, -50.0, 50.0);
@@ -1975,7 +2085,10 @@ mod tests {
         let qty = gen_f64(n, 0x9E37_79B9_7F4A_7C15, 0.0, 100.0);
         check_batch_f(
             "price >= 100.0 && qty < 50.0",
-            &[("price", ColData::Float(price)), ("qty", ColData::Float(qty))],
+            &[
+                ("price", ColData::Float(price)),
+                ("qty", ColData::Float(qty)),
+            ],
         );
     }
 
@@ -1985,7 +2098,10 @@ mod tests {
         let n = 3000;
         let a = gen_f64(n, 0xAAAA_5555_AAAA_5555, -1.0, 1.0);
         let b = gen_f64(n, 0xBBBB_4444_BBBB_4444, -1.0, 1.0);
-        check_batch_f("a >= b", &[("a", ColData::Float(a)), ("b", ColData::Float(b))]);
+        check_batch_f(
+            "a >= b",
+            &[("a", ColData::Float(a)), ("b", ColData::Float(b))],
+        );
     }
 
     #[test]
@@ -1996,7 +2112,10 @@ mod tests {
         let qty = gen_f64(n, 0x5555_6666_7777_8888, 0.0, 100.0);
         check_batch_f(
             "price * qty >= 2500.0",
-            &[("price", ColData::Float(price)), ("qty", ColData::Float(qty))],
+            &[
+                ("price", ColData::Float(price)),
+                ("qty", ColData::Float(qty)),
+            ],
         );
     }
 
@@ -2009,7 +2128,10 @@ mod tests {
         let price = gen_f64(n, 0xF00D_CAFE_F00D_CAFE, 0.0, 200.0);
         check_batch_f(
             "flagged >= 1 && price >= 100.0",
-            &[("flagged", ColData::Int(flagged)), ("price", ColData::Float(price))],
+            &[
+                ("flagged", ColData::Int(flagged)),
+                ("price", ColData::Float(price)),
+            ],
         );
     }
 
@@ -2033,7 +2155,10 @@ mod tests {
         // a plain float column vs float column arm selection.
         check_batch_float(
             "price >= qty ? price : qty",
-            &[("price", ColData::Float(price)), ("qty", ColData::Float(qty))],
+            &[
+                ("price", ColData::Float(price)),
+                ("qty", ColData::Float(qty)),
+            ],
         );
     }
 
@@ -2052,7 +2177,10 @@ mod tests {
         // Negation inside a float ternary arm (FSELECT blends a negated value).
         check_batch_float(
             "price >= qty ? -price : qty",
-            &[("price", ColData::Float(price)), ("qty", ColData::Float(qty))],
+            &[
+                ("price", ColData::Float(price)),
+                ("qty", ColData::Float(qty)),
+            ],
         );
     }
 
@@ -2079,7 +2207,10 @@ mod tests {
         for expr in ["a < b", "a <= b", "a > b", "a >= b", "a == b", "a != b"] {
             check_batch_f(
                 expr,
-                &[("a", ColData::UInt(a.clone())), ("b", ColData::UInt(b.clone()))],
+                &[
+                    ("a", ColData::UInt(a.clone())),
+                    ("b", ColData::UInt(b.clone())),
+                ],
             );
         }
     }
@@ -2102,10 +2233,12 @@ mod tests {
         let base_a = gen_i64(n, 0x3141_5926_5358_9793, 1, 1000);
         let base_b = gen_i64(n, 0x2718_2818_2845_9045, 1, 1000);
 
-        let schema: Schema =
-            [("a".to_string(), ValType::Int), ("b".to_string(), ValType::Int)]
-                .into_iter()
-                .collect();
+        let schema: Schema = [
+            ("a".to_string(), ValType::Int),
+            ("b".to_string(), ValType::Int),
+        ]
+        .into_iter()
+        .collect();
         // Bounded rows everywhere except the tail, whose operands are picked to
         // overflow the operator under test (`a - b` needs a huge NEGATIVE `a`,
         // which the `a + b` pair would not produce).
@@ -2168,7 +2301,10 @@ mod tests {
         for expr in ["a + b", "a - b", "a * b", "a * b + a - b"] {
             check_batch_f(
                 expr,
-                &[("a", ColData::Int(a.clone())), ("b", ColData::Int(b.clone()))],
+                &[
+                    ("a", ColData::Int(a.clone())),
+                    ("b", ColData::Int(b.clone())),
+                ],
             );
         }
     }
@@ -2282,9 +2418,12 @@ mod tests {
         // accumulator — see `batch_float_aggregate`; a mixed int/float comparison
         // widens via cast_int_to_float — see `batch_mixed_col_compare`; a
         // same-bank float ternary lowers to FSELECT — see `batch_float_ternary`.)
-        let schema: Schema = [("p".to_string(), ValType::Float), ("q".to_string(), ValType::Int)]
-            .into_iter()
-            .collect();
+        let schema: Schema = [
+            ("p".to_string(), ValType::Float),
+            ("q".to_string(), ValType::Int),
+        ]
+        .into_iter()
+        .collect();
         for expr in ["p % 2.0 >= 1.0", "p + q", "p >= 1.0 ? p : q"] {
             let program = Program::compile(expr).unwrap();
             assert!(
@@ -2304,13 +2443,19 @@ mod tests {
         let level = gen_i64(n, 0x3030_3030_3030_3030, 0, 10);
         check_batch_f(
             "price >= level",
-            &[("price", ColData::Float(price)), ("level", ColData::Int(level))],
+            &[
+                ("price", ColData::Float(price)),
+                ("level", ColData::Int(level)),
+            ],
         );
         let price2 = gen_f64(n, 0x4040_4040_4040_4040, 0.0, 10.0);
         let level2 = gen_i64(n, 0x5050_5050_5050_5050, 0, 10);
         check_batch_f(
             "level < price",
-            &[("level", ColData::Int(level2)), ("price", ColData::Float(price2))],
+            &[
+                ("level", ColData::Int(level2)),
+                ("price", ColData::Float(price2)),
+            ],
         );
     }
 
@@ -2323,11 +2468,17 @@ mod tests {
         let qty = gen_f64(n, 0xF0F0_F0F0_F0F0_F0F0, 0.0, 100.0);
         check_batch_f(
             "price >= 100 && qty < 50",
-            &[("price", ColData::Float(price.clone())), ("qty", ColData::Float(qty.clone()))],
+            &[
+                ("price", ColData::Float(price.clone())),
+                ("qty", ColData::Float(qty.clone())),
+            ],
         );
         check_batch_f(
             "100 <= price && 50 > qty",
-            &[("price", ColData::Float(price)), ("qty", ColData::Float(qty))],
+            &[
+                ("price", ColData::Float(price)),
+                ("qty", ColData::Float(qty)),
+            ],
         );
     }
 

@@ -66,6 +66,7 @@ pub const OP_RETURN_F: i64 = 36; // [RETURN_F, freg]        return fregs[freg].t
 pub const OP_FSELECT: i64 = 37; // [FSELECT, c, ft, ff, fdst]  fregs[fdst] = if regs[c]!=0 {fregs[ft]} else {fregs[ff]}
 pub const OP_ULT: i64 = 38; // [a, b, dst]              regs[dst] = ((regs[a] as u64) <  (regs[b] as u64)) as 0/1
 pub const OP_ULE: i64 = 39; // [a, b, dst]              regs[dst] = ((regs[a] as u64) <= (regs[b] as u64)) as 0/1
+
 // Overflow-checked user arithmetic. `OP_ADD`/`OP_SUB`/`OP_MUL` above stay plain
 // (wrapping) for the batch machinery's own counter/address/accumulator, which
 // operate on controlled values and whose cross-row sum must match the oracle's
@@ -200,8 +201,14 @@ impl Column<'_> {
         // column of content-hash ids.
         matches!(
             (self, ty),
-            (Column::Int(_), ValType::Int | ValType::UInt | ValType::Str | ValType::Timestamp | ValType::Duration)
-                | (Column::Float(_), ValType::Float)
+            (
+                Column::Int(_),
+                ValType::Int
+                    | ValType::UInt
+                    | ValType::Str
+                    | ValType::Timestamp
+                    | ValType::Duration
+            ) | (Column::Float(_), ValType::Float)
         )
     }
 }
@@ -423,12 +430,7 @@ pub mod float_bank {
         // aliasing the helper call to the opcode.
         native_int_binops = { majit_uint_mul_high => UintMulHigh },
     )]
-    fn run_mainloop_f(
-        program: &Code,
-        num_regs: usize,
-        num_fregs: usize,
-        threshold: u32,
-    ) -> i64 {
+    fn run_mainloop_f(program: &Code, num_regs: usize, num_fregs: usize, threshold: u32) -> i64 {
         let mut driver: majit_metainterp::JitDriver<VmStateF> =
             majit_metainterp::JitDriver::new(threshold);
         driver.set_on_compile_loop(|_green_key, _ops_before, _ops_after| {
@@ -820,11 +822,13 @@ pub mod float_bank {
                     pc += 3;
                 }
                 OP_I2F => {
-                    state.fregs[program[pc + 2] as usize] = state.regs[program[pc + 1] as usize] as f64;
+                    state.fregs[program[pc + 2] as usize] =
+                        state.regs[program[pc + 1] as usize] as f64;
                     pc += 3;
                 }
                 OP_F2I => {
-                    state.regs[program[pc + 2] as usize] = state.fregs[program[pc + 1] as usize] as i64;
+                    state.regs[program[pc + 2] as usize] =
+                        state.fregs[program[pc + 1] as usize] as i64;
                     pc += 3;
                 }
                 OP_FMOV => {
@@ -1120,13 +1124,17 @@ pub mod float_bank {
                     pc += 4;
                 }
                 OP_ULT => {
-                    regs[program[pc + 3] as usize] =
-                        majit_uint_lt(regs[program[pc + 1] as usize], regs[program[pc + 2] as usize]);
+                    regs[program[pc + 3] as usize] = majit_uint_lt(
+                        regs[program[pc + 1] as usize],
+                        regs[program[pc + 2] as usize],
+                    );
                     pc += 4;
                 }
                 OP_ULE => {
-                    regs[program[pc + 3] as usize] =
-                        majit_uint_le(regs[program[pc + 1] as usize], regs[program[pc + 2] as usize]);
+                    regs[program[pc + 3] as usize] = majit_uint_le(
+                        regs[program[pc + 1] as usize],
+                        regs[program[pc + 2] as usize],
+                    );
                     pc += 4;
                 }
                 OP_EQ => {

@@ -323,7 +323,10 @@ impl LoweredF {
             bases.len(),
             self.slots.len()
         );
-        assert!(n >= 1, "batch_sum_program: n must be >= 1 (do-while back-edge)");
+        assert!(
+            n >= 1,
+            "batch_sum_program: n must be >= 1 (do-while back-edge)"
+        );
         let m = self.num_int_regs; // first int machinery register
         let (r_i, r_acc, r_n, r_one, r_stride, r_ea) = (m, m + 1, m + 2, m + 3, m + 4, m + 5);
         let r_trap = m + 6;
@@ -334,7 +337,11 @@ impl LoweredF {
         // bank at the body's count. `f_acc` is unused when the result is int.
         let (f_acc, total_float_regs) = match self.result_bank {
             ValType::Float => (self.num_float_regs, self.num_float_regs + 1),
-            ValType::Int | ValType::UInt | ValType::Str | ValType::Timestamp | ValType::Duration => (0, self.num_float_regs),
+            ValType::Int
+            | ValType::UInt
+            | ValType::Str
+            | ValType::Timestamp
+            | ValType::Duration => (0, self.num_float_regs),
         };
 
         let mut p = Vec::new();
@@ -346,7 +353,11 @@ impl LoweredF {
         // `f64::from_bits` must stay out of the traced loop body; here it is in
         // the setup (0.0 has zero bits).
         match self.result_bank {
-            ValType::Int | ValType::UInt | ValType::Str | ValType::Timestamp | ValType::Duration => load_const(&mut p, 0, r_acc),
+            ValType::Int
+            | ValType::UInt
+            | ValType::Str
+            | ValType::Timestamp
+            | ValType::Duration => load_const(&mut p, 0, r_acc),
             ValType::Float => p.extend_from_slice(&[OP_LOAD_CONST_F, 0, f_acc as i64]),
         }
         load_const(&mut p, n, r_n);
@@ -381,7 +392,11 @@ impl LoweredF {
                 continue;
             }
             let op = match slot.ty {
-                ValType::Int | ValType::UInt | ValType::Str | ValType::Timestamp | ValType::Duration => OP_COL_LOAD,
+                ValType::Int
+                | ValType::UInt
+                | ValType::Str
+                | ValType::Timestamp
+                | ValType::Duration => OP_COL_LOAD,
                 ValType::Float => OP_COL_LOAD_F,
             };
             p.extend_from_slice(&[op, (r_base0 + k) as i64, r_ea as i64, slot.reg as i64]);
@@ -398,7 +413,11 @@ impl LoweredF {
         // trace cannot reassociate it — the running total sums in row order, bit
         // for bit like the interpreter tiers.
         match self.result_bank {
-            ValType::Int | ValType::UInt | ValType::Str | ValType::Timestamp | ValType::Duration => {
+            ValType::Int
+            | ValType::UInt
+            | ValType::Str
+            | ValType::Timestamp
+            | ValType::Duration => {
                 p.extend_from_slice(&[OP_ADD, r_acc as i64, self.result_reg as i64, r_acc as i64])
             }
             ValType::Float => {
@@ -413,7 +432,11 @@ impl LoweredF {
             p.extend_from_slice(&[OP_TRAP_STORE, r_trap as i64, OVF_FLAG_REG as i64]);
         }
         match self.result_bank {
-            ValType::Int | ValType::UInt | ValType::Str | ValType::Timestamp | ValType::Duration => p.extend_from_slice(&[OP_RETURN, r_acc as i64]),
+            ValType::Int
+            | ValType::UInt
+            | ValType::Str
+            | ValType::Timestamp
+            | ValType::Duration => p.extend_from_slice(&[OP_RETURN, r_acc as i64]),
             ValType::Float => p.extend_from_slice(&[OP_RETURN_F, f_acc as i64]),
         }
         (p, total_int_regs, total_float_regs)
@@ -462,7 +485,11 @@ impl LowerCtxF<'_> {
     fn fresh(&mut self, bank: ValType) -> TReg {
         let idx = match bank {
             // `Str` ids share the int register file (an `i64` content hash).
-            ValType::Int | ValType::UInt | ValType::Str | ValType::Timestamp | ValType::Duration => {
+            ValType::Int
+            | ValType::UInt
+            | ValType::Str
+            | ValType::Timestamp
+            | ValType::Duration => {
                 let r = self.next_int;
                 self.next_int += 1;
                 r
@@ -589,7 +616,9 @@ pub fn lower_typed(expr: &IdedExpr, schema: &Schema) -> Result<LoweredF, LowerEr
         result.bank,
         ValType::Str | ValType::Timestamp | ValType::Duration
     ) {
-        return Err(LowerError::unsupported("string/temporal-valued top-level result"));
+        return Err(LowerError::unsupported(
+            "string/temporal-valued top-level result",
+        ));
     }
     Ok(LoweredF {
         prelude: ctx.prelude,
@@ -845,7 +874,11 @@ fn emit_days_of_jan1(ctx: &mut LowerCtxF, year: TReg) -> TReg {
 /// Narrow a float-bank value to a fresh int reg via a per-row `f64 as i64` cast
 /// (`OP_F2I` -> `cast_float_to_int`), the inverse of [`emit_i2f`].
 fn emit_f2i(ctx: &mut LowerCtxF, src: TReg) -> TReg {
-    debug_assert_eq!(src.bank, ValType::Float, "emit_f2i: source must be float-banked");
+    debug_assert_eq!(
+        src.bank,
+        ValType::Float,
+        "emit_f2i: source must be float-banked"
+    );
     let r = ctx.fresh(ValType::Int);
     ctx.body
         .extend_from_slice(&[OP_F2I, src.idx as i64, r.idx as i64]);
@@ -856,7 +889,11 @@ fn emit_f2i(ctx: &mut LowerCtxF, src: TReg) -> TReg {
 /// (`OP_I2F` -> `cast_int_to_float`). Emitted into the body: unlike a literal
 /// (folded to a prelude constant), a data-dependent int is cast per row.
 fn emit_i2f(ctx: &mut LowerCtxF, src: TReg) -> TReg {
-    debug_assert_eq!(src.bank, ValType::Int, "emit_i2f: source must be int-banked");
+    debug_assert_eq!(
+        src.bank,
+        ValType::Int,
+        "emit_i2f: source must be int-banked"
+    );
     let r = ctx.fresh(ValType::Float);
     ctx.body
         .extend_from_slice(&[OP_I2F, src.idx as i64, r.idx as i64]);
@@ -1145,8 +1182,14 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
             // mixed int/float comparisons already use.
             ("double", ValType::Int) => Ok(emit_i2f(ctx, a)),
             // Reinterpretations within the int register file.
-            ("int", ValType::UInt) => Ok(TReg { bank: ValType::Int, idx: a.idx }),
-            ("uint", ValType::Int) => Ok(TReg { bank: ValType::UInt, idx: a.idx }),
+            ("int", ValType::UInt) => Ok(TReg {
+                bank: ValType::Int,
+                idx: a.idx,
+            }),
+            ("uint", ValType::Int) => Ok(TReg {
+                bank: ValType::UInt,
+                idx: a.idx,
+            }),
             // `u64 as f64` differs from `i64 as f64` above 2^63 and the trace IR
             // has no unsigned widening cast, so this one is not ours to answer.
             ("double", ValType::UInt) => Err(LowerError::unsupported(
@@ -1189,7 +1232,11 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
                 .extend_from_slice(&[OP_LOAD_CONST, 0, d.idx as i64]);
             return Ok(d);
         }
-        let eq_op = if x.bank == ValType::Float { OP_FEQ } else { OP_EQ };
+        let eq_op = if x.bank == ValType::Float {
+            OP_FEQ
+        } else {
+            OP_EQ
+        };
         let mut acc: Option<TReg> = None;
         for e in elements {
             let ev = compile_t(ctx, e)?;
@@ -1203,8 +1250,12 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
                 None => t,
                 Some(prev) => {
                     let o = ctx.fresh(ValType::Int);
-                    ctx.body
-                        .extend_from_slice(&[OP_OR, prev.idx as i64, t.idx as i64, o.idx as i64]);
+                    ctx.body.extend_from_slice(&[
+                        OP_OR,
+                        prev.idx as i64,
+                        t.idx as i64,
+                        o.idx as i64,
+                    ]);
                     o
                 }
             });
@@ -1222,7 +1273,9 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
         }
         let c = compile_t(ctx, &call.args[0])?;
         if c.bank != ValType::Int {
-            return Err(LowerError::unsupported("ternary condition must be int/bool"));
+            return Err(LowerError::unsupported(
+                "ternary condition must be int/bool",
+            ));
         }
         let t = compile_t(ctx, &call.args[1])?;
         let f = compile_t(ctx, &call.args[2])?;
@@ -1232,13 +1285,8 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
             _ => return Err(LowerError::unsupported("mixed-bank ternary arms")),
         };
         let d = ctx.fresh(bank);
-        ctx.body.extend_from_slice(&[
-            op,
-            c.idx as i64,
-            t.idx as i64,
-            f.idx as i64,
-            d.idx as i64,
-        ]);
+        ctx.body
+            .extend_from_slice(&[op, c.idx as i64, t.idx as i64, f.idx as i64, d.idx as i64]);
         return Ok(d);
     }
 
@@ -1301,7 +1349,9 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
         // etc. bail; a string mixed with a non-string is a CEL type error.
         if a.bank == ValType::Str || b.bank == ValType::Str {
             if a.bank != ValType::Str || b.bank != ValType::Str {
-                return Err(LowerError::unsupported("mixed string/non-string comparison"));
+                return Err(LowerError::unsupported(
+                    "mixed string/non-string comparison",
+                ));
             }
             let op = match name {
                 ops::EQUALS => OP_EQ,
@@ -1451,12 +1501,8 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
                 let op = match a.bank {
                     ValType::Int => OP_NEG,
                     ValType::Float => OP_FNEG,
-                    ValType::UInt => {
-                        return Err(LowerError::unsupported("unary negate on uint"))
-                    }
-                    ValType::Str => {
-                        return Err(LowerError::unsupported("unary negate on string"))
-                    }
+                    ValType::UInt => return Err(LowerError::unsupported("unary negate on uint")),
+                    ValType::Str => return Err(LowerError::unsupported("unary negate on string")),
                     ValType::Timestamp | ValType::Duration => {
                         return Err(LowerError::unsupported("unary negate on temporal"))
                     }
