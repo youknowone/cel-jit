@@ -645,11 +645,11 @@ pub mod float_bank {
     pub static GUARD_FAILS: AtomicUsize = AtomicUsize::new(0);
 
     use super::{
-        OP_ADD, OP_AND, OP_COL_LOAD, OP_COL_LOAD_F, OP_EQ, OP_FADD, OP_FDIV, OP_FEQ, OP_FGE,
-        OP_FGT, OP_FLE, OP_FLT, OP_FMOV, OP_FMUL, OP_FNE, OP_FNEG, OP_FSUB, OP_GE, OP_GT, OP_I2F,
-        OP_JUMP_IF_ABOVE, OP_LE, OP_LOAD_CONST, OP_LOAD_CONST_F, OP_LT, OP_MOV, OP_MUL, OP_NE,
-        OP_FSELECT, OP_NEG, OP_NOT, OP_OR, OP_RETURN, OP_RETURN_F, OP_SELECT, OP_SUB, OP_ULE,
-        OP_ULT,
+        OP_ADD, OP_AND, OP_COL_LOAD, OP_COL_LOAD_F, OP_DIV, OP_EQ, OP_FADD, OP_FDIV, OP_FEQ,
+        OP_FGE, OP_FGT, OP_FLE, OP_FLT, OP_FMOV, OP_FMUL, OP_FNE, OP_FNEG, OP_FSUB, OP_GE, OP_GT,
+        OP_I2F, OP_JUMP_IF_ABOVE, OP_LE, OP_LOAD_CONST, OP_LOAD_CONST_F, OP_LT, OP_MOD, OP_MOV,
+        OP_MUL, OP_NE, OP_FSELECT, OP_NEG, OP_NOT, OP_OR, OP_RETURN, OP_RETURN_F, OP_SELECT,
+        OP_SUB, OP_ULE, OP_ULT,
     };
     use core::sync::atomic::Ordering;
 
@@ -762,6 +762,41 @@ pub mod float_bank {
                     let b = program[pc + 2] as usize;
                     let d = program[pc + 3] as usize;
                     state.regs[d] = state.regs[a] * state.regs[b];
+                    pc += 4;
+                }
+                OP_DIV => {
+                    let a = state.regs[program[pc + 1] as usize];
+                    let b = state.regs[program[pc + 2] as usize];
+                    let d = program[pc + 3] as usize;
+                    // Same toward-zero divide as the single-bank machine (see the
+                    // `OP_DIV` arm in `run_mainloop`): majit lowers a bare `/` to
+                    // Python floor division, so divide the magnitudes — where
+                    // floor and truncation agree — and reapply the sign
+                    // branchlessly. Inlined, not a helper call: a residual call
+                    // in the mainloop aborts the trace.
+                    let ma = a >> 63;
+                    let mb = b >> 63;
+                    let ua = (a ^ ma) - ma;
+                    let ub = (b ^ mb) - mb;
+                    let uq = ua / ub;
+                    let s = ma ^ mb;
+                    state.regs[d] = (uq ^ s) - s;
+                    pc += 4;
+                }
+                OP_MOD => {
+                    let a = state.regs[program[pc + 1] as usize];
+                    let b = state.regs[program[pc + 2] as usize];
+                    let d = program[pc + 3] as usize;
+                    // cel `%` takes the sign of the DIVIDEND (Rust/C remainder),
+                    // while majit's floor `%` takes the sign of the divisor, so
+                    // build the remainder from magnitudes and reapply the
+                    // dividend's sign.
+                    let ma = a >> 63;
+                    let mb = b >> 63;
+                    let ua = (a ^ ma) - ma;
+                    let ub = (b ^ mb) - mb;
+                    let ur = ua % ub;
+                    state.regs[d] = (ur ^ ma) - ma;
                     pc += 4;
                 }
                 OP_NEG => {
@@ -1013,6 +1048,20 @@ pub mod float_bank {
                 OP_MUL => {
                     regs[program[pc + 3] as usize] =
                         regs[program[pc + 1] as usize] * regs[program[pc + 2] as usize];
+                    pc += 4;
+                }
+                OP_DIV => {
+                    // The reference tier is plain Rust, whose `/` and `%` already
+                    // truncate toward zero — the semantics cel wants. The traced
+                    // mainloop has to reconstruct that from magnitudes because
+                    // majit lowers a bare `/` to floor division.
+                    regs[program[pc + 3] as usize] =
+                        regs[program[pc + 1] as usize] / regs[program[pc + 2] as usize];
+                    pc += 4;
+                }
+                OP_MOD => {
+                    regs[program[pc + 3] as usize] =
+                        regs[program[pc + 1] as usize] % regs[program[pc + 2] as usize];
                     pc += 4;
                 }
                 OP_NEG => {

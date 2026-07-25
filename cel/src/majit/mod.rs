@@ -1024,6 +1024,89 @@ mod tests {
     }
 
     #[test]
+    fn batch_int_division() {
+        // Regression: the two-bank machine never implemented `OP_DIV`/`OP_MOD`,
+        // so every int `/` or `%` that reached the typed (columnar) path died
+        // with `bad op`. Only the single-bank machine had them, and no columnar
+        // test divided, so the gap went unseen. Negative operands included: cel
+        // `/` truncates toward zero while majit lowers a bare `/` to floor.
+        let n = 2000;
+        let a = gen_nanos(n, 0x5151_2626_3737_4848, -5000, 10_000);
+        let b = gen_nanos(n, 0x1234_5678_9abc_def0, 1, 97); // nonzero divisor
+        for expr in ["a / b", "a % b"] {
+            check_batch_f(
+                expr,
+                &[
+                    ("a", ColData::Int(a.clone())),
+                    ("b", ColData::Int(b.clone())),
+                ],
+            );
+        }
+        // Constant divisor: the literal folds to a prelude register, which is
+        // also the shape the duration accessors emit.
+        for expr in ["a / 7", "a % 7", "(a + 1) / 7 - a % 3"] {
+            check_batch_f(expr, &[("a", ColData::Int(a.clone()))]);
+        }
+    }
+
+    #[test]
+    fn batch_duration_accessors() {
+        // `d.getHours()` and friends are `chrono::Duration::num_*` = a
+        // toward-zero divide of the i64-nanos payload. The span straddles zero so
+        // NEGATIVE durations are exercised: that is where truncation and floor
+        // disagree, the exact class the `OP_DIV` sign-mask fix exists for. Both
+        // the compiled and interpreter tiers must match the tree-walker oracle.
+        let n = 3000;
+        let elapsed = gen_nanos(n, 0x0f1e_2d3c_4b5a_6978, -7_200_000_000_000, 14_400_000_000_000);
+        for expr in [
+            "elapsed.getHours()",
+            "elapsed.getMinutes()",
+            "elapsed.getSeconds()",
+            "elapsed.getMilliseconds()",
+            // The accessor result is a plain int, so it composes with the rest of
+            // the int subset (arithmetic, comparison, ternary).
+            "elapsed.getSeconds() * 2 + 1",
+            "elapsed.getMinutes() >= 0",
+            "elapsed.getHours() > 0 ? elapsed.getMinutes() : 0 - elapsed.getMinutes()",
+        ] {
+            check_batch_f(expr, &[("elapsed", ColData::Duration(elapsed.clone()))]);
+        }
+    }
+
+    #[test]
+    fn duration_accessor_bails() {
+        // The four names are registered ONLY as member overloads on `duration`
+        // (`common/types/duration.rs:191-222`), so everything else must bail to
+        // the tree-walker rather than answer:
+        //   * the global spelling is an UndeclaredReference in the walker,
+        //   * a timestamp receiver is a calendar field, not a scaled count
+        //     (civil-from-days, not lowered yet),
+        //   * a non-temporal receiver is a type error,
+        //   * the accessors take no arguments.
+        let schema: Schema = [
+            ("t".to_string(), ValType::Timestamp),
+            ("d".to_string(), ValType::Duration),
+            ("i".to_string(), ValType::Int),
+        ]
+        .into_iter()
+        .collect();
+        for expr in [
+            "getHours(d)",
+            "t.getHours()",
+            "t.getFullYear()",
+            "i.getSeconds()",
+            "d.getHours(1)",
+            "d.getDayOfWeek()",
+        ] {
+            let program = Program::compile(expr).unwrap();
+            assert!(
+                lower_typed(program.expression(), &schema).is_err(),
+                "`{expr}` must bail the typed lowering"
+            );
+        }
+    }
+
+    #[test]
     fn temporal_mixed_bails() {
         // A timestamp vs duration comparison is NoSuchOverload, a temporal vs int
         // is a type error, temporal arithmetic is out of subset, and a bare

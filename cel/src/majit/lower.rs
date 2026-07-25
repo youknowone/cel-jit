@@ -747,11 +747,83 @@ fn compile_cmp_operands(
 }
 
 fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerError> {
-    if call.target.is_some() {
-        return Err(LowerError::unsupported(format!(
-            "method call `{}`",
-            call.func_name
-        )));
+    // CEL member syntax `x.f(a)` is sugar for `f(x, a)`: the tree-walker resolves
+    // it by inserting the target at `args[0]` and looking up a member overload
+    // (`objects.rs:1358-1375`). Desugar to that same shape so a member call
+    // reaches the same arms as its global form. An unhandled name still falls
+    // through to the `call `{name}`` bail at the end, so this only widens what
+    // lowers — it never changes which function a lowered expression runs.
+    //
+    // The one shape the tree-walker resolves differently is a bare-`Ident`
+    // target, which it first tries as the QUALIFIED global `prefix.f`
+    // (`objects.rs:1348-1356`, e.g. `optional.none()`). Such a target names a
+    // namespace, not a value: it resolves to an untyped (`Int`) slot here and so
+    // fails the bank checks of every arm below, bailing to the tree-walker
+    // instead of miscompiling. Matching a function by bare name is the same
+    // assumption `timestamp`/`duration` already make (see the module header's
+    // schema/shape-guard note).
+    if let Some(target) = &call.target {
+        // Receiver-only stdlib accessors are registered with
+        // `add_member_overload` (`common/types/duration.rs:191-222`), so they
+        // exist ONLY in receiver form: the global spelling `getHours(d)` is an
+        // `UndeclaredReference` error in the tree-walker. Match them here, before
+        // the desugar, so the global spelling keeps bailing instead of answering
+        // where the walker raises.
+        //
+        // `d.getHours()` / `getMinutes()` / `getSeconds()` / `getMilliseconds()`
+        // on a `duration` are `chrono::Duration::num_*`: the whole number of
+        // units in the duration, TRUNCATED toward zero (`num_seconds` adds one
+        // back when secs is negative and nanos positive, so `-1.5s` is `-1`, not
+        // `-2`). A duration is already carried as i64 nanoseconds in the int
+        // file, so each is one truncating divide by a green constant — and
+        // `OP_DIV` is exactly toward-zero (bytecode.rs:205-221 divides the
+        // magnitudes and reapplies the sign), so this is bit-exact with the
+        // tree-walker and needs no new opcode. The divisor is a loop invariant,
+        // so its load goes in the prelude.
+        //
+        // The same four names are ALSO timestamp accessors, where the answer is a
+        // calendar field rather than a scaled count; those need a civil-from-days
+        // conversion and are not lowered yet, so a non-`duration` receiver bails
+        // rather than silently dividing a wall-clock instant.
+        if let Some(nanos_per_unit) = match call.func_name.as_str() {
+            "getHours" => Some(3_600_000_000_000i64),
+            "getMinutes" => Some(60_000_000_000i64),
+            "getSeconds" => Some(1_000_000_000i64),
+            "getMilliseconds" => Some(1_000_000i64),
+            _ => None,
+        } {
+            if !call.args.is_empty() {
+                return Err(LowerError::unsupported(format!(
+                    "`{}` arity",
+                    call.func_name
+                )));
+            }
+            let a = compile_t(ctx, target)?;
+            if a.bank != ValType::Duration {
+                return Err(LowerError::unsupported(format!(
+                    "`{}` on a non-duration receiver",
+                    call.func_name
+                )));
+            }
+            let k = ctx.fresh(ValType::Int);
+            ctx.prelude
+                .extend_from_slice(&[OP_LOAD_CONST, nanos_per_unit, k.idx as i64]);
+            let d = ctx.fresh(ValType::Int);
+            ctx.body
+                .extend_from_slice(&[OP_DIV, a.idx as i64, k.idx as i64, d.idx as i64]);
+            return Ok(d);
+        }
+        let mut args = Vec::with_capacity(call.args.len() + 1);
+        args.push((**target).clone());
+        args.extend(call.args.iter().cloned());
+        return compile_call_t(
+            ctx,
+            &CallExpr {
+                func_name: call.func_name.clone(),
+                target: None,
+                args,
+            },
+        );
     }
     let name = call.func_name.as_str();
 
