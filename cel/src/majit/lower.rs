@@ -1425,51 +1425,47 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
     // `OP_MUL` stay reserved for the batch machinery's own counters and offsets
     // and for the calendar helpers, whose operands are bounded by construction.
     let arith = match name {
-        ops::ADD => Some((OP_ADD_OVF, Some(OP_FADD))),
-        ops::SUBSTRACT => Some((OP_SUB_OVF, Some(OP_FSUB))),
-        ops::MULTIPLY => Some((OP_MUL_OVF, Some(OP_FMUL))),
-        ops::DIVIDE => Some((OP_DIV, Some(OP_FDIV))),
-        ops::MODULO => Some((OP_MOD, None)),
+        ops::ADD => Some((OP_ADD_OVF, None, Some(OP_FADD))),
+        ops::SUBSTRACT => Some((OP_SUB_OVF, None, Some(OP_FSUB))),
+        ops::MULTIPLY => Some((OP_MUL_OVF, None, Some(OP_FMUL))),
+        ops::DIVIDE => Some((OP_DIV_CHK, Some(OP_UDIV), Some(OP_FDIV))),
+        ops::MODULO => Some((OP_MOD_CHK, Some(OP_UMOD), None)),
         _ => None,
     };
-    if let Some((iop, fop)) = arith {
+    if let Some((iop, uop, fop)) = arith {
         if call.args.len() != 2 {
             return Err(LowerError::unsupported(format!("{name} arity")));
         }
         let a = compile_t(ctx, &call.args[0])?;
         let b = compile_t(ctx, &call.args[1])?;
-        let is_ovf_checked = iop == OP_ADD_OVF || iop == OP_SUB_OVF || iop == OP_MUL_OVF;
+        // Every int-bank arithmetic opcode reachable from a user expression is a
+        // TRAPPING (5-word) form carrying `OVF_FLAG_REG`: each of these five
+        // operators is partial in the tree-walker, so the JIT either answers
+        // what the walker answers or records that it cannot answer at all.
+        let emit_trapping = |ctx: &mut LowerCtxF, op: i64, bank: ValType| {
+            let d = ctx.fresh(bank);
+            ctx.body.extend_from_slice(&[
+                op,
+                a.idx as i64,
+                b.idx as i64,
+                d.idx as i64,
+                OVF_FLAG_REG as i64,
+            ]);
+            d
+        };
         match (a.bank, b.bank) {
-            (ValType::Int, ValType::Int) => {
-                let d = ctx.fresh(ValType::Int);
-                if is_ovf_checked {
-                    ctx.body.extend_from_slice(&[
-                        iop,
-                        a.idx as i64,
-                        b.idx as i64,
-                        d.idx as i64,
-                        OVF_FLAG_REG as i64,
-                    ]);
-                } else {
-                    ctx.body
-                        .extend_from_slice(&[iop, a.idx as i64, b.idx as i64, d.idx as i64]);
-                }
-                Ok(d)
-            }
-            (ValType::UInt, ValType::UInt) => {
-                // uint arithmetic is checked against the UNSIGNED bounds
+            (ValType::Int, ValType::Int) => Ok(emit_trapping(ctx, iop, ValType::Int)),
+            (ValType::UInt, ValType::UInt) => match uop {
+                Some(op) => Ok(emit_trapping(ctx, op, ValType::UInt)),
+                // uint `+ - *` are checked against the UNSIGNED bounds
                 // (`common/types/uint.rs:78-196` uses `u64::checked_*`), which
                 // the signed `Int*Ovf` guard does not answer: `2^63 + 1` is fine
                 // unsigned and overflows signed, and `0u - 1u` is the reverse.
-                // The trace IR has no unsigned overflow op, and detecting
-                // unsigned `*` overflow by hand needs a division — so the whole
-                // group bails rather than wrap silently. Division/modulo bail
-                // for the same missing-unsigned-opcode reason.
-                let _ = fop;
-                Err(LowerError::unsupported(
-                    "uint arithmetic (no unsigned overflow/division opcodes)",
-                ))
-            }
+                // They bail rather than wrap silently.
+                None => Err(LowerError::unsupported(
+                    "uint `+ - *` (no unsigned overflow guard)",
+                )),
+            },
             (ValType::Float, ValType::Float) => {
                 let fop = fop.ok_or_else(|| LowerError::unsupported("float modulo"))?;
                 let d = ctx.fresh(ValType::Float);

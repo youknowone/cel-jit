@@ -94,6 +94,28 @@ pub const OP_TRAP_STORE: i64 = 43; // [addr, flag]      *(regs[addr]) = regs[fla
 /// is needed. The inverse of [`OP_I2F`].
 pub const OP_F2I: i64 = 44; // [fsrc, dst]             regs[dst] = fregs[fsrc] as i64  (cast_float_to_int)
 
+// Domain-guarded division. The tree-walker's `/` and `%` are partial on both
+// numeric banks: a zero divisor raises `DivisionByZero`/`RemainderByZero`, and
+// `INT_MIN / -1` raises `Overflow` (`common/types/int.rs:119-143` uses
+// `checked_div`/`checked_rem`). RPython spells the same partiality as two
+// guards emitted UPSTREAM of the division helper — `int_eq(rhs, 0)` and
+// `(lhs == INT_MIN) & (rhs == -1)`, both `guard_false`, inlined from
+// `rint.py:429 ll_int_py_div_ovf_zer` — so these carry that guard and record
+// the trap on its failure, exactly as the `OP_*_OVF` group does.
+//
+// The unguarded [`OP_DIV`]/[`OP_MOD`] above stay for the divisions this
+// lowering creates itself: the temporal accessors divide by a green constant
+// that is nonzero by construction, and paying a per-row guard for a divisor the
+// optimizer can see is a constant would be waste. They are also what the legacy
+// int-only `lower` path emits, which reserves no trap register.
+pub const OP_DIV_CHK: i64 = 45; // [a, b, dst, trap]  regs[dst] = a / b   (trunc toward zero)
+pub const OP_MOD_CHK: i64 = 46; // [a, b, dst, trap]  regs[dst] = a % b   (sign of dividend)
+/// Unsigned division on the int bank, the `uint` peer of [`OP_DIV_CHK`]. Only
+/// the zero divisor is guarded — every pair of `u64` operands with a nonzero
+/// divisor has a representable quotient, so there is no `INT_MIN / -1` corner.
+pub const OP_UDIV: i64 = 47; // [a, b, dst, trap]  regs[dst] = (a as u64) / (b as u64)
+pub const OP_UMOD: i64 = 48; // [a, b, dst, trap]  regs[dst] = (a as u64) % (b as u64)
+
 /// Raw native-memory load intrinsic recognized by the `#[jit_interp]` proc
 /// macro (lowered to `raw_load_i`); at the interpreter tier this real fn runs.
 /// `base` is a column buffer's base address, `ea` a byte offset — reading
@@ -263,11 +285,11 @@ fn run_mainloop(program: &Code, num_regs: usize, threshold: u32) -> i64 {
                 // Inlined (not a helper call): a residual call aborts the trace.
                 let ma = a >> 63; // 0 or -1 (sign mask of a)
                 let mb = b >> 63;
-                let ua = (a ^ ma) - ma; // |a|
-                let ub = (b ^ mb) - mb; // |b|
+                let ua = (a ^ ma).wrapping_sub(ma); // |a|
+                let ub = (b ^ mb).wrapping_sub(mb); // |b|
                 let uq = ua / ub; // non-negative quotient: floor == trunc here
                 let s = ma ^ mb; // -1 iff signs differ
-                state.regs[d] = (uq ^ s) - s; // negate quotient iff signs differ
+                state.regs[d] = (uq ^ s).wrapping_sub(s); // negate quotient iff signs differ
                 pc += 4;
             }
             OP_MOD => {
@@ -277,10 +299,10 @@ fn run_mainloop(program: &Code, num_regs: usize, threshold: u32) -> i64 {
                 // Truncating remainder = cel's `%` (sign of the dividend).
                 let ma = a >> 63;
                 let mb = b >> 63;
-                let ua = (a ^ ma) - ma;
-                let ub = (b ^ mb) - mb;
+                let ua = (a ^ ma).wrapping_sub(ma);
+                let ub = (b ^ mb).wrapping_sub(mb);
                 let ur = ua % ub; // non-negative remainder
-                state.regs[d] = (ur ^ ma) - ma; // reapply the dividend's sign
+                state.regs[d] = (ur ^ ma).wrapping_sub(ma); // reapply the dividend's sign
                 pc += 4;
             }
             OP_NEG => {
@@ -728,11 +750,12 @@ pub mod float_bank {
     pub static GUARD_FAILS: AtomicUsize = AtomicUsize::new(0);
 
     use super::{
-        OP_ADD, OP_ADD_OVF, OP_AND, OP_COL_LOAD, OP_COL_LOAD_F, OP_DIV, OP_EQ, OP_FADD, OP_FDIV,
-        OP_FEQ, OP_FGE, OP_FGT, OP_FLE, OP_FLT, OP_FMOV, OP_FMUL, OP_FNE, OP_FNEG, OP_FSUB, OP_GE,
-        OP_F2I, OP_GT, OP_I2F, OP_JUMP_IF_ABOVE, OP_LE, OP_LOAD_CONST, OP_LOAD_CONST_F, OP_LT, OP_MOD,
-        OP_MOV, OP_MUL, OP_MUL_OVF, OP_NE, OP_FSELECT, OP_NEG, OP_NOT, OP_OR, OP_RETURN,
-        OP_RETURN_F, OP_SELECT, OP_SUB, OP_SUB_OVF, OP_TRAP_STORE, OP_ULE, OP_ULT,
+        OP_ADD, OP_ADD_OVF, OP_AND, OP_COL_LOAD, OP_COL_LOAD_F, OP_DIV, OP_DIV_CHK, OP_EQ, OP_F2I,
+        OP_FADD, OP_FDIV, OP_FEQ, OP_FGE, OP_FGT, OP_FLE, OP_FLT, OP_FMOV, OP_FMUL, OP_FNE,
+        OP_FNEG, OP_FSELECT, OP_FSUB, OP_GE, OP_GT, OP_I2F, OP_JUMP_IF_ABOVE, OP_LE, OP_LOAD_CONST,
+        OP_LOAD_CONST_F, OP_LT, OP_MOD, OP_MOD_CHK, OP_MOV, OP_MUL, OP_MUL_OVF, OP_NE, OP_NEG,
+        OP_NOT, OP_OR, OP_RETURN, OP_RETURN_F, OP_SELECT, OP_SUB, OP_SUB_OVF, OP_TRAP_STORE,
+        OP_UDIV, OP_ULE, OP_ULT, OP_UMOD,
     };
     use core::sync::atomic::Ordering;
 
@@ -783,6 +806,26 @@ pub mod float_bank {
     #[inline]
     fn majit_uint_le(a: i64, b: i64) -> i64 {
         ((a as u64) <= (b as u64)) as i64
+    }
+
+    /// Unsigned `/` on the int bank. The macro recognizes the name and lowers it
+    /// to the `int.udiv` oopspec residual call (`ll_uint_py_div`), NOT to a
+    /// trace opcode: RPython deleted `UINT_FLOORDIV` from the resop set in 2016
+    /// and routes unsigned division through that elidable call instead. A bare
+    /// Rust `/` would lower to the SIGNED `int.py_div`, which disagrees with
+    /// this fn for any operand above `2^63` — the interpreter and compiled tiers
+    /// would then diverge silently.
+    ///
+    /// Caller must guarantee `b != 0`; the helper divides unconditionally.
+    #[inline]
+    fn majit_uint_div(a: i64, b: i64) -> i64 {
+        ((a as u64) / (b as u64)) as i64
+    }
+
+    /// Unsigned `%` — `int.umod` / `ll_uint_py_mod`. See [`majit_uint_div`].
+    #[inline]
+    fn majit_uint_mod(a: i64, b: i64) -> i64 {
+        ((a as u64) % (b as u64)) as i64
     }
 
     struct VmStateF {
@@ -923,11 +966,11 @@ pub mod float_bank {
                     // in the mainloop aborts the trace.
                     let ma = a >> 63;
                     let mb = b >> 63;
-                    let ua = (a ^ ma) - ma;
-                    let ub = (b ^ mb) - mb;
+                    let ua = (a ^ ma).wrapping_sub(ma);
+                    let ub = (b ^ mb).wrapping_sub(mb);
                     let uq = ua / ub;
                     let s = ma ^ mb;
-                    state.regs[d] = (uq ^ s) - s;
+                    state.regs[d] = (uq ^ s).wrapping_sub(s);
                     pc += 4;
                 }
                 OP_MOD => {
@@ -940,11 +983,106 @@ pub mod float_bank {
                     // dividend's sign.
                     let ma = a >> 63;
                     let mb = b >> 63;
-                    let ua = (a ^ ma) - ma;
-                    let ub = (b ^ mb) - mb;
+                    let ua = (a ^ ma).wrapping_sub(ma);
+                    let ub = (b ^ mb).wrapping_sub(mb);
                     let ur = ua % ub;
-                    state.regs[d] = (ur ^ ma) - ma;
+                    state.regs[d] = (ur ^ ma).wrapping_sub(ma);
                     pc += 4;
+                }
+                OP_DIV_CHK => {
+                    let a = state.regs[program[pc + 1] as usize];
+                    let b = state.regs[program[pc + 2] as usize];
+                    let d = program[pc + 3] as usize;
+                    let t = program[pc + 4] as usize;
+                    if b == 0 {
+                        // `int_eq(rhs, 0) -> guard_false`. The walker raises
+                        // `DivisionByZero`, so there is no answer to give.
+                        state.regs[t] = 1;
+                        state.regs[d] = 0;
+                    } else {
+                        // Truncating (toward-zero) division = cel's `/`. The
+                        // magnitudes are divided UNSIGNED: `|i64::MIN|` is 2^63,
+                        // which is not an i64, so a signed divide of the
+                        // magnitude would come back negative and the sign
+                        // reapplication would then flip it (`i64::MIN / 2`
+                        // answering `+2^62`). Read as u64 the magnitude is exact.
+                        let ma = a >> 63; // 0 or -1 (sign mask of a)
+                        let mb = b >> 63;
+                        // The magnitude subtraction WRAPS by construction: for
+                        // `a == i64::MIN` it lands on 2^63, which is the case
+                        // this whole arm exists to get right. `IntSub` is what
+                        // both `-` and `wrapping_sub` trace to, so the compiled
+                        // tier is unchanged and only the debug-build overflow
+                        // panic goes away.
+                        let ua = (a ^ ma).wrapping_sub(ma); // |a|, exact as a u64 bit pattern
+                        let ub = (b ^ mb).wrapping_sub(mb); // |b|
+                        let uq = majit_uint_div(ua, ub);
+                        let s = ma ^ mb; // -1 iff signs differ
+                        if ua < 0 && ub == 1 && s == 0 {
+                            // `(lhs == INT_MIN) & (rhs == -1) -> guard_false`:
+                            // `ua` reads negative only for `a == i64::MIN`, and
+                            // with `|b| == 1` and matching signs that is the
+                            // `INT_MIN / -1` corner, whose true quotient `2^63`
+                            // is not an i64. `checked_div` reports it as
+                            // `Overflow` and so must we.
+                            state.regs[t] = 1;
+                        }
+                        state.regs[d] = (uq ^ s).wrapping_sub(s); // negate iff signs differ
+                    }
+                    pc += 5;
+                }
+                OP_MOD_CHK => {
+                    let a = state.regs[program[pc + 1] as usize];
+                    let b = state.regs[program[pc + 2] as usize];
+                    let d = program[pc + 3] as usize;
+                    let t = program[pc + 4] as usize;
+                    if b == 0 {
+                        state.regs[t] = 1;
+                        state.regs[d] = 0;
+                    } else {
+                        // Truncating remainder = cel's `%` (sign of the
+                        // dividend); unsigned magnitudes for the same
+                        // `|i64::MIN|` reason as `OP_DIV_CHK`.
+                        let ma = a >> 63;
+                        let mb = b >> 63;
+                        let ua = (a ^ ma).wrapping_sub(ma);
+                        let ub = (b ^ mb).wrapping_sub(mb);
+                        let ur = majit_uint_mod(ua, ub);
+                        if ua < 0 && ub == 1 && (ma ^ mb) == 0 {
+                            // `INT_MIN % -1` is mathematically 0, but
+                            // `checked_rem` reports it as `Overflow` and the
+                            // walker raises, so trap the same corner `/` does.
+                            state.regs[t] = 1;
+                        }
+                        state.regs[d] = (ur ^ ma).wrapping_sub(ma); // reapply dividend's sign
+                    }
+                    pc += 5;
+                }
+                OP_UDIV => {
+                    let a = state.regs[program[pc + 1] as usize];
+                    let b = state.regs[program[pc + 2] as usize];
+                    let d = program[pc + 3] as usize;
+                    let t = program[pc + 4] as usize;
+                    if b == 0 {
+                        state.regs[t] = 1;
+                        state.regs[d] = 0;
+                    } else {
+                        state.regs[d] = majit_uint_div(a, b);
+                    }
+                    pc += 5;
+                }
+                OP_UMOD => {
+                    let a = state.regs[program[pc + 1] as usize];
+                    let b = state.regs[program[pc + 2] as usize];
+                    let d = program[pc + 3] as usize;
+                    let t = program[pc + 4] as usize;
+                    if b == 0 {
+                        state.regs[t] = 1;
+                        state.regs[d] = 0;
+                    } else {
+                        state.regs[d] = majit_uint_mod(a, b);
+                    }
+                    pc += 5;
                 }
                 OP_NEG => {
                     state.regs[program[pc + 2] as usize] = -state.regs[program[pc + 1] as usize];
@@ -1252,6 +1390,59 @@ pub mod float_bank {
                     regs[program[pc + 3] as usize] =
                         regs[program[pc + 1] as usize] % regs[program[pc + 2] as usize];
                     pc += 4;
+                }
+                // The guarded forms mirror the traced tier's two guards. The
+                // reference tier can spell them directly — `checked_div` is
+                // exactly the walker's own test — and where the guard fires the
+                // result value is irrelevant: a set trap makes every tier return
+                // `None`, so no value comparison survives it.
+                OP_DIV_CHK => {
+                    let a = regs[program[pc + 1] as usize];
+                    let b = regs[program[pc + 2] as usize];
+                    match a.checked_div(b) {
+                        Some(q) => regs[program[pc + 3] as usize] = q,
+                        None => {
+                            regs[program[pc + 4] as usize] = 1;
+                            regs[program[pc + 3] as usize] = 0;
+                        }
+                    }
+                    pc += 5;
+                }
+                OP_MOD_CHK => {
+                    let a = regs[program[pc + 1] as usize];
+                    let b = regs[program[pc + 2] as usize];
+                    match a.checked_rem(b) {
+                        Some(r) => regs[program[pc + 3] as usize] = r,
+                        None => {
+                            regs[program[pc + 4] as usize] = 1;
+                            regs[program[pc + 3] as usize] = 0;
+                        }
+                    }
+                    pc += 5;
+                }
+                OP_UDIV => {
+                    let a = regs[program[pc + 1] as usize] as u64;
+                    let b = regs[program[pc + 2] as usize] as u64;
+                    match a.checked_div(b) {
+                        Some(q) => regs[program[pc + 3] as usize] = q as i64,
+                        None => {
+                            regs[program[pc + 4] as usize] = 1;
+                            regs[program[pc + 3] as usize] = 0;
+                        }
+                    }
+                    pc += 5;
+                }
+                OP_UMOD => {
+                    let a = regs[program[pc + 1] as usize] as u64;
+                    let b = regs[program[pc + 2] as usize] as u64;
+                    match a.checked_rem(b) {
+                        Some(r) => regs[program[pc + 3] as usize] = r as i64,
+                        None => {
+                            regs[program[pc + 4] as usize] = 1;
+                            regs[program[pc + 3] as usize] = 0;
+                        }
+                    }
+                    pc += 5;
                 }
                 OP_NEG => {
                     regs[program[pc + 2] as usize] = -regs[program[pc + 1] as usize];

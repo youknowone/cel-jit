@@ -628,6 +628,73 @@ mod tests {
         }
     }
 
+    /// Bind row `i` of every column into a fresh tree-walker context — the
+    /// oracle's view of one row.
+    fn row_context<'a>(cols: &'a [(&str, ColData)], i: usize) -> Context<'a> {
+        let mut ctx = Context::default();
+        for (name, d) in cols {
+            match d {
+                ColData::Int(c) => ctx.add_variable_from_value(*name, c[i]),
+                ColData::UInt(c) => ctx.add_variable_from_value(*name, c[i] as u64),
+                ColData::Float(c) => ctx.add_variable_from_value(*name, c[i]),
+                ColData::Str(c) => ctx.add_variable_from_value(*name, c[i].clone()),
+                ColData::Timestamp(c) => ctx.add_variable_from_value(
+                    *name,
+                    Value::Timestamp(chrono::DateTime::from_timestamp_nanos(c[i]).fixed_offset()),
+                ),
+                ColData::Duration(c) => ctx.add_variable_from_value(
+                    *name,
+                    Value::Duration(chrono::Duration::nanoseconds(c[i])),
+                ),
+            }
+        }
+        ctx
+    }
+
+    /// Cross-check that a typed batch REFUSES to answer — the other half of the
+    /// [`check_batch_f`] contract. A refusal is only correct when the
+    /// tree-walker itself raises, so that is asserted first; then all three
+    /// tiers must return `None`, meaning the trap flag survived the loop and
+    /// reached the driver. The compiled tier must still trace the loop:
+    /// refusing is a guard exit taken on some row, not a failure to compile.
+    fn check_batch_f_refuses(expr_src: &str, cols: &[(&str, ColData)]) {
+        use super::bytecode::float_bank::COMPILES as COMPILES_F;
+
+        let program =
+            Program::compile(expr_src).unwrap_or_else(|e| panic!("parse `{expr_src}`: {e:?}"));
+        let schema: Schema = cols.iter().map(|(n, d)| (n.to_string(), d.ty())).collect();
+        let lowered = lower_typed(program.expression(), &schema)
+            .unwrap_or_else(|e| panic!("lower_typed `{expr_src}`: {e}"));
+
+        let n = cols.first().map_or(0, |(_, d)| d.len());
+        assert!(
+            (0..n).any(|i| program.execute(&row_context(cols, i)).is_err()),
+            "`{expr_src}`: the tree-walker answers every row, so refusing would be wrong"
+        );
+
+        let columns: Vec<Column> = cols.iter().map(|(_, d)| d.column()).collect();
+        assert_eq!(
+            clean_batch_sum_f(&lowered, &columns, n),
+            None,
+            "clean must refuse `{expr_src}`"
+        );
+        assert_eq!(
+            eval_batch_sum_f(&lowered, &columns, u32::MAX),
+            None,
+            "batch jit-off must refuse `{expr_src}`"
+        );
+        let before = COMPILES_F.load(Ordering::Relaxed);
+        assert_eq!(
+            eval_batch_sum_f(&lowered, &columns, 8),
+            None,
+            "batch jit-on must refuse `{expr_src}`"
+        );
+        assert!(
+            COMPILES_F.load(Ordering::Relaxed) > before,
+            "float batch `{expr_src}` must still compile the hot loop"
+        );
+    }
+
     /// Cross-check the typed (two-bank) columnar batch evaluator. The schema is
     /// read off `cols` (int vs `double`), which also pins the lowering's slot
     /// order. The clean two-bank interpreter, the majit interpreter tier, and
@@ -655,34 +722,19 @@ mod tests {
             assert_eq!(d.len(), n, "column `{name}` length for `{expr_src}`");
         }
 
-        // Oracle: sum the stock tree-walker's per-row result.
+        // Oracle: sum the stock tree-walker's per-row result. A `uint` result
+        // rides the int accumulator as its raw bit pattern, exactly as the
+        // machine's plain `OP_ADD` reduction does.
         let mut expected = 0i64;
         for i in 0..n {
-            let mut ctx = Context::default();
-            for (name, d) in cols {
-                match d {
-                    ColData::Int(c) => ctx.add_variable_from_value(*name, c[i]),
-                    ColData::UInt(c) => ctx.add_variable_from_value(*name, c[i] as u64),
-                    ColData::Float(c) => ctx.add_variable_from_value(*name, c[i]),
-                    ColData::Str(c) => ctx.add_variable_from_value(*name, c[i].clone()),
-                    ColData::Timestamp(c) => ctx.add_variable_from_value(
-                        *name,
-                        Value::Timestamp(
-                            chrono::DateTime::from_timestamp_nanos(c[i]).fixed_offset(),
-                        ),
-                    ),
-                    ColData::Duration(c) => ctx.add_variable_from_value(
-                        *name,
-                        Value::Duration(chrono::Duration::nanoseconds(c[i])),
-                    ),
-                }
-            }
+            let ctx = row_context(cols, i);
             expected += match program
                 .execute(&ctx)
                 .unwrap_or_else(|e| panic!("execute `{expr_src}`: {e:?}"))
             {
                 Value::Bool(b) => b as i64,
                 Value::Int(v) => v,
+                Value::UInt(v) => v as i64,
                 other => panic!("`{expr_src}`: unexpected {other:?}"),
             };
         }
@@ -1190,6 +1242,148 @@ mod tests {
         // also the shape the duration accessors emit.
         for expr in ["a / 7", "a % 7", "(a + 1) / 7 - a % 3"] {
             check_batch_f(expr, &[("a", ColData::Int(a.clone()))]);
+        }
+    }
+
+    #[test]
+    fn batch_int_division_at_i64_min() {
+        // Regression: the traced `/` and `%` divide the operands' MAGNITUDES
+        // (floor and truncation agree there) and reapply the sign. `|i64::MIN|`
+        // is 2^63, which is not an i64 — read as a signed magnitude it comes
+        // back NEGATIVE, and the sign reapplication then flipped the answer, so
+        // `i64::MIN / 2` produced `+2^62` in the compiled tier while the walker
+        // and the clean tier said `-2^62`. Dividing the magnitudes UNSIGNED
+        // makes the bit pattern exact. Every legal `i64::MIN` divisor is
+        // covered; `-1` is the illegal one and belongs to the refusal test.
+        // The divisor cycle avoids `-1`, the one illegal divisor for
+        // `i64::MIN` (that corner belongs to `int_division_refuses`).
+        let divisors = [2i64, -2, 3, -3, 1, 7, -7, 97, -97, 5, -5, i64::MIN];
+        let n = 240;
+        let b: Vec<i64> = (0..n).map(|i| divisors[i % divisors.len()]).collect();
+        // Mostly `i64::MIN`, with the neighbours mixed in so the column is not
+        // one constant the optimizer could specialize the whole loop on.
+        let a: Vec<i64> = (0..n)
+            .map(|i| match i % 8 {
+                3 => i64::MIN + 1,
+                6 => i64::MAX,
+                _ => i64::MIN,
+            })
+            .collect();
+        // The quotients and remainders here reach ±2^63, which would overflow
+        // the machine's plain `OP_ADD` reduction (and the oracle's `+=`), so
+        // reduce each one mod a large prime: still magnitude-sensitive to every
+        // bit that matters, but summable. The sign predicates pin the exact
+        // symptom the bug had — a flipped sign.
+        for expr in [
+            "(a / b) % 1000000007",
+            "(a % b) % 1000000007",
+            "a / b < 0",
+            "a % b < 0",
+            "a / b > 0",
+        ] {
+            check_batch_f(
+                expr,
+                &[
+                    ("a", ColData::Int(a.clone())),
+                    ("b", ColData::Int(b.clone())),
+                ],
+            );
+        }
+    }
+
+    #[test]
+    fn int_division_refuses() {
+        // `/` and `%` are PARTIAL in the tree-walker: a zero divisor raises
+        // `DivisionByZero`/`RemainderByZero` and `i64::MIN / -1` raises
+        // `Overflow` (`common/types/int.rs:119-143`). Both were an undeclared
+        // "assumed domain" — the zero divisor PANICKED the process (Rust integer
+        // division by zero panics in every build) and the overflow corner
+        // answered `i64::MIN`. Now each is the RPython `ll_int_py_div_ovf_zer`
+        // guard pair, whose failure records the trap and abandons the batch.
+        // Long enough that the row loop still gets hot: refusing is a guard exit
+        // on one row, not a reason for the trace never to compile.
+        let n = 240;
+        let a: Vec<i64> = (0..n).map(|i| i as i64 + 10).collect();
+        // A single zero, late enough that the loop is already compiled.
+        let mut zero_divisor: Vec<i64> = (0..n).map(|i| (i % 7) as i64 + 1).collect();
+        zero_divisor[200] = 0;
+        // `i64::MIN / -1` is the overflow corner: one row carries it.
+        let mut min_dividend = a.clone();
+        min_dividend[200] = i64::MIN;
+        let mut minus_one: Vec<i64> = (0..n).map(|i| (i % 7) as i64 + 1).collect();
+        minus_one[200] = -1;
+        for (expr, a, b) in [
+            ("a / b", a.clone(), zero_divisor.clone()),
+            ("a % b", a.clone(), zero_divisor),
+            ("a / b", min_dividend.clone(), minus_one.clone()),
+            ("a % b", min_dividend, minus_one),
+        ] {
+            check_batch_f_refuses(expr, &[("a", ColData::Int(a)), ("b", ColData::Int(b))]);
+        }
+    }
+
+    #[test]
+    fn batch_uint_division() {
+        // Unsigned `/` and `%`. The columns are full-range u64 (roughly half
+        // with the high bit set), which is exactly where a signed division
+        // answers something else — so this fails outright if the lowering reuses
+        // the signed opcode. RPython has NO unsigned division resop (`UINT_
+        // FLOORDIV` was deleted in 2016); these lower to the `int.udiv` /
+        // `int.umod` oopspec residual calls instead, the same shape the signed
+        // `/` already used.
+        let n = 2000;
+        let a = gen_u64_bits(n, 0x9E37_79B9_7F4A_7C15);
+        // Divisor column: full-range but never zero.
+        let b: Vec<i64> = gen_u64_bits(n, 0x2545_F491_4F6C_DD1D)
+            .into_iter()
+            .map(|v| if v == 0 { 1 } else { v })
+            .collect();
+        // A full-range quotient or remainder would overflow the machine's plain
+        // `OP_ADD` reduction, so reduce each row mod a large prime first — which
+        // is itself another unsigned division.
+        for expr in [
+            "(a / b) % 1000000007u",
+            "(a % b) % 1000000007u",
+            "a / b == 0u",
+            "a % b == a",
+        ] {
+            check_batch_f(
+                expr,
+                &[
+                    ("a", ColData::UInt(a.clone())),
+                    ("b", ColData::UInt(b.clone())),
+                ],
+            );
+        }
+        // Constant divisors, including one above 2^63 where the signed quotient
+        // would be negative and the unsigned one is 0 or 1.
+        for expr in [
+            "(a / 7u) % 1000000007u",
+            "a % 7u",
+            "a / 9223372036854775809u",
+            "(a % 9223372036854775809u) % 1000000007u",
+        ] {
+            check_batch_f(expr, &[("a", ColData::UInt(a.clone()))]);
+        }
+    }
+
+    #[test]
+    fn uint_division_refuses() {
+        // The unsigned zero divisor is the only partial case: every pair of u64
+        // operands with a nonzero divisor has a representable quotient, so there
+        // is no unsigned peer of the `i64::MIN / -1` corner.
+        let n = 240;
+        let a: Vec<i64> = (0..n).map(|i| i as i64 + 10).collect();
+        let mut b: Vec<i64> = (0..n).map(|i| (i % 7) as i64 + 1).collect();
+        b[200] = 0;
+        for expr in ["a / b", "a % b"] {
+            check_batch_f_refuses(
+                expr,
+                &[
+                    ("a", ColData::UInt(a.clone())),
+                    ("b", ColData::UInt(b.clone())),
+                ],
+            );
         }
     }
 
@@ -1736,34 +1930,34 @@ mod tests {
 
     #[test]
     fn uint_arith_bails() {
-        // Every uint arithmetic operator bails; only comparisons lower.
+        // uint `+ - *` bail; `/ %` and the comparisons lower.
         //
         // `+ - *` USED to reuse the signed opcodes on the grounds that they are
         // bit-identical mod 2^64 — true of the value, false of the CHECK. The
         // tree-walker uses `u64::checked_*` (`common/types/uint.rs:78-196`) and
         // raises on unsigned overflow, which the signed `Int*Ovf` guard answers
         // wrongly in both directions: `2^63 + 1` is fine unsigned but overflows
-        // signed, and `0u - 1u` is the reverse. The trace IR has no unsigned
-        // overflow opcode (and detecting unsigned `*` overflow by hand needs a
-        // division), so the whole group falls back rather than wrap silently.
-        //
-        // `/ %` bail for the neighbouring reason: no unsigned floordiv/mod
-        // opcode. Both wait on the same parent majit-macros addition.
+        // signed, and `0u - 1u` is the reverse. So they fall back rather than
+        // wrap silently.
         let schema: Schema =
             [("a".to_string(), ValType::UInt), ("b".to_string(), ValType::UInt)]
                 .into_iter()
                 .collect();
-        for expr in [
-            "a + b >= 1500u",
-            "a - b >= 1500u",
-            "a * b < 250000u",
-            "a / b >= 1u",
-            "a % b >= 1u",
-        ] {
+        for expr in ["a + b >= 1500u", "a - b >= 1500u", "a * b < 250000u"] {
             let program = Program::compile(expr).unwrap();
             assert!(
                 lower_typed(program.expression(), &schema).is_err(),
-                "`{expr}` must bail the typed lowering (no unsigned arithmetic opcodes)"
+                "`{expr}` must bail the typed lowering (no unsigned overflow guard)"
+            );
+        }
+        // Division and modulo DO lower — unsigned `/` and `%` are total once the
+        // zero divisor is guarded, and the guard is the same shape the signed
+        // ones carry.
+        for expr in ["a / b >= 1u", "a % b >= 1u"] {
+            let program = Program::compile(expr).unwrap();
+            assert!(
+                lower_typed(program.expression(), &schema).is_ok(),
+                "`{expr}` must lower (unsigned division is guarded, not refused)"
             );
         }
     }
