@@ -555,9 +555,25 @@ pub fn eval_batch_sum_f(
             slot.ty
         );
     }
-    let n = columns.first().map_or(0, |c| c.len());
-    for (k, c) in columns.iter().enumerate() {
-        assert_eq!(c.len(), n, "eval_batch_sum_f: column {k} length {} != {n}", c.len());
+    // The row count comes from a ROW column. A list's flattened ELEMENT column
+    // is as long as the batch's total element count, not the row count, so it
+    // neither sets `n` nor has to match it.
+    use super::lower::SlotKind;
+    let n = columns
+        .iter()
+        .zip(&lowered.slots)
+        .find(|(_, s)| s.kind == SlotKind::Row)
+        .map_or(0, |(c, _)| c.len());
+    for (k, (c, slot)) in columns.iter().zip(&lowered.slots).enumerate() {
+        if slot.kind != SlotKind::Row {
+            continue;
+        }
+        assert_eq!(
+            c.len(),
+            n,
+            "eval_batch_sum_f: column {k} length {} != {n}",
+            c.len()
+        );
     }
     if n == 0 {
         return Some(0);

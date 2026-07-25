@@ -14,8 +14,10 @@
 //!   * boolean `&& || !` (non-short-circuit, correct for the pure int/bool
 //!     domain where operands cannot raise),
 //!   * `all` / `exists` / `exists_one` comprehensions over a **literal** list
-//!     (green-constant length), unrolled into a straight-line fold. `map` /
-//!     `filter` build a list and stay out of the int subset.
+//!     (green-constant length), unrolled into a straight-line fold, or over a
+//!     **runtime-length** list column ([`declares_list`]), which gets a real
+//!     inner loop instead. `map` / `filter` build a list and stay out of the
+//!     int subset.
 //!
 //! **Schema assumption**: every slot is assumed to carry an `int`/`bool` value.
 //! A CEL expression comparing a slot bound to a `double`/`uint`/`string` at
@@ -386,8 +388,25 @@ struct TReg {
     idx: usize,
 }
 
+/// Where in the batch program a slot's column is read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlotKind {
+    /// A per-ROW column: read at `row * 8` in the outer loop's prologue, which
+    /// [`LoweredF::batch_sum_program_trapping`] emits.
+    Row,
+    /// A flattened ELEMENT column of a list: read at `(offset(list) + j) * 8`
+    /// INSIDE a comprehension's inner loop. Only the lowering knows where that
+    /// loop is, so the lowering emits the load and the batch builder just parks
+    /// the column base in `base_reg` before the row loop starts.
+    Element {
+        /// Int register holding the column's base address, loop-invariant.
+        base_reg: usize,
+    },
+}
+
 /// One typed input slot for the two-bank machine: a path resolved to a register
-/// in its bank, plus which bank ([`ValType`]) it is.
+/// in its bank, plus which bank ([`ValType`]) it is and where it is read
+/// ([`SlotKind`]).
 #[derive(Debug, Clone)]
 pub struct SlotInfoF {
     /// Dotted variable path, e.g. `account.balance`.
@@ -396,6 +415,8 @@ pub struct SlotInfoF {
     pub ty: ValType,
     /// Register index within [`SlotInfoF::ty`]'s bank.
     pub reg: usize,
+    /// Row column vs flattened list-element column.
+    pub kind: SlotKind,
 }
 
 /// Slot path of the DERIVED length column for the string column at `path` — the
@@ -407,10 +428,60 @@ pub fn size_slot_path(path: &str) -> String {
     format!("size({path})")
 }
 
-/// The string column path a [`size_slot_path`] key was derived from, or `None`
-/// if the key is an ordinary column.
+/// The string path a [`size_slot_path`] key was derived from, or `None` if the
+/// key is an ordinary column. For a list column the same key carries the
+/// per-row ELEMENT COUNT (see [`elem_slot_path`]).
 pub fn size_slot_source(slot_path: &str) -> Option<&str> {
     slot_path.strip_prefix("size(")?.strip_suffix(')')
+}
+
+/// Slot path of the DERIVED per-row START INDEX of the list at `path` into its
+/// flattened element columns — Arrow's offsets buffer, and the other half of
+/// the `(offset, size)` pair that locates one row's elements.
+pub fn offset_slot_path(path: &str) -> String {
+    format!("offset({path})")
+}
+
+/// The list path an [`offset_slot_path`] key was derived from, or `None` if the
+/// key is an ordinary column.
+pub fn offset_slot_source(slot_path: &str) -> Option<&str> {
+    slot_path.strip_prefix("offset(")?.strip_suffix(')')
+}
+
+/// Slot path of a flattened ELEMENT column of the list at `list`: the elements
+/// themselves for a list of scalars (`field == None`), or one struct field's
+/// values for a list of records (`field == Some(f)`).
+///
+/// Arrow's layout: every row's elements laid end to end in ONE buffer per
+/// field, addressed by `offset(list)[row] + j`. A list is therefore not a value
+/// on this machine — it is a `(size, offset)` pair of row columns plus one
+/// element column per field it reads.
+pub fn elem_slot_path(list: &str, field: Option<&str>) -> String {
+    match field {
+        None => format!("{list}[]"),
+        Some(f) => format!("{list}[].{f}"),
+    }
+}
+
+/// Split an [`elem_slot_path`] key back into `(list, field)`, or `None` if the
+/// key is not an element column.
+pub fn elem_slot_source(slot_path: &str) -> Option<(&str, Option<&str>)> {
+    let (list, rest) = slot_path.split_once("[]")?;
+    match rest {
+        "" => Some((list, None)),
+        _ => Some((list, Some(rest.strip_prefix('.')?))),
+    }
+}
+
+/// True if `schema` declares `path` as a LIST, i.e. it carries at least one
+/// flattened element column ([`elem_slot_path`]). Declaring the elements is
+/// what makes a list iterable here; the list path itself never names a
+/// register, so there is no list "bank".
+pub fn declares_list(schema: &Schema, path: &str) -> bool {
+    let prefix = format!("{path}[]");
+    schema
+        .keys()
+        .any(|k| k.as_str() == prefix || k.starts_with(&format!("{prefix}.")))
 }
 
 /// Int register reserved for the overflow trap flag of the two-bank machine
@@ -455,6 +526,11 @@ pub struct LoweredF {
     /// injectivity check so a literal that collides with a distinct column
     /// string bails rather than miscompiles.
     pub str_literals: Vec<String>,
+    /// Positions **within [`LoweredF::body`]** of jump target words, which the
+    /// lowering writes body-relative because it cannot know where the body
+    /// lands. [`LoweredF::batch_sum_program_trapping`] relocates each to an
+    /// absolute program address once it does.
+    pub jump_fixups: Vec<usize>,
 }
 
 impl LoweredF {
@@ -533,8 +609,15 @@ impl LoweredF {
         // bases), and the epilogue publishes it once the loop is done.
         load_const(&mut p, 0, OVF_FLAG_REG);
         load_const(&mut p, trap_addr, r_trap);
-        for (k, &base) in bases.iter().enumerate() {
-            load_const(&mut p, base, r_base0 + k);
+        // Column bases, one loop-invariant int register each. A row column's
+        // base lives in the machinery bank; a list ELEMENT column's base lives
+        // in the register the lowering reserved for it, because the load that
+        // reads it was emitted inside the body's inner loop.
+        for (k, (&base, slot)) in bases.iter().zip(&self.slots).enumerate() {
+            match slot.kind {
+                SlotKind::Row => load_const(&mut p, base, r_base0 + k),
+                SlotKind::Element { base_reg } => load_const(&mut p, base, base_reg),
+            }
         }
         // Loop-invariant literal loads, run once before the merge point.
         p.extend_from_slice(&self.prelude);
@@ -542,15 +625,26 @@ impl LoweredF {
         let body_pc = p.len();
         // ea = i * 8 (byte offset of row i in an 8-byte column)
         p.extend_from_slice(&[OP_MUL, r_i as i64, r_stride as i64, r_ea as i64]);
-        // slot_k = *(base_k + ea)   — the red-index columnar read, per bank
+        // slot_k = *(base_k + ea)   — the red-index columnar read, per bank.
+        // Element columns are skipped: their index is the inner loop's, not the
+        // row's, so the lowering already emitted their loads inside the body.
         for (k, slot) in self.slots.iter().enumerate() {
+            if slot.kind != SlotKind::Row {
+                continue;
+            }
             let op = match slot.ty {
                 ValType::Int | ValType::UInt | ValType::Str | ValType::Timestamp | ValType::Duration => OP_COL_LOAD,
                 ValType::Float => OP_COL_LOAD_F,
             };
             p.extend_from_slice(&[op, (r_base0 + k) as i64, r_ea as i64, slot.reg as i64]);
         }
+        let body_at = p.len();
         p.extend_from_slice(&self.body);
+        // Relocate the body's jump targets, which were emitted relative to
+        // `body[0]`, to absolute program addresses.
+        for &f in &self.jump_fixups {
+            p[body_at + f] += body_at as i64;
+        }
         // acc += result (bank-matched); i += 1; if n > i goto @body; return acc.
         // The float accumulate is a loop-carried dependency, so the compiled
         // trace cannot reassociate it — the running total sums in row order, bit
@@ -592,7 +686,28 @@ struct LowerCtxF<'s> {
     /// batch builder folds these into the injectivity check alongside the
     /// [`ValType::Str`] column values.
     str_literals: Vec<String>,
+    /// Element slots created by the runtime-list comprehension currently being
+    /// lowered, keyed by slot path. Scoped to that comprehension on purpose:
+    /// two comprehensions over the same list get their OWN registers, since
+    /// each reloads the column at its own inner index. Sharing one register
+    /// would let the second loop read the first loop's last element.
+    elem_map: HashMap<String, TReg>,
+    /// The runtime-list comprehension currently being lowered, if any.
+    list_loop: Option<ListLoop>,
+    /// Positions within `body` holding a body-relative jump target.
+    jump_fixups: Vec<usize>,
     schema: &'s Schema,
+}
+
+/// The runtime-list comprehension being lowered — what an iteration variable
+/// resolves against.
+struct ListLoop {
+    /// Iteration variable name, e.g. `i` in `items.all(i, i.price > 10)`.
+    iter_var: String,
+    /// Schema path of the list, e.g. `items`.
+    list: String,
+    /// Int register holding the inner loop's byte offset `(offset + j) * 8`.
+    ea_reg: usize,
 }
 
 impl LowerCtxF<'_> {
@@ -620,8 +735,77 @@ impl LowerCtxF<'_> {
         let ty = self.schema.get(&path).copied().unwrap_or(ValType::Int);
         let r = self.fresh(ty);
         self.slot_map.insert(path.clone(), r);
-        self.slots.push(SlotInfoF { path, ty, reg: r.idx });
+        self.slots.push(SlotInfoF {
+            path,
+            ty,
+            reg: r.idx,
+            kind: SlotKind::Row,
+        });
         r
+    }
+
+    /// Resolve a flattened ELEMENT slot of the list loop being lowered,
+    /// emitting its columnar load **at the first reference** — which is inside
+    /// the inner loop, where `ea_reg` holds `(offset + j) * 8`. The inner loop
+    /// body is straight-line (no runtime-list comprehension may nest inside
+    /// one), so the first reference dominates every later one.
+    fn elem_slot(&mut self, path: String, ea_reg: usize) -> TReg {
+        if let Some(&r) = self.elem_map.get(&path) {
+            return r;
+        }
+        let ty = self.schema.get(&path).copied().unwrap_or(ValType::Int);
+        let r = self.fresh(ty);
+        let base_reg = self.fresh(ValType::Int).idx;
+        let op = match ty {
+            ValType::Float => OP_COL_LOAD_F,
+            _ => OP_COL_LOAD,
+        };
+        self.body
+            .extend_from_slice(&[op, base_reg as i64, ea_reg as i64, r.idx as i64]);
+        self.elem_map.insert(path.clone(), r);
+        self.slots.push(SlotInfoF {
+            path,
+            ty,
+            reg: r.idx,
+            kind: SlotKind::Element { base_reg },
+        });
+        r
+    }
+
+    /// Resolve `name` (optionally `.field`) against the list loop being
+    /// lowered: `Some(reg)` when `name` is its iteration variable, `None` when
+    /// it is not.
+    fn iter_var_slot(&mut self, name: &str, field: Option<&str>) -> Option<TReg> {
+        let (list, ea_reg) = match &self.list_loop {
+            Some(l) if l.iter_var == name => (l.list.clone(), l.ea_reg),
+            _ => return None,
+        };
+        Some(self.elem_slot(elem_slot_path(&list, field), ea_reg))
+    }
+
+    /// Emit `if regs[a] > regs[b] goto <patched later>` and return the body
+    /// index of its target word, for [`LowerCtxF::patch_jump`].
+    fn emit_jump_if_above(&mut self, a: TReg, b: TReg) -> usize {
+        let at = self.body.len() + 3;
+        self.body
+            .extend_from_slice(&[OP_JUMP_IF_ABOVE, a.idx as i64, b.idx as i64, 0]);
+        self.jump_fixups.push(at);
+        at
+    }
+
+    /// Point a jump emitted by [`LowerCtxF::emit_jump_if_above`] at the current
+    /// end of the body (a forward branch).
+    fn patch_jump(&mut self, at: usize) {
+        self.body[at] = self.body.len() as i64;
+    }
+
+    /// Emit a backward jump `if regs[a] > regs[b] goto tgt` — a loop back-edge,
+    /// which is where the mainloop's `can_enter_jit` sits.
+    fn emit_back_edge(&mut self, a: TReg, b: TReg, tgt: usize) {
+        let at = self.body.len() + 3;
+        self.body
+            .extend_from_slice(&[OP_JUMP_IF_ABOVE, a.idx as i64, b.idx as i64, tgt as i64]);
+        self.jump_fixups.push(at);
     }
 }
 
@@ -644,6 +828,9 @@ pub fn lower_typed(expr: &IdedExpr, schema: &Schema) -> Result<LoweredF, LowerEr
         slot_map: HashMap::new(),
         locals: HashMap::new(),
         str_literals: Vec::new(),
+        elem_map: HashMap::new(),
+        list_loop: None,
+        jump_fixups: Vec::new(),
         schema,
     };
     let result = compile_t(&mut ctx, expr)?;
@@ -665,6 +852,7 @@ pub fn lower_typed(expr: &IdedExpr, schema: &Schema) -> Result<LoweredF, LowerEr
         num_float_regs: ctx.next_float,
         slots: ctx.slots,
         str_literals: ctx.str_literals,
+        jump_fixups: ctx.jump_fixups,
     })
 }
 
@@ -673,16 +861,31 @@ fn compile_t(ctx: &mut LowerCtxF, e: &IdedExpr) -> Result<TReg, LowerError> {
         Expr::Literal(lit) => compile_literal_t(ctx, lit),
         Expr::Ident(name) => {
             if let Some(&r) = ctx.locals.get(name) {
-                Ok(r)
-            } else {
-                Ok(ctx.slot(name.clone()))
+                return Ok(r);
             }
+            // A runtime-list iteration variable resolves to that list's element
+            // column, read at the inner loop's index.
+            if let Some(r) = ctx.iter_var_slot(name, None) {
+                return Ok(r);
+            }
+            if declares_list(ctx.schema, name) {
+                return Err(LowerError::unsupported("list-valued expression"));
+            }
+            Ok(ctx.slot(name.clone()))
         }
         Expr::Select(_) => {
             let path = resolve_path(e)?;
-            let root = path.split('.').next().unwrap_or_default();
+            let (root, field) = path.split_once('.').unwrap_or((path.as_str(), ""));
+            if let Some(r) = ctx.iter_var_slot(root, Some(field)) {
+                return Ok(r);
+            }
             if ctx.locals.contains_key(root) {
-                return Err(LowerError::unsupported("field access on comprehension variable"));
+                return Err(LowerError::unsupported(
+                    "field access on comprehension variable",
+                ));
+            }
+            if declares_list(ctx.schema, &path) {
+                return Err(LowerError::unsupported("list-valued expression"));
             }
             Ok(ctx.slot(path))
         }
@@ -1160,10 +1363,16 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
             Expr::Select(_) => resolve_path(&call.args[0])?,
             _ => return Err(LowerError::unsupported("size() of a non-column argument")),
         };
-        // Only a `string` column has a materialized length. A list/map/bytes
-        // column has no representation on this machine at all.
-        if ctx.schema.get(&path).copied() != Some(ValType::Str) {
-            return Err(LowerError::unsupported("size() of a non-string column"));
+        // A `string` column carries its byte length as a derived column, and a
+        // LIST column carries its per-row element count as the same derived
+        // column — the length half of the `(offset, size)` pair that locates a
+        // row's elements. A map/bytes column has no representation on this
+        // machine at all.
+        if ctx.schema.get(&path).copied() != Some(ValType::Str) && !declares_list(ctx.schema, &path)
+        {
+            return Err(LowerError::unsupported(
+                "size() of a non-string, non-list column",
+            ));
         }
         return Ok(ctx.slot(size_slot_path(&path)));
     }
@@ -1525,7 +1734,18 @@ fn compile_comprehension_t(
     }
     let elements = match &comp.iter_range.expr {
         Expr::List(list) => list.elements.clone(),
-        _ => return Err(LowerError::unsupported("comprehension over non-literal range")),
+        // A declared list column has a RED length, so there is nothing to
+        // unroll against: it gets a real inner loop instead.
+        _ => match resolve_path(&comp.iter_range) {
+            Ok(path) if declares_list(ctx.schema, &path) => {
+                return compile_list_comprehension_t(ctx, comp, &path)
+            }
+            _ => {
+                return Err(LowerError::unsupported(
+                    "comprehension over non-literal range",
+                ))
+            }
+        },
     };
 
     let prev_iter = ctx.locals.remove(&comp.iter_var);
@@ -1538,6 +1758,118 @@ fn compile_comprehension_t(
         ctx.locals.insert(comp.accu_var.clone(), accu);
         accu = compile_t(ctx, &comp.loop_step)?;
     }
+    ctx.locals.insert(comp.accu_var.clone(), accu);
+    let result = compile_t(ctx, &comp.result)?;
+
+    ctx.locals.remove(&comp.iter_var);
+    ctx.locals.remove(&comp.accu_var);
+    if let Some(r) = prev_iter {
+        ctx.locals.insert(comp.iter_var.clone(), r);
+    }
+    if let Some(r) = prev_accu {
+        ctx.locals.insert(comp.accu_var.clone(), r);
+    }
+    Ok(result)
+}
+
+/// Emit a bank-matched register move `dst = src`.
+fn emit_mov(ctx: &mut LowerCtxF, src: TReg, dst: TReg) {
+    let op = match dst.bank {
+        ValType::Float => OP_FMOV,
+        _ => OP_MOV,
+    };
+    ctx.body
+        .extend_from_slice(&[op, src.idx as i64, dst.idx as i64]);
+}
+
+/// RED-length comprehension over a runtime list: a real inner loop, not an
+/// unroll. The element count is a per-row column value, so there is no green
+/// trip count to unroll against — and unrolling is not what upstream does
+/// either. PyPy only unrolls a loop whose size is `jit.isconstant`
+/// (`rlib/jit.py`'s `loop_unrolling_heuristic`); a data-dependent length is
+/// simply *traced as a loop*. The inner back-edge is its own `can_enter_jit`
+/// point, so the pc-green mainloop gives the element loop its own trace
+/// identity, separate from the row loop's.
+///
+/// The list is stored the columnar (Arrow) way: one flattened element column
+/// per field read, laid end to end across rows, plus two derived per-row
+/// columns — `size(list)` (element count) and `offset(list)` (start index).
+/// Locating a row's elements is then arithmetic, not a pointer chase.
+///
+/// Emitted shape, with `L` the list and `j` the element index:
+///
+/// ```text
+///     accu = <accu_init>; j = 0
+///     if 1 > size(L) goto after          ; zero-trip guard ([].all(..) is true)
+///   inner:
+///     ea = (offset(L) + j) * 8
+///     <element loads at ea, on first reference>
+///     accu = <loop_step>; j = j + 1
+///     if size(L) > j goto inner          ; back-edge -> can_enter_jit
+///   after:
+///     <result>
+/// ```
+///
+/// As in the literal unroll, `loop_cond`'s short-circuit is dropped: every
+/// element is evaluated. Where the walker would stop early and the eager fold
+/// traps instead, the batch answers `None` and the walker owns the row.
+fn compile_list_comprehension_t(
+    ctx: &mut LowerCtxF,
+    comp: &ComprehensionExpr,
+    list: &str,
+) -> Result<TReg, LowerError> {
+    // A list of lists would need per-ELEMENT offsets; a flat row column cannot
+    // express those, so one level of nesting is the whole subset. This is also
+    // what keeps the inner loop body straight-line, which is what makes
+    // `elem_slot`'s load-at-first-reference dominate every use.
+    if ctx.list_loop.is_some() {
+        return Err(LowerError::unsupported("nested runtime-list comprehension"));
+    }
+    let len = ctx.slot(size_slot_path(list));
+    let off = ctx.slot(offset_slot_path(list));
+    let one = emit_int_const(ctx, 1);
+    let stride = emit_int_const(ctx, 8);
+
+    let prev_iter = ctx.locals.remove(&comp.iter_var);
+    let prev_accu = ctx.locals.remove(&comp.accu_var);
+
+    // The accumulator is loop-carried, so it lives in a FIXED register the step
+    // writes back to — `loop_step` lands in a different register each time it
+    // is compiled, and here it is compiled once and executed many times.
+    let init = compile_t(ctx, &comp.accu_init)?;
+    let accu = ctx.fresh(init.bank);
+    emit_mov(ctx, init, accu);
+    let j = ctx.fresh(ValType::Int);
+    ctx.body
+        .extend_from_slice(&[OP_LOAD_CONST, 0, j.idx as i64]);
+    // Zero-trip guard: an empty list must yield `accu_init`, and the back-edge
+    // below is a do-while.
+    let zero_trip = ctx.emit_jump_if_above(one, len);
+
+    let inner = ctx.body.len();
+    let idx = emit_int_bin(ctx, OP_ADD, off, j);
+    let ea = emit_int_bin(ctx, OP_MUL, idx, stride);
+    ctx.list_loop = Some(ListLoop {
+        iter_var: comp.iter_var.clone(),
+        list: list.to_string(),
+        ea_reg: ea.idx,
+    });
+    ctx.locals.insert(comp.accu_var.clone(), accu);
+    let step = compile_t(ctx, &comp.loop_step);
+    ctx.list_loop = None;
+    ctx.elem_map.clear();
+    let step = step?;
+    if step.bank != accu.bank {
+        return Err(LowerError::unsupported(
+            "comprehension accumulator changes bank",
+        ));
+    }
+    emit_mov(ctx, step, accu);
+    ctx.body
+        .extend_from_slice(&[OP_ADD, j.idx as i64, one.idx as i64, j.idx as i64]);
+    ctx.emit_back_edge(len, j, inner);
+    ctx.patch_jump(zero_trip);
+
     ctx.locals.insert(comp.accu_var.clone(), accu);
     let result = compile_t(ctx, &comp.result)?;
 

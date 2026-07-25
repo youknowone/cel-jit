@@ -69,14 +69,34 @@
 //!     reassociation an arithmetic blend would need.
 //!   * **uint columns** share the int register file (the raw 64-bit pattern):
 //!     add/sub/mul and eq/ne reuse the int ops, ordering compares unsigned
-//!     (`OP_ULT`/`OP_ULE`, `>`/`>=` via an operand swap). Division/modulo bail
-//!     (the trace IR has no unsigned floordiv/mod).
+//!     (`OP_ULT`/`OP_ULE`, `>`/`>=` via an operand swap). Division/modulo go
+//!     through the `int.udiv`/`int.umod` oopspec residual calls, which is where
+//!     upstream put them when it deleted its unsigned division resops.
 //!
-//! Everything outside this numeric/bool columnar subset — strings, bytes, maps,
-//! lists, member/method calls, `in`, timestamps, custom functions — is a
+//! ## M6 — runtime-length lists (a nested red loop)
+//!
+//! A comprehension over a list column whose length is a per-row value has no
+//! green trip count, so it cannot unroll — and unrolling is not what upstream
+//! does either: PyPy only unrolls a `jit.isconstant` length
+//! (`rlib/jit.py`'s `loop_unrolling_heuristic`) and otherwise just traces the
+//! loop. So the lowering emits a real inner loop whose back-edge is its own
+//! `can_enter_jit` point; the pc-green mainloop then gives the element loop a
+//! trace identity separate from the row loop's.
+//!
+//! The list is stored the columnar (Arrow) way rather than as a value: one
+//! flattened element column per field read (`items[]`, `items[].price`), laid
+//! end to end across the batch, plus two derived per-row columns —
+//! `size(items)` and `offset(items)`. Locating a row's elements is then
+//! arithmetic, and the element load is a `raw_load` at `(offset + j) * 8`
+//! exactly as a row load is one at `row * 8`. Field access on the loop variable
+//! resolves to those element columns, which is what the literal-list unroll
+//! could never do.
+//!
+//! Everything outside this columnar subset — bytes, maps, lists of lists,
+//! list-valued results, member/method calls, `in`, custom functions — is a
 //! structural loss for a batch JIT and returns [`lower::LowerError`], falling
-//! back to the stock tree-walker. The win is confined to what a compiled
-//! straight-line trace over aligned columns can express.
+//! back to the stock tree-walker. The win is confined to what a compiled trace
+//! over aligned columns can express.
 
 pub mod bytecode;
 pub mod lower;
@@ -628,25 +648,27 @@ mod tests {
         }
     }
 
+    /// The tree-walker's value for element `k` of a column — the oracle's view
+    /// of one cell.
+    fn cell_value(d: &ColData, k: usize) -> Value {
+        match d {
+            ColData::Int(c) => Value::Int(c[k]),
+            ColData::UInt(c) => Value::UInt(c[k] as u64),
+            ColData::Float(c) => Value::Float(c[k]),
+            ColData::Str(c) => Value::String(std::sync::Arc::new(c[k].clone())),
+            ColData::Timestamp(c) => {
+                Value::Timestamp(chrono::DateTime::from_timestamp_nanos(c[k]).fixed_offset())
+            }
+            ColData::Duration(c) => Value::Duration(chrono::Duration::nanoseconds(c[k])),
+        }
+    }
+
     /// Bind row `i` of every column into a fresh tree-walker context — the
     /// oracle's view of one row.
     fn row_context<'a>(cols: &'a [(&str, ColData)], i: usize) -> Context<'a> {
         let mut ctx = Context::default();
         for (name, d) in cols {
-            match d {
-                ColData::Int(c) => ctx.add_variable_from_value(*name, c[i]),
-                ColData::UInt(c) => ctx.add_variable_from_value(*name, c[i] as u64),
-                ColData::Float(c) => ctx.add_variable_from_value(*name, c[i]),
-                ColData::Str(c) => ctx.add_variable_from_value(*name, c[i].clone()),
-                ColData::Timestamp(c) => ctx.add_variable_from_value(
-                    *name,
-                    Value::Timestamp(chrono::DateTime::from_timestamp_nanos(c[i]).fixed_offset()),
-                ),
-                ColData::Duration(c) => ctx.add_variable_from_value(
-                    *name,
-                    Value::Duration(chrono::Duration::nanoseconds(c[i])),
-                ),
-            }
+            ctx.add_variable_from_value(*name, cell_value(d, i));
         }
         ctx
     }
@@ -1037,6 +1059,235 @@ mod tests {
         );
     }
 
+    /// A runtime-length **list** column, in the flattened (Arrow) layout the
+    /// machine reads: `lens[r]` elements for row `r`, all rows' elements laid
+    /// end to end in one column per field. `offset(list)` is the exclusive
+    /// prefix sum of `lens`, so locating a row's elements is arithmetic.
+    struct ListCol {
+        /// Per-row element count — the `size(list)` column.
+        lens: Vec<i64>,
+        /// `(field, flattened element column)`. `None` names the elements
+        /// themselves (a list of scalars, slot path `list[]`); `Some(f)` names
+        /// one record field (slot path `list[].f`). Every column is
+        /// `lens.iter().sum()` long.
+        fields: Vec<(Option<&'static str>, ColData)>,
+    }
+
+    impl ListCol {
+        /// Exclusive prefix sums of [`ListCol::lens`] — the `offset(list)`
+        /// column.
+        fn offsets(&self) -> Vec<i64> {
+            let mut acc = 0;
+            self.lens
+                .iter()
+                .map(|&l| {
+                    let o = acc;
+                    acc += l;
+                    o
+                })
+                .collect()
+        }
+
+        /// The tree-walker's view of row `r`: a list of scalars when the sole
+        /// field is unnamed, otherwise a list of records.
+        fn row_value(&self, r: usize) -> Value {
+            use crate::objects::{Key, Map};
+            use std::sync::Arc;
+
+            let off = self.offsets()[r] as usize;
+            let elems: Vec<Value> = (off..off + self.lens[r] as usize)
+                .map(|k| match self.fields.as_slice() {
+                    [(None, d)] => cell_value(d, k),
+                    named => {
+                        let map: HashMap<Key, Value> = named
+                            .iter()
+                            .map(|(f, d)| {
+                                let f = f.expect("a record list names every field");
+                                (Key::String(Arc::new(f.to_string())), cell_value(d, k))
+                            })
+                            .collect();
+                        Value::Map(Map { map: Arc::new(map) })
+                    }
+                })
+                .collect();
+            Value::List(Arc::new(elems))
+        }
+    }
+
+    /// Cross-check a typed batch whose expression iterates a **runtime-length
+    /// list** — the nested-loop shape, where the element count is a column
+    /// value rather than a green constant. The list's element columns are
+    /// flattened across the whole batch and read at `(offset + j) * 8` inside
+    /// the inner loop, so this also pins the derived `size(..)` / `offset(..)`
+    /// row columns and the row-vs-element slot split.
+    ///
+    /// `expect_refusal` selects the contract: either all three tiers equal the
+    /// tree-walker's per-row sum, or all three refuse (`None`) because the
+    /// walker itself raises on some row. Either way the compiled run must
+    /// actually trace a hot loop.
+    fn check_batch_list_impl(
+        expr_src: &str,
+        rows: &[(&str, ColData)],
+        lists: &[(&str, ListCol)],
+        expect_refusal: bool,
+    ) {
+        use super::bytecode::float_bank::COMPILES as COMPILES_F;
+        use super::lower::{elem_slot_path, elem_slot_source, offset_slot_source, SlotKind};
+
+        let program =
+            Program::compile(expr_src).unwrap_or_else(|e| panic!("parse `{expr_src}`: {e:?}"));
+        let mut schema: Schema = rows.iter().map(|(n, d)| (n.to_string(), d.ty())).collect();
+        for (name, lc) in lists {
+            for (field, d) in &lc.fields {
+                schema.insert(elem_slot_path(name, *field), d.ty());
+            }
+        }
+        let lowered = lower_typed(program.expression(), &schema)
+            .unwrap_or_else(|e| panic!("lower_typed `{expr_src}`: {e}"));
+
+        let n = rows
+            .first()
+            .map_or_else(|| lists[0].1.lens.len(), |(_, d)| d.len());
+        for (name, d) in rows {
+            assert_eq!(d.len(), n, "column `{name}` length for `{expr_src}`");
+        }
+        for (name, lc) in lists {
+            assert_eq!(lc.lens.len(), n, "list `{name}` row count for `{expr_src}`");
+            let total: i64 = lc.lens.iter().sum();
+            for (field, d) in &lc.fields {
+                assert_eq!(
+                    d.len() as i64,
+                    total,
+                    "list `{name}` field {field:?} element count for `{expr_src}`"
+                );
+            }
+        }
+
+        let declared_rows: HashMap<&str, &ColData> = rows.iter().map(|(n, d)| (*n, d)).collect();
+        let declared_lists: HashMap<&str, &ListCol> =
+            lists.iter().map(|(n, lc)| (*n, lc)).collect();
+        let offsets: HashMap<&str, Vec<i64>> =
+            lists.iter().map(|(n, lc)| (*n, lc.offsets())).collect();
+
+        // One column per SLOT: an element column for a `list[]`/`list[].f`
+        // slot, the derived length / offset column for `size(list)` /
+        // `offset(list)`, and the declared column for anything else.
+        let columns: Vec<Column> = lowered
+            .slots
+            .iter()
+            .map(|slot| {
+                if let Some((list, field)) = elem_slot_source(&slot.path) {
+                    assert!(
+                        matches!(slot.kind, SlotKind::Element { .. }),
+                        "slot `{}` must be an element slot for `{expr_src}`",
+                        slot.path
+                    );
+                    let lc = declared_lists
+                        .get(list)
+                        .unwrap_or_else(|| panic!("slot `{}` names no list", slot.path));
+                    let (_, d) = lc
+                        .fields
+                        .iter()
+                        .find(|(f, _)| *f == field)
+                        .unwrap_or_else(|| panic!("list `{list}` declares no field {field:?}"));
+                    return d.column();
+                }
+                assert_eq!(
+                    slot.kind,
+                    SlotKind::Row,
+                    "slot `{}` must be a row slot for `{expr_src}`",
+                    slot.path
+                );
+                if let Some(src) = size_slot_source(&slot.path) {
+                    return Column::Int(&declared_lists[src].lens);
+                }
+                if let Some(src) = offset_slot_source(&slot.path) {
+                    return Column::Int(&offsets[src]);
+                }
+                declared_rows
+                    .get(slot.path.as_str())
+                    .unwrap_or_else(|| panic!("slot `{}` has no declared column", slot.path))
+                    .column()
+            })
+            .collect();
+
+        // Oracle: the stock tree-walker, one row at a time, with each list
+        // rebuilt as a real `Value::List` from the same flattened data.
+        let row_ctx = |i: usize| {
+            let mut ctx = Context::default();
+            for (name, d) in rows {
+                ctx.add_variable_from_value(*name, cell_value(d, i));
+            }
+            for (name, lc) in lists {
+                ctx.add_variable_from_value(*name, lc.row_value(i));
+            }
+            ctx
+        };
+        let expected = if expect_refusal {
+            assert!(
+                (0..n).any(|i| program.execute(&row_ctx(i)).is_err()),
+                "`{expr_src}`: the tree-walker answers every row, so refusing would be wrong"
+            );
+            None
+        } else {
+            let mut sum = 0i64;
+            for i in 0..n {
+                sum += match program
+                    .execute(&row_ctx(i))
+                    .unwrap_or_else(|e| panic!("execute `{expr_src}`: {e:?}"))
+                {
+                    Value::Bool(b) => b as i64,
+                    Value::Int(v) => v,
+                    Value::UInt(v) => v as i64,
+                    other => panic!("`{expr_src}`: unexpected {other:?}"),
+                };
+            }
+            Some(sum)
+        };
+
+        assert_eq!(
+            clean_batch_sum_f(&lowered, &columns, n),
+            expected,
+            "clean vs stock for `{expr_src}`"
+        );
+        assert_eq!(
+            eval_batch_sum_f(&lowered, &columns, u32::MAX),
+            expected,
+            "batch jit-off vs stock for `{expr_src}`"
+        );
+        let before = COMPILES_F.load(Ordering::Relaxed);
+        assert_eq!(
+            eval_batch_sum_f(&lowered, &columns, 8),
+            expected,
+            "batch jit-on vs stock for `{expr_src}`"
+        );
+        assert!(
+            COMPILES_F.load(Ordering::Relaxed) > before,
+            "list batch `{expr_src}` must compile a hot loop"
+        );
+    }
+
+    /// [`check_batch_list_impl`] with the answering contract.
+    fn check_batch_list(expr_src: &str, rows: &[(&str, ColData)], lists: &[(&str, ListCol)]) {
+        check_batch_list_impl(expr_src, rows, lists, false);
+    }
+
+    /// [`check_batch_list_impl`] with the refusing contract.
+    fn check_batch_list_refuses(
+        expr_src: &str,
+        rows: &[(&str, ColData)],
+        lists: &[(&str, ListCol)],
+    ) {
+        check_batch_list_impl(expr_src, rows, lists, true);
+    }
+
+    /// Deterministic per-row element counts in `[0, max]`, so the batch mixes
+    /// empty rows (the zero-trip guard) with rows of several elements (the
+    /// back-edge).
+    fn gen_lens(n: usize, seed: u64, max: i64) -> Vec<i64> {
+        gen_i64(n, seed, 0, max)
+    }
+
     #[test]
     fn batch_size() {
         // `size(s)` reads a DERIVED length column: the machine carries a string
@@ -1069,9 +1320,9 @@ mod tests {
 
     #[test]
     fn size_bails() {
-        // Only a `string` column has a materialized length column. A list/map
-        // column has no representation on this machine at all, and a non-column
-        // argument has nothing to derive from.
+        // Only a `string` or `list` column has a materialized length column. An
+        // int/map column has no length at all, and a non-column argument has
+        // nothing to derive from.
         let schema: Schema = [
             ("s".to_string(), ValType::Str),
             ("i".to_string(), ValType::Int),
@@ -2115,6 +2366,217 @@ mod tests {
             assert!(
                 lower(program.expression()).is_err(),
                 "`{expr}` must be rejected as out of subset"
+            );
+        }
+    }
+
+    /// A list-of-records column and the batch-wide flattened field it declares.
+    fn record_list(lens: Vec<i64>, fields: Vec<(Option<&'static str>, ColData)>) -> ListCol {
+        ListCol { lens, fields }
+    }
+
+    #[test]
+    fn batch_list_record_field() {
+        // The headline shape: a comprehension over a RUNTIME-length list with a
+        // field access on the loop variable. The element count is a column
+        // value, so there is no green trip count and no unroll — the lowering
+        // emits a real inner loop whose back-edge is its own `can_enter_jit`
+        // point, and the element column is read at `(offset + j) * 8`.
+        let n = 400;
+        let lens = gen_lens(n, 0x11A5_7C01_D0DE_0001, 3);
+        let total = lens.iter().sum::<i64>() as usize;
+        let price = gen_i64(total, 0x11A5_7C01_D0DE_0002, 0, 30);
+        let items = || {
+            vec![(
+                "items",
+                record_list(
+                    lens.clone(),
+                    vec![(Some("price"), ColData::Int(price.clone()))],
+                ),
+            )]
+        };
+        for expr in [
+            "items.all(i, i.price > 10)",
+            "items.exists(i, i.price > 25)",
+            "items.exists_one(i, i.price == 7)",
+            // The derived length column, shared with the comprehension's own
+            // trip count.
+            "size(items)",
+            "size(items) > 1 && items.all(i, i.price > 5)",
+            // Arithmetic on the element inside the inner loop.
+            "items.all(i, i.price * 2 - 1 > 10)",
+        ] {
+            check_batch_list(expr, &[], &items());
+        }
+    }
+
+    #[test]
+    fn batch_list_scalar_elements() {
+        // A list of bare scalars: the loop variable IS the element, so it
+        // resolves to the unnamed element column `nums[]`.
+        let n = 400;
+        let lens = gen_lens(n, 0x5CA1_A200_0001, 4);
+        let total = lens.iter().sum::<i64>() as usize;
+        let nums = gen_i64(total, 0x5CA1_A200_0002, -20, 20);
+        let cols = || {
+            vec![(
+                "nums",
+                record_list(lens.clone(), vec![(None, ColData::Int(nums.clone()))]),
+            )]
+        };
+        for expr in [
+            "nums.exists(i, i > 5)",
+            "nums.all(i, i > -100)",
+            "nums.all(i, i % 2 == 0)",
+            "size(nums) == 0",
+        ] {
+            check_batch_list(expr, &[], &cols());
+        }
+    }
+
+    #[test]
+    fn batch_list_multi_field_and_row_column() {
+        // Two element columns plus an ordinary ROW column read inside the inner
+        // loop: the row load stays in the outer prologue and the element loads
+        // stay in the inner loop, and the two indices must not be confused.
+        let n = 400;
+        let lens = gen_lens(n, 0xF1E1_D500_0001, 3);
+        let total = lens.iter().sum::<i64>() as usize;
+        let price = gen_i64(total, 0xF1E1_D500_0002, 0, 20);
+        let qty = gen_i64(total, 0xF1E1_D500_0003, 1, 5);
+        let limit = gen_i64(n, 0xF1E1_D500_0004, 0, 15);
+        let items = || {
+            vec![(
+                "items",
+                record_list(
+                    lens.clone(),
+                    vec![
+                        (Some("price"), ColData::Int(price.clone())),
+                        (Some("qty"), ColData::Int(qty.clone())),
+                    ],
+                ),
+            )]
+        };
+        for expr in [
+            "items.all(i, i.price * i.qty > 10)",
+            "items.exists(i, i.price > limit)",
+            "items.all(i, i.price > limit) && limit > 5",
+        ] {
+            check_batch_list(expr, &[("limit", ColData::Int(limit.clone()))], &items());
+        }
+    }
+
+    #[test]
+    fn batch_list_float_field() {
+        // A `double` element field rides the float bank: the element load is an
+        // `OP_COL_LOAD_F` at the inner index, and the comparison crosses banks
+        // exactly as a row-column float compare does.
+        let n = 400;
+        let lens = gen_lens(n, 0xF10A_7000_0001, 3);
+        let total = lens.iter().sum::<i64>() as usize;
+        let amount = gen_f64(total, 0xF10A_7000_0002, 0.0, 4.0);
+        let costs = || {
+            vec![(
+                "costs",
+                record_list(
+                    lens.clone(),
+                    vec![(Some("amount"), ColData::Float(amount.clone()))],
+                ),
+            )]
+        };
+        for expr in [
+            "costs.all(i, i.amount > 1.5)",
+            "costs.exists(i, i.amount < 0.5)",
+        ] {
+            check_batch_list(expr, &[], &costs());
+        }
+    }
+
+    #[test]
+    fn batch_list_two_comprehensions_over_one_list() {
+        // Two comprehensions over the SAME list must each get their own element
+        // register: they read the column at their own inner index, so sharing
+        // one register would let the second loop see the first loop's last
+        // element. The rows below mix lengths, so a shared register would
+        // disagree with the walker.
+        let n = 400;
+        let lens = gen_lens(n, 0x2C0F_0001, 3);
+        let total = lens.iter().sum::<i64>() as usize;
+        let price = gen_i64(total, 0x2C0F_0002, 0, 30);
+        check_batch_list(
+            "items.all(i, i.price > 0) && items.exists(i, i.price > 20)",
+            &[],
+            &[(
+                "items",
+                record_list(lens, vec![(Some("price"), ColData::Int(price))]),
+            )],
+        );
+    }
+
+    #[test]
+    fn list_arith_refuses() {
+        // Overflow INSIDE the inner loop must reach the driver: the trap flag is
+        // set on one element of one row, survives both loops, and is published
+        // once after the row loop. The walker raises there, so no sum is the
+        // right answer.
+        let n = 240;
+        let lens = vec![1i64; n];
+        let mut price = vec![3i64; n];
+        // Late enough that the loops are long since compiled when the guard
+        // finally exits.
+        price[200] = i64::MAX / 2;
+        check_batch_list_refuses(
+            "items.all(i, i.price * 4 > 0)",
+            &[],
+            &[(
+                "items",
+                record_list(lens, vec![(Some("price"), ColData::Int(price))]),
+            )],
+        );
+    }
+
+    #[test]
+    fn list_lowering_bails() {
+        // The subset boundary around runtime lists.
+        let schema: Schema = [
+            ("items[].price".to_string(), ValType::Int),
+            ("groups[].n".to_string(), ValType::Int),
+            ("x".to_string(), ValType::Int),
+        ]
+        .into_iter()
+        .collect();
+        for expr in [
+            // A list of lists needs per-ELEMENT offsets; a flat row column
+            // cannot express those, and one level of nesting is also what keeps
+            // the inner loop body straight-line.
+            "items.all(i, groups.exists(g, g.n > i.price))",
+            // A list is not a value on this machine — it is a (size, offset)
+            // pair plus element columns — so it can never reach a register.
+            "items == items",
+            // A scalar column is not iterable, list or not.
+            "x.all(y, y > 0)",
+            // `map` / `filter` accumulate a list.
+            "items.map(i, i.price)",
+            "items.filter(i, i.price > 1)",
+        ] {
+            let program = Program::compile(expr).unwrap();
+            assert!(
+                lower_typed(program.expression(), &schema).is_err(),
+                "`{expr}` must bail the typed lowering"
+            );
+        }
+        // Two lists SIDE BY SIDE are in subset — one inner loop each. This pins
+        // the nesting bail above to nesting, not to "more than one list".
+        for expr in [
+            "items.all(i, i.price > x) && groups.exists(g, g.n > 0)",
+            "items.all(i, i.price > 0)",
+            // Both arms of a ternary reduce to the derived length columns.
+            "x > 0 ? size(items) : size(groups)",
+        ] {
+            let program = Program::compile(expr).unwrap();
+            assert!(
+                lower_typed(program.expression(), &schema).is_ok(),
+                "`{expr}` must lower"
             );
         }
     }
