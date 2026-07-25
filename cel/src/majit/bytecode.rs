@@ -351,6 +351,11 @@ pub mod float_bank {
     /// int-path statics so parallel tests don't race on a shared counter.
     pub static COMPILES: AtomicUsize = AtomicUsize::new(0);
     pub static GUARD_FAILS: AtomicUsize = AtomicUsize::new(0);
+    /// Traces the tracer started and threw away. A loop that never appears in
+    /// [`COMPILES`] is either aborting (counted here) or never reaching its
+    /// merge point hot enough to be traced at all; the two have different
+    /// causes, and only this counter tells them apart.
+    pub static TRACE_ABORTS: AtomicUsize = AtomicUsize::new(0);
 
     use super::{
         OP_ADD, OP_ADD_OVF, OP_AND, OP_COL_LOAD, OP_COL_LOAD_F, OP_DIV, OP_DIV_CHK, OP_EQ, OP_F2I,
@@ -470,6 +475,9 @@ pub mod float_bank {
         });
         driver.set_on_guard_failure(|_green_key, _a, _b| {
             GUARD_FAILS.fetch_add(1, Ordering::Relaxed);
+        });
+        driver.set_on_trace_abort(|_green_key, _permanent| {
+            TRACE_ABORTS.fetch_add(1, Ordering::Relaxed);
         });
         let mut pc: usize = 0;
         let mut state = VmStateF {

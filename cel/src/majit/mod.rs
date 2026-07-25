@@ -4,26 +4,30 @@
 //!
 //! majit does not attach to cel-rust's live `Value::resolve_val` evaluator:
 //! that path returns `Cow<'a, dyn Val>` and dispatches through trait objects /
-//! `downcast_ref`, which is outside the restricted Rust subset majit can
-//! meta-trace. Instead, a CEL `Program` (a fixed AST = green constant) is
+//! `downcast_ref`, which is outside the restricted Rust subset the
+//! `#[jit_interp]` front-end can meta-trace. (majit's other front-end,
+//! `majit-translate`, traces real Rust from LLBC and does handle class
+//! dispatch; `CONVERGENCE.md` in this directory is the plan for getting cel
+//! onto it.) Instead, a CEL `Program` (a fixed AST = green constant) is
 //! lowered to a flat `i64`-word bytecode, and a small mainloop authored in the
 //! traceable subset evaluates it over a batch of inputs. The de-risk phase
 //! established the perf envelope (scalar arith 9-16x, slot-resolved policy
 //! predicate ~6x over a clean interpreter, comprehensions 2-4x only when the
 //! list length is a green constant and can be unrolled).
 //!
-//! ## M1 — smoke check ([`smoke`])
+//! ## M1 — the framework links and compiles a loop
 //!
-//! A self-contained register-machine mainloop cloned from
-//! `majit/examples/tinyframe`. It de-risks, before any CEL-IR work:
-//!   * the `majit` crates build as cross-workspace path deps of `cel`,
-//!   * the cranelift backend links here,
-//!   * a hot loop actually traces + compiles (observed via
-//!     `set_on_compile_loop`).
+//! That the `majit` crates build as cross-workspace path deps of `cel`, that
+//! the cranelift backend links here, and that a hot loop actually traces and
+//! compiles were first shown on a self-contained register machine cloned from
+//! `majit/examples/tinyframe`. That second mainloop is gone: the same
+//! properties are now asserted on the real mainloop over real CEL in
+//! `tests/majit_trace_evidence.rs`, which also pins that the compiled trace
+//! RUNS the loop rather than deopting per iteration.
 //!
 //! ## M2 — CEL AST -> traceable bytecode ([`lower`], [`bytecode`])
 //!
-//! [`lower::lower`] compiles the supported `Expr` subset (`Int`/`Boolean`
+//! [`lower::lower_typed`] compiles the supported `Expr` subset (`Int`/`Boolean`
 //! literals, slot-resolved `Ident`/`Select`, arithmetic `+ - * / %`, unary
 //! `-`, comparisons, boolean `&& || !`) to the flat `i64`-word program of
 //! [`bytecode`]. Anything outside the subset returns [`lower::LowerError`], the
@@ -33,7 +37,7 @@
 //!
 //! ## M3 — batch evaluation + green-length comprehension unroll
 //!
-//! [`bytecode::eval_batch_sum`] wraps the lowered body in a batch-over-rows loop
+//! [`bytecode::eval_batch_sum_f`] wraps the lowered body in a batch-over-rows loop
 //! (the majit merge point), reading each context column at the red row index via
 //! a compiled `raw_load` (the buffer bases held loop-invariant in the register
 //! file). Green-length comprehensions unroll into the straight-line fold. The
@@ -102,7 +106,6 @@
 
 pub mod bytecode;
 pub mod lower;
-pub mod smoke;
 
 #[cfg(test)]
 mod tests {
