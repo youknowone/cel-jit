@@ -37,8 +37,11 @@
 //! (the majit merge point), reading each context column at the red row index via
 //! a compiled `raw_load` (the buffer bases held loop-invariant in the register
 //! file). Green-length comprehensions unroll into the straight-line fold. The
-//! flagship int policy `balance >= amount && !frozen` runs ~119x over the stock
-//! tree-walker (see `examples/majit_columnar_batch`).
+//! The columnar path can run far faster end-to-end than the stock tree-walker,
+//! but that is a cross-model batch result, not a JIT-only or request-latency
+//! multiplier. `examples/majit_ab` is the default fair suite: it keeps real CEL
+//! request latency, same-bytecode JIT throughput, and cold/break-even results in
+//! separate panels.
 //!
 //! ## M4 — `double` columns (the two-bank machine)
 //!
@@ -47,8 +50,8 @@
 //! parallel `fregs` bank ([`bytecode::float_bank`]). A float comparison crosses
 //! banks (`f64` operands, an int `0`/`1` result). Loop-invariant literal loads
 //! are hoisted to a prelude that runs once. [`bytecode::eval_batch_sum_f`] is the
-//! float batch path; the flagship float policy `price >= 100.0 && qty < 50.0`
-//! runs ~94x over the tree-walker, bit-exact (see
+//! float batch path. The experimental float example reports its cross-model
+//! batch ratio and same-bytecode JIT-only ratio separately, bit-exact (see
 //! `examples/majit_columnar_batch_float`).
 //!
 //! ## M5 — filling out the numeric columnar subset
@@ -959,7 +962,10 @@ mod tests {
         (0..n)
             .map(|_| {
                 x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-                base + ((x >> 33) % span as u64) as i64
+                // Keep the top 63 bits: an LCG's low bits are short-period, and
+                // `>> 33` would cap every draw at ~2^31 ns (~2.1s), collapsing a
+                // multi-year span into a single instant.
+                base + ((x >> 1) % span as u64) as i64
             })
             .collect()
     }
@@ -1074,14 +1080,73 @@ mod tests {
     }
 
     #[test]
-    fn duration_accessor_bails() {
-        // The four names are registered ONLY as member overloads on `duration`
-        // (`common/types/duration.rs:191-222`), so everything else must bail to
-        // the tree-walker rather than answer:
+    fn batch_timestamp_accessors() {
+        // Calendar fields from an i64-nanos instant: a floored day split plus
+        // Hinnant's civil-from-days. The span deliberately straddles the epoch,
+        // so PRE-1970 instants (negative nanos, where the day count must floor
+        // rather than truncate) are covered, and it is wide enough to cross leap
+        // years and year ends. Every field is checked against the tree-walker.
+        let n = 4000;
+        // ~1962-01 .. ~1977-12, i.e. both sides of the epoch.
+        let ts = gen_nanos(
+            n,
+            0x7a6b_5c4d_3e2f_1009,
+            -252_460_800_000_000_000,
+            504_921_600_000_000_000,
+        );
+        for expr in [
+            "t.getFullYear()",
+            "t.getMonth()",
+            "t.getDate()",
+            "t.getDayOfMonth()",
+            "t.getDayOfYear()",
+            "t.getDayOfWeek()",
+            "t.getHours()",
+            "t.getMinutes()",
+            "t.getSeconds()",
+            "t.getMilliseconds()",
+            // Composes with the rest of the int subset.
+            "t.getFullYear() * 100 + t.getMonth()",
+            "t.getDayOfWeek() == 0 || t.getDayOfWeek() == 6",
+            "t.getHours() >= 9 && t.getHours() < 18 ? t.getMinutes() : 0",
+        ] {
+            check_batch_f(expr, &[("t", ColData::Timestamp(ts.clone()))]);
+        }
+    }
+
+    #[test]
+    fn batch_timestamp_accessors_recent_epoch() {
+        // A second window entirely after the epoch, spanning a leap day
+        // (2024-02-29) and a year boundary, so the leap-year arm of
+        // civil-from-days is exercised on positive day counts too.
+        let n = 4000;
+        let ts = gen_nanos(
+            n,
+            0x1122_3344_5566_7788,
+            1_703_980_800_000_000_000, // 2023-12-31T00:00:00Z
+            86_400_000_000_000_000,    // 1000 days
+        );
+        for expr in [
+            "t.getFullYear()",
+            "t.getMonth()",
+            "t.getDate()",
+            "t.getDayOfYear()",
+            "t.getDayOfWeek()",
+        ] {
+            check_batch_f(expr, &[("t", ColData::Timestamp(ts.clone()))]);
+        }
+    }
+
+    #[test]
+    fn temporal_accessor_bails() {
+        // The accessor names are registered ONLY as member overloads
+        // (`common/types/duration.rs:191-222`, `timestamp.rs:278-357`), so
+        // everything outside those overloads must bail to the tree-walker rather
+        // than answer:
         //   * the global spelling is an UndeclaredReference in the walker,
-        //   * a timestamp receiver is a calendar field, not a scaled count
-        //     (civil-from-days, not lowered yet),
         //   * a non-temporal receiver is a type error,
+        //   * the calendar names have no `duration` overload,
+        //   * a folded timestamp literal has lost its UTC offset,
         //   * the accessors take no arguments.
         let schema: Schema = [
             ("t".to_string(), ValType::Timestamp),
@@ -1091,12 +1156,22 @@ mod tests {
         .into_iter()
         .collect();
         for expr in [
+            // Registered only as member overloads, so the global spelling is an
+            // UndeclaredReference in the walker — lowering it would answer where
+            // the walker raises.
             "getHours(d)",
-            "t.getHours()",
-            "t.getFullYear()",
+            "getFullYear(t)",
+            // Non-temporal receiver: a type error in the walker.
             "i.getSeconds()",
+            // The accessors take no arguments.
             "d.getHours(1)",
+            // Calendar fields have no `duration` overload.
             "d.getDayOfWeek()",
+            "d.getFullYear()",
+            // A folded timestamp literal drops the RFC-3339 offset the walker
+            // keeps, so its calendar fields are not ours to answer.
+            "timestamp(\"2024-03-05T06:07:08+09:00\").getHours()",
+            "timestamp(\"2024-03-05T06:07:08Z\").getFullYear()",
         ] {
             let program = Program::compile(expr).unwrap();
             assert!(

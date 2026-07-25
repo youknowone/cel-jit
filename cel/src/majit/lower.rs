@@ -697,6 +697,145 @@ fn emit_float_const(ctx: &mut LowerCtxF, v: f64) -> TReg {
     r
 }
 
+/// The stdlib's receiver-only temporal accessors (`common/types/duration.rs`
+/// and `common/types/timestamp.rs`). All are registered with
+/// `add_member_overload` and take no arguments; the first four have both a
+/// `duration` overload (a scaled count) and a `timestamp` one (a clock field).
+const TEMPORAL_ACCESSORS: &[&str] = &[
+    "getHours",
+    "getMinutes",
+    "getSeconds",
+    "getMilliseconds",
+    "getDayOfWeek",
+    "getFullYear",
+    "getMonth",
+    "getDate",
+    "getDayOfMonth",
+    "getDayOfYear",
+];
+
+/// Emit a loop-invariant int constant load into the prelude and return its reg.
+fn emit_int_const(ctx: &mut LowerCtxF, v: i64) -> TReg {
+    let r = ctx.fresh(ValType::Int);
+    ctx.prelude
+        .extend_from_slice(&[OP_LOAD_CONST, v, r.idx as i64]);
+    r
+}
+
+/// Emit a three-address int-bank op `dst = a <op> b` into the body.
+fn emit_int_bin(ctx: &mut LowerCtxF, op: i64, a: TReg, b: TReg) -> TReg {
+    let d = ctx.fresh(ValType::Int);
+    ctx.body
+        .extend_from_slice(&[op, a.idx as i64, b.idx as i64, d.idx as i64]);
+    d
+}
+
+/// `dst = a <op> k` for a green constant `k` (its load is hoisted to the prelude).
+fn emit_int_bin_k(ctx: &mut LowerCtxF, op: i64, a: TReg, k: i64) -> TReg {
+    let kr = emit_int_const(ctx, k);
+    emit_int_bin(ctx, op, a, kr)
+}
+
+/// Nanoseconds in one day — the scale between an instant and its calendar day.
+const NANOS_PER_DAY: i64 = 86_400_000_000_000;
+
+/// Split an i64-nanoseconds instant into whole days since the Unix epoch and the
+/// nanoseconds-of-day remainder in `[0, NANOS_PER_DAY)`.
+///
+/// The day count is FLOORED, so a pre-epoch instant lands on the day below and
+/// its remainder stays non-negative — that is what a calendar field means.
+/// `OP_DIV`/`OP_MOD` truncate toward zero, so the negative case is corrected
+/// with the `r < 0` flag; a comparison already yields 0/1, so the correction is
+/// plain arithmetic with no branch (the traced loop lowers no control flow).
+fn emit_days_and_nanos_of_day(ctx: &mut LowerCtxF, ts: TReg) -> (TReg, TReg) {
+    let q = emit_int_bin_k(ctx, OP_DIV, ts, NANOS_PER_DAY);
+    let r = emit_int_bin_k(ctx, OP_MOD, ts, NANOS_PER_DAY);
+    let neg = emit_int_bin_k(ctx, OP_LT, r, 0);
+    let days = emit_int_bin(ctx, OP_SUB, q, neg);
+    let back = emit_int_bin_k(ctx, OP_MUL, neg, NANOS_PER_DAY);
+    let nanos_of_day = emit_int_bin(ctx, OP_ADD, r, back);
+    (days, nanos_of_day)
+}
+
+/// Howard Hinnant's `civil_from_days`: days since 1970-01-01 to
+/// `(year, month 1-12, day 1-31)`.
+///
+/// Every division below has a non-negative dividend, so `OP_DIV`'s truncation
+/// is the floor the algorithm calls for: an i64-nanosecond instant only spans
+/// ~1678-2262, which keeps `days` inside ±106752 and `z = days + 719468` inside
+/// [612716, 826220]. A timestamp outside that range cannot exist in this VM —
+/// the column payload is i64 nanos.
+fn emit_civil_from_days(ctx: &mut LowerCtxF, days: TReg) -> (TReg, TReg, TReg) {
+    let z = emit_int_bin_k(ctx, OP_ADD, days, 719_468);
+    let era = emit_int_bin_k(ctx, OP_DIV, z, 146_097);
+    let era_days = emit_int_bin_k(ctx, OP_MUL, era, 146_097);
+    let doe = emit_int_bin(ctx, OP_SUB, z, era_days);
+
+    // yoe = (doe - doe/1460 + doe/36524 - doe/146096) / 365
+    let by_1460 = emit_int_bin_k(ctx, OP_DIV, doe, 1_460);
+    let by_36524 = emit_int_bin_k(ctx, OP_DIV, doe, 36_524);
+    let by_146096 = emit_int_bin_k(ctx, OP_DIV, doe, 146_096);
+    let t1 = emit_int_bin(ctx, OP_SUB, doe, by_1460);
+    let t2 = emit_int_bin(ctx, OP_ADD, t1, by_36524);
+    let t3 = emit_int_bin(ctx, OP_SUB, t2, by_146096);
+    let yoe = emit_int_bin_k(ctx, OP_DIV, t3, 365);
+    let era400 = emit_int_bin_k(ctx, OP_MUL, era, 400);
+    let year_of_era = emit_int_bin(ctx, OP_ADD, yoe, era400);
+
+    // doy = doe - (365*yoe + yoe/4 - yoe/100)   (days since 1 March)
+    let y365 = emit_int_bin_k(ctx, OP_MUL, yoe, 365);
+    let y4 = emit_int_bin_k(ctx, OP_DIV, yoe, 4);
+    let y100 = emit_int_bin_k(ctx, OP_DIV, yoe, 100);
+    let s1 = emit_int_bin(ctx, OP_ADD, y365, y4);
+    let s2 = emit_int_bin(ctx, OP_SUB, s1, y100);
+    let doy = emit_int_bin(ctx, OP_SUB, doe, s2);
+
+    // mp = (5*doy + 2)/153 ; day = doy - (153*mp + 2)/5 + 1
+    let d5 = emit_int_bin_k(ctx, OP_MUL, doy, 5);
+    let d5p2 = emit_int_bin_k(ctx, OP_ADD, d5, 2);
+    let mp = emit_int_bin_k(ctx, OP_DIV, d5p2, 153);
+    let m153 = emit_int_bin_k(ctx, OP_MUL, mp, 153);
+    let m153p2 = emit_int_bin_k(ctx, OP_ADD, m153, 2);
+    let month_start = emit_int_bin_k(ctx, OP_DIV, m153p2, 5);
+    let dm = emit_int_bin(ctx, OP_SUB, doy, month_start);
+    let day = emit_int_bin_k(ctx, OP_ADD, dm, 1);
+
+    // month = mp + (mp < 10 ? 3 : -9), written as mp + 3 - 12*(mp >= 10) so the
+    // select is arithmetic on a 0/1 comparison rather than a branch.
+    let ge10 = emit_int_bin_k(ctx, OP_GE, mp, 10);
+    let mp3 = emit_int_bin_k(ctx, OP_ADD, mp, 3);
+    let wrap = emit_int_bin_k(ctx, OP_MUL, ge10, 12);
+    let month = emit_int_bin(ctx, OP_SUB, mp3, wrap);
+
+    // The era year starts in March, so January and February belong to the next
+    // calendar year: year = year_of_era + (month <= 2).
+    let le2 = emit_int_bin_k(ctx, OP_LE, month, 2);
+    let year = emit_int_bin(ctx, OP_ADD, year_of_era, le2);
+    (year, month, day)
+}
+
+/// Days since the Unix epoch of 1 January of `year` — Hinnant's
+/// `days_from_civil(year, 1, 1)`, specialised: for month 1 the March-based
+/// `doy` term `(153*(m+9) + 2)/5 + d - 1` folds to the constant 306 (1 March to
+/// the following 1 January). Used to turn an absolute day count into a
+/// day-of-year. `year - 1` is positive over the representable range, so
+/// truncation is again the floor the algorithm wants.
+fn emit_days_of_jan1(ctx: &mut LowerCtxF, year: TReg) -> TReg {
+    let y = emit_int_bin_k(ctx, OP_SUB, year, 1);
+    let era = emit_int_bin_k(ctx, OP_DIV, y, 400);
+    let era400 = emit_int_bin_k(ctx, OP_MUL, era, 400);
+    let yoe = emit_int_bin(ctx, OP_SUB, y, era400);
+    let y365 = emit_int_bin_k(ctx, OP_MUL, yoe, 365);
+    let y4 = emit_int_bin_k(ctx, OP_DIV, yoe, 4);
+    let y100 = emit_int_bin_k(ctx, OP_DIV, yoe, 100);
+    let s1 = emit_int_bin(ctx, OP_ADD, y365, y4);
+    let s2 = emit_int_bin(ctx, OP_SUB, s1, y100);
+    let doe = emit_int_bin_k(ctx, OP_ADD, s2, 306);
+    let era_days = emit_int_bin_k(ctx, OP_MUL, era, 146_097);
+    let abs = emit_int_bin(ctx, OP_ADD, era_days, doe);
+    emit_int_bin_k(ctx, OP_SUB, abs, 719_468)
+}
+
 /// Widen an int-bank value to a fresh float reg via a per-row `int as f64` cast
 /// (`OP_I2F` -> `cast_int_to_float`). Emitted into the body: unlike a literal
 /// (folded to a prelude constant), a data-dependent int is cast per row.
@@ -764,54 +903,128 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
     // schema/shape-guard note).
     if let Some(target) = &call.target {
         // Receiver-only stdlib accessors are registered with
-        // `add_member_overload` (`common/types/duration.rs:191-222`), so they
-        // exist ONLY in receiver form: the global spelling `getHours(d)` is an
-        // `UndeclaredReference` error in the tree-walker. Match them here, before
-        // the desugar, so the global spelling keeps bailing instead of answering
-        // where the walker raises.
+        // `add_member_overload` (`common/types/duration.rs:191-222`,
+        // `common/types/timestamp.rs:278-357`), so they exist ONLY in receiver
+        // form: the global spelling `getHours(d)` is an `UndeclaredReference`
+        // error in the tree-walker. Match them here, before the desugar, so the
+        // global spelling keeps bailing instead of answering where the walker
+        // raises.
         //
-        // `d.getHours()` / `getMinutes()` / `getSeconds()` / `getMilliseconds()`
-        // on a `duration` are `chrono::Duration::num_*`: the whole number of
-        // units in the duration, TRUNCATED toward zero (`num_seconds` adds one
-        // back when secs is negative and nanos positive, so `-1.5s` is `-1`, not
-        // `-2`). A duration is already carried as i64 nanoseconds in the int
-        // file, so each is one truncating divide by a green constant — and
-        // `OP_DIV` is exactly toward-zero (bytecode.rs:205-221 divides the
-        // magnitudes and reapplies the sign), so this is bit-exact with the
-        // tree-walker and needs no new opcode. The divisor is a loop invariant,
-        // so its load goes in the prelude.
+        // The receiver's bank picks the meaning. On a `duration`, `getHours` /
+        // `getMinutes` / `getSeconds` / `getMilliseconds` are
+        // `chrono::Duration::num_*`: the whole number of units, TRUNCATED toward
+        // zero (`num_seconds` adds one back when secs is negative and nanos
+        // positive, so `-1.5s` is `-1`, not `-2`). A duration is already carried
+        // as i64 nanoseconds in the int file, so each is one truncating divide
+        // by a green constant — and `OP_DIV` is exactly toward-zero
+        // (bytecode.rs:205-221 divides the magnitudes and reapplies the sign),
+        // so this is bit-exact with the tree-walker and needs no new opcode. The
+        // divisor is a loop invariant, so its load goes in the prelude. The six
+        // calendar names have no `duration` overload and bail there.
         //
-        // The same four names are ALSO timestamp accessors, where the answer is a
-        // calendar field rather than a scaled count; those need a civil-from-days
-        // conversion and are not lowered yet, so a non-`duration` receiver bails
-        // rather than silently dividing a wall-clock instant.
-        if let Some(nanos_per_unit) = match call.func_name.as_str() {
-            "getHours" => Some(3_600_000_000_000i64),
-            "getMinutes" => Some(60_000_000_000i64),
-            "getSeconds" => Some(1_000_000_000i64),
-            "getMilliseconds" => Some(1_000_000i64),
-            _ => None,
-        } {
+        // On a `timestamp` the answer is a calendar field instead: split the
+        // instant into a FLOORED day count plus nanoseconds-of-day, read the
+        // clock fields off the remainder and the date fields off the day count
+        // via civil-from-days. All of it is int-file arithmetic on green
+        // constants, so the whole conversion stays inside the traced loop.
+        if TEMPORAL_ACCESSORS.contains(&call.func_name.as_str()) {
             if !call.args.is_empty() {
                 return Err(LowerError::unsupported(format!(
                     "`{}` arity",
                     call.func_name
                 )));
             }
+            // A timestamp accessor reads a CALENDAR field, so it depends on the
+            // instant's UTC offset — which this VM does not carry: a column is
+            // i64 nanoseconds and the oracle rebuilds it as
+            // `DateTime::from_timestamp_nanos(n).fixed_offset()`, i.e. always
+            // +00:00. A folded `timestamp("...+09:00")` literal, by contrast,
+            // keeps its offset in the tree-walker while the fold here drops it,
+            // so its accessors would disagree. Restricting the receiver to a
+            // column path keeps the UTC assumption sound; anything else bails.
+            let receiver_is_column = match &target.expr {
+                Expr::Ident(n) => !ctx.locals.contains_key(n),
+                Expr::Select(_) => true,
+                _ => false,
+            };
             let a = compile_t(ctx, target)?;
-            if a.bank != ValType::Duration {
-                return Err(LowerError::unsupported(format!(
-                    "`{}` on a non-duration receiver",
-                    call.func_name
-                )));
+            match a.bank {
+                ValType::Duration => {
+                    let nanos_per_unit = match call.func_name.as_str() {
+                        "getHours" => 3_600_000_000_000i64,
+                        "getMinutes" => 60_000_000_000i64,
+                        "getSeconds" => 1_000_000_000i64,
+                        "getMilliseconds" => 1_000_000i64,
+                        // The calendar accessors have no `duration` overload.
+                        _ => {
+                            return Err(LowerError::unsupported(format!(
+                                "`{}` on a duration receiver",
+                                call.func_name
+                            )))
+                        }
+                    };
+                    return Ok(emit_int_bin_k(ctx, OP_DIV, a, nanos_per_unit));
+                }
+                ValType::Timestamp => {
+                    if !receiver_is_column {
+                        return Err(LowerError::unsupported(format!(
+                            "`{}` on a non-column timestamp (UTC offset not carried)",
+                            call.func_name
+                        )));
+                    }
+                    let (days, nanos_of_day) = emit_days_and_nanos_of_day(ctx, a);
+                    return Ok(match call.func_name.as_str() {
+                        "getHours" => emit_int_bin_k(ctx, OP_DIV, nanos_of_day, 3_600_000_000_000),
+                        "getMinutes" => {
+                            let m = emit_int_bin_k(ctx, OP_DIV, nanos_of_day, 60_000_000_000);
+                            emit_int_bin_k(ctx, OP_MOD, m, 60)
+                        }
+                        "getSeconds" => {
+                            let s = emit_int_bin_k(ctx, OP_DIV, nanos_of_day, 1_000_000_000);
+                            emit_int_bin_k(ctx, OP_MOD, s, 60)
+                        }
+                        "getMilliseconds" => {
+                            let ms = emit_int_bin_k(ctx, OP_DIV, nanos_of_day, 1_000_000);
+                            emit_int_bin_k(ctx, OP_MOD, ms, 1_000)
+                        }
+                        // `weekday().num_days_from_sunday()`: 1970-01-01 was a
+                        // Thursday (4 days from Sunday), and `days` can be
+                        // negative, so the remainder is floored back into [0, 7).
+                        "getDayOfWeek" => {
+                            let shifted = emit_int_bin_k(ctx, OP_ADD, days, 4);
+                            let rem = emit_int_bin_k(ctx, OP_MOD, shifted, 7);
+                            let neg = emit_int_bin_k(ctx, OP_LT, rem, 0);
+                            let back = emit_int_bin_k(ctx, OP_MUL, neg, 7);
+                            emit_int_bin(ctx, OP_ADD, rem, back)
+                        }
+                        "getFullYear" => emit_civil_from_days(ctx, days).0,
+                        // `month0()` / `day0()` are 0-based; `day()` is 1-based.
+                        "getMonth" => {
+                            let (_, month, _) = emit_civil_from_days(ctx, days);
+                            emit_int_bin_k(ctx, OP_SUB, month, 1)
+                        }
+                        "getDate" => emit_civil_from_days(ctx, days).2,
+                        "getDayOfMonth" => {
+                            let (_, _, day) = emit_civil_from_days(ctx, days);
+                            emit_int_bin_k(ctx, OP_SUB, day, 1)
+                        }
+                        // 0-based: the walker subtracts month0 and day0 to reach
+                        // 1 January of the same year and takes the day span.
+                        "getDayOfYear" => {
+                            let (year, _, _) = emit_civil_from_days(ctx, days);
+                            let jan1 = emit_days_of_jan1(ctx, year);
+                            emit_int_bin(ctx, OP_SUB, days, jan1)
+                        }
+                        _ => unreachable!("name is in TEMPORAL_ACCESSORS"),
+                    });
+                }
+                _ => {
+                    return Err(LowerError::unsupported(format!(
+                        "`{}` on a non-temporal receiver",
+                        call.func_name
+                    )))
+                }
             }
-            let k = ctx.fresh(ValType::Int);
-            ctx.prelude
-                .extend_from_slice(&[OP_LOAD_CONST, nanos_per_unit, k.idx as i64]);
-            let d = ctx.fresh(ValType::Int);
-            ctx.body
-                .extend_from_slice(&[OP_DIV, a.idx as i64, k.idx as i64, d.idx as i64]);
-            return Ok(d);
         }
         let mut args = Vec::with_capacity(call.args.len() + 1);
         args.push((**target).clone());
