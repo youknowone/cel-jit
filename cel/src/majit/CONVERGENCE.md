@@ -127,6 +127,45 @@ second number is what Step 3 would deliver on the real interpreter.
 The runtime-length list comprehension shipped in `0758724` is **correct but a
 net performance loss**: `items.all(i, i.price > 10)` measures 0.0–0.4x of the
 clean VM and 0.3–0.8x of the tree-walker at every list length, with a flat
-~1–3 µs per-row cost that says the row loop cannot stay in compiled code across
-the inner loop. Whatever happens to the columnar path, that shape must not be
-elected on a performance path until the per-row exit is understood.
+~1–3 µs per-row cost.
+
+That cost is now diagnosed, and `tests/majit_trace_evidence.rs` pins it.
+Counters from `float_bank::{COMPILES, GUARD_FAILS, TRACE_ABORTS}`:
+
+| workload | compiles | guard_fails | aborts |
+|---|---|---|---|
+| flat int predicate, 50000 rows | 1 | 1 | 0 |
+| flat float predicate, 50000 rows | 1 | 1 | 0 |
+| nested list, 4000 rows × 8 elements | 1 | **3999** | **1** |
+
+One deopt per row. Under `MAJIT_LOG=1` the reason is explicit: the inner
+element loop traces to `CloseLoop` and compiles; the outer row loop *also*
+traces to `CloseLoop` and is then **refused at optimize time** —
+
+```
+abort trace (InvalidLoop: next_iteration_args longer than inputargs
+             (full-body-walk cross-loop cut over a forced heap virtual))
+abort compile: root loop entry/jump arity mismatch input=3 jump=29
+```
+
+— the tripwire at `majit-metainterp/src/optimizeopt/optimizer.rs` (the
+`inputarg_type_at` check). The outer trace's header declares 3 inputargs while
+its closing JUMP carries 29. That guard's own comment states RPython makes the
+two shapes equal *by construction*: `reached_loop_header`
+(`pyjitpl.py:2934-2978`) builds `live_arg_boxes = reds + virtualizable_boxes[:-1]`
+for both the merge-point registration and the closing JUMP. So this is not a
+design gap in meta-tracing; it is front-end A not reproducing that
+construction when a trace is cut across a second merge point and the
+virtualizable `regs: [int; virt]` array is forced to the heap.
+
+Consequences for this document:
+
+- The per-row cost is **one compiled-trace entry plus one guard deopt**, not
+  anything about the columnar data model. It is a majit-side defect, so Step 4
+  demoting the columnar path does not make it go away — the same shape will
+  appear on the real interpreter of Step 1 the moment a CEL expression contains
+  a loop inside a loop, which `x.all(i, i.items.all(j, ...))` does.
+- It is one more argument for Step 3. Front-end B is the pipeline where that
+  merge-point/JUMP construction is the ported RPython one.
+
+Until it is fixed, the nested shape must not be elected on a performance path.
