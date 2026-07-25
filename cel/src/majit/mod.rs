@@ -1223,6 +1223,77 @@ mod tests {
         }
     }
 
+    /// The numeric conversions that are pure moves on the two-bank machine.
+    /// `double(int)` is one `cast_int_to_float`; `int(uint)` and `uint(int)` are
+    /// raw reinterpretations of the same 64-bit pattern, so they emit nothing at
+    /// all and only relabel the bank; the same-type spellings are the identity.
+    /// The uint columns deliberately include values above 2^63, where the signed
+    /// and unsigned readings differ, so a mislabelled bank cannot pass.
+    #[test]
+    fn batch_numeric_conversions() {
+        let n = 3000;
+        let i = gen_i64(n, 0x4a3b_2c1d_0e9f_8a7b, -5_000, 10_000);
+        let f = gen_f64(n, 0x9f8e_7d6c_5b4a_3928, -5_000.0, 10_000.0);
+        // Straddles 2^63: read as i64 these are negative, as u64 they are huge.
+        let u: Vec<i64> = gen_i64(n, 0x1357_9bdf_2468_ace0, -5_000, 10_000)
+            .into_iter()
+            .enumerate()
+            .map(|(k, v)| if k % 3 == 0 { v.wrapping_add(i64::MIN) } else { v })
+            .collect();
+
+        check_batch_f("double(i) > 100.0", &[("i", ColData::Int(i.clone()))]);
+        for expr in ["double(i) + f > 0.0", "double(i) == f"] {
+            check_batch_f(
+                expr,
+                &[("i", ColData::Int(i.clone())), ("f", ColData::Float(f.clone()))],
+            );
+        }
+        for expr in ["int(u) < 0", "int(u) > 100", "uint(int(u)) > 100u"] {
+            check_batch_f(expr, &[("u", ColData::UInt(u.clone()))]);
+        }
+        for expr in ["uint(i) > 100u", "int(uint(i)) > 100"] {
+            check_batch_f(expr, &[("i", ColData::Int(i.clone()))]);
+        }
+        // Identity spellings.
+        check_batch_f("int(i) > 100", &[("i", ColData::Int(i.clone()))]);
+        check_batch_f("double(f) > 100.0", &[("f", ColData::Float(f))]);
+        check_batch_f("uint(u) > 100u", &[("u", ColData::UInt(u))]);
+    }
+
+    #[test]
+    fn numeric_conversion_bails() {
+        // `double(uint)` needs `u64 as f64`, which differs from the signed cast
+        // above 2^63 and has no trace opcode. `int(double)`/`uint(double)` need
+        // `CastFloatToInt`, which the IR has but the `#[jit_interp]` macro does
+        // not lower yet. String and temporal arguments are a parse or a
+        // `FunctionError` in the walker.
+        let schema: Schema = [
+            ("i".to_string(), ValType::Int),
+            ("f".to_string(), ValType::Float),
+            ("u".to_string(), ValType::UInt),
+            ("s".to_string(), ValType::Str),
+            ("t".to_string(), ValType::Timestamp),
+        ]
+        .into_iter()
+        .collect();
+        for expr in [
+            "double(u) > 1.0",
+            "int(f) > 1",
+            "uint(f) > 1u",
+            "int(s) > 1",
+            "double(s) > 1.0",
+            "int(\"123\") > 1",
+            "int(t) > 1",
+            "double(t) > 1.0",
+        ] {
+            let program = Program::compile(expr).unwrap();
+            assert!(
+                lower_typed(program.expression(), &schema).is_err(),
+                "`{expr}` must bail the typed lowering"
+            );
+        }
+    }
+
     /// Member syntax must never reach a GLOBAL overload. The tree-walker looks
     /// the two spellings up in disjoint namespaces (`objects.rs:1331` global vs
     /// `:1364` member), and of the whole stdlib only `size` is registered both

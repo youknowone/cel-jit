@@ -1100,6 +1100,47 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
         return Ok(r);
     }
 
+    // Numeric type conversions. `double`/`int`/`uint` are global (non-member)
+    // overloads whose `Kind`-dispatched bodies (`common/types/double.rs:199`,
+    // `int.rs:229`, `uint.rs:250`) are TOTAL for the numeric arguments — a plain
+    // Rust `as` cast, no error — so each lowers to a pure register move, a bank
+    // relabel, or one widening cast. The string arguments parse and the rest are
+    // a `FunctionError`; both bail.
+    //
+    // The signed/unsigned pairs are FREE: `int(uint)` is `u64 as i64` and
+    // `uint(int)` is `i64 as u64`, i.e. raw reinterpretations, and the int
+    // register file already carries a uint as its raw 64-bit pattern. Only the
+    // bank label on the result changes, so no instruction is emitted at all.
+    if matches!(name, "double" | "int" | "uint") && call.args.len() == 1 {
+        let a = compile_t(ctx, &call.args[0])?;
+        return match (name, a.bank) {
+            // Identity conversions.
+            ("double", ValType::Float) | ("int", ValType::Int) | ("uint", ValType::UInt) => Ok(a),
+            // Widening: `i64 as f64` per row, the same `cast_int_to_float` the
+            // mixed int/float comparisons already use.
+            ("double", ValType::Int) => Ok(emit_i2f(ctx, a)),
+            // Reinterpretations within the int register file.
+            ("int", ValType::UInt) => Ok(TReg { bank: ValType::Int, idx: a.idx }),
+            ("uint", ValType::Int) => Ok(TReg { bank: ValType::UInt, idx: a.idx }),
+            // `u64 as f64` differs from `i64 as f64` above 2^63 and the trace IR
+            // has no unsigned widening cast, so this one is not ours to answer.
+            ("double", ValType::UInt) => Err(LowerError::unsupported(
+                "double(uint) (no unsigned int->float cast)",
+            )),
+            // `f64 as i64`/`as u64` are Rust's saturating casts (NaN -> 0, out of
+            // range clamps) and the IR has `CastFloatToInt`, but the
+            // `#[jit_interp]` macro only lowers an `as f64` cast, not the inverse
+            // (`lower_value.rs:209-221` requires an int-banked operand), so this
+            // waits on a parent addition rather than aborting the trace.
+            ("int", ValType::Float) | ("uint", ValType::Float) => Err(
+                LowerError::unsupported(format!("{name}(double) (no float->int cast)")),
+            ),
+            _ => Err(LowerError::unsupported(format!(
+                "{name}() of a non-numeric argument"
+            ))),
+        };
+    }
+
     // `x in [e0, e1, ...]` over a LITERAL list unrolls to a constant membership
     // set `(x == e0) || (x == e1) || ...`. Reuses the per-bank equality op
     // (`OP_EQ` for the int-file banks incl. string ids and temporal nanos,
