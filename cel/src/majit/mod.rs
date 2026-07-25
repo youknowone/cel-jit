@@ -1350,6 +1350,16 @@ mod tests {
         for expr in ["uint(i) > 100u", "int(uint(i)) > 100"] {
             check_batch_f(expr, &[("i", ColData::Int(i.clone()))]);
         }
+        // `int(double)` truncates toward zero and saturates at the i64 bounds.
+        // The float column spans both signs so the toward-zero rounding is
+        // exercised on negatives, where a floor would differ.
+        for expr in ["int(f) > 100", "int(f) < 0", "int(f)"] {
+            check_batch_f(expr, &[("f", ColData::Float(f.clone()))]);
+        }
+        check_batch_f(
+            "int(f) + i > 0",
+            &[("f", ColData::Float(f.clone())), ("i", ColData::Int(i.clone()))],
+        );
         // Identity spellings.
         check_batch_f("int(i) > 100", &[("i", ColData::Int(i.clone()))]);
         check_batch_f("double(f) > 100.0", &[("f", ColData::Float(f))]);
@@ -1374,7 +1384,6 @@ mod tests {
         .collect();
         for expr in [
             "double(u) > 1.0",
-            "int(f) > 1",
             "uint(f) > 1u",
             "int(s) > 1",
             "double(s) > 1.0",

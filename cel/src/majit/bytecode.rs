@@ -87,6 +87,12 @@ pub const OP_MUL_OVF: i64 = 42; // [a, b, dst, trap]    regs[dst] = ovfchecked(a
 /// channel out. `regs[addr]` holds the address of a caller-owned i64 word, the
 /// same loop-invariant-pointer-in-a-register shape the column bases use.
 pub const OP_TRAP_STORE: i64 = 43; // [addr, flag]      *(regs[addr]) = regs[flag]
+/// Narrow a float-bank value into the int bank (`cast_float_to_int`): Rust's
+/// `as i64`, truncating toward zero and SATURATING at the i64 bounds, with NaN
+/// mapping to 0. That is total — the walker's `int(double)` is the same plain
+/// `as` cast (`common/types/int.rs:237-239`) and raises nothing — so no guard
+/// is needed. The inverse of [`OP_I2F`].
+pub const OP_F2I: i64 = 44; // [fsrc, dst]             regs[dst] = fregs[fsrc] as i64  (cast_float_to_int)
 
 /// Raw native-memory load intrinsic recognized by the `#[jit_interp]` proc
 /// macro (lowered to `raw_load_i`); at the interpreter tier this real fn runs.
@@ -724,7 +730,7 @@ pub mod float_bank {
     use super::{
         OP_ADD, OP_ADD_OVF, OP_AND, OP_COL_LOAD, OP_COL_LOAD_F, OP_DIV, OP_EQ, OP_FADD, OP_FDIV,
         OP_FEQ, OP_FGE, OP_FGT, OP_FLE, OP_FLT, OP_FMOV, OP_FMUL, OP_FNE, OP_FNEG, OP_FSUB, OP_GE,
-        OP_GT, OP_I2F, OP_JUMP_IF_ABOVE, OP_LE, OP_LOAD_CONST, OP_LOAD_CONST_F, OP_LT, OP_MOD,
+        OP_F2I, OP_GT, OP_I2F, OP_JUMP_IF_ABOVE, OP_LE, OP_LOAD_CONST, OP_LOAD_CONST_F, OP_LT, OP_MOD,
         OP_MOV, OP_MUL, OP_MUL_OVF, OP_NE, OP_FSELECT, OP_NEG, OP_NOT, OP_OR, OP_RETURN,
         OP_RETURN_F, OP_SELECT, OP_SUB, OP_SUB_OVF, OP_TRAP_STORE, OP_ULE, OP_ULT,
     };
@@ -1058,6 +1064,10 @@ pub mod float_bank {
                     state.fregs[program[pc + 2] as usize] = state.regs[program[pc + 1] as usize] as f64;
                     pc += 3;
                 }
+                OP_F2I => {
+                    state.regs[program[pc + 2] as usize] = state.fregs[program[pc + 1] as usize] as i64;
+                    pc += 3;
+                }
                 OP_FMOV => {
                     state.fregs[program[pc + 2] as usize] = state.fregs[program[pc + 1] as usize];
                     pc += 3;
@@ -1335,6 +1345,10 @@ pub mod float_bank {
                 }
                 OP_I2F => {
                     fregs[program[pc + 2] as usize] = regs[program[pc + 1] as usize] as f64;
+                    pc += 3;
+                }
+                OP_F2I => {
+                    regs[program[pc + 2] as usize] = fregs[program[pc + 1] as usize] as i64;
                     pc += 3;
                 }
                 OP_FMOV => {

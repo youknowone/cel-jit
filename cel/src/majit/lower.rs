@@ -891,6 +891,16 @@ fn emit_days_of_jan1(ctx: &mut LowerCtxF, year: TReg) -> TReg {
     emit_int_bin_k(ctx, OP_SUB, abs, 719_468)
 }
 
+/// Narrow a float-bank value to a fresh int reg via a per-row `f64 as i64` cast
+/// (`OP_F2I` -> `cast_float_to_int`), the inverse of [`emit_i2f`].
+fn emit_f2i(ctx: &mut LowerCtxF, src: TReg) -> TReg {
+    debug_assert_eq!(src.bank, ValType::Float, "emit_f2i: source must be float-banked");
+    let r = ctx.fresh(ValType::Int);
+    ctx.body
+        .extend_from_slice(&[OP_F2I, src.idx as i64, r.idx as i64]);
+    r
+}
+
 /// Widen an int-bank value to a fresh float reg via a per-row `int as f64` cast
 /// (`OP_I2F` -> `cast_int_to_float`). Emitted into the body: unlike a literal
 /// (folded to a prelude constant), a data-dependent int is cast per row.
@@ -1185,14 +1195,15 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
             ("double", ValType::UInt) => Err(LowerError::unsupported(
                 "double(uint) (no unsigned int->float cast)",
             )),
-            // `f64 as i64`/`as u64` are Rust's saturating casts (NaN -> 0, out of
-            // range clamps) and the IR has `CastFloatToInt`, but the
-            // `#[jit_interp]` macro only lowers an `as f64` cast, not the inverse
-            // (`lower_value.rs:209-221` requires an int-banked operand), so this
-            // waits on a parent addition rather than aborting the trace.
-            ("int", ValType::Float) | ("uint", ValType::Float) => Err(
-                LowerError::unsupported(format!("{name}(double) (no float->int cast)")),
-            ),
+            // `f64 as i64` truncates toward zero and saturates at the i64
+            // bounds (NaN -> 0) — total, exactly what the walker's plain `as`
+            // cast does, so no guard is needed. `uint(double)` is `as u64`,
+            // which saturates at DIFFERENT bounds (a negative float clamps to 0,
+            // not to i64::MIN), and there is no unsigned narrowing op.
+            ("int", ValType::Float) => Ok(emit_f2i(ctx, a)),
+            ("uint", ValType::Float) => Err(LowerError::unsupported(
+                "uint(double) (no float->unsigned cast)",
+            )),
             _ => Err(LowerError::unsupported(format!(
                 "{name}() of a non-numeric argument"
             ))),
