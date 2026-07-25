@@ -1,7 +1,13 @@
 //! cell-majit columnar batch evaluator vs the stock tree-walker (issue #357).
 //!
+//! This is an explicit **cross-model batch experiment**, not the default fair
+//! CEL JIT benchmark. The stock side evaluates one structured activation per
+//! call; the majit side consumes pre-transposed primitive columns and fuses the
+//! outer row loop. Do not report `stock / JIT-on` as a JIT-only speedup. Run
+//! `./bench.sh` for the fair request/engine/cold suite.
+//!
 //! Runs the REAL cel path: a CEL `Program` is lowered (`cel::majit::lower::lower`)
-//! and evaluated over a batch of rows via `eval_batch_sum`, which reads each
+//! and evaluated over a batch of rows via `batch_sum_program`, which reads each
 //! context column at the data-dependent (red) row index through a compiled
 //! `raw_load` trace, the buffer bases held loop-invariant in the register file.
 //!
@@ -13,20 +19,21 @@
 //! against a fresh-`Context`-per-row walker — that pays a per-row allocation the
 //! JIT never does (cold vs hot), which would flatter the JIT dishonestly.
 //!
-//! Three steady-state measurements on identical data columns:
-//!   naive    stock tree-walker, reused Context  — the baseline to beat
-//!   JIT-off  majit bytecode interpreter tier    — lowering only, no compilation
-//!   JIT-on   majit compiled trace               — the win
-//! JIT-off ≈ naive is the point: the speedup comes from COMPILATION, not from
-//! lowering the expression to integer bytecode. RELEASE ONLY (i64 wrap; 3-way
+//! Four steady-state measurements over one prebuilt batch program:
+//!   stock    stock tree-walker, reused Context
+//!   clean VM plain Rust bytecode interpreter, no tracing/JIT machinery
+//!   JIT-off  majit tracing interpreter, compilation disabled
+//!   JIT-on   majit compiled trace
+//! This separates the representation/lowering win (`stock / clean VM`) from
+//! the compilation win (`clean VM / JIT-on`). RELEASE ONLY (i64 wrap; 4-way
 //! equality gate).
 
 use std::hint::black_box;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
-use cel::majit::bytecode::{eval_batch_sum, COMPILES};
-use cel::majit::lower::lower;
+use cel::majit::bytecode::float_bank::{clean_interp_f, run_jit_f, COMPILES};
+use cel::majit::lower::{lower_typed, Schema};
 use cel::{Context, Program, Value};
 
 const LCG_A: i64 = 6364136223846793005;
@@ -59,7 +66,8 @@ fn main() {
     // Flagship policy predicate over three int/bool columns.
     let expr = "balance >= amount && !frozen";
     let program = Program::compile(expr).expect("compile");
-    let lowered = lower(program.expression()).expect("lower policy to majit subset");
+    let lowered =
+        lower_typed(program.expression(), &Schema::new()).expect("lower policy to majit subset");
     let slot_paths: Vec<&str> = lowered.slots.iter().map(|s| s.path.as_str()).collect();
     assert_eq!(slot_paths, ["balance", "amount", "frozen"], "slot order");
 
@@ -68,6 +76,8 @@ fn main() {
     let amount = make_col(n, -1_000_000, 1_000_000, 0x9E3779B9);
     let frozen = make_col(n, 0, 1, 0x1000_0001);
     let columns: Vec<&[i64]> = vec![&balance, &amount, &frozen];
+    let bases: Vec<i64> = columns.iter().map(|c| c.as_ptr() as i64).collect();
+    let (batch, nr, nf) = lowered.batch_sum_program(&bases, n as i64);
 
     // FAIR baseline: the stock tree-walker at its best — reuse one Context,
     // overwrite the three variables per row (hot; no per-row Context alloc).
@@ -87,14 +97,16 @@ fn main() {
         acc
     };
 
-    // Correctness gate: naive == JIT-off == JIT-on (all read the same columns).
+    // Correctness gate: stock == clean VM == JIT-off == JIT-on.
     COMPILES.store(0, Ordering::Relaxed);
     let base = naive();
-    let off = eval_batch_sum(&lowered, &columns, u32::MAX);
+    let clean = clean_interp_f(&batch, nr, nf);
+    let off = run_jit_f(&batch, nr, nf, u32::MAX);
     let off_c = COMPILES.load(Ordering::Relaxed);
     COMPILES.store(0, Ordering::Relaxed);
-    let on = eval_batch_sum(&lowered, &columns, 8);
+    let on = run_jit_f(&batch, nr, nf, 8);
     let on_c = COMPILES.load(Ordering::Relaxed);
+    assert_eq!(base, clean, "stock vs clean VM divergence");
     assert_eq!(base, off, "naive vs JIT-off divergence");
     assert_eq!(base, on, "naive vs JIT-on divergence -> miscompile");
     assert_eq!(off_c, 0, "JIT-off must never compile");
@@ -106,25 +118,40 @@ fn main() {
     );
 
     let rounds = 5;
-    let (mut on_t, mut off_t, mut naive_t) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut on_t, mut off_t, mut clean_t, mut naive_t) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for _ in 0..rounds {
         naive_t.push(time_ns_per_row(n, naive));
-        off_t.push(time_ns_per_row(n, || eval_batch_sum(&lowered, &columns, u32::MAX)));
-        on_t.push(time_ns_per_row(n, || eval_batch_sum(&lowered, &columns, 8)));
+        clean_t.push(time_ns_per_row(n, || clean_interp_f(&batch, nr, nf)));
+        off_t.push(time_ns_per_row(n, || run_jit_f(&batch, nr, nf, u32::MAX)));
+        on_t.push(time_ns_per_row(n, || run_jit_f(&batch, nr, nf, 8)));
     }
-    let (jit, jit_off, nv) = (median(on_t), median(off_t), median(naive_t));
-    println!();
-    println!("  naive   (cel tree-walk, reused ctx) : {nv:>9.2} ns/row   ← fair baseline (hot)");
-    println!("  majit   JIT-off (bytecode interp)   : {jit_off:>9.2} ns/row   ← lowering only, no compile");
-    println!(
-        "  majit   JIT-on  (compiled trace)    : {jit:>9.2} ns/row   ← {:.0}x faster than naive  {}",
-        nv / jit,
-        if nv / jit > 1.0 { "✅" } else { "❌" }
+    let (jit, jit_off, vm, nv) = (
+        median(on_t),
+        median(off_t),
+        median(clean_t),
+        median(naive_t),
     );
     println!();
+    println!("  stock   (cel tree-walk, reused ctx) : {nv:>9.2} ns/row");
+    println!("  clean VM(lowered bytecode, no JIT)  : {vm:>9.2} ns/row");
+    println!("  majit   (tracing interp, JIT off)    : {jit_off:>9.2} ns/row");
+    println!("  majit   (compiled trace, JIT on)     : {jit:>9.2} ns/row");
+    println!();
     println!(
-        "  => JIT-off is {:.2}x of naive, so the {:.0}x win is COMPILATION, not lowering.",
-        jit_off / nv,
+        "  VM/data-model effect  stock / clean VM : {:>8.2}x",
+        nv / vm
+    );
+    println!(
+        "  JIT effect          clean VM / JIT-on  : {:>8.2}x",
+        vm / jit
+    );
+    println!(
+        "  majit tier delta     JIT-off / JIT-on  : {:>8.2}x",
+        jit_off / jit
+    );
+    println!(
+        "  cross-model batch    stock / JIT-on    : {:>8.2}x",
         nv / jit
     );
     black_box((&balance, &amount, &frozen));

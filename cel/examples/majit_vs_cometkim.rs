@@ -1,5 +1,8 @@
-//! Head-to-head: cell-majit (batch meta-tracing) vs cometkim's cel-jit
-//! (per-call AOT cranelift, PR #233) on cometkim's own benchmark expressions.
+//! Historical cross-regime probe: cell-majit batch throughput and cometkim's
+//! per-call AOT cranelift latency (PR #233) on the same expression texts.
+//! These numbers are shown side by side for context only. They have different
+//! inputs, evaluation units, and measurement sessions, so no speedup ratio or
+//! winner is reported. Use `./bench.sh` for the fair benchmark suite.
 //!
 //! cometkim's `comparison.rs` measures ONE `CompiledProgram::execute(&ctx)` per
 //! criterion iteration over a FIXED context — per-call latency. His compiled /
@@ -7,30 +10,27 @@
 //! portable across machines — they were measured on THIS machine by re-running
 //! his own `cargo bench --bench comparison` in the same session as this harness
 //! (fresh, 2026-07-22). Re-measure both sides together on any other machine
-//! before trusting the ratios; the criterion medians are the moving part.
+//! before using the absolute numbers; the criterion medians are the moving part.
 //!
-//! majit's regime is THROUGHPUT: one traced batch loop over N rows. We report
-//! majit's compiled ns/row. The comparison is conservative — cometkim's
-//! fixed-context ns/call is a LOWER BOUND on his throughput ns/eval (varying
-//! inputs would add per-row context rebuilds he doesn't pay here), so
-//! `majit_ns_per_row < cometkim_aot_ns_per_call` ⇒ majit wins throughput. It is
-//! further conservative in that majit's ns/row *includes* per-row input
-//! generation (an LCG advance + mask per slot) that cometkim doesn't pay.
+//! majit's regime is THROUGHPUT: one traced batch loop over N rows. Cometkim's
+//! regime is one `execute` call over a fixed context. Comparing their numerical
+//! magnitudes does not isolate a JIT effect.
 //!
 //! Every case in cometkim's `comparison.rs` that falls into majit's int subset
 //! is covered: constant fold, variable/member/constant-index access, ternary,
 //! and integer arithmetic including `/`. List/string-returning and custom
 //! functions stay out of the int subset and report "out of subset".
 //!
-//! RELEASE ONLY. Run: `cargo run --release --example majit_vs_cometkim --features majit-jit`.
+//! RELEASE ONLY. Run: `cargo run --release --example majit_vs_cometkim --features jit`.
 
 use std::hint::black_box;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
-use cel::majit::bytecode::{clean_interp, run_jit, Code, COMPILES};
+use cel::majit::bytecode::float_bank::{clean_interp_f, run_jit_f, COMPILES};
+use cel::majit::bytecode::Code;
 use cel::majit::bytecode::{OP_ADD, OP_AND, OP_JUMP_IF_ABOVE, OP_LOAD_CONST, OP_MUL, OP_RETURN};
-use cel::majit::lower::{lower, Lowered};
+use cel::majit::lower::{lower_typed, LoweredF, Schema};
 use cel::Program;
 
 const LCG_A: i64 = 6364136223846793005;
@@ -77,8 +77,8 @@ struct Case {
     cometkim_aot_ns: f64,
 }
 
-fn build_batch(lowered: &Lowered, n: i64, shape: Shape) -> Vec<i64> {
-    let base = lowered.num_regs as i64;
+fn build_batch(lowered: &LoweredF, n: i64, shape: Shape) -> Vec<i64> {
+    let base = lowered.num_int_regs as i64;
     let ns = lowered.slots.len() as i64;
     let r_x = base;
     let r_lcg_a = base + 1;
@@ -104,6 +104,9 @@ fn build_batch(lowered: &Lowered, n: i64, shape: Shape) -> Vec<i64> {
         p.extend_from_slice(&[OP_LOAD_CONST, bias, bias_reg(i)]);
     }
 
+    // Loop-invariant literal loads, hoisted by the typed lowering.
+    p.extend_from_slice(&lowered.prelude);
+
     let body_pc = p.len() as i64;
 
     for (i, slot) in lowered.slots.iter().enumerate() {
@@ -119,7 +122,12 @@ fn build_batch(lowered: &Lowered, n: i64, shape: Shape) -> Vec<i64> {
             p.extend_from_slice(&[OP_ADD, dst, bias_reg(i), dst]);
         }
     }
+    let body_at = p.len();
     p.extend_from_slice(&lowered.body);
+    // Body-relative jump targets -> absolute program addresses.
+    for &f in &lowered.jump_fixups {
+        p[body_at + f] += body_at as i64;
+    }
     p.extend_from_slice(&[OP_ADD, r_acc, lowered.result_reg as i64, r_acc]);
     p.extend_from_slice(&[OP_ADD, r_i, r_one, r_i]);
     p.extend_from_slice(&[OP_JUMP_IF_ABOVE, r_n, r_i, body_pc]);
@@ -146,7 +154,7 @@ fn run_case(case: &Case) {
             return;
         }
     };
-    let lowered = match lower(program.expression()) {
+    let lowered = match lower_typed(program.expression(), &Schema::new()) {
         Ok(l) => l,
         Err(e) => {
             println!(
@@ -156,50 +164,97 @@ fn run_case(case: &Case) {
             return;
         }
     };
-    let nregs = lowered.num_regs + 7 + 2 * lowered.slots.len();
+    let nregs = lowered.num_int_regs + 7 + 2 * lowered.slots.len();
+    let nfregs = lowered.num_float_regs;
     let batch = build_batch(&lowered, N, case.shape);
     let code: &Code = &batch;
 
     // self-consistency miscompile gate
     COMPILES.store(0, Ordering::Relaxed);
-    let clean = clean_interp(code, nregs);
-    let off = run_jit(code, nregs, JIT_OFF);
+    let clean = clean_interp_f(code, nregs, nfregs);
+    let off = run_jit_f(code, nregs, nfregs, JIT_OFF);
     COMPILES.store(0, Ordering::Relaxed);
-    let on = run_jit(code, nregs, JIT_ON);
+    let on = run_jit_f(code, nregs, nfregs, JIT_ON);
     let compiles = COMPILES.load(Ordering::Relaxed);
     assert_eq!(clean, off, "{}: clean vs jit-off", case.label);
     assert_eq!(clean, on, "{}: clean vs jit-on -> miscompile", case.label);
 
     let mut a = Vec::new();
     for _ in 0..ROUNDS {
-        a.push(time_ns(N, || run_jit(code, nregs, JIT_ON)));
+        a.push(time_ns(N, || run_jit_f(code, nregs, nfregs, JIT_ON)));
     }
     let majit = median(a);
 
-    let vs_aot = case.cometkim_aot_ns / majit;
-    let verdict = if vs_aot >= 1.0 { "majit WINS" } else { "majit slower" };
     println!(
-        "{:22} majit {:7.2} | cometkim AOT {:7.1} ({:>2} slots, compiles={compiles}) | {:6.1}x  {verdict}",
-        case.label, majit, case.cometkim_aot_ns, lowered.slots.len(), vs_aot,
+        "{:22} majit batch {:7.2} ns/row | cometkim AOT {:7.1} ns/call ({:>2} slots, compiles={compiles})",
+        case.label, majit, case.cometkim_aot_ns, lowered.slots.len(),
     );
 }
 
 fn main() {
     println!(
-        "ns/row (majit batch, throughput) vs ns/call (cometkim AOT, per-call fixed-ctx best case)\n\
-         majit < cometkim ⇒ majit wins throughput (cometkim's per-call is a lower bound on his ns/eval)\n"
+        "NON-COMPARABLE UNITS: majit batch ns/row beside cometkim fixed-context ns/call.\n\
+         No ratio or winner is valid; use the default ./bench.sh suite for fair measurements.\n"
     );
 
     let cases = [
-        Case { label: "comparison(const)", src: "10 > 5 && 3 < 7 || 1 == 1", shape: default_shape, cometkim_interp_ns: 37.33, cometkim_aot_ns: 7.84 },
-        Case { label: "variable_access", src: "x", shape: default_shape, cometkim_interp_ns: 7.73, cometkim_aot_ns: 13.97 },
-        Case { label: "conditional", src: "x > 10 ? x * 2 : x + 5", shape: default_shape, cometkim_interp_ns: 35.14, cometkim_aot_ns: 22.25 },
-        Case { label: "member_access", src: "obj.nested.value + obj.other", shape: default_shape, cometkim_interp_ns: 133.0, cometkim_aot_ns: 164.22 },
-        Case { label: "list_indexing", src: "list[0] + list[5] + list[9]", shape: default_shape, cometkim_interp_ns: 61.80, cometkim_aot_ns: 74.27 },
-        Case { label: "simple_arithmetic", src: "1 + 2 * 3 - 4 / 2", shape: default_shape, cometkim_interp_ns: 46.11, cometkim_aot_ns: 7.97 },
-        Case { label: "nested_expr(div)", src: "((a + b) * (c - d)) / ((e + f) - (g * h))", shape: nested_shape, cometkim_interp_ns: 156.97, cometkim_aot_ns: 140.45 },
+        Case {
+            label: "comparison(const)",
+            src: "10 > 5 && 3 < 7 || 1 == 1",
+            shape: default_shape,
+            cometkim_interp_ns: 37.33,
+            cometkim_aot_ns: 7.84,
+        },
+        Case {
+            label: "variable_access",
+            src: "x",
+            shape: default_shape,
+            cometkim_interp_ns: 7.73,
+            cometkim_aot_ns: 13.97,
+        },
+        Case {
+            label: "conditional",
+            src: "x > 10 ? x * 2 : x + 5",
+            shape: default_shape,
+            cometkim_interp_ns: 35.14,
+            cometkim_aot_ns: 22.25,
+        },
+        Case {
+            label: "member_access",
+            src: "obj.nested.value + obj.other",
+            shape: default_shape,
+            cometkim_interp_ns: 133.0,
+            cometkim_aot_ns: 164.22,
+        },
+        Case {
+            label: "list_indexing",
+            src: "list[0] + list[5] + list[9]",
+            shape: default_shape,
+            cometkim_interp_ns: 61.80,
+            cometkim_aot_ns: 74.27,
+        },
+        Case {
+            label: "simple_arithmetic",
+            src: "1 + 2 * 3 - 4 / 2",
+            shape: default_shape,
+            cometkim_interp_ns: 46.11,
+            cometkim_aot_ns: 7.97,
+        },
+        Case {
+            label: "nested_expr(div)",
+            src: "((a + b) * (c - d)) / ((e + f) - (g * h))",
+            shape: nested_shape,
+            cometkim_interp_ns: 156.97,
+            cometkim_aot_ns: 140.45,
+        },
         // green-length unroll: literal-list `all` folds to a constant bool.
-        Case { label: "all_comprehension", src: "[1, 2, 3, 4, 5].all(x, x > 0)", shape: default_shape, cometkim_interp_ns: 512.50, cometkim_aot_ns: 197.40 },
+        Case {
+            label: "all_comprehension",
+            src: "[1, 2, 3, 4, 5].all(x, x > 0)",
+            shape: default_shape,
+            cometkim_interp_ns: 512.50,
+            cometkim_aot_ns: 197.40,
+        },
     ];
 
     for case in &cases {

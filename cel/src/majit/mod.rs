@@ -104,8 +104,8 @@ pub mod smoke;
 
 #[cfg(test)]
 mod tests {
-    use super::bytecode::{clean_interp, eval_batch_sum, eval_batch_sum_f, run_jit, Column, COMPILES};
-    use super::lower::{lower, lower_typed, size_slot_source, Schema, ValType};
+    use super::bytecode::{eval_batch_sum_f, Column};
+    use super::lower::{lower_typed, size_slot_source, Schema, ValType};
     use crate::{Context, Program, Value};
     use core::sync::atomic::Ordering;
     use std::collections::HashMap;
@@ -125,16 +125,29 @@ mod tests {
         }
     }
 
-    /// Cross-check: a lowered CEL expression, run on both the clean interpreter
-    /// and the majit mainloop (JIT compilation disabled — this validates the
-    /// lowering, not the trace), yields the same scalar the stock
-    /// `Program::execute` tree-walker does for the same variable bindings.
+    /// Cross-check ONE row: a lowered CEL expression run on both the clean
+    /// two-bank interpreter and the majit mainloop with compilation disabled
+    /// (this validates the LOWERING, not the trace) yields the same scalar the
+    /// stock `Program::execute` tree-walker does for the same bindings. A
+    /// one-row batch is the single-row program on this machine — the loop runs
+    /// once and the accumulator holds the row's value.
     fn check(expr_src: &str, binds: &[(&str, Bind)]) {
-        let program = Program::compile(expr_src).unwrap_or_else(|e| panic!("parse `{expr_src}`: {e:?}"));
-        let lowered = lower(program.expression())
-            .unwrap_or_else(|e| panic!("lower `{expr_src}`: {e}"));
+        let cols: Vec<(&str, ColData)> = binds
+            .iter()
+            .map(|(n, b)| (*n, ColData::Int(vec![b.as_i64()])))
+            .collect();
+        let program =
+            Program::compile(expr_src).unwrap_or_else(|e| panic!("parse `{expr_src}`: {e:?}"));
+        let schema: Schema = binds
+            .iter()
+            .map(|(n, _)| (n.to_string(), ValType::Int))
+            .collect();
+        let lowered = lower_typed(program.expression(), &schema)
+            .unwrap_or_else(|e| panic!("lower_typed `{expr_src}`: {e}"));
 
-        // Stock tree-walker reference.
+        // Stock tree-walker reference. A `Bind::Bool` must bind a real bool, not
+        // its 0/1 image, or the walker would compare an int where CEL sees a
+        // bool and the oracle would stop being one.
         let mut ctx = Context::default();
         for (name, b) in binds {
             match b {
@@ -142,28 +155,50 @@ mod tests {
                 Bind::Bool(v) => ctx.add_variable_from_value(*name, *v),
             }
         }
-        let cel_val = program
+        let cel_i = match program
             .execute(&ctx)
-            .unwrap_or_else(|e| panic!("execute `{expr_src}`: {e:?}"));
-        let cel_i = match cel_val {
+            .unwrap_or_else(|e| panic!("execute `{expr_src}`: {e:?}"))
+        {
             Value::Bool(b) => b as i64,
             Value::Int(i) => i,
             other => panic!("`{expr_src}`: unexpected result {other:?}"),
         };
 
-        // majit inputs aligned to the lowering's slot order.
-        let map: HashMap<&str, i64> = binds.iter().map(|(n, b)| (*n, b.as_i64())).collect();
-        let inputs: Vec<i64> = lowered
-            .slots
-            .iter()
-            .map(|s| *map.get(s.path.as_str()).unwrap_or_else(|| panic!("no binding for slot `{}`", s.path)))
-            .collect();
-        let prog = lowered.program_for(&inputs);
+        let columns: Vec<Column> = cols.iter().map(|(_, d)| d.column()).collect();
+        assert_eq!(
+            clean_batch_sum_f(&lowered, &columns, 1),
+            Some(cel_i),
+            "clean interp vs stock for `{expr_src}` {binds:?}"
+        );
+        assert_eq!(
+            majit_batch_sum_f(&lowered, &columns, 1, u32::MAX),
+            Some(cel_i),
+            "majit (jit-off) vs stock for `{expr_src}` {binds:?}"
+        );
+    }
 
-        let clean = clean_interp(&prog, lowered.num_regs);
-        assert_eq!(clean, cel_i, "clean interp vs stock for `{expr_src}` {binds:?}");
-        let jit = run_jit(&prog, lowered.num_regs, u32::MAX);
-        assert_eq!(jit, cel_i, "majit (jit-off) vs stock for `{expr_src}` {binds:?}");
+    /// [`super::bytecode::eval_batch_sum_f`] with an EXPLICIT row count. The
+    /// public entry point reads `n` off the first row column, which cannot work
+    /// for an expression that reads no column at all (`[1,2,3].all(x, x > 0)`
+    /// folds to a constant and has zero slots).
+    fn majit_batch_sum_f(
+        lowered: &super::lower::LoweredF,
+        columns: &[Column],
+        n: usize,
+        threshold: u32,
+    ) -> Option<i64> {
+        use super::bytecode::float_bank::run_jit_f;
+        let bases: Vec<i64> = columns.iter().map(|c| c.base()).collect();
+        let mut trap: Box<i64> = Box::new(0);
+        let trap_addr = (&mut *trap) as *mut i64 as i64;
+        let (prog, ni, nf) = lowered.batch_sum_program_trapping(&bases, n as i64, trap_addr);
+        let out = run_jit_f(&prog, ni, nf, threshold);
+        core::hint::black_box(columns);
+        if *trap != 0 {
+            None
+        } else {
+            Some(out)
+        }
     }
 
     /// Regression: an overflow-checked op (`OP_ADD_OVF`) whose `GuardNoOverflow`
@@ -177,6 +212,7 @@ mod tests {
     /// tree-walker raises.
     #[test]
     fn overflow_deopt_on_compiled_trace() {
+        use super::bytecode::float_bank::{clean_interp_f, run_jit_f, COMPILES as COMPILES_F};
         use super::bytecode::{
             OP_ADD, OP_ADD_OVF, OP_JUMP_IF_ABOVE, OP_LOAD_CONST, OP_RETURN, OP_TRAP_STORE,
         };
@@ -203,16 +239,22 @@ mod tests {
             OP_TRAP_STORE, 6, 5,        // *trap_addr = trap_flag
             OP_RETURN, 2,
         ];
-        let before = COMPILES.load(Ordering::Relaxed);
-        let jit = run_jit(&prog, 7, 3);
+        let before = COMPILES_F.load(Ordering::Relaxed);
+        let jit = run_jit_f(&prog, 7, 0, 3);
         let jit_trap = *trap;
         *trap = 0;
-        let clean = clean_interp(&prog, 7);
-        assert_eq!(jit, clean, "compiled-tier overflow deopt must match wrapping oracle");
-        assert_eq!(jit_trap, 1, "the compiled tier's overflow deopt must set the trap flag");
+        let clean = clean_interp_f(&prog, 7, 0);
+        assert_eq!(
+            jit, clean,
+            "compiled-tier overflow deopt must match wrapping oracle"
+        );
+        assert_eq!(
+            jit_trap, 1,
+            "the compiled tier's overflow deopt must set the trap flag"
+        );
         assert_eq!(*trap, 1, "the reference tier must set the trap flag too");
         assert!(
-            COMPILES.load(Ordering::Relaxed) > before,
+            COMPILES_F.load(Ordering::Relaxed) > before,
             "loop must tier-compile so the overflow lands in the compiled trace",
         );
     }
@@ -295,7 +337,8 @@ mod tests {
     #[test]
     fn list_index_constant() {
         let program = Program::compile("list[0] + list[2] + list[4]").unwrap();
-        let lowered = lower(program.expression()).expect("constant list index is lowerable");
+        let lowered = lower_typed(program.expression(), &Schema::new())
+            .expect("constant list index is lowerable");
         let paths: Vec<&str> = lowered.slots.iter().map(|s| s.path.as_str()).collect();
         assert_eq!(paths, ["list[0]", "list[2]", "list[4]"]);
 
@@ -305,10 +348,11 @@ mod tests {
             Value::Int(i) => i,
             o => panic!("unexpected {o:?}"),
         };
-        let inputs = vec![10i64, 30, 50]; // list[0], list[2], list[4]
-        let prog = lowered.program_for(&inputs);
-        assert_eq!(clean_interp(&prog, lowered.num_regs), cel);
-        assert_eq!(run_jit(&prog, lowered.num_regs, u32::MAX), cel);
+        // One column per constant-index slot: list[0], list[2], list[4].
+        let (c0, c2, c4) = (vec![10i64], vec![30i64], vec![50i64]);
+        let columns = [Column::Int(&c0), Column::Int(&c2), Column::Int(&c4)];
+        assert_eq!(clean_batch_sum_f(&lowered, &columns, 1), Some(cel));
+        assert_eq!(eval_batch_sum_f(&lowered, &columns, u32::MAX), Some(cel));
     }
 
     #[test]
@@ -317,7 +361,8 @@ mod tests {
         // first-encounter order (no execute — map construction is covered by
         // M3's batch harness).
         let program = Program::compile("account.balance >= txn.amount && !account.frozen").unwrap();
-        let lowered = lower(program.expression()).expect("member-access policy is lowerable");
+        let lowered = lower_typed(program.expression(), &Schema::new())
+            .expect("member-access policy is lowerable");
         let paths: Vec<&str> = lowered.slots.iter().map(|s| s.path.as_str()).collect();
         assert_eq!(paths, ["account.balance", "txn.amount", "account.frozen"]);
     }
@@ -337,60 +382,31 @@ mod tests {
         check("[1, 2, 3].all(x, x < n)", &[("n", Bind::Int(2))]);
     }
 
-    /// Cross-check the columnar batch evaluator. `eval_batch_sum` on both the
-    /// interpreter tier (jit-off) and the compiled tier (jit-on) must equal the
-    /// sum of the stock tree-walker's per-row result, and the jit-on run must
-    /// actually compile the hot loop. `slot_paths` pins the lowering's slot
-    /// order; `rows[i][k]` is slot `k`'s value in row `i` (int/bool as `i64`).
-    /// This exercises the real throughput path — each column is read at the red
-    /// row index via `raw_load`, not baked as a per-row constant.
+    /// Cross-check the columnar batch evaluator over ROW-MAJOR test data:
+    /// `slot_paths` pins the lowering's slot order and `rows[i][k]` is slot
+    /// `k`'s value in row `i` (int/bool as `i64`). Transposes into columns and
+    /// delegates to [`check_batch_f`], so it inherits the full three-tier
+    /// bit-exact contract. `bool_slots` marks which columns the tree-walker must
+    /// see as real `bool`s — on the machine they are `0`/`1` in the int bank
+    /// either way.
     fn check_batch(expr_src: &str, slot_paths: &[&str], bool_slots: &[bool], rows: &[Vec<i64>]) {
-        let program =
-            Program::compile(expr_src).unwrap_or_else(|e| panic!("parse `{expr_src}`: {e:?}"));
-        let lowered =
-            lower(program.expression()).unwrap_or_else(|e| panic!("lower `{expr_src}`: {e}"));
-        let paths: Vec<&str> = lowered.slots.iter().map(|s| s.path.as_str()).collect();
-        assert_eq!(paths, slot_paths, "slot order for `{expr_src}`");
-
-        // Oracle: sum the stock tree-walker's per-row result.
-        let mut expected = 0i64;
-        for row in rows {
-            let mut ctx = Context::default();
-            for ((name, &v), &is_bool) in slot_paths.iter().zip(row).zip(bool_slots) {
-                if is_bool {
-                    ctx.add_variable_from_value(*name, v != 0);
-                } else {
-                    ctx.add_variable_from_value(*name, v);
-                }
-            }
-            expected += match program
-                .execute(&ctx)
-                .unwrap_or_else(|e| panic!("execute `{expr_src}`: {e:?}"))
-            {
-                Value::Bool(b) => b as i64,
-                Value::Int(i) => i,
-                other => panic!("`{expr_src}`: unexpected {other:?}"),
-            };
-        }
-
-        // Transpose rows into per-slot i64 columns.
-        let columns: Vec<Vec<i64>> = (0..slot_paths.len())
-            .map(|k| rows.iter().map(|r| r[k]).collect())
+        let cols: Vec<(&str, ColData)> = slot_paths
+            .iter()
+            .zip(bool_slots)
+            .enumerate()
+            .map(|(k, (name, &is_bool))| {
+                let c: Vec<i64> = rows.iter().map(|r| r[k]).collect();
+                (
+                    *name,
+                    if is_bool {
+                        ColData::Bool(c)
+                    } else {
+                        ColData::Int(c)
+                    },
+                )
+            })
             .collect();
-        let col_refs: Vec<&[i64]> = columns.iter().map(|c| c.as_slice()).collect();
-
-        let off = eval_batch_sum(&lowered, &col_refs, u32::MAX);
-        assert_eq!(off, expected, "batch jit-off vs stock for `{expr_src}`");
-        // Assert the compile counter *increased* across the jit-on run rather
-        // than resetting it to 0 first: the counter is a shared global, so a
-        // concurrent batch test's reset could otherwise mask a real compile.
-        let before = COMPILES.load(Ordering::Relaxed);
-        let on = eval_batch_sum(&lowered, &col_refs, 8);
-        assert_eq!(on, expected, "batch jit-on vs stock for `{expr_src}`");
-        assert!(
-            COMPILES.load(Ordering::Relaxed) > before,
-            "batch `{expr_src}` must compile the hot loop"
-        );
+        check_batch_f(expr_src, &cols);
     }
 
     /// Deterministic per-row column data: an LCG mapped into `[lo, hi]` per slot.
@@ -533,6 +549,11 @@ mod tests {
     /// its data so the test keeps the buffers alive.
     enum ColData {
         Int(Vec<i64>),
+        /// A `bool` column, stored as `0`/`1`. Identical to [`ColData::Int`] on
+        /// the machine (bools live in the int bank as `0`/`1`); the difference
+        /// is the ORACLE, which must bind a real `Value::Bool` or the
+        /// tree-walker would see an int where CEL declares a bool.
+        Bool(Vec<i64>),
         UInt(Vec<i64>),
         Float(Vec<f64>),
         /// A string column. Interned to an `i64` content-hash column
@@ -553,6 +574,7 @@ mod tests {
         fn len(&self) -> usize {
             match self {
                 ColData::Int(c)
+                | ColData::Bool(c)
                 | ColData::UInt(c)
                 | ColData::Timestamp(c)
                 | ColData::Duration(c) => c.len(),
@@ -562,7 +584,7 @@ mod tests {
         }
         fn ty(&self) -> ValType {
             match self {
-                ColData::Int(_) => ValType::Int,
+                ColData::Int(_) | ColData::Bool(_) => ValType::Int,
                 ColData::UInt(_) => ValType::UInt,
                 ColData::Float(_) => ValType::Float,
                 ColData::Str(_) => ValType::Str,
@@ -573,6 +595,7 @@ mod tests {
         fn column(&self) -> Column<'_> {
             match self {
                 ColData::Int(c)
+                | ColData::Bool(c)
                 | ColData::UInt(c)
                 | ColData::Timestamp(c)
                 | ColData::Duration(c) => Column::Int(c),
@@ -653,6 +676,7 @@ mod tests {
     fn cell_value(d: &ColData, k: usize) -> Value {
         match d {
             ColData::Int(c) => Value::Int(c[k]),
+            ColData::Bool(c) => Value::Bool(c[k] != 0),
             ColData::UInt(c) => Value::UInt(c[k] as u64),
             ColData::Float(c) => Value::Float(c[k]),
             ColData::Str(c) => Value::String(std::sync::Arc::new(c[k].clone())),
@@ -823,22 +847,7 @@ mod tests {
         for i in 0..n {
             let mut ctx = Context::default();
             for (name, d) in cols {
-                match d {
-                    ColData::Int(c) => ctx.add_variable_from_value(*name, c[i]),
-                    ColData::UInt(c) => ctx.add_variable_from_value(*name, c[i] as u64),
-                    ColData::Float(c) => ctx.add_variable_from_value(*name, c[i]),
-                    ColData::Str(c) => ctx.add_variable_from_value(*name, c[i].clone()),
-                    ColData::Timestamp(c) => ctx.add_variable_from_value(
-                        *name,
-                        Value::Timestamp(
-                            chrono::DateTime::from_timestamp_nanos(c[i]).fixed_offset(),
-                        ),
-                    ),
-                    ColData::Duration(c) => ctx.add_variable_from_value(
-                        *name,
-                        Value::Duration(chrono::Duration::nanoseconds(c[i])),
-                    ),
-                }
+                ctx.add_variable_from_value(*name, cell_value(d, i));
             }
             expected += match program
                 .execute(&ctx)
@@ -1012,22 +1021,7 @@ mod tests {
         for i in 0..n {
             let mut ctx = Context::default();
             for (name, d) in cols {
-                match d {
-                    ColData::Int(c) => ctx.add_variable_from_value(*name, c[i]),
-                    ColData::UInt(c) => ctx.add_variable_from_value(*name, c[i] as u64),
-                    ColData::Float(c) => ctx.add_variable_from_value(*name, c[i]),
-                    ColData::Str(c) => ctx.add_variable_from_value(*name, c[i].clone()),
-                    ColData::Timestamp(c) => ctx.add_variable_from_value(
-                        *name,
-                        Value::Timestamp(
-                            chrono::DateTime::from_timestamp_nanos(c[i]).fixed_offset(),
-                        ),
-                    ),
-                    ColData::Duration(c) => ctx.add_variable_from_value(
-                        *name,
-                        Value::Duration(chrono::Duration::nanoseconds(c[i])),
-                    ),
-                }
+                ctx.add_variable_from_value(*name, cell_value(d, i));
             }
             expected += match program
                 .execute(&ctx)
@@ -2351,8 +2345,11 @@ mod tests {
 
     #[test]
     fn out_of_subset_bails() {
-        // list-returning / string / double / member-fn / list-valued
-        // comprehension (`map` builds a list) all fall back to the tree-walker.
+        // list-returning / string-arith / member-fn on a non-string column /
+        // mixed int-float arithmetic / list-valued comprehension (`map` builds a
+        // list) / comprehension over a non-list column all fall back to the
+        // tree-walker. Every path is undeclared here, so the schema is empty and
+        // each slot defaults to the int bank.
         for expr in [
             "[1, 2, 3]",
             "'a' + 'b'",
@@ -2364,7 +2361,7 @@ mod tests {
         ] {
             let program = Program::compile(expr).unwrap();
             assert!(
-                lower(program.expression()).is_err(),
+                lower_typed(program.expression(), &Schema::new()).is_err(),
                 "`{expr}` must be rejected as out of subset"
             );
         }
