@@ -398,6 +398,15 @@ pub struct SlotInfoF {
     pub reg: usize,
 }
 
+/// Int register reserved for the overflow trap flag of the two-bank machine
+/// (see [`OP_ADD_OVF`]). Fixed at 0 and allocated before any body register, so
+/// the overflow-checked arithmetic ops can name it while the body is still
+/// being emitted — the flag's *address* is only chosen by the batch driver at
+/// run time, which is too late for an immediate operand. The batch builder
+/// zeroes it in the setup and publishes it with [`OP_TRAP_STORE`] after the
+/// loop.
+pub const OVF_FLAG_REG: usize = 0;
+
 /// A CEL expression compiled to two-bank bytecode. The result is an int
 /// register (a bool/count/int-sum) or a float register (a float total), tracked
 /// by [`LoweredF::result_bank`]. [`LoweredF::batch_sum_program`] prepends the
@@ -449,7 +458,25 @@ impl LoweredF {
     /// register (never a scalar state field, which would trip
     /// `VirtualStatesCantMatch` at loop close). The back-edge is a do-while, so
     /// callers must pass `n >= 1`.
+    /// [`LoweredF::batch_sum_program_trapping`] without an overflow trap word:
+    /// the program still guards its `int` arithmetic, but nothing publishes the
+    /// flag, so the caller **cannot tell** an overflowed row from a good one.
+    /// Only for harnesses whose data is bounded by construction; the evaluator
+    /// path ([`super::bytecode::eval_batch_sum_f`]) always passes a trap word.
     pub fn batch_sum_program(&self, bases: &[i64], n: i64) -> (Vec<i64>, usize, usize) {
+        self.batch_sum_program_trapping(bases, n, 0)
+    }
+
+    /// As [`LoweredF::batch_sum_program`], but `trap_addr` is the address of a
+    /// caller-owned `i64` the epilogue writes the overflow flag to (see
+    /// [`OP_TRAP_STORE`]). A zero address means "no trap word" and suppresses
+    /// the store.
+    pub fn batch_sum_program_trapping(
+        &self,
+        bases: &[i64],
+        n: i64,
+        trap_addr: i64,
+    ) -> (Vec<i64>, usize, usize) {
         assert_eq!(
             bases.len(),
             self.slots.len(),
@@ -460,7 +487,8 @@ impl LoweredF {
         assert!(n >= 1, "batch_sum_program: n must be >= 1 (do-while back-edge)");
         let m = self.num_int_regs; // first int machinery register
         let (r_i, r_acc, r_n, r_one, r_stride, r_ea) = (m, m + 1, m + 2, m + 3, m + 4, m + 5);
-        let r_base0 = m + 6;
+        let r_trap = m + 6;
+        let r_base0 = m + 7;
         let total_int_regs = r_base0 + self.slots.len();
         // A float result accumulates into a float register above the body's
         // float bank; an int result uses the int `r_acc` and leaves the float
@@ -485,6 +513,11 @@ impl LoweredF {
         load_const(&mut p, n, r_n);
         load_const(&mut p, 1, r_one);
         load_const(&mut p, 8, r_stride);
+        // Overflow trap: the flag starts clear, its destination address is a
+        // loop-invariant pointer in a register (the same shape as the column
+        // bases), and the epilogue publishes it once the loop is done.
+        load_const(&mut p, 0, OVF_FLAG_REG);
+        load_const(&mut p, trap_addr, r_trap);
         for (k, &base) in bases.iter().enumerate() {
             load_const(&mut p, base, r_base0 + k);
         }
@@ -517,6 +550,11 @@ impl LoweredF {
         }
         p.extend_from_slice(&[OP_ADD, r_i as i64, r_one as i64, r_i as i64]);
         p.extend_from_slice(&[OP_JUMP_IF_ABOVE, r_n as i64, r_i as i64, body_pc as i64]);
+        // Publish the overflow flag. Outside the loop, so it costs the traced
+        // body nothing and runs once when the back-edge guard finally exits.
+        if trap_addr != 0 {
+            p.extend_from_slice(&[OP_TRAP_STORE, r_trap as i64, OVF_FLAG_REG as i64]);
+        }
         match self.result_bank {
             ValType::Int | ValType::UInt | ValType::Str | ValType::Timestamp | ValType::Duration => p.extend_from_slice(&[OP_RETURN, r_acc as i64]),
             ValType::Float => p.extend_from_slice(&[OP_RETURN_F, f_acc as i64]),
@@ -583,7 +621,9 @@ pub fn lower_typed(expr: &IdedExpr, schema: &Schema) -> Result<LoweredF, LowerEr
     let mut ctx = LowerCtxF {
         prelude: Vec::new(),
         body: Vec::new(),
-        next_int: 0,
+        // Register 0 is reserved for the overflow trap flag; body allocation
+        // starts above it.
+        next_int: OVF_FLAG_REG + 1,
         next_float: 0,
         slots: Vec::new(),
         slot_map: HashMap::new(),
@@ -1278,10 +1318,18 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
     }
 
     // arithmetic — same-bank operands, same-bank result. No float modulo.
+    //
+    // `+ - *` on `int` are OVERFLOW-CHECKED in the tree-walker
+    // (`common/types/int.rs:79-187` uses `checked_add`/`checked_sub`/
+    // `checked_mul` and raises `ExecutionError::Overflow`), so they lower to the
+    // fused `OP_*_OVF` form — `Int*Ovf` + `GuardNoOverflow` in the trace, the
+    // PyPy `int_add_ovf` shape — not to the plain wrapping ops. Plain `OP_ADD`/
+    // `OP_MUL` stay reserved for the batch machinery's own counters and offsets
+    // and for the calendar helpers, whose operands are bounded by construction.
     let arith = match name {
-        ops::ADD => Some((OP_ADD, Some(OP_FADD))),
-        ops::SUBSTRACT => Some((OP_SUB, Some(OP_FSUB))),
-        ops::MULTIPLY => Some((OP_MUL, Some(OP_FMUL))),
+        ops::ADD => Some((OP_ADD_OVF, Some(OP_FADD))),
+        ops::SUBSTRACT => Some((OP_SUB_OVF, Some(OP_FSUB))),
+        ops::MULTIPLY => Some((OP_MUL_OVF, Some(OP_FMUL))),
         ops::DIVIDE => Some((OP_DIV, Some(OP_FDIV))),
         ops::MODULO => Some((OP_MOD, None)),
         _ => None,
@@ -1292,23 +1340,37 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
         }
         let a = compile_t(ctx, &call.args[0])?;
         let b = compile_t(ctx, &call.args[1])?;
+        let is_ovf_checked = iop == OP_ADD_OVF || iop == OP_SUB_OVF || iop == OP_MUL_OVF;
         match (a.bank, b.bank) {
             (ValType::Int, ValType::Int) => {
                 let d = ctx.fresh(ValType::Int);
-                ctx.body
-                    .extend_from_slice(&[iop, a.idx as i64, b.idx as i64, d.idx as i64]);
+                if is_ovf_checked {
+                    ctx.body.extend_from_slice(&[
+                        iop,
+                        a.idx as i64,
+                        b.idx as i64,
+                        d.idx as i64,
+                        OVF_FLAG_REG as i64,
+                    ]);
+                } else {
+                    ctx.body
+                        .extend_from_slice(&[iop, a.idx as i64, b.idx as i64, d.idx as i64]);
+                }
                 Ok(d)
             }
             (ValType::UInt, ValType::UInt) => {
-                // add/sub/mul are bit-identical to the signed ops (mod 2^64);
-                // division/modulo need unsigned opcodes the trace IR lacks.
-                if name == ops::DIVIDE || name == ops::MODULO {
-                    return Err(LowerError::unsupported("uint division/modulo"));
-                }
-                let d = ctx.fresh(ValType::UInt);
-                ctx.body
-                    .extend_from_slice(&[iop, a.idx as i64, b.idx as i64, d.idx as i64]);
-                Ok(d)
+                // uint arithmetic is checked against the UNSIGNED bounds
+                // (`common/types/uint.rs:78-196` uses `u64::checked_*`), which
+                // the signed `Int*Ovf` guard does not answer: `2^63 + 1` is fine
+                // unsigned and overflows signed, and `0u - 1u` is the reverse.
+                // The trace IR has no unsigned overflow op, and detecting
+                // unsigned `*` overflow by hand needs a division — so the whole
+                // group bails rather than wrap silently. Division/modulo bail
+                // for the same missing-unsigned-opcode reason.
+                let _ = fop;
+                Err(LowerError::unsupported(
+                    "uint arithmetic (no unsigned overflow/division opcodes)",
+                ))
             }
             (ValType::Float, ValType::Float) => {
                 let fop = fop.ok_or_else(|| LowerError::unsupported("float modulo"))?;

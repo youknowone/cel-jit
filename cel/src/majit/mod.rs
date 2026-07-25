@@ -151,31 +151,46 @@ mod tests {
     /// virtualizable `[int; virt]` regs. This mid-body guard is the first on
     /// this machine to land in vable-array resume territory; before the
     /// deopt-time vinfo seed + `token_offset==0` inert token-clear it panicked.
-    /// The wrapped result must match the oracle.
+    /// The wrapped result must match the oracle — and the resume must RECORD the
+    /// overflow in the trap register, which `OP_TRAP_STORE` then publishes: that
+    /// write is what lets the batch driver refuse to answer where the
+    /// tree-walker raises.
     #[test]
     fn overflow_deopt_on_compiled_trace() {
-        use super::bytecode::{OP_ADD, OP_ADD_OVF, OP_JUMP_IF_ABOVE, OP_LOAD_CONST, OP_RETURN};
-        // regs: i=0, n=1, acc=2, inc=3, one=4. `inc = MAX/4` makes `acc` overflow
-        // a handful of iterations in — after the threshold-3 loop has compiled,
-        // so the overflow guard fails in the compiled trace.
+        use super::bytecode::{
+            OP_ADD, OP_ADD_OVF, OP_JUMP_IF_ABOVE, OP_LOAD_CONST, OP_RETURN, OP_TRAP_STORE,
+        };
+        // regs: i=0, n=1, acc=2, inc=3, one=4, trap_flag=5, trap_addr=6.
+        // `inc = MAX/4` makes `acc` overflow a handful of iterations in — after
+        // the threshold-3 loop has compiled, so the overflow guard fails in the
+        // compiled trace.
         let n: i64 = 30;
         let inc: i64 = i64::MAX / 4;
+        let mut trap: Box<i64> = Box::new(0);
+        let trap_addr = (&mut *trap) as *mut i64 as i64;
         let prog: Vec<i64> = vec![
             OP_LOAD_CONST, 0, 0,
             OP_LOAD_CONST, n, 1,
             OP_LOAD_CONST, 0, 2,
             OP_LOAD_CONST, inc, 3,
             OP_LOAD_CONST, 1, 4,
-            // loop_start @ pc = 15
-            OP_ADD_OVF, 2, 3, 2,        // acc = ovfchecked(acc + inc)
+            OP_LOAD_CONST, 0, 5,
+            OP_LOAD_CONST, trap_addr, 6,
+            // loop_start @ pc = 21
+            OP_ADD_OVF, 2, 3, 2, 5,     // acc = ovfchecked(acc + inc), trap -> r5
             OP_ADD, 0, 4, 0,            // i = i + 1
-            OP_JUMP_IF_ABOVE, 1, 0, 15, // while n > i
+            OP_JUMP_IF_ABOVE, 1, 0, 21, // while n > i
+            OP_TRAP_STORE, 6, 5,        // *trap_addr = trap_flag
             OP_RETURN, 2,
         ];
         let before = COMPILES.load(Ordering::Relaxed);
-        let jit = run_jit(&prog, 5, 3);
-        let clean = clean_interp(&prog, 5);
+        let jit = run_jit(&prog, 7, 3);
+        let jit_trap = *trap;
+        *trap = 0;
+        let clean = clean_interp(&prog, 7);
         assert_eq!(jit, clean, "compiled-tier overflow deopt must match wrapping oracle");
+        assert_eq!(jit_trap, 1, "the compiled tier's overflow deopt must set the trap flag");
+        assert_eq!(*trap, 1, "the reference tier must set the trap flag too");
         assert!(
             COMPILES.load(Ordering::Relaxed) > before,
             "loop must tier-compile so the overflow lands in the compiled trace",
@@ -589,13 +604,37 @@ mod tests {
             .collect()
     }
 
+    /// Run the clean two-bank interpreter over a freshly built batch program.
+    /// Returns `None` on an int-arithmetic overflow, the same contract as
+    /// [`super::bytecode::eval_batch_sum_f`], so all three tiers are compared on
+    /// equal terms — a tier that silently wrapped where another trapped would
+    /// show up as a `Some`/`None` mismatch, not as a plausible wrong number.
+    fn clean_batch_sum_f(
+        lowered: &super::lower::LoweredF,
+        columns: &[Column],
+        n: usize,
+    ) -> Option<i64> {
+        use super::bytecode::float_bank::clean_interp_f;
+        let bases: Vec<i64> = columns.iter().map(|c| c.base()).collect();
+        let mut trap: Box<i64> = Box::new(0);
+        let trap_addr = (&mut *trap) as *mut i64 as i64;
+        let (prog, ni, nf) = lowered.batch_sum_program_trapping(&bases, n as i64, trap_addr);
+        let out = clean_interp_f(&prog, ni, nf);
+        core::hint::black_box(columns);
+        if *trap != 0 {
+            None
+        } else {
+            Some(out)
+        }
+    }
+
     /// Cross-check the typed (two-bank) columnar batch evaluator. The schema is
     /// read off `cols` (int vs `double`), which also pins the lowering's slot
     /// order. The clean two-bank interpreter, the majit interpreter tier, and
     /// the compiled tier must all equal the stock tree-walker's per-row sum, and
     /// the compiled run must actually trace the hot loop.
     fn check_batch_f(expr_src: &str, cols: &[(&str, ColData)]) {
-        use super::bytecode::float_bank::{clean_interp_f, COMPILES as COMPILES_F};
+        use super::bytecode::float_bank::COMPILES as COMPILES_F;
 
         let program =
             Program::compile(expr_src).unwrap_or_else(|e| panic!("parse `{expr_src}`: {e:?}"));
@@ -651,20 +690,21 @@ mod tests {
         let columns: Vec<Column> = cols.iter().map(|(_, d)| d.column()).collect();
 
         // Clean two-bank interpreter over the built batch program.
-        let bases: Vec<i64> = columns.iter().map(|c| c.base()).collect();
-        let (prog, ni, nf) = lowered.batch_sum_program(&bases, n as i64);
-        assert_eq!(clean_interp_f(&prog, ni, nf), expected, "clean vs stock for `{expr_src}`");
-        core::hint::black_box(&columns);
+        assert_eq!(
+            clean_batch_sum_f(&lowered, &columns, n),
+            Some(expected),
+            "clean vs stock for `{expr_src}`"
+        );
 
         // majit interpreter tier, then compiled tier. The compile counter is a
         // shared, monotonic global; asserting it *increased* across the jit-on
         // run (rather than resetting it to 0 first) is robust to other float
         // tests compiling concurrently.
         let off = eval_batch_sum_f(&lowered, &columns, u32::MAX);
-        assert_eq!(off, expected, "batch jit-off vs stock for `{expr_src}`");
+        assert_eq!(off, Some(expected), "batch jit-off vs stock for `{expr_src}`");
         let before = COMPILES_F.load(Ordering::Relaxed);
         let on = eval_batch_sum_f(&lowered, &columns, 8);
-        assert_eq!(on, expected, "batch jit-on vs stock for `{expr_src}`");
+        assert_eq!(on, Some(expected), "batch jit-on vs stock for `{expr_src}`");
         assert!(
             COMPILES_F.load(Ordering::Relaxed) > before,
             "float batch `{expr_src}` must compile the hot loop"
@@ -678,7 +718,7 @@ mod tests {
     /// compare bits, never a tolerance). The compiled run must trace the loop.
     fn check_batch_float(expr_src: &str, cols: &[(&str, ColData)]) {
         use super::bytecode::eval_batch_sum_float;
-        use super::bytecode::float_bank::{clean_interp_f, COMPILES as COMPILES_F};
+        use super::bytecode::float_bank::COMPILES as COMPILES_F;
 
         let program =
             Program::compile(expr_src).unwrap_or_else(|e| panic!("parse `{expr_src}`: {e:?}"));
@@ -738,17 +778,18 @@ mod tests {
         let columns: Vec<Column> = cols.iter().map(|(_, d)| d.column()).collect();
 
         // Clean two-bank interpreter over the built batch program.
-        let bases: Vec<i64> = columns.iter().map(|c| c.base()).collect();
-        let (prog, ni, nf) = lowered.batch_sum_program(&bases, n as i64);
-        let clean = f64::from_bits(clean_interp_f(&prog, ni, nf) as u64);
+        let clean = clean_batch_sum_f(&lowered, &columns, n)
+            .map(|bits| f64::from_bits(bits as u64))
+            .unwrap_or_else(|| panic!("clean tier trapped on `{expr_src}`"));
         assert_eq!(clean.to_bits(), expected.to_bits(), "clean vs stock for `{expr_src}`");
-        core::hint::black_box(&columns);
 
         // majit interpreter tier, then compiled tier (monotonic compile-counter).
-        let off = eval_batch_sum_float(&lowered, &columns, u32::MAX);
+        let off = eval_batch_sum_float(&lowered, &columns, u32::MAX)
+            .unwrap_or_else(|| panic!("jit-off tier trapped on `{expr_src}`"));
         assert_eq!(off.to_bits(), expected.to_bits(), "batch jit-off vs stock for `{expr_src}`");
         let before = COMPILES_F.load(Ordering::Relaxed);
-        let on = eval_batch_sum_float(&lowered, &columns, 8);
+        let on = eval_batch_sum_float(&lowered, &columns, 8)
+            .unwrap_or_else(|| panic!("jit-on tier trapped on `{expr_src}`"));
         assert_eq!(on.to_bits(), expected.to_bits(), "batch jit-on vs stock for `{expr_src}`");
         assert!(
             COMPILES_F.load(Ordering::Relaxed) > before,
@@ -777,7 +818,7 @@ mod tests {
     /// the stock tree-walker's per-row bool/int sum, and the compiled run must
     /// trace the loop.
     fn check_batch_str(expr_src: &str, cols: &[(&str, ColData)]) {
-        use super::bytecode::float_bank::{clean_interp_f, COMPILES as COMPILES_F};
+        use super::bytecode::float_bank::COMPILES as COMPILES_F;
         use super::lower::intern_hash;
 
         let program =
@@ -879,18 +920,19 @@ mod tests {
         }
 
         // Clean two-bank interpreter over the built batch program.
-        let bases: Vec<i64> = columns.iter().map(|c| c.base()).collect();
-        let (prog, ni, nf) = lowered.batch_sum_program(&bases, n as i64);
-        assert_eq!(clean_interp_f(&prog, ni, nf), expected, "clean vs stock for `{expr_src}`");
-        core::hint::black_box(&columns);
+        assert_eq!(
+            clean_batch_sum_f(&lowered, &columns, n),
+            Some(expected),
+            "clean vs stock for `{expr_src}`"
+        );
         core::hint::black_box(&id_storage);
 
         // majit interpreter tier, then compiled tier (monotonic compile counter).
         let off = eval_batch_sum_f(&lowered, &columns, u32::MAX);
-        assert_eq!(off, expected, "batch jit-off vs stock for `{expr_src}`");
+        assert_eq!(off, Some(expected), "batch jit-off vs stock for `{expr_src}`");
         let before = COMPILES_F.load(Ordering::Relaxed);
         let on = eval_batch_sum_f(&lowered, &columns, 8);
-        assert_eq!(on, expected, "batch jit-on vs stock for `{expr_src}`");
+        assert_eq!(on, Some(expected), "batch jit-on vs stock for `{expr_src}`");
         assert!(
             COMPILES_F.load(Ordering::Relaxed) > before,
             "string batch `{expr_src}` must compile the hot loop"
@@ -1397,38 +1439,125 @@ mod tests {
         }
     }
 
+    /// The overflow contract, end to end: on a batch where some row's `int`
+    /// arithmetic overflows, the tree-walker RAISES, so no sum is a correct
+    /// answer and every tier must refuse to produce one.
+    ///
+    /// This is the batch transposition of PyPy's `int_add_ovf` +
+    /// `guard_no_overflow`: the guard exits the compiled trace, the blackhole
+    /// resumes into the `None` arm, that arm records the event, and the driver
+    /// turns the record into "no result — use the tree-walker", which is what
+    /// actually raises. The rows are chosen so the overflow appears LATE, well
+    /// after the loop has tier-compiled, so the refusal comes from a guard
+    /// failing inside compiled code and not merely from the interpreter tier.
     #[test]
-    fn batch_uint_arith() {
-        // uint add/mul reuse the signed opcodes (bit-identical mod 2^64). Bounded
-        // operands keep the tree-walker's checked arithmetic from overflowing, so
-        // the wrapping VM result matches; the uint result then feeds an unsigned
-        // compare.
+    fn batch_int_overflow_refuses() {
+        use super::bytecode::float_bank::COMPILES as COMPILES_F;
         let n = 3000;
-        let a = gen_i64(n, 0x1122_3344_5566_7788, 0, 1000);
-        let b = gen_i64(n, 0x8877_6655_4433_2211, 0, 1000);
-        check_batch_f(
-            "a + b >= 1500u",
-            &[("a", ColData::UInt(a.clone())), ("b", ColData::UInt(b.clone()))],
-        );
-        check_batch_f(
-            "a * b < 250000u",
-            &[("a", ColData::UInt(a)), ("b", ColData::UInt(b))],
-        );
+        let base_a = gen_i64(n, 0x3141_5926_5358_9793, 1, 1000);
+        let base_b = gen_i64(n, 0x2718_2818_2845_9045, 1, 1000);
+
+        let schema: Schema =
+            [("a".to_string(), ValType::Int), ("b".to_string(), ValType::Int)]
+                .into_iter()
+                .collect();
+        // Bounded rows everywhere except the tail, whose operands are picked to
+        // overflow the operator under test (`a - b` needs a huge NEGATIVE `a`,
+        // which the `a + b` pair would not produce).
+        for (expr, tail_a, tail_b) in [
+            ("a + b", i64::MAX - 1, i64::MAX - 1),
+            ("a - b", i64::MIN + 1, i64::MAX - 1),
+            ("a * b", i64::MAX / 2, 3),
+        ] {
+            let mut a = base_a.clone();
+            let mut b = base_b.clone();
+            a[n - 1] = tail_a;
+            b[n - 1] = tail_b;
+            let program = Program::compile(expr).unwrap();
+            let lowered = lower_typed(program.expression(), &schema)
+                .unwrap_or_else(|e| panic!("lower_typed `{expr}`: {e}"));
+
+            // The oracle really does raise on the offending row — without this
+            // the test would be asserting a refusal nobody asked for.
+            let mut ctx = Context::default();
+            ctx.add_variable_from_value("a", a[n - 1]);
+            ctx.add_variable_from_value("b", b[n - 1]);
+            assert!(
+                program.execute(&ctx).is_err(),
+                "`{expr}` must overflow the tree-walker on the tail row"
+            );
+
+            let data = [ColData::Int(a.clone()), ColData::Int(b.clone())];
+            let columns: Vec<Column> = data.iter().map(|d| d.column()).collect();
+            assert_eq!(
+                clean_batch_sum_f(&lowered, &columns, n),
+                None,
+                "clean tier must refuse `{expr}`"
+            );
+            assert_eq!(
+                eval_batch_sum_f(&lowered, &columns, u32::MAX),
+                None,
+                "jit-off tier must refuse `{expr}`"
+            );
+            let before = COMPILES_F.load(Ordering::Relaxed);
+            assert_eq!(
+                eval_batch_sum_f(&lowered, &columns, 8),
+                None,
+                "jit-on tier must refuse `{expr}`"
+            );
+            assert!(
+                COMPILES_F.load(Ordering::Relaxed) > before,
+                "`{expr}` must tier-compile so the refusal comes from a compiled guard"
+            );
+        }
+    }
+
+    /// The flip side: a batch whose rows all stay in range must still answer.
+    /// `OP_*_OVF` replaced the plain wrapping ops on every user `+ - *`, so this
+    /// pins that the guard is free when it does not fire.
+    #[test]
+    fn batch_int_arith_in_range_still_answers() {
+        let n = 3000;
+        let a = gen_i64(n, 0x0bad_c0de_dead_beef, -1_000_000, 1_000_000);
+        let b = gen_i64(n, 0x00c0_ffee_0bad_f00d, -1_000_000, 1_000_000);
+        for expr in ["a + b", "a - b", "a * b", "a * b + a - b"] {
+            check_batch_f(
+                expr,
+                &[("a", ColData::Int(a.clone())), ("b", ColData::Int(b.clone()))],
+            );
+        }
     }
 
     #[test]
-    fn uint_div_mod_bails() {
-        // uint division / modulo need unsigned opcodes the trace IR lacks, so the
-        // typed lowering bails and the tree-walker handles them.
+    fn uint_arith_bails() {
+        // Every uint arithmetic operator bails; only comparisons lower.
+        //
+        // `+ - *` USED to reuse the signed opcodes on the grounds that they are
+        // bit-identical mod 2^64 — true of the value, false of the CHECK. The
+        // tree-walker uses `u64::checked_*` (`common/types/uint.rs:78-196`) and
+        // raises on unsigned overflow, which the signed `Int*Ovf` guard answers
+        // wrongly in both directions: `2^63 + 1` is fine unsigned but overflows
+        // signed, and `0u - 1u` is the reverse. The trace IR has no unsigned
+        // overflow opcode (and detecting unsigned `*` overflow by hand needs a
+        // division), so the whole group falls back rather than wrap silently.
+        //
+        // `/ %` bail for the neighbouring reason: no unsigned floordiv/mod
+        // opcode. Both wait on the same parent majit-macros addition.
         let schema: Schema =
             [("a".to_string(), ValType::UInt), ("b".to_string(), ValType::UInt)]
                 .into_iter()
                 .collect();
-        for expr in ["a / b >= 1u", "a % b >= 1u"] {
+        for expr in [
+            "a + b >= 1500u",
+            "a - b >= 1500u",
+            "a * b < 250000u",
+            "a / b >= 1u",
+            "a % b >= 1u",
+        ] {
             let program = Program::compile(expr).unwrap();
             assert!(
                 lower_typed(program.expression(), &schema).is_err(),
-                "`{expr}` must bail the typed lowering (uint div/mod)"
+                "`{expr}` must bail the typed lowering (no unsigned arithmetic opcodes)"
             );
         }
     }

@@ -72,9 +72,21 @@ pub const OP_ULE: i64 = 39; // [a, b, dst]              regs[dst] = ((regs[a] as
 // expression: the no-overflow path is a fused `int_*_jump_if_ovf` (traced to
 // `Int*Ovf` + `GuardNoOverflow`); on overflow the guard deopts into the None
 // arm, which the blackhole runs on the virtualizable resume path.
-pub const OP_ADD_OVF: i64 = 40; // [a, b, dst]          regs[dst] = ovfchecked(a + b)
-pub const OP_SUB_OVF: i64 = 41; // [a, b, dst]          regs[dst] = ovfchecked(a - b)
-pub const OP_MUL_OVF: i64 = 42; // [a, b, dst]          regs[dst] = ovfchecked(a * b)
+//
+// The tree-walker RAISES `ExecutionError::Overflow` on these, so a wrapped
+// result is not an answer — the None arm records the event in `regs[trap]` and
+// the batch driver turns a set flag into "no result, use the tree-walker".
+// `trap` is a plain register, so the write costs nothing on the hot path (it
+// only executes on the guard-exit resume) and needs no memory channel.
+pub const OP_ADD_OVF: i64 = 40; // [a, b, dst, trap]    regs[dst] = ovfchecked(a + b)
+pub const OP_SUB_OVF: i64 = 41; // [a, b, dst, trap]    regs[dst] = ovfchecked(a - b)
+pub const OP_MUL_OVF: i64 = 42; // [a, b, dst, trap]    regs[dst] = ovfchecked(a * b)
+/// Publish the overflow flag to the caller. Emitted **once** in the batch
+/// epilogue (after the loop's back-edge), never in the traced body: the single
+/// i64 a mainloop returns is the accumulated sum, so the flag needs its own
+/// channel out. `regs[addr]` holds the address of a caller-owned i64 word, the
+/// same loop-invariant-pointer-in-a-register shape the column bases use.
+pub const OP_TRAP_STORE: i64 = 43; // [addr, flag]      *(regs[addr]) = regs[flag]
 
 /// Raw native-memory load intrinsic recognized by the `#[jit_interp]` proc
 /// macro (lowered to `raw_load_i`); at the interpreter tier this real fn runs.
@@ -90,6 +102,18 @@ fn majit_raw_load_i64(base: i64, ea: i64) -> i64 {
     // SAFETY: `base + ea` addresses element `ea/8` of a live `&[i64]` column
     // whose length the batch builder guarantees covers every row index.
     unsafe { core::ptr::read_unaligned((base as usize).wrapping_add(ea as usize) as *const i64) }
+}
+
+/// Raw native-memory store intrinsic (`raw_store_i`), the write-side analogue of
+/// [`majit_raw_load_i64`]. Used only by [`OP_TRAP_STORE`] to publish the
+/// overflow flag to the batch driver.
+#[inline]
+fn majit_raw_store_i64(base: i64, ea: i64, val: i64) {
+    // SAFETY: `base + ea` addresses the caller's live `i64` trap word, which the
+    // batch driver keeps alive across the whole run.
+    unsafe {
+        core::ptr::write_unaligned((base as usize).wrapping_add(ea as usize) as *mut i64, val)
+    }
 }
 
 /// Counts hot loops majit compiled — evidence the JIT tier traced + compiled.
@@ -173,34 +197,53 @@ fn run_mainloop(program: &Code, num_regs: usize, threshold: u32) -> i64 {
                 let a = program[pc + 1] as usize;
                 let b = program[pc + 2] as usize;
                 let d = program[pc + 3] as usize;
+                let t = program[pc + 4] as usize;
                 // Overflow-checked user add: the no-overflow path is a fused
                 // `int_add_jump_if_ovf` (traced to `IntAddOvf` + `GuardNoOverflow`);
-                // on overflow the guard deopts into the None arm.
+                // on overflow the guard deopts into the None arm, which records
+                // the event so the caller can fall back to the tree-walker.
                 state.regs[d] = match state.regs[a].checked_add(state.regs[b]) {
                     Some(s) => s,
-                    None => state.regs[a].wrapping_add(state.regs[b]),
+                    None => {
+                        state.regs[t] = 1;
+                        state.regs[a].wrapping_add(state.regs[b])
+                    }
                 };
-                pc += 4;
+                pc += 5;
             }
             OP_SUB_OVF => {
                 let a = program[pc + 1] as usize;
                 let b = program[pc + 2] as usize;
                 let d = program[pc + 3] as usize;
+                let t = program[pc + 4] as usize;
                 state.regs[d] = match state.regs[a].checked_sub(state.regs[b]) {
                     Some(s) => s,
-                    None => state.regs[a].wrapping_sub(state.regs[b]),
+                    None => {
+                        state.regs[t] = 1;
+                        state.regs[a].wrapping_sub(state.regs[b])
+                    }
                 };
-                pc += 4;
+                pc += 5;
             }
             OP_MUL_OVF => {
                 let a = program[pc + 1] as usize;
                 let b = program[pc + 2] as usize;
                 let d = program[pc + 3] as usize;
+                let t = program[pc + 4] as usize;
                 state.regs[d] = match state.regs[a].checked_mul(state.regs[b]) {
                     Some(s) => s,
-                    None => state.regs[a].wrapping_mul(state.regs[b]),
+                    None => {
+                        state.regs[t] = 1;
+                        state.regs[a].wrapping_mul(state.regs[b])
+                    }
                 };
-                pc += 4;
+                pc += 5;
+            }
+            OP_TRAP_STORE => {
+                let addr = program[pc + 1] as usize;
+                let flag = program[pc + 2] as usize;
+                majit_raw_store_i64(state.regs[addr], 0, state.regs[flag]);
+                pc += 3;
             }
             OP_DIV => {
                 let a = state.regs[program[pc + 1] as usize];
@@ -440,11 +483,17 @@ impl Column<'_> {
 /// compiled trace reads each column at the red row index via `raw_load` (base
 /// carried loop-invariant in an int register), int columns as `i64`, float
 /// columns as `f64`. `threshold == u32::MAX` gives the interpreter tier.
+///
+/// Returns `None` when a row's `int` arithmetic OVERFLOWED. The tree-walker
+/// raises `ExecutionError::Overflow` there, so no sum is the right answer; the
+/// caller falls back to the tree-walker, which owns the error. This is the
+/// batch transposition of PyPy's `guard_no_overflow` deopt: the guard exits to
+/// the interpreter, and the interpreter is what raises.
 pub fn eval_batch_sum_f(
     lowered: &super::lower::LoweredF,
     columns: &[Column],
     threshold: u32,
-) -> i64 {
+) -> Option<i64> {
     assert_eq!(
         columns.len(),
         lowered.slots.len(),
@@ -465,15 +514,23 @@ pub fn eval_batch_sum_f(
         assert_eq!(c.len(), n, "eval_batch_sum_f: column {k} length {} != {n}", c.len());
     }
     if n == 0 {
-        return 0;
+        return Some(0);
     }
     let bases: Vec<i64> = columns.iter().map(|c| c.base()).collect();
-    let (prog, num_int, num_float) = lowered.batch_sum_program(&bases, n as i64);
+    // The trap word must outlive the run and must not be aliased by a reference
+    // while the program writes it through the raw pointer baked into `prog`.
+    let mut trap: Box<i64> = Box::new(0);
+    let trap_addr = (&mut *trap) as *mut i64 as i64;
+    let (prog, num_int, num_float) =
+        lowered.batch_sum_program_trapping(&bases, n as i64, trap_addr);
     let result = float_bank::run_jit_f(&prog, num_int, num_float, threshold);
     // The raw pointers in `prog` alias `columns`; keep the borrow live across
     // the run so the buffers cannot be dropped underneath the trace.
     core::hint::black_box(columns);
-    result
+    if *trap != 0 {
+        return None;
+    }
+    Some(result)
 }
 
 /// Columnar batch sum for a **float-valued** lowering: the per-row result is a
@@ -486,13 +543,13 @@ pub fn eval_batch_sum_float(
     lowered: &super::lower::LoweredF,
     columns: &[Column],
     threshold: u32,
-) -> f64 {
+) -> Option<f64> {
     debug_assert_eq!(
         lowered.result_bank,
         super::lower::ValType::Float,
         "eval_batch_sum_float requires a float-valued lowering"
     );
-    f64::from_bits(eval_batch_sum_f(lowered, columns, threshold) as u64)
+    eval_batch_sum_f(lowered, columns, threshold).map(|bits| f64::from_bits(bits as u64))
 }
 
 /// Reference interpreter: a plain `match` over the same bytecode with no majit
@@ -526,22 +583,42 @@ pub fn clean_interp(program: &Code, num_regs: usize) -> i64 {
                     regs[program[pc + 1] as usize] * regs[program[pc + 2] as usize];
                 pc += 4;
             }
-            // The oracle mirrors the fused-ovf None arm (wrapping) so it agrees
-            // with the JIT's overflow deopt result bit-for-bit.
+            // The oracle mirrors the fused-ovf None arm (wrapping value + trap
+            // flag) so it agrees with the JIT's overflow deopt bit-for-bit.
             OP_ADD_OVF => {
-                regs[program[pc + 3] as usize] =
-                    regs[program[pc + 1] as usize].wrapping_add(regs[program[pc + 2] as usize]);
-                pc += 4;
+                let a = regs[program[pc + 1] as usize];
+                let b = regs[program[pc + 2] as usize];
+                if a.checked_add(b).is_none() {
+                    regs[program[pc + 4] as usize] = 1;
+                }
+                regs[program[pc + 3] as usize] = a.wrapping_add(b);
+                pc += 5;
             }
             OP_SUB_OVF => {
-                regs[program[pc + 3] as usize] =
-                    regs[program[pc + 1] as usize].wrapping_sub(regs[program[pc + 2] as usize]);
-                pc += 4;
+                let a = regs[program[pc + 1] as usize];
+                let b = regs[program[pc + 2] as usize];
+                if a.checked_sub(b).is_none() {
+                    regs[program[pc + 4] as usize] = 1;
+                }
+                regs[program[pc + 3] as usize] = a.wrapping_sub(b);
+                pc += 5;
             }
             OP_MUL_OVF => {
-                regs[program[pc + 3] as usize] =
-                    regs[program[pc + 1] as usize].wrapping_mul(regs[program[pc + 2] as usize]);
-                pc += 4;
+                let a = regs[program[pc + 1] as usize];
+                let b = regs[program[pc + 2] as usize];
+                if a.checked_mul(b).is_none() {
+                    regs[program[pc + 4] as usize] = 1;
+                }
+                regs[program[pc + 3] as usize] = a.wrapping_mul(b);
+                pc += 5;
+            }
+            OP_TRAP_STORE => {
+                majit_raw_store_i64(
+                    regs[program[pc + 1] as usize],
+                    0,
+                    regs[program[pc + 2] as usize],
+                );
+                pc += 3;
             }
             OP_DIV => {
                 regs[program[pc + 3] as usize] =
@@ -645,13 +722,25 @@ pub mod float_bank {
     pub static GUARD_FAILS: AtomicUsize = AtomicUsize::new(0);
 
     use super::{
-        OP_ADD, OP_AND, OP_COL_LOAD, OP_COL_LOAD_F, OP_DIV, OP_EQ, OP_FADD, OP_FDIV, OP_FEQ,
-        OP_FGE, OP_FGT, OP_FLE, OP_FLT, OP_FMOV, OP_FMUL, OP_FNE, OP_FNEG, OP_FSUB, OP_GE, OP_GT,
-        OP_I2F, OP_JUMP_IF_ABOVE, OP_LE, OP_LOAD_CONST, OP_LOAD_CONST_F, OP_LT, OP_MOD, OP_MOV,
-        OP_MUL, OP_NE, OP_FSELECT, OP_NEG, OP_NOT, OP_OR, OP_RETURN, OP_RETURN_F, OP_SELECT,
-        OP_SUB, OP_ULE, OP_ULT,
+        OP_ADD, OP_ADD_OVF, OP_AND, OP_COL_LOAD, OP_COL_LOAD_F, OP_DIV, OP_EQ, OP_FADD, OP_FDIV,
+        OP_FEQ, OP_FGE, OP_FGT, OP_FLE, OP_FLT, OP_FMOV, OP_FMUL, OP_FNE, OP_FNEG, OP_FSUB, OP_GE,
+        OP_GT, OP_I2F, OP_JUMP_IF_ABOVE, OP_LE, OP_LOAD_CONST, OP_LOAD_CONST_F, OP_LT, OP_MOD,
+        OP_MOV, OP_MUL, OP_MUL_OVF, OP_NE, OP_FSELECT, OP_NEG, OP_NOT, OP_OR, OP_RETURN,
+        OP_RETURN_F, OP_SELECT, OP_SUB, OP_SUB_OVF, OP_TRAP_STORE, OP_ULE, OP_ULT,
     };
     use core::sync::atomic::Ordering;
+
+    /// Raw native-memory store intrinsic (`raw_store_i`) — see the int-bank
+    /// [`super::majit_raw_store_i64`]. Duplicated here because the `#[jit_interp]`
+    /// macro recognizes the call by name within the traced function's module.
+    #[inline]
+    fn majit_raw_store_i64(base: i64, ea: i64, val: i64) {
+        // SAFETY: `base + ea` addresses the caller's live `i64` trap word, which
+        // the batch driver keeps alive across the whole run.
+        unsafe {
+            core::ptr::write_unaligned((base as usize).wrapping_add(ea as usize) as *mut i64, val)
+        }
+    }
 
     #[inline]
     fn majit_raw_load_f(base: i64, ea: i64) -> f64 {
@@ -763,6 +852,58 @@ pub mod float_bank {
                     let d = program[pc + 3] as usize;
                     state.regs[d] = state.regs[a] * state.regs[b];
                     pc += 4;
+                }
+                OP_ADD_OVF => {
+                    let a = program[pc + 1] as usize;
+                    let b = program[pc + 2] as usize;
+                    let d = program[pc + 3] as usize;
+                    let t = program[pc + 4] as usize;
+                    // Overflow-checked USER add (see the `OP_ADD_OVF` docs): the
+                    // no-overflow path is a fused `int_add_jump_if_ovf`; the None
+                    // arm runs only on the guard-exit resume and records the
+                    // event, which invalidates the whole batch result.
+                    state.regs[d] = match state.regs[a].checked_add(state.regs[b]) {
+                        Some(s) => s,
+                        None => {
+                            state.regs[t] = 1;
+                            state.regs[a].wrapping_add(state.regs[b])
+                        }
+                    };
+                    pc += 5;
+                }
+                OP_SUB_OVF => {
+                    let a = program[pc + 1] as usize;
+                    let b = program[pc + 2] as usize;
+                    let d = program[pc + 3] as usize;
+                    let t = program[pc + 4] as usize;
+                    state.regs[d] = match state.regs[a].checked_sub(state.regs[b]) {
+                        Some(s) => s,
+                        None => {
+                            state.regs[t] = 1;
+                            state.regs[a].wrapping_sub(state.regs[b])
+                        }
+                    };
+                    pc += 5;
+                }
+                OP_MUL_OVF => {
+                    let a = program[pc + 1] as usize;
+                    let b = program[pc + 2] as usize;
+                    let d = program[pc + 3] as usize;
+                    let t = program[pc + 4] as usize;
+                    state.regs[d] = match state.regs[a].checked_mul(state.regs[b]) {
+                        Some(s) => s,
+                        None => {
+                            state.regs[t] = 1;
+                            state.regs[a].wrapping_mul(state.regs[b])
+                        }
+                    };
+                    pc += 5;
+                }
+                OP_TRAP_STORE => {
+                    let addr = program[pc + 1] as usize;
+                    let flag = program[pc + 2] as usize;
+                    majit_raw_store_i64(state.regs[addr], 0, state.regs[flag]);
+                    pc += 3;
                 }
                 OP_DIV => {
                     let a = state.regs[program[pc + 1] as usize];
@@ -1049,6 +1190,44 @@ pub mod float_bank {
                     regs[program[pc + 3] as usize] =
                         regs[program[pc + 1] as usize] * regs[program[pc + 2] as usize];
                     pc += 4;
+                }
+                // The reference tier mirrors the fused-ovf None arm (wrapping
+                // value + trap flag) so it agrees with the JIT's overflow deopt
+                // bit-for-bit.
+                OP_ADD_OVF => {
+                    let a = regs[program[pc + 1] as usize];
+                    let b = regs[program[pc + 2] as usize];
+                    if a.checked_add(b).is_none() {
+                        regs[program[pc + 4] as usize] = 1;
+                    }
+                    regs[program[pc + 3] as usize] = a.wrapping_add(b);
+                    pc += 5;
+                }
+                OP_SUB_OVF => {
+                    let a = regs[program[pc + 1] as usize];
+                    let b = regs[program[pc + 2] as usize];
+                    if a.checked_sub(b).is_none() {
+                        regs[program[pc + 4] as usize] = 1;
+                    }
+                    regs[program[pc + 3] as usize] = a.wrapping_sub(b);
+                    pc += 5;
+                }
+                OP_MUL_OVF => {
+                    let a = regs[program[pc + 1] as usize];
+                    let b = regs[program[pc + 2] as usize];
+                    if a.checked_mul(b).is_none() {
+                        regs[program[pc + 4] as usize] = 1;
+                    }
+                    regs[program[pc + 3] as usize] = a.wrapping_mul(b);
+                    pc += 5;
+                }
+                OP_TRAP_STORE => {
+                    majit_raw_store_i64(
+                        regs[program[pc + 1] as usize],
+                        0,
+                        regs[program[pc + 2] as usize],
+                    );
+                    pc += 3;
                 }
                 OP_DIV => {
                     // The reference tier is plain Rust, whose `/` and `%` already
