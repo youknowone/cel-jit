@@ -233,21 +233,30 @@ fn nested_list_loop_deopt_census() {
 /// | 8, 8, 8, …      | 9    | 0 | 9 |
 /// | 8, 9, 8, 9, …   | 210  | 0 | 50004 / 1 abort |
 /// | 4..12 cycling   | 1609 | 0 | 88888 / 8 aborts |
-/// | 0..32 spread    | ≤ 13000 | — | 165621 / 12 aborts |
+/// | 0..32 spread    | 959  | 4 | 165621 / 12 aborts |
 ///
-/// (`was` = 100k rows before the bridge fix; the counts here are 4000 rows for
-/// the first three.) The exit guard now forms a bridge instead of deopting
-/// forever: `#[jit_interp]` states with a `[.. ; virt]` array never rebuilt
+/// (`was` = 100k rows before the bridge fix; the counts here are 4000 rows.)
+/// The exit guard now forms a bridge instead of deopting forever:
+/// `#[jit_interp]` states with a `[.. ; virt]` array never rebuilt
 /// `virtualizable_boxes` at bridge entry (`pyjitpl.py:3449
 /// rebuild_state_after_failure`), so `__trace_*` aborted on its first statement
 /// — `standard_virtualizable_jitcode_argbox` had nothing to resolve — and every
 /// guard exit fell back to the blackhole.
 ///
-/// The 0..32 spread still deopts: rows whose length exits through the
-/// preamble's copy of the guard hit a vable section whose identity does not
-/// resolve to the live state, and that bridge gives up (`compile.py:725-729`).
-/// It is bounded here rather than pinned exactly because the give-up count
-/// tracks the optimizer's peeling decisions.
+/// The 0..32 spread was bounded at 13000 while the *preamble's* copy of the exit
+/// guard still gave the bridge a vable identity that did not resolve to the live
+/// state (`compile.py:725-729`). That was the `[.. ; virt]` header synthesis:
+/// `extract_live` named the virtualizable once per virt array, so the loop's
+/// entry contract carried 29 boxes with refs at 0 and 2 while a bridge's
+/// contract — decoded from the guard's vable section — carried 26 with a ref
+/// only at 0, and the bridge's JUMP put an int where the preamble guard named
+/// the identity. Carrying the virtualizable as ONE slot
+/// (`warmspot.py:529-538`, `virtualizable.py:139-144`) makes both contracts 26
+/// with a ref only at 0, and the spread drops to 959.
+///
+/// These counts are deterministic for a given majit revision; they are pinned
+/// with a small margin so a regression that reintroduces per-row bailing is
+/// caught rather than absorbed by a loose budget.
 #[test]
 fn nested_list_loop_varying_trip_count() {
     let _serial = serial();
@@ -265,7 +274,7 @@ fn nested_list_loop_varying_trip_count() {
         ("constant 8", |_| 8, 16),
         ("alternating 8/9", |r| if r % 2 == 0 { 8 } else { 9 }, 400),
         ("cycle 4..12", |r| 4 + (r % 9) as i64, 2_000),
-        ("spread 0..32", |r| ((r * 2654435761) % 32) as i64, 13_000),
+        ("spread 0..32", |r| ((r * 2654435761) % 32) as i64, 1_200),
     ];
 
     for (label, len_of, deopt_budget) in cases {
@@ -292,6 +301,73 @@ fn nested_list_loop_varying_trip_count() {
             deopts <= deopt_budget,
             "{label}: got {deopts} deopts over {rows} rows (budget {deopt_budget}) \
              — the exit guard is not bridging"
+        );
+    }
+}
+
+/// The property that decides whether the tier is a speedup at all: the deopt
+/// count must be a WARMUP cost, not a per-row one.
+///
+/// A budget checked at one batch size cannot tell those apart — 1609 deopts over
+/// 4000 rows and 1609 over 200000 rows pass the same `deopts <= 2000`, but the
+/// first is a fixed price the batch amortises and the second is a per-row bail
+/// that never does. Before the defects above were fixed this shape deopted
+/// exactly `rows - 1` times at every size and ran at a flat 0.04–0.05x of the
+/// clean VM; afterwards it amortises to 2.8–9.2x by 640k rows
+/// (`examples/majit_nested_bench.rs`).
+///
+/// So this compares the count at two batch sizes 50x apart and requires it to
+/// stay essentially flat. It asserts the shape of the curve, not a wall-clock
+/// ratio, so it does not flake on a loaded machine the way a timing gate would.
+#[test]
+fn nested_loop_deopts_are_a_warmup_cost_not_a_per_row_cost() {
+    let _serial = serial();
+    let schema: Schema = [
+        ("size(items)".to_string(), ValType::Int),
+        ("offset(items)".to_string(), ValType::Int),
+        ("items[].price".to_string(), ValType::Int),
+    ]
+    .into_iter()
+    .collect();
+    let lowered = lower("items.all(i, i.price > 10)", &schema);
+
+    let cases: [(&str, fn(usize) -> i64); 4] = [
+        ("constant 8", |_| 8),
+        ("alternating 8/9", |r| if r % 2 == 0 { 8 } else { 9 }),
+        ("cycle 4..12", |r| 4 + (r % 9) as i64),
+        ("spread 0..32", |r| ((r * 2654435761) % 32) as i64),
+    ];
+    const SMALL: usize = 4_000;
+    const LARGE: usize = 200_000;
+
+    for (label, len_of) in cases {
+        let mut counts = Vec::with_capacity(2);
+        for rows in [SMALL, LARGE] {
+            let lens: Vec<i64> = (0..rows).map(len_of).collect();
+            let mut offsets = Vec::with_capacity(rows);
+            let mut total = 0i64;
+            for &l in &lens {
+                offsets.push(total);
+                total += l;
+            }
+            let elems: Vec<i64> = (0..total.max(1)).map(|k| (k * 7) % 40).collect();
+            let columns = [
+                Column::Int(&lens),
+                Column::Int(&offsets),
+                Column::Int(&elems),
+            ];
+            let (_, deopts, _, _) = measure(&lowered, &columns, rows);
+            counts.push(deopts);
+        }
+        let (small, large) = (counts[0], counts[1]);
+        eprintln!("[warmup] {label} deopts {SMALL}rows={small} {LARGE}rows={large}");
+        // 50x the rows may not cost more than 2x the deopts plus a small slack
+        // for the extra lengths a bigger batch happens to present first.
+        assert!(
+            large <= small * 2 + 64,
+            "{label}: {small} deopts over {SMALL} rows but {large} over {LARGE} \
+             — the deopt count scales with the batch, so it is a per-row bail \
+             back to the interpreter and no batch size can amortise it"
         );
     }
 }

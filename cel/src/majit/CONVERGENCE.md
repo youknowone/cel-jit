@@ -379,18 +379,114 @@ Result, same 100k-row runs:
 Pinned by `nested_list_loop_varying_trip_count` in
 `cel/tests/majit_trace_evidence.rs`.
 
+## Defect 4 — the preamble's copy of the exit guard, and the `[.. ; virt]` header
+
+Defect 3 left the spread case giving up on most of its bridges. The rows that
+gave up were the ones leaving through the **peeled preamble's** copy of the exit
+guard rather than through the loop body's copy: two copies of ONE guard, with
+byte-identical resume stream, `fail_arg_types` and frame pc, disagreeing on what
+deadframe slot 0 held at runtime — a `&state` pointer through the body copy, a
+small integer (`3`, `16`) through the preamble copy.
+
+Which trip counts broke was deterministic and *moved with the trace-eagerness
+threshold* — `(E-1) | threshold && E >= 3`, so {3,5,9} at threshold 8 and
+{3,5,7,13} at threshold 12. That rules the selection law out as the defect: it
+only decides whether the bad bridge→loop JUMP gets built at all.
+
+The defect was in `#[jit_interp]`'s state layout. For each `[.. ; virt]` array
+the macro synthesized a `(<arr>_ptr, <arr>_len)` inputarg pair, and `extract_live`
+filled every `<arr>_ptr` with the same `self as *const Self`. `VmStateF` has two
+virt arrays, so the loop **named its virtualizable twice** — entry contract
+`n=29` with refs at positions 0 AND 2. A bridge's contract is not synthesized; it
+is decoded from the guard's vable section, `[identity, elements…]` — `n=26` with
+a ref only at 0. The bridge's JUMP into the loop's procedure token re-read
+`sym.fregs_ptr`, which in its own 26-slot contract is an **Int**, so the JUMP
+carried `InputArgInt` at position 2 — precisely the position the preamble guard
+names as the vable identity. Piece 3 of defect 3 then correctly refused to
+dereference it and gave up on the bridge.
+
+**Fixed** by removing the synthesis rather than patching the bridge, because
+RPython does not have it:
+
+- `warmspot.py:529-538` — `jd.index_of_virtualizable = jitdriver.reds.index(vname)`.
+  The virtualizable is ONE red.
+- `virtualizable.py:139-144 load_list_of_boxes` — the vable list names it once,
+  identity last.
+- `virtualizable.py:150-153` — every array's length is read off the live object,
+  never boxed.
+
+So the macro now mints a single `__vable_identity` slot, `<arr>_len` inputargs
+are gone, and `StateFieldLayout::total_slots` loses its `2·N` term. Both
+contracts became `n=26` with a ref only at 0. This also unmasked a latent bug it
+had been hiding: `initialize_virtualizable` scanned `original_boxes`
+(`[Void; num_green_args] ++ live_values`) and fed the position it found to a
+**reds-only** `input_arg_typed`; with a duplicated identity the first match
+happened to land on a ref anyway. It now scans `live_values`.
+
+Census effect at 4000 rows: the 0..32 spread goes 12959 → **959** deopts.
+
+**Refuted along the way** (kept so they are not re-investigated): peel/numbering
+(both copies number the same canonical box — `resume.rs:3768` replacement-walks
+before numbering); the backend deadframe (dense, base 64 on both sides);
+`resolve_failarg_opref` demoted-home/stale-ref asymmetry (every slot 0 resolved
+through plain `ssa`); and a third arg-vector construction in
+`close_into_merge_point_token` (it uses the same `collect_jump_args_with_boxes`
+as the other close paths).
+
+## Measured result: the tier is now a win, not a loss
+
+`cel/examples/majit_nested_bench.rs` sweeps each shape over a geometric ladder of
+row counts and reports the MINIMUM of interleaved rounds — interference can only
+make a round slower, so the fastest round is the robust estimator, and a median
+on a shared box swings the baseline several-fold. Compilation is inside the timed
+region (there is no API to reuse a warm `JitDriver`), so a single batch size
+cannot separate "the compiled code is slow" from "the batch was too short to pay
+for compiling"; the ladder can.
+
+The same binary, built once against pre-defect-1 majit and once against HEAD
+(three HEAD runs, one base run, all on the same loaded box):
+
+| shape | deopts before | deopts after | jit/clean before | jit/clean after @640k | fitted steady |
+|---|---|---|---|---|---|
+| constant 8      | 1 per row | 9    | 0.04–0.05x | **7.8–9.2x** | 20–26x |
+| alternating 8/9 | 1 per row | 210  | 0.02–0.04x | **4.3–5.1x** | 8–10x |
+| cycle 4..12     | 1 per row | 1609 | 0.04–0.05x | **2.5–2.8x** | 6–7x |
+| spread 0..32    | 1 per row | 959  | 0.08x      | **4.6–7.2x** | 8–13x |
+| constant 64     | 1 per row | 10   | 0.23–0.26x | **4.8–5.1x** | (degenerate) |
+
+"before" is flat across every batch size and the sweep prints `no swept size
+where the JIT total wins` for all five — one deopt per row never amortises, so
+turning the tier on made cel slower than not having it. "after" climbs with batch
+size because the only fixed cost left is tracing and compiling, fitted at
+10–25 ms, putting break-even at roughly 60k–180k rows. For comparison the FLAT
+single-loop shape (`majit_ab`) runs 11.15x at 2M rows off a ~1.7 ms compile.
+
+The floor check says the columnar pipeline is worth having in the first place —
+`constant 8` at 640k rows:
+
+| tier | ns per row/eval |
+|---|---|
+| tree-walking `Program::execute` (what cel ships) | 1498.89 |
+| clean bytecode VM over the lowered program | 177.97 |
+| **compiled majit trace** | **22.70** |
+
+so the lowering alone buys ~8x and the JIT buys ~8x on top of that, ~66x
+end to end. Pre-fix majit ran this at 3276 ns/row — slower than the tree-walker.
+
 ### Still open
 
-- **The preamble's copy of the exit guard.** The spread case's remaining deopts
-  are rows that leave through the peeled preamble rather than the loop body.
-  That guard's vable section names the identity as failarg 0, but the deadframe
-  slot the backend writes there holds something else, so piece 3's check gives
-  up on the bridge. Odd trip counts (3, 5, …) hit it deterministically.
+- **Trace + compile cost.** 8–27 ms for the nested shape against ~1.7 ms for the
+  flat one is what sets break-even, and it is now the dominant remaining cost
+  below ~100k rows. This is a compile-speed problem, not a code-quality one.
+- **`cycle 4..12` is the weakest shape** at 2.8x against 8–9x for a constant trip
+  count. Its 1609 deopts are warmup-bounded (the count does not grow with row
+  count), so the residual is the cost of hopping between bridges, not bailing.
 - **The JUMP-into-ptoken half of :3001-3007.** Now that bridges form it is
-  reachable and measurably better on non-uniform lengths (`cycle 4..12`
-  1.69–1.72x and `0..32` 0.71–0.74x, all at a flat ~201 deopts, versus 0.56x /
-  0.45x above), because the trip count stays in the inner loop's own back-edge
-  instead of being baked into the outer trace. It is NOT landed: it routes every
-  row's exit through the guard above, so trip counts 3 and 5 go from 6 and 15
-  deopts to 2101 and 4192. It becomes a strict win once the preamble guard
-  bridges.
+  reachable, because the trip count stays in the inner loop's own back-edge
+  instead of being baked into the outer trace. On top of defect 4 it takes trip
+  count 3 from 2101 deopts + 1 abort to 401 deopts and 0 aborts, and removes
+  every abort the selection law used to pick. It is NOT landed; landing it must
+  come with a TIGHTENED census, not a relaxed one.
+- **Single-activation API.** None of this touches `Program::execute(&Context)`,
+  which is how CEL is actually called. The JIT cell in `majit_ab`'s primary panel
+  stays N/A until an `execute_jit(program, activation)` exists.

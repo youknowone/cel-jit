@@ -12,8 +12,15 @@
 # This runs the selected example in release with the `jit` feature. cd's
 # to its own dir first so it works regardless of where it is invoked from.
 #
+# `majit_nested_bench` covers the nested comprehension shape, which the default
+# suite's flat single-loop engine panel does not reach. It sweeps a ladder of
+# batch sizes so tracing/compilation can be separated from the compiled trace's
+# own per-row cost, and prints a tree-walker reference as a floor.
+#
 # Usage:
 #   ./bench.sh                         # fair request/engine/cold suite (default)
+#   ./bench.sh majit_nested_bench      # nested comprehension, size ladder
+#   ./bench.sh majit_nested_bench 640000 9   # <max_rows> <rounds>
 #   ./bench.sh majit_columnar_batch    # explicit columnar batch experiment
 #   ./bench.sh majit_vs_cometkim       # explicitly cross-regime historical probe
 set -euo pipefail
