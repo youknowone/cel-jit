@@ -122,27 +122,32 @@ second number is what Step 3 would deliver on the real interpreter.
   `Value`-boxing VM traces to anything near that is unknown until measured, and
   the runtime-list result below is a warning that some shapes lose outright.
 
-## Known open defect that Step 4 must not paper over
+## The nested-loop defect (FIXED — kept for the RCA)
 
-The runtime-length list comprehension shipped in `0758724` is **correct but a
-net performance loss**: `items.all(i, i.price > 10)` measures 0.0–0.4x of the
+The runtime-length list comprehension shipped in `0758724` was **correct but a
+net performance loss**: `items.all(i, i.price > 10)` measured 0.0–0.4x of the
 clean VM and 0.3–0.8x of the tree-walker at every list length, with a flat
 ~1–3 µs per-row cost.
 
-That cost is now diagnosed, and `tests/majit_trace_evidence.rs` pins it.
-Counters from `float_bank::{COMPILES, GUARD_FAILS, TRACE_ABORTS}`:
+Two stacked `majit-metainterp` defects, both now fixed. Counters from
+`float_bank::{COMPILES, GUARD_FAILS, TRACE_ABORTS}`, pinned by
+`tests/majit_trace_evidence.rs`:
 
 | workload | compiles | guard_fails | aborts |
 |---|---|---|---|
 | flat int predicate, 50000 rows | 1 | 1 | 0 |
 | flat float predicate, 50000 rows | 1 | 1 | 0 |
-| nested list, 4000 rows × 8 elements | 2 | **3999** | **1** |
+| nested list, 4000 rows × 8 elements | 2 | **9** (was 3999) | **0** (was 1) |
 
-One deopt per row. Under `MAJIT_LOG=1` the inner element loop traces to
-`CloseLoop` and compiles; the outer row loop hits that inner merge point twice
-and closes there too, as the cross-loop cut.
+100000 rows × 8 elements goes from a net loss to **1.68x** over the clean
+bytecode VM; the compiled trace itself runs at the flat case's ~10x, with the
+one-shot compile amortising from roughly 65k rows.
 
-That cut used to be **refused at optimize time** —
+Under `MAJIT_LOG=1` the inner element loop traces to `CloseLoop` and compiles;
+the outer row loop then hits that inner merge point twice and used to close
+there too, as the cross-loop cut.
+
+**Defect 1 — the cut was refused at optimize time:**
 
 ```
 abort trace (InvalidLoop: next_iteration_args longer than inputargs
@@ -152,8 +157,7 @@ abort compile: root loop entry/jump arity mismatch input=3 jump=29
 
 — the tripwire at `majit-metainterp/src/optimizeopt/optimizer.rs` (the
 `inputarg_type_at` check): the cut label declared 3 inputargs while the closing
-JUMP carried 29. That is fixed (see below); the cut now compiles, which is the
-`compiles` 1 → 2 above. The per-row cost survives it, on a second defect.
+JUMP carried 29.
 
 **Checked against RPython source** (`rpython/jit/metainterp/`, present on this
 machine), because whether this is a design limit or a port defect decides
@@ -210,15 +214,15 @@ boxes are typed end to end because the registered ones become a cut trace's
 LABEL inputargs. `MAJIT_LOG=1` now reports `cut_trace_from: original_boxes=29`
 against the 29-arg JUMP, and the cut compiles.
 
-## The defect behind it: the cut's storage key
+## Defect 2 — the cut's storage key
 
-The outer loop now compiles and still nothing enters it. `compile_loop` stores a
-cross-loop cut under `ctx.cut_inner_green_key`, which the dispatch loop derives
-as `green_key_from_code_ptr(ctx.green_key_raw.0, pc)` — and `green_key_raw.0` is
-`JitState::code_ptr()`, which **defaults to 0** and is overridden by nobody on
-front-end A. So the cut lands under a pc-only hash while the interpreter
-presents `S::green_key([pc, program])` at that merge point. Measured with
-`MAJIT_LOG=1 MAJIT_MPTRACE=1`:
+With the arity fixed the outer loop compiled and still nothing entered it.
+`compile_loop` stores a cross-loop cut under `ctx.cut_inner_green_key`, which the
+dispatch loop derives as `green_key_from_code_ptr(ctx.green_key_raw.0, pc)` —
+and `green_key_raw.0` is `JitState::code_ptr()`, which **defaults to 0** and is
+overridden by nobody on front-end A. So the cut lands under a pc-only hash while
+the interpreter presents `S::green_key([pc, program])` at that merge point.
+Measured with `MAJIT_LOG=1 MAJIT_MPTRACE=1`:
 
 ```
 [jit] start tracing at key=10921439234107011841   (inner loop, pc=64) → compiles
@@ -240,21 +244,35 @@ if has_compiled_targets(ptoken):
 ```
 
 `greenboxes` is the merge point just reached, so an outer trace that walks into
-an already-compiled inner loop ends with a JUMP into that loop's procedure. The
-inner element loop always compiles first here (it takes two back-edges per row
-to the outer's one), so that is the branch this shape belongs in. The dispatch
-loop implements neither it nor a greens-derived cut key; `compiled_key_for_greens`
-/ `record_loop_header_greens` already exist for the bridge path and are the
-obvious material for the latter.
+an already-compiled inner loop ends with a JUMP into that loop's procedure — the
+cut is only for an inner loop nobody has compiled yet, and there `compile_loop`
+attaches the result to `original_boxes[:num_green_args]`, the inner greenkey the
+interpreter actually presents. The inner element loop always compiles first here
+(two back-edges per row to the outer's one), so this shape belongs in the
+`compile_trace` branch.
+
+**Fixed**, the `has_compiled_targets` half: `TraceCtx::compiled_key_for_greens_fn`
+(installed alongside `has_compiled_targets_fn` at the three trace-start sites,
+wrapping the existing `MetaInterp::compiled_key_for_greens`) lets the dispatch
+loop resolve the merge point's greens, and the cut is declined when a compiled
+loop already lives there. The trace keeps tracing and closes at its own header
+with the inner loop's body inlined — the same shape it produces at trip counts
+too low to reach the merge point twice, which was already the fast case.
+
+Still open: the **JUMP-into-ptoken** half of :3001-3007, and a greens-derived cut
+key. Neither is reachable from this workload now, since declining the cut already
+closes at the outer header. `compile_trace_from_interp` exists and is unused, and
+`compile_trace_entry_data` declines an entry-bridge close for `header_pc != 0` on
+the grounds that it would drop the trace's own back-edge — RPython accepts that
+loss and recovers the back-edge through the bridge that leaves the inner loop's
+exit guard, so closing this gap means revisiting that decline.
 
 Consequences for this document:
 
-- The per-row cost is **one compiled-trace entry plus one guard deopt**, not
-  anything about the columnar data model. It is a majit-side defect, so Step 4
-  demoting the columnar path does not make it go away — the same shape will
-  appear on the real interpreter of Step 1 the moment a CEL expression contains
-  a loop inside a loop, which `x.all(i, i.items.all(j, ...))` does.
-- It is one more argument for Step 3. Front-end B is the pipeline where that
-  merge-point/JUMP construction is the ported RPython one.
-
-Until it is fixed, the nested shape must not be elected on a performance path.
+- The per-row cost was **one compiled-trace entry plus one guard deopt**, not
+  anything about the columnar data model — it was a majit-side defect, and Step 4
+  demoting the columnar path would not have made it go away. The same shape
+  reaches the real interpreter of Step 1 the moment a CEL expression puts a loop
+  inside a loop, which `x.all(i, i.items.all(j, ...))` does.
+- Both fixes landed in the dispatch loop that front-end B also runs, so Step 3
+  inherits them.

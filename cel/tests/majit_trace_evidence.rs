@@ -127,59 +127,51 @@ fn list_columns(per_row: i64, rows: usize) -> (Vec<i64>, Vec<i64>, Vec<i64>) {
     (lens, offsets, elems)
 }
 
-/// The nested case, and a KNOWN DEFECT pinned as it currently behaves.
-///
-/// A comprehension over a runtime-length list column puts an inner element loop
-/// inside the row loop, each back-edge its own `can_enter_jit` point. Sweeping
-/// the inner trip count splits the behaviour cleanly at **3**:
+/// The nested case: a comprehension over a runtime-length list column, which
+/// puts an inner element loop inside the row loop with each back-edge its own
+/// `can_enter_jit` point. Sweeping the inner trip count:
 ///
 /// | elements/row | compiles | guard_fails | aborts |
 /// |---|---|---|---|
 /// | 0 | 1 | 1 | 0 |
 /// | 1 | 1 | 1 | 0 |
-/// | 2 | **2** | **1** | 0 |
-/// | 3 | 2 | 3996 | 1 |
-/// | 8 | 2 | 3999 | 1 |
+/// | 2 | 2 | 1 | 0 |
+/// | 3 | 2 | 6 | 0 |
+/// | 8 | 2 | 9 | 0 |
 ///
-/// At 0 and 1 the inner back-edge is never taken, so there is only one loop. At
-/// **2 both loops compile** and the whole batch still deopts once — so a
-/// compiled inner loop inside a compiled outer loop is not itself the problem.
-/// From 3 the outer row loop hits the inner merge point TWICE while tracing, and
-/// closes there: the cross-loop cut (`compile.py:269`), which peels the outer
-/// prefix as preamble.
+/// At 0 and 1 the inner back-edge is never taken, so there is only one loop.
+/// From 2 both loops compile and the batch deopts a constant number of times.
 ///
-/// That cut used to be REFUSED at optimize time — its label carried 3 inputargs
-/// against a 29-arg JUMP, because the merge-point registration built
-/// `original_boxes` from the scalar state fields alone while the close expanded
-/// the whole virtualizable. `VmStateF` is `{ regs: [int; virt], fregs: [float;
-/// virt] }`, no scalars at all, so the registration fell back to the greens plus
-/// one unexpanded vable ref. Fixed in `majit-metainterp`: both sides now go
-/// through one construction (`JitCodeSym::loop_carried_boxes`, pyjitpl.py:2981-
-/// 2989), and `MAJIT_LOG=1` shows `cut_trace_from: original_boxes=29` against a
-/// 29-arg JUMP, compiling where it used to abort — hence `compiles` 1 → 2 here.
+/// This used to cost **one deopt per row** from trip count 3 up (3996 / 3999
+/// over 4000 rows), on two stacked `majit-metainterp` defects:
 ///
-/// The per-row cost survives that fix, on a SECOND and separate defect. The cut
-/// loop is stored under `cut_inner_green_key` =
-/// `green_key_from_code_ptr(state.code_ptr(), pc)`, and `JitState::code_ptr()`
-/// defaults to 0 for every `#[jit_interp]` interpreter — so the key is a
-/// pc-only hash, not the `S::green_key([pc, program])` hash the interpreter
-/// presents at that merge point. The outer loop therefore compiles into a key
-/// nothing enters, every row still enters the inner loop and leaves through its
-/// exit guard, and the bridge attempt from that guard aborts. Reproduce with
-/// `MAJIT_LOG=1 MAJIT_MPTRACE=1` and compare `add-mp ... inner_key=` against the
-/// `start tracing at key=` of the inner loop's own trace.
+///  1. From 3 the outer row loop hits the inner merge point TWICE while tracing
+///     and closes there — the cross-loop cut (`compile.py:269`), which peels the
+///     outer prefix as preamble. That cut was REFUSED at optimize time, its
+///     label carrying 3 inputargs against a 29-arg JUMP: the merge-point
+///     registration built `original_boxes` from the scalar state fields alone
+///     while the close expanded the whole virtualizable, and `VmStateF` is
+///     `{ regs: [int; virt], fregs: [float; virt] }` with no scalars at all.
+///     Both sides now go through one construction
+///     (`JitCodeSym::loop_carried_boxes`, pyjitpl.py:2981-2989).
+///  2. The cut then compiled but nothing entered it: it is stored under
+///     `green_key_from_code_ptr(state.code_ptr(), pc)`, and
+///     `JitState::code_ptr()` defaults to 0 for every `#[jit_interp]`
+///     interpreter, so the key is a pc-only hash rather than the
+///     `S::green_key([pc, program])` the interpreter presents there. Every row
+///     still entered the inner loop and left through its exit guard.
+///     `reached_loop_header` (pyjitpl.py:3001-3007) never cuts at a merge point
+///     that already holds a compiled loop — it jumps into that loop's procedure
+///     token instead — so the dispatch loop now declines the cut there and keeps
+///     tracing to its own header, which inlines the inner loop into the outer
+///     one. The remaining half of :3001-3007, the JUMP into an already-compiled
+///     foreign loop, is still unimplemented (`compile_trace_entry_data` declines
+///     an entry-bridge close for `header_pc != 0`); it is not reachable here
+///     because declining the cut already closes at the outer header.
 ///
-/// RPython would not take the cut here at all: `reached_loop_header`
-/// (pyjitpl.py:3001-3007) first does `ptoken = get_procedure_token(greenboxes)`
-/// on the merge point just reached and, when it `has_compiled_targets`, ends the
-/// trace with a JUMP into that procedure (`compile_trace`). The inner element
-/// loop always compiles first here, so that is the branch the outer trace should
-/// be taking; the dispatch loop implements neither it nor a greens-derived cut
-/// key.
-///
-/// If this test starts failing because `deopts` dropped, that second defect is
-/// fixed — replace the pins below with the `deopts <= 16` bound the flat cases
-/// use.
+/// Reproduce the key mismatch with `MAJIT_LOG=1 MAJIT_MPTRACE=1`: compare
+/// `add-mp ... inner_key=` against the `start tracing at key=` of the inner
+/// loop's own trace.
 #[test]
 fn nested_list_loop_deopt_census() {
     let _serial = serial();
@@ -211,26 +203,18 @@ fn nested_list_loop_deopt_census() {
             "[nested] per_row={per_row} rows={rows} compiles={compiles} \
              guard_fails={deopts} aborts={aborts} result={result:?}"
         );
-        if per_row < 3 {
-            assert_eq!(aborts, 0, "per_row={per_row}: no trace should be refused");
-            assert!(
-                deopts <= 16,
-                "per_row={per_row}: the batch should deopt a constant number of \
-                 times, got {deopts} over {rows} rows"
-            );
-        } else {
-            assert_eq!(
-                compiles, 2,
-                "per_row={per_row}: both the inner element loop and the outer \
-                 row loop's cross-loop cut compile; 1 would mean the cut's \
-                 label/JUMP arity regressed"
-            );
-            assert!(
-                deopts >= rows - 16,
-                "per_row={per_row}: the known shape is one deopt per row (the \
-                 inner loop's exit, because the cut loop is keyed where nothing \
-                 enters), got {deopts} over {rows} rows"
-            );
-        }
+        assert_eq!(aborts, 0, "per_row={per_row}: no trace should be refused");
+        assert!(
+            deopts <= 16,
+            "per_row={per_row}: the batch should deopt a constant number of \
+             times, got {deopts} over {rows} rows — that is a per-row bail back \
+             to the interpreter"
+        );
+        let expected_compiles = if per_row < 2 { 1 } else { 2 };
+        assert_eq!(
+            compiles, expected_compiles,
+            "per_row={per_row}: the row loop compiles, and from 2 elements the \
+             inner element loop's own back-edge gets hot and compiles too"
+        );
     }
 }
