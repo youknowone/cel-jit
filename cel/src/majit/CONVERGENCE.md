@@ -276,3 +276,121 @@ Consequences for this document:
   inside a loop, which `x.all(i, i.items.all(j, ...))` does.
 - Both fixes landed in the dispatch loop that front-end B also runs, so Step 3
   inherits them.
+
+---
+
+## Defect 3 — the exit guard could not bridge, so a varying trip count deopted forever
+
+The census that pinned defects 1 and 2 used a **constant** trip count, which
+hid what the fix actually bought. The outer trace inlines the inner loop and
+guards its trip count; every row whose list is a different length fails that
+guard. Over 100k rows, 4000-element batches (before this section's fix):
+
+| lengths | guard_fails | aborts | JIT vs the clean VM |
+|---|---|---|---|
+| 8, 8, 8, …    | 9      | 0  | 1.31x |
+| 8, 9, 8, 9, … | 50004  | 1  | 0.06–0.13x |
+| 4..12 cycling | 88888  | 8  | 0.03–0.09x |
+| 0..32 spread  | 165621 | 12 | 0.04–0.05x |
+
+A guard that fails that often is supposed to grow a bridge. None ever formed:
+
+```
+[bridge] start_bridge_tracing (green resume) key=… trace=1 fail=1 resume_pc=95 ok=true
+Abort during bridge tracing            ← with ZERO ops recorded
+```
+
+`start_bridge_tracing` succeeded and the walk aborted on its **first statement**.
+The macro-generated `__trace_*` opens with
+
+```rust
+let Some(__vable_argbox) = __ctx.standard_virtualizable_jitcode_argbox() else {
+    return TraceAction::Abort;
+};
+```
+
+and on a bridge `ctx.virtualizable_boxes` was `None`. `pyjitpl.py:3449
+rebuild_state_after_failure` ends with
+
+```python
+if vinfo is not None:
+    self.virtualizable_boxes = virtualizable_boxes
+    self.check_synchronized_virtualizable()
+```
+
+where `virtualizable_boxes` is what `resume.py:1370
+consume_virtualizable_boxes` decoded out of the guard's vable section. pyre does
+that assignment in each front-end's `setup_bridge_sym`; pyre-jit-trace has
+`seed_virtualizable_boxes`, and the `#[jit_interp]` macro had nothing — its own
+STATUS comment says it seeds int/ref scalars only. So **no front-end A state
+with a `[.. ; virt]` array has ever formed a guard-exit bridge**, on any
+interpreter.
+
+The guard's vable stream was there (26 entries, exactly the parent loop's box
+count) and decoded fine — except for its first entry, the virtualizable
+identity, which came back as `Box(0, Int)` = 25 rather than the `&state`
+pointer. `initialize_virtualizable` mints that box as
+
+```rust
+OpRef::input_arg_ref(info.identity_ref_bank_index.unwrap_or(index_of_virtualizable))
+```
+
+and `identity_ref_bank_index` is a JitCode ref **register** (the macro sets it to
+1 because the dispatch lowering binds `program` to ref reg 0 and `&state` to ref
+reg 1), while trace inputargs are numbered **flat across banks**. `InputArgRef(1)`
+is inputarg #1, an int; the optimizer resolved it straight through to
+`InputArgInt(1)`:
+
+```
+[callee-rca][store-final-vable] vable=[(InputArgRef(1), InputArgInt(1), false, Int), …]
+```
+
+The alias was invisible while the identity was only read back through
+`virtualizable_values[-1]` (whose concrete is written separately, and is
+correct), but it is what `capture_resumedata` writes into every guard.
+
+**Fixed**, three pieces:
+
+1. `initialize_virtualizable` recovers the identity the way `pyjitpl.py:3295
+   virtualizable_box = original_boxes[index]` does — as the red that *holds* the
+   virtualizable — by matching the live `vable_ptr` against `live_values`, and
+   mints `OpRef::input_arg_typed(idx, Type::Ref)`. The vable section now reads
+   `(InputArgRef(2), InputArgRef(2), false, Ref)`.
+2. `majit_metainterp::seed_bridge_virtualizable_boxes` rebuilds the shadow from
+   the decoded stream (`[identity, statics…, array items…]`, array lengths read
+   off the live object per `virtualizable.py:150-153`), and the macro's
+   `setup_bridge_sym` calls it for any state with a virt array.
+3. `start_bridge_tracing` resolves the live virtualizable through the same
+   `virtualizable_heap_ptr` hook trace entry uses and puts it on the ctx, so the
+   seed can run `check_synchronized_virtualizable`: a decoded identity that is
+   not the live object declines the bridge (`compile.py:725-729
+   compile.giveup()`) instead of being dereferenced. Without that check a
+   0..32 spread SIGSEGVs on `state.regs.len()` through a bogus pointer.
+
+Result, same 100k-row runs:
+
+| lengths | guard_fails | JIT vs the clean VM |
+|---|---|---|
+| 8, 8, 8, …    | 9     | **1.37–1.41x** |
+| 8, 9, 8, 9, … | 210   | **1.14–1.60x** |
+| 4..12 cycling | 1609  | **0.56–0.57x** |
+| 0..32 spread  | 12959 | **0.45–0.50x** |
+
+Pinned by `nested_list_loop_varying_trip_count` in
+`cel/tests/majit_trace_evidence.rs`.
+
+### Still open
+
+- **The preamble's copy of the exit guard.** The spread case's remaining deopts
+  are rows that leave through the peeled preamble rather than the loop body.
+  That guard's vable section names the identity as failarg 0, but the deadframe
+  slot the backend writes there holds something else, so piece 3's check gives
+  up on the bridge. Odd trip counts (3, 5, …) hit it deterministically.
+- **The JUMP-into-ptoken half of :3001-3007.** Now that bridges form it is
+  reachable and measurably better on non-uniform lengths (`cycle 4..12`
+  1.69–1.72x and `0..32` 0.71–0.74x, all at a flat ~201 deopts, versus 0.56x /
+  0.45x above), because the trip count stays in the inner loop's own back-edge
+  instead of being baked into the outer trace. It is NOT landed: it routes every
+  row's exit through the guard above, so trip counts 3 and 5 go from 6 and 15
+  deopts to 2101 and 4192. It becomes a strict win once the preamble guard
+  bridges.

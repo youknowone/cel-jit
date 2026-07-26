@@ -218,3 +218,80 @@ fn nested_list_loop_deopt_census() {
         );
     }
 }
+
+/// The same nested shape with a trip count that VARIES row to row — the shape
+/// real list columns have.
+///
+/// The constant-trip-count census above is satisfied by the outer trace
+/// inlining the inner loop and guarding its trip count, so it says nothing
+/// about what happens when that guard is wrong on the next row. Rows of
+/// alternating lengths used to deopt on every second row, and a 0..32 spread on
+/// most rows:
+///
+/// | lengths | guard_fails | aborts | was |
+/// |---|---|---|---|
+/// | 8, 8, 8, …      | 9    | 0 | 9 |
+/// | 8, 9, 8, 9, …   | 210  | 0 | 50004 / 1 abort |
+/// | 4..12 cycling   | 1609 | 0 | 88888 / 8 aborts |
+/// | 0..32 spread    | ≤ 13000 | — | 165621 / 12 aborts |
+///
+/// (`was` = 100k rows before the bridge fix; the counts here are 4000 rows for
+/// the first three.) The exit guard now forms a bridge instead of deopting
+/// forever: `#[jit_interp]` states with a `[.. ; virt]` array never rebuilt
+/// `virtualizable_boxes` at bridge entry (`pyjitpl.py:3449
+/// rebuild_state_after_failure`), so `__trace_*` aborted on its first statement
+/// — `standard_virtualizable_jitcode_argbox` had nothing to resolve — and every
+/// guard exit fell back to the blackhole.
+///
+/// The 0..32 spread still deopts: rows whose length exits through the
+/// preamble's copy of the guard hit a vable section whose identity does not
+/// resolve to the live state, and that bridge gives up (`compile.py:725-729`).
+/// It is bounded here rather than pinned exactly because the give-up count
+/// tracks the optimizer's peeling decisions.
+#[test]
+fn nested_list_loop_varying_trip_count() {
+    let _serial = serial();
+    let rows = 4_000usize;
+    let schema: Schema = [
+        ("size(items)".to_string(), ValType::Int),
+        ("offset(items)".to_string(), ValType::Int),
+        ("items[].price".to_string(), ValType::Int),
+    ]
+    .into_iter()
+    .collect();
+    let lowered = lower("items.all(i, i.price > 10)", &schema);
+
+    let cases: [(&str, fn(usize) -> i64, usize); 4] = [
+        ("constant 8", |_| 8, 16),
+        ("alternating 8/9", |r| if r % 2 == 0 { 8 } else { 9 }, 400),
+        ("cycle 4..12", |r| 4 + (r % 9) as i64, 2_000),
+        ("spread 0..32", |r| ((r * 2654435761) % 32) as i64, 13_000),
+    ];
+
+    for (label, len_of, deopt_budget) in cases {
+        let lens: Vec<i64> = (0..rows).map(len_of).collect();
+        let mut offsets = Vec::with_capacity(rows);
+        let mut total = 0i64;
+        for &l in &lens {
+            offsets.push(total);
+            total += l;
+        }
+        let elems: Vec<i64> = (0..total.max(1)).map(|k| (k * 7) % 40).collect();
+        let columns = [
+            Column::Int(&lens),
+            Column::Int(&offsets),
+            Column::Int(&elems),
+        ];
+        let (compiles, deopts, aborts, result) = measure(&lowered, &columns, rows);
+        eprintln!(
+            "[varying] {label} rows={rows} compiles={compiles} guard_fails={deopts} \
+             aborts={aborts} result={result:?}"
+        );
+        assert_eq!(compiles, 2, "{label}: both loops must compile");
+        assert!(
+            deopts <= deopt_budget,
+            "{label}: got {deopts} deopts over {rows} rows (budget {deopt_budget}) \
+             — the exit guard is not bridging"
+        );
+    }
+}
