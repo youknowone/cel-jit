@@ -136,11 +136,13 @@ Counters from `float_bank::{COMPILES, GUARD_FAILS, TRACE_ABORTS}`:
 |---|---|---|---|
 | flat int predicate, 50000 rows | 1 | 1 | 0 |
 | flat float predicate, 50000 rows | 1 | 1 | 0 |
-| nested list, 4000 rows × 8 elements | 1 | **3999** | **1** |
+| nested list, 4000 rows × 8 elements | 2 | **3999** | **1** |
 
-One deopt per row. Under `MAJIT_LOG=1` the reason is explicit: the inner
-element loop traces to `CloseLoop` and compiles; the outer row loop *also*
-traces to `CloseLoop` and is then **refused at optimize time** —
+One deopt per row. Under `MAJIT_LOG=1` the inner element loop traces to
+`CloseLoop` and compiles; the outer row loop hits that inner merge point twice
+and closes there too, as the cross-loop cut.
+
+That cut used to be **refused at optimize time** —
 
 ```
 abort trace (InvalidLoop: next_iteration_args longer than inputargs
@@ -149,8 +151,9 @@ abort compile: root loop entry/jump arity mismatch input=3 jump=29
 ```
 
 — the tripwire at `majit-metainterp/src/optimizeopt/optimizer.rs` (the
-`inputarg_type_at` check). The outer trace's header declares 3 inputargs while
-its closing JUMP carries 29.
+`inputarg_type_at` check): the cut label declared 3 inputargs while the closing
+JUMP carried 29. That is fixed (see below); the cut now compiles, which is the
+`compiles` 1 → 2 above. The per-row cost survives it, on a second defect.
 
 **Checked against RPython source** (`rpython/jit/metainterp/`, present on this
 machine), because whether this is a design limit or a port defect decides
@@ -198,9 +201,51 @@ header is minted expanded, which is why the flat row loop and the inner element
 loop both compile. The 3 is the **cut** label, rebuilt from the registration
 when the outer trace is cut at the inner loop's second visit.
 
-Orthodox fix: build the registered `original_boxes` with the same construction
-as the close, mirroring `pyjitpl.py:2981-2989`. It lives in the parent majit
-repo (`majit-metainterp`), not here.
+**Fixed** in the parent majit repo (`majit-metainterp`), not here: the macro now
+emits one `__jit_loop_carried_boxes` and both the close
+(`JitState::collect_jump_args_with_boxes`) and the registration (the new
+`JitCodeSym::loop_carried_boxes`, reachable from the jitcode dispatch loop) go
+through it, mirroring `pyjitpl.py:2981-2989`'s single `live_arg_boxes`. The
+boxes are typed end to end because the registered ones become a cut trace's
+LABEL inputargs. `MAJIT_LOG=1` now reports `cut_trace_from: original_boxes=29`
+against the 29-arg JUMP, and the cut compiles.
+
+## The defect behind it: the cut's storage key
+
+The outer loop now compiles and still nothing enters it. `compile_loop` stores a
+cross-loop cut under `ctx.cut_inner_green_key`, which the dispatch loop derives
+as `green_key_from_code_ptr(ctx.green_key_raw.0, pc)` — and `green_key_raw.0` is
+`JitState::code_ptr()`, which **defaults to 0** and is overridden by nobody on
+front-end A. So the cut lands under a pc-only hash while the interpreter
+presents `S::green_key([pc, program])` at that merge point. Measured with
+`MAJIT_LOG=1 MAJIT_MPTRACE=1`:
+
+```
+[jit] start tracing at key=10921439234107011841   (inner loop, pc=64) → compiles
+[jit] start tracing at key=8274026927361047311    (outer loop, pc=42)
+@@@MPTRACE add-mp pc=64 header_pc=42 inner_key=6467483736705779522
+[jit] cut_trace_from: start.op_index=14 original_boxes=29 trace_ops=24
+[jit][compile-loop] trace_id=2 header_pc=6467483736705779522
+```
+
+`6467483736705779522` ≠ `10921439234107011841` for the same `(pc=64, program)`.
+
+RPython would not reach the cut here at all. `reached_loop_header`
+(`pyjitpl.py:3001-3007`) runs *before* the `current_merge_points` scan:
+
+```python
+ptoken = self.get_procedure_token(greenboxes)
+if has_compiled_targets(ptoken):
+    self.compile_trace(live_arg_boxes, ptoken)
+```
+
+`greenboxes` is the merge point just reached, so an outer trace that walks into
+an already-compiled inner loop ends with a JUMP into that loop's procedure. The
+inner element loop always compiles first here (it takes two back-edges per row
+to the outer's one), so that is the branch this shape belongs in. The dispatch
+loop implements neither it nor a greens-derived cut key; `compiled_key_for_greens`
+/ `record_loop_header_greens` already exist for the bridge path and are the
+obvious material for the latter.
 
 Consequences for this document:
 
