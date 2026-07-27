@@ -136,6 +136,13 @@ pub const OP_UADD_OVF: i64 = 49; // [a, b, dst, trap]  regs[dst] = ovfchecked_u(
 pub const OP_USUB_OVF: i64 = 50; // [a, b, dst, trap]  regs[dst] = ovfchecked_u(a - b)
 pub const OP_UMUL_OVF: i64 = 51; // [a, b, dst, trap]  regs[dst] = ovfchecked_u(a * b)
 
+/// Widen a `uint` to `double`. The unsigned twin of [`OP_I2F`]: the source word
+/// is a uint's raw bit pattern, so it converts through `u64`, and reading it as
+/// `i64` would turn every value above `i64::MAX` negative. Comparison is the
+/// only place a uint meets a double — `1u == 1.0` is `true`, `1u < 2.0` is
+/// `true` — and the widening is the same `as f64` the tree-walker performs.
+pub const OP_U2F: i64 = 52; // [src, fdst]   fregs[fdst] = (regs[src] as u64) as f64
+
 /// Raw native-memory load intrinsic recognized by the `#[jit_interp]` proc
 /// macro (lowered to `raw_load_i`); at the interpreter tier this real fn runs.
 /// `base` is a column buffer's base address, `ea` a byte offset — reading
@@ -411,7 +418,7 @@ pub mod float_bank {
         OP_FNEG, OP_FSELECT, OP_FSUB, OP_GE, OP_GT, OP_I2F, OP_JUMP_IF_ABOVE, OP_LE, OP_LOAD_CONST,
         OP_LOAD_CONST_F, OP_LT, OP_MOD, OP_MOD_CHK, OP_MOV, OP_MUL, OP_MUL_OVF, OP_NE, OP_NEG,
         OP_NOT, OP_OR, OP_RETURN, OP_RETURN_F, OP_SELECT, OP_SUB, OP_SUB_OVF, OP_TRAP_STORE,
-        OP_UADD_OVF, OP_UDIV, OP_ULE, OP_ULT, OP_UMOD, OP_UMUL_OVF, OP_USUB_OVF,
+        OP_U2F, OP_UADD_OVF, OP_UDIV, OP_ULE, OP_ULT, OP_UMOD, OP_UMUL_OVF, OP_USUB_OVF,
     };
     use core::sync::atomic::Ordering;
 
@@ -903,6 +910,11 @@ pub mod float_bank {
                         state.regs[program[pc + 1] as usize] as f64;
                     pc += 3;
                 }
+                OP_U2F => {
+                    state.fregs[program[pc + 2] as usize] =
+                        state.regs[program[pc + 1] as usize] as u64 as f64;
+                    pc += 3;
+                }
                 OP_F2I => {
                     state.regs[program[pc + 2] as usize] =
                         state.fregs[program[pc + 1] as usize] as i64;
@@ -1279,6 +1291,10 @@ pub mod float_bank {
                 }
                 OP_I2F => {
                     fregs[program[pc + 2] as usize] = regs[program[pc + 1] as usize] as f64;
+                    pc += 3;
+                }
+                OP_U2F => {
+                    fregs[program[pc + 2] as usize] = regs[program[pc + 1] as usize] as u64 as f64;
                     pc += 3;
                 }
                 OP_F2I => {

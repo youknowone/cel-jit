@@ -1996,17 +1996,27 @@ mod tests {
             "b - c",
             "b * c",
             "b + i",
-            // Cross-type `==` answers `false` in the walker instead of comparing
-            // bits, and cross-type ordering is NoSuchOverload.
-            "i == b",
-            "i != b",
+            // Cross-type ordering is NoSuchOverload.
             "i < b",
+            "b > i",
         ] {
             let program = Program::compile(expr).unwrap();
             assert!(
                 lower_typed(program.expression(), &schema).is_err(),
                 "`{expr}` must bail the typed lowering (bool is not int)"
             );
+        }
+
+        // Cross-type `==` does NOT compare the bits: an int and a bool are
+        // never equal whatever they hold, so the walker answers `false` and the
+        // lowering folds to that constant rather than declining.
+        for i in [0i64, 1, 2, -1] {
+            for x in [false, true] {
+                let pair = &[("i", Bind::Int(i)), ("b", Bind::Bool(x))];
+                check("i == b", pair);
+                check("i != b", pair);
+                check("b == i", pair);
+            }
         }
 
         // The same operators on real bools lower and agree with the walker.
@@ -3027,6 +3037,290 @@ mod tests {
             );
         }
         SweepVerdict::Agreed
+    }
+
+    /// The tree-walker's answers for the cross-type cases the lowering folds.
+    ///
+    /// None of these follow from the operator table: `1 == 1u` is `true`
+    /// (`int`/`uint`/`double` are ONE equality class and compare numerically),
+    /// `1 == "ab"` is `false` rather than an error (two different classes are
+    /// never equal), and `1 || true` is `true` though `1 || false` is
+    /// `NoSuchOverload` (the logical operators absorb the other operand whole).
+    /// The lowering encodes each of these. Pin them here so a change to the
+    /// walker's semantics fails loudly instead of leaving the JIT tier as a
+    /// second, quietly disagreeing implementation.
+    #[test]
+    fn cross_type_ground_truth() {
+        let cases: [(&str, Result<Value, ()>); 30] = [
+            // One numeric class, compared numerically — not by bit pattern.
+            ("1 == 1u", Ok(Value::Bool(true))),
+            ("1 != 1u", Ok(Value::Bool(false))),
+            ("1 < 2u", Ok(Value::Bool(true))),
+            ("2u < 1", Ok(Value::Bool(false))),
+            ("1u == 1.0", Ok(Value::Bool(true))),
+            ("1u < 2.0", Ok(Value::Bool(true))),
+            ("2.0 < 1u", Ok(Value::Bool(false))),
+            // The int's sign decides across int/uint: every negative int is
+            // below every uint, and `u64::MAX` is not `-1` however the bits
+            // read. Neither machine compare answers this on its own.
+            ("1u < -1", Ok(Value::Bool(false))),
+            ("-1 < 1u", Ok(Value::Bool(true))),
+            ("18446744073709551615u == -1", Ok(Value::Bool(false))),
+            ("18446744073709551615u > 1", Ok(Value::Bool(true))),
+            // int/double widens the int, losing precision exactly as `as f64`
+            // does — the JIT tier's OP_I2F must not be more exact than this.
+            (
+                "9007199254740993 == 9007199254740992.0",
+                Ok(Value::Bool(true)),
+            ),
+            // Different classes: equal is false, unequal is true whatever the
+            // operands hold, and ordering is an error.
+            ("1 == 'ab'", Ok(Value::Bool(false))),
+            ("1 != 'ab'", Ok(Value::Bool(true))),
+            ("true == 1", Ok(Value::Bool(false))),
+            ("1 == true", Ok(Value::Bool(false))),
+            (
+                "1 == timestamp('2020-01-01T00:00:00Z')",
+                Ok(Value::Bool(false)),
+            ),
+            (
+                "timestamp('2020-01-01T00:00:00Z') == duration('1s')",
+                Ok(Value::Bool(false)),
+            ),
+            ("1 < 'ab'", Err(())),
+            ("1 < true", Err(())),
+            // The logical operators absorb the other operand whole — its value,
+            // its errors AND its type — but only the absorbing constant does.
+            ("1 || true", Ok(Value::Bool(true))),
+            ("true || 1", Ok(Value::Bool(true))),
+            ("1 && false", Ok(Value::Bool(false))),
+            ("false && 1", Ok(Value::Bool(false))),
+            ("1 || false", Err(())),
+            ("1 && true", Err(())),
+            // Ordering IS defined on strings; a uint arm rides the ternary.
+            ("'ab' < 'cd'", Ok(Value::Bool(true))),
+            ("true ? 1u : 2u", Ok(Value::UInt(1))),
+            // Negation is defined on neither uint nor string.
+            ("-1u", Err(())),
+            ("-'ab'", Err(())),
+        ];
+        for (src, want) in cases {
+            let program = Program::compile(src).unwrap();
+            let got = program.execute(&Context::default()).map_err(|_| ());
+            assert_eq!(got, want, "tree-walker ground truth for `{src}`");
+        }
+    }
+
+    /// Every expression the sweep matrix can build, bucketed by why the
+    /// lowering declined it — and, of those, how many the tree-walker ANSWERS.
+    ///
+    /// A decline only costs coverage where the walker has an answer to give;
+    /// where the walker raises, declining is the correct outcome, and counting
+    /// it would reward the lowering for refusing expressions CEL rejects. This
+    /// asserts the answerable declines do not GROW: covering another pairing
+    /// lowers the number, and a regression that starts refusing legal
+    /// expressions raises it. The breakdown rides the failure message, so a
+    /// break names the family that moved.
+    #[test]
+    fn coverage_gap_does_not_grow() {
+        use std::collections::BTreeMap;
+        // What is left. Every entry is the same limit: a string is interned to
+        // an `i64` content-hash id, so `<` has no order to read and `+` has no
+        // characters to join, and a string- or timestamp-valued top-level
+        // result has no sum for the batch loop to reduce to. (`-b` is the
+        // walker answering `-true` as `false`, which no CEL overload defines —
+        // matching it would put that bug in the JIT tier too.)
+        const GAP_CEILING: usize = 89;
+
+        let (srcs, cols) = sweep_operands();
+        let schema: Schema = cols
+            .iter()
+            .map(|(nm, d)| (nm.to_string(), d.ty()))
+            .collect();
+        let rows = cols[0].1.len();
+
+        let mut exprs: Vec<String> = Vec::new();
+        for a in &srcs {
+            for b in &srcs {
+                for op in [
+                    "+", "-", "*", "/", "%", "==", "!=", "<", "<=", ">", ">=", "&&", "||",
+                ] {
+                    exprs.push(format!("{a} {op} {b}"));
+                }
+                exprs.push(format!("{a} ? {b} : {b}"));
+            }
+            exprs.push(format!("!{a}"));
+            exprs.push(format!("-{a}"));
+        }
+
+        let mut gap: BTreeMap<String, (usize, String)> = BTreeMap::new();
+        let mut gap_total = 0usize;
+        for expr in &exprs {
+            let program = Program::compile(expr).unwrap();
+            let Err(e) = lower_typed(program.expression(), &schema) else {
+                continue;
+            };
+            if (0..rows).any(|k| program.execute(&row_context(&cols, k)).is_err()) {
+                continue;
+            }
+            gap_total += 1;
+            let slot = gap.entry(e.reason).or_insert((0, expr.clone()));
+            slot.0 += 1;
+        }
+
+        let mut buckets: Vec<(usize, String, String)> =
+            gap.into_iter().map(|(k, (n, ex))| (n, k, ex)).collect();
+        buckets.sort_by_key(|(n, _, _)| std::cmp::Reverse(*n));
+        let breakdown = buckets
+            .iter()
+            .map(|(n, reason, ex)| format!("\n  {n:5}  {reason}   e.g. `{ex}`"))
+            .collect::<String>();
+        assert!(
+            gap_total <= GAP_CEILING,
+            "{gap_total} of {} sweep expressions are answered by the tree-walker \
+             and declined by the lowering (ceiling {GAP_CEILING}):{breakdown}",
+            exprs.len(),
+        );
+    }
+
+    /// Comparisons that cross the int/uint and uint/double banks, over operands
+    /// the sweep matrix's small numbers never reach.
+    ///
+    /// The int/uint pairing is where a machine compare is simply wrong in both
+    /// directions: signed reads `u64::MAX` as `-1`, unsigned reads `-1` as
+    /// `u64::MAX`, and the tree-walker answers neither. Every row here has an
+    /// operand on the far side of `i64::MAX` or below zero, so a lowering that
+    /// picked one machine compare and hoped fails on it.
+    #[test]
+    fn cross_bank_numeric_comparison_at_the_boundaries() {
+        let cols: Vec<(&'static str, ColData)> = vec![
+            ("i", ColData::Int(vec![-1, 0, 1, i64::MIN])),
+            ("j", ColData::Int(vec![i64::MAX, -7, 0, 3])),
+            (
+                "u",
+                ColData::UInt(vec![u64::MAX as i64, 0, 1, (i64::MAX as u64 + 1) as i64]),
+            ),
+            ("f", ColData::Float(vec![-1.0, 0.0, 1.0, 9.3e18])),
+        ];
+        for op in ["==", "!=", "<", "<=", ">", ">="] {
+            for (a, b) in [
+                ("i", "u"),
+                ("u", "i"),
+                ("j", "u"),
+                ("u", "j"),
+                ("u", "f"),
+                ("f", "u"),
+                ("i", "f"),
+                ("f", "i"),
+            ] {
+                let expr = format!("{a} {op} {b}");
+                assert_eq!(
+                    sweep_case(&expr, &cols),
+                    SweepVerdict::Agreed,
+                    "`{expr}` must lower and agree with the tree-walker"
+                );
+            }
+        }
+    }
+
+    /// Two operands of different type classes are never equal and always
+    /// unequal, so `==`/`!=` fold to a constant instead of declining — but the
+    /// operands still evaluate, so a row either side traps on still refuses.
+    #[test]
+    fn cross_class_equality_folds_but_still_evaluates_its_operands() {
+        let cols: Vec<(&'static str, ColData)> = vec![
+            ("i", ColData::Int(vec![7, -3, 11, 2])),
+            ("j", ColData::Int(vec![2, 5, -1, 4])),
+            ("b", ColData::Bool(vec![1, 0, 1, 0])),
+            (
+                "s",
+                ColData::Str(
+                    ["ab", "cd", "ab", "ef"]
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect(),
+                ),
+            ),
+            ("t", ColData::Timestamp(vec![1, 2, 3, 4])),
+            ("d", ColData::Duration(vec![1, 2, 3, 4])),
+        ];
+        for (a, b) in [
+            ("i", "b"),
+            ("i", "s"),
+            ("i", "t"),
+            ("b", "s"),
+            ("t", "d"),
+            ("s", "t"),
+        ] {
+            for op in ["==", "!="] {
+                for expr in [format!("{a} {op} {b}"), format!("{b} {op} {a}")] {
+                    assert_eq!(
+                        sweep_case(&expr, &cols),
+                        SweepVerdict::Agreed,
+                        "`{expr}` folds to a constant and must match the walker"
+                    );
+                }
+            }
+            // Ordering across classes has no answer to fold to.
+            for op in ["<", "<=", ">", ">="] {
+                let expr = format!("{a} {op} {b}");
+                assert_eq!(
+                    sweep_case(&expr, &cols),
+                    SweepVerdict::Declined,
+                    "`{expr}` is NoSuchOverload and must decline"
+                );
+            }
+        }
+        // The fold does not skip the operands: `i / 0` still traps the row it
+        // would have compared, exactly as the walker raises on it.
+        assert_eq!(
+            sweep_case("(i / (j - j)) == b", &cols),
+            SweepVerdict::Refused,
+            "the constant answer must not outrank the division the row still performs"
+        );
+    }
+
+    /// `||` answers `true` and `&&` answers `false` as soon as one operand is
+    /// that literal, whatever the others are — CEL absorbs the other operand's
+    /// value, errors and type. Without the absorbing literal the type error
+    /// stands.
+    #[test]
+    fn logical_operators_absorb_the_other_operand() {
+        let cols: Vec<(&'static str, ColData)> = vec![
+            ("i", ColData::Int(vec![7, -3, 11, 2])),
+            ("b", ColData::Bool(vec![1, 0, 1, 0])),
+            (
+                "s",
+                ColData::Str(
+                    ["ab", "cd", "ab", "ef"]
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect(),
+                ),
+            ),
+        ];
+        for expr in [
+            "i || true",
+            "true || i",
+            "s || true",
+            "i && false",
+            "false && i",
+            "b || true",
+            "b && false",
+        ] {
+            assert_eq!(
+                sweep_case(expr, &cols),
+                SweepVerdict::Agreed,
+                "`{expr}` is absorbed by its literal and must match the walker"
+            );
+        }
+        for expr in ["i || false", "false || i", "i && true", "true && i"] {
+            assert_eq!(
+                sweep_case(expr, &cols),
+                SweepVerdict::Declined,
+                "`{expr}` has no absorbing literal and stays a type error"
+            );
+        }
     }
 
     /// Cross every operand with every binary operator and check parity.

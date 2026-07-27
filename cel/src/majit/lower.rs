@@ -60,6 +60,13 @@ fn as_int_literal(e: &IdedExpr) -> Option<i64> {
     }
 }
 
+fn as_bool_literal(e: &IdedExpr) -> Option<bool> {
+    match &e.expr {
+        Expr::Literal(LiteralValue::Boolean(b)) => Some(b.into_inner()),
+        _ => None,
+    }
+}
+
 fn as_string_literal(e: &IdedExpr) -> Option<&str> {
     match &e.expr {
         Expr::Literal(LiteralValue::String(s)) => Some(s.inner()),
@@ -996,6 +1003,99 @@ fn emit_f2i(ctx: &mut LowerCtxF, src: TReg) -> TReg {
     r
 }
 
+/// CEL's comparison type classes.
+///
+/// Equality is heterogeneous ACROSS classes and answers rather than raising:
+/// `1 == "ab"` is `false`, `1 != "ab"` is `true`, and so is every other pairing
+/// of two different classes. Ordering across classes stays `NoSuchOverload`.
+/// `int`, `uint` and `double` are ONE class — they compare numerically, so
+/// `1 == 1u` is `true` and `1u < 2.0` is `true`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CmpClass {
+    Numeric,
+    Bool,
+    Str,
+    Timestamp,
+    Duration,
+}
+
+fn cmp_class(bank: ValType) -> CmpClass {
+    match bank {
+        ValType::Int | ValType::UInt | ValType::Float => CmpClass::Numeric,
+        ValType::Bool => CmpClass::Bool,
+        ValType::Str => CmpClass::Str,
+        ValType::Timestamp => CmpClass::Timestamp,
+        ValType::Duration => CmpClass::Duration,
+    }
+}
+
+/// A `bool` the lowering knows without looking at the row, hoisted to the
+/// prelude like any other constant.
+fn emit_bool_const(ctx: &mut LowerCtxF, v: bool) -> TReg {
+    let r = ctx.fresh(ValType::Bool);
+    ctx.prelude
+        .extend_from_slice(&[OP_LOAD_CONST, v as i64, r.idx as i64]);
+    r
+}
+
+/// A zero in the int file, for the sign tests a mixed int/uint comparison needs.
+fn emit_zero_const(ctx: &mut LowerCtxF) -> TReg {
+    let r = ctx.fresh(ValType::Int);
+    ctx.prelude
+        .extend_from_slice(&[OP_LOAD_CONST, 0, r.idx as i64]);
+    r
+}
+
+/// Emit `[op, a, b, dst]` into the body and hand back `dst`.
+fn emit_bin(ctx: &mut LowerCtxF, op: i64, a: TReg, b: TReg, bank: ValType) -> TReg {
+    let d = ctx.fresh(bank);
+    ctx.body
+        .extend_from_slice(&[op, a.idx as i64, b.idx as i64, d.idx as i64]);
+    d
+}
+
+/// Lower one of the six comparisons over one `int` and one `uint` operand.
+///
+/// Neither machine compare answers this on its own: the signed one misreads a
+/// uint above `i64::MAX`, the unsigned one misreads a negative int as huge. The
+/// int's sign decides between them — every negative int is below every uint —
+/// so each comparison is one sign test combined with the unsigned compare of
+/// the two bit patterns. Six shapes, two combiners: `(i >= 0) & u_cmp` where a
+/// negative int settles the answer as false, `(i < 0) | u_cmp` where it settles
+/// it as true.
+fn lower_int_uint_cmp(
+    ctx: &mut LowerCtxF,
+    name: &str,
+    a: TReg,
+    b: TReg,
+) -> Result<TReg, LowerError> {
+    let int_on_left = a.bank == ValType::Int;
+    let (i, u) = if int_on_left { (a, b) } else { (b, a) };
+    // `and` reads "a negative int makes this false", `or` "…makes this true".
+    // The two orderings that a negative int settles as TRUE — `int < uint` and
+    // its mirror `uint > int` — share one shape; so do the two it settles as
+    // false. Equality is symmetric, so only the combiner differs there.
+    let (and, lhs, rhs, uop) = match (name, int_on_left) {
+        (ops::EQUALS, _) => (true, i, u, OP_EQ),
+        (ops::NOT_EQUALS, _) => (false, i, u, OP_NE),
+        (ops::LESS, true) | (ops::GREATER, false) => (false, i, u, OP_ULT),
+        (ops::LESS_EQUALS, true) | (ops::GREATER_EQUALS, false) => (false, i, u, OP_ULE),
+        (ops::GREATER, true) | (ops::LESS, false) => (true, u, i, OP_ULT),
+        (ops::GREATER_EQUALS, true) | (ops::LESS_EQUALS, false) => (true, u, i, OP_ULE),
+        _ => unreachable!("caller matched one of the six comparison ops"),
+    };
+    let zero = emit_zero_const(ctx);
+    let sign = emit_bin(ctx, if and { OP_GE } else { OP_LT }, i, zero, ValType::Bool);
+    let cmp = emit_bin(ctx, uop, lhs, rhs, ValType::Bool);
+    Ok(emit_bin(
+        ctx,
+        if and { OP_AND } else { OP_OR },
+        sign,
+        cmp,
+        ValType::Bool,
+    ))
+}
+
 /// Widen an int-bank value to a fresh float reg via a per-row `int as f64` cast
 /// (`OP_I2F` -> `cast_int_to_float`). Emitted into the body: unlike a literal
 /// (folded to a prelude constant), a data-dependent int is cast per row.
@@ -1008,6 +1108,21 @@ fn emit_i2f(ctx: &mut LowerCtxF, src: TReg) -> TReg {
     let r = ctx.fresh(ValType::Float);
     ctx.body
         .extend_from_slice(&[OP_I2F, src.idx as i64, r.idx as i64]);
+    r
+}
+
+/// Widen a uint-bank value to a fresh float reg (`OP_U2F`). Same shape as
+/// [`emit_i2f`], through `u64` rather than `i64` so a uint above `i64::MAX`
+/// does not widen to a negative double.
+fn emit_u2f(ctx: &mut LowerCtxF, src: TReg) -> TReg {
+    debug_assert_eq!(
+        src.bank,
+        ValType::UInt,
+        "emit_u2f: source must be uint-banked"
+    );
+    let r = ctx.fresh(ValType::Float);
+    ctx.body
+        .extend_from_slice(&[OP_U2F, src.idx as i64, r.idx as i64]);
     r
 }
 
@@ -1391,11 +1506,13 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
         let t = compile_t(ctx, &call.args[1])?;
         let f = compile_t(ctx, &call.args[2])?;
         let (op, bank) = match (t.bank, f.bank) {
-            (ValType::Int, ValType::Int) => (OP_SELECT, ValType::Int),
-            // Both arms bool: the arithmetic select over `0`/`1` yields the
-            // chosen arm unchanged.
-            (ValType::Bool, ValType::Bool) => (OP_SELECT, ValType::Bool),
             (ValType::Float, ValType::Float) => (OP_FSELECT, ValType::Float),
+            // Every other bank rides the int file, so the arithmetic select
+            // hands back the chosen arm's word unchanged — a `0`/`1` bool, a
+            // uint's bit pattern, a string's id, a temporal's nanoseconds. Only
+            // arms of the SAME bank blend: the tree-walker yields one type or
+            // the other per row, which no single result bank can carry.
+            (x, y) if x == y => (OP_SELECT, x),
             _ => return Err(LowerError::unsupported("mixed-bank ternary arms")),
         };
         let d = ctx.fresh(bank);
@@ -1437,6 +1554,19 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
         } else {
             OP_OR
         };
+        // CEL's logical operators are commutative and absorb the other operand
+        // whole — its value, its errors and its type. `1 || true` is `true` and
+        // `1 && false` is `false`, though `1` alone is NoSuchOverload under
+        // either. So an absorbing literal answers before anything else is
+        // compiled; without one, `1 || false` stays the type error it is.
+        let absorbing = name == ops::LOGICAL_OR;
+        if call
+            .args
+            .iter()
+            .any(|a| as_bool_literal(a) == Some(absorbing))
+        {
+            return Ok(emit_bool_const(ctx, absorbing));
+        }
         let mut acc = compile_t(ctx, &call.args[0])?;
         if acc.bank != ValType::Bool {
             return Err(LowerError::unsupported("boolean operand must be bool"));
@@ -1469,16 +1599,26 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
             return Err(LowerError::unsupported(format!("{name} arity")));
         }
         let (mut a, mut b) = compile_cmp_operands(ctx, &call.args[0], &call.args[1])?;
+        // Operands of two DIFFERENT type classes are never equal and always
+        // unequal, whatever the row holds, so `==`/`!=` fold to a constant. The
+        // operands still compiled above, so a trap either side raises reaches
+        // the row the way the tree-walker's does; only the comparison itself is
+        // constant. Ordering across classes is NoSuchOverload and bails.
+        let (class_a, class_b) = (cmp_class(a.bank), cmp_class(b.bank));
+        if class_a != class_b {
+            return match name {
+                ops::EQUALS => Ok(emit_bool_const(ctx, false)),
+                ops::NOT_EQUALS => Ok(emit_bool_const(ctx, true)),
+                _ => Err(LowerError::unsupported(format!(
+                    "ordering across type classes ({class_a:?} vs {class_b:?})"
+                ))),
+            };
+        }
         // Strings support only equality here: a content-hash compare (OP_EQ/OP_NE
         // over the int-file ids) equals a string compare once the batch builder
         // has verified the hash is injective. Ordering needs sorted ids, so `<`
-        // etc. bail; a string mixed with a non-string is a CEL type error.
-        if a.bank == ValType::Str || b.bank == ValType::Str {
-            if a.bank != ValType::Str || b.bank != ValType::Str {
-                return Err(LowerError::unsupported(
-                    "mixed string/non-string comparison",
-                ));
-            }
+        // etc. bail.
+        if a.bank == ValType::Str {
             let op = match name {
                 ops::EQUALS => OP_EQ,
                 ops::NOT_EQUALS => OP_NE,
@@ -1491,19 +1631,21 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
         }
         // Timestamp / Duration compare as i64 nanoseconds: the signed int order
         // equals the chronological / magnitude order the tree-walker uses, so all
-        // six comparisons use the signed int op. Both operands must be the SAME
-        // temporal type (timestamp vs duration is NoSuchOverload; temporal vs a
-        // non-temporal operand is a type error) — otherwise bail.
-        if matches!(a.bank, ValType::Timestamp | ValType::Duration)
-            || matches!(b.bank, ValType::Timestamp | ValType::Duration)
+        // six comparisons use the signed int op. Timestamp and duration are
+        // separate classes, so the check above already split them apart.
+        if matches!(a.bank, ValType::Timestamp | ValType::Duration) {
+            return Ok(emit_bin(ctx, iop, a, b, ValType::Bool));
+        }
+        // One int and one uint operand: compare NUMERICALLY, which is neither
+        // the signed nor the unsigned machine compare. The int side's sign
+        // decides which — a negative int is below every uint — so each
+        // comparison is a sign test guarding the unsigned compare of the two bit
+        // patterns. `1u < -1` is false and `-1 < 1u` is true, the way the
+        // tree-walker answers them.
+        if (a.bank == ValType::Int && b.bank == ValType::UInt)
+            || (a.bank == ValType::UInt && b.bank == ValType::Int)
         {
-            if a.bank != b.bank {
-                return Err(LowerError::unsupported("mixed temporal comparison"));
-            }
-            let d = ctx.fresh(ValType::Bool);
-            ctx.body
-                .extend_from_slice(&[iop, a.idx as i64, b.idx as i64, d.idx as i64]);
-            return Ok(d);
+            return lower_int_uint_cmp(ctx, name, a, b);
         }
         // Two uint operands compare unsigned: `<`/`<=` map to OP_ULT/OP_ULE and
         // `>`/`>=` reuse them by swapping operands; eq/ne are bit-identical to
@@ -1545,6 +1687,15 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
             }
             (ValType::Float, ValType::Int) => {
                 b = emit_i2f(ctx, b);
+                fop
+            }
+            // A uint against a double widens the same way, through `u64`.
+            (ValType::UInt, ValType::Float) => {
+                a = emit_u2f(ctx, a);
+                fop
+            }
+            (ValType::Float, ValType::UInt) => {
+                b = emit_u2f(ctx, b);
                 fop
             }
             _ => return Err(LowerError::unsupported("mixed-bank comparison")),
