@@ -109,6 +109,9 @@ fn ns_per_row(d: Duration, rows: usize) -> f64 {
     d.as_secs_f64() * 1e9 / rows as f64
 }
 
+/// One swept data shape: a label and the per-row element count it produces.
+type Shape = (&'static str, fn(usize) -> i64);
+
 fn nested_schema() -> Schema {
     [("items[].price".to_string(), ValType::Int)]
         .into_iter()
@@ -295,7 +298,7 @@ fn main() {
     let lowered = lower(SRC, &schema);
     let program = Program::compile(SRC).expect("compile the reference program");
 
-    let cases: [(&str, fn(usize) -> i64); 5] = [
+    let cases: [Shape; 5] = [
         ("constant 8", |_| 8),
         ("alternating 8/9", |r| if r % 2 == 0 { 8 } else { 9 }),
         ("cycle 4..12", |r| 4 + (r % 9) as i64),

@@ -156,8 +156,8 @@ fn request_latency(label: &str, expression: &str, schema: &Schema, samples: &[Re
 
     // Warm the stock evaluator and its instruction/data caches. Parsing and
     // activation construction are deliberately outside the measured region.
-    for i in 0..samples.len() {
-        black_box(bool_result(&program, &samples[i].context));
+    for sample in samples {
+        black_box(bool_result(&program, &sample.context));
     }
 
     let mut timings = Vec::with_capacity(ROUNDS);

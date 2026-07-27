@@ -64,6 +64,9 @@ fn measure_warm(
     (compiles, deopts, aborts, jit)
 }
 
+/// One swept data shape: a label and the per-row element count it produces.
+type Shape = (&'static str, fn(usize) -> i64);
+
 fn lower(src: &str, schema: &Schema) -> LoweredF {
     let program = Program::compile(src).unwrap_or_else(|e| panic!("parse `{src}`: {e:?}"));
     lower_typed(program.expression(), schema).unwrap_or_else(|e| panic!("lower_typed `{src}`: {e}"))
@@ -452,14 +455,14 @@ fn nested_list_loop_varying_trip_count() {
     .collect();
     let lowered = lower("items.all(i, i.price > 10)", &schema);
 
-    let cases: [(&str, fn(usize) -> i64, usize); 4] = [
-        ("constant 8", |_| 8, 16),
-        ("alternating 8/9", |r| if r % 2 == 0 { 8 } else { 9 }, 400),
-        ("cycle 4..12", |r| 4 + (r % 9) as i64, 2_000),
-        ("spread 0..32", |r| ((r * 2654435761) % 32) as i64, 1_200),
+    let cases: [(Shape, usize); 4] = [
+        (("constant 8", |_| 8), 16),
+        (("alternating 8/9", |r| if r % 2 == 0 { 8 } else { 9 }), 400),
+        (("cycle 4..12", |r| 4 + (r % 9) as i64), 2_000),
+        (("spread 0..32", |r| ((r * 2654435761) % 32) as i64), 1_200),
     ];
 
-    for (label, len_of, deopt_budget) in cases {
+    for ((label, len_of), deopt_budget) in cases {
         let lens: Vec<i64> = (0..rows).map(len_of).collect();
         let mut offsets = Vec::with_capacity(rows);
         let mut total = 0i64;
@@ -513,7 +516,7 @@ fn nested_loop_deopts_are_a_warmup_cost_not_a_per_row_cost() {
     .collect();
     let lowered = lower("items.all(i, i.price > 10)", &schema);
 
-    let cases: [(&str, fn(usize) -> i64); 4] = [
+    let cases: [Shape; 4] = [
         ("constant 8", |_| 8),
         ("alternating 8/9", |r| if r % 2 == 0 { 8 } else { 9 }),
         ("cycle 4..12", |r| 4 + (r % 9) as i64),
