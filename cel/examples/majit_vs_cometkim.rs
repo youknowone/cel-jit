@@ -30,7 +30,7 @@ use std::time::Instant;
 use cel::majit::bytecode::float_bank::{clean_interp_f, run_jit_f, COMPILES};
 use cel::majit::bytecode::Code;
 use cel::majit::bytecode::{OP_ADD, OP_AND, OP_JUMP_IF_ABOVE, OP_LOAD_CONST, OP_MUL, OP_RETURN};
-use cel::majit::lower::{lower_typed, LoweredF, Schema};
+use cel::majit::lower::{lower_typed, LoweredF, Schema, ValType};
 use cel::Program;
 
 const LCG_A: i64 = 6364136223846793005;
@@ -67,11 +67,15 @@ fn nested_shape(i: usize) -> (i64, i64) {
     }
 }
 
-/// One benchmark case: a CEL source, its per-slot input shape, and cometkim's
-/// measured ns/call for interp + AOT on this machine.
+/// One benchmark case: a CEL source, the declared type of every path it reads,
+/// its per-slot input shape, and cometkim's measured ns/call for interp + AOT on
+/// this machine.
 struct Case {
     label: &'static str,
     src: &'static str,
+    /// Every path the source reads. The lowering declines an undeclared path, so
+    /// this is the case's input type declaration, not a convenience.
+    schema: &'static [(&'static str, ValType)],
     shape: Shape,
     cometkim_interp_ns: f64,
     cometkim_aot_ns: f64,
@@ -154,7 +158,12 @@ fn run_case(case: &Case) {
             return;
         }
     };
-    let lowered = match lower_typed(program.expression(), &Schema::new()) {
+    let schema: Schema = case
+        .schema
+        .iter()
+        .map(|(p, t)| (p.to_string(), *t))
+        .collect();
+    let lowered = match lower_typed(program.expression(), &schema) {
         Ok(l) => l,
         Err(e) => {
             println!(
@@ -201,6 +210,7 @@ fn main() {
         Case {
             label: "comparison(const)",
             src: "10 > 5 && 3 < 7 || 1 == 1",
+            schema: &[],
             shape: default_shape,
             cometkim_interp_ns: 37.33,
             cometkim_aot_ns: 7.84,
@@ -208,6 +218,7 @@ fn main() {
         Case {
             label: "variable_access",
             src: "x",
+            schema: &[("x", ValType::Int)],
             shape: default_shape,
             cometkim_interp_ns: 7.73,
             cometkim_aot_ns: 13.97,
@@ -215,6 +226,7 @@ fn main() {
         Case {
             label: "conditional",
             src: "x > 10 ? x * 2 : x + 5",
+            schema: &[("x", ValType::Int)],
             shape: default_shape,
             cometkim_interp_ns: 35.14,
             cometkim_aot_ns: 22.25,
@@ -222,6 +234,10 @@ fn main() {
         Case {
             label: "member_access",
             src: "obj.nested.value + obj.other",
+            schema: &[
+                ("obj.nested.value", ValType::Int),
+                ("obj.other", ValType::Int),
+            ],
             shape: default_shape,
             cometkim_interp_ns: 133.0,
             cometkim_aot_ns: 164.22,
@@ -229,6 +245,7 @@ fn main() {
         Case {
             label: "list_indexing",
             src: "list[0] + list[5] + list[9]",
+            schema: &[("list[]", ValType::Int)],
             shape: default_shape,
             cometkim_interp_ns: 61.80,
             cometkim_aot_ns: 74.27,
@@ -236,6 +253,7 @@ fn main() {
         Case {
             label: "simple_arithmetic",
             src: "1 + 2 * 3 - 4 / 2",
+            schema: &[],
             shape: default_shape,
             cometkim_interp_ns: 46.11,
             cometkim_aot_ns: 7.97,
@@ -243,6 +261,16 @@ fn main() {
         Case {
             label: "nested_expr(div)",
             src: "((a + b) * (c - d)) / ((e + f) - (g * h))",
+            schema: &[
+                ("a", ValType::Int),
+                ("b", ValType::Int),
+                ("c", ValType::Int),
+                ("d", ValType::Int),
+                ("e", ValType::Int),
+                ("f", ValType::Int),
+                ("g", ValType::Int),
+                ("h", ValType::Int),
+            ],
             shape: nested_shape,
             cometkim_interp_ns: 156.97,
             cometkim_aot_ns: 140.45,
@@ -251,6 +279,7 @@ fn main() {
         Case {
             label: "all_comprehension",
             src: "[1, 2, 3, 4, 5].all(x, x > 0)",
+            schema: &[],
             shape: default_shape,
             cometkim_interp_ns: 512.50,
             cometkim_aot_ns: 197.40,

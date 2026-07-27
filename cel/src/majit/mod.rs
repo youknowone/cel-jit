@@ -122,6 +122,13 @@ mod tests {
     }
 
     impl Bind {
+        fn ty(self) -> ValType {
+            match self {
+                Bind::Int(_) => ValType::Int,
+                Bind::Bool(_) => ValType::Bool,
+            }
+        }
+
         fn as_i64(self) -> i64 {
             match self {
                 Bind::Int(v) => v,
@@ -143,10 +150,7 @@ mod tests {
             .collect();
         let program =
             Program::compile(expr_src).unwrap_or_else(|e| panic!("parse `{expr_src}`: {e:?}"));
-        let schema: Schema = binds
-            .iter()
-            .map(|(n, _)| (n.to_string(), ValType::Int))
-            .collect();
+        let schema: Schema = binds.iter().map(|(n, b)| (n.to_string(), b.ty())).collect();
         let lowered = lower_typed(program.expression(), &schema)
             .unwrap_or_else(|e| panic!("lower_typed `{expr_src}`: {e}"));
 
@@ -338,8 +342,10 @@ mod tests {
     #[test]
     fn list_index_constant() {
         let program = Program::compile("list[0] + list[2] + list[4]").unwrap();
-        let lowered = lower_typed(program.expression(), &Schema::new())
-            .expect("constant list index is lowerable");
+        // One declaration of the element type covers every constant index.
+        let schema: Schema = [("list[]".to_string(), ValType::Int)].into_iter().collect();
+        let lowered =
+            lower_typed(program.expression(), &schema).expect("constant list index is lowerable");
         let paths: Vec<&str> = lowered.slots.iter().map(|s| s.path.as_str()).collect();
         assert_eq!(paths, ["list[0]", "list[2]", "list[4]"]);
 
@@ -362,8 +368,15 @@ mod tests {
         // first-encounter order (no execute — map construction is covered by
         // M3's batch harness).
         let program = Program::compile("account.balance >= txn.amount && !account.frozen").unwrap();
-        let lowered = lower_typed(program.expression(), &Schema::new())
-            .expect("member-access policy is lowerable");
+        let schema: Schema = [
+            ("account.balance".to_string(), ValType::Int),
+            ("txn.amount".to_string(), ValType::Int),
+            ("account.frozen".to_string(), ValType::Bool),
+        ]
+        .into_iter()
+        .collect();
+        let lowered =
+            lower_typed(program.expression(), &schema).expect("member-access policy is lowerable");
         let paths: Vec<&str> = lowered.slots.iter().map(|s| s.path.as_str()).collect();
         assert_eq!(paths, ["account.balance", "txn.amount", "account.frozen"]);
     }
@@ -561,10 +574,12 @@ mod tests {
     /// its data so the test keeps the buffers alive.
     enum ColData {
         Int(Vec<i64>),
-        /// A `bool` column, stored as `0`/`1`. Identical to [`ColData::Int`] on
-        /// the machine (bools live in the int bank as `0`/`1`); the difference
-        /// is the ORACLE, which must bind a real `Value::Bool` or the
-        /// tree-walker would see an int where CEL declares a bool.
+        /// A `bool` column, stored as `0`/`1`. Its STORAGE is identical to
+        /// [`ColData::Int`] (bools live in the int bank as `0`/`1`), but it is a
+        /// different declared type on both ends: the schema says
+        /// [`ValType::Bool`], so `&&`/`!`/`?:` accept it and arithmetic does
+        /// not, and the oracle binds a real `Value::Bool` rather than its `0`/`1`
+        /// image.
         Bool(Vec<i64>),
         UInt(Vec<i64>),
         Float(Vec<f64>),
@@ -596,7 +611,8 @@ mod tests {
         }
         fn ty(&self) -> ValType {
             match self {
-                ColData::Int(_) | ColData::Bool(_) => ValType::Int,
+                ColData::Int(_) => ValType::Int,
+                ColData::Bool(_) => ValType::Bool,
                 ColData::UInt(_) => ValType::UInt,
                 ColData::Float(_) => ValType::Float,
                 ColData::Str(_) => ValType::Str,
@@ -1943,6 +1959,84 @@ mod tests {
             assert!(
                 lower_typed(program.expression(), &schema).is_err(),
                 "`{expr}` must bail: member syntax does not reach a global overload"
+            );
+        }
+    }
+
+    /// `bool` is its own declared type, not a spelling of `int`.
+    ///
+    /// Before [`ValType::Bool`] existed, an `int` column reached `&&`/`||`/`!`
+    /// and `?:` because the only test those sites made was "is it in the int
+    /// bank", so `a && b` with `a = 1, b = 2` answered `3` (`OP_AND` is bitwise)
+    /// where the tree-walker raises `NoSuchOverload` — a JIT-only answer to an
+    /// expression CEL rejects. The lowering must now decline every one of these.
+    #[test]
+    fn bool_is_a_type_not_an_int() {
+        let schema: Schema = [
+            ("b".to_string(), ValType::Bool),
+            ("c".to_string(), ValType::Bool),
+            ("i".to_string(), ValType::Int),
+            ("j".to_string(), ValType::Int),
+        ]
+        .into_iter()
+        .collect();
+        for expr in [
+            // Logical ops are bool-only: `1 && 2`, `1 || 2`, `!1` are all
+            // NoSuchOverload in the walker.
+            "i && j",
+            "i || j",
+            "!i",
+            "b && i",
+            "i && b",
+            // The ternary condition is bool-only.
+            "i ? i : j",
+            // Arithmetic on bool is UnsupportedBinaryOperator.
+            "b + c",
+            "b - c",
+            "b * c",
+            "b + i",
+            // Cross-type `==` answers `false` in the walker instead of comparing
+            // bits, and cross-type ordering is NoSuchOverload.
+            "i == b",
+            "i != b",
+            "i < b",
+        ] {
+            let program = Program::compile(expr).unwrap();
+            assert!(
+                lower_typed(program.expression(), &schema).is_err(),
+                "`{expr}` must bail the typed lowering (bool is not int)"
+            );
+        }
+
+        // The same operators on real bools lower and agree with the walker.
+        for (x, y) in [(false, false), (false, true), (true, false), (true, true)] {
+            let pair = &[("b", Bind::Bool(x)), ("c", Bind::Bool(y))];
+            for expr in ["b && c", "b || c", "b < c", "b <= c", "b == c", "b != c"] {
+                check(expr, pair);
+            }
+            check("!b", &[("b", Bind::Bool(x))]);
+            check(
+                "b ? i : j",
+                &[
+                    ("b", Bind::Bool(x)),
+                    ("i", Bind::Int(7)),
+                    ("j", Bind::Int(-3)),
+                ],
+            );
+        }
+    }
+
+    /// A path the schema does not declare is a decline, not an implicit `int`.
+    /// The bank decides which operators the path is legal under, so guessing one
+    /// answers an expression the caller never typed.
+    #[test]
+    fn undeclared_path_bails() {
+        let schema: Schema = [("i".to_string(), ValType::Int)].into_iter().collect();
+        for expr in ["i + missing", "missing > 0", "i > 0 && missing"] {
+            let program = Program::compile(expr).unwrap();
+            assert!(
+                lower_typed(program.expression(), &schema).is_err(),
+                "`{expr}` must bail: `missing` is undeclared"
             );
         }
     }

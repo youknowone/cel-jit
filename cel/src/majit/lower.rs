@@ -11,19 +11,21 @@
 //!   * arithmetic `+ - * / %`, unary `-` (division assumes a nonzero,
 //!     non-`INT_MIN`/`-1` divisor domain — the schema/domain shape guard),
 //!   * comparisons `>= > <= < == !=`,
-//!   * boolean `&& || !` (non-short-circuit, correct for the pure int/bool
-//!     domain where operands cannot raise),
+//!   * boolean `&& || !` over `bool` operands (non-short-circuit, correct in
+//!     this domain because the operands cannot raise),
 //!   * `all` / `exists` / `exists_one` comprehensions over a **literal** list
 //!     (green-constant length), unrolled into a straight-line fold, or over a
 //!     **runtime-length** list column ([`declares_list`]), which gets a real
 //!     inner loop instead. `map` / `filter` build a list and stay out of the
 //!     int subset.
 //!
-//! **Schema assumption**: every slot is assumed to carry an `int`/`bool` value.
-//! A CEL expression comparing a slot bound to a `double`/`uint`/`string` at
-//! runtime is outside this subset; a real integration guards on the context
-//! schema before electing the JIT (the PyPy-style shape guard). The lowering
-//! itself is type-blind on slots.
+//! **Schema**: the caller declares every path an expression reads, with its
+//! [`ValType`], in a [`Schema`]; an undeclared path is a decline. The declared
+//! bank is what decides which operators the path is legal under — `!x` needs a
+//! `bool`, `x + 1` needs a numeric bank — and it is the same declaration the
+//! caller builds its columns from, so lowering and data agree by construction.
+//! A real integration derives it from the context's variable types before
+//! electing the JIT (the PyPy-style shape guard).
 
 use super::bytecode::*;
 use crate::common::ast::operators as ops;
@@ -85,6 +87,13 @@ fn resolve_path(e: &IdedExpr) -> Result<String, LowerError> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValType {
     Int,
+    /// A `bool`, carried as `0`/`1` in the int register file, so storage, column
+    /// loads and moves reuse the int ops. It is a type of its own and not a
+    /// spelling of `int`, because CEL says so: `1 && 2`, `!1` and `1 ? x : y`
+    /// are all `NoSuchOverload`, `true + true` is an unsupported operator, and
+    /// `1 == true` is `false` rather than a bit compare. Ordering IS defined
+    /// (`false < true`), so the six comparisons lower to the signed int ops.
+    Bool,
     /// Unsigned 64-bit. Shares the int register file (the raw bit pattern), so
     /// storage, column loads, moves, add/sub/mul and eq/ne reuse the int ops;
     /// only ordering comparisons differ (unsigned `OP_ULT`/`OP_ULE`).
@@ -123,10 +132,11 @@ pub fn intern_hash(s: &str) -> i64 {
     h as i64
 }
 
-/// Declared type of each input path. A path absent from the schema defaults to
-/// [`ValType::Int`] (the int/bool domain of [`lower`]). A real integration
-/// builds this from the context's variable types and guards on it before
-/// electing the float JIT.
+/// Declared type of each input path. Every path an expression reads must appear
+/// here: an absent path is a DECLINE, because the bank is what decides which
+/// operators the path is legal under, and the caller builds its columns from the
+/// same declaration. A real integration builds this from the context's variable
+/// types and guards on it before electing the float JIT.
 pub type Schema = HashMap<String, ValType>;
 
 /// A typed register: a bank plus the index within that bank.
@@ -395,6 +405,7 @@ impl LoweredF {
         let (f_acc, total_float_regs) = match self.result_bank {
             ValType::Float => (self.num_float_regs, self.num_float_regs + 1),
             ValType::Int
+            | ValType::Bool
             | ValType::UInt
             | ValType::Str
             | ValType::Timestamp
@@ -411,6 +422,7 @@ impl LoweredF {
         // the setup (0.0 has zero bits).
         match self.result_bank {
             ValType::Int
+            | ValType::Bool
             | ValType::UInt
             | ValType::Str
             | ValType::Timestamp
@@ -455,6 +467,7 @@ impl LoweredF {
             }
             let op = match slot.ty {
                 ValType::Int
+                | ValType::Bool
                 | ValType::UInt
                 | ValType::Str
                 | ValType::Timestamp
@@ -476,6 +489,7 @@ impl LoweredF {
         // for bit like the interpreter tiers.
         match self.result_bank {
             ValType::Int
+            | ValType::Bool
             | ValType::UInt
             | ValType::Str
             | ValType::Timestamp
@@ -495,6 +509,7 @@ impl LoweredF {
         }
         match self.result_bank {
             ValType::Int
+            | ValType::Bool
             | ValType::UInt
             | ValType::Str
             | ValType::Timestamp
@@ -557,6 +572,7 @@ impl LowerCtxF<'_> {
         let idx = match bank {
             // `Str` ids share the int register file (an `i64` content hash).
             ValType::Int
+            | ValType::Bool
             | ValType::UInt
             | ValType::Str
             | ValType::Timestamp
@@ -574,11 +590,27 @@ impl LowerCtxF<'_> {
         TReg { bank, idx }
     }
 
-    fn slot(&mut self, path: String) -> TReg {
+    /// Resolve a row slot whose type the schema must declare. An UNDECLARED path
+    /// is a decline, not a guess: the bank decides which ops the path is legal
+    /// under (`!x` needs `bool`, `x + 1` needs a numeric bank), so defaulting it
+    /// would silently pick a meaning the caller never stated — and the caller's
+    /// column, built from the same declaration, would then be read in the wrong
+    /// bank.
+    fn slot(&mut self, path: String) -> Result<TReg, LowerError> {
+        let ty = self
+            .schema
+            .get(&path)
+            .copied()
+            .ok_or_else(|| LowerError::unsupported(format!("undeclared path `{path}`")))?;
+        Ok(self.slot_typed(path, ty))
+    }
+
+    /// Resolve a slot whose type the LOWERING knows rather than the schema: the
+    /// derived `size(...)` / `offset(...)` columns, which are counts.
+    fn slot_typed(&mut self, path: String, ty: ValType) -> TReg {
         if let Some(&r) = self.slot_map.get(&path) {
             return r;
         }
-        let ty = self.schema.get(&path).copied().unwrap_or(ValType::Int);
         let r = self.fresh(ty);
         self.slot_map.insert(path.clone(), r);
         self.slots.push(SlotInfoF {
@@ -595,11 +627,14 @@ impl LowerCtxF<'_> {
     /// the inner loop, where `ea_reg` holds `(offset + j) * 8`. The inner loop
     /// body is straight-line (no runtime-list comprehension may nest inside
     /// one), so the first reference dominates every later one.
-    fn elem_slot(&mut self, path: String, ea_reg: usize) -> TReg {
+    fn elem_slot(&mut self, path: String, ea_reg: usize) -> Result<TReg, LowerError> {
         if let Some(&r) = self.elem_map.get(&path) {
-            return r;
+            return Ok(r);
         }
-        let ty = self.schema.get(&path).copied().unwrap_or(ValType::Int);
+        let ty =
+            self.schema.get(&path).copied().ok_or_else(|| {
+                LowerError::unsupported(format!("undeclared element path `{path}`"))
+            })?;
         let r = self.fresh(ty);
         let base_reg = self.fresh(ValType::Int).idx;
         let op = match ty {
@@ -615,18 +650,23 @@ impl LowerCtxF<'_> {
             reg: r.idx,
             kind: SlotKind::Element { base_reg },
         });
-        r
+        Ok(r)
     }
 
     /// Resolve `name` (optionally `.field`) against the list loop being
     /// lowered: `Some(reg)` when `name` is its iteration variable, `None` when
     /// it is not.
-    fn iter_var_slot(&mut self, name: &str, field: Option<&str>) -> Option<TReg> {
+    fn iter_var_slot(
+        &mut self,
+        name: &str,
+        field: Option<&str>,
+    ) -> Result<Option<TReg>, LowerError> {
         let (list, ea_reg) = match &self.list_loop {
             Some(l) if l.iter_var == name => (l.list.clone(), l.ea_reg),
-            _ => return None,
+            _ => return Ok(None),
         };
-        Some(self.elem_slot(elem_slot_path(&list, field), ea_reg))
+        self.elem_slot(elem_slot_path(&list, field), ea_reg)
+            .map(Some)
     }
 
     /// Emit `if regs[a] > regs[b] goto <patched later>` and return the body
@@ -713,18 +753,18 @@ fn compile_t(ctx: &mut LowerCtxF, e: &IdedExpr) -> Result<TReg, LowerError> {
             }
             // A runtime-list iteration variable resolves to that list's element
             // column, read at the inner loop's index.
-            if let Some(r) = ctx.iter_var_slot(name, None) {
+            if let Some(r) = ctx.iter_var_slot(name, None)? {
                 return Ok(r);
             }
             if declares_list(ctx.schema, name) {
                 return Err(LowerError::unsupported("list-valued expression"));
             }
-            Ok(ctx.slot(name.clone()))
+            ctx.slot(name.clone())
         }
         Expr::Select(_) => {
             let path = resolve_path(e)?;
             let (root, field) = path.split_once('.').unwrap_or((path.as_str(), ""));
-            if let Some(r) = ctx.iter_var_slot(root, Some(field)) {
+            if let Some(r) = ctx.iter_var_slot(root, Some(field))? {
                 return Ok(r);
             }
             if ctx.locals.contains_key(root) {
@@ -735,7 +775,7 @@ fn compile_t(ctx: &mut LowerCtxF, e: &IdedExpr) -> Result<TReg, LowerError> {
             if declares_list(ctx.schema, &path) {
                 return Err(LowerError::unsupported("list-valued expression"));
             }
-            Ok(ctx.slot(path))
+            ctx.slot(path)
         }
         Expr::Call(call) => compile_call_t(ctx, call),
         Expr::Comprehension(comp) => compile_comprehension_t(ctx, comp),
@@ -757,7 +797,7 @@ fn compile_literal_t(ctx: &mut LowerCtxF, lit: &LiteralValue) -> Result<TReg, Lo
             Ok(r)
         }
         LiteralValue::Boolean(b) => {
-            let r = ctx.fresh(ValType::Int);
+            let r = ctx.fresh(ValType::Bool);
             ctx.prelude
                 .extend_from_slice(&[OP_LOAD_CONST, b.into_inner() as i64, r.idx as i64]);
             Ok(r)
@@ -1230,7 +1270,7 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
                 "size() of a non-string, non-list column",
             ));
         }
-        return Ok(ctx.slot(size_slot_path(&path)));
+        return Ok(ctx.slot_typed(size_slot_path(&path), ValType::Int));
     }
 
     // Numeric type conversions. `double`/`int`/`uint` are global (non-member)
@@ -1298,7 +1338,7 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
         let x = compile_t(ctx, &call.args[0])?;
         if elements.is_empty() {
             // `x in []` is always false (the operand is still evaluated above).
-            let d = ctx.fresh(ValType::Int);
+            let d = ctx.fresh(ValType::Bool);
             ctx.prelude
                 .extend_from_slice(&[OP_LOAD_CONST, 0, d.idx as i64]);
             return Ok(d);
@@ -1314,13 +1354,13 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
             if ev.bank != x.bank {
                 return Err(LowerError::unsupported("@in heterogeneous element"));
             }
-            let t = ctx.fresh(ValType::Int);
+            let t = ctx.fresh(ValType::Bool);
             ctx.body
                 .extend_from_slice(&[eq_op, x.idx as i64, ev.idx as i64, t.idx as i64]);
             acc = Some(match acc {
                 None => t,
                 Some(prev) => {
-                    let o = ctx.fresh(ValType::Int);
+                    let o = ctx.fresh(ValType::Bool);
                     ctx.body.extend_from_slice(&[
                         OP_OR,
                         prev.idx as i64,
@@ -1334,7 +1374,7 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
         return Ok(acc.expect("non-empty element list"));
     }
 
-    // ternary `c ? t : f` — branchless blend on an int condition. Int arms use
+    // ternary `c ? t : f` — branchless blend on a bool condition. Int arms use
     // an arithmetic SELECT; float arms use a bit-mask FSELECT (bit-exact, no
     // reassociation). Mixed-bank arms bail: the tree-walker yields int-or-float
     // per row, which no single result bank can carry.
@@ -1343,15 +1383,18 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
             return Err(LowerError::unsupported("_?_:_ arity"));
         }
         let c = compile_t(ctx, &call.args[0])?;
-        if c.bank != ValType::Int {
-            return Err(LowerError::unsupported(
-                "ternary condition must be int/bool",
-            ));
+        // `1 ? x : y` is NoSuchOverload in the tree-walker: the condition is
+        // bool, not "anything in the int bank".
+        if c.bank != ValType::Bool {
+            return Err(LowerError::unsupported("ternary condition must be bool"));
         }
         let t = compile_t(ctx, &call.args[1])?;
         let f = compile_t(ctx, &call.args[2])?;
         let (op, bank) = match (t.bank, f.bank) {
             (ValType::Int, ValType::Int) => (OP_SELECT, ValType::Int),
+            // Both arms bool: the arithmetic select over `0`/`1` yields the
+            // chosen arm unchanged.
+            (ValType::Bool, ValType::Bool) => (OP_SELECT, ValType::Bool),
             (ValType::Float, ValType::Float) => (OP_FSELECT, ValType::Float),
             _ => return Err(LowerError::unsupported("mixed-bank ternary arms")),
         };
@@ -1369,10 +1412,22 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
         let base = resolve_path(&call.args[0])?;
         let idx = as_int_literal(&call.args[1])
             .ok_or_else(|| LowerError::unsupported("non-constant index"))?;
-        return Ok(ctx.slot(format!("{base}[{idx}]")));
+        // `base[k]` takes its type from its own key when the caller declared the
+        // indexed column directly, and otherwise from the list's element
+        // declaration `base[]` — the two spellings name the same values.
+        let path = format!("{base}[{idx}]");
+        let ty = ctx
+            .schema
+            .get(&path)
+            .or_else(|| ctx.schema.get(&elem_slot_path(&base, None)))
+            .copied()
+            .ok_or_else(|| LowerError::unsupported(format!("undeclared path `{path}`")))?;
+        return Ok(ctx.slot_typed(path, ty));
     }
 
-    // n-ary boolean fold — int operands, int result.
+    // n-ary boolean fold — bool operands, bool result. `OP_AND`/`OP_OR` are
+    // bitwise, which is only the logical answer on 0/1, so an int operand must
+    // bail rather than quietly compute `1 & 2`: `1 && 2` is NoSuchOverload.
     if name == ops::LOGICAL_AND || name == ops::LOGICAL_OR {
         if call.args.len() < 2 {
             return Err(LowerError::unsupported(format!("{name} arity")));
@@ -1383,15 +1438,15 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
             OP_OR
         };
         let mut acc = compile_t(ctx, &call.args[0])?;
-        if acc.bank != ValType::Int {
-            return Err(LowerError::unsupported("boolean operand must be int/bool"));
+        if acc.bank != ValType::Bool {
+            return Err(LowerError::unsupported("boolean operand must be bool"));
         }
         for arg in &call.args[1..] {
             let b = compile_t(ctx, arg)?;
-            if b.bank != ValType::Int {
-                return Err(LowerError::unsupported("boolean operand must be int/bool"));
+            if b.bank != ValType::Bool {
+                return Err(LowerError::unsupported("boolean operand must be bool"));
             }
-            let d = ctx.fresh(ValType::Int);
+            let d = ctx.fresh(ValType::Bool);
             ctx.body
                 .extend_from_slice(&[op, acc.idx as i64, b.idx as i64, d.idx as i64]);
             acc = d;
@@ -1399,7 +1454,7 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
         return Ok(acc);
     }
 
-    // comparisons — same-bank operands, int `0`/`1` result.
+    // comparisons — same-bank operands, `bool` result.
     let cmp = match name {
         ops::GREATER_EQUALS => Some((OP_GE, OP_FGE)),
         ops::GREATER => Some((OP_GT, OP_FGT)),
@@ -1429,7 +1484,7 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
                 ops::NOT_EQUALS => OP_NE,
                 _ => return Err(LowerError::unsupported("string ordering comparison")),
             };
-            let d = ctx.fresh(ValType::Int);
+            let d = ctx.fresh(ValType::Bool);
             ctx.body
                 .extend_from_slice(&[op, a.idx as i64, b.idx as i64, d.idx as i64]);
             return Ok(d);
@@ -1445,7 +1500,7 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
             if a.bank != b.bank {
                 return Err(LowerError::unsupported("mixed temporal comparison"));
             }
-            let d = ctx.fresh(ValType::Int);
+            let d = ctx.fresh(ValType::Bool);
             ctx.body
                 .extend_from_slice(&[iop, a.idx as i64, b.idx as i64, d.idx as i64]);
             return Ok(d);
@@ -1464,7 +1519,7 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
                 ops::NOT_EQUALS => (OP_NE, a, b),
                 _ => unreachable!("cmp is one of the six comparison ops"),
             };
-            let d = ctx.fresh(ValType::Int);
+            let d = ctx.fresh(ValType::Bool);
             ctx.body
                 .extend_from_slice(&[op, lhs.idx as i64, rhs.idx as i64, d.idx as i64]);
             return Ok(d);
@@ -1476,6 +1531,13 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
         // different bank is a CEL type error and bails.
         let op = match (a.bank, b.bank) {
             (ValType::Int, ValType::Int) => iop,
+            // Ordering IS defined on bool (`false < true`, `common/types/bool.rs`
+            // derives `Ord`), and `0`/`1` in the int file sorts the same way, so
+            // all six use the signed int op. A bool mixed with any other bank
+            // falls to the bail below: ordering is NoSuchOverload, and
+            // `1 == true` answers `false` rather than comparing bits — neither is
+            // something the int ops would produce.
+            (ValType::Bool, ValType::Bool) => iop,
             (ValType::Float, ValType::Float) => fop,
             (ValType::Int, ValType::Float) => {
                 a = emit_i2f(ctx, a);
@@ -1487,7 +1549,7 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
             }
             _ => return Err(LowerError::unsupported("mixed-bank comparison")),
         };
-        let d = ctx.fresh(ValType::Int);
+        let d = ctx.fresh(ValType::Bool);
         ctx.body
             .extend_from_slice(&[op, a.idx as i64, b.idx as i64, d.idx as i64]);
         return Ok(d);
@@ -1552,10 +1614,12 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
                     return Err(LowerError::unsupported("!_ arity"));
                 }
                 let a = compile_t(ctx, &call.args[0])?;
-                if a.bank != ValType::Int {
-                    return Err(LowerError::unsupported("! operand must be int/bool"));
+                // `!1` is NoSuchOverload; `OP_NOT` is only the logical negation
+                // on 0/1.
+                if a.bank != ValType::Bool {
+                    return Err(LowerError::unsupported("! operand must be bool"));
                 }
-                let d = ctx.fresh(ValType::Int);
+                let d = ctx.fresh(ValType::Bool);
                 ctx.body
                     .extend_from_slice(&[OP_NOT, a.idx as i64, d.idx as i64]);
                 Ok(d)
@@ -1572,6 +1636,7 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
                 let op = match a.bank {
                     ValType::Int => OP_NEG,
                     ValType::Float => OP_FNEG,
+                    ValType::Bool => return Err(LowerError::unsupported("unary negate on bool")),
                     ValType::UInt => return Err(LowerError::unsupported("unary negate on uint")),
                     ValType::Str => return Err(LowerError::unsupported("unary negate on string")),
                     ValType::Timestamp | ValType::Duration => {
@@ -1690,8 +1755,8 @@ fn compile_list_comprehension_t(
     if ctx.list_loop.is_some() {
         return Err(LowerError::unsupported("nested runtime-list comprehension"));
     }
-    let len = ctx.slot(size_slot_path(list));
-    let off = ctx.slot(offset_slot_path(list));
+    let len = ctx.slot_typed(size_slot_path(list), ValType::Int);
+    let off = ctx.slot_typed(offset_slot_path(list), ValType::Int);
     let one = emit_int_const(ctx, 1);
     let stride = emit_int_const(ctx, 8);
 

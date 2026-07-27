@@ -31,7 +31,7 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use cel::majit::bytecode::float_bank::{clean_interp_seeded_f, run_jit_seeded_f, COMPILES};
-use cel::majit::lower::{lower_typed, Schema};
+use cel::majit::lower::{lower_typed, Schema, ValType};
 use cel::{Context, Program, Value};
 
 const LCG_A: u64 = 6_364_136_223_846_793_005;
@@ -137,7 +137,7 @@ fn median_duration(mut values: Vec<Duration>) -> Duration {
     values[values.len() / 2]
 }
 
-fn request_latency(label: &str, expression: &str, samples: &[RequestSample]) {
+fn request_latency(label: &str, expression: &str, schema: &Schema, samples: &[RequestSample]) {
     let program = Program::compile(expression).expect("compile request expression");
     for sample in samples {
         assert_eq!(
@@ -168,7 +168,7 @@ fn request_latency(label: &str, expression: &str, samples: &[RequestSample]) {
     black_box(observed);
 
     let stock_ns = median_f64(timings);
-    let subset = if lower_typed(program.expression(), &Schema::new()).is_ok() {
+    let subset = if lower_typed(program.expression(), schema).is_ok() {
         "lowerable"
     } else {
         "not lowerable"
@@ -199,8 +199,16 @@ fn engine_program(
 ) -> (Vec<i64>, Vec<i64>, usize) {
     let program =
         Program::compile("balance >= amount && !frozen").expect("compile engine expression");
-    let lowered =
-        lower_typed(program.expression(), &Schema::new()).expect("engine expression must lower");
+    // `frozen` is a `bool` column — stored as `0`/`1` in the int file like the
+    // other two, but declared as what it is, which is what lets `!frozen` lower.
+    let schema: Schema = [
+        ("balance".to_string(), ValType::Int),
+        ("amount".to_string(), ValType::Int),
+        ("frozen".to_string(), ValType::Bool),
+    ]
+    .into_iter()
+    .collect();
+    let lowered = lower_typed(program.expression(), &schema).expect("engine expression must lower");
     let bases = [
         balance.as_ptr() as i64,
         amount.as_ptr() as i64,
@@ -301,16 +309,38 @@ fn main() {
     request_latency(
         "authorization",
         "account.balance >= transaction.withdrawal && !account.frozen",
+        &[
+            ("account.balance", ValType::Int),
+            ("transaction.withdrawal", ValType::Int),
+            ("account.frozen", ValType::Bool),
+        ]
+        .into_iter()
+        .map(|(p, t)| (p.to_string(), t))
+        .collect(),
         &auth_samples(),
     );
     request_latency(
         "HTTP routing",
         r#"request.method == "GET" && request.path.startsWith("/admin/")"#,
+        &[
+            ("request.method", ValType::Str),
+            ("request.path", ValType::Str),
+        ]
+        .into_iter()
+        .map(|(p, t)| (p.to_string(), t))
+        .collect(),
         &routing_samples(),
     );
     request_latency(
         "resource validation",
         "object.tags.all(t, t.size() <= 16) && object.replicas >= 1 && object.replicas <= 10",
+        &[
+            ("object.tags[]", ValType::Str),
+            ("object.replicas", ValType::Int),
+        ]
+        .into_iter()
+        .map(|(p, t)| (p.to_string(), t))
+        .collect(),
         &validation_samples(),
     );
 

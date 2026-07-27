@@ -33,7 +33,7 @@ use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use cel::majit::bytecode::float_bank::{clean_interp_seeded_f, run_jit_seeded_f, COMPILES};
-use cel::majit::lower::{lower_typed, Schema};
+use cel::majit::lower::{lower_typed, Schema, ValType};
 use cel::{Context, Program, Value};
 
 const LCG_A: i64 = 6364136223846793005;
@@ -66,8 +66,14 @@ fn main() {
     // Flagship policy predicate over three int/bool columns.
     let expr = "balance >= amount && !frozen";
     let program = Program::compile(expr).expect("compile");
-    let lowered =
-        lower_typed(program.expression(), &Schema::new()).expect("lower policy to majit subset");
+    let schema: Schema = [
+        ("balance".to_string(), ValType::Int),
+        ("amount".to_string(), ValType::Int),
+        ("frozen".to_string(), ValType::Bool),
+    ]
+    .into_iter()
+    .collect();
+    let lowered = lower_typed(program.expression(), &schema).expect("lower policy to majit subset");
     let slot_paths: Vec<&str> = lowered.slots.iter().map(|s| s.path.as_str()).collect();
     assert_eq!(slot_paths, ["balance", "amount", "frozen"], "slot order");
 

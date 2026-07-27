@@ -197,13 +197,14 @@ impl Column<'_> {
     fn matches(&self, ty: super::lower::ValType) -> bool {
         use super::lower::ValType;
         // A `uint` slot is backed by an int-bit column (the int register file
-        // carries the raw 64-bit pattern); a `string` slot is backed by an int
-        // column of content-hash ids.
+        // carries the raw 64-bit pattern); a `bool` slot by an int column of
+        // `0`/`1`; a `string` slot by an int column of content-hash ids.
         matches!(
             (self, ty),
             (
                 Column::Int(_),
                 ValType::Int
+                    | ValType::Bool
                     | ValType::UInt
                     | ValType::Str
                     | ValType::Timestamp
