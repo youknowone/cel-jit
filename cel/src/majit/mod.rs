@@ -2797,4 +2797,283 @@ mod tests {
             );
         }
     }
+
+    // ---------------------------------------------------------------------
+    // Lowering <-> tree-walker parity sweep
+    // ---------------------------------------------------------------------
+    //
+    // The per-feature tests above check expressions someone thought to write.
+    // `1 && 2` was not one of them: it lowered, the machine answered `3`, and
+    // the tree-walker raises `NoSuchOverload` — a JIT-only answer that stood
+    // because no test crossed an `int` operand with a boolean operator.
+    //
+    // This sweep crosses the whole operand matrix with the whole operator set
+    // mechanically. It asserts ONE property, the only one that matters for a
+    // drop-in replacement:
+    //
+    //   whenever the lowering ACCEPTS an expression and the machine ANSWERS,
+    //   the answer equals the tree-walker's — and the tree-walker must have
+    //   had an answer to give.
+    //
+    // Declining is always allowed (the caller falls back to the walker), and so
+    // is refusing mid-batch (the trap flag reaching the driver). Only answering
+    // differently, or answering at all where the walker raises, is a defect.
+
+    /// What one sweep expression did. Only [`SweepVerdict::Agreed`] compares
+    /// values; the other two are legal outcomes counted for coverage, so a
+    /// change that quietly declines everything shows up as a collapsed census
+    /// rather than as a green run.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum SweepVerdict {
+        /// The lowering refused the expression: it stays with the tree-walker.
+        Declined,
+        /// The machine ran but trapped, so the batch driver returned no answer.
+        Refused,
+        /// The machine answered and the answer equals the tree-walker's.
+        Agreed,
+    }
+
+    /// Every operand the sweep crosses: two columns of each declared type so a
+    /// same-bank binary op has two distinct operands, plus one literal of each
+    /// type so literal folding is covered on both sides of every operator.
+    ///
+    /// Values are chosen so the tree-walker itself never raises on the numeric
+    /// operators: no zero divisor, and magnitudes far from the i64/u64 bounds.
+    /// Overflow and division-by-zero have their own refusal tests; mixing them
+    /// in here would push most of the matrix down the `Refused` path and stop
+    /// the sweep from comparing values.
+    /// One literal of each type, so literal folding is covered on both sides of
+    /// every operator.
+    const LITERALS: [&str; 5] = ["6", "6u", "1.5", "true", "\"ab\""];
+
+    fn sweep_operands() -> (Vec<&'static str>, Vec<(&'static str, ColData)>) {
+        let cols: Vec<(&'static str, ColData)> = vec![
+            ("i", ColData::Int(vec![7, -3, 11, 2])),
+            ("j", ColData::Int(vec![2, 5, -1, 4])),
+            ("u", ColData::UInt(vec![3, 9, 1, 6])),
+            ("v", ColData::UInt(vec![2, 4, 8, 5])),
+            ("f", ColData::Float(vec![2.5, -0.5, 1.25, 3.0])),
+            ("g", ColData::Float(vec![0.5, 4.0, -2.0, 1.5])),
+            ("b", ColData::Bool(vec![1, 0, 1, 0])),
+            ("c", ColData::Bool(vec![1, 1, 0, 0])),
+            (
+                "s",
+                ColData::Str(
+                    ["ab", "cd", "ab", "ef"]
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect(),
+                ),
+            ),
+            (
+                "r",
+                ColData::Str(
+                    ["ab", "zz", "cd", "ef"]
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect(),
+                ),
+            ),
+            (
+                "t",
+                ColData::Timestamp(vec![
+                    1_700_000_000_000_000_000,
+                    1_600_000_000_000_000_000,
+                    1_800_000_000_000_000_000,
+                    0,
+                ]),
+            ),
+            (
+                "w",
+                ColData::Timestamp(vec![
+                    1_700_000_000_000_000_000,
+                    1_650_000_000_000_000_000,
+                    -1_000_000_000,
+                    1_000_000_000,
+                ]),
+            ),
+            (
+                "d",
+                ColData::Duration(vec![1_000_000_000, 2_500_000_000, -500_000_000, 0]),
+            ),
+            (
+                "e",
+                ColData::Duration(vec![3_000_000_000, -1_000_000_000, 1_000_000_000, 7]),
+            ),
+        ];
+        let mut srcs: Vec<&'static str> = cols.iter().map(|(n, _)| *n).collect();
+        srcs.extend(LITERALS);
+        (srcs, cols)
+    }
+
+    /// Run one sweep expression through both evaluators and check the parity
+    /// property. Panics with the expression on any divergence.
+    fn sweep_case(expr_src: &str, cols: &[(&str, ColData)]) -> SweepVerdict {
+        use super::lower::intern_hash;
+
+        let n = cols[0].1.len();
+
+        let program =
+            Program::compile(expr_src).unwrap_or_else(|e| panic!("parse `{expr_src}`: {e:?}"));
+        let schema: Schema = cols
+            .iter()
+            .map(|(nm, d)| (nm.to_string(), d.ty()))
+            .collect();
+        let lowered = match lower_typed(program.expression(), &schema) {
+            Ok(l) => l,
+            Err(_) => return SweepVerdict::Declined,
+        };
+
+        // Columns in SLOT order, materializing the two derived kinds the schema
+        // does not declare: a string column's `i64` content-hash ids, and a
+        // `size(<string>)` length column.
+        let declared: HashMap<&str, &ColData> = cols.iter().map(|(nm, d)| (*nm, d)).collect();
+        let mut derived: Vec<Vec<i64>> = Vec::new();
+        let mut plan: Vec<Result<&ColData, usize>> = Vec::new();
+        for slot in &lowered.slots {
+            match size_slot_source(&slot.path) {
+                Some(src) => {
+                    let Some(ColData::Str(c)) = declared.get(src) else {
+                        panic!(
+                            "`{expr_src}`: size slot `{}` has no string column",
+                            slot.path
+                        )
+                    };
+                    derived.push(c.iter().map(|s| s.len() as i64).collect());
+                    plan.push(Err(derived.len() - 1));
+                }
+                None => match declared.get(slot.path.as_str()) {
+                    Some(ColData::Str(c)) => {
+                        derived.push(c.iter().map(|s| intern_hash(s)).collect());
+                        plan.push(Err(derived.len() - 1));
+                    }
+                    Some(d) => plan.push(Ok(d)),
+                    None => panic!("`{expr_src}`: slot `{}` has no column", slot.path),
+                },
+            }
+        }
+        let columns: Vec<Column> = plan
+            .iter()
+            .map(|p| match p {
+                Ok(d) => d.column(),
+                Err(k) => Column::Int(&derived[*k]),
+            })
+            .collect();
+
+        // The tree-walker's per-row results, in row order. `None` marks a row it
+        // raised on: answering that row at all would be a JIT-only answer.
+        let oracle: Vec<Option<Value>> = (0..n)
+            .map(|k| program.execute(&row_context(cols, k)).ok())
+            .collect();
+        let walker_raised = oracle.iter().any(|v| v.is_none());
+
+        let float_result = lowered.result_bank == ValType::Float;
+        let got = if float_result {
+            super::bytecode::eval_batch_sum_float(&lowered, &columns, n, u32::MAX)
+                .map(|f| f.to_bits() as i64)
+        } else {
+            clean_batch_sum_f(&lowered, &columns, n)
+        };
+        let Some(got) = got else {
+            return SweepVerdict::Refused;
+        };
+        assert!(
+            !walker_raised,
+            "`{expr_src}`: the machine answered {got} where the tree-walker raises"
+        );
+
+        // Reduce the walker's rows the same way the batch loop does: an int-bank
+        // result sums as i64 (a `uint` rides the accumulator as its raw bit
+        // pattern), a float result sums as f64 in row order and is compared by
+        // BITS — float addition is order-sensitive, so a tolerance would hide
+        // exactly the reassociation this is here to catch.
+        let want = if float_result {
+            let mut acc = 0.0f64;
+            for v in oracle.iter().flatten() {
+                match v {
+                    Value::Float(x) => acc += x,
+                    other => panic!("`{expr_src}`: float result vs walker {other:?}"),
+                }
+            }
+            acc.to_bits() as i64
+        } else {
+            let mut acc = 0i64;
+            for v in oracle.iter().flatten() {
+                acc += match v {
+                    Value::Bool(x) => *x as i64,
+                    Value::Int(x) => *x,
+                    Value::UInt(x) => *x as i64,
+                    other => panic!(
+                        "`{expr_src}`: lowered to bank {:?} but the walker answers {other:?}",
+                        lowered.result_bank
+                    ),
+                };
+            }
+            acc
+        };
+        assert_eq!(got, want, "`{expr_src}`: machine vs tree-walker");
+
+        // The majit interpreter tier must reproduce the clean tier's answer.
+        // The COMPILED tier is deliberately not run here: it would trace and
+        // compile once per expression, and what this sweep is testing is the
+        // LOWERING's type rules, which are the same words on every tier. The
+        // compiled tier is covered per feature by the `check_batch_*` helpers.
+        if !float_result {
+            assert_eq!(
+                eval_batch_sum_f(&lowered, &columns, n, u32::MAX),
+                Some(got),
+                "`{expr_src}`: majit interp tier vs clean tier"
+            );
+        }
+        SweepVerdict::Agreed
+    }
+
+    /// Cross every operand with every binary operator and check parity.
+    #[test]
+    fn parity_sweep_binary_operators() {
+        let (srcs, cols) = sweep_operands();
+        let mut census = [0usize; 3];
+        for a in &srcs {
+            for b in &srcs {
+                for op in [
+                    "+", "-", "*", "/", "%", "==", "!=", "<", "<=", ">", ">=", "&&", "||",
+                ] {
+                    let expr = format!("{a} {op} {b}");
+                    let v = sweep_case(&expr, &cols);
+                    census[v as usize] += 1;
+                }
+            }
+        }
+        // The sweep is only evidence while it still ANSWERS things. These floors
+        // are well under the current counts; they exist so a change that makes
+        // the lowering decline everything fails here instead of going green.
+        assert!(
+            census[SweepVerdict::Agreed as usize] > 200,
+            "parity sweep census {census:?} — too few compared answers to be evidence"
+        );
+    }
+
+    /// The unary operators and the ternary, over the same operand matrix.
+    #[test]
+    fn parity_sweep_unary_and_ternary() {
+        let (srcs, cols) = sweep_operands();
+        let mut agreed = 0usize;
+        for a in &srcs {
+            for expr in [format!("!{a}"), format!("-{a}")] {
+                if sweep_case(&expr, &cols) == SweepVerdict::Agreed {
+                    agreed += 1;
+                }
+            }
+            for b in &srcs {
+                let expr = format!("{a} ? {b} : {b}");
+                if sweep_case(&expr, &cols) == SweepVerdict::Agreed {
+                    agreed += 1;
+                }
+            }
+        }
+        assert!(
+            agreed > 20,
+            "unary/ternary sweep agreed on only {agreed} expressions — too few to be evidence"
+        );
+    }
 }
