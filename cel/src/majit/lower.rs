@@ -1810,7 +1810,15 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
                     .extend_from_slice(&[fop, a.idx as i64, b.idx as i64, d.idx as i64]);
                 Ok(d)
             }
-            _ => Err(LowerError::unsupported("mixed int/float arithmetic")),
+            // Not only the int/float mix: `string + string` is concatenation and
+            // `timestamp + duration` is calendar arithmetic, both of which CEL
+            // defines and both of which land here. Name the banks so the census
+            // reports the operand types it actually declined rather than
+            // filing every one of them under a numeric mismatch.
+            _ => Err(LowerError::unsupported(format!(
+                "arithmetic on {:?} and {:?}",
+                a.bank, b.bank
+            ))),
         }
     } else {
         match name {
