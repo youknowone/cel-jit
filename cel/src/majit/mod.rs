@@ -1394,20 +1394,43 @@ mod tests {
 
     #[test]
     fn size_bails() {
-        // Only a `string` or `list` column has a materialized length column. An
-        // int/map column has no length at all, and a non-column argument has
-        // nothing to derive from.
+        // Only a `string` or `list` column has a materialized length column,
+        // and an int column has no length at all. A LITERAL string or list is
+        // not a column and does not need one — its length is green and folds
+        // (see `size_folds_a_literal_argument`).
         let schema: Schema = [
             ("s".to_string(), ValType::Str),
             ("i".to_string(), ValType::Int),
         ]
         .into_iter()
         .collect();
-        for expr in ["size(i) > 1", "i.size() > 1", "size(\"abc\") > 1"] {
+        for expr in ["size(i) > 1", "i.size() > 1"] {
             let program = Program::compile(expr).unwrap();
             assert!(
                 lower_typed(program.expression(), &schema).is_err(),
                 "`{expr}` must bail the typed lowering"
+            );
+        }
+    }
+
+    /// A literal argument's length is known while lowering — `str::len` is the
+    /// same UTF-8 BYTE count the walker reports, including for multi-byte
+    /// characters, so the fold must not count chars.
+    #[test]
+    fn size_folds_a_literal_argument() {
+        let cols: Vec<(&'static str, ColData)> = vec![("i", ColData::Int(vec![1, 2, 3, 4]))];
+        for expr in [
+            "size('abc') > 1",
+            "size('') == 0",
+            "size('\u{00e9}') == 2",
+            "size('\u{d55c}\u{ae00}') == 6",
+            "size([1, 2, 3]) == 3",
+            "size('ab') + i > 3",
+        ] {
+            assert_eq!(
+                sweep_case(expr, &cols),
+                SweepVerdict::Agreed,
+                "`{expr}` folds to a constant and must match the walker"
             );
         }
     }
@@ -3132,13 +3155,15 @@ mod tests {
     #[test]
     fn coverage_gap_does_not_grow() {
         use std::collections::BTreeMap;
-        // What is left. Every entry is the same limit: a string is interned to
-        // an `i64` content-hash id, so `<` has no order to read and `+` has no
-        // characters to join, and a string- or timestamp-valued top-level
-        // result has no sum for the batch loop to reduce to. (`-b` is the
-        // walker answering `-true` as `false`, which no CEL overload defines —
-        // matching it would put that bug in the JIT tier too.)
-        const GAP_CEILING: usize = 89;
+        // What is left, and it is almost all ONE limit: a string is interned
+        // to an `i64` content-hash id, so `<` has no order to read, `+` and
+        // `string(x)` have no characters to produce, and `startsWith` and its
+        // three siblings have none to inspect. The rest is the batch loop
+        // reducing by SUM, which a string- or timestamp-valued top-level result
+        // has no answer for. (`-b` is the walker answering `-true` as `false`,
+        // which no CEL overload defines — matching it would put that bug in the
+        // JIT tier too.)
+        const GAP_CEILING: usize = 117;
 
         let (srcs, cols) = sweep_operands();
         let schema: Schema = cols
@@ -3159,6 +3184,20 @@ mod tests {
             }
             exprs.push(format!("!{a}"));
             exprs.push(format!("-{a}"));
+            // The operator matrix says nothing about CEL's FUNCTION surface,
+            // and the two are separate coverage questions: the conversions and
+            // the string methods each reach the lowering by a different door.
+            // Applying every one to every operand leaves the walker to say
+            // which pairings have an answer, exactly as above.
+            for f in ["int", "uint", "double", "string", "size"] {
+                exprs.push(format!("{f}({a}) == {f}({a})"));
+            }
+            for m in ["startsWith", "endsWith", "contains", "matches"] {
+                exprs.push(format!("{a}.{m}('ab')"));
+            }
+            for g in ["getFullYear", "getHours", "getDayOfWeek"] {
+                exprs.push(format!("{a}.{g}() > 1"));
+            }
         }
 
         let mut gap: BTreeMap<String, (usize, String)> = BTreeMap::new();

@@ -1414,6 +1414,11 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
         if let Expr::List(list) = &call.args[0].expr {
             return Ok(emit_int_const(ctx, list.elements.len() as i64));
         }
+        // A string literal has its bytes right here, so its length is green
+        // too. `str::len` is the same BYTE count the walker reports.
+        if let Some(lit) = as_string_literal(&call.args[0]) {
+            return Ok(emit_int_const(ctx, lit.len() as i64));
+        }
         let path = match &call.args[0].expr {
             Expr::Ident(n) if !ctx.locals.contains_key(n) => n.clone(),
             Expr::Select(_) => resolve_path(&call.args[0])?,
