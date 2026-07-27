@@ -314,7 +314,10 @@ fn main() {
     let sizes = ladder(max_rows);
 
     println!("items.all(i, i.price > 10) — {rounds} interleaved rounds per point");
-    println!("fresh JitDriver per jit run: trace + compile are INSIDE the timed region");
+    println!(
+        "the driver and the interned program outlive a run, so trace + compile are inside the \
+         timed region only until one of them has paid for the loop; the `cmp` column says which"
+    );
 
     for (label, len_of) in cases {
         if let Some(filter) = &only {

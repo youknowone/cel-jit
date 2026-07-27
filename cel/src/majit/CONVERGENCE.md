@@ -438,10 +438,11 @@ as the other close paths).
 `cel/examples/majit_nested_bench.rs` sweeps each shape over a geometric ladder of
 row counts and reports the MINIMUM of interleaved rounds — interference can only
 make a round slower, so the fastest round is the robust estimator, and a median
-on a shared box swings the baseline several-fold. Compilation is inside the timed
-region (there is no API to reuse a warm `JitDriver`), so a single batch size
-cannot separate "the compiled code is slow" from "the batch was too short to pay
-for compiling"; the ladder can.
+on a shared box swings the baseline several-fold. Compilation was inside the
+timed region of every batch when these numbers were taken, so a single batch size
+could not separate "the compiled code is slow" from "the batch was too short to
+pay for compiling"; the ladder can. (The section below removes that fixed cost;
+the ladder is still what shows it is gone.)
 
 The same binary, built once against pre-defect-1 majit and once against HEAD
 (three HEAD runs, one base run, all on the same loaded box):
@@ -473,14 +474,78 @@ The floor check says the columnar pipeline is worth having in the first place �
 so the lowering alone buys ~8x and the JIT buys ~8x on top of that, ~66x
 end to end. Pre-fix majit ran this at 3276 ns/row — slower than the tree-walker.
 
+## The fixed cost: the driver and the program now outlive a batch
+
+The break-even above was set entirely by trace + compile, and the arithmetic said
+no per-compile trim could reach it: the compiled tier beat the clean VM by
+155 ns/row, so winning under 10k rows needed the whole trace-and-compile to fit
+in 1.55 ms, against a measured ~10 ms (optimize 1.65 ms, cranelift backend
+3.72 ms at ~18 us/op, driver setup ~1.2 ms). Trimming all of it at once still
+lands at 3.5–5 ms.
+
+The cost was not the compiler's. It was that cel paid it **again for every
+batch**, which upstream never does: the compiled procedure token lives on the
+greens-keyed JitCell (`warmstate.py:157-199 wref_procedure_token`) and
+`memmgr.py:23-69` keeps it for `max_age` generations. Two things forced the
+repeat, and both had to go:
+
+1. `batch_sum_program_trapping` emitted an `OP_LOAD_CONST` for each column base,
+   for `n` and for the trap-word address. The green key is the program POINTER
+   plus pc (`trace_ctx.rs green_key_raw`), so different data meant different
+   words meant a different key. They are now plain reds, seeded into the initial
+   register bank by `BatchSeed::regs`. Red data columns are the upstream norm:
+   `rsre_core.py:384-385` keeps the regex pattern green and the subject string
+   red, `micronumpy/loop.py:88-89` keeps array base storage red. They must stay
+   *plain* reds — `promote()` inserts a `guard_value`, and a guard that fails
+   every batch generates a bridge per batch (`rlib/jit.py`), which is per-batch
+   recompilation renamed.
+2. `run_mainloop_f` built its own `JitDriver`, so the compiled loop died with the
+   call. The mainloop now takes `&mut JitDriver`, and `float_bank` keeps drivers
+   in a thread-local map plus interns the program words, so the address the key
+   is built from stays put. This is the wasmi kernel's arrangement
+   (`kernel.rs:1610`, `:3677-3689`).
+
+Same binary, same box, five shapes over the same ladder:
+
+| shape | jit/clean @640k before → after | fitted steady before → after | break-even |
+|---|---|---|---|
+| constant 8      | 7.8–9.2x → **28.74x** | 20–26x → 29.26x | 22–32k rows → **358** |
+| alternating 8/9 | 4.3–5.1x → **9.57x**  | 8–10x → 9.64x   | → **620** |
+| cycle 4..12     | 2.5–2.8x → **5.83x**  | 6–7x → 5.86x    | → **577** |
+| spread 0..32    | 4.6–7.2x → **7.68x**  | 8–13x → 7.69x   | → **271** |
+| constant 64     | 4.8–5.1x → **13.08x** | (degenerate)    | — |
+
+The signature is that measured @640k now EQUALS fitted steady (28.74 vs 29.26,
+9.57 vs 9.64, 5.83 vs 5.86, 7.68 vs 7.69): with no fixed cost left there is
+nothing to amortise, so every size runs at the same rate. Trace + compile fits at
+0.02–0.05 ms, and every shape wins at the smallest swept size — 10k rows, where
+all five used to lose. Paying the compile in full, `constant 8` at 10k still runs
+12.00x the clean VM.
+
+Read the `cmp` column when comparing shapes in one run: the five shapes share one
+expression, so the first shape to reach 10k rows compiles the loop and the rest
+reuse it. That is the real shape of the win for cel's use case — one policy,
+many batches — but it means a shape's own compile shows up only where `cmp` is
+non-zero. A second batch of one expression compiles 0 times and still answers its
+own columns' question, which `same_expression_second_batch_reuses_the_loop` pins.
+
+A second data shape on a warm driver takes the existing loop's exit guard until
+that guard is hot and then attaches a BRIDGE (`Traces bridged: 1` under
+`MAJIT_STATS=1`), which is why the trace-census tests reset between shapes: they
+pin per-shape tracing, not the reuse path.
+
+Also landed here: cranelift's IR verifier now runs only under `debug_assertions`
+(backend 3719 → 2783 us, steady-state unchanged), matching `compile.py:242-244`,
+which runs the equivalent checks under `if not we_are_translated()`. And
+`new_driver_f` passes `periodic_invalidation = false`, since there is no
+quasi-immutable state here and the timer would re-invalidate what a persistent
+driver just compiled.
+
 ### Still open
 
-- **Trace + compile cost.** 8–27 ms for the nested shape against ~1.7 ms for the
-  flat one is what sets break-even, and it is now the dominant remaining cost
-  below ~100k rows. This is a compile-speed problem, not a code-quality one.
-- **`cycle 4..12` is the weakest shape** at 2.8x against 8–9x for a constant trip
-  count. Its 1609 deopts are warmup-bounded (the count does not grow with row
-  count), so the residual is the cost of hopping between bridges, not bailing.
+- **`cycle 4..12` is the weakest shape** at 5.8x against 29x for a constant trip
+  count. Its deopts are warmup-bounded (the count does not grow with row count),
+  so the residual is the cost of hopping between bridges, not bailing.
 - **The JUMP-into-ptoken half of :3001-3007.** Now that bridges form it is
   reachable, because the trip count stays in the inner loop's own back-edge
   instead of being baked into the outer trace. On top of defect 4 it takes trip
