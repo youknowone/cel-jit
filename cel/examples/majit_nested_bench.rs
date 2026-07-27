@@ -90,9 +90,34 @@ impl ListColumns {
         )
     }
 
-    /// Mean elements per row — the inner loop's trip count.
+    /// Mean elements per row — the list LENGTH, not the loop's trip count.
     fn mean_trip(&self) -> f64 {
         self.lens.iter().sum::<i64>() as f64 / self.lens.len() as f64
+    }
+
+    /// Elements the comprehension actually inspects, over the first `rows`.
+    ///
+    /// `all()` stops at the first element that fails the predicate, so the list
+    /// length is NOT the trip count, and where that first failure lands is most
+    /// of what separates these shapes. Dividing ns/row by the length would
+    /// charge the loop for elements it never read, which is why the per-element
+    /// column reports against this instead.
+    fn examined(&self, rows: usize) -> u64 {
+        let mut total = 0;
+        let mut off = 0usize;
+        for r in 0..rows {
+            let len = self.lens[r] as usize;
+            let mut seen = 0;
+            for k in 0..len {
+                seen += 1;
+                if self.elems[off + k] <= 10 {
+                    break;
+                }
+            }
+            total += seen;
+            off += len;
+        }
+        total
     }
 }
 
@@ -335,23 +360,36 @@ fn main() {
         );
         println!();
         println!(
-            "[{label}]  mean trip count {:.2};  tree-walker reference \
+            "[{label}]  mean list length {:.2}, mean elements examined {:.2};  \
+             tree-walker reference \
              {tree_ns:.2} ns/eval (cached Program::execute, pool of {pool_rows})",
-            data.mean_trip()
+            data.mean_trip(),
+            data.examined(max_rows) as f64 / max_rows as f64,
         );
         println!(
-            "{:>10} {:>11} {:>12} {:>11} {:>10} {:>10} {:>5} {:>8} {:>5}",
-            "rows", "clean", "interp", "jit", "jit/clean", "jit/interp", "cmp", "deopts", "abrt"
+            "{:>10} {:>11} {:>12} {:>11} {:>9} {:>10} {:>10} {:>5} {:>8} {:>5}",
+            "rows",
+            "clean",
+            "interp",
+            "jit",
+            "jit/elem",
+            "jit/clean",
+            "jit/interp",
+            "cmp",
+            "deopts",
+            "abrt"
         );
         let mut points = Vec::new();
         for &n in &sizes {
             let p = measure_at(&lowered, &data, n, rounds, label);
             println!(
-                "{:>10} {:>8.2} ns {:>9.2} ns {:>8.2} ns {:>9.2}x {:>9.2}x {:>5} {:>8} {:>5}",
+                "{:>10} {:>8.2} ns {:>9.2} ns {:>8.2} ns {:>6.2} ns {:>9.2}x {:>9.2}x {:>5} \
+                 {:>8} {:>5}",
                 p.rows,
                 ns_per_row(p.clean, p.rows),
                 ns_per_row(p.interp, p.rows),
                 ns_per_row(p.jit, p.rows),
+                p.jit.as_secs_f64() * 1e9 / data.examined(p.rows) as f64,
                 p.clean.as_secs_f64() / p.jit.as_secs_f64(),
                 p.interp.as_secs_f64() / p.jit.as_secs_f64(),
                 p.compiles,
