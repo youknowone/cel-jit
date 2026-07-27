@@ -555,3 +555,77 @@ driver just compiled.
 - **Single-activation API.** None of this touches `Program::execute(&Context)`,
   which is how CEL is actually called. The JIT cell in `majit_ab`'s primary panel
   stays N/A until an `execute_jit(program, activation)` exists.
+
+## Two evaluators means the second one must be checked against the first
+
+Until the convergence above lands, the tier's correctness claim rests entirely on
+"evaluator 2 answers what evaluator 1 answers". Three things now hold that up.
+
+**`bool` is a type.** `ValType` had `Int`, `UInt`, `Float`, `Str`, `Timestamp`,
+`Duration` — and no `Bool`, because a bool is `0`/`1` in the int register file
+and storage was the only question asked. So the tests at `&&`, `||`, `!` and the
+ternary condition were "is this operand in the int bank", which an `int` passes.
+`a && b` with `a = 1, b = 2` lowered to the bitwise `OP_AND` and answered `3`;
+the tree-walker raises `NoSuchOverload`. Reproducible on the clean tier, so it
+was never a trace defect. `ValType::Bool` now exists and those operators require
+it — CEL says `1 && 2`, `!1` and `1 ? x : y` are all `NoSuchOverload`,
+`true + true` is unsupported, and `1 == true` is `false` rather than a bit
+compare, while ordering IS defined (`false < true`) and lowers to the signed int
+ops.
+
+**An undeclared path declines.** `slot()` used to default an absent schema entry
+to `ValType::Int`. The bank decides which operators a path is legal under, and
+the caller builds its columns from the same declaration, so a default is a
+silently chosen meaning. `select_chain_slots` had been asserting that
+`account.balance >= txn.amount && !account.frozen` was "lowerable" with an empty
+schema — i.e. with a bool read as an int. Only the derived `size(...)` /
+`offset(...)` columns still get their type from the lowering, because they are
+counts.
+
+**A parity sweep, not a list of remembered cases.** `parity_sweep_binary_operators`
+crosses two columns of every `ValType` plus one literal of each type with the
+thirteen binary operators — 4693 expressions — and asserts the one property that
+matters: when the lowering accepts and the machine answers, the answer equals
+the tree-walker's, and the walker must have had an answer to give. Declining and
+refusing mid-batch are legal and are counted (4159 / 6 / 528) rather than
+asserted, so a change that quietly declines everything collapses the census
+instead of going green. Restoring the int operand to the `&&` fold fails it with
+`` `i && i`: the machine answered 17 where the tree-walker raises ``.
+
+## The batch tier has an API now
+
+The tier had internals and no API, so every caller repeated the encoding by
+hand: column vectors in the lowering's slot order, base pointers, `intern_hash`
+loops with their own injectivity check, Arrow offset buffers, register counts.
+That hand-encoding is where the `bool`-as-`int` declaration came from.
+
+`cel::majit::batch` is that encoding written once, in CEL's types:
+
+```rust
+let program = BatchProgram::compile("balance >= amount && !frozen", &schema)?;
+let batch = Batch::new(n)
+    .column("balance", ColumnRef::Int(&balance))
+    .column("amount", ColumnRef::Int(&amount))
+    .column("frozen", ColumnRef::Bool(&frozen));
+let matching_rows = program.bind(&batch)?.sum()?;
+```
+
+`compile` is per expression, `bind` is per batch — the split the warm driver
+needs. `bind` materializes what the schema does not declare (`0`/`1` for bools,
+content-hash ids, `size(...)` lengths, `offset(...)` prefix sums), checks hash
+injectivity, and builds the batch program once; `sum_on(tier)` runs it. Slot
+order, banks and base pointers never reach the caller. Errors are split into the
+permanent (`Lower`) and the data-dependent (`MissingColumn`, `ColumnType`,
+`RowCount`, `HashCollision`, `Trapped`), all meaning "use `Program::execute`".
+
+This is a **batch aggregate** API, not the single-activation one the section
+above is still waiting on: the answer is `sum over rows of expr(row)`, because a
+running total in a loop-carried accumulator is what the compiled trace has. A
+per-row output column would need a store opcode whose PyPy justification has not
+been verified.
+
+Moving `majit_columnar_batch` onto it moved its JIT figure from 1.23 to 0.62
+ns/row: it had been calling `run_jit_seeded_f`, which builds a driver per call,
+so the flagship example had never measured the warm driver. `majit_ab` stays on
+the raw entry points on purpose — both of its panels measure the cold path, a
+fresh driver per run, which the API cannot express.
