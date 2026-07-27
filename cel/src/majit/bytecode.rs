@@ -259,8 +259,13 @@ fn batch_sum_with(
     // while the program writes it through the raw pointer baked into `prog`.
     let mut trap: Box<i64> = Box::new(0);
     let trap_addr = (&mut *trap) as *mut i64 as i64;
-    let (batch, init_regs) = lowered.batch_sum_program_trapping(&bases, n as i64, trap_addr);
-    let result = run(&batch.code, &init_regs, batch.num_float_regs);
+    let shape = lowered.batch_sum_shape(true);
+    let init_regs = shape.seed.regs(&bases, n as i64, trap_addr);
+    // The words are the same for every batch of this expression, so interning
+    // them keeps the JIT's green key — and with it the compiled loop the driver
+    // holds — from changing between batches.
+    let code = float_bank::intern_program(shape.code);
+    let result = run(&code, &init_regs, shape.num_float_regs);
     // The raw pointers in `init_regs` alias `columns`; keep the borrow live
     // across the run so the buffers cannot be dropped underneath the trace.
     core::hint::black_box(columns);
@@ -295,7 +300,7 @@ pub fn eval_batch_sum_f(
     threshold: u32,
 ) -> Option<i64> {
     batch_sum_with(lowered, columns, n, "eval_batch_sum_f", |prog, regs, nf| {
-        float_bank::run_jit_seeded_f(prog, regs, nf, threshold)
+        float_bank::run_jit_persistent_f(prog, regs, nf, threshold)
     })
 }
 
@@ -1317,8 +1322,12 @@ pub mod float_bank {
         num_regs: usize,
         num_fregs: usize,
     ) -> majit_metainterp::JitDriver<VmStateF> {
+        // No quasi-immutable state exists here (a fixed batch program over plain
+        // integer and float reds), so skip the periodic loop-invalidation timer:
+        // it has nothing to invalidate and would only force a persistent driver
+        // to re-trace what it already compiled (`jitdriver.rs with_options`).
         let mut driver: majit_metainterp::JitDriver<VmStateF> =
-            majit_metainterp::JitDriver::new(threshold);
+            majit_metainterp::JitDriver::with_options(threshold, false);
         driver.set_on_compile_loop(|_green_key, _ops_before, _ops_after| {
             COMPILES.fetch_add(1, Ordering::Relaxed);
         });
@@ -1359,5 +1368,80 @@ pub mod float_bank {
         let init_fregs = vec![0.0f64; num_fregs];
         let mut driver = new_driver_f(threshold, program, init_regs.len(), num_fregs);
         run_mainloop_f(&mut driver, program, init_regs, &init_fregs)
+    }
+
+    std::thread_local! {
+        /// Batch programs interned by their own words.
+        ///
+        /// The `#[jit_interp]` green key is the program **pointer** plus pc
+        /// (`trace_ctx.rs` `green_key_raw`), so a compiled loop is only reused
+        /// when the next batch runs the same allocation. A batch program's words
+        /// depend only on the expression's shape, so every batch of one
+        /// expression builds identical words and shares this entry. Entries are
+        /// never removed, which is what keeps the address stable.
+        static PROGRAMS: core::cell::RefCell<std::collections::HashSet<std::rc::Rc<[i64]>>> =
+            core::cell::RefCell::new(std::collections::HashSet::new());
+
+        /// Drivers kept across calls, keyed by the state shape they were built
+        /// for and the threshold they compile at.
+        ///
+        /// The compiled loop lives in the driver, so a driver per call is a
+        /// recompile per call. RPython keeps it on the greens-keyed JitCell
+        /// instead (`warmstate.py:157-199` `wref_procedure_token`, held for
+        /// `max_age` generations by `memmgr.py:23-69`) and never recompiles per
+        /// invocation. The threshold is part of the key so the interpreter tier
+        /// (`u32::MAX`) can never pick up the JIT tier's compiled loop.
+        static DRIVERS: core::cell::RefCell<
+            std::collections::HashMap<(usize, usize, u32), majit_metainterp::JitDriver<VmStateF>>,
+        > = core::cell::RefCell::new(std::collections::HashMap::new());
+    }
+
+    /// Intern a batch program's words, returning a handle whose address stays
+    /// put for the rest of the process so the green key keyed on it does too.
+    pub fn intern_program(code: Vec<i64>) -> std::rc::Rc<[i64]> {
+        PROGRAMS.with(|p| {
+            let mut p = p.borrow_mut();
+            if let Some(interned) = p.get(&code[..]) {
+                return interned.clone();
+            }
+            let interned: std::rc::Rc<[i64]> = code.into();
+            p.insert(interned.clone());
+            interned
+        })
+    }
+
+    /// Drop this thread's interned programs and persistent drivers, so the next
+    /// batch traces and compiles from cold.
+    ///
+    /// The two caches are cleared together and must always be: a driver's
+    /// compiled loops are keyed on program **addresses**, so keeping the drivers
+    /// while freeing the programs would let a freshly interned program land on a
+    /// freed address and pick up another program's compiled loop.
+    pub fn reset_persistent_state() {
+        DRIVERS.with(|d| d.borrow_mut().clear());
+        PROGRAMS.with(|p| p.borrow_mut().clear());
+    }
+
+    /// [`run_jit_seeded_f`] on a driver that outlives the call, so a program
+    /// already compiled by an earlier call runs compiled from its first row.
+    pub fn run_jit_persistent_f(
+        program: &Code,
+        init_regs: &[i64],
+        num_fregs: usize,
+        threshold: u32,
+    ) -> i64 {
+        let key = (init_regs.len(), num_fregs, threshold);
+        // Take the driver out of the map for the duration of the run instead of
+        // holding the borrow across it: a re-entrant call then builds its own
+        // driver rather than panicking on the `RefCell`.
+        let mut driver = DRIVERS
+            .with(|d| d.borrow_mut().remove(&key))
+            .unwrap_or_else(|| new_driver_f(threshold, program, init_regs.len(), num_fregs));
+        let init_fregs = vec![0.0f64; num_fregs];
+        let result = run_mainloop_f(&mut driver, program, init_regs, &init_fregs);
+        DRIVERS.with(|d| {
+            d.borrow_mut().insert(key, driver);
+        });
+        result
     }
 }

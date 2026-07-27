@@ -723,6 +723,9 @@ mod tests {
             None,
             "batch jit-off must refuse `{expr_src}`"
         );
+        // Start the compiled tier cold: the driver persists across calls, so a
+        // loop an earlier case already compiled would not compile again.
+        super::bytecode::float_bank::reset_persistent_state();
         let before = COMPILES_F.load(Ordering::Relaxed);
         assert_eq!(
             eval_batch_sum_f(&lowered, &columns, n, 8),
@@ -803,6 +806,9 @@ mod tests {
             Some(expected),
             "batch jit-off vs stock for `{expr_src}`"
         );
+        // Start the compiled tier cold: the driver persists across calls, so a
+        // loop an earlier case already compiled would not compile again.
+        super::bytecode::float_bank::reset_persistent_state();
         let before = COMPILES_F.load(Ordering::Relaxed);
         let on = eval_batch_sum_f(&lowered, &columns, n, 8);
         assert_eq!(on, Some(expected), "batch jit-on vs stock for `{expr_src}`");
@@ -886,6 +892,9 @@ mod tests {
             expected.to_bits(),
             "batch jit-off vs stock for `{expr_src}`"
         );
+        // Start the compiled tier cold: the driver persists across calls, so a
+        // loop an earlier case already compiled would not compile again.
+        super::bytecode::float_bank::reset_persistent_state();
         let before = COMPILES_F.load(Ordering::Relaxed);
         let on = eval_batch_sum_float(&lowered, &columns, n, 8)
             .unwrap_or_else(|| panic!("jit-on tier trapped on `{expr_src}`"));
@@ -1081,6 +1090,9 @@ mod tests {
             Some(expected),
             "batch jit-off vs stock for `{expr_src}`"
         );
+        // Start the compiled tier cold: the driver persists across calls, so a
+        // loop an earlier case already compiled would not compile again.
+        super::bytecode::float_bank::reset_persistent_state();
         let before = COMPILES_F.load(Ordering::Relaxed);
         let on = eval_batch_sum_f(&lowered, &columns, n, 8);
         assert_eq!(on, Some(expected), "batch jit-on vs stock for `{expr_src}`");
@@ -1286,6 +1298,9 @@ mod tests {
             expected,
             "batch jit-off vs stock for `{expr_src}`"
         );
+        // Start the compiled tier cold: the driver persists across calls, so a
+        // loop an earlier case already compiled would not compile again.
+        super::bytecode::float_bank::reset_persistent_state();
         let before = COMPILES_F.load(Ordering::Relaxed);
         assert_eq!(
             eval_batch_sum_f(&lowered, &columns, n, 8),
@@ -2234,6 +2249,9 @@ mod tests {
                 None,
                 "jit-off tier must refuse `{expr}`"
             );
+            // Start the compiled tier cold: the driver persists across calls, so a
+            // loop an earlier case already compiled would not compile again.
+            super::bytecode::float_bank::reset_persistent_state();
             let before = COMPILES_F.load(Ordering::Relaxed);
             assert_eq!(
                 eval_batch_sum_f(&lowered, &columns, n, 8),

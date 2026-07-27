@@ -16,7 +16,9 @@
 
 use std::sync::atomic::Ordering;
 
-use cel::majit::bytecode::float_bank::{COMPILES, GUARD_FAILS, TRACE_ABORTS};
+use cel::majit::bytecode::float_bank::{
+    reset_persistent_state, COMPILES, GUARD_FAILS, TRACE_ABORTS,
+};
 use cel::majit::bytecode::{clean_batch_sum_f, eval_batch_sum_f, Column};
 use cel::majit::lower::{lower_typed, LoweredF, Schema, ValType};
 use cel::Program;
@@ -32,6 +34,23 @@ fn serial() -> std::sync::MutexGuard<'static, ()> {
 /// `columns` — with the oracle tier's answer asserted equal first, so a
 /// measurement is never taken off a miscompile.
 fn measure(lowered: &LoweredF, columns: &[Column], n: usize) -> (usize, usize, usize, Option<i64>) {
+    // Census one data shape at a time. The driver and the interned program now
+    // outlive a call, so a second shape of the same expression would reuse the
+    // first one's compiled loop, take its exit guard until that guard is hot,
+    // and attach a bridge — real behaviour, but not the per-shape trace census
+    // these tests exist to pin. `same_expression_second_batch_reuses_the_loop`
+    // covers the reuse path instead.
+    reset_persistent_state();
+    measure_warm(lowered, columns, n)
+}
+
+/// [`measure`] without the reset: the driver keeps whatever it compiled for an
+/// earlier batch, which is how the tier actually runs.
+fn measure_warm(
+    lowered: &LoweredF,
+    columns: &[Column],
+    n: usize,
+) -> (usize, usize, usize, Option<i64>) {
     let clean = clean_batch_sum_f(lowered, columns, n);
     COMPILES.store(0, Ordering::Relaxed);
     GUARD_FAILS.store(0, Ordering::Relaxed);
@@ -79,6 +98,45 @@ fn flat_row_loop_stays_in_compiled_code() {
          side exits), got {deopts} deopts over {n} rows — that is a per-row bail \
          back to the interpreter"
     );
+}
+
+/// What keeping the driver and the interned program alive across calls buys:
+/// a second batch of the same expression finds its loop already compiled and
+/// does not compile it again.
+///
+/// It also pins the correctness half of moving the column bases into registers.
+/// The second batch reads a different buffer at a different address through the
+/// *same* compiled code, so if a base were still baked into the program words —
+/// or promoted, and the trace specialised on it — this batch would answer the
+/// first batch's question.
+#[test]
+fn same_expression_second_batch_reuses_the_loop() {
+    let _serial = serial();
+    let n = 4_000usize;
+    let schema: Schema = [("a".to_string(), ValType::Int)].into_iter().collect();
+    let lowered = lower("a > 10", &schema);
+
+    let first: Vec<i64> = (0..n as i64).collect();
+    let second: Vec<i64> = (0..n as i64).map(|v| v + 5).collect();
+
+    let (compiles_1, _, aborts_1, r1) = measure(&lowered, &[Column::Int(&first)], n);
+    assert_eq!(aborts_1, 0, "first batch: no trace should be refused");
+    assert_eq!(compiles_1, 1, "the first batch must compile the row loop");
+
+    let (compiles_2, deopts_2, aborts_2, r2) = measure_warm(&lowered, &[Column::Int(&second)], n);
+    eprintln!("[reuse] first={r1:?} second={r2:?} compiles_2={compiles_2} deopts_2={deopts_2}");
+    assert_eq!(aborts_2, 0, "second batch: no trace should be refused");
+    assert_eq!(
+        compiles_2, 0,
+        "the second batch must reuse the compiled loop, not compile again"
+    );
+    assert!(
+        deopts_2 <= 16,
+        "the reused loop must run the rows itself, got {deopts_2} deopts over {n} rows"
+    );
+    // Both tiers agreed inside `measure_warm`; this pins that the answers are
+    // genuinely the two different columns'.
+    assert_ne!(r1, r2, "the two batches must not answer the same question");
 }
 
 /// The same property for the two-bank machine: a `double` column keeps the row
