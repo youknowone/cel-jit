@@ -139,6 +139,87 @@ fn same_expression_second_batch_reuses_the_loop() {
     assert_ne!(r1, r2, "the two batches must not answer the same question");
 }
 
+/// Two expressions of different register shapes get their own pooled drivers,
+/// and both must keep answering correctly while they take turns.
+///
+/// majit publishes the jitcode registry and packed liveness that guard and
+/// resume metadata decode through into ONE slot per thread, written when a
+/// driver registers its dispatch jitcode — i.e. once, when the driver is built.
+/// Holding a driver per shape breaks the invariant that the slot describes the
+/// driver about to run, and `JitDriverStaticData::frame_value_count_fn` records
+/// that the wrong slot does not fail: it decodes an unrelated jitcode at the
+/// same pc and returns a mistyped frame count. `run_jit_persistent_f` therefore
+/// re-publishes on the way in.
+///
+/// The nested shape is the one that stresses it: its trip count changes each
+/// round, so its reused driver keeps attaching bridges — compiling *after* the
+/// other shape's driver was the last to write the slot.
+#[test]
+fn alternating_shapes_share_one_thread_state_field_store() {
+    let _serial = serial();
+    let rows = 4_000usize;
+
+    let nested_schema: Schema = [
+        ("size(items)".to_string(), ValType::Int),
+        ("offset(items)".to_string(), ValType::Int),
+        ("items[].price".to_string(), ValType::Int),
+    ]
+    .into_iter()
+    .collect();
+    let nested = lower("items.all(i, i.price > 10)", &nested_schema);
+
+    let flat_schema: Schema = [
+        ("a".to_string(), ValType::Int),
+        ("b".to_string(), ValType::Int),
+    ]
+    .into_iter()
+    .collect();
+    let flat = lower("a * 3 + b > 10 && a % 7 != 0", &flat_schema);
+    let a: Vec<i64> = (0..rows as i64).collect();
+    let b: Vec<i64> = (0..rows as i64).map(|v| (v * 3) % 97).collect();
+
+    reset_persistent_state();
+    for per_row in [1i64, 2, 3, 8, 2, 1] {
+        let (lens, offsets, elems) = list_columns(per_row, rows);
+        // Each `measure_warm` asserts the compiled tier against the oracle, so a
+        // frame count decoded through the other shape's store shows up here.
+        let (_, _, nested_aborts, nested_r) = measure_warm(
+            &nested,
+            &[
+                Column::Int(&lens),
+                Column::Int(&offsets),
+                Column::Int(&elems),
+            ],
+            rows,
+        );
+        let (_, _, flat_aborts, flat_r) =
+            measure_warm(&flat, &[Column::Int(&a), Column::Int(&b)], rows);
+        eprintln!(
+            "[shapes] per_row={per_row} nested={nested_r:?} ({nested_aborts} abrt) \
+             flat={flat_r:?} ({flat_aborts} abrt)"
+        );
+        // The answers are the assertion: `measure_warm` compares each tier
+        // against the oracle, so a frame count decoded through the other shape's
+        // store shows up as a divergence there.
+        //
+        // Aborts are only bounded, not required to be zero. Revisiting a trip
+        // count on a driver that has since bridged for other counts does throw
+        // traces away — 2 for this sequence — which the cold per-shape census
+        // never sees because it starts each shape on a fresh driver. That is a
+        // property of the warm regime, not a regression: the flat shape, which
+        // never changes its data, aborts nothing.
+        assert_eq!(flat_aborts, 0, "per_row={per_row}: flat trace refused");
+        assert!(
+            nested_aborts <= 4,
+            "per_row={per_row}: nested threw away {nested_aborts} traces"
+        );
+        assert!(
+            flat_r.is_some(),
+            "per_row={per_row}: the flat shape must keep answering"
+        );
+    }
+}
+
 /// The same property for the two-bank machine: a `double` column keeps the row
 /// loop compiled just as an `int` column does.
 #[test]

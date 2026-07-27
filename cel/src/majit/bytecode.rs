@@ -1,6 +1,6 @@
 //! Flat `i64`-word bytecode for the majit-traceable CEL subset, plus the majit
 //! `#[jit_interp]` mainloop that evaluates it ([`float_bank::run_mainloop_f`])
-//! and a plain-`match` reference interpreter ([`float_bank::clean_interp_f`])
+//! and a plain-`match` reference interpreter ([`float_bank::clean_interp_seeded_f`])
 //! used as the correctness oracle and the honest perf baseline.
 //!
 //! The instruction set is a three-address register machine over two banks: an
@@ -216,7 +216,7 @@ impl Column<'_> {
 /// Build the batch program for `n` rows over `columns` and run it with `run`,
 /// which selects the tier. Shared by [`eval_batch_sum_f`] (the majit tier) and
 /// [`clean_batch_sum_f`] (the oracle tier) so the trap protocol — allocate the
-/// caller-owned word, bake its address into the program, read it back — is
+/// caller-owned word, seed its address into the initial register bank, read it back — is
 /// written once.
 fn batch_sum_with(
     lowered: &super::lower::LoweredF,
@@ -256,7 +256,7 @@ fn batch_sum_with(
     }
     let bases: Vec<i64> = columns.iter().map(|c| c.base()).collect();
     // The trap word must outlive the run and must not be aliased by a reference
-    // while the program writes it through the raw pointer baked into `prog`.
+    // while the program writes it through the raw pointer seeded into `init_regs`.
     let mut trap: Box<i64> = Box::new(0);
     let trap_addr = (&mut *trap) as *mut i64 as i64;
     let shape = lowered.batch_sum_shape(true);
@@ -305,7 +305,8 @@ pub fn eval_batch_sum_f(
 }
 
 /// [`eval_batch_sum_f`] on the oracle tier: the same batch program run by the
-/// plain-`match` [`float_bank::clean_interp_f`], with no tracing or compilation
+/// plain-`match` [`float_bank::clean_interp_seeded_f`], with no tracing or
+/// compilation
 /// machinery in the loop. This is what a majit result is checked against.
 pub fn clean_batch_sum_f(
     lowered: &super::lower::LoweredF,
@@ -475,12 +476,14 @@ pub mod float_bank {
         mut driver: &mut majit_metainterp::JitDriver<VmStateF>,
         program: &Code,
         init_regs: &[i64],
-        init_fregs: &[f64],
+        num_fregs: usize,
     ) -> i64 {
         let mut pc: usize = 0;
+        // Only the int bank is seeded: the column bases, the row count and the
+        // trap address all live there, and no float ever enters from outside.
         let mut state = VmStateF {
             regs: init_regs.to_vec(),
-            fregs: init_fregs.to_vec(),
+            fregs: vec![0.0; num_fregs],
         };
 
         loop {
@@ -1365,9 +1368,8 @@ pub mod float_bank {
         num_fregs: usize,
         threshold: u32,
     ) -> i64 {
-        let init_fregs = vec![0.0f64; num_fregs];
         let mut driver = new_driver_f(threshold, program, init_regs.len(), num_fregs);
-        run_mainloop_f(&mut driver, program, init_regs, &init_fregs)
+        run_mainloop_f(&mut driver, program, init_regs, num_fregs)
     }
 
     std::thread_local! {
@@ -1437,8 +1439,13 @@ pub mod float_bank {
         let mut driver = DRIVERS
             .with(|d| d.borrow_mut().remove(&key))
             .unwrap_or_else(|| new_driver_f(threshold, program, init_regs.len(), num_fregs));
-        let init_fregs = vec![0.0f64; num_fregs];
-        let result = run_mainloop_f(&mut driver, program, init_regs, &init_fregs);
+        // The store majit decodes guard and resume metadata through is one slot
+        // per thread, written when a driver registers its dispatch jitcode. We
+        // keep a driver per shape, so aim it back at this one before it can
+        // compile anything: another shape's store decodes at the same pcs and
+        // returns a mistyped frame count rather than failing.
+        driver.republish_state_field_fvc();
+        let result = run_mainloop_f(&mut driver, program, init_regs, num_fregs);
         DRIVERS.with(|d| {
             d.borrow_mut().insert(key, driver);
         });

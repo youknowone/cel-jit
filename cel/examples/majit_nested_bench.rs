@@ -15,13 +15,16 @@
 //!   the same loop carrying the meta-tracer's instrumentation but never
 //!   compiling. The gap `clean → interp` is what the tier costs when it never
 //!   pays off.
-//! * `jit`    — the same mainloop at `threshold = 8`. A fresh `JitDriver` per
-//!   run, so tracing and compilation are INSIDE the timed region.
+//! * `jit`    — the same mainloop at `threshold = 8`. The driver and the
+//!   interned program outlive a run, so only the first run to reach the merge
+//!   point pays for tracing and compiling; the `cmp` column says which one did.
 //!
-//! Because compilation is inside the timed region and there is no API to reuse a
-//! warm driver, a single batch size cannot separate "the compiled code is slow"
-//! from "the batch was too short to pay for compiling". So each shape is swept
-//! over a geometric ladder of row counts and the totals are fitted:
+//! A single batch size still cannot separate "the compiled code is slow" from
+//! "the batch was too short to pay for compiling", so each shape is swept over a
+//! geometric ladder of row counts and the totals are fitted. Read the fitted
+//! intercept as a compile cost only for a point whose `cmp` is non-zero; where
+//! `cmp` is 0 the loop was already compiled and the intercept is measuring
+//! per-call setup alone:
 //!
 //! ```text
 //! jit_total(n) ≈ compile_cost + steady_ns_per_row * n

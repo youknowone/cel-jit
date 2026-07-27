@@ -140,7 +140,7 @@ struct TReg {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SlotKind {
     /// A per-ROW column: read at `row * 8` in the outer loop's prologue, which
-    /// [`LoweredF::batch_sum_program_trapping`] emits.
+    /// [`LoweredF::batch_sum_shape`] emits.
     Row,
     /// A flattened ELEMENT column of a list: read at `(offset(list) + j) * 8`
     /// INSIDE a comprehension's inner loop. Only the lowering knows where that
@@ -276,7 +276,7 @@ pub struct LoweredF {
     pub str_literals: Vec<String>,
     /// Positions **within [`LoweredF::body`]** of jump target words, which the
     /// lowering writes body-relative because it cannot know where the body
-    /// lands. [`LoweredF::batch_sum_program_trapping`] relocates each to an
+    /// lands. [`LoweredF::batch_sum_shape`] relocates each to an
     /// absolute program address once it does.
     pub jump_fixups: Vec<usize>,
 }
@@ -297,9 +297,8 @@ pub struct LoweredF {
 pub struct BatchShape {
     /// The program words.
     pub code: Vec<i64>,
-    /// Int-bank register count the program runs on.
-    pub num_int_regs: usize,
-    /// Float-bank register count the program runs on.
+    /// Float-bank register count the program runs on. The int-bank count is
+    /// [`BatchSeed`]'s, since the only thing that needs it is building the bank.
     pub num_float_regs: usize,
     /// Which int registers the caller fills in per batch.
     pub seed: BatchSeed,
@@ -365,7 +364,7 @@ impl LoweredF {
     /// per-slot base pointers live in the **int** bank above `num_int_regs`, so
     /// the body's registers are untouched. The back-edge is a do-while, so
     /// callers must pass `n >= 1`.
-    /// [`LoweredF::batch_sum_program_trapping`] without an overflow trap word:
+    /// [`LoweredF::batch_sum_shape`] without an overflow trap word:
     /// the program still guards its `int` arithmetic, but nothing publishes the
     /// flag, so the caller **cannot tell** an overflowed row from a good one.
     /// Only for harnesses whose data is bounded by construction; the evaluator
@@ -376,23 +375,14 @@ impl LoweredF {
         (shape, regs)
     }
 
-    /// As [`LoweredF::batch_sum_program`], but the epilogue publishes the
-    /// overflow flag to `trap_addr`, the address of a caller-owned `i64` (see
-    /// [`OP_TRAP_STORE`]). Whether that store is emitted at all is shape; the
-    /// address it writes to is data and rides in a seeded register.
-    pub fn batch_sum_program_trapping(
-        &self,
-        bases: &[i64],
-        n: i64,
-        trap_addr: i64,
-    ) -> (BatchShape, Vec<i64>) {
-        let shape = self.batch_sum_shape(true);
-        let regs = shape.seed.regs(bases, n, trap_addr);
-        (shape, regs)
-    }
-
     /// Build the batch program's words and the layout of the registers its
-    /// caller seeds. `with_trap` emits the epilogue's overflow-flag store.
+    /// caller seeds.
+    ///
+    /// `with_trap` emits the epilogue's overflow-flag store (see
+    /// [`OP_TRAP_STORE`]). Whether that store is there at all is shape; the
+    /// address it writes to is data and rides in a seeded register, so the
+    /// evaluator path passes `true` here and the trap word's address to
+    /// [`BatchSeed::regs`].
     pub fn batch_sum_shape(&self, with_trap: bool) -> BatchShape {
         let m = self.num_int_regs; // first int machinery register
         let (r_i, r_acc, r_n, r_one, r_stride, r_ea) = (m, m + 1, m + 2, m + 3, m + 4, m + 5);
@@ -513,7 +503,6 @@ impl LoweredF {
         }
         BatchShape {
             code: p,
-            num_int_regs: total_int_regs,
             num_float_regs: total_float_regs,
             seed: BatchSeed {
                 r_n,
