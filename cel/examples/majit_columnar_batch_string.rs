@@ -31,14 +31,13 @@
 //! `clean VM / JIT-on` measures the compilation effect. RELEASE ONLY (4-way
 //! equality gate).
 
-use std::collections::HashMap;
 use std::hint::black_box;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
-use cel::majit::bytecode::float_bank::{clean_interp_seeded_f, run_jit_seeded_f, COMPILES};
-use cel::majit::bytecode::Column;
-use cel::majit::lower::{intern_hash, lower_typed, Schema, ValType};
+use cel::majit::batch::{Batch, BatchProgram, ColumnRef, Tier};
+use cel::majit::bytecode::float_bank::COMPILES;
+use cel::majit::lower::{Schema, ValType};
 use cel::{Context, Program, Value};
 
 const LCG_A: u64 = 6364136223846793005;
@@ -66,6 +65,14 @@ fn time_ns_per_row<F: FnMut() -> i64>(n: usize, mut f: F) -> f64 {
     t.elapsed().as_nanos() as f64 / n as f64
 }
 
+/// The batch API answers in CEL's types; this benchmark counts matching rows.
+fn count(v: Value) -> i64 {
+    match v {
+        Value::Int(i) => i,
+        other => panic!("unexpected batch result {other:?}"),
+    }
+}
+
 fn main() {
     // Flagship string policy: two string equalities joined by `&&`.
     let expr = "role == \"admin\" && region == \"us-west-2\"";
@@ -76,9 +83,7 @@ fn main() {
     ]
     .into_iter()
     .collect();
-    let lowered = lower_typed(program.expression(), &schema).expect("lower string policy");
-    let slot_paths: Vec<&str> = lowered.slots.iter().map(|s| s.path.as_str()).collect();
-    assert_eq!(slot_paths, ["role", "region"], "slot order");
+    let lowered = BatchProgram::compile(expr, &schema).expect("lower string policy");
 
     let n: usize = 2_000_000;
     let roles = ["admin", "user", "guest", "auditor", "root", "service"];
@@ -86,36 +91,14 @@ fn main() {
     let role = make_col_str(n, 0x2545_F491_4F6C_DD1D, &roles);
     let region = make_col_str(n, 0x9E37_79B9_7F4A_7C15, &regions);
 
-    // Intern the string columns to i64 content-hash columns and verify the hash
-    // is injective over every distinct string present (column values +
-    // literals), so an id compare equals a content compare bit for bit.
-    let id_role: Vec<i64> = role.iter().map(|s| intern_hash(s)).collect();
-    let id_region: Vec<i64> = region.iter().map(|s| intern_hash(s)).collect();
-    let mut seen: HashMap<i64, String> = HashMap::new();
-    let mut check = |s: &str| {
-        let h = intern_hash(s);
-        match seen.get(&h) {
-            Some(prev) => assert_eq!(
-                prev.as_str(),
-                s,
-                "hash collision `{prev}` vs `{s}` (would bail)"
-            ),
-            None => {
-                seen.insert(h, s.to_string());
-            }
-        }
-    };
-    for &s in roles.iter().chain(regions.iter()) {
-        check(s);
-    }
-    for lit in &lowered.str_literals {
-        check(lit);
-    }
-    drop(check);
-    let columns: Vec<Column> = vec![Column::Int(&id_role), Column::Int(&id_region)];
-    let bases: Vec<i64> = columns.iter().map(Column::base).collect();
-    let (shape, regs) = lowered.batch_sum_program(&bases, n as i64);
-    let (batch, num_float) = (shape.code, shape.num_float_regs);
+    // Binding interns each string column to an i64 content-hash column and
+    // verifies the hash is injective over every distinct string present (column
+    // values + the expression's literals), so an id compare equals a content
+    // compare bit for bit. A collision would be a `BatchError::HashCollision`.
+    let batch = Batch::new(n)
+        .column("role", ColumnRef::Str(&role))
+        .column("region", ColumnRef::Str(&region));
+    let bound = lowered.bind(&batch).expect("intern string columns");
 
     // FAIR baseline: the stock tree-walker at its best — reuse one Context,
     // overwrite the two string variables per row (hot; no per-row Context
@@ -139,11 +122,11 @@ fn main() {
     // Correctness gate: stock == clean VM == JIT-off == JIT-on.
     COMPILES.store(0, Ordering::Relaxed);
     let base = naive();
-    let clean = clean_interp_seeded_f(&batch, &regs, num_float);
-    let off = run_jit_seeded_f(&batch, &regs, num_float, u32::MAX);
+    let clean = count(bound.sum_on(Tier::Clean).expect("clean tier"));
+    let off = count(bound.sum_on(Tier::Interpreter).expect("interp tier"));
     let off_c = COMPILES.load(Ordering::Relaxed);
     COMPILES.store(0, Ordering::Relaxed);
-    let on = run_jit_seeded_f(&batch, &regs, num_float, 8);
+    let on = count(bound.sum_on(Tier::Jit).expect("jit tier"));
     let on_c = COMPILES.load(Ordering::Relaxed);
     assert_eq!(base, clean, "stock vs clean VM divergence");
     assert_eq!(base, off, "naive vs JIT-off divergence");
@@ -162,13 +145,13 @@ fn main() {
     for _ in 0..rounds {
         naive_t.push(time_ns_per_row(n, naive));
         clean_t.push(time_ns_per_row(n, || {
-            clean_interp_seeded_f(&batch, &regs, num_float)
+            count(bound.sum_on(Tier::Clean).expect("clean tier"))
         }));
         off_t.push(time_ns_per_row(n, || {
-            run_jit_seeded_f(&batch, &regs, num_float, u32::MAX)
+            count(bound.sum_on(Tier::Interpreter).expect("interp tier"))
         }));
         on_t.push(time_ns_per_row(n, || {
-            run_jit_seeded_f(&batch, &regs, num_float, 8)
+            count(bound.sum_on(Tier::Jit).expect("jit tier"))
         }));
     }
     let (jit, jit_off, vm, nv) = (
@@ -199,5 +182,5 @@ fn main() {
         "  cross-model batch    stock / JIT-on    : {:>8.2}x",
         nv / jit
     );
-    black_box((&id_role, &id_region));
+    black_box((&role, &region));
 }

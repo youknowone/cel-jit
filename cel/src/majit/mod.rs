@@ -104,6 +104,7 @@
 //! back to the stock tree-walker. The win is confined to what a compiled trace
 //! over aligned columns can express.
 
+pub mod batch;
 pub mod bytecode;
 pub mod lower;
 

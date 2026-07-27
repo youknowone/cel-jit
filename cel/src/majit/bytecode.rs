@@ -167,6 +167,7 @@ fn majit_raw_store_i64(base: i64, ea: i64, val: i64) {
 /// One input column for the two-bank batch evaluator: an `i64` column for an
 /// int/bool slot, or an `f64` column for a `double` slot. Its base pointer (an
 /// `i64` regardless of bank) is what a compiled trace reads per row.
+#[derive(Debug, Clone, Copy)]
 pub enum Column<'a> {
     Int(&'a [i64]),
     Float(&'a [f64]),
@@ -214,18 +215,53 @@ impl Column<'_> {
     }
 }
 
-/// Build the batch program for `n` rows over `columns` and run it with `run`,
-/// which selects the tier. Shared by [`eval_batch_sum_f`] (the majit tier) and
-/// [`clean_batch_sum_f`] (the oracle tier) so the trap protocol — allocate the
-/// caller-owned word, seed its address into the initial register bank, read it back — is
-/// written once.
-fn batch_sum_with(
+/// One batch of rows, prepared: the interned program words, the seeded initial
+/// register bank (column bases, row count, trap address) and the trap word
+/// itself. Everything that depends on the expression and the data but not on
+/// the tier, built once so a caller running the same batch more than once — a
+/// benchmark sweeping tiers, a cross-tier check — pays for it once.
+///
+/// Holds raw base pointers into `columns`, so the borrow is carried in `'a`.
+pub struct BatchRun<'a> {
+    code: std::rc::Rc<[i64]>,
+    init_regs: Vec<i64>,
+    num_float_regs: usize,
+    /// The word the program publishes the overflow flag to. Boxed so its
+    /// address is stable, and never aliased by a reference while the program
+    /// writes it through the raw pointer seeded into `init_regs`.
+    trap: Box<i64>,
+    rows: usize,
+    columns: core::marker::PhantomData<&'a ()>,
+}
+
+impl BatchRun<'_> {
+    /// Run the prepared batch with `run`, which selects the tier. `None` means a
+    /// row trapped (`int` overflow, division by zero), where the tree-walker
+    /// raises and no sum is the right answer.
+    pub fn run(&mut self, run: impl FnOnce(&Code, &[i64], usize) -> i64) -> Option<i64> {
+        // A zero-row batch reduces to the accumulator's initial value without
+        // entering the loop, and its column bases point at nothing.
+        if self.rows == 0 {
+            return Some(0);
+        }
+        *self.trap = 0;
+        let result = run(&self.code, &self.init_regs, self.num_float_regs);
+        if *self.trap != 0 {
+            return None;
+        }
+        Some(result)
+    }
+}
+
+/// Build the batch program for `n` rows over `columns`. Panics on a column set
+/// that does not match `lowered.slots` — count, bank or row length — since that
+/// is a caller bug rather than a property of the data.
+pub fn prepare_batch<'a>(
     lowered: &super::lower::LoweredF,
-    columns: &[Column],
+    columns: &[Column<'a>],
     n: usize,
     what: &str,
-    run: impl FnOnce(&Code, &[i64], usize) -> i64,
-) -> Option<i64> {
+) -> BatchRun<'a> {
     assert_eq!(
         columns.len(),
         lowered.slots.len(),
@@ -252,12 +288,7 @@ fn batch_sum_with(
         }
         assert_eq!(c.len(), n, "{what}: column {k} length {} != {n}", c.len());
     }
-    if n == 0 {
-        return Some(0);
-    }
     let bases: Vec<i64> = columns.iter().map(|c| c.base()).collect();
-    // The trap word must outlive the run and must not be aliased by a reference
-    // while the program writes it through the raw pointer seeded into `init_regs`.
     let mut trap: Box<i64> = Box::new(0);
     let trap_addr = (&mut *trap) as *mut i64 as i64;
     let shape = lowered.batch_sum_shape(true);
@@ -266,14 +297,25 @@ fn batch_sum_with(
     // them keeps the JIT's green key — and with it the compiled loop the driver
     // holds — from changing between batches.
     let code = float_bank::intern_program(shape.code);
-    let result = run(&code, &init_regs, shape.num_float_regs);
-    // The raw pointers in `init_regs` alias `columns`; keep the borrow live
-    // across the run so the buffers cannot be dropped underneath the trace.
-    core::hint::black_box(columns);
-    if *trap != 0 {
-        return None;
+    BatchRun {
+        code,
+        init_regs,
+        num_float_regs: shape.num_float_regs,
+        trap,
+        rows: n,
+        columns: core::marker::PhantomData,
     }
-    Some(result)
+}
+
+/// [`prepare_batch`] plus one run, for a caller evaluating a batch once.
+fn batch_sum_with(
+    lowered: &super::lower::LoweredF,
+    columns: &[Column],
+    n: usize,
+    what: &str,
+    run: impl FnOnce(&Code, &[i64], usize) -> i64,
+) -> Option<i64> {
+    prepare_batch(lowered, columns, n, what).run(run)
 }
 
 /// Columnar **batch** evaluation of a typed (two-bank) lowered expression:

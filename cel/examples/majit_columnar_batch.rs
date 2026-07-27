@@ -6,10 +6,12 @@
 //! outer row loop. Do not report `stock / JIT-on` as a JIT-only speedup. Run
 //! `./bench.sh` for the fair request/engine/cold suite.
 //!
-//! Runs the REAL cel path: a CEL `Program` is lowered (`cel::majit::lower::lower`)
-//! and evaluated over a batch of rows via `batch_sum_program`, which reads each
-//! context column at the data-dependent (red) row index through a compiled
-//! `raw_load` trace, the buffer bases held loop-invariant in the register file.
+//! Runs the REAL cel path through the public batch API
+//! (`cel::majit::batch`): a CEL source is lowered against a schema and bound to
+//! named columns, and each column is read at the data-dependent (red) row index
+//! through a compiled `raw_load` trace, the buffer bases held loop-invariant in
+//! the register file. The caller states column TYPES and never sees slot order,
+//! register banks or base pointers.
 //!
 //! FAIR comparison = hot vs hot. Both sides receive their data already laid out
 //! (i64 columns for the JIT, a live `Context` for the walker) and are measured
@@ -32,8 +34,9 @@ use std::hint::black_box;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
-use cel::majit::bytecode::float_bank::{clean_interp_seeded_f, run_jit_seeded_f, COMPILES};
-use cel::majit::lower::{lower_typed, Schema, ValType};
+use cel::majit::batch::{Batch, BatchProgram, ColumnRef, Tier};
+use cel::majit::bytecode::float_bank::COMPILES;
+use cel::majit::lower::{Schema, ValType};
 use cel::{Context, Program, Value};
 
 const LCG_A: i64 = 6364136223846793005;
@@ -62,10 +65,17 @@ fn time_ns_per_row<F: FnMut() -> i64>(n: usize, mut f: F) -> f64 {
     t.elapsed().as_nanos() as f64 / n as f64
 }
 
+/// The batch API answers in CEL's types; this benchmark counts matching rows.
+fn count(v: Value) -> i64 {
+    match v {
+        Value::Int(i) => i,
+        other => panic!("unexpected batch result {other:?}"),
+    }
+}
+
 fn main() {
     // Flagship policy predicate over three int/bool columns.
     let expr = "balance >= amount && !frozen";
-    let program = Program::compile(expr).expect("compile");
     let schema: Schema = [
         ("balance".to_string(), ValType::Int),
         ("amount".to_string(), ValType::Int),
@@ -73,18 +83,21 @@ fn main() {
     ]
     .into_iter()
     .collect();
-    let lowered = lower_typed(program.expression(), &schema).expect("lower policy to majit subset");
-    let slot_paths: Vec<&str> = lowered.slots.iter().map(|s| s.path.as_str()).collect();
-    assert_eq!(slot_paths, ["balance", "amount", "frozen"], "slot order");
+    let program = Program::compile(expr).expect("compile");
+    let lowered = BatchProgram::compile(expr, &schema).expect("lower policy to majit subset");
 
     let n: usize = 2_000_000;
     let balance = make_col(n, -1_000_000, 1_000_000, 0x2545F491);
     let amount = make_col(n, -1_000_000, 1_000_000, 0x9E3779B9);
-    let frozen = make_col(n, 0, 1, 0x1000_0001);
-    let columns: Vec<&[i64]> = vec![&balance, &amount, &frozen];
-    let bases: Vec<i64> = columns.iter().map(|c| c.as_ptr() as i64).collect();
-    let (shape, regs) = lowered.batch_sum_program(&bases, n as i64);
-    let (batch, nf) = (shape.code, shape.num_float_regs);
+    let frozen: Vec<bool> = make_col(n, 0, 1, 0x1000_0001)
+        .iter()
+        .map(|&v| v != 0)
+        .collect();
+    let batch = Batch::new(n)
+        .column("balance", ColumnRef::Int(&balance))
+        .column("amount", ColumnRef::Int(&amount))
+        .column("frozen", ColumnRef::Bool(&frozen));
+    let bound = lowered.bind(&batch).expect("bind columns");
 
     // FAIR baseline: the stock tree-walker at its best — reuse one Context,
     // overwrite the three variables per row (hot; no per-row Context alloc).
@@ -94,7 +107,7 @@ fn main() {
         for i in 0..n {
             ctx.add_variable_from_value("balance", balance[i]);
             ctx.add_variable_from_value("amount", amount[i]);
-            ctx.add_variable_from_value("frozen", frozen[i] != 0);
+            ctx.add_variable_from_value("frozen", frozen[i]);
             acc += match program.execute(&ctx).expect("execute") {
                 Value::Bool(b) => b as i64,
                 Value::Int(v) => v,
@@ -107,11 +120,11 @@ fn main() {
     // Correctness gate: stock == clean VM == JIT-off == JIT-on.
     COMPILES.store(0, Ordering::Relaxed);
     let base = naive();
-    let clean = clean_interp_seeded_f(&batch, &regs, nf);
-    let off = run_jit_seeded_f(&batch, &regs, nf, u32::MAX);
+    let clean = count(bound.sum_on(Tier::Clean).expect("clean tier"));
+    let off = count(bound.sum_on(Tier::Interpreter).expect("interp tier"));
     let off_c = COMPILES.load(Ordering::Relaxed);
     COMPILES.store(0, Ordering::Relaxed);
-    let on = run_jit_seeded_f(&batch, &regs, nf, 8);
+    let on = count(bound.sum_on(Tier::Jit).expect("jit tier"));
     let on_c = COMPILES.load(Ordering::Relaxed);
     assert_eq!(base, clean, "stock vs clean VM divergence");
     assert_eq!(base, off, "naive vs JIT-off divergence");
@@ -130,13 +143,13 @@ fn main() {
     for _ in 0..rounds {
         naive_t.push(time_ns_per_row(n, naive));
         clean_t.push(time_ns_per_row(n, || {
-            clean_interp_seeded_f(&batch, &regs, nf)
+            count(bound.sum_on(Tier::Clean).expect("clean tier"))
         }));
         off_t.push(time_ns_per_row(n, || {
-            run_jit_seeded_f(&batch, &regs, nf, u32::MAX)
+            count(bound.sum_on(Tier::Interpreter).expect("interp tier"))
         }));
         on_t.push(time_ns_per_row(n, || {
-            run_jit_seeded_f(&batch, &regs, nf, 8)
+            count(bound.sum_on(Tier::Jit).expect("jit tier"))
         }));
     }
     let (jit, jit_off, vm, nv) = (

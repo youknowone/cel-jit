@@ -21,6 +21,13 @@
 //!   total time at several batch sizes.  This includes tracing and compilation,
 //!   but excludes CEL parsing/lowering and column construction for both tiers.
 //!
+//! Both secondary panels drive `cel::majit::bytecode::float_bank` directly
+//! rather than the public `cel::majit::batch` API, because both measure the
+//! COLD path: a fresh driver per run, so tracing and compilation are inside the
+//! timed region. The batch API keeps the driver warm across runs by design (see
+//! `CONVERGENCE.md`), which is the steady state the other examples report and
+//! the opposite of what this file is for.
+//!
 //! No ratio crosses the request/columnar boundary.  RELEASE ONLY.
 //! Run: `./bench.sh` or
 //! `cargo run --release --example majit_ab --features jit`.

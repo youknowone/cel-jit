@@ -50,53 +50,44 @@ use std::hint::black_box;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
+use cel::majit::batch::{Batch, BatchProgram, ColumnRef, Tier};
 use cel::majit::bytecode::float_bank::{COMPILES, GUARD_FAILS, TRACE_ABORTS};
-use cel::majit::bytecode::{clean_batch_sum_f, eval_batch_sum_f, Column};
-use cel::majit::lower::{lower_typed, LoweredF, Schema, ValType};
+use cel::majit::lower::{Schema, ValType};
 use cel::{Context, Program, Value};
 
-const JIT_ON: u32 = 8;
-const JIT_OFF: u32 = u32::MAX;
 /// Reference tier: how many distinct activations to build, and how many
 /// `Program::execute` calls to time over them.
 const TREE_POOL: usize = 512;
 const TREE_EVALS: usize = 20_000;
 
-/// The three columns of `items.all(i, i.price > 10)` in the lowering's slot
-/// order: per-row list length, per-row element offset, flattened elements.
+/// The list column of `items.all(i, i.price > 10)`: a per-row element count and
+/// the flattened element buffer. The `offset(items)` column the lowering also
+/// reads is derived at bind time from the counts.
 struct ListColumns {
     lens: Vec<i64>,
-    offsets: Vec<i64>,
     elems: Vec<i64>,
 }
 
 impl ListColumns {
     fn build(rows: usize, len_of: fn(usize) -> i64) -> Self {
         let lens: Vec<i64> = (0..rows).map(len_of).collect();
-        let mut offsets = Vec::with_capacity(rows);
-        let mut total = 0i64;
-        for &l in &lens {
-            offsets.push(total);
-            total += l;
-        }
+        let total: i64 = lens.iter().sum();
         // `.max(1)` keeps the buffer non-empty at length 0, where nothing reads
         // it but a column still needs a base address.
         let elems: Vec<i64> = (0..total.max(1)).map(|k| (k * 7) % 40).collect();
-        Self {
-            lens,
-            offsets,
-            elems,
-        }
+        Self { lens, elems }
     }
 
-    /// The first `rows` rows as columns. The element column is shared whole —
-    /// `offsets` already restricts which part of it a prefix reads.
-    fn prefix(&self, rows: usize) -> [Column<'_>; 3] {
-        [
-            Column::Int(&self.lens[..rows]),
-            Column::Int(&self.offsets[..rows]),
-            Column::Int(&self.elems),
-        ]
+    /// The first `rows` rows as a batch. The element buffer is shared whole —
+    /// the derived offsets restrict which part of it a prefix reads.
+    fn prefix(&self, rows: usize) -> Batch<'_> {
+        Batch::new(rows).column(
+            "items",
+            ColumnRef::List {
+                lens: &self.lens[..rows],
+                fields: vec![(Some("price"), ColumnRef::Int(&self.elems))],
+            },
+        )
     }
 
     /// Mean elements per row — the inner loop's trip count.
@@ -119,18 +110,13 @@ fn ns_per_row(d: Duration, rows: usize) -> f64 {
 }
 
 fn nested_schema() -> Schema {
-    [
-        ("size(items)".to_string(), ValType::Int),
-        ("offset(items)".to_string(), ValType::Int),
-        ("items[].price".to_string(), ValType::Int),
-    ]
-    .into_iter()
-    .collect()
+    [("items[].price".to_string(), ValType::Int)]
+        .into_iter()
+        .collect()
 }
 
-fn lower(src: &str, schema: &Schema) -> LoweredF {
-    let program = Program::compile(src).unwrap_or_else(|e| panic!("parse `{src}`: {e:?}"));
-    lower_typed(program.expression(), schema).unwrap_or_else(|e| panic!("lower_typed `{src}`: {e}"))
+fn lower(src: &str, schema: &Schema) -> BatchProgram {
+    BatchProgram::compile(src, schema).unwrap_or_else(|e| panic!("lower `{src}`: {e}"))
 }
 
 struct Point {
@@ -144,20 +130,21 @@ struct Point {
 }
 
 fn measure_at(
-    lowered: &LoweredF,
+    lowered: &BatchProgram,
     data: &ListColumns,
     rows: usize,
     rounds: usize,
     label: &str,
 ) -> Point {
-    let columns = data.prefix(rows);
+    let batch = data.prefix(rows);
+    let bound = lowered.bind(&batch).expect("bind list columns");
 
     // Oracle first: never report a timing taken off a miscompile.
-    let expected = clean_batch_sum_f(lowered, &columns, rows);
+    let expected = bound.sum_on(Tier::Clean).ok();
     COMPILES.store(0, Ordering::Relaxed);
     GUARD_FAILS.store(0, Ordering::Relaxed);
     TRACE_ABORTS.store(0, Ordering::Relaxed);
-    let compiled = eval_batch_sum_f(lowered, &columns, rows, JIT_ON);
+    let compiled = bound.sum_on(Tier::Jit).ok();
     let compiles = COMPILES.load(Ordering::Relaxed);
     let deopts = GUARD_FAILS.load(Ordering::Relaxed);
     let aborts = TRACE_ABORTS.load(Ordering::Relaxed);
@@ -167,7 +154,7 @@ fn measure_at(
     );
     assert_eq!(
         expected,
-        eval_batch_sum_f(lowered, &columns, rows, JIT_OFF),
+        bound.sum_on(Tier::Interpreter).ok(),
         "{label} @{rows}: majit interpreter tier diverged from the oracle tier"
     );
 
@@ -176,15 +163,15 @@ fn measure_at(
     let mut jit_times = Vec::with_capacity(rounds);
     for _ in 0..rounds {
         let start = Instant::now();
-        black_box(clean_batch_sum_f(lowered, &columns, rows));
+        black_box(bound.sum_on(Tier::Clean).ok());
         clean_times.push(start.elapsed());
 
         let start = Instant::now();
-        black_box(eval_batch_sum_f(lowered, &columns, rows, JIT_OFF));
+        black_box(bound.sum_on(Tier::Interpreter).ok());
         interp_times.push(start.elapsed());
 
         let start = Instant::now();
-        black_box(eval_batch_sum_f(lowered, &columns, rows, JIT_ON));
+        black_box(bound.sum_on(Tier::Jit).ok());
         jit_times.push(start.elapsed());
     }
 
@@ -215,10 +202,10 @@ fn tree_walker_ns_per_eval(
     rounds: usize,
     pool: usize,
 ) -> (f64, usize) {
+    let mut base = 0usize;
     let contexts: Vec<Context<'static>> = (0..pool)
         .map(|r| {
             let len = data.lens[r] as usize;
-            let base = data.offsets[r] as usize;
             let items: Vec<Value> = (0..len)
                 .map(|k| {
                     Value::from(HashMap::from([(
@@ -227,6 +214,7 @@ fn tree_walker_ns_per_eval(
                     )]))
                 })
                 .collect();
+            base += len;
             let mut context = Context::default();
             context.add_variable_from_value("items", items);
             context
@@ -332,9 +320,14 @@ fn main() {
         let pool_rows = TREE_POOL.min(max_rows);
         let (tree_ns, tree_matches) = tree_walker_ns_per_eval(&program, &data, rounds, pool_rows);
         // The reference tier and the columnar tiers must agree on the same rows.
+        let pool_batch = data.prefix(pool_rows);
         assert_eq!(
-            clean_batch_sum_f(&lowered, &data.prefix(pool_rows), pool_rows),
-            Some(tree_matches as i64),
+            lowered
+                .bind(&pool_batch)
+                .expect("bind list columns")
+                .sum_on(Tier::Clean)
+                .ok(),
+            Some(Value::Int(tree_matches as i64)),
             "{label}: the tree-walker and the columnar lowering disagree"
         );
         println!();

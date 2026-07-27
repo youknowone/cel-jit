@@ -33,9 +33,9 @@ use std::hint::black_box;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
-use cel::majit::bytecode::float_bank::{clean_interp_seeded_f, run_jit_seeded_f, COMPILES};
-use cel::majit::bytecode::Column;
-use cel::majit::lower::{lower_typed, Schema, ValType};
+use cel::majit::batch::{Batch, BatchProgram, ColumnRef, Tier};
+use cel::majit::bytecode::float_bank::COMPILES;
+use cel::majit::lower::{Schema, ValType};
 use cel::{Context, Program, Value};
 
 const LCG_A: u64 = 6364136223846793005;
@@ -43,12 +43,12 @@ const LCG_C: u64 = 1442695040888963407;
 
 /// Deterministic full-range u64 column, returned as the i64 bit pattern the int
 /// register file carries. `as u64` in the oracle recovers the unsigned value.
-fn make_col_u(n: usize, seed: u64) -> Vec<i64> {
+fn make_col_u(n: usize, seed: u64) -> Vec<u64> {
     let mut x = seed;
     let mut v = Vec::with_capacity(n);
     for _ in 0..n {
         x = x.wrapping_mul(LCG_A).wrapping_add(LCG_C);
-        v.push(x as i64);
+        v.push(x);
     }
     v
 }
@@ -64,6 +64,14 @@ fn time_ns_per_row<F: FnMut() -> i64>(n: usize, mut f: F) -> f64 {
     t.elapsed().as_nanos() as f64 / n as f64
 }
 
+/// The batch API answers in CEL's types; this benchmark counts matching rows.
+fn count(v: Value) -> i64 {
+    match v {
+        Value::Int(i) => i,
+        other => panic!("unexpected batch result {other:?}"),
+    }
+}
+
 fn main() {
     // Flagship uint policy: an unsigned column clears a per-row unsigned minimum
     // AND stays under an unsigned ceiling above the signed range (10^19 >
@@ -76,17 +84,15 @@ fn main() {
     ]
     .into_iter()
     .collect();
-    let lowered = lower_typed(program.expression(), &schema).expect("lower uint policy");
-    let slot_paths: Vec<&str> = lowered.slots.iter().map(|s| s.path.as_str()).collect();
-    assert_eq!(slot_paths, ["account", "minimum"], "slot order");
+    let lowered = BatchProgram::compile(expr, &schema).expect("lower uint policy");
 
     let n: usize = 2_000_000;
     let account = make_col_u(n, 0x2545_F491_4F6C_DD1D);
     let minimum = make_col_u(n, 0x9E37_79B9_7F4A_7C15);
-    let columns: Vec<Column> = vec![Column::Int(&account), Column::Int(&minimum)];
-    let bases: Vec<i64> = columns.iter().map(Column::base).collect();
-    let (shape, regs) = lowered.batch_sum_program(&bases, n as i64);
-    let (batch, num_float) = (shape.code, shape.num_float_regs);
+    let batch = Batch::new(n)
+        .column("account", ColumnRef::UInt(&account))
+        .column("minimum", ColumnRef::UInt(&minimum));
+    let bound = lowered.bind(&batch).expect("bind columns");
 
     // FAIR baseline: the stock tree-walker at its best — reuse one Context,
     // overwrite the two uint variables per row (hot; no per-row Context alloc).
@@ -94,8 +100,8 @@ fn main() {
         let mut acc = 0i64;
         let mut ctx = Context::default();
         for i in 0..n {
-            ctx.add_variable_from_value("account", account[i] as u64);
-            ctx.add_variable_from_value("minimum", minimum[i] as u64);
+            ctx.add_variable_from_value("account", account[i]);
+            ctx.add_variable_from_value("minimum", minimum[i]);
             acc += match program.execute(&ctx).expect("execute") {
                 Value::Bool(b) => b as i64,
                 Value::Int(v) => v,
@@ -108,11 +114,11 @@ fn main() {
     // Correctness gate: stock == clean VM == JIT-off == JIT-on.
     COMPILES.store(0, Ordering::Relaxed);
     let base = naive();
-    let clean = clean_interp_seeded_f(&batch, &regs, num_float);
-    let off = run_jit_seeded_f(&batch, &regs, num_float, u32::MAX);
+    let clean = count(bound.sum_on(Tier::Clean).expect("clean tier"));
+    let off = count(bound.sum_on(Tier::Interpreter).expect("interp tier"));
     let off_c = COMPILES.load(Ordering::Relaxed);
     COMPILES.store(0, Ordering::Relaxed);
-    let on = run_jit_seeded_f(&batch, &regs, num_float, 8);
+    let on = count(bound.sum_on(Tier::Jit).expect("jit tier"));
     let on_c = COMPILES.load(Ordering::Relaxed);
     assert_eq!(base, clean, "stock vs clean VM divergence");
     assert_eq!(base, off, "naive vs JIT-off divergence");
@@ -131,13 +137,13 @@ fn main() {
     for _ in 0..rounds {
         naive_t.push(time_ns_per_row(n, naive));
         clean_t.push(time_ns_per_row(n, || {
-            clean_interp_seeded_f(&batch, &regs, num_float)
+            count(bound.sum_on(Tier::Clean).expect("clean tier"))
         }));
         off_t.push(time_ns_per_row(n, || {
-            run_jit_seeded_f(&batch, &regs, num_float, u32::MAX)
+            count(bound.sum_on(Tier::Interpreter).expect("interp tier"))
         }));
         on_t.push(time_ns_per_row(n, || {
-            run_jit_seeded_f(&batch, &regs, num_float, 8)
+            count(bound.sum_on(Tier::Jit).expect("jit tier"))
         }));
     }
     let (jit, jit_off, vm, nv) = (
