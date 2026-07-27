@@ -3520,6 +3520,63 @@ mod tests {
                 "`{src}`: majit interp tier vs tree-walker"
             );
         }
+
+        // And the COMPILED tier, which is where the bounds check has to
+        // survive being traced: it is a forward jump inside the row body, so a
+        // trace that recorded only the in-range path would answer the
+        // out-of-range rows instead of refusing them. Enough rows to cross the
+        // trace threshold many times over, with the short rows spread through
+        // so the compiled loop meets both paths.
+        let mut long_lens = Vec::new();
+        let mut long_elems = Vec::new();
+        for r in 0..400i64 {
+            let n = if r % 7 == 3 { 1 } else { 3 };
+            long_lens.push(n);
+            for k in 0..n {
+                long_elems.push(r * 10 + k);
+            }
+        }
+        let long_batch = Batch::new(long_lens.len()).column(
+            "items",
+            ColumnRef::List {
+                lens: &long_lens,
+                fields: vec![(None, ColumnRef::Int(&long_elems))],
+            },
+        );
+        // `items[0]` is in range on every row; `items[1]` is not on the short
+        // ones, so the compiled loop must refuse the whole batch.
+        let in_range: i64 = {
+            let mut off = 0usize;
+            let mut acc = 0;
+            for len in &long_lens {
+                acc += long_elems[off];
+                off += *len as usize;
+            }
+            acc
+        };
+        use super::bytecode::float_bank::COMPILES as COMPILES_F;
+        use core::sync::atomic::Ordering;
+
+        let program = BatchProgram::compile("items[0]", &schema).unwrap();
+        let bound = program.bind(&long_batch).unwrap();
+        let before = COMPILES_F.load(Ordering::Relaxed);
+        assert_eq!(
+            bound.sum_on(Tier::Jit).unwrap(),
+            Value::Int(in_range),
+            "the compiled tier must read each row's own first element"
+        );
+        // Otherwise the assertions above only re-ran the tracing interpreter
+        // and said nothing about the compiled loop.
+        assert!(
+            COMPILES_F.load(Ordering::Relaxed) > before,
+            "the loop must actually have been traced and compiled"
+        );
+        let program = BatchProgram::compile("items[1]", &schema).unwrap();
+        let bound = program.bind(&long_batch).unwrap();
+        assert!(
+            bound.sum_on(Tier::Jit).is_err(),
+            "the compiled tier must refuse the rows whose list is too short"
+        );
     }
 
     /// The same read through a list of STRUCTS, where the index picks the
