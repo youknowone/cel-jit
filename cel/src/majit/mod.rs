@@ -3220,6 +3220,19 @@ mod tests {
                     "`{expr}` must lower and agree with the tree-walker"
                 );
             }
+            // An int LITERAL against a uint settles the sign while lowering:
+            // non-negative leaves the bare unsigned compare, negative settles
+            // the comparison outright. Both must still answer what the walker
+            // answers, including for uints above `i64::MAX`.
+            for lit in ["0", "1", "-1", "-9223372036854775808"] {
+                for expr in [format!("u {op} {lit}"), format!("{lit} {op} u")] {
+                    assert_eq!(
+                        sweep_case(&expr, &cols),
+                        SweepVerdict::Agreed,
+                        "`{expr}` must lower and agree with the tree-walker"
+                    );
+                }
+            }
         }
     }
 

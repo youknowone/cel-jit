@@ -1063,11 +1063,17 @@ fn emit_bin(ctx: &mut LowerCtxF, op: i64, a: TReg, b: TReg, bank: ValType) -> TR
 /// the two bit patterns. Six shapes, two combiners: `(i >= 0) & u_cmp` where a
 /// negative int settles the answer as false, `(i < 0) | u_cmp` where it settles
 /// it as true.
+///
+/// `int_literal` is the int operand's value when the source spelled it as one.
+/// `u > 0` and `u < 100` are how a policy usually meets a uint, and there the
+/// sign is known while lowering: the guard folds away and the comparison is the
+/// single unsigned op it would have been in one bank, three ops down to one.
 fn lower_int_uint_cmp(
     ctx: &mut LowerCtxF,
     name: &str,
     a: TReg,
     b: TReg,
+    int_literal: Option<i64>,
 ) -> Result<TReg, LowerError> {
     let int_on_left = a.bank == ValType::Int;
     let (i, u) = if int_on_left { (a, b) } else { (b, a) };
@@ -1084,16 +1090,24 @@ fn lower_int_uint_cmp(
         (ops::GREATER_EQUALS, true) | (ops::LESS_EQUALS, false) => (true, u, i, OP_ULE),
         _ => unreachable!("caller matched one of the six comparison ops"),
     };
-    let zero = emit_zero_const(ctx);
-    let sign = emit_bin(ctx, if and { OP_GE } else { OP_LT }, i, zero, ValType::Bool);
-    let cmp = emit_bin(ctx, uop, lhs, rhs, ValType::Bool);
-    Ok(emit_bin(
-        ctx,
-        if and { OP_AND } else { OP_OR },
-        sign,
-        cmp,
-        ValType::Bool,
-    ))
+    match int_literal {
+        // The sign settles the whole comparison on its own.
+        Some(v) if v < 0 => Ok(emit_bool_const(ctx, !and)),
+        // Known non-negative: the unsigned compare is the answer.
+        Some(_) => Ok(emit_bin(ctx, uop, lhs, rhs, ValType::Bool)),
+        None => {
+            let zero = emit_zero_const(ctx);
+            let sign = emit_bin(ctx, if and { OP_GE } else { OP_LT }, i, zero, ValType::Bool);
+            let cmp = emit_bin(ctx, uop, lhs, rhs, ValType::Bool);
+            Ok(emit_bin(
+                ctx,
+                if and { OP_AND } else { OP_OR },
+                sign,
+                cmp,
+                ValType::Bool,
+            ))
+        }
+    }
 }
 
 /// Widen an int-bank value to a fresh float reg via a per-row `int as f64` cast
@@ -1645,7 +1659,12 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
         if (a.bank == ValType::Int && b.bank == ValType::UInt)
             || (a.bank == ValType::UInt && b.bank == ValType::Int)
         {
-            return lower_int_uint_cmp(ctx, name, a, b);
+            let int_literal = if a.bank == ValType::Int {
+                as_int_literal(&call.args[0])
+            } else {
+                as_int_literal(&call.args[1])
+            };
+            return lower_int_uint_cmp(ctx, name, a, b, int_literal);
         }
         // Two uint operands compare unsigned: `<`/`<=` map to OP_ULT/OP_ULE and
         // `>`/`>=` reuse them by swapping operands; eq/ne are bit-identical to
