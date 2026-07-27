@@ -340,11 +340,22 @@ mod tests {
         }
     }
 
+    /// A caller may FLATTEN the indices it uses into columns of their own,
+    /// declaring `list[k]` for each. That is a different convention from
+    /// binding the list itself (see `constant_index_reads_the_rows_own_list`),
+    /// and the schema is what picks between them: a declared `list[k]` is a row
+    /// column and reads like any other, with no bounds check because the caller
+    /// has already resolved the index.
     #[test]
     fn list_index_constant() {
         let program = Program::compile("list[0] + list[2] + list[4]").unwrap();
-        // One declaration of the element type covers every constant index.
-        let schema: Schema = [("list[]".to_string(), ValType::Int)].into_iter().collect();
+        let schema: Schema = [
+            ("list[0]".to_string(), ValType::Int),
+            ("list[2]".to_string(), ValType::Int),
+            ("list[4]".to_string(), ValType::Int),
+        ]
+        .into_iter()
+        .collect();
         let lowered =
             lower_typed(program.expression(), &schema).expect("constant list index is lowerable");
         let paths: Vec<&str> = lowered.slots.iter().map(|s| s.path.as_str()).collect();
@@ -3395,6 +3406,117 @@ mod tests {
                 "`{expr}` must lower and agree with the tree-walker"
             );
         }
+    }
+
+    /// `list[k]` on a bound LIST column reads the row's OWN element, which
+    /// sits at a different place in every row, and refuses the row where the
+    /// index is past that row's span.
+    ///
+    /// Both halves matter: reading `elems[k]` instead of `elems[offset + k]`
+    /// would answer a neighbouring row's value, and answering an out-of-range
+    /// index at all would be a JIT-only answer — the tree-walker raises there.
+    #[test]
+    fn constant_index_reads_the_rows_own_list() {
+        use super::batch::{Batch, BatchProgram, ColumnRef, Tier};
+
+        // Jagged: row 0 = [5, 6], row 1 = [7], row 2 = [8, 9, 10]. Only row 1
+        // is short, so `list[1]` is in range on two rows out of three.
+        let lens: Vec<i64> = vec![2, 1, 3];
+        let elems: Vec<i64> = vec![5, 6, 7, 8, 9, 10];
+
+        let walker_sum = |src: &str| -> Option<i64> {
+            let program = Program::compile(src).unwrap();
+            let mut total = 0;
+            let mut off = 0usize;
+            for len in &lens {
+                let n = *len as usize;
+                let list: Vec<Value> = elems[off..off + n].iter().map(|v| Value::Int(*v)).collect();
+                off += n;
+                let mut ctx = Context::default();
+                ctx.add_variable_from_value("items", Value::List(list.into()));
+                total += match program.execute(&ctx).ok()? {
+                    Value::Int(i) => i,
+                    Value::Bool(b) => b as i64,
+                    other => panic!("`{src}`: unexpected {other:?}"),
+                };
+            }
+            Some(total)
+        };
+
+        let schema: Schema = [("items[]".to_string(), ValType::Int)]
+            .into_iter()
+            .collect();
+        for src in [
+            "items[0]",
+            "items[1]",
+            "items[2]",
+            "items[0] > 6",
+            "items[0] + items[1]",
+        ] {
+            let program = BatchProgram::compile(src, &schema)
+                .unwrap_or_else(|e| panic!("lower `{src}`: {e}"));
+            let batch = Batch::new(lens.len()).column(
+                "items",
+                ColumnRef::List {
+                    lens: &lens,
+                    fields: vec![(None, ColumnRef::Int(&elems))],
+                },
+            );
+            let bound = program
+                .bind(&batch)
+                .unwrap_or_else(|e| panic!("bind `{src}`: {e}"));
+            let got = match bound.sum_on(Tier::Clean) {
+                Ok(Value::Int(i)) => Some(i),
+                Ok(other) => panic!("`{src}`: unexpected {other:?}"),
+                Err(_) => None,
+            };
+            assert_eq!(got, walker_sum(src), "`{src}`: machine vs tree-walker");
+            // The tracing interpreter must reach the same verdict.
+            assert_eq!(
+                bound.sum_on(Tier::Interpreter).ok().map(|v| match v {
+                    Value::Int(i) => i,
+                    other => panic!("`{src}`: unexpected {other:?}"),
+                }),
+                walker_sum(src),
+                "`{src}`: majit interp tier vs tree-walker"
+            );
+        }
+    }
+
+    /// The same read through a list of STRUCTS, where the index picks the
+    /// element and the field picks the column. `resolve_path` stops at the
+    /// index, so this shape is recognised before it is asked.
+    #[test]
+    fn constant_index_then_field() {
+        use super::batch::{Batch, BatchProgram, ColumnRef, Tier};
+
+        let lens: Vec<i64> = vec![2, 1, 3];
+        let price: Vec<i64> = vec![5, 6, 7, 8, 9, 10];
+        let schema: Schema = [("items[].price".to_string(), ValType::Int)]
+            .into_iter()
+            .collect();
+        let batch = Batch::new(3).column(
+            "items",
+            ColumnRef::List {
+                lens: &lens,
+                fields: vec![(Some("price"), ColumnRef::Int(&price))],
+            },
+        );
+
+        let program = BatchProgram::compile("items[0].price", &schema)
+            .expect("a constant index into a struct list lowers");
+        assert_eq!(
+            program.bind(&batch).unwrap().sum_on(Tier::Clean).unwrap(),
+            Value::Int(5 + 7 + 8),
+            "each row's FIRST element, not the buffer's first three",
+        );
+
+        // Past the shortest row's span: the row refuses, so the batch does.
+        let program = BatchProgram::compile("items[1].price", &schema).unwrap();
+        assert!(
+            program.bind(&batch).unwrap().sum_on(Tier::Clean).is_err(),
+            "row 1 has one element, so `items[1]` is out of range there",
+        );
     }
 
     /// Cross every operand with every binary operator and check parity.

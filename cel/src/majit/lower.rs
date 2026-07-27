@@ -555,7 +555,7 @@ struct LowerCtxF<'s> {
     /// two comprehensions over the same list get their OWN registers, since
     /// each reloads the column at its own inner index. Sharing one register
     /// would let the second loop read the first loop's last element.
-    elem_map: HashMap<String, TReg>,
+    elem_map: HashMap<(String, usize), TReg>,
     /// The runtime-list comprehension currently being lowered, if any.
     list_loop: Option<ListLoop>,
     /// Positions within `body` holding a body-relative jump target.
@@ -633,9 +633,11 @@ impl LowerCtxF<'_> {
     /// emitting its columnar load **at the first reference** — which is inside
     /// the inner loop, where `ea_reg` holds `(offset + j) * 8`. The inner loop
     /// body is straight-line (no runtime-list comprehension may nest inside
-    /// one), so the first reference dominates every later one.
+    /// one), so the first reference dominates every later one. The cache is
+    /// keyed on the ADDRESS too: `items[0].price + items[1].price` reads the
+    /// same element column at two addresses and must load twice.
     fn elem_slot(&mut self, path: String, ea_reg: usize) -> Result<TReg, LowerError> {
-        if let Some(&r) = self.elem_map.get(&path) {
+        if let Some(&r) = self.elem_map.get(&(path.clone(), ea_reg)) {
             return Ok(r);
         }
         let ty =
@@ -650,7 +652,7 @@ impl LowerCtxF<'_> {
         };
         self.body
             .extend_from_slice(&[op, base_reg as i64, ea_reg as i64, r.idx as i64]);
-        self.elem_map.insert(path.clone(), r);
+        self.elem_map.insert((path.clone(), ea_reg), r);
         self.slots.push(SlotInfoF {
             path,
             ty,
@@ -768,7 +770,21 @@ fn compile_t(ctx: &mut LowerCtxF, e: &IdedExpr) -> Result<TReg, LowerError> {
             }
             ctx.slot(name.clone())
         }
-        Expr::Select(_) => {
+        Expr::Select(sel) => {
+            // `list[k].field`: a constant index into the row's list, then one
+            // of its element columns. `resolve_path` stops at the index, so
+            // recognise the shape before asking it.
+            if let (false, Expr::Call(inner)) = (sel.test, &sel.operand.expr) {
+                if inner.func_name == ops::INDEX && inner.args.len() == 2 {
+                    if let (Ok(base), Some(k)) =
+                        (resolve_path(&inner.args[0]), as_int_literal(&inner.args[1]))
+                    {
+                        if declares_list(ctx.schema, &base) {
+                            return lower_const_index(ctx, &base, Some(&sel.field), k);
+                        }
+                    }
+                }
+            }
             let path = resolve_path(e)?;
             let (root, field) = path.split_once('.').unwrap_or((path.as_str(), ""));
             if let Some(r) = ctx.iter_var_slot(root, Some(field))? {
@@ -1555,17 +1571,19 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
         let base = resolve_path(&call.args[0])?;
         let idx = as_int_literal(&call.args[1])
             .ok_or_else(|| LowerError::unsupported("non-constant index"))?;
-        // `base[k]` takes its type from its own key when the caller declared the
-        // indexed column directly, and otherwise from the list's element
-        // declaration `base[]` — the two spellings name the same values.
+        // A caller may flatten one index into a column of its own, in which
+        // case `base[k]` names that column and reads like any other row value.
         let path = format!("{base}[{idx}]");
-        let ty = ctx
-            .schema
-            .get(&path)
-            .or_else(|| ctx.schema.get(&elem_slot_path(&base, None)))
-            .copied()
-            .ok_or_else(|| LowerError::unsupported(format!("undeclared path `{path}`")))?;
-        return Ok(ctx.slot_typed(path, ty));
+        if let Some(&ty) = ctx.schema.get(&path) {
+            return Ok(ctx.slot_typed(path, ty));
+        }
+        // Otherwise it indexes into the row's LIST, which is a bounds-checked
+        // read of the flattened element column rather than a row column: the
+        // element at `k` sits at a different place in every row.
+        if declares_list(ctx.schema, &base) {
+            return lower_const_index(ctx, &base, None, idx);
+        }
+        return Err(LowerError::unsupported(format!("undeclared path `{path}`")));
     }
 
     // n-ary boolean fold — bool operands, bool result. `OP_AND`/`OP_OR` are
@@ -1882,6 +1900,72 @@ fn compile_comprehension_t(
         ctx.locals.insert(comp.accu_var.clone(), r);
     }
     Ok(result)
+}
+
+/// `list[k]` / `list[k].field` for a green index `k`: read the row's list
+/// element straight out of the flattened element column.
+///
+/// The address is the comprehension's, with the induction variable pinned to
+/// `k`: `(offset(list) + k) * 8`. What the loop gets from its trip count this
+/// has to check for itself — `items[1]` on a one-element row is an
+/// out-of-range error in the tree-walker, so the row must refuse rather than
+/// answer. `k >= len` is OR-ed into the trap flag, and the SAME condition
+/// jumps over the load: reading past a row's span would run off the element
+/// buffer entirely on the last row, which no trap flag can undo.
+fn lower_const_index(
+    ctx: &mut LowerCtxF,
+    list: &str,
+    field: Option<&str>,
+    k: i64,
+) -> Result<TReg, LowerError> {
+    let elem_path = elem_slot_path(list, field);
+    let ty =
+        ctx.schema.get(&elem_path).copied().ok_or_else(|| {
+            LowerError::unsupported(format!("undeclared element path `{elem_path}`"))
+        })?;
+    // A negative index is an error on every row, whatever the data holds.
+    if k < 0 {
+        return Err(LowerError::unsupported("negative constant index"));
+    }
+    let len = ctx.slot_typed(size_slot_path(list), ValType::Int);
+    let off = ctx.slot_typed(offset_slot_path(list), ValType::Int);
+    let kr = emit_int_const(ctx, k);
+
+    // The result register is written on the in-range path only, so give it a
+    // defined value first: the row traps either way, but a register the loop
+    // reads must not depend on what a previous row left behind.
+    let out = ctx.fresh(ty);
+    match ty {
+        ValType::Float => {
+            let zero = ctx.fresh(ValType::Float);
+            ctx.prelude
+                .extend_from_slice(&[OP_LOAD_CONST_F, 0, zero.idx as i64]);
+            emit_mov(ctx, zero, out);
+        }
+        _ => ctx
+            .body
+            .extend_from_slice(&[OP_LOAD_CONST, 0, out.idx as i64]),
+    }
+
+    let trap = TReg {
+        bank: ValType::Int,
+        idx: OVF_FLAG_REG,
+    };
+    let oob = emit_bin(ctx, OP_GE, kr, len, ValType::Bool);
+    ctx.body
+        .extend_from_slice(&[OP_OR, trap.idx as i64, oob.idx as i64, trap.idx as i64]);
+
+    // `k + 1 > len` is `k >= len` — the same test, in the form the machine's
+    // one forward jump takes.
+    let kp1 = emit_int_const(ctx, k + 1);
+    let skip = ctx.emit_jump_if_above(kp1, len);
+    let idx = emit_int_bin(ctx, OP_ADD, off, kr);
+    let stride = emit_int_const(ctx, 8);
+    let ea = emit_int_bin(ctx, OP_MUL, idx, stride);
+    let v = ctx.elem_slot(elem_path, ea.idx)?;
+    emit_mov(ctx, v, out);
+    ctx.patch_jump(skip);
+    Ok(out)
 }
 
 /// Emit a bank-matched register move `dst = src`.
