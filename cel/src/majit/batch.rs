@@ -2,7 +2,7 @@
 //!
 //! [`super::lower`] turns a CEL expression into two-bank bytecode and
 //! [`super::bytecode`] runs it, but both speak the machine's language: `i64`
-//! register banks, base pointers, content-hash ids, Arrow offset buffers. Every
+//! register banks, base pointers, string ids, Arrow offset buffers. Every
 //! caller that wanted the batch tier had to reimplement the same encoding, in
 //! the same order the lowering happened to allocate slots in — which is how a
 //! `bool` column came to be declared as an `int` and `!frozen` came to lower as
@@ -51,8 +51,8 @@ use std::collections::HashMap;
 
 use super::bytecode::{float_bank, prepare_batch, BatchRun, Column};
 use super::lower::{
-    elem_slot_source, intern_hash, lower_typed, offset_slot_source, size_slot_source, LoweredF,
-    Schema, SlotKind, ValType,
+    elem_slot_source, lower_typed, offset_slot_source, size_slot_source, LoweredF, Schema,
+    SlotKind, ValType,
 };
 use crate::{Program, Value};
 
@@ -89,10 +89,6 @@ pub enum BatchError {
         /// The batch's row count.
         rows: usize,
     },
-    /// Two distinct strings in this batch share a content hash, so an id compare
-    /// would not equal a content compare. Data-dependent: another batch of the
-    /// same expression may be fine.
-    HashCollision(String, String),
     /// A row's arithmetic trapped — an `int` overflow or a division by zero,
     /// where the tree-walker raises. No sum is the right answer.
     Trapped,
@@ -109,9 +105,6 @@ impl std::fmt::Display for BatchError {
             }
             BatchError::RowCount { name, len, rows } => {
                 write!(f, "column `{name}` has {len} rows, batch has {rows}")
-            }
-            BatchError::HashCollision(a, b) => {
-                write!(f, "content-hash collision between `{a}` and `{b}`")
             }
             BatchError::Trapped => write!(f, "a row trapped (overflow or division by zero)"),
         }
@@ -141,8 +134,9 @@ pub enum ColumnRef<'a> {
     UInt(&'a [u64]),
     /// A `double` column.
     Float(&'a [f64]),
-    /// A `string` column. Encoded to `i64` content hashes, which is why only
-    /// equality is defined on it (see [`ValType::Str`]).
+    /// A `string` column. Encoded to order-preserving `i64` ranks over the
+    /// batch's distinct strings, so equality AND ordering are content
+    /// comparisons (see [`ValType::Str`]).
     Str(&'a [String]),
     /// A `timestamp` column, as nanoseconds since the Unix epoch.
     Timestamp(&'a [i64]),
@@ -264,8 +258,9 @@ impl BatchProgram {
     }
 
     /// Encode `batch` into the machine's columns, in slot order, materializing
-    /// the buffers the schema does not declare: a string column's content-hash
-    /// ids, a `size(...)` length column, a list's `offset(...)` prefix sums.
+    /// the buffers the schema does not declare: a `size(...)` length column, a
+    /// list's `offset(...)` prefix sums. String columns pass through as
+    /// strings; `prepare_batch` ranks them, since the ids span the batch.
     ///
     /// This is the per-batch work. Keep the [`BoundBatch`] and call
     /// [`BoundBatch::sum`] on it rather than rebinding to run again.
@@ -297,12 +292,6 @@ impl BatchProgram {
                 });
             }
         }
-
-        // A string id compare equals a content compare only while the hash is
-        // injective over the strings PRESENT — the column values and the
-        // expression's own literals. A collision is data-dependent, so it is an
-        // error on this batch, not on the expression.
-        self.check_hash_injectivity(batch)?;
 
         // Build the batch program once, from the caller's buffers and the ones
         // the encoding materialized.
@@ -379,42 +368,6 @@ impl BatchProgram {
         }
         encode(lookup(batch, path)?, ty, path, derived)
     }
-
-    /// FNV-1a is injective over every string set these batches have carried, but
-    /// it is a 64-bit hash, so "is" has to be checked rather than assumed.
-    fn check_hash_injectivity<'s>(&'s self, batch: &'s Batch) -> Result<(), BatchError> {
-        fn note<'s>(seen: &mut HashMap<i64, &'s str>, s: &'s str) -> Result<(), BatchError> {
-            match seen.insert(intern_hash(s), s) {
-                Some(prev) if prev != s => {
-                    Err(BatchError::HashCollision(prev.to_string(), s.to_string()))
-                }
-                _ => Ok(()),
-            }
-        }
-        fn strings<'s>(c: &'s ColumnRef) -> &'s [String] {
-            match c {
-                ColumnRef::Str(c) => c,
-                _ => &[],
-            }
-        }
-        let mut seen: HashMap<i64, &str> = HashMap::new();
-        for lit in &self.lowered.str_literals {
-            note(&mut seen, &lit.text)?;
-        }
-        for col in batch.columns.values() {
-            for s in strings(col) {
-                note(&mut seen, s)?;
-            }
-            if let ColumnRef::List { fields, .. } = col {
-                for (_, f) in fields {
-                    for s in strings(f) {
-                        note(&mut seen, s)?;
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
 }
 
 /// A column the encoding had to materialize because the caller's data is not
@@ -488,7 +441,9 @@ fn encode<'a>(
             return Ok(Plan::Borrowed(Column::Int(bits)));
         }
         ColumnRef::Bool(c) => c.iter().map(|&b| b as i64).collect(),
-        ColumnRef::Str(c) => c.iter().map(|s| intern_hash(s)).collect(),
+        // Strings go to `prepare_batch` as strings: the ids are ranks over the
+        // whole batch, which one column cannot compute on its own.
+        ColumnRef::Str(c) => return Ok(Plan::Borrowed(Column::Str(c))),
         ColumnRef::List { .. } => return Err(BatchError::MissingColumn(path.to_string())),
     };
     derived.push(DerivedColumn::int(buf));
@@ -646,7 +601,7 @@ mod tests {
     }
 
     #[test]
-    fn string_equality_goes_through_content_hashes() {
+    fn string_equality_goes_through_ranked_ids() {
         let s = schema(&[("name", ValType::Str)]);
         let program = BatchProgram::compile("name == \"ab\"", &s).unwrap();
         let name: Vec<String> = ["ab", "cd", "ab", "ab"]

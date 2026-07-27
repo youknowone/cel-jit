@@ -106,12 +106,13 @@ pub enum ValType {
     /// only ordering comparisons differ (unsigned `OP_ULT`/`OP_ULE`).
     UInt,
     Float,
-    /// A string, carried as an `i64` content hash ([`intern_hash`]) in the int
-    /// register file. Only equality is defined: a hash compare (`OP_EQ`/`OP_NE`)
-    /// equals a content compare bit-for-bit once the batch builder has verified
-    /// the hash is injective over the strings present (a collision bails).
-    /// Ordering, arithmetic, and any other string op fall back to the
-    /// tree-walker.
+    /// A string, carried in the int register file as its **rank** among the
+    /// batch's distinct strings (`bytecode::StrDict`). The ranking is
+    /// order-preserving, so the signed int comparisons are content comparisons
+    /// bit-for-bit — equality and ordering alike — and injective by
+    /// construction, so no id compare can confuse two distinct strings.
+    /// Arithmetic (concatenation) and anything else needing the characters
+    /// themselves falls back to the tree-walker.
     Str,
     /// A `timestamp`, carried as `i64` nanoseconds since the Unix epoch in the
     /// int register file. i64-nanos ordering equals the chronological order the
@@ -123,20 +124,6 @@ pub enum ValType {
     /// [`ValType::Timestamp`], comparisons lower to the signed int ops; a
     /// timestamp vs duration comparison is NoSuchOverload and bails.
     Duration,
-}
-
-/// Stable content hash mapping a string to the `i64` id a [`ValType::Str`]
-/// column and a string literal share. FNV-1a: deterministic across processes
-/// (unlike a randomly-seeded [`std::hash`]), so a literal hashed at lowering
-/// time and a column value hashed at batch-build time agree. Injectivity over
-/// the strings actually present is checked by the batch builder, not assumed.
-pub fn intern_hash(s: &str) -> i64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in s.as_bytes() {
-        h ^= *b as u64;
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    h as i64
 }
 
 /// Declared type of each input path. Every path an expression reads must appear
@@ -264,8 +251,7 @@ pub const OVF_FLAG_REG: usize = 0;
 /// the batch — the whole point of [`BatchSeed`] is that anything data-dependent
 /// reaches the program through a register, so one set of words serves every
 /// batch and the JIT's green key stays put. A literal's id is data even when
-/// today's [`intern_hash`] happens to be pure, because the resolution is the
-/// batch builder's to choose.
+/// the batch builder's interning is the only thing that can resolve it.
 #[derive(Debug, Clone)]
 pub struct StrLiteral {
     /// Raw content, as written in the expression.
@@ -426,24 +412,19 @@ impl LoweredF {
     /// flag, so the caller **cannot tell** an overflowed row from a good one.
     /// Only for harnesses whose data is bounded by construction; the evaluator
     /// path ([`super::bytecode::eval_batch_sum_f`]) always passes a trap word.
-    /// Broadcast scalars are resolved here with [`intern_hash`], the same
-    /// resolution [`super::bytecode::prepare_batch`] uses, so a harness that
-    /// builds its own columns does not have to know how a string literal
-    /// becomes an id.
+    /// Takes column bases already computed, so it cannot rank a batch's
+    /// strings; an expression carrying a string literal has no id to seed here
+    /// and must go through [`super::bytecode::prepare_batch`], which is handed
+    /// the strings themselves.
     pub fn batch_sum_program(&self, bases: &[i64], n: i64) -> (BatchShape, Vec<i64>) {
+        assert!(
+            self.str_literals.is_empty(),
+            "batch_sum_program takes bases, not strings: `{}` needs a ranked batch",
+            self.str_literals[0].text
+        );
         let shape = self.batch_sum_shape(false);
-        let scalars = self.scalar_seeds();
-        let regs = shape.seed.regs(bases, &scalars, n, 0);
+        let regs = shape.seed.regs(bases, &[], n, 0);
         (shape, regs)
-    }
-
-    /// The broadcast-scalar values this expression's batch registers are seeded
-    /// with, in [`BatchSeed::scalar_regs`] order.
-    pub fn scalar_seeds(&self) -> Vec<i64> {
-        self.str_literals
-            .iter()
-            .map(|lit| intern_hash(&lit.text))
-            .collect()
     }
 
     /// Build the batch program's words and the layout of the registers its
@@ -632,7 +613,7 @@ struct ListLoop {
 impl LowerCtxF<'_> {
     fn fresh(&mut self, bank: ValType) -> TReg {
         let idx = match bank {
-            // `Str` ids share the int register file (an `i64` content hash).
+            // `Str` ids share the int register file (an `i64` rank).
             ValType::Int
             | ValType::Bool
             | ValType::UInt
@@ -786,7 +767,7 @@ pub fn lower_typed(expr: &IdedExpr, schema: &Schema) -> Result<LoweredF, LowerEr
     let result = compile_t(&mut ctx, expr)?;
     // A string- or temporal-valued top-level result is not sum-reducible (the
     // batch loop accumulates an int count or a float total); such an expression
-    // bails to the tree-walker rather than accumulating content hashes / nanos.
+    // bails to the tree-walker rather than accumulating string ids / nanos.
     if matches!(
         result.bank,
         ValType::Str | ValType::Timestamp | ValType::Duration
@@ -1464,7 +1445,7 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
     //
     // A LITERAL list has a green length, so it folds to a prelude constant. A
     // string column's length cannot be computed in the loop at all (the machine
-    // carries a string as a 64-bit content hash and has no bytes to count), so
+    // carries a string as a 64-bit id and has no bytes to count), so
     // it is read from a DERIVED column under the synthetic slot path
     // `size(<path>)`, which the batch builder materializes from the same strings
     // it interns. That is the columnar move — a length is column metadata, the
@@ -1723,26 +1704,17 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
                 ))),
             };
         }
-        // Strings support only equality here: a content-hash compare (OP_EQ/OP_NE
-        // over the int-file ids) equals a string compare once the batch builder
-        // has verified the hash is injective. Ordering needs sorted ids, so `<`
-        // etc. bail.
-        if a.bank == ValType::Str {
-            let op = match name {
-                ops::EQUALS => OP_EQ,
-                ops::NOT_EQUALS => OP_NE,
-                _ => return Err(LowerError::unsupported("string ordering comparison")),
-            };
-            let d = ctx.fresh(ValType::Bool);
-            ctx.body
-                .extend_from_slice(&[op, a.idx as i64, b.idx as i64, d.idx as i64]);
-            return Ok(d);
-        }
-        // Timestamp / Duration compare as i64 nanoseconds: the signed int order
-        // equals the chronological / magnitude order the tree-walker uses, so all
-        // six comparisons use the signed int op. Timestamp and duration are
-        // separate classes, so the check above already split them apart.
-        if matches!(a.bank, ValType::Timestamp | ValType::Duration) {
+        // String, timestamp and duration all compare as signed ints, for the
+        // same reason: their `i64` encoding is order-preserving. A timestamp and
+        // a duration are i64 nanoseconds, whose signed order is the
+        // chronological / magnitude order; a string is its RANK among the
+        // batch's distinct strings (`bytecode::StrDict`), whose signed order is
+        // lexicographic order. So all six comparisons are the signed int op.
+        // The class check above already kept the three from mixing.
+        if matches!(
+            a.bank,
+            ValType::Str | ValType::Timestamp | ValType::Duration
+        ) {
             return Ok(emit_bin(ctx, iop, a, b, ValType::Bool));
         }
         // One int and one uint operand: compare NUMERICALLY, which is neither

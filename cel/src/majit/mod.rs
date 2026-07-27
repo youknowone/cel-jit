@@ -595,10 +595,8 @@ mod tests {
         Bool(Vec<i64>),
         UInt(Vec<i64>),
         Float(Vec<f64>),
-        /// A string column. Interned to an `i64` content-hash column
-        /// (`intern_hash`) by the batch harness before it reaches the machine;
-        /// [`ColData::column`] therefore refuses it (the id vec is derived, not
-        /// borrowable from here).
+        /// A string column. Handed to the machine as strings; `prepare_batch`
+        /// ranks the batch's distinct values into the `i64` ids it runs on.
         Str(Vec<String>),
         /// A timestamp column, as `i64` nanoseconds since the Unix epoch. Read
         /// directly as an int column (no interning); the oracle rebuilds a
@@ -640,9 +638,7 @@ mod tests {
                 | ColData::Timestamp(c)
                 | ColData::Duration(c) => Column::Int(c),
                 ColData::Float(c) => Column::Float(c),
-                ColData::Str(_) => {
-                    panic!("Str column must be interned to an id column before `column()`")
-                }
+                ColData::Str(c) => Column::Str(c),
             }
         }
     }
@@ -953,15 +949,14 @@ mod tests {
     }
 
     /// Cross-check a typed batch containing **string** columns. Each string
-    /// column is interned to an `i64` content-hash column (`intern_hash`); the
-    /// hash is verified injective over every distinct string present (column
-    /// values + the expression's literals), so an id compare equals a content
-    /// compare bit for bit. The clean / interp / compiled tiers must all equal
-    /// the stock tree-walker's per-row bool/int sum, and the compiled run must
-    /// trace the loop.
+    /// column reaches the machine as strings, and `prepare_batch` ranks the
+    /// batch's distinct values into the `i64` ids it compares — an
+    /// order-preserving, injective encoding, so an id compare equals a content
+    /// compare bit for bit for ordering as well as equality. The clean / interp
+    /// / compiled tiers must all equal the stock tree-walker's per-row bool/int
+    /// sum, and the compiled run must trace the loop.
     fn check_batch_str(expr_src: &str, cols: &[(&str, ColData)]) {
         use super::bytecode::float_bank::COMPILES as COMPILES_F;
-        use super::lower::intern_hash;
 
         let program =
             Program::compile(expr_src).unwrap_or_else(|e| panic!("parse `{expr_src}`: {e:?}"));
@@ -1023,24 +1018,6 @@ mod tests {
             assert_eq!(d.len(), n, "column `{name}` length for `{expr_src}`");
         }
 
-        // Intern each string column to an i64 content-hash column, and gather
-        // every (string, hash) pair (literals + column values) for the
-        // injectivity check.
-        let mut all_strs: Vec<(&str, i64)> = Vec::new();
-        for lit in &lowered.str_literals {
-            all_strs.push((lit.text.as_str(), intern_hash(&lit.text)));
-        }
-        let mut id_storage: std::collections::HashMap<&str, Vec<i64>> =
-            std::collections::HashMap::new();
-        for (name, d) in cols {
-            if let ColData::Str(c) = d {
-                let ids: Vec<i64> = c.iter().map(|s| intern_hash(s)).collect();
-                for (s, &h) in c.iter().zip(&ids) {
-                    all_strs.push((s.as_str(), h));
-                }
-                id_storage.insert(*name, ids);
-            }
-        }
         // Derived length columns: `str::len()` per row, exactly what
         // `String::size` returns. Materialized from the SAME strings the ids come
         // from, so the two columns cannot drift apart.
@@ -1053,36 +1030,16 @@ mod tests {
                 }
             }
         }
-        // Injectivity: no two distinct strings may share a hash (a real collision
-        // bails to the tree-walker in production; the test data is collision-free
-        // so the assert documents the id-compare == content-compare invariant).
-        let mut seen: std::collections::HashMap<i64, &str> = std::collections::HashMap::new();
-        for &(s, h) in &all_strs {
-            match seen.get(&h) {
-                Some(&prev) => {
-                    assert_eq!(
-                        prev, s,
-                        "hash collision for `{expr_src}`: `{prev}` vs `{s}`"
-                    )
-                }
-                None => {
-                    seen.insert(h, s);
-                }
-            }
-        }
-
         // Build one column per SLOT, keyed by path: a `size(x)` slot reads the
-        // derived length column, a Str slot its interned id column, anything else
-        // its own buffer.
+        // derived length column, anything else its own buffer. A string column
+        // is handed over AS STRINGS — the ids are ranks over the whole batch,
+        // which `prepare_batch` is the only thing positioned to compute.
         let columns: Vec<Column> = lowered
             .slots
             .iter()
             .map(|slot| match size_slot_source(&slot.path) {
                 Some(src) => Column::Int(&len_storage[src]),
-                None => match declared[slot.path.as_str()] {
-                    ColData::Str(_) => Column::Int(&id_storage[slot.path.as_str()]),
-                    d => d.column(),
-                },
+                None => declared[slot.path.as_str()].column(),
             })
             .collect();
 
@@ -1109,7 +1066,6 @@ mod tests {
             Some(expected),
             "clean vs stock for `{expr_src}`"
         );
-        core::hint::black_box(&id_storage);
 
         // majit interpreter tier, then compiled tier (monotonic compile counter).
         let off = eval_batch_sum_f(&lowered, &columns, n, u32::MAX);
@@ -1365,7 +1321,7 @@ mod tests {
     #[test]
     fn batch_size() {
         // `size(s)` reads a DERIVED length column: the machine carries a string
-        // as a content hash and has no bytes to count, so the batch builder
+        // as an `i64` id and has no bytes to count, so the batch builder
         // materializes `str::len()` per row from the same strings it interns.
         // The walker's `String::size` is exactly `str::len()` — UTF-8 BYTES, not
         // code points — so the multi-byte choices below are the interesting case
@@ -1437,7 +1393,7 @@ mod tests {
 
     #[test]
     fn batch_string_equality() {
-        // String ==/!= lower to a content-hash compare (OP_EQ/OP_NE over the
+        // String ==/!= lower to an id compare (OP_EQ/OP_NE over the
         // int-file ids). The oracle compares actual strings; the id compare is
         // bit-exact against it across the clean / interp / compiled tiers.
         let n = 3000;
@@ -1488,11 +1444,13 @@ mod tests {
     /// This is what keeps the warm driver warm. `prepare_batch` interns the code
     /// words and the JIT keys its compiled loop on them, so a per-batch value
     /// baked into an immediate would re-key the trace on every batch and compile
-    /// the loop again each time. The assertion that pins it: two expressions
-    /// differing ONLY in the literal must produce byte-identical words.
+    /// the loop again each time. And the id IS per-batch now that it is a rank:
+    /// `"m"` is id 1 among `["a", "m", "z"]` and id 0 among `["m", "z"]`.
+    ///
+    /// The assertion that pins it: two expressions differing ONLY in the literal
+    /// must produce byte-identical words.
     #[test]
     fn string_literal_id_rides_a_register_not_the_words() {
-        use super::lower::intern_hash;
         let schema: Schema = [("role".to_string(), ValType::Str)].into_iter().collect();
         let lower = |src: &str| {
             let program = Program::compile(src).unwrap();
@@ -1501,12 +1459,8 @@ mod tests {
 
         let admin = lower("role == \"admin\"");
         let guest = lower("role == \"superadmin\"");
-
-        // The ids genuinely differ, so identical words below are not a case of
-        // two literals that happen to share one.
-        assert_eq!(admin.scalar_seeds(), vec![intern_hash("admin")]);
-        assert_eq!(guest.scalar_seeds(), vec![intern_hash("superadmin")]);
-        assert_ne!(admin.scalar_seeds(), guest.scalar_seeds());
+        assert_eq!(admin.str_literals[0].text, "admin");
+        assert_eq!(guest.str_literals[0].text, "superadmin");
 
         let (a_shape, g_shape) = (admin.batch_sum_shape(true), guest.batch_sum_shape(true));
         assert_eq!(
@@ -1514,38 +1468,99 @@ mod tests {
             "two literals, one shape: the id is not in the words"
         );
         assert_eq!(a_shape.seed.num_scalars(), 1);
+        assert_eq!(
+            admin.str_literals[0].reg, guest.str_literals[0].reg,
+            "and both arrive in the same register"
+        );
+    }
 
-        // And spelled out directly: the id appears nowhere in the program.
-        for (src, lowered, shape) in [
-            ("admin", &admin, &a_shape),
-            ("superadmin", &guest, &g_shape),
+    /// The same batch, one literal, two different sets of neighbours: the
+    /// literal's rank moves, and the answer does not.
+    ///
+    /// A rank is a property of the batch, which is what forced the id out of the
+    /// words. This is the case that would silently break if a literal's id were
+    /// ever cached across batches.
+    #[test]
+    fn a_literals_rank_moves_with_the_batch_and_the_answer_does_not() {
+        use super::batch::{Batch, BatchProgram, ColumnRef};
+        let schema: Schema = [("role".to_string(), ValType::Str)].into_iter().collect();
+        let program = BatchProgram::compile("role < \"m\"", &schema).expect("string `<` lowers");
+
+        // `"m"` sorts last here and in the middle there, so its rank differs.
+        for (rows, want) in [
+            (vec!["a", "b", "c"], 3),
+            (vec!["a", "z", "n", "b"], 2),
+            (vec!["z", "y"], 0),
         ] {
-            let id = intern_hash(src);
-            assert!(
-                !shape.code.contains(&id),
-                "`{src}`'s id {id} is baked into the words of `{:?}`",
-                lowered.str_literals
-            );
+            let col: Vec<String> = rows.iter().map(|s| s.to_string()).collect();
+            let batch = Batch::new(col.len()).column("role", ColumnRef::Str(&col));
+            let got = program.bind(&batch).expect("bind").sum().expect("sum");
+            assert_eq!(got, Value::Int(want), "rows {rows:?}");
         }
     }
 
+    /// String ordering lowers now that ids are ranks; what still bails is a
+    /// string-VALUED result, which is the reduction's limit and not the
+    /// comparison's — there is no sum of strings.
     #[test]
-    fn string_ordering_bails() {
-        // Strings support only equality here; ordering (`<` etc.) needs sorted
-        // ids, so the typed lowering bails and the tree-walker handles it. A bare
-        // string result is likewise not sum-reducible and bails.
+    fn string_ordering_lowers_and_a_string_result_still_bails() {
         let schema: Schema = [
             ("a".to_string(), ValType::Str),
             ("b".to_string(), ValType::Str),
         ]
         .into_iter()
         .collect();
-        for expr in ["a < b", "a <= b", "a > b", "a >= b", "a"] {
+        let lower = |expr: &str| {
             let program = Program::compile(expr).unwrap();
+            lower_typed(program.expression(), &schema)
+        };
+        for expr in ["a < b", "a <= b", "a > b", "a >= b", "a == b", "a != b"] {
+            assert!(lower(expr).is_ok(), "`{expr}` must lower to a rank compare");
+        }
+        for expr in ["a", "a + b"] {
             assert!(
-                lower_typed(program.expression(), &schema).is_err(),
-                "`{expr}` must bail the typed lowering (string ordering / bare result)"
+                lower(expr).is_err(),
+                "`{expr}` is string-valued and not sum-reducible"
             );
+        }
+    }
+
+    /// Ordering over a real batch, cross-checked against the tree-walker across
+    /// every tier. This is the assertion the rank encoding exists for: the
+    /// walker compares CONTENT, the machine compares ids, and they must agree.
+    #[test]
+    fn batch_string_ordering() {
+        let n = 3000;
+        // Deliberately not sorted, not uniform in length, and sharing prefixes,
+        // so a rank that merely grouped equal strings would not survive.
+        let words = [
+            "admin",
+            "ad",
+            "administrator",
+            "auditor",
+            "guest",
+            "g",
+            "root",
+            "Root",
+            "",
+        ];
+        let a = gen_str(n, 0x5150_1234_ABCD_9876, &words);
+        let b = gen_str(n, 0xFEED_FACE_0BAD_C0DE, &words);
+        for op in ["<", "<=", ">", ">="] {
+            check_batch_str(
+                &format!("a {op} b"),
+                &[
+                    ("a", ColData::Str(a.clone())),
+                    ("b", ColData::Str(b.clone())),
+                ],
+            );
+            // Against a literal, both present in the column and absent from it.
+            for lit in ["guest", "zzz"] {
+                check_batch_str(
+                    &format!("a {op} \"{lit}\""),
+                    &[("a", ColData::Str(a.clone()))],
+                );
+            }
         }
     }
 
@@ -2169,7 +2184,7 @@ mod tests {
 
     #[test]
     fn batch_string_in_set() {
-        // String membership: an OR-chain of content-hash equalities. Literals in
+        // String membership: an OR-chain of id equalities. Literals in
         // the set feed the injectivity check alongside the column values.
         let n = 3000;
         let roles = ["admin", "user", "guest", "root", "auditor"];
@@ -2999,8 +3014,6 @@ mod tests {
     /// Run one sweep expression through both evaluators and check the parity
     /// property. Panics with the expression on any divergence.
     fn sweep_case(expr_src: &str, cols: &[(&str, ColData)]) -> SweepVerdict {
-        use super::lower::intern_hash;
-
         let n = cols[0].1.len();
 
         let program =
@@ -3015,7 +3028,7 @@ mod tests {
         };
 
         // Columns in SLOT order, materializing the two derived kinds the schema
-        // does not declare: a string column's `i64` content-hash ids, and a
+        // does not declare: a string column's `i64` ids, and a
         // `size(<string>)` length column.
         let declared: HashMap<&str, &ColData> = cols.iter().map(|(nm, d)| (*nm, d)).collect();
         let mut derived: Vec<Vec<i64>> = Vec::new();
@@ -3033,10 +3046,6 @@ mod tests {
                     plan.push(Err(derived.len() - 1));
                 }
                 None => match declared.get(slot.path.as_str()) {
-                    Some(ColData::Str(c)) => {
-                        derived.push(c.iter().map(|s| intern_hash(s)).collect());
-                        plan.push(Err(derived.len() - 1));
-                    }
                     Some(d) => plan.push(Ok(d)),
                     None => panic!("`{expr_src}`: slot `{}` has no column", slot.path),
                 },
@@ -3203,15 +3212,24 @@ mod tests {
     #[test]
     fn coverage_gap_does_not_grow() {
         use std::collections::BTreeMap;
-        // What is left, and it is almost all ONE limit: a string is interned
-        // to an `i64` content-hash id, so `<` has no order to read, `+` and
-        // `string(x)` have no characters to produce, and `startsWith` and its
-        // three siblings have none to inspect. The rest is the batch loop
-        // reducing by SUM, which a string- or timestamp-valued top-level result
-        // has no answer for. (`-b` is the walker answering `-true` as `false`,
-        // which no CEL overload defines — matching it would put that bug in the
-        // JIT tier too.)
-        const GAP_CEILING: usize = 117;
+        // What is left splits three ways.
+        //
+        // A string id is a RANK now, so ordering reads it; what a rank still
+        // cannot give is the CHARACTERS — `s + s` and `string(x)` have none to
+        // produce, `startsWith` and its three siblings none to inspect.
+        //
+        // The batch loop reduces by SUM, which a string- or temporal-valued
+        // top-level result has no answer for.
+        //
+        // Temporal arithmetic (`d + d`, `t + d`, `t - t`) declines at the
+        // operator, not at the reduction: the operands are i64 nanoseconds but
+        // the walker's chrono arithmetic is wider than i64 nanoseconds, so a
+        // machine add can overflow where the walker answers. Covering it needs a
+        // bind-time domain check, not just an opcode.
+        //
+        // And `-b` is the walker answering `-true` as `false`, which no CEL
+        // overload defines — matching it would put that bug in the JIT tier too.
+        const GAP_CEILING: usize = 81;
 
         let (srcs, cols) = sweep_operands();
         let schema: Schema = cols

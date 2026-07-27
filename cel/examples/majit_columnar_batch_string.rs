@@ -2,23 +2,22 @@
 //! tree-walker (issue #357). The string analog of `majit_columnar_batch_uint`.
 //!
 //! This is an explicit **cross-model batch experiment**, not the default fair
-//! CEL JIT benchmark. Hash interning, columnar specialization, batch fusion,
+//! CEL JIT benchmark. Dictionary interning, columnar specialization, batch fusion,
 //! and compilation are all present in its stock/JIT ratio.
 //!
 //! Runs the REAL cel path: a CEL `Program` whose predicate is a string equality
 //! (`role == "admin" && region == "us-west-2"`) is lowered
 //! (`cel::majit::lower::lower_typed`, under a schema declaring the string slots)
 //! and evaluated over a batch of rows via `eval_batch_sum_f`. A string column is
-//! interned to an `i64` content-hash column (`cel::majit::lower::intern_hash`,
-//! shared with the literal folding), so the compiled trace reads each column as
-//! `i64` bits via a `raw_load` and the equality is a single `OP_EQ` — no string
-//! comparison in the hot loop. The tree-walker, by contrast, compares the actual
-//! `Arc<String>` content per row.
+//! interned to an `i64` id column — the string's RANK among the batch's
+//! distinct strings, the literals included — so the compiled trace reads each
+//! column as `i64` bits via a `raw_load` and the equality is a single `OP_EQ` —
+//! no string comparison in the hot loop. The tree-walker, by contrast, compares
+//! the actual `Arc<String>` content per row.
 //!
-//! The interning is verified injective over every distinct string present
-//! (column values + the expression's literals): with an injective hash an id
-//! compare equals a content compare bit for bit. A real collision would bail to
-//! the tree-walker; the controlled data here is collision-free.
+//! Ranking is injective by construction, so an id compare equals a content
+//! compare bit for bit with nothing to verify and no data-dependent bail; being
+//! order-preserving, it does the same for `<` and its three siblings.
 //!
 //! FAIR comparison = hot vs hot. Both sides receive their data already laid out
 //! (id columns for the JIT, a live `Context` for the walker) and are measured
@@ -91,10 +90,9 @@ fn main() {
     let role = make_col_str(n, 0x2545_F491_4F6C_DD1D, &roles);
     let region = make_col_str(n, 0x9E37_79B9_7F4A_7C15, &regions);
 
-    // Binding interns each string column to an i64 content-hash column and
-    // verifies the hash is injective over every distinct string present (column
-    // values + the expression's literals), so an id compare equals a content
-    // compare bit for bit. A collision would be a `BatchError::HashCollision`.
+    // Binding ranks every string this batch can be asked about — the column
+    // values and the expression's literals together — into one order, so an id
+    // compare equals a content compare bit for bit.
     let batch = Batch::new(n)
         .column("role", ColumnRef::Str(&role))
         .column("region", ColumnRef::Str(&region));

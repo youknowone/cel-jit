@@ -5,7 +5,7 @@
 //!
 //! The instruction set is a three-address register machine over two banks: an
 //! `i64` bank (`regs`) carrying ints, bools as `0`/`1`, `uint` as a raw bit
-//! pattern, strings as content hashes and temporals as nanos, and a parallel
+//! pattern, strings as ranked ids and temporals as nanos, and a parallel
 //! `f64` bank (`fregs`). Every operand is a register index (`usize`), every
 //! immediate an `i64`. Operator opcodes read two source registers and write one
 //! destination; comparisons write `1`/`0` into the int bank whichever bank the
@@ -179,28 +179,30 @@ fn majit_raw_store_i64(base: i64, ea: i64, val: i64) {
 }
 
 /// One input column for the two-bank batch evaluator: an `i64` column for an
-/// int/bool slot, or an `f64` column for a `double` slot. Its base pointer (an
-/// `i64` regardless of bank) is what a compiled trace reads per row.
+/// int/bool slot, an `f64` column for a `double` slot, or raw strings for a
+/// `string` slot. Its base pointer (an `i64` regardless of bank) is what a
+/// compiled trace reads per row.
 #[derive(Debug, Clone, Copy)]
 pub enum Column<'a> {
     Int(&'a [i64]),
     Float(&'a [f64]),
+    /// A `string` column, handed over as its raw content.
+    ///
+    /// The machine runs on `i64` ids, but **which** ids is [`prepare_batch`]'s
+    /// to decide, not the caller's: it ranks the batch's distinct strings (see
+    /// [`StrDict`]) so that one order covers the column values and the
+    /// expression's own literals alike. A caller cannot pre-encode, because a
+    /// second ranking would not agree with the one the literals came from.
+    Str(&'a [String]),
 }
 
 impl Column<'_> {
-    /// Base address of the column buffer, as the `i64` a `raw_load` base holds.
-    pub fn base(&self) -> i64 {
-        match self {
-            Column::Int(c) => c.as_ptr() as i64,
-            Column::Float(c) => c.as_ptr() as i64,
-        }
-    }
-
     /// Number of rows.
     pub fn len(&self) -> usize {
         match self {
             Column::Int(c) => c.len(),
             Column::Float(c) => c.len(),
+            Column::Str(c) => c.len(),
         }
     }
 
@@ -212,8 +214,8 @@ impl Column<'_> {
     fn matches(&self, ty: super::lower::ValType) -> bool {
         use super::lower::ValType;
         // A `uint` slot is backed by an int-bit column (the int register file
-        // carries the raw 64-bit pattern); a `bool` slot by an int column of
-        // `0`/`1`; a `string` slot by an int column of content-hash ids.
+        // carries the raw 64-bit pattern) and a `bool` slot by an int column of
+        // `0`/`1`. A `string` slot takes the strings themselves.
         matches!(
             (self, ty),
             (
@@ -221,11 +223,55 @@ impl Column<'_> {
                 ValType::Int
                     | ValType::Bool
                     | ValType::UInt
-                    | ValType::Str
                     | ValType::Timestamp
                     | ValType::Duration
             ) | (Column::Float(_), ValType::Float)
+                | (Column::Str(_), ValType::Str)
         )
+    }
+}
+
+/// A batch's strings encoded as **order-preserving** `i64` ids: id `k` is the
+/// `k`-th smallest distinct string in the batch.
+///
+/// This is ordinary dictionary encoding, and it is what makes an id compare a
+/// content compare for ORDERING and not only for equality — a content hash
+/// could do equality but had no order to read, which is why string `<` used to
+/// bail. It is also injective by construction, so unlike a hash there is no
+/// collision to check for and no data-dependent bail.
+///
+/// Built over every string the batch carries AND every literal the expression
+/// mentions, so column-vs-column and column-vs-literal share one order.
+struct StrDict<'s> {
+    rank: std::collections::HashMap<&'s str, i64>,
+}
+
+impl<'s> StrDict<'s> {
+    /// Rank `strings`, which must include every string the batch will ask for.
+    fn build(strings: impl Iterator<Item = &'s str>) -> Self {
+        // Dedup BEFORE sorting. A batch is millions of rows over a handful of
+        // distinct values, so the sort is over the distinct set and the
+        // per-row cost stays one hash lookup, the same order as the content
+        // hashing this replaced.
+        let distinct: std::collections::HashSet<&'s str> = strings.collect();
+        let mut distinct: Vec<&'s str> = distinct.into_iter().collect();
+        distinct.sort_unstable();
+        StrDict {
+            rank: distinct
+                .into_iter()
+                .enumerate()
+                .map(|(k, s)| (s, k as i64))
+                .collect(),
+        }
+    }
+
+    /// The id of a string that was in the build set.
+    fn id(&self, s: &str) -> i64 {
+        self.rank[s]
+    }
+
+    fn encode(&self, col: &[String]) -> Box<[i64]> {
+        col.iter().map(|s| self.id(s)).collect()
     }
 }
 
@@ -245,6 +291,11 @@ pub struct BatchRun<'a> {
     /// writes it through the raw pointer seeded into `init_regs`.
     trap: Box<i64>,
     rows: usize,
+    /// Id columns materialized from the caller's [`Column::Str`] buffers.
+    /// `init_regs` holds raw pointers into these, so they are kept alive here
+    /// for as long as the run is. Each is separately heap-allocated, so moving
+    /// the `BatchRun` moves the box pointers and not the buffers they address.
+    _str_ids: Vec<Box<[i64]>>,
     columns: core::marker::PhantomData<&'a ()>,
 }
 
@@ -302,14 +353,49 @@ pub fn prepare_batch<'a>(
         }
         assert_eq!(c.len(), n, "{what}: column {k} length {} != {n}", c.len());
     }
-    let bases: Vec<i64> = columns.iter().map(|c| c.base()).collect();
+    // Rank every string this batch can be asked about — the column values and
+    // the expression's literals together — so all of them share one order.
+    let dict = StrDict::build(
+        columns
+            .iter()
+            .filter_map(|c| match c {
+                Column::Str(s) => Some(s.iter().map(String::as_str)),
+                _ => None,
+            })
+            .flatten()
+            .chain(lowered.str_literals.iter().map(|lit| lit.text.as_str())),
+    );
+    let str_ids: Vec<Box<[i64]>> = columns
+        .iter()
+        .filter_map(|c| match c {
+            Column::Str(s) => Some(dict.encode(s)),
+            _ => None,
+        })
+        .collect();
+    let mut next_id_col = 0;
+    let bases: Vec<i64> = columns
+        .iter()
+        .map(|c| match c {
+            Column::Int(x) => x.as_ptr() as i64,
+            Column::Float(x) => x.as_ptr() as i64,
+            Column::Str(_) => {
+                let base = str_ids[next_id_col].as_ptr() as i64;
+                next_id_col += 1;
+                base
+            }
+        })
+        .collect();
     let mut trap: Box<i64> = Box::new(0);
     let trap_addr = (&mut *trap) as *mut i64 as i64;
     let shape = lowered.batch_sum_shape(true);
     // Column bases, the row count, the trap address and the string literals'
     // ids are all this batch's data, and all reach the program the same way:
     // through the seeded bank, never through the words.
-    let scalars = lowered.scalar_seeds();
+    let scalars: Vec<i64> = lowered
+        .str_literals
+        .iter()
+        .map(|lit| dict.id(&lit.text))
+        .collect();
     let init_regs = shape.seed.regs(&bases, &scalars, n as i64, trap_addr);
     // The words are the same for every batch of this expression, so interning
     // them keeps the JIT's green key — and with it the compiled loop the driver
@@ -321,6 +407,7 @@ pub fn prepare_batch<'a>(
         num_float_regs: shape.num_float_regs,
         trap,
         rows: n,
+        _str_ids: str_ids,
         columns: core::marker::PhantomData,
     }
 }
