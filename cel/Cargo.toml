@@ -23,11 +23,19 @@ bytes = { version = "1", optional = true }
 thiserror = "2"
 pastey = "0.2.1"
 
-# PoC meta-tracing JIT tier (feature `jit`). The `majit` crates live in a
-# separate workspace two levels up, so these are cross-workspace path deps.
-majit-ir = { path = "../../majit/majit-ir", optional = true }
-majit-macros = { path = "../../majit/majit-macros", optional = true }
-majit-metainterp = { path = "../../majit/majit-metainterp", default-features = false, optional = true }
+# PoC meta-tracing JIT tier (feature `jit`). The `majit` crates live in the
+# pyre repository, pinned by revision.
+#
+# They are `optional`, but cargo resolves a dependency's SOURCE while parsing
+# this manifest, before it knows which features are on. As path deps into a
+# sibling checkout that made every cargo command — `fmt --check` included —
+# fail on a clean clone. A git revision resolves for anyone.
+#
+# `rev` is https://github.com/youknowone/pyre/pull/834. Bump it deliberately:
+# it is the only thing pinning the JIT tier's behaviour.
+majit-ir = { git = "https://github.com/youknowone/pyre.git", rev = "2fc3d72bf2bdc3d96b7f1e8c4021f7bcf5d4f8f3", optional = true }
+majit-macros = { git = "https://github.com/youknowone/pyre.git", rev = "2fc3d72bf2bdc3d96b7f1e8c4021f7bcf5d4f8f3", optional = true }
+majit-metainterp = { git = "https://github.com/youknowone/pyre.git", rev = "2fc3d72bf2bdc3d96b7f1e8c4021f7bcf5d4f8f3", default-features = false, optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.5.1", features = ["html_reports"] }
