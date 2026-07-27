@@ -1316,12 +1316,16 @@ pub mod float_bank {
     }
 
     /// Build a driver for one state shape and install its canonical liveness
-    /// once. The install is program-independent (the generated `build_meta`
-    /// ignores its args), so a caller may keep one driver per
-    /// `(num_regs, num_fregs)` shape and run every program of that shape on it.
+    /// once.
+    ///
+    /// The install takes no program. `build_meta` is generated to ignore both
+    /// of its arguments — it fills `__JitMeta` from the state's array lengths
+    /// alone (`majit-macros` `codegen_state.rs` `build_meta_fields`) — and a
+    /// driver here serves every program of its shape, so there is no program
+    /// this could meaningfully be handed. Passing the batch that happened to
+    /// arrive first would only make the driver look program-specific.
     fn new_driver_f(
         threshold: u32,
-        program: &Code,
         num_regs: usize,
         num_fregs: usize,
     ) -> majit_metainterp::JitDriver<VmStateF> {
@@ -1346,7 +1350,7 @@ pub mod float_bank {
         };
         {
             use majit_metainterp::JitState as _;
-            seed.build_meta(0, program)
+            seed.build_meta(0, &[])
                 .install_canonical_liveness(&mut driver);
         }
         driver
@@ -1368,9 +1372,19 @@ pub mod float_bank {
         num_fregs: usize,
         threshold: u32,
     ) -> i64 {
-        let mut driver = new_driver_f(threshold, program, init_regs.len(), num_fregs);
+        let mut driver = new_driver_f(threshold, init_regs.len(), num_fregs);
         run_mainloop_f(&mut driver, program, init_regs, num_fregs)
     }
+
+    /// How many distinct batch programs one thread interns before the caches are
+    /// recycled.
+    ///
+    /// The caches grow with the number of distinct EXPRESSIONS a thread has
+    /// evaluated, not with the number of calls, so a host with a fixed set of
+    /// policies never reaches this. What it bounds is a host that compiles CEL
+    /// from untrusted or generated text: each new expression would otherwise add
+    /// a program that is never freed plus a compiled loop that is never retired.
+    pub const MAX_INTERNED_PROGRAMS: usize = 256;
 
     std::thread_local! {
         /// Batch programs interned by their own words.
@@ -1379,8 +1393,9 @@ pub mod float_bank {
         /// (`trace_ctx.rs` `green_key_raw`), so a compiled loop is only reused
         /// when the next batch runs the same allocation. A batch program's words
         /// depend only on the expression's shape, so every batch of one
-        /// expression builds identical words and shares this entry. Entries are
-        /// never removed, which is what keeps the address stable.
+        /// expression builds identical words and shares this entry. An entry is
+        /// never removed on its own, which is what keeps the address stable —
+        /// only [`MAX_INTERNED_PROGRAMS`] recycles it, together with the drivers.
         static PROGRAMS: core::cell::RefCell<std::collections::HashSet<std::rc::Rc<[i64]>>> =
             core::cell::RefCell::new(std::collections::HashSet::new());
 
@@ -1399,8 +1414,26 @@ pub mod float_bank {
     }
 
     /// Intern a batch program's words, returning a handle whose address stays
-    /// put for the rest of the process so the green key keyed on it does too.
+    /// put so the green key built from it does too.
+    ///
+    /// Interning a program that would push the thread past
+    /// [`MAX_INTERNED_PROGRAMS`] recycles the caches first, so retained memory
+    /// is bounded by the cap rather than by the number of distinct expressions
+    /// the thread has seen. That is a wholesale flush, not upstream's per-loop
+    /// retirement: `memmgr.py:23-69 MemoryManager` ages individual loops out of
+    /// `alive_loops`, and majit ports it (`memmgr.rs`, reachable through the
+    /// `loop_longevity` parameter) but nothing drives it — no counterpart of
+    /// `pyjitpl.py:2348 try_to_free_some_loops` calls `next_generation` or
+    /// `keep_loop_alive` outside its own tests, so per-loop ages never advance.
+    /// Until that is wired, a cap on this side is what bounds the growth.
     pub fn intern_program(code: Vec<i64>) -> std::rc::Rc<[i64]> {
+        let recycle = PROGRAMS.with(|p| {
+            let p = p.borrow();
+            p.len() >= MAX_INTERNED_PROGRAMS && !p.contains(&code[..])
+        });
+        if recycle {
+            reset_persistent_state();
+        }
         PROGRAMS.with(|p| {
             let mut p = p.borrow_mut();
             if let Some(interned) = p.get(&code[..]) {
@@ -1410,6 +1443,12 @@ pub mod float_bank {
             p.insert(interned.clone());
             interned
         })
+    }
+
+    /// How many batch programs this thread currently has interned. Bounded by
+    /// [`MAX_INTERNED_PROGRAMS`].
+    pub fn interned_program_count() -> usize {
+        PROGRAMS.with(|p| p.borrow().len())
     }
 
     /// Drop this thread's interned programs and persistent drivers, so the next
@@ -1438,7 +1477,7 @@ pub mod float_bank {
         // driver rather than panicking on the `RefCell`.
         let mut driver = DRIVERS
             .with(|d| d.borrow_mut().remove(&key))
-            .unwrap_or_else(|| new_driver_f(threshold, program, init_regs.len(), num_fregs));
+            .unwrap_or_else(|| new_driver_f(threshold, init_regs.len(), num_fregs));
         // The store majit decodes guard and resume metadata through is one slot
         // per thread, written when a driver registers its dispatch jitcode. We
         // keep a driver per shape, so aim it back at this one before it can

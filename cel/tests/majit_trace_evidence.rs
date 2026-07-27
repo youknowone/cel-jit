@@ -17,7 +17,8 @@
 use std::sync::atomic::Ordering;
 
 use cel::majit::bytecode::float_bank::{
-    reset_persistent_state, COMPILES, GUARD_FAILS, TRACE_ABORTS,
+    interned_program_count, reset_persistent_state, COMPILES, GUARD_FAILS, MAX_INTERNED_PROGRAMS,
+    TRACE_ABORTS,
 };
 use cel::majit::bytecode::{clean_batch_sum_f, eval_batch_sum_f, Column};
 use cel::majit::lower::{lower_typed, LoweredF, Schema, ValType};
@@ -218,6 +219,48 @@ fn alternating_shapes_share_one_thread_state_field_store() {
             "per_row={per_row}: the flat shape must keep answering"
         );
     }
+}
+
+/// Keeping programs and drivers alive is bounded, not a leak: a thread that
+/// keeps evaluating NEW expressions recycles its caches instead of growing one
+/// never-freed program and one never-retired compiled loop per expression.
+///
+/// Each `a > K` interns its own words (the literal rides in the prelude), so
+/// this walks past the cap and back round. Every answer is still checked
+/// against the oracle, since recycling frees program allocations that compiled
+/// loops were keyed on — dropping the drivers in the same breath is what makes
+/// that safe.
+#[test]
+fn interning_is_bounded_and_survives_recycling() {
+    let _serial = serial();
+    let rows = 64usize;
+    let schema: Schema = [("a".to_string(), ValType::Int)].into_iter().collect();
+    let a: Vec<i64> = (0..rows as i64).collect();
+
+    reset_persistent_state();
+    let mut recycled = false;
+    for k in 0..(MAX_INTERNED_PROGRAMS + 8) {
+        let lowered = lower(&format!("a > {k}"), &schema);
+        let before = interned_program_count();
+        let (_, _, aborts, result) = measure_warm(&lowered, &[Column::Int(&a)], rows);
+        recycled |= interned_program_count() < before;
+        let expected = (0..rows as i64).filter(|v| *v > k as i64).count() as i64;
+        assert_eq!(
+            result,
+            Some(expected),
+            "k={k}: wrong answer after recycling"
+        );
+        assert_eq!(aborts, 0, "k={k}: trace refused");
+        assert!(
+            interned_program_count() <= MAX_INTERNED_PROGRAMS,
+            "k={k}: {} interned programs exceeds the cap",
+            interned_program_count()
+        );
+    }
+    assert!(
+        recycled,
+        "the cap never fired, so this asserted nothing about recycling"
+    );
 }
 
 /// The same property for the two-bank machine: a `double` column keeps the row
