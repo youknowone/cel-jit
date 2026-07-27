@@ -467,30 +467,17 @@ pub mod float_bank {
         // aliasing the helper call to the opcode.
         native_int_binops = { majit_uint_mul_high => UintMulHigh },
     )]
-    fn run_mainloop_f(program: &Code, num_regs: usize, num_fregs: usize, threshold: u32) -> i64 {
-        let mut driver: majit_metainterp::JitDriver<VmStateF> =
-            majit_metainterp::JitDriver::new(threshold);
-        driver.set_on_compile_loop(|_green_key, _ops_before, _ops_after| {
-            COMPILES.fetch_add(1, Ordering::Relaxed);
-        });
-        driver.set_on_guard_failure(|_green_key, _a, _b| {
-            GUARD_FAILS.fetch_add(1, Ordering::Relaxed);
-        });
-        driver.set_on_trace_abort(|_green_key, _permanent| {
-            TRACE_ABORTS.fetch_add(1, Ordering::Relaxed);
-        });
+    fn run_mainloop_f(
+        mut driver: &mut majit_metainterp::JitDriver<VmStateF>,
+        program: &Code,
+        init_regs: &[i64],
+        init_fregs: &[f64],
+    ) -> i64 {
         let mut pc: usize = 0;
         let mut state = VmStateF {
-            regs: vec![0; num_regs],
-            fregs: vec![0.0; num_fregs],
+            regs: init_regs.to_vec(),
+            fregs: init_fregs.to_vec(),
         };
-
-        {
-            use majit_metainterp::JitState as _;
-            state
-                .build_meta(0, program)
-                .install_canonical_liveness(&mut driver);
-        }
 
         loop {
             jit_merge_point!();
@@ -1314,9 +1301,46 @@ pub mod float_bank {
         }
     }
 
-    /// Run the two-bank mainloop. `threshold == u32::MAX` gives the interpreter
-    /// tier; a small value enables JIT compilation.
+    /// Build a driver for one state shape and install its canonical liveness
+    /// once. The install is program-independent (the generated `build_meta`
+    /// ignores its args), so a caller may keep one driver per
+    /// `(num_regs, num_fregs)` shape and run every program of that shape on it.
+    fn new_driver_f(
+        threshold: u32,
+        program: &Code,
+        num_regs: usize,
+        num_fregs: usize,
+    ) -> majit_metainterp::JitDriver<VmStateF> {
+        let mut driver: majit_metainterp::JitDriver<VmStateF> =
+            majit_metainterp::JitDriver::new(threshold);
+        driver.set_on_compile_loop(|_green_key, _ops_before, _ops_after| {
+            COMPILES.fetch_add(1, Ordering::Relaxed);
+        });
+        driver.set_on_guard_failure(|_green_key, _a, _b| {
+            GUARD_FAILS.fetch_add(1, Ordering::Relaxed);
+        });
+        driver.set_on_trace_abort(|_green_key, _permanent| {
+            TRACE_ABORTS.fetch_add(1, Ordering::Relaxed);
+        });
+        let seed = VmStateF {
+            regs: vec![0; num_regs],
+            fregs: vec![0.0; num_fregs],
+        };
+        {
+            use majit_metainterp::JitState as _;
+            seed.build_meta(0, program)
+                .install_canonical_liveness(&mut driver);
+        }
+        driver
+    }
+
+    /// Run the two-bank mainloop on a one-off driver with every register zeroed,
+    /// so the program itself supplies all of its inputs. `threshold == u32::MAX`
+    /// gives the interpreter tier; a small value enables JIT compilation.
     pub fn run_jit_f(program: &Code, num_regs: usize, num_fregs: usize, threshold: u32) -> i64 {
-        run_mainloop_f(program, num_regs, num_fregs, threshold)
+        let init_regs = vec![0i64; num_regs];
+        let init_fregs = vec![0.0f64; num_fregs];
+        let mut driver = new_driver_f(threshold, program, num_regs, num_fregs);
+        run_mainloop_f(&mut driver, program, &init_regs, &init_fregs)
     }
 }
