@@ -258,6 +258,22 @@ pub fn declares_list(schema: &Schema, path: &str) -> bool {
 /// loop.
 pub const OVF_FLAG_REG: usize = 0;
 
+/// One string literal the body reads, and the int register it arrives in.
+///
+/// The id is **not** an immediate in the program words. An id is a property of
+/// the batch — the whole point of [`BatchSeed`] is that anything data-dependent
+/// reaches the program through a register, so one set of words serves every
+/// batch and the JIT's green key stays put. A literal's id is data even when
+/// today's [`intern_hash`] happens to be pure, because the resolution is the
+/// batch builder's to choose.
+#[derive(Debug, Clone)]
+pub struct StrLiteral {
+    /// Raw content, as written in the expression.
+    pub text: String,
+    /// Int register the batch builder seeds with this literal's id.
+    pub reg: usize,
+}
+
 /// A CEL expression compiled to two-bank bytecode. The result is an int
 /// register (a bool/count/int-sum) or a float register (a float total), tracked
 /// by [`LoweredF::result_bank`]. [`LoweredF::batch_sum_program`] prepends the
@@ -286,11 +302,13 @@ pub struct LoweredF {
     pub num_float_regs: usize,
     /// Input slots in first-encounter order.
     pub slots: Vec<SlotInfoF>,
-    /// String literals the body compares against, as raw content. The batch
-    /// builder hashes these with [`intern_hash`] and includes them in the
+    /// String literals the body compares against, in first-encounter order,
+    /// each paired with the int register it arrives in. The batch builder
+    /// resolves the raw content to an id and seeds that register
+    /// ([`BatchSeed::scalar_regs`]); it also folds the content into the
     /// injectivity check so a literal that collides with a distinct column
     /// string bails rather than miscompiles.
-    pub str_literals: Vec<String>,
+    pub str_literals: Vec<StrLiteral>,
     /// Positions **within [`LoweredF::body`]** of jump target words, which the
     /// lowering writes body-relative because it cannot know where the body
     /// lands. [`LoweredF::batch_sum_shape`] relocates each to an
@@ -337,17 +355,29 @@ pub struct BatchSeed {
     /// order. A ROW column's base lives in the machinery bank; a list ELEMENT
     /// column's lives in the register its lowering reserved.
     base_regs: Vec<usize>,
+    /// Register holding each **broadcast scalar** — one value that is the same
+    /// for every row of the batch but not the same for every batch — in
+    /// [`LoweredF::str_literals`] order. A column base is the batch's address;
+    /// these are the batch's values. Same reason for being red: an immediate
+    /// would put batch data in the words the green key is taken over.
+    scalar_regs: Vec<usize>,
     /// Length of the int register bank these indices address.
     num_int_regs: usize,
 }
 
 impl BatchSeed {
+    /// How many broadcast scalars this shape expects, for callers that build
+    /// the vector themselves.
+    pub fn num_scalars(&self) -> usize {
+        self.scalar_regs.len()
+    }
+
     /// Build one batch's initial int register bank: the row count, the trap
-    /// word's address, and each column's base address in its own register,
-    /// every other register zero.
+    /// word's address, each column's base address and each broadcast scalar in
+    /// its own register, every other register zero.
     ///
     /// The back-edge is a do-while, so callers must pass `n >= 1`.
-    pub fn regs(&self, bases: &[i64], n: i64, trap_addr: i64) -> Vec<i64> {
+    pub fn regs(&self, bases: &[i64], scalars: &[i64], n: i64, trap_addr: i64) -> Vec<i64> {
         assert_eq!(
             bases.len(),
             self.base_regs.len(),
@@ -355,12 +385,22 @@ impl BatchSeed {
             bases.len(),
             self.base_regs.len()
         );
+        assert_eq!(
+            scalars.len(),
+            self.scalar_regs.len(),
+            "batch seed: scalar arity {} != {} broadcast scalars",
+            scalars.len(),
+            self.scalar_regs.len()
+        );
         assert!(n >= 1, "batch seed: n must be >= 1 (do-while back-edge)");
         let mut regs = vec![0i64; self.num_int_regs];
         regs[self.r_n] = n;
         regs[self.r_trap] = trap_addr;
         for (&base, &reg) in bases.iter().zip(&self.base_regs) {
             regs[reg] = base;
+        }
+        for (&v, &reg) in scalars.iter().zip(&self.scalar_regs) {
+            regs[reg] = v;
         }
         regs
     }
@@ -386,10 +426,24 @@ impl LoweredF {
     /// flag, so the caller **cannot tell** an overflowed row from a good one.
     /// Only for harnesses whose data is bounded by construction; the evaluator
     /// path ([`super::bytecode::eval_batch_sum_f`]) always passes a trap word.
+    /// Broadcast scalars are resolved here with [`intern_hash`], the same
+    /// resolution [`super::bytecode::prepare_batch`] uses, so a harness that
+    /// builds its own columns does not have to know how a string literal
+    /// becomes an id.
     pub fn batch_sum_program(&self, bases: &[i64], n: i64) -> (BatchShape, Vec<i64>) {
         let shape = self.batch_sum_shape(false);
-        let regs = shape.seed.regs(bases, n, 0);
+        let scalars = self.scalar_seeds();
+        let regs = shape.seed.regs(bases, &scalars, n, 0);
         (shape, regs)
+    }
+
+    /// The broadcast-scalar values this expression's batch registers are seeded
+    /// with, in [`BatchSeed::scalar_regs`] order.
+    pub fn scalar_seeds(&self) -> Vec<i64> {
+        self.str_literals
+            .iter()
+            .map(|lit| intern_hash(&lit.text))
+            .collect()
     }
 
     /// Build the batch program's words and the layout of the registers its
@@ -530,6 +584,7 @@ impl LoweredF {
                 r_n,
                 r_trap,
                 base_regs,
+                scalar_regs: self.str_literals.iter().map(|lit| lit.reg).collect(),
                 num_int_regs: total_int_regs,
             },
         }
@@ -549,7 +604,7 @@ struct LowerCtxF<'s> {
     /// String literals referenced by the body, in first-encounter order. The
     /// batch builder folds these into the injectivity check alongside the
     /// [`ValType::Str`] column values.
-    str_literals: Vec<String>,
+    str_literals: Vec<StrLiteral>,
     /// Element slots created by the runtime-list comprehension currently being
     /// lowered, keyed by slot path. Scoped to that comprehension on purpose:
     /// two comprehensions over the same list get their OWN registers, since
@@ -844,13 +899,18 @@ fn compile_literal_t(ctx: &mut LowerCtxF, lit: &LiteralValue) -> Result<TReg, Lo
             Ok(r)
         }
         LiteralValue::String(s) => {
-            // A string literal is a loop invariant: fold it to its content hash
-            // and load that `i64` id once in the prelude. Record the raw content
-            // so the batch builder can check the hash against the column strings.
+            // A string literal is a loop invariant, but unlike an int or a
+            // `double` it is not a program CONSTANT: its `i64` id is whatever
+            // the batch builder's interning assigns it, which is data. So it
+            // gets a register and no words at all — the register arrives
+            // already holding the id, the same way a column base does. The raw
+            // content is recorded so the builder can resolve it and check it
+            // against the column strings.
             let r = ctx.fresh(ValType::Str);
-            ctx.prelude
-                .extend_from_slice(&[OP_LOAD_CONST, intern_hash(s.inner()), r.idx as i64]);
-            ctx.str_literals.push(s.inner().to_string());
+            ctx.str_literals.push(StrLiteral {
+                text: s.inner().to_string(),
+                reg: r.idx,
+            });
             Ok(r)
         }
         LiteralValue::Bytes(_) => Err(LowerError::unsupported("bytes literal")),

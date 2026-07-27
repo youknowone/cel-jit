@@ -1028,7 +1028,7 @@ mod tests {
         // injectivity check.
         let mut all_strs: Vec<(&str, i64)> = Vec::new();
         for lit in &lowered.str_literals {
-            all_strs.push((lit.as_str(), intern_hash(lit)));
+            all_strs.push((lit.text.as_str(), intern_hash(&lit.text)));
         }
         let mut id_storage: std::collections::HashMap<&str, Vec<i64>> =
             std::collections::HashMap::new();
@@ -1479,6 +1479,54 @@ mod tests {
             "role == \"admin\" && age >= 18",
             &[("role", ColData::Str(role)), ("age", ColData::Int(age))],
         );
+    }
+
+    /// A string literal's id is a **broadcast scalar**, not a program constant:
+    /// it reaches the machine in a seeded register, and no word of the program
+    /// carries it.
+    ///
+    /// This is what keeps the warm driver warm. `prepare_batch` interns the code
+    /// words and the JIT keys its compiled loop on them, so a per-batch value
+    /// baked into an immediate would re-key the trace on every batch and compile
+    /// the loop again each time. The assertion that pins it: two expressions
+    /// differing ONLY in the literal must produce byte-identical words.
+    #[test]
+    fn string_literal_id_rides_a_register_not_the_words() {
+        use super::lower::intern_hash;
+        let schema: Schema = [("role".to_string(), ValType::Str)].into_iter().collect();
+        let lower = |src: &str| {
+            let program = Program::compile(src).unwrap();
+            lower_typed(program.expression(), &schema).expect("string equality lowers")
+        };
+
+        let admin = lower("role == \"admin\"");
+        let guest = lower("role == \"superadmin\"");
+
+        // The ids genuinely differ, so identical words below are not a case of
+        // two literals that happen to share one.
+        assert_eq!(admin.scalar_seeds(), vec![intern_hash("admin")]);
+        assert_eq!(guest.scalar_seeds(), vec![intern_hash("superadmin")]);
+        assert_ne!(admin.scalar_seeds(), guest.scalar_seeds());
+
+        let (a_shape, g_shape) = (admin.batch_sum_shape(true), guest.batch_sum_shape(true));
+        assert_eq!(
+            a_shape.code, g_shape.code,
+            "two literals, one shape: the id is not in the words"
+        );
+        assert_eq!(a_shape.seed.num_scalars(), 1);
+
+        // And spelled out directly: the id appears nowhere in the program.
+        for (src, lowered, shape) in [
+            ("admin", &admin, &a_shape),
+            ("superadmin", &guest, &g_shape),
+        ] {
+            let id = intern_hash(src);
+            assert!(
+                !shape.code.contains(&id),
+                "`{src}`'s id {id} is baked into the words of `{:?}`",
+                lowered.str_literals
+            );
+        }
     }
 
     #[test]

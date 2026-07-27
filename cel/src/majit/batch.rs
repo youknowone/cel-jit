@@ -399,7 +399,7 @@ impl BatchProgram {
         }
         let mut seen: HashMap<i64, &str> = HashMap::new();
         for lit in &self.lowered.str_literals {
-            note(&mut seen, lit)?;
+            note(&mut seen, &lit.text)?;
         }
         for col in batch.columns.values() {
             for s in strings(col) {

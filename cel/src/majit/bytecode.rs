@@ -306,7 +306,11 @@ pub fn prepare_batch<'a>(
     let mut trap: Box<i64> = Box::new(0);
     let trap_addr = (&mut *trap) as *mut i64 as i64;
     let shape = lowered.batch_sum_shape(true);
-    let init_regs = shape.seed.regs(&bases, n as i64, trap_addr);
+    // Column bases, the row count, the trap address and the string literals'
+    // ids are all this batch's data, and all reach the program the same way:
+    // through the seeded bank, never through the words.
+    let scalars = lowered.scalar_seeds();
+    let init_regs = shape.seed.regs(&bases, &scalars, n as i64, trap_addr);
     // The words are the same for every batch of this expression, so interning
     // them keeps the JIT's green key — and with it the compiled loop the driver
     // holds — from changing between batches.
