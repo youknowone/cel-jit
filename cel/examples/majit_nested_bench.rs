@@ -294,6 +294,10 @@ fn main() {
         .next()
         .map(|a| a.parse().expect("rounds must be a number"))
         .unwrap_or(5);
+    // Optional substring filter over the shape labels. The `MAJIT_STATS`
+    // counters are process-global and cumulative, so attributing a
+    // Tracing/Backend split to one shape means running only that shape.
+    let only = args.next();
 
     const SRC: &str = "items.all(i, i.price > 10)";
     let schema = nested_schema();
@@ -313,6 +317,11 @@ fn main() {
     println!("fresh JitDriver per jit run: trace + compile are INSIDE the timed region");
 
     for (label, len_of) in cases {
+        if let Some(filter) = &only {
+            if !label.contains(filter.as_str()) {
+                continue;
+            }
+        }
         let data = ListColumns::build(max_rows, len_of);
         let pool_rows = TREE_POOL.min(max_rows);
         let (tree_ns, tree_matches) = tree_walker_ns_per_eval(&program, &data, rounds, pool_rows);
