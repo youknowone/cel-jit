@@ -2,9 +2,9 @@ name: Rust
 
 on:
   push:
-    branches: [ "master" ]
+    branches: [ "master", "majit" ]
   pull_request:
-    branches: [ "master" ]
+    branches: [ "master", "majit" ]
 
 env:
   CARGO_TERM_COLOR: always
@@ -32,6 +32,12 @@ jobs:
           cargo test --verbose --features json
           cargo test --verbose --features regex
           cargo test --verbose --features chrono
+      # The majit tier only reaches its compiled trace in a release build (the
+      # tracing interpreter is ~200 ns/row in debug), and its cross-tier
+      # assertions compare a compiled answer against the tree-walker's, so a
+      # debug run would assert on the interpreter tier alone.
+      - name: Run JIT tier tests
+        run: cargo test --release --verbose --features jit
   fuzz:
     name: Fuzz
     runs-on: ubuntu-latest
