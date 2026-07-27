@@ -1140,6 +1140,21 @@ fn emit_u2f(ctx: &mut LowerCtxF, src: TReg) -> TReg {
     r
 }
 
+/// Narrow a float-bank value to a fresh uint reg (`OP_F2U`). The unsigned twin
+/// of [`emit_f2i`]; it saturates at different bounds, so `uint(-1.5)` is `0u`
+/// where `int(-1.5)` is `-1`.
+fn emit_f2u(ctx: &mut LowerCtxF, src: TReg) -> TReg {
+    debug_assert_eq!(
+        src.bank,
+        ValType::Float,
+        "emit_f2u: source must be float-banked"
+    );
+    let r = ctx.fresh(ValType::UInt);
+    ctx.body
+        .extend_from_slice(&[OP_F2U, src.idx as i64, r.idx as i64]);
+    r
+}
+
 /// Compile the two operands of a comparison, promoting a bare `int` literal to
 /// a `double` constant when its peer is float. This constant-folds the
 /// tree-walker's `int as f64` promotion (CEL compares mixed numeric operands by
@@ -1430,20 +1445,17 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
                 bank: ValType::UInt,
                 idx: a.idx,
             }),
-            // `u64 as f64` differs from `i64 as f64` above 2^63 and the trace IR
-            // has no unsigned widening cast, so this one is not ours to answer.
-            ("double", ValType::UInt) => Err(LowerError::unsupported(
-                "double(uint) (no unsigned int->float cast)",
-            )),
-            // `f64 as i64` truncates toward zero and saturates at the i64
-            // bounds (NaN -> 0) — total, exactly what the walker's plain `as`
-            // cast does, so no guard is needed. `uint(double)` is `as u64`,
-            // which saturates at DIFFERENT bounds (a negative float clamps to 0,
-            // not to i64::MIN), and there is no unsigned narrowing op.
+            // `u64 as f64`, which differs from `i64 as f64` above 2^63:
+            // `double(18446744073709551615u)` is `1.8446744073709552e19`, not
+            // `-1.0`.
+            ("double", ValType::UInt) => Ok(emit_u2f(ctx, a)),
+            // Both narrowings truncate toward zero and SATURATE, with NaN
+            // mapping to `0` — total, exactly what the walker's plain `as` cast
+            // does, so neither needs a guard. They saturate at different bounds,
+            // which is why `uint` cannot reuse the signed op: `uint(-1.5)` is
+            // `0u` where `int(-1.5)` is `-1`.
             ("int", ValType::Float) => Ok(emit_f2i(ctx, a)),
-            ("uint", ValType::Float) => Err(LowerError::unsupported(
-                "uint(double) (no float->unsigned cast)",
-            )),
+            ("uint", ValType::Float) => Ok(emit_f2u(ctx, a)),
             _ => Err(LowerError::unsupported(format!(
                 "{name}() of a non-numeric argument"
             ))),

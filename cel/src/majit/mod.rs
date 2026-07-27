@@ -1903,11 +1903,10 @@ mod tests {
 
     #[test]
     fn numeric_conversion_bails() {
-        // `double(uint)` needs `u64 as f64`, which differs from the signed cast
-        // above 2^63 and has no trace opcode. `int(double)`/`uint(double)` need
-        // `CastFloatToInt`, which the IR has but the `#[jit_interp]` macro does
-        // not lower yet. String and temporal arguments are a parse or a
-        // `FunctionError` in the walker.
+        // What is left after the four numeric casts: a string or temporal
+        // argument, which the walker answers with a parse or a `FunctionError`
+        // rather than a number. (The numeric pairings all lower — see
+        // `numeric_conversions_at_the_saturation_bounds`.)
         let schema: Schema = [
             ("i".to_string(), ValType::Int),
             ("f".to_string(), ValType::Float),
@@ -1918,8 +1917,6 @@ mod tests {
         .into_iter()
         .collect();
         for expr in [
-            "double(u) > 1.0",
-            "uint(f) > 1u",
             "int(s) > 1",
             "double(s) > 1.0",
             "int(\"123\") > 1",
@@ -3332,6 +3329,70 @@ mod tests {
                 sweep_case(expr, &cols),
                 SweepVerdict::Declined,
                 "`{expr}` has no absorbing literal and stays a type error"
+            );
+        }
+    }
+
+    /// The numeric conversions, at the bounds where the four casts differ.
+    ///
+    /// The walker converts with a plain Rust `as`, so every one of them is
+    /// TOTAL: the two widenings wrap or lose precision rather than raise, and
+    /// the two narrowings truncate toward zero and saturate. That is why none
+    /// of them needs a trap guard — and why `uint` cannot borrow the signed
+    /// narrowing, which saturates at different bounds.
+    #[test]
+    fn numeric_conversions_at_the_saturation_bounds() {
+        for (src, want) in [
+            // int <-> uint reinterpret the same 64 bits, in both directions.
+            ("int(18446744073709551615u)", Value::Int(-1)),
+            ("int(9223372036854775808u)", Value::Int(i64::MIN)),
+            ("uint(-1)", Value::UInt(u64::MAX)),
+            // uint -> double goes through `u64`, so it does not turn negative
+            // above 2^63; precision is lost the way `as f64` loses it.
+            (
+                "double(18446744073709551615u)",
+                Value::Float(u64::MAX as f64),
+            ),
+            (
+                "double(9007199254740993u)",
+                Value::Float(9007199254740992.0),
+            ),
+            // double -> int and double -> uint saturate at DIFFERENT bounds.
+            ("int(1.0e20)", Value::Int(i64::MAX)),
+            ("int(-1.0e20)", Value::Int(i64::MIN)),
+            ("uint(1.0e20)", Value::UInt(u64::MAX)),
+            ("uint(-1.5)", Value::UInt(0)),
+            ("uint(10.5)", Value::UInt(10)),
+        ] {
+            let program = Program::compile(src).unwrap();
+            assert_eq!(
+                program.execute(&Context::default()).map_err(|_| ()),
+                Ok(want),
+                "tree-walker ground truth for `{src}`"
+            );
+        }
+
+        // The same conversions on COLUMN operands, through the machine.
+        let cols: Vec<(&'static str, ColData)> = vec![
+            ("i", ColData::Int(vec![-1, 0, 7, i64::MIN])),
+            (
+                "u",
+                ColData::UInt(vec![u64::MAX as i64, 0, 7, (i64::MAX as u64 + 1) as i64]),
+            ),
+            ("f", ColData::Float(vec![-1.5, 0.0, 10.5, 1.0e20])),
+        ];
+        for expr in [
+            "int(u) < 0",
+            "uint(i) > 0u",
+            "double(u) > 1.5",
+            "double(i) > 1.5",
+            "int(f) > 0",
+            "uint(f) > 0u",
+        ] {
+            assert_eq!(
+                sweep_case(expr, &cols),
+                SweepVerdict::Agreed,
+                "`{expr}` must lower and agree with the tree-walker"
             );
         }
     }
