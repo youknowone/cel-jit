@@ -223,7 +223,7 @@ fn batch_sum_with(
     columns: &[Column],
     n: usize,
     what: &str,
-    run: impl FnOnce(&Code, usize, usize) -> i64,
+    run: impl FnOnce(&Code, &[i64], usize) -> i64,
 ) -> Option<i64> {
     assert_eq!(
         columns.len(),
@@ -259,11 +259,10 @@ fn batch_sum_with(
     // while the program writes it through the raw pointer baked into `prog`.
     let mut trap: Box<i64> = Box::new(0);
     let trap_addr = (&mut *trap) as *mut i64 as i64;
-    let (prog, num_int, num_float) =
-        lowered.batch_sum_program_trapping(&bases, n as i64, trap_addr);
-    let result = run(&prog, num_int, num_float);
-    // The raw pointers in `prog` alias `columns`; keep the borrow live across
-    // the run so the buffers cannot be dropped underneath the trace.
+    let (batch, init_regs) = lowered.batch_sum_program_trapping(&bases, n as i64, trap_addr);
+    let result = run(&batch.code, &init_regs, batch.num_float_regs);
+    // The raw pointers in `init_regs` alias `columns`; keep the borrow live
+    // across the run so the buffers cannot be dropped underneath the trace.
     core::hint::black_box(columns);
     if *trap != 0 {
         return None;
@@ -295,8 +294,8 @@ pub fn eval_batch_sum_f(
     n: usize,
     threshold: u32,
 ) -> Option<i64> {
-    batch_sum_with(lowered, columns, n, "eval_batch_sum_f", |prog, ni, nf| {
-        float_bank::run_jit_f(prog, ni, nf, threshold)
+    batch_sum_with(lowered, columns, n, "eval_batch_sum_f", |prog, regs, nf| {
+        float_bank::run_jit_seeded_f(prog, regs, nf, threshold)
     })
 }
 
@@ -313,7 +312,7 @@ pub fn clean_batch_sum_f(
         columns,
         n,
         "clean_batch_sum_f",
-        float_bank::clean_interp_f,
+        float_bank::clean_interp_seeded_f,
     )
 }
 
@@ -963,7 +962,14 @@ pub mod float_bank {
 
     /// Reference two-bank interpreter — correctness oracle for the float path.
     pub fn clean_interp_f(program: &Code, num_regs: usize, num_fregs: usize) -> i64 {
-        let mut regs = vec![0i64; num_regs];
+        clean_interp_seeded_f(program, &vec![0i64; num_regs], num_fregs)
+    }
+
+    /// [`clean_interp_f`] over a caller-supplied initial int register bank, for
+    /// programs whose data (column bases, row count, trap-word address) arrives
+    /// in registers instead of as immediates.
+    pub fn clean_interp_seeded_f(program: &Code, init_regs: &[i64], num_fregs: usize) -> i64 {
+        let mut regs = init_regs.to_vec();
         let mut fregs = vec![0.0f64; num_fregs];
         let mut pc = 0usize;
         loop {
@@ -1338,9 +1344,20 @@ pub mod float_bank {
     /// so the program itself supplies all of its inputs. `threshold == u32::MAX`
     /// gives the interpreter tier; a small value enables JIT compilation.
     pub fn run_jit_f(program: &Code, num_regs: usize, num_fregs: usize, threshold: u32) -> i64 {
-        let init_regs = vec![0i64; num_regs];
+        run_jit_seeded_f(program, &vec![0i64; num_regs], num_fregs, threshold)
+    }
+
+    /// [`run_jit_f`] over a caller-supplied initial int register bank. The
+    /// seeded values are plain reds — the trace reads them as loop-invariant
+    /// inputs, not as constants, so one compiled loop serves every batch.
+    pub fn run_jit_seeded_f(
+        program: &Code,
+        init_regs: &[i64],
+        num_fregs: usize,
+        threshold: u32,
+    ) -> i64 {
         let init_fregs = vec![0.0f64; num_fregs];
-        let mut driver = new_driver_f(threshold, program, num_regs, num_fregs);
-        run_mainloop_f(&mut driver, program, &init_regs, &init_fregs)
+        let mut driver = new_driver_f(threshold, program, init_regs.len(), num_fregs);
+        run_mainloop_f(&mut driver, program, init_regs, &init_fregs)
     }
 }

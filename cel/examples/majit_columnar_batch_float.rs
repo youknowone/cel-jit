@@ -33,7 +33,7 @@ use std::hint::black_box;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
-use cel::majit::bytecode::float_bank::{clean_interp_f, run_jit_f, COMPILES};
+use cel::majit::bytecode::float_bank::{clean_interp_seeded_f, run_jit_seeded_f, COMPILES};
 use cel::majit::bytecode::Column;
 use cel::majit::lower::{lower_typed, Schema, ValType};
 use cel::{Context, Program, Value};
@@ -86,7 +86,8 @@ fn main() {
     let qty = make_col_f(n, 0.0, 100.0, 0x9E37_79B9_7F4A_7C15);
     let columns: Vec<Column> = vec![Column::Float(&price), Column::Float(&qty)];
     let bases: Vec<i64> = columns.iter().map(Column::base).collect();
-    let (batch, num_int, num_float) = lowered.batch_sum_program(&bases, n as i64);
+    let (shape, regs) = lowered.batch_sum_program(&bases, n as i64);
+    let (batch, num_float) = (shape.code, shape.num_float_regs);
 
     // FAIR baseline: the stock tree-walker at its best — reuse one Context,
     // overwrite the two float variables per row (hot; no per-row Context alloc).
@@ -108,11 +109,11 @@ fn main() {
     // Correctness gate: stock == clean VM == JIT-off == JIT-on.
     COMPILES.store(0, Ordering::Relaxed);
     let base = naive();
-    let clean = clean_interp_f(&batch, num_int, num_float);
-    let off = run_jit_f(&batch, num_int, num_float, u32::MAX);
+    let clean = clean_interp_seeded_f(&batch, &regs, num_float);
+    let off = run_jit_seeded_f(&batch, &regs, num_float, u32::MAX);
     let off_c = COMPILES.load(Ordering::Relaxed);
     COMPILES.store(0, Ordering::Relaxed);
-    let on = run_jit_f(&batch, num_int, num_float, 8);
+    let on = run_jit_seeded_f(&batch, &regs, num_float, 8);
     let on_c = COMPILES.load(Ordering::Relaxed);
     assert_eq!(base, clean, "stock vs clean VM divergence");
     assert_eq!(base, off, "naive vs JIT-off divergence");
@@ -131,13 +132,13 @@ fn main() {
     for _ in 0..rounds {
         naive_t.push(time_ns_per_row(n, naive));
         clean_t.push(time_ns_per_row(n, || {
-            clean_interp_f(&batch, num_int, num_float)
+            clean_interp_seeded_f(&batch, &regs, num_float)
         }));
         off_t.push(time_ns_per_row(n, || {
-            run_jit_f(&batch, num_int, num_float, u32::MAX)
+            run_jit_seeded_f(&batch, &regs, num_float, u32::MAX)
         }));
         on_t.push(time_ns_per_row(n, || {
-            run_jit_f(&batch, num_int, num_float, 8)
+            run_jit_seeded_f(&batch, &regs, num_float, 8)
         }));
     }
     let (jit, jit_off, vm, nv) = (
@@ -183,7 +184,8 @@ fn main() {
         ValType::Float,
         "aggregate must be float-valued"
     );
-    let (agg_batch, agg_num_int, agg_num_float) = agg_lowered.batch_sum_program(&bases, n as i64);
+    let (agg_shape, agg_regs) = agg_lowered.batch_sum_program(&bases, n as i64);
+    let (agg_batch, agg_num_float) = (agg_shape.code, agg_shape.num_float_regs);
 
     let naive_agg = || -> f64 {
         let mut acc = 0.0f64;
@@ -200,10 +202,12 @@ fn main() {
     };
 
     let base_a = naive_agg();
-    let clean_a = f64::from_bits(clean_interp_f(&agg_batch, agg_num_int, agg_num_float) as u64);
-    let off_a = f64::from_bits(run_jit_f(&agg_batch, agg_num_int, agg_num_float, u32::MAX) as u64);
+    let clean_a =
+        f64::from_bits(clean_interp_seeded_f(&agg_batch, &agg_regs, agg_num_float) as u64);
+    let off_a =
+        f64::from_bits(run_jit_seeded_f(&agg_batch, &agg_regs, agg_num_float, u32::MAX) as u64);
     COMPILES.store(0, Ordering::Relaxed);
-    let on_a = f64::from_bits(run_jit_f(&agg_batch, agg_num_int, agg_num_float, 8) as u64);
+    let on_a = f64::from_bits(run_jit_seeded_f(&agg_batch, &agg_regs, agg_num_float, 8) as u64);
     let on_ac = COMPILES.load(Ordering::Relaxed);
     assert_eq!(
         base_a.to_bits(),
@@ -227,13 +231,13 @@ fn main() {
     for _ in 0..rounds {
         naive_a_t.push(time_ns_per_row(n, || naive_agg().to_bits()));
         clean_a_t.push(time_ns_per_row(n, || {
-            clean_interp_f(&agg_batch, agg_num_int, agg_num_float)
+            clean_interp_seeded_f(&agg_batch, &agg_regs, agg_num_float)
         }));
         off_a_t.push(time_ns_per_row(n, || {
-            run_jit_f(&agg_batch, agg_num_int, agg_num_float, u32::MAX)
+            run_jit_seeded_f(&agg_batch, &agg_regs, agg_num_float, u32::MAX)
         }));
         on_a_t.push(time_ns_per_row(n, || {
-            run_jit_f(&agg_batch, agg_num_int, agg_num_float, 8)
+            run_jit_seeded_f(&agg_batch, &agg_regs, agg_num_float, 8)
         }));
     }
     let (jit_a, jit_off_a, vm_a, nv_a) = (

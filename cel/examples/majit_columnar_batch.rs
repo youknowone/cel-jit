@@ -32,7 +32,7 @@ use std::hint::black_box;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
-use cel::majit::bytecode::float_bank::{clean_interp_f, run_jit_f, COMPILES};
+use cel::majit::bytecode::float_bank::{clean_interp_seeded_f, run_jit_seeded_f, COMPILES};
 use cel::majit::lower::{lower_typed, Schema};
 use cel::{Context, Program, Value};
 
@@ -77,7 +77,8 @@ fn main() {
     let frozen = make_col(n, 0, 1, 0x1000_0001);
     let columns: Vec<&[i64]> = vec![&balance, &amount, &frozen];
     let bases: Vec<i64> = columns.iter().map(|c| c.as_ptr() as i64).collect();
-    let (batch, nr, nf) = lowered.batch_sum_program(&bases, n as i64);
+    let (shape, regs) = lowered.batch_sum_program(&bases, n as i64);
+    let (batch, nf) = (shape.code, shape.num_float_regs);
 
     // FAIR baseline: the stock tree-walker at its best — reuse one Context,
     // overwrite the three variables per row (hot; no per-row Context alloc).
@@ -100,11 +101,11 @@ fn main() {
     // Correctness gate: stock == clean VM == JIT-off == JIT-on.
     COMPILES.store(0, Ordering::Relaxed);
     let base = naive();
-    let clean = clean_interp_f(&batch, nr, nf);
-    let off = run_jit_f(&batch, nr, nf, u32::MAX);
+    let clean = clean_interp_seeded_f(&batch, &regs, nf);
+    let off = run_jit_seeded_f(&batch, &regs, nf, u32::MAX);
     let off_c = COMPILES.load(Ordering::Relaxed);
     COMPILES.store(0, Ordering::Relaxed);
-    let on = run_jit_f(&batch, nr, nf, 8);
+    let on = run_jit_seeded_f(&batch, &regs, nf, 8);
     let on_c = COMPILES.load(Ordering::Relaxed);
     assert_eq!(base, clean, "stock vs clean VM divergence");
     assert_eq!(base, off, "naive vs JIT-off divergence");
@@ -122,9 +123,15 @@ fn main() {
         (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for _ in 0..rounds {
         naive_t.push(time_ns_per_row(n, naive));
-        clean_t.push(time_ns_per_row(n, || clean_interp_f(&batch, nr, nf)));
-        off_t.push(time_ns_per_row(n, || run_jit_f(&batch, nr, nf, u32::MAX)));
-        on_t.push(time_ns_per_row(n, || run_jit_f(&batch, nr, nf, 8)));
+        clean_t.push(time_ns_per_row(n, || {
+            clean_interp_seeded_f(&batch, &regs, nf)
+        }));
+        off_t.push(time_ns_per_row(n, || {
+            run_jit_seeded_f(&batch, &regs, nf, u32::MAX)
+        }));
+        on_t.push(time_ns_per_row(n, || {
+            run_jit_seeded_f(&batch, &regs, nf, 8)
+        }));
     }
     let (jit, jit_off, vm, nv) = (
         median(on_t),

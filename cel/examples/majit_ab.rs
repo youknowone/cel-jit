@@ -30,7 +30,7 @@ use std::hint::black_box;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use cel::majit::bytecode::float_bank::{clean_interp_f, run_jit_f, COMPILES};
+use cel::majit::bytecode::float_bank::{clean_interp_seeded_f, run_jit_seeded_f, COMPILES};
 use cel::majit::lower::{lower_typed, Schema};
 use cel::{Context, Program, Value};
 
@@ -196,7 +196,7 @@ fn engine_program(
     balance: &[i64],
     amount: &[i64],
     frozen: &[i64],
-) -> (Vec<i64>, usize, usize) {
+) -> (Vec<i64>, Vec<i64>, usize) {
     let program =
         Program::compile("balance >= amount && !frozen").expect("compile engine expression");
     let lowered =
@@ -206,7 +206,8 @@ fn engine_program(
         amount.as_ptr() as i64,
         frozen.as_ptr() as i64,
     ];
-    lowered.batch_sum_program(&bases, n as i64)
+    let (shape, regs) = lowered.batch_sum_program(&bases, n as i64);
+    (shape.code, regs, shape.num_float_regs)
 }
 
 fn time_ns_per_row<F: FnMut() -> i64>(n: usize, mut run: F) -> f64 {
@@ -217,14 +218,14 @@ fn time_ns_per_row<F: FnMut() -> i64>(n: usize, mut run: F) -> f64 {
 
 fn engine_only() {
     let (balance, amount, frozen) = make_engine_columns(ENGINE_ROWS);
-    let (code, nr, nf) = engine_program(ENGINE_ROWS, &balance, &amount, &frozen);
+    let (code, regs, nf) = engine_program(ENGINE_ROWS, &balance, &amount, &frozen);
 
     COMPILES.store(0, Ordering::Relaxed);
-    let clean = clean_interp_f(&code, nr, nf);
-    let off = run_jit_f(&code, nr, nf, JIT_OFF);
+    let clean = clean_interp_seeded_f(&code, &regs, nf);
+    let off = run_jit_seeded_f(&code, &regs, nf, JIT_OFF);
     assert_eq!(COMPILES.load(Ordering::Relaxed), 0);
     COMPILES.store(0, Ordering::Relaxed);
-    let compiled = run_jit_f(&code, nr, nf, JIT_ON);
+    let compiled = run_jit_seeded_f(&code, &regs, nf, JIT_ON);
     let compiles = COMPILES.load(Ordering::Relaxed);
     assert_eq!(clean, off, "clean VM vs majit interpreter divergence");
     assert_eq!(clean, compiled, "clean VM vs compiled trace divergence");
@@ -234,10 +235,10 @@ fn engine_only() {
     let mut jit_times = Vec::with_capacity(ROUNDS);
     for _ in 0..ROUNDS {
         clean_times.push(time_ns_per_row(ENGINE_ROWS, || {
-            clean_interp_f(&code, nr, nf)
+            clean_interp_seeded_f(&code, &regs, nf)
         }));
         jit_times.push(time_ns_per_row(ENGINE_ROWS, || {
-            run_jit_f(&code, nr, nf, JIT_ON)
+            run_jit_seeded_f(&code, &regs, nf, JIT_ON)
         }));
     }
     let clean_ns = median_f64(clean_times);
@@ -259,22 +260,22 @@ fn cold_break_even() {
     println!("      rows    clean total      JIT total    JIT/clean  compiles");
     let mut first_win = None;
     for &n in SIZES {
-        let (code, nr, nf) = engine_program(n, &balance[..n], &amount[..n], &frozen[..n]);
-        let expected = clean_interp_f(&code, nr, nf);
+        let (code, regs, nf) = engine_program(n, &balance[..n], &amount[..n], &frozen[..n]);
+        let expected = clean_interp_seeded_f(&code, &regs, nf);
         COMPILES.store(0, Ordering::Relaxed);
-        assert_eq!(run_jit_f(&code, nr, nf, JIT_ON), expected);
+        assert_eq!(run_jit_seeded_f(&code, &regs, nf, JIT_ON), expected);
         let compiles = COMPILES.load(Ordering::Relaxed);
 
         let mut clean_times = Vec::with_capacity(COLD_ROUNDS);
         let mut jit_times = Vec::with_capacity(COLD_ROUNDS);
         for _ in 0..COLD_ROUNDS {
             let start = Instant::now();
-            black_box(clean_interp_f(&code, nr, nf));
+            black_box(clean_interp_seeded_f(&code, &regs, nf));
             clean_times.push(start.elapsed());
 
             COMPILES.store(0, Ordering::Relaxed);
             let start = Instant::now();
-            black_box(run_jit_f(&code, nr, nf, JIT_ON));
+            black_box(run_jit_seeded_f(&code, &regs, nf, JIT_ON));
             jit_times.push(start.elapsed());
         }
         let clean = median_duration(clean_times);

@@ -281,6 +281,75 @@ pub struct LoweredF {
     pub jump_fixups: Vec<usize>,
 }
 
+/// A batch program's words plus the register banks they run on.
+///
+/// The words carry only the expression's **shape** — no column address, no row
+/// count, no trap-word address. Those are data, and reach the program through
+/// [`BatchShape::seed`] instead. One built program therefore serves every batch
+/// of that shape, which is what lets the JIT's green key (the program pointer
+/// and pc, `trace_ctx.rs` `green_key_raw`) stay put from batch to batch rather
+/// than re-keying and recompiling.
+///
+/// This is the upstream arrangement: `rsre_core.py:384-385` keeps the regex
+/// PATTERN green and the subject string and its positions red, so one compiled
+/// loop matches every subject; `micronumpy/loop.py:88-89` keeps the arrays,
+/// base storage included, red while the greens are the computation's shape.
+pub struct BatchShape {
+    /// The program words.
+    pub code: Vec<i64>,
+    /// Int-bank register count the program runs on.
+    pub num_int_regs: usize,
+    /// Float-bank register count the program runs on.
+    pub num_float_regs: usize,
+    /// Which int registers the caller fills in per batch.
+    pub seed: BatchSeed,
+}
+
+/// Which int registers a [`BatchShape`]'s words expect to find already filled
+/// in when the mainloop starts.
+///
+/// These are plain reds. They must **not** be promoted: promotion inserts a
+/// `guard_value`, and a guard that fails on every batch generates a bridge per
+/// batch (`rlib/jit.py`, `promote`) — per-batch recompilation under another
+/// name.
+pub struct BatchSeed {
+    /// Register holding the row count.
+    r_n: usize,
+    /// Register holding the overflow trap word's address.
+    r_trap: usize,
+    /// Register holding each column's base address, in [`LoweredF::slots`]
+    /// order. A ROW column's base lives in the machinery bank; a list ELEMENT
+    /// column's lives in the register its lowering reserved.
+    base_regs: Vec<usize>,
+    /// Length of the int register bank these indices address.
+    num_int_regs: usize,
+}
+
+impl BatchSeed {
+    /// Build one batch's initial int register bank: the row count, the trap
+    /// word's address, and each column's base address in its own register,
+    /// every other register zero.
+    ///
+    /// The back-edge is a do-while, so callers must pass `n >= 1`.
+    pub fn regs(&self, bases: &[i64], n: i64, trap_addr: i64) -> Vec<i64> {
+        assert_eq!(
+            bases.len(),
+            self.base_regs.len(),
+            "batch seed: base arity {} != slot count {}",
+            bases.len(),
+            self.base_regs.len()
+        );
+        assert!(n >= 1, "batch seed: n must be >= 1 (do-while back-edge)");
+        let mut regs = vec![0i64; self.num_int_regs];
+        regs[self.r_n] = n;
+        regs[self.r_trap] = trap_addr;
+        for (&base, &reg) in bases.iter().zip(&self.base_regs) {
+            regs[reg] = base;
+        }
+        regs
+    }
+}
+
 impl LoweredF {
     /// Build a **columnar batch** program over the two-bank machine: for each
     /// row `i` in `0..n`, load each slot's `col_k[i]` via a red-index `raw_load`
@@ -288,45 +357,43 @@ impl LoweredF {
     /// body, and accumulate the result into a running sum in the result's bank
     /// (int `r_acc` -> `OP_RETURN`, or float `f_acc` -> `OP_RETURN_F`). `bases[k]` is the
     /// base address of slot `k`'s column buffer (an `i64` pointer regardless of
-    /// bank), aligned to [`LoweredF::slots`]. Returns
-    /// `(program, total_int_regs, total_float_regs)`.
+    /// bank), aligned to [`LoweredF::slots`]. Returns the [`BatchShape`] and the
+    /// initial int register bank to run it on, since `bases` and `n` are data
+    /// and reach the program through registers rather than as immediates.
     ///
     /// The loop machinery (`i`, `acc`, `n`, `one`, `stride`, `ea`) and the
     /// per-slot base pointers live in the **int** bank above `num_int_regs`, so
-    /// the body's registers are untouched. Every base is a loop-invariant int
-    /// register (never a scalar state field, which would trip
-    /// `VirtualStatesCantMatch` at loop close). The back-edge is a do-while, so
+    /// the body's registers are untouched. The back-edge is a do-while, so
     /// callers must pass `n >= 1`.
     /// [`LoweredF::batch_sum_program_trapping`] without an overflow trap word:
     /// the program still guards its `int` arithmetic, but nothing publishes the
     /// flag, so the caller **cannot tell** an overflowed row from a good one.
     /// Only for harnesses whose data is bounded by construction; the evaluator
     /// path ([`super::bytecode::eval_batch_sum_f`]) always passes a trap word.
-    pub fn batch_sum_program(&self, bases: &[i64], n: i64) -> (Vec<i64>, usize, usize) {
-        self.batch_sum_program_trapping(bases, n, 0)
+    pub fn batch_sum_program(&self, bases: &[i64], n: i64) -> (BatchShape, Vec<i64>) {
+        let shape = self.batch_sum_shape(false);
+        let regs = shape.seed.regs(bases, n, 0);
+        (shape, regs)
     }
 
-    /// As [`LoweredF::batch_sum_program`], but `trap_addr` is the address of a
-    /// caller-owned `i64` the epilogue writes the overflow flag to (see
-    /// [`OP_TRAP_STORE`]). A zero address means "no trap word" and suppresses
-    /// the store.
+    /// As [`LoweredF::batch_sum_program`], but the epilogue publishes the
+    /// overflow flag to `trap_addr`, the address of a caller-owned `i64` (see
+    /// [`OP_TRAP_STORE`]). Whether that store is emitted at all is shape; the
+    /// address it writes to is data and rides in a seeded register.
     pub fn batch_sum_program_trapping(
         &self,
         bases: &[i64],
         n: i64,
         trap_addr: i64,
-    ) -> (Vec<i64>, usize, usize) {
-        assert_eq!(
-            bases.len(),
-            self.slots.len(),
-            "batch_sum_program: base arity {} != slot count {}",
-            bases.len(),
-            self.slots.len()
-        );
-        assert!(
-            n >= 1,
-            "batch_sum_program: n must be >= 1 (do-while back-edge)"
-        );
+    ) -> (BatchShape, Vec<i64>) {
+        let shape = self.batch_sum_shape(true);
+        let regs = shape.seed.regs(bases, n, trap_addr);
+        (shape, regs)
+    }
+
+    /// Build the batch program's words and the layout of the registers its
+    /// caller seeds. `with_trap` emits the epilogue's overflow-flag store.
+    pub fn batch_sum_shape(&self, with_trap: bool) -> BatchShape {
         let m = self.num_int_regs; // first int machinery register
         let (r_i, r_acc, r_n, r_one, r_stride, r_ea) = (m, m + 1, m + 2, m + 3, m + 4, m + 5);
         let r_trap = m + 6;
@@ -360,24 +427,29 @@ impl LoweredF {
             | ValType::Duration => load_const(&mut p, 0, r_acc),
             ValType::Float => p.extend_from_slice(&[OP_LOAD_CONST_F, 0, f_acc as i64]),
         }
-        load_const(&mut p, n, r_n);
         load_const(&mut p, 1, r_one);
         load_const(&mut p, 8, r_stride);
-        // Overflow trap: the flag starts clear, its destination address is a
-        // loop-invariant pointer in a register (the same shape as the column
-        // bases), and the epilogue publishes it once the loop is done.
+        // Overflow trap: the flag starts clear. Where it is published is data,
+        // so the address arrives in a seeded register rather than as an
+        // immediate, and the epilogue stores through it once the loop is done.
         load_const(&mut p, 0, OVF_FLAG_REG);
-        load_const(&mut p, trap_addr, r_trap);
-        // Column bases, one loop-invariant int register each. A row column's
-        // base lives in the machinery bank; a list ELEMENT column's base lives
-        // in the register the lowering reserved for it, because the load that
-        // reads it was emitted inside the body's inner loop.
-        for (k, (&base, slot)) in bases.iter().zip(&self.slots).enumerate() {
-            match slot.kind {
-                SlotKind::Row => load_const(&mut p, base, r_base0 + k),
-                SlotKind::Element { base_reg } => load_const(&mut p, base, base_reg),
-            }
-        }
+        // The row count and every column base are data as well, and reach the
+        // program the same way, so the words emitted below are identical for
+        // every batch of this shape. Each base is still a loop-invariant int
+        // register (never a scalar state field, which would trip
+        // `VirtualStatesCantMatch` at loop close): a ROW column's lives in the
+        // machinery bank, and a list ELEMENT column's in the register the
+        // lowering reserved for it, because the load that reads it was emitted
+        // inside the body's inner loop.
+        let base_regs: Vec<usize> = self
+            .slots
+            .iter()
+            .enumerate()
+            .map(|(k, slot)| match slot.kind {
+                SlotKind::Row => r_base0 + k,
+                SlotKind::Element { base_reg } => base_reg,
+            })
+            .collect();
         // Loop-invariant literal loads, run once before the merge point.
         p.extend_from_slice(&self.prelude);
 
@@ -428,7 +500,7 @@ impl LoweredF {
         p.extend_from_slice(&[OP_JUMP_IF_ABOVE, r_n as i64, r_i as i64, body_pc as i64]);
         // Publish the overflow flag. Outside the loop, so it costs the traced
         // body nothing and runs once when the back-edge guard finally exits.
-        if trap_addr != 0 {
+        if with_trap {
             p.extend_from_slice(&[OP_TRAP_STORE, r_trap as i64, OVF_FLAG_REG as i64]);
         }
         match self.result_bank {
@@ -439,7 +511,17 @@ impl LoweredF {
             | ValType::Duration => p.extend_from_slice(&[OP_RETURN, r_acc as i64]),
             ValType::Float => p.extend_from_slice(&[OP_RETURN_F, f_acc as i64]),
         }
-        (p, total_int_regs, total_float_regs)
+        BatchShape {
+            code: p,
+            num_int_regs: total_int_regs,
+            num_float_regs: total_float_regs,
+            seed: BatchSeed {
+                r_n,
+                r_trap,
+                base_regs,
+                num_int_regs: total_int_regs,
+            },
+        }
     }
 }
 
