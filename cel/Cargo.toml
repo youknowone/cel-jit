@@ -71,6 +71,10 @@ name = "majit_columnar_batch_string"
 required-features = ["jit"]
 
 [[example]]
+name = "majit_columnar_batch_per_row"
+required-features = ["jit"]
+
+[[example]]
 name = "majit_nested_bench"
 required-features = ["jit"]
 

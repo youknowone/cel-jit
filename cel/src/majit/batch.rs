@@ -33,26 +33,39 @@
 //! # Ok::<(), cel::majit::batch::BatchError>(())
 //! ```
 //!
-//! **What it computes.** The machine evaluates the expression per row and
-//! reduces with a running total, so the answer is `sum over rows of expr(row)` —
-//! for a boolean predicate, the number of matching rows. There is no per-row
-//! output: the reduction is what the compiled trace's loop-carried accumulator
-//! is. The reduction is the DRIVER's, not a CEL `+`: it wraps at 64 bits and
-//! sums floats left to right in row order (bit-exact with the same rows summed
-//! through the tree-walker, since float addition does not reassociate).
+//! **What it computes.** The machine evaluates the expression per row. What it
+//! does with each row's result is the caller's choice, made at bind:
+//!
+//! * [`BatchProgram::bind`] reduces with a running total, so the answer is
+//!   `sum over rows of expr(row)` — for a boolean predicate, the number of
+//!   matching rows. The reduction is the DRIVER's, not a CEL `+`: it wraps at
+//!   64 bits and sums floats left to right in row order (bit-exact with the
+//!   same rows summed through the tree-walker, since float addition does not
+//!   reassociate). A total is only meaningful for a numeric or boolean result,
+//!   so this door refuses the rest.
+//! * [`BatchProgram::bind_per_row`] stores each row's result and
+//!   [`BoundBatch::collect`] reads them back as [`Value`]s. A store takes a
+//!   result of any type, so this is the compiled path for the `string`-,
+//!   `timestamp`- and `duration`-valued expressions a sum has nothing to do
+//!   with — and the one that keeps each row's own answer rather than a figure
+//!   they all collapse into.
+//!
+//! Both compile the same loop over the same red-index column reads; only the
+//! last instruction of an iteration differs.
 //!
 //! **What it refuses.** Everything outside the traceable subset declines at
 //! [`BatchProgram::compile`], and a batch whose data would make the tree-walker
-//! raise (an `int` overflow, a division by zero) refuses at [`BoundBatch::sum`].
+//! raise (an `int` overflow, a division by zero) refuses at the run.
 //! Both are the signal to evaluate that expression with
 //! [`crate::Program::execute`], which owns the error.
 
 use std::collections::HashMap;
 
-use super::bytecode::{float_bank, prepare_batch, BatchRun, Column};
+use super::bytecode::{float_bank, prepare_batch_reduce, BatchRun, Column};
 use super::lower::{
     concat_slot_index, concat_slot_path, elem_slot_source, lower_typed, offset_slot_source,
-    size_slot_source, string_slot_source, ConcatSide, LoweredF, Schema, SlotKind, ValType,
+    size_slot_source, string_slot_source, BatchReduce, ConcatSide, LoweredF, Schema, SlotKind,
+    ValType,
 };
 use crate::{Program, Value};
 
@@ -259,11 +272,11 @@ impl BatchProgram {
     /// [`BatchProgram::compile`] for an already-parsed program, so a caller that
     /// keeps a [`Program`] for the tree-walker does not parse twice.
     pub fn from_program(program: &Program, schema: &Schema) -> Result<Self, BatchError> {
+        // Whether the expression LOWERS is asked here. Whether a given
+        // REDUCTION can consume its result is a separate question, asked at
+        // bind: `sum` refuses a string or a timestamp, `bind_per_row` takes any
+        // bank, and one program can be bound either way.
         let lowered = lower_typed(program.expression(), schema)?;
-        // Two separate refusals, both permanent for this expression: the
-        // lowering could not take it, or it could but this API reduces by sum
-        // and the result is not something a sum consumes.
-        lowered.sum_reducible()?;
         Ok(BatchProgram { lowered })
     }
 
@@ -285,6 +298,31 @@ impl BatchProgram {
     /// This is the per-batch work. Keep the [`BoundBatch`] and call
     /// [`BoundBatch::sum`] on it rather than rebinding to run again.
     pub fn bind<'a, 'b>(&'b self, batch: &'a Batch<'a>) -> Result<BoundBatch<'a, 'b>, BatchError> {
+        // Only a sum has a result the loop cannot consume, so only this door
+        // asks.
+        self.lowered.sum_reducible()?;
+        self.bind_reduce(batch, BatchReduce::Sum)
+    }
+
+    /// [`BatchProgram::bind`] for a per-row result: the loop stores `expr(row)`
+    /// to `out[i]` instead of accumulating, and [`BoundBatch::collect`] reads
+    /// them back as CEL values.
+    ///
+    /// Takes a result of ANY type, since a store does not have to add: this is
+    /// the accelerated path for the `string`-, `timestamp`- and
+    /// `duration`-valued expressions a sum has nothing to do with.
+    pub fn bind_per_row<'a, 'b>(
+        &'b self,
+        batch: &'a Batch<'a>,
+    ) -> Result<BoundBatch<'a, 'b>, BatchError> {
+        self.bind_reduce(batch, BatchReduce::PerRow)
+    }
+
+    fn bind_reduce<'a, 'b>(
+        &'b self,
+        batch: &'a Batch<'a>,
+        reduce: BatchReduce,
+    ) -> Result<BoundBatch<'a, 'b>, BatchError> {
         // Derived buffers are owned by the BoundBatch; `plan` records, per slot,
         // either a borrowed column or an index into them. Building the plan
         // first keeps `derived` from reallocating under a borrow.
@@ -338,9 +376,16 @@ impl BatchProgram {
                     .expect("a bound found the value"),
             });
         }
-        let run = prepare_batch(&self.lowered, &columns, batch.rows, "BatchProgram::bind");
+        let run = prepare_batch_reduce(
+            &self.lowered,
+            &columns,
+            batch.rows,
+            "BatchProgram::bind",
+            reduce,
+        );
         Ok(BoundBatch {
             program: self,
+            reduce,
             run: std::cell::RefCell::new(run),
             _derived: derived,
         })
@@ -586,6 +631,10 @@ fn lookup<'a>(batch: &'a Batch<'a>, name: &str) -> Result<&'a ColumnRef<'a>, Bat
 /// a bound batch belongs to the thread that bound it.
 pub struct BoundBatch<'a, 'b> {
     program: &'b BatchProgram,
+    /// Which reduction the program was prepared with. A run answers through the
+    /// matching door only: a `Sum` batch has no output buffer to collect from,
+    /// and a `PerRow` one returns its row count rather than a total.
+    reduce: BatchReduce,
     /// The prepared program. `RefCell` because running writes the trap word,
     /// while `sum` takes `&self` so a caller can hold the batch across runs.
     run: std::cell::RefCell<BatchRun<'a>>,
@@ -602,24 +651,19 @@ impl BoundBatch<'_, '_> {
 
     /// [`BoundBatch::sum`] on a chosen tier.
     pub fn sum_on(&self, tier: Tier) -> Result<Value, BatchError> {
-        let threshold = match tier {
-            Tier::Jit => DEFAULT_JIT_THRESHOLD,
-            Tier::Interpreter | Tier::Clean => u32::MAX,
-        };
-        self.sum_with(tier, threshold)
+        self.sum_with(tier, threshold_for(tier))
     }
 
     /// [`BoundBatch::sum_on`] with an explicit trace threshold, for a caller
     /// measuring where the compiled tier starts to pay for itself.
     pub fn sum_with(&self, tier: Tier, threshold: u32) -> Result<Value, BatchError> {
         let lowered = &self.program.lowered;
-        let raw = self.run.borrow_mut().run(|code, regs, nf| match tier {
-            Tier::Clean => float_bank::clean_interp_seeded_f(code, regs, nf),
-            Tier::Interpreter | Tier::Jit => {
-                float_bank::run_jit_persistent_f(code, regs, nf, threshold)
-            }
-        });
-        let raw = raw.ok_or(BatchError::Trapped)?;
+        assert_eq!(
+            self.reduce,
+            BatchReduce::Sum,
+            "sum on a batch bound per-row: use `collect`"
+        );
+        let raw = self.execute(tier, threshold).ok_or(BatchError::Trapped)?;
         // The accumulator's bank is the expression's result bank: an int-bank
         // result sums in the int accumulator (a `uint` as its raw bit pattern, a
         // `bool` predicate as a count of matching rows), a float result in the
@@ -629,6 +673,86 @@ impl BoundBatch<'_, '_> {
             ValType::UInt => Value::UInt(raw as u64),
             _ => Value::Int(raw),
         })
+    }
+
+    /// Evaluate every row and return each row's own value, on [`Tier::Jit`].
+    ///
+    /// Requires the batch to have been bound with
+    /// [`BatchProgram::bind_per_row`].
+    pub fn collect(&self) -> Result<Vec<Value>, BatchError> {
+        self.collect_on(Tier::Jit)
+    }
+
+    /// [`BoundBatch::collect`] on a chosen tier.
+    pub fn collect_on(&self, tier: Tier) -> Result<Vec<Value>, BatchError> {
+        self.collect_with(tier, threshold_for(tier))
+    }
+
+    /// [`BoundBatch::collect_on`] with an explicit trace threshold.
+    pub fn collect_with(&self, tier: Tier, threshold: u32) -> Result<Vec<Value>, BatchError> {
+        assert_eq!(
+            self.reduce,
+            BatchReduce::PerRow,
+            "collect on a batch bound to sum: use `bind_per_row`"
+        );
+        let bank = self.program.lowered.result_bank;
+        let mut run = self.run.borrow_mut();
+        run.run(|code, regs, nf| dispatch(tier, threshold, code, regs, nf))
+            .ok_or(BatchError::Trapped)?;
+        // The loop wrote one `i64` per row in the result bank's own encoding;
+        // decoding is the exact inverse of how a column of that type was
+        // encoded on the way in, so a collected value equals the tree-walker's.
+        Ok(run
+            .output()
+            .iter()
+            .map(|&v| decode(bank, v, run.distinct()))
+            .collect())
+    }
+
+    fn execute(&self, tier: Tier, threshold: u32) -> Option<i64> {
+        self.run
+            .borrow_mut()
+            .run(|code, regs, nf| dispatch(tier, threshold, code, regs, nf))
+    }
+}
+
+fn threshold_for(tier: Tier) -> u32 {
+    match tier {
+        Tier::Jit => DEFAULT_JIT_THRESHOLD,
+        Tier::Interpreter | Tier::Clean => u32::MAX,
+    }
+}
+
+fn dispatch(tier: Tier, threshold: u32, code: &[i64], regs: &[i64], nf: usize) -> i64 {
+    match tier {
+        Tier::Clean => float_bank::clean_interp_seeded_f(code, regs, nf),
+        Tier::Interpreter | Tier::Jit => {
+            float_bank::run_jit_persistent_f(code, regs, nf, threshold)
+        }
+    }
+}
+
+/// One stored row result, read back as the CEL value it stands for.
+///
+/// `distinct` is the batch's strings in rank order and is only consulted for a
+/// `string` result, where the stored `i64` is a rank rather than the value.
+///
+/// The index is always in range, by construction rather than by check: the
+/// machine has no op that COMPUTES a string id. Every string a row can produce
+/// is either a column value, a broadcast literal, or one of those two selected
+/// between — and the ranking is taken over exactly that set (see
+/// `prepare_batch`), the derived `string(x)` and `concat#k` columns included.
+fn decode(bank: ValType, v: i64, distinct: &[String]) -> Value {
+    match bank {
+        ValType::Int => Value::Int(v),
+        ValType::UInt => Value::UInt(v as u64),
+        ValType::Bool => Value::Bool(v != 0),
+        ValType::Float => Value::Float(f64::from_bits(v as u64)),
+        ValType::Str => Value::String(std::sync::Arc::new(distinct[v as usize].clone())),
+        ValType::Timestamp => {
+            Value::Timestamp(chrono::DateTime::from_timestamp_nanos(v).fixed_offset())
+        }
+        ValType::Duration => Value::Duration(chrono::Duration::nanoseconds(v)),
     }
 }
 

@@ -150,6 +150,22 @@ pub const OP_U2F: i64 = 52; // [src, fdst]   fregs[fdst] = (regs[src] as u64) as
 /// `uint(-1.5)` is `0u` where `int(-1.5)` is `-1`.
 pub const OP_F2U: i64 = 53; // [fsrc, dst]   regs[dst] = (fregs[fsrc] as u64) as i64
 
+/// The write side of [`OP_COL_LOAD`], and what a per-row output loop ends each
+/// iteration with instead of accumulating: `*(regs[base] + regs[ea]) = regs[src]`.
+///
+/// The base is loop-invariant in a register exactly as a read column's is, and
+/// the effective address is the same `i * 8` the reads use, so a row's output
+/// lands at the row's index.
+pub const OP_COL_STORE: i64 = 54; // [base, ea, src]
+
+/// [`OP_COL_STORE`] from the float bank, storing `fregs[fsrc]`'s 64-BIT PATTERN.
+///
+/// Writing the bits rather than the `f64` keeps the output buffer one `i64`
+/// buffer for every result bank, and costs nothing: it reuses the two
+/// intrinsics the tracer already recognizes (`convert_float_bytes_to_longlong`
+/// then `raw_store_i`) instead of adding a float store to the machine.
+pub const OP_COL_STORE_F: i64 = 55; // [base, ea, fsrc]
+
 /// Raw native-memory load intrinsic recognized by the `#[jit_interp]` proc
 /// macro (lowered to `raw_load_i`); at the interpreter tier this real fn runs.
 /// `base` is a column buffer's base address, `ea` a byte offset — reading
@@ -177,6 +193,8 @@ fn majit_raw_store_i64(base: i64, ea: i64, val: i64) {
         core::ptr::write_unaligned((base as usize).wrapping_add(ea as usize) as *mut i64, val)
     }
 }
+
+use super::lower::BatchReduce;
 
 /// One input column for the two-bank batch evaluator: an `i64` column for an
 /// int/bool slot, an `f64` column for a `double` slot, or raw strings for a
@@ -304,10 +322,22 @@ pub struct BatchRun<'a> {
     /// for as long as the run is. Each is separately heap-allocated, so moving
     /// the `BatchRun` moves the box pointers and not the buffers they address.
     _str_ids: Vec<Box<[i64]>>,
+    /// One `i64` per row, under [`BatchReduce::PerRow`]: where the loop stores
+    /// each row's result. Boxed for the same reason `trap` is — `init_regs`
+    /// holds a raw pointer to it, which must survive the run moving.
+    out: Option<Box<[i64]>>,
+    /// The batch's distinct strings in rank order, so a `string`-banked output
+    /// id can be read back as the string it stands for. Kept only where the
+    /// result is a string; ranking is otherwise write-only.
+    ///
+    /// OWNED, not borrowed from the columns: the set includes the expression's
+    /// own string literals, which live in the lowering, and a decode table that
+    /// borrowed from both would tie the run's lifetime to the program's.
+    distinct: Vec<String>,
     columns: core::marker::PhantomData<&'a ()>,
 }
 
-impl BatchRun<'_> {
+impl<'a> BatchRun<'a> {
     /// Run the prepared batch with `run`, which selects the tier. `None` means a
     /// row trapped (`int` overflow, division by zero), where the tree-walker
     /// raises and no sum is the right answer.
@@ -324,6 +354,23 @@ impl BatchRun<'_> {
         }
         Some(result)
     }
+
+    /// The per-row results the last [`BatchRun::run`] stored, one `i64` per row
+    /// in the result's bank encoding: a `double` as its bit pattern, a `string`
+    /// as a rank into [`BatchRun::distinct`], a temporal value as nanoseconds.
+    ///
+    /// Empty unless the run was prepared [`BatchReduce::PerRow`]. Exactly as
+    /// long as the batch has rows: the buffer carries one spare element so a
+    /// zero-row batch still has a non-null address to seed, and that element is
+    /// never a result.
+    pub fn output(&self) -> &[i64] {
+        self.out.as_deref().map_or(&[], |b| &b[..self.rows])
+    }
+
+    /// The batch's distinct strings in rank order, indexed by an output id.
+    pub fn distinct(&self) -> &[String] {
+        &self.distinct
+    }
 }
 
 /// Build the batch program for `n` rows over `columns`. Panics on a column set
@@ -334,6 +381,19 @@ pub fn prepare_batch<'a>(
     columns: &[Column<'a>],
     n: usize,
     what: &str,
+) -> BatchRun<'a> {
+    prepare_batch_reduce(lowered, columns, n, what, BatchReduce::Sum)
+}
+
+/// [`prepare_batch`] for a chosen reduction. Under [`BatchReduce::PerRow`] the
+/// run owns an `n`-element output buffer and the loop stores through its
+/// address, seeded like any other batch datum.
+pub fn prepare_batch_reduce<'a>(
+    lowered: &super::lower::LoweredF,
+    columns: &[Column<'a>],
+    n: usize,
+    what: &str,
+    reduce: BatchReduce,
 ) -> BatchRun<'a> {
     assert_eq!(
         columns.len(),
@@ -410,7 +470,14 @@ pub fn prepare_batch<'a>(
         .collect();
     let mut trap: Box<i64> = Box::new(0);
     let trap_addr = (&mut *trap) as *mut i64 as i64;
-    let shape = lowered.batch_sum_shape(true);
+    // A zero-row batch never enters the loop, but the seed still asserts a
+    // non-null output address, so give the buffer one element to point at.
+    let mut out: Option<Box<[i64]>> = match reduce {
+        BatchReduce::Sum => None,
+        BatchReduce::PerRow => Some(vec![0i64; n.max(1)].into_boxed_slice()),
+    };
+    let out_addr = out.as_mut().map_or(0, |b| b.as_mut_ptr() as i64);
+    let shape = lowered.batch_shape(true, reduce);
     // Column bases, the row count, the trap address and the string literals'
     // ids are all this batch's data, and all reach the program the same way:
     // through the seeded bank, never through the words.
@@ -432,7 +499,19 @@ pub fn prepare_batch<'a>(
         })
         .collect();
     let str_ids: Vec<Box<[i64]>> = str_ids.into_iter().chain(pred_tables).collect();
-    let init_regs = shape.seed.regs(&bases, &scalars, n as i64, trap_addr);
+    // A string-banked per-row output stores ids, which mean nothing without the
+    // order they were ranked in.
+    let distinct: Vec<String> = match (reduce, lowered.result_bank) {
+        (BatchReduce::PerRow, super::lower::ValType::Str) => distinct
+            .get_or_insert_with(|| dict.sorted())
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect(),
+        _ => Vec::new(),
+    };
+    let init_regs = shape
+        .seed
+        .regs_out(&bases, &scalars, n as i64, trap_addr, out_addr);
     // The words are the same for every batch of this expression, so interning
     // them keeps the JIT's green key — and with it the compiled loop the driver
     // holds — from changing between batches.
@@ -444,6 +523,8 @@ pub fn prepare_batch<'a>(
         trap,
         rows: n,
         _str_ids: str_ids,
+        out,
+        distinct,
         columns: core::marker::PhantomData,
     }
 }
@@ -547,12 +628,13 @@ pub mod float_bank {
     pub static TRACE_ABORTS: AtomicUsize = AtomicUsize::new(0);
 
     use super::{
-        OP_ADD, OP_ADD_OVF, OP_AND, OP_COL_LOAD, OP_COL_LOAD_F, OP_DIV, OP_DIV_CHK, OP_EQ, OP_F2I,
-        OP_F2U, OP_FADD, OP_FDIV, OP_FEQ, OP_FGE, OP_FGT, OP_FLE, OP_FLT, OP_FMOV, OP_FMUL, OP_FNE,
-        OP_FNEG, OP_FSELECT, OP_FSUB, OP_GE, OP_GT, OP_I2F, OP_JUMP_IF_ABOVE, OP_LE, OP_LOAD_CONST,
-        OP_LOAD_CONST_F, OP_LT, OP_MOD, OP_MOD_CHK, OP_MOV, OP_MUL, OP_MUL_OVF, OP_NE, OP_NEG,
-        OP_NOT, OP_OR, OP_RETURN, OP_RETURN_F, OP_SELECT, OP_SUB, OP_SUB_OVF, OP_TRAP_STORE,
-        OP_U2F, OP_UADD_OVF, OP_UDIV, OP_ULE, OP_ULT, OP_UMOD, OP_UMUL_OVF, OP_USUB_OVF,
+        OP_ADD, OP_ADD_OVF, OP_AND, OP_COL_LOAD, OP_COL_LOAD_F, OP_COL_STORE, OP_COL_STORE_F,
+        OP_DIV, OP_DIV_CHK, OP_EQ, OP_F2I, OP_F2U, OP_FADD, OP_FDIV, OP_FEQ, OP_FGE, OP_FGT,
+        OP_FLE, OP_FLT, OP_FMOV, OP_FMUL, OP_FNE, OP_FNEG, OP_FSELECT, OP_FSUB, OP_GE, OP_GT,
+        OP_I2F, OP_JUMP_IF_ABOVE, OP_LE, OP_LOAD_CONST, OP_LOAD_CONST_F, OP_LT, OP_MOD, OP_MOD_CHK,
+        OP_MOV, OP_MUL, OP_MUL_OVF, OP_NE, OP_NEG, OP_NOT, OP_OR, OP_RETURN, OP_RETURN_F,
+        OP_SELECT, OP_SUB, OP_SUB_OVF, OP_TRAP_STORE, OP_U2F, OP_UADD_OVF, OP_UDIV, OP_ULE, OP_ULT,
+        OP_UMOD, OP_UMUL_OVF, OP_USUB_OVF,
     };
     use core::sync::atomic::Ordering;
 
@@ -754,6 +836,19 @@ pub mod float_bank {
                     let flag = program[pc + 2] as usize;
                     majit_raw_store_i64(state.regs[addr], 0, state.regs[flag]);
                     pc += 3;
+                }
+                OP_COL_STORE => {
+                    let base = state.regs[program[pc + 1] as usize];
+                    let ea = state.regs[program[pc + 2] as usize];
+                    majit_raw_store_i64(base, ea, state.regs[program[pc + 3] as usize]);
+                    pc += 4;
+                }
+                OP_COL_STORE_F => {
+                    let base = state.regs[program[pc + 1] as usize];
+                    let ea = state.regs[program[pc + 2] as usize];
+                    let bits = majit_f64_to_bits(state.fregs[program[pc + 3] as usize]);
+                    majit_raw_store_i64(base, ea, bits);
+                    pc += 4;
                 }
                 OP_DIV => {
                     let a = state.regs[program[pc + 1] as usize];
@@ -1236,6 +1331,22 @@ pub mod float_bank {
                         regs[program[pc + 2] as usize],
                     );
                     pc += 3;
+                }
+                OP_COL_STORE => {
+                    majit_raw_store_i64(
+                        regs[program[pc + 1] as usize],
+                        regs[program[pc + 2] as usize],
+                        regs[program[pc + 3] as usize],
+                    );
+                    pc += 4;
+                }
+                OP_COL_STORE_F => {
+                    majit_raw_store_i64(
+                        regs[program[pc + 1] as usize],
+                        regs[program[pc + 2] as usize],
+                        majit_f64_to_bits(fregs[program[pc + 3] as usize]),
+                    );
+                    pc += 4;
                 }
                 OP_DIV => {
                     // The reference tier is plain Rust, whose `/` and `%` already

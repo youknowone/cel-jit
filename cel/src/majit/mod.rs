@@ -584,6 +584,7 @@ mod tests {
     /// One input column for a typed-lowering batch test: an int/bool column, a
     /// `uint` column (stored as its i64 bit pattern), or a `double` column. Owns
     /// its data so the test keeps the buffers alive.
+    #[derive(Clone)]
     enum ColData {
         Int(Vec<i64>),
         /// A `bool` column, stored as `0`/`1`. Its STORAGE is identical to
@@ -1596,11 +1597,101 @@ mod tests {
     /// Cross-check a batch through the PUBLIC API on all three tiers against
     /// the tree-walker's per-row sum.
     ///
+    /// Borrowed [`ColumnRef`] views over owned test columns, for the harnesses
+    /// that go through the public `Batch` builder.
+    fn column_refs<'c>(
+        cols: &'c [(&'c str, ColData)],
+    ) -> Vec<(&'c str, super::batch::ColumnRef<'c>)> {
+        use super::batch::ColumnRef;
+        cols.iter()
+            .map(|(nm, d)| {
+                (
+                    *nm,
+                    match d {
+                        ColData::Int(c) => ColumnRef::Int(c),
+                        ColData::Timestamp(c) => ColumnRef::Timestamp(c),
+                        ColData::Duration(c) => ColumnRef::Duration(c),
+                        ColData::Float(c) => ColumnRef::Float(c),
+                        ColData::Str(c) => ColumnRef::Str(c),
+                        // SAFETY: same size, alignment and validity both ways,
+                        // and `ColData::UInt` stores exactly the `u64` bit
+                        // pattern (see `ValType::UInt`). `cols` outlives the
+                        // batch built from these views.
+                        ColData::UInt(c) => ColumnRef::UInt(unsafe {
+                            core::slice::from_raw_parts(c.as_ptr().cast::<u64>(), c.len())
+                        }),
+                        ColData::Bool(_) => panic!("bool column"),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// Every row's own value from the per-row batch loop, against the
+    /// tree-walker's value for that row — on all three tiers.
+    ///
+    /// This is the check that a stored result decodes back to what CEL says,
+    /// which is the whole question for the banks a sum cannot consume: a
+    /// `string` comes back through its rank, a `timestamp` and a `duration`
+    /// through their nanoseconds.
+    fn check_collect(expr_src: &str, cols: &[(&str, ColData)]) {
+        use super::batch::{Batch, BatchProgram, Tier};
+        use super::bytecode::float_bank::COMPILES as COMPILES_F;
+        let n = cols[0].1.len();
+        let schema: Schema = cols
+            .iter()
+            .map(|(nm, d)| (nm.to_string(), d.ty()))
+            .collect();
+        let program = Program::compile(expr_src).unwrap();
+        let expected: Vec<Value> = (0..n)
+            .map(|i| {
+                program
+                    .execute(&row_context(cols, i))
+                    .unwrap_or_else(|e| panic!("execute `{expr_src}`: {e:?}"))
+            })
+            .collect();
+
+        let mut batch = Batch::new(n);
+        for (nm, c) in column_refs(cols) {
+            batch = batch.column(nm, c);
+        }
+        let bp = BatchProgram::compile(expr_src, &schema)
+            .unwrap_or_else(|e| panic!("compile `{expr_src}`: {e}"));
+        let bound = bp
+            .bind_per_row(&batch)
+            .unwrap_or_else(|e| panic!("bind `{expr_src}`: {e}"));
+        for tier in [Tier::Clean, Tier::Interpreter, Tier::Jit] {
+            // Start the compiled tier cold: the driver persists across calls, so
+            // a loop an earlier case already compiled would not compile again.
+            if tier == Tier::Jit {
+                super::bytecode::float_bank::reset_persistent_state();
+            }
+            let before = COMPILES_F.load(Ordering::Relaxed);
+            let got = bound
+                .collect_on(tier)
+                .unwrap_or_else(|e| panic!("{tier:?}: {e}"));
+            assert_eq!(got.len(), n, "{tier:?} row count for `{expr_src}`");
+            for (i, (g, w)) in got.iter().zip(&expected).enumerate() {
+                assert_eq!(g, w, "{tier:?} row {i} of `{expr_src}`");
+            }
+            // Coverage without acceleration would be worth nothing: the whole
+            // claim of this door is that a store traces where a sum could not
+            // even be emitted. `raw_store_i` in the loop body is what would
+            // abort the trace if the frontend could not take it.
+            if tier == Tier::Jit {
+                assert!(
+                    COMPILES_F.load(Ordering::Relaxed) > before,
+                    "per-row `{expr_src}` must compile the hot loop"
+                );
+            }
+        }
+    }
+
     /// Unlike `check_batch_str` this goes through `BatchProgram::bind`, which
     /// is what materializes the derived `string(x)` and `concat#k` columns —
     /// the harnesses that build columns by hand cannot.
     fn check_bound_batch(expr_src: &str, cols: &[(&str, ColData)]) {
-        use super::batch::{Batch, BatchProgram, ColumnRef, Tier};
+        use super::batch::{Batch, BatchProgram, Tier};
         let n = cols[0].1.len();
         let schema: Schema = cols
             .iter()
@@ -1621,32 +1712,8 @@ mod tests {
             };
         }
 
-        // Borrowed views, kept alive for the whole bind.
-        let owned: Vec<(&str, ColumnRef)> = cols
-            .iter()
-            .map(|(nm, d)| {
-                (
-                    *nm,
-                    match d {
-                        ColData::Int(c) => ColumnRef::Int(c),
-                        ColData::Timestamp(c) => ColumnRef::Timestamp(c),
-                        ColData::Duration(c) => ColumnRef::Duration(c),
-                        ColData::Float(c) => ColumnRef::Float(c),
-                        ColData::Str(c) => ColumnRef::Str(c),
-                        // SAFETY: same size, alignment and validity both ways,
-                        // and `ColData::UInt` stores exactly the `u64` bit
-                        // pattern (see `ValType::UInt`). `cols` outlives the
-                        // batch built from these views.
-                        ColData::UInt(c) => ColumnRef::UInt(unsafe {
-                            core::slice::from_raw_parts(c.as_ptr().cast::<u64>(), c.len())
-                        }),
-                        ColData::Bool(_) => panic!("`{expr_src}`: bool column"),
-                    },
-                )
-            })
-            .collect();
         let mut batch = Batch::new(n);
-        for (nm, c) in owned {
+        for (nm, c) in column_refs(cols) {
             batch = batch.column(nm, c);
         }
 
@@ -1663,6 +1730,69 @@ mod tests {
                 Value::Int(expected),
                 "{tier:?} vs stock for `{expr_src}`"
             );
+        }
+    }
+
+    /// The batch loop's OTHER reduction: instead of accumulating each row's
+    /// result, store it, so a result of any bank has somewhere to go.
+    ///
+    /// This is the accelerated path for the expressions a sum has nothing to do
+    /// with — a `string`, a `timestamp`, a `duration` — and the check is per
+    /// row against the tree-walker, not against a total, so a wrong value
+    /// cannot cancel against another wrong value the way a sum's can.
+    #[test]
+    fn batch_per_row_results() {
+        const YEAR: i64 = 365 * 24 * 3_600_000_000_000;
+        let n = 700;
+        let words = ["admin", "ad", "", "guest", "root"];
+        let cols: Vec<(&str, ColData)> = vec![
+            ("b", ColData::Int(gen_i64(n, 0x1357_9BDF_2468_ACE0, 0, 1))),
+            (
+                "i",
+                ColData::Int(gen_i64(n, 0x0F1E_2D3C_4B5A_6978, -50, 50)),
+            ),
+            ("u", ColData::UInt(gen_i64(n, 0x1122_3344_5566_7788, 0, 99))),
+            (
+                "f",
+                ColData::Float(gen_f64(n, 0xAAAA_BBBB_CCCC_DDDD, -1e6, 1e6)),
+            ),
+            ("s", ColData::Str(gen_str(n, 0x2468_ACE0_1357_9BDF, &words))),
+            (
+                "t",
+                ColData::Timestamp(gen_nanos(n, 0x1111_2222_3333_4444, -20 * YEAR, 40 * YEAR)),
+            ),
+            (
+                "d",
+                ColData::Duration(gen_nanos(n, 0x9999_AAAA_BBBB_CCCC, -YEAR, 2 * YEAR)),
+            ),
+        ];
+        let pick = |names: &[&str]| -> Vec<(&'static str, ColData)> {
+            names
+                .iter()
+                .map(|nm| {
+                    let (n2, d) = cols.iter().find(|(c, _)| c == nm).expect("declared column");
+                    (*n2, d.clone())
+                })
+                .collect::<Vec<_>>()
+        };
+        for (expr, names) in [
+            // The three banks a sum refuses, which is the point of the door.
+            ("b == 1 ? s : 'none'", &["b", "s"][..]),
+            ("s + '!'", &["s"][..]),
+            ("string(i)", &["i"][..]),
+            ("b == 1 ? t : t", &["b", "t"][..]),
+            ("t + d", &["t", "d"][..]),
+            ("t - t", &["t"][..]),
+            ("d + d", &["d"][..]),
+            ("b == 1 ? d : duration('24h')", &["b", "d"][..]),
+            // And the banks a sum DOES take, whose per-row values a total hides:
+            // `i - 1` and `i + 1` have the same sum over a symmetric column.
+            ("i * 2 - 1", &["i"][..]),
+            ("u + 7u", &["u"][..]),
+            ("f / 2.0", &["f"][..]),
+            ("i > 0", &["i"][..]),
+        ] {
+            check_collect(expr, &pick(names));
         }
     }
 
@@ -3547,20 +3677,24 @@ mod tests {
     /// refusing legal expressions breaks it. The breakdown rides the failure
     /// message, so a break names the family that moved.
     ///
-    /// ⚠️Counted separately, and reported either way, is the second refusal:
-    /// an expression that LOWERS but whose result the batch loop's sum cannot
-    /// consume (`LoweredF::sum_reducible`). That is the reduction's limit, not
-    /// the lowering's, and folding the two together would let a lowering gain
-    /// look like a reduction gain or hide one behind the other.
+    /// ⚠️Counted separately, and reported either way, is which DOOR an
+    /// expression goes through: a result the loop's running total cannot
+    /// consume (`LoweredF::sum_reducible`) is accelerated by
+    /// `BatchProgram::bind_per_row` instead, which stores each row's result
+    /// rather than adding it. Both are compiled paths, so this second number is
+    /// not a gap — but folding it into the first would hide a real lowering
+    /// regression behind a routing fact.
     #[test]
     fn lowering_declines_nothing_the_walker_answers() {
         use std::collections::BTreeMap;
         // The LOWERING gap is closed: over this matrix, every expression the
-        // tree-walker answers also lowers. The two refusals below it are
-        // separate and stay: the batch loop reduces by SUM, so a Str- or
-        // Timestamp-valued RESULT has nothing to accumulate into, and a batch
-        // whose temporal values leave the i64-nanosecond domain is refused at
-        // BIND, not at lowering.
+        // tree-walker answers also lowers, and every one that lowers has a
+        // compiled path — by sum where a total means something, by per-row
+        // store otherwise.
+        //
+        // What is left is not a gap but a property of the DATA: a batch whose
+        // temporal values leave the i64-nanosecond domain is refused at bind,
+        // and another batch of the same expression is not.
         //
         // Zero is a ratchet, not a milestone — a decline that reappears here
         // is a capability this file used to have.
@@ -3602,8 +3736,8 @@ mod tests {
 
         let mut gap: BTreeMap<String, (usize, String)> = BTreeMap::new();
         let mut gap_total = 0usize;
-        // The second refusal, tracked apart: lowered, but not something the
-        // loop's sum can accumulate.
+        // The second door, tracked apart: lowered, but routed to the per-row
+        // store because the loop's sum cannot accumulate the result.
         let mut unreduced: BTreeMap<String, (usize, String)> = BTreeMap::new();
         let mut unreduced_total = 0usize;
         for expr in &exprs {
@@ -3647,7 +3781,7 @@ mod tests {
             0,
             "{gap_total} of {} sweep expressions are answered by the tree-walker \
              and declined by the LOWERING:{breakdown}\n\
-             \n{unreduced_total} more lower but are not sum-reducible:\
+             \n{unreduced_total} more lower and go through the per-row door:\
              {unreduced_breakdown}",
             exprs.len(),
         );

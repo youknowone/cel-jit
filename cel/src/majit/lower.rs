@@ -443,6 +443,24 @@ pub struct LoweredF {
 /// PATTERN green and the subject string and its positions red, so one compiled
 /// loop matches every subject; `micronumpy/loop.py:88-89` keeps the arrays,
 /// base storage included, red while the greens are the computation's shape.
+/// What a batch loop does with each row's result.
+///
+/// The loop's shape is the same either way — the same red-index column reads,
+/// the same body. Only the last instruction of the iteration differs, and with
+/// it what the run produces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchReduce {
+    /// Accumulate into a running total carried across iterations, and return
+    /// it. The only answer a `bool` predicate has (a count of matching rows),
+    /// and the only one that costs no memory.
+    Sum,
+    /// Store each row's result to `out[i]` and return nothing but the row
+    /// count. The loop carries only `i`, so a result of ANY bank has somewhere
+    /// to go — including the string ranks and nanosecond counts a sum cannot
+    /// consume.
+    PerRow,
+}
+
 pub struct BatchShape {
     /// The program words.
     pub code: Vec<i64>,
@@ -465,6 +483,10 @@ pub struct BatchSeed {
     r_n: usize,
     /// Register holding the overflow trap word's address.
     r_trap: usize,
+    /// Register holding the output buffer's base address, under
+    /// [`BatchReduce::PerRow`]. Data like any column base, so it is seeded and
+    /// never an immediate.
+    r_out: Option<usize>,
     /// Register holding each column's base address, in [`LoweredF::slots`]
     /// order. A ROW column's base lives in the machinery bank; a list ELEMENT
     /// column's lives in the register its lowering reserved.
@@ -492,6 +514,20 @@ impl BatchSeed {
     ///
     /// The back-edge is a do-while, so callers must pass `n >= 1`.
     pub fn regs(&self, bases: &[i64], scalars: &[i64], n: i64, trap_addr: i64) -> Vec<i64> {
+        self.regs_out(bases, scalars, n, trap_addr, 0)
+    }
+
+    /// [`BatchSeed::regs`] plus the output buffer's base address, which a
+    /// [`BatchReduce::PerRow`] shape stores each row's result through. Ignored
+    /// by a [`BatchReduce::Sum`] shape, which has no output register.
+    pub fn regs_out(
+        &self,
+        bases: &[i64],
+        scalars: &[i64],
+        n: i64,
+        trap_addr: i64,
+        out_addr: i64,
+    ) -> Vec<i64> {
         assert_eq!(
             bases.len(),
             self.base_regs.len(),
@@ -515,6 +551,13 @@ impl BatchSeed {
         }
         for (&v, &reg) in scalars.iter().zip(&self.scalar_regs) {
             regs[reg] = v;
+        }
+        if let Some(reg) = self.r_out {
+            assert!(
+                out_addr != 0,
+                "batch seed: PerRow shape needs an output buffer"
+            );
+            regs[reg] = out_addr;
         }
         regs
     }
@@ -606,27 +649,37 @@ impl LoweredF {
     /// evaluator path passes `true` here and the trap word's address to
     /// [`BatchSeed::regs`].
     pub fn batch_sum_shape(&self, with_trap: bool) -> BatchShape {
-        // The arms below fold a Str/Timestamp/Duration result into the int
-        // accumulate, which would sum ranks or nanoseconds. Callers must have
-        // asked [`LoweredF::sum_reducible`] first; the public entry points do.
+        // The accumulate below folds a Str/Timestamp/Duration result into the
+        // int sum, which would add ranks or nanoseconds. Callers must have asked
+        // [`LoweredF::sum_reducible`] first; the public entry points do.
         self.sum_reducible()
             .expect("batch_sum_shape on a result the loop's sum cannot consume");
+        self.batch_shape(with_trap, BatchReduce::Sum)
+    }
+
+    /// [`LoweredF::batch_sum_shape`] for a chosen reduction.
+    ///
+    /// [`BatchReduce::PerRow`] has no `sum_reducible` precondition: a store
+    /// takes a result of any bank, which is the whole reason the reduction is a
+    /// choice.
+    pub fn batch_shape(&self, with_trap: bool, reduce: BatchReduce) -> BatchShape {
         let m = self.num_int_regs; // first int machinery register
         let (r_i, r_acc, r_n, r_one, r_stride, r_ea) = (m, m + 1, m + 2, m + 3, m + 4, m + 5);
         let r_trap = m + 6;
-        let r_base0 = m + 7;
+        // The output base is a machinery register too, present only where the
+        // reduction stores through it.
+        let r_out = match reduce {
+            BatchReduce::Sum => None,
+            BatchReduce::PerRow => Some(m + 7),
+        };
+        let r_base0 = m + 7 + usize::from(r_out.is_some());
         let total_int_regs = r_base0 + self.slots.len();
         // A float result accumulates into a float register above the body's
         // float bank; an int result uses the int `r_acc` and leaves the float
         // bank at the body's count. `f_acc` is unused when the result is int.
-        let (f_acc, total_float_regs) = match self.result_bank {
-            ValType::Float => (self.num_float_regs, self.num_float_regs + 1),
-            ValType::Int
-            | ValType::Bool
-            | ValType::UInt
-            | ValType::Str
-            | ValType::Timestamp
-            | ValType::Duration => (0, self.num_float_regs),
+        let (f_acc, total_float_regs) = match (reduce, self.result_bank) {
+            (BatchReduce::Sum, ValType::Float) => (self.num_float_regs, self.num_float_regs + 1),
+            _ => (0, self.num_float_regs),
         };
 
         let mut p = Vec::new();
@@ -637,14 +690,13 @@ impl LoweredF {
         // Accumulator init, run once before the merge point. `OP_LOAD_CONST_F`'s
         // `f64::from_bits` must stay out of the traced loop body; here it is in
         // the setup (0.0 has zero bits).
-        match self.result_bank {
-            ValType::Int
-            | ValType::Bool
-            | ValType::UInt
-            | ValType::Str
-            | ValType::Timestamp
-            | ValType::Duration => load_const(&mut p, 0, r_acc),
-            ValType::Float => p.extend_from_slice(&[OP_LOAD_CONST_F, 0, f_acc as i64]),
+        match (reduce, self.result_bank) {
+            (BatchReduce::Sum, ValType::Float) => {
+                p.extend_from_slice(&[OP_LOAD_CONST_F, 0, f_acc as i64])
+            }
+            // A `PerRow` loop carries no accumulator, but zeroing `r_acc` costs
+            // one setup instruction and leaves the bank in one known state.
+            _ => load_const(&mut p, 0, r_acc),
         }
         load_const(&mut p, 1, r_one);
         load_const(&mut p, 8, r_stride);
@@ -704,19 +756,28 @@ impl LoweredF {
         // The float accumulate is a loop-carried dependency, so the compiled
         // trace cannot reassociate it — the running total sums in row order, bit
         // for bit like the interpreter tiers.
-        match self.result_bank {
-            ValType::Int
-            | ValType::Bool
-            | ValType::UInt
-            | ValType::Str
-            | ValType::Timestamp
-            | ValType::Duration => {
-                p.extend_from_slice(&[OP_ADD, r_acc as i64, self.result_reg as i64, r_acc as i64])
+        let tail: [i64; 4] = match (reduce, self.result_bank) {
+            (BatchReduce::Sum, ValType::Float) => {
+                [OP_FADD, f_acc as i64, self.result_reg as i64, f_acc as i64]
             }
-            ValType::Float => {
-                p.extend_from_slice(&[OP_FADD, f_acc as i64, self.result_reg as i64, f_acc as i64])
-            }
-        }
+            (BatchReduce::Sum, _) => [OP_ADD, r_acc as i64, self.result_reg as i64, r_acc as i64],
+            // `out[i] = result`, at the same `i * 8` the row's columns were read
+            // at. The float form stores the bit pattern, so one `i64` buffer
+            // serves every bank.
+            (BatchReduce::PerRow, ValType::Float) => [
+                OP_COL_STORE_F,
+                r_out.expect("PerRow shape allocates an output register") as i64,
+                r_ea as i64,
+                self.result_reg as i64,
+            ],
+            (BatchReduce::PerRow, _) => [
+                OP_COL_STORE,
+                r_out.expect("PerRow shape allocates an output register") as i64,
+                r_ea as i64,
+                self.result_reg as i64,
+            ],
+        };
+        p.extend_from_slice(&tail);
         p.extend_from_slice(&[OP_ADD, r_i as i64, r_one as i64, r_i as i64]);
         p.extend_from_slice(&[OP_JUMP_IF_ABOVE, r_n as i64, r_i as i64, body_pc as i64]);
         // Publish the overflow flag. Outside the loop, so it costs the traced
@@ -724,14 +785,12 @@ impl LoweredF {
         if with_trap {
             p.extend_from_slice(&[OP_TRAP_STORE, r_trap as i64, OVF_FLAG_REG as i64]);
         }
-        match self.result_bank {
-            ValType::Int
-            | ValType::Bool
-            | ValType::UInt
-            | ValType::Str
-            | ValType::Timestamp
-            | ValType::Duration => p.extend_from_slice(&[OP_RETURN, r_acc as i64]),
-            ValType::Float => p.extend_from_slice(&[OP_RETURN_F, f_acc as i64]),
+        // A `PerRow` loop's answer is in the output buffer; what it returns is
+        // the row count it wrote, which the caller already knows and can check.
+        match (reduce, self.result_bank) {
+            (BatchReduce::Sum, ValType::Float) => p.extend_from_slice(&[OP_RETURN_F, f_acc as i64]),
+            (BatchReduce::Sum, _) => p.extend_from_slice(&[OP_RETURN, r_acc as i64]),
+            (BatchReduce::PerRow, _) => p.extend_from_slice(&[OP_RETURN, r_i as i64]),
         }
         BatchShape {
             code: p,
@@ -739,6 +798,7 @@ impl LoweredF {
             seed: BatchSeed {
                 r_n,
                 r_trap,
+                r_out,
                 base_regs,
                 scalar_regs: self.scalar_seeds.iter().map(|s| s.reg).collect(),
                 num_int_regs: total_int_regs,
