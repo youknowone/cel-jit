@@ -1451,6 +1451,7 @@ mod tests {
     /// must produce byte-identical words.
     #[test]
     fn string_literal_id_rides_a_register_not_the_words() {
+        use super::lower::SeedKind;
         let schema: Schema = [("role".to_string(), ValType::Str)].into_iter().collect();
         let lower = |src: &str| {
             let program = Program::compile(src).unwrap();
@@ -1459,8 +1460,14 @@ mod tests {
 
         let admin = lower("role == \"admin\"");
         let guest = lower("role == \"superadmin\"");
-        assert_eq!(admin.str_literals[0].text, "admin");
-        assert_eq!(guest.str_literals[0].text, "superadmin");
+        assert_eq!(
+            admin.scalar_seeds[0].kind,
+            SeedKind::StrId("admin".to_string())
+        );
+        assert_eq!(
+            guest.scalar_seeds[0].kind,
+            SeedKind::StrId("superadmin".to_string())
+        );
 
         let (a_shape, g_shape) = (admin.batch_sum_shape(true), guest.batch_sum_shape(true));
         assert_eq!(
@@ -1469,7 +1476,7 @@ mod tests {
         );
         assert_eq!(a_shape.seed.num_scalars(), 1);
         assert_eq!(
-            admin.str_literals[0].reg, guest.str_literals[0].reg,
+            admin.scalar_seeds[0].reg, guest.scalar_seeds[0].reg,
             "and both arrive in the same register"
         );
     }
@@ -1497,6 +1504,93 @@ mod tests {
             let got = program.bind(&batch).expect("bind").sum().expect("sum");
             assert_eq!(got, Value::Int(want), "rows {rows:?}");
         }
+    }
+
+    /// The four pure string predicates, cross-checked against the tree-walker
+    /// on every tier. Each is answered once per DISTINCT string at bind and
+    /// read per row from a table indexed by the id, so the assertion that
+    /// matters is that per-distinct and per-row give the same answers.
+    #[test]
+    fn batch_string_predicates() {
+        let n = 3000;
+        // Prefixes, suffixes and infixes that overlap, plus the empty string,
+        // so a table that confused two ids would show up.
+        let words = [
+            "admin",
+            "ad",
+            "administrator",
+            "badmin",
+            "guest",
+            "gu",
+            "",
+            "ADMIN",
+        ];
+        let col = gen_str(n, 0x0BAD_5EED_1234_5678, &words);
+        for expr in [
+            "s.startsWith('ad')",
+            "s.startsWith('')",
+            "s.startsWith('zzz')",
+            "s.endsWith('min')",
+            "s.endsWith('')",
+            "s.contains('dmi')",
+            "s.contains('')",
+            "s.matches('^a.*n$')",
+            "s.matches('[Aa]dmin')",
+            // Combined with the id compare and an ordering, so the table read
+            // and the rank compare share a batch.
+            "s.startsWith('ad') && s != 'ad'",
+            "s.contains('d') || s < 'b'",
+        ] {
+            check_batch_str(expr, &[("s", ColData::Str(col.clone()))]);
+        }
+    }
+
+    /// A predicate's argument must be a literal (there is no single table for a
+    /// per-row argument), and an invalid regex must DECLINE rather than answer:
+    /// the tree-walker raises on it, and swallowing that would be a wrong
+    /// answer rather than a missing one.
+    #[test]
+    fn string_predicate_declines_keep_the_walkers_errors() {
+        let schema: Schema = [
+            ("s".to_string(), ValType::Str),
+            ("t".to_string(), ValType::Str),
+        ]
+        .into_iter()
+        .collect();
+        let lower = |expr: &str| {
+            let program = Program::compile(expr).unwrap();
+            lower_typed(program.expression(), &schema)
+        };
+        for expr in ["s.startsWith(t)", "s.contains(t)", "s.matches('[')"] {
+            assert!(lower(expr).is_err(), "`{expr}` must decline");
+        }
+        // And the walker really does raise on that regex, so declining is what
+        // keeps the two tiers agreeing.
+        let program = Program::compile("s.matches('[')").unwrap();
+        let mut ctx = Context::default();
+        ctx.add_variable_from_value("s", Value::String("a".to_string().into()));
+        assert!(program.execute(&ctx).is_err(), "invalid regex must raise");
+    }
+
+    /// `-b` is not a CEL overload, but the evaluator this tier accelerates
+    /// answers it as `!b`, so the tier answers it the same way. A JIT that
+    /// disagreed with its own interpreter would be wrong whichever one matches
+    /// the spec.
+    #[test]
+    fn unary_minus_on_bool_matches_the_evaluator() {
+        for b in [true, false] {
+            let program = Program::compile("-b").unwrap();
+            let mut ctx = Context::default();
+            ctx.add_variable_from_value("b", Value::Bool(b));
+            assert_eq!(
+                program.execute(&ctx).unwrap(),
+                Value::Bool(!b),
+                "evaluator ground truth for `-{b}`"
+            );
+        }
+        let n = 600;
+        let flags = gen_i64(n, 0x1357_9BDF_2468_ACE0, 0, 1);
+        check_batch_f("-b", &[("b", ColData::Bool(flags))]);
     }
 
     /// String ordering lowers now that ids are ranks; what still bails is a
@@ -3229,7 +3323,7 @@ mod tests {
         //
         // And `-b` is the walker answering `-true` as `false`, which no CEL
         // overload defines — matching it would put that bug in the JIT tier too.
-        const GAP_CEILING: usize = 81;
+        const GAP_CEILING: usize = 66;
 
         let (srcs, cols) = sweep_operands();
         let schema: Schema = cols

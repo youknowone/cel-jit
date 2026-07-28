@@ -245,19 +245,76 @@ pub fn declares_list(schema: &Schema, path: &str) -> bool {
 /// loop.
 pub const OVF_FLAG_REG: usize = 0;
 
-/// One string literal the body reads, and the int register it arrives in.
+/// One **broadcast scalar** the body reads, and the int register it arrives in.
 ///
-/// The id is **not** an immediate in the program words. An id is a property of
-/// the batch — the whole point of [`BatchSeed`] is that anything data-dependent
-/// reaches the program through a register, so one set of words serves every
-/// batch and the JIT's green key stays put. A literal's id is data even when
-/// the batch builder's interning is the only thing that can resolve it.
+/// Broadcast means one value for every row of the batch — but not for every
+/// batch, which is why it is a seeded register and not an immediate. The whole
+/// point of [`BatchSeed`] is that anything data-dependent reaches the program
+/// through a register, so one set of words serves every batch and the JIT's
+/// green key stays put.
 #[derive(Debug, Clone)]
-pub struct StrLiteral {
-    /// Raw content, as written in the expression.
-    pub text: String,
-    /// Int register the batch builder seeds with this literal's id.
+pub struct ScalarSeed {
+    /// What the batch builder must resolve to fill the register.
+    pub kind: SeedKind,
+    /// Int register it arrives in.
     pub reg: usize,
+}
+
+/// What a [`ScalarSeed`] asks the batch builder for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SeedKind {
+    /// The id of this string among the batch's distinct strings.
+    StrId(String),
+    /// Base address of a `0`/`1` table indexed by string id, holding this
+    /// predicate's answer for each of the batch's distinct strings.
+    ///
+    /// Ids are dense `0..k`, so a pure single-string predicate can be answered
+    /// once per DISTINCT string at bind and then read per row with a load. This
+    /// is dictionary encoding's other half — predicate pushdown — and it needs
+    /// no new opcode: the read is `OP_MUL` (id by 8) then `OP_COL_LOAD`, the
+    /// same `*(base + ea)` a column read already is.
+    StrPredicate(StrPredicate),
+}
+
+/// A pure predicate over one string, with its argument fixed by the expression.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StrPredicate {
+    /// `s.startsWith(arg)`.
+    StartsWith(String),
+    /// `s.endsWith(arg)`.
+    EndsWith(String),
+    /// `s.contains(arg)`.
+    Contains(String),
+    /// `s.matches(arg)`, an RE2-flavoured regex match.
+    #[cfg(feature = "regex")]
+    Matches(String),
+}
+
+impl StrPredicate {
+    /// Answer this predicate for each of `strings`, in id order.
+    ///
+    /// The operations are the ones `common/types/string.rs` applies per row, so
+    /// answering them per distinct string instead cannot change any answer —
+    /// only how many times it is computed.
+    pub fn table(&self, strings: &[&str]) -> Vec<i64> {
+        match self {
+            StrPredicate::StartsWith(p) => {
+                strings.iter().map(|s| s.starts_with(p) as i64).collect()
+            }
+            StrPredicate::EndsWith(p) => strings.iter().map(|s| s.ends_with(p) as i64).collect(),
+            StrPredicate::Contains(p) => strings
+                .iter()
+                .map(|s| s.contains(p.as_str()) as i64)
+                .collect(),
+            #[cfg(feature = "regex")]
+            StrPredicate::Matches(p) => {
+                // Compiled ONCE for the whole table rather than per row, and
+                // valid because the lowering refused the call otherwise.
+                let re = regex::Regex::new(p).expect("regex validated when the call was lowered");
+                strings.iter().map(|s| re.is_match(s) as i64).collect()
+            }
+        }
+    }
 }
 
 /// A CEL expression compiled to two-bank bytecode. The result is an int
@@ -288,13 +345,10 @@ pub struct LoweredF {
     pub num_float_regs: usize,
     /// Input slots in first-encounter order.
     pub slots: Vec<SlotInfoF>,
-    /// String literals the body compares against, in first-encounter order,
-    /// each paired with the int register it arrives in. The batch builder
-    /// resolves the raw content to an id and seeds that register
-    /// ([`BatchSeed::scalar_regs`]); it also folds the content into the
-    /// injectivity check so a literal that collides with a distinct column
-    /// string bails rather than miscompiles.
-    pub str_literals: Vec<StrLiteral>,
+    /// Broadcast scalars the body reads, in first-encounter order. The batch
+    /// builder resolves each against the batch and seeds its register
+    /// ([`BatchSeed::scalar_regs`]).
+    pub scalar_seeds: Vec<ScalarSeed>,
     /// Positions **within [`LoweredF::body`]** of jump target words, which the
     /// lowering writes body-relative because it cannot know where the body
     /// lands. [`LoweredF::batch_sum_shape`] relocates each to an
@@ -418,9 +472,9 @@ impl LoweredF {
     /// the strings themselves.
     pub fn batch_sum_program(&self, bases: &[i64], n: i64) -> (BatchShape, Vec<i64>) {
         assert!(
-            self.str_literals.is_empty(),
-            "batch_sum_program takes bases, not strings: `{}` needs a ranked batch",
-            self.str_literals[0].text
+            self.scalar_seeds.is_empty(),
+            "batch_sum_program takes bases, not strings: {:?} needs a ranked batch",
+            self.scalar_seeds[0].kind
         );
         let shape = self.batch_sum_shape(false);
         let regs = shape.seed.regs(bases, &[], n, 0);
@@ -565,7 +619,7 @@ impl LoweredF {
                 r_n,
                 r_trap,
                 base_regs,
-                scalar_regs: self.str_literals.iter().map(|lit| lit.reg).collect(),
+                scalar_regs: self.scalar_seeds.iter().map(|s| s.reg).collect(),
                 num_int_regs: total_int_regs,
             },
         }
@@ -582,10 +636,8 @@ struct LowerCtxF<'s> {
     slots: Vec<SlotInfoF>,
     slot_map: HashMap<String, TReg>,
     locals: HashMap<String, TReg>,
-    /// String literals referenced by the body, in first-encounter order. The
-    /// batch builder folds these into the injectivity check alongside the
-    /// [`ValType::Str`] column values.
-    str_literals: Vec<StrLiteral>,
+    /// Broadcast scalars referenced by the body, in first-encounter order.
+    scalar_seeds: Vec<ScalarSeed>,
     /// Element slots created by the runtime-list comprehension currently being
     /// lowered, keyed by slot path. Scoped to that comprehension on purpose:
     /// two comprehensions over the same list get their OWN registers, since
@@ -758,7 +810,7 @@ pub fn lower_typed(expr: &IdedExpr, schema: &Schema) -> Result<LoweredF, LowerEr
         slots: Vec::new(),
         slot_map: HashMap::new(),
         locals: HashMap::new(),
-        str_literals: Vec::new(),
+        scalar_seeds: Vec::new(),
         elem_map: HashMap::new(),
         list_loop: None,
         jump_fixups: Vec::new(),
@@ -784,7 +836,7 @@ pub fn lower_typed(expr: &IdedExpr, schema: &Schema) -> Result<LoweredF, LowerEr
         num_int_regs: ctx.next_int,
         num_float_regs: ctx.next_float,
         slots: ctx.slots,
-        str_literals: ctx.str_literals,
+        scalar_seeds: ctx.scalar_seeds,
         jump_fixups: ctx.jump_fixups,
     })
 }
@@ -888,8 +940,8 @@ fn compile_literal_t(ctx: &mut LowerCtxF, lit: &LiteralValue) -> Result<TReg, Lo
             // content is recorded so the builder can resolve it and check it
             // against the column strings.
             let r = ctx.fresh(ValType::Str);
-            ctx.str_literals.push(StrLiteral {
-                text: s.inner().to_string(),
+            ctx.scalar_seeds.push(ScalarSeed {
+                kind: SeedKind::StrId(s.inner().to_string()),
                 reg: r.idx,
             });
             Ok(r)
@@ -1084,6 +1136,64 @@ fn cmp_class(bank: ValType) -> CmpClass {
         ValType::Timestamp => CmpClass::Timestamp,
         ValType::Duration => CmpClass::Duration,
     }
+}
+
+/// Match a member call against the four pure string predicates, resolving its
+/// argument. `None` is "not one of these names"; `Some(Err(_))` is one of them
+/// that this lowering cannot take — a non-literal argument (there would be no
+/// single table to build) or, for `matches`, a regex the walker itself would
+/// reject.
+fn str_predicate(name: &str, args: &[IdedExpr]) -> Option<Result<StrPredicate, LowerError>> {
+    let is_predicate = matches!(name, "startsWith" | "endsWith" | "contains" | "matches");
+    if !is_predicate {
+        return None;
+    }
+    Some((|| {
+        if args.len() != 1 {
+            return Err(LowerError::unsupported(format!("`{name}` arity")));
+        }
+        let arg = as_string_literal(&args[0]).ok_or_else(|| {
+            // A per-row argument would need a table per row, which is the work
+            // the table exists to avoid.
+            LowerError::unsupported(format!("`{name}` argument must be a string literal"))
+        })?;
+        Ok(match name {
+            "startsWith" => StrPredicate::StartsWith(arg.to_string()),
+            "endsWith" => StrPredicate::EndsWith(arg.to_string()),
+            "contains" => StrPredicate::Contains(arg.to_string()),
+            #[cfg(feature = "regex")]
+            "matches" => {
+                // An invalid regex is an ERROR in the tree-walker, not `false`.
+                // Declining leaves the caller on `Program::execute`, which
+                // raises it; answering would swallow it.
+                regex::Regex::new(arg).map_err(|e| {
+                    LowerError::unsupported(format!("`{arg}` is not a valid regex: {e}"))
+                })?;
+                StrPredicate::Matches(arg.to_string())
+            }
+            #[cfg(not(feature = "regex"))]
+            "matches" => return Err(LowerError::unsupported("`matches` needs the regex feature")),
+            _ => unreachable!("name matched one of the four predicates"),
+        })
+    })())
+}
+
+/// Read `pred`'s answer for `s` out of the bind-time table: `ea = id * 8`, then
+/// the same `*(base + ea)` load a column read is.
+fn emit_str_predicate(ctx: &mut LowerCtxF, pred: StrPredicate, s: TReg) -> TReg {
+    let table = ctx.fresh(ValType::Int);
+    ctx.scalar_seeds.push(ScalarSeed {
+        kind: SeedKind::StrPredicate(pred),
+        reg: table.idx,
+    });
+    // `8` is the element stride, a property of the table and not of the batch,
+    // so unlike the table's address it is a genuine immediate.
+    let stride = emit_int_const(ctx, 8);
+    let ea = emit_bin(ctx, OP_MUL, s, stride, ValType::Int);
+    let d = ctx.fresh(ValType::Bool);
+    ctx.body
+        .extend_from_slice(&[OP_COL_LOAD, table.idx as i64, ea.idx as i64, d.idx as i64]);
+    d
 }
 
 /// A `bool` the lowering knows without looking at the row, hoisted to the
@@ -1385,6 +1495,22 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
                     )))
                 }
             }
+        }
+        // The pure single-string predicates. Each answers a question about the
+        // CHARACTERS, which the machine does not carry — but the answer depends
+        // only on WHICH string, and ids are a dense `0..k` over the batch's
+        // distinct strings. So the answer is computed once per distinct string
+        // at bind and read per row out of a table indexed by the id.
+        if let Some(pred) = str_predicate(&call.func_name, &call.args) {
+            let pred = pred?;
+            let a = compile_t(ctx, target)?;
+            if a.bank != ValType::Str {
+                return Err(LowerError::unsupported(format!(
+                    "`{}` on a non-string receiver",
+                    call.func_name
+                )));
+            }
+            return Ok(emit_str_predicate(ctx, pred, a));
         }
         // `size` is the ONE stdlib name registered in both namespaces
         // (`string.rs:292` + `:299`, and likewise for list/map/bytes), so for it
@@ -1878,10 +2004,22 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
                 // are NoSuchOverload in the tree-walker, so they bail (and a uint
                 // or string operand lives in the int bank — OP_FNEG would wrongly
                 // read the float register file).
+                // `-bool` has no CEL overload, but this tier's contract is
+                // bit-exact agreement with the evaluator it accelerates, and
+                // that evaluator answers `-b` as `!b`
+                // (`common/types/bool.rs`, `Bool::negate`). Declining would
+                // make the JIT tier and the interpreter tier disagree on the
+                // same expression, which is the one thing a JIT may not do.
+                if a.bank == ValType::Bool {
+                    let d = ctx.fresh(ValType::Bool);
+                    ctx.body
+                        .extend_from_slice(&[OP_NOT, a.idx as i64, d.idx as i64]);
+                    return Ok(d);
+                }
                 let op = match a.bank {
                     ValType::Int => OP_NEG,
                     ValType::Float => OP_FNEG,
-                    ValType::Bool => return Err(LowerError::unsupported("unary negate on bool")),
+                    ValType::Bool => unreachable!("handled above"),
                     ValType::UInt => return Err(LowerError::unsupported("unary negate on uint")),
                     ValType::Str => return Err(LowerError::unsupported("unary negate on string")),
                     ValType::Timestamp | ValType::Duration => {

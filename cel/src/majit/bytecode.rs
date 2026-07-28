@@ -247,6 +247,14 @@ struct StrDict<'s> {
 }
 
 impl<'s> StrDict<'s> {
+    /// The distinct strings in id order, which is what a predicate table is
+    /// indexed by.
+    fn sorted(&self) -> Vec<&'s str> {
+        let mut out: Vec<(i64, &'s str)> = self.rank.iter().map(|(s, &k)| (k, *s)).collect();
+        out.sort_unstable();
+        out.into_iter().map(|(_, s)| s).collect()
+    }
+
     /// Rank `strings`, which must include every string the batch will ask for.
     fn build(strings: impl Iterator<Item = &'s str>) -> Self {
         // Dedup BEFORE sorting. A batch is millions of rows over a handful of
@@ -363,7 +371,13 @@ pub fn prepare_batch<'a>(
                 _ => None,
             })
             .flatten()
-            .chain(lowered.str_literals.iter().map(|lit| lit.text.as_str())),
+            // An id seed is compared against column ids, so it must share their
+            // order. A PREDICATE's argument is not — it is never an id — so it
+            // stays out of the dictionary.
+            .chain(lowered.scalar_seeds.iter().filter_map(|s| match &s.kind {
+                super::lower::SeedKind::StrId(t) => Some(t.as_str()),
+                super::lower::SeedKind::StrPredicate(_) => None,
+            })),
     );
     let str_ids: Vec<Box<[i64]>> = columns
         .iter()
@@ -391,11 +405,24 @@ pub fn prepare_batch<'a>(
     // Column bases, the row count, the trap address and the string literals'
     // ids are all this batch's data, and all reach the program the same way:
     // through the seeded bank, never through the words.
+    // Predicate tables are answered once per DISTINCT string, so they are built
+    // here and their addresses broadcast like any other seed. Held in
+    // `pred_tables` for as long as the run is, alongside the id columns.
+    let mut pred_tables: Vec<Box<[i64]>> = Vec::new();
+    let mut distinct: Option<Vec<&str>> = None;
     let scalars: Vec<i64> = lowered
-        .str_literals
+        .scalar_seeds
         .iter()
-        .map(|lit| dict.id(&lit.text))
+        .map(|seed| match &seed.kind {
+            super::lower::SeedKind::StrId(t) => dict.id(t),
+            super::lower::SeedKind::StrPredicate(p) => {
+                let strings = distinct.get_or_insert_with(|| dict.sorted());
+                pred_tables.push(p.table(strings).into_boxed_slice());
+                pred_tables[pred_tables.len() - 1].as_ptr() as i64
+            }
+        })
         .collect();
+    let str_ids: Vec<Box<[i64]>> = str_ids.into_iter().chain(pred_tables).collect();
     let init_regs = shape.seed.regs(&bases, &scalars, n as i64, trap_addr);
     // The words are the same for every batch of this expression, so interning
     // them keeps the JIT's green key — and with it the compiled loop the driver
