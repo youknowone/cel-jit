@@ -67,6 +67,7 @@ use super::lower::{
     size_slot_source, string_slot_source, BatchReduce, ConcatSide, LoweredF, Schema, SlotKind,
     ValType,
 };
+use crate::objects::Key;
 use crate::{Program, Value};
 
 /// Trace threshold [`Tier::Jit`] runs at: the batch loop compiles after this
@@ -695,10 +696,50 @@ impl BoundBatch<'_, '_> {
             BatchReduce::PerRow,
             "collect on a batch bound to sum: use `bind_per_row`"
         );
-        let bank = self.program.lowered.result_bank;
+        let lowered = &self.program.lowered;
+        let bank = lowered.result_bank;
         let mut run = self.run.borrow_mut();
         run.run(|code, regs, nf| dispatch(tier, threshold, code, regs, nf))
             .ok_or(BatchError::Trapped)?;
+        // A LIST-valued result stored each row's element COUNT, and the
+        // elements themselves went to their own flat buffers at a cursor
+        // running across the batch. So a row's elements are the ones after
+        // every earlier row's — the same prefix-sum an input list column is
+        // read by.
+        if let Some(out) = &lowered.list_output {
+            let elems = run.list_output();
+            let mut at = 0usize;
+            let mut rows = Vec::with_capacity(run.output().len());
+            for &count in run.output() {
+                let count = count.max(0) as usize;
+                let items = (at..at + count)
+                    .map(|k| match out.fields.as_slice() {
+                        // A list of scalars: the element IS the value.
+                        [(None, ty)] => decode(*ty, elems[0][k], run.distinct()),
+                        // A list of records: one field per buffer, rebuilt as
+                        // the map the tree-walker compares and prints.
+                        fields => Value::Map(
+                            fields
+                                .iter()
+                                .enumerate()
+                                .map(|(f, (name, ty))| {
+                                    (
+                                        Key::String(std::sync::Arc::new(
+                                            name.clone().unwrap_or_default(),
+                                        )),
+                                        decode(*ty, elems[f][k], run.distinct()),
+                                    )
+                                })
+                                .collect::<HashMap<_, _>>()
+                                .into(),
+                        ),
+                    })
+                    .collect::<Vec<_>>();
+                rows.push(Value::List(std::sync::Arc::new(items)));
+                at += count;
+            }
+            return Ok(rows);
+        }
         // The loop wrote one `i64` per row in the result bank's own encoding;
         // decoding is the exact inverse of how a column of that type was
         // encoded on the way in, so a collected value equals the tree-walker's.

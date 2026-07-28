@@ -326,6 +326,9 @@ pub struct BatchRun<'a> {
     /// each row's result. Boxed for the same reason `trap` is — `init_regs`
     /// holds a raw pointer to it, which must survive the run moving.
     out: Option<Box<[i64]>>,
+    /// One buffer per output field, for a LIST-valued result: the flat element
+    /// stream the loop wrote, which `out` indexes into by running length.
+    list_out: Vec<Box<[i64]>>,
     /// The batch's distinct strings in rank order, so a `string`-banked output
     /// id can be read back as the string it stands for. Kept only where the
     /// result is a string; ranking is otherwise write-only.
@@ -370,6 +373,13 @@ impl<'a> BatchRun<'a> {
     /// The batch's distinct strings in rank order, indexed by an output id.
     pub fn distinct(&self) -> &[String] {
         &self.distinct
+    }
+
+    /// The flat element buffers a LIST-valued result wrote, one per output
+    /// field. Row `i`'s elements are the `output()[i]` entries starting at the
+    /// sum of the counts before it.
+    pub fn list_output(&self) -> Vec<&[i64]> {
+        self.list_out.iter().map(|b| &**b).collect()
     }
 }
 
@@ -477,6 +487,29 @@ pub fn prepare_batch_reduce<'a>(
         BatchReduce::PerRow => Some(vec![0i64; n.max(1)].into_boxed_slice()),
     };
     let out_addr = out.as_mut().map_or(0, |b| b.as_mut_ptr() as i64);
+    // A list-valued result writes at most as many elements as the SOURCE list
+    // carries across the whole batch — `map` writes exactly that many, `filter`
+    // fewer — so the source's flattened element column is an exact bound.
+    let mut list_out: Vec<Box<[i64]>> = match (reduce, &lowered.list_output) {
+        (BatchReduce::PerRow, Some(o)) => {
+            let cap = columns
+                .iter()
+                .zip(&lowered.slots)
+                .filter(|(_, slot)| {
+                    super::lower::elem_slot_source(&slot.path).is_some_and(|(l, _)| l == o.source)
+                })
+                .map(|(c, _)| c.len())
+                .max()
+                .unwrap_or(0);
+            // One spare, so a batch that writes nothing still has an address.
+            o.fields
+                .iter()
+                .map(|_| vec![0i64; cap.max(1)].into_boxed_slice())
+                .collect()
+        }
+        _ => Vec::new(),
+    };
+    let list_addrs: Vec<i64> = list_out.iter_mut().map(|b| b.as_mut_ptr() as i64).collect();
     let shape = lowered.batch_shape(true, reduce);
     // Column bases, the row count, the trap address and the string literals'
     // ids are all this batch's data, and all reach the program the same way:
@@ -509,9 +542,10 @@ pub fn prepare_batch_reduce<'a>(
             .collect(),
         _ => Vec::new(),
     };
-    let init_regs = shape
-        .seed
-        .regs_out(&bases, &scalars, n as i64, trap_addr, out_addr);
+    let init_regs =
+        shape
+            .seed
+            .regs_list(&bases, &scalars, n as i64, trap_addr, out_addr, &list_addrs);
     // The words are the same for every batch of this expression, so interning
     // them keeps the JIT's green key — and with it the compiled loop the driver
     // holds — from changing between batches.
@@ -524,6 +558,7 @@ pub fn prepare_batch_reduce<'a>(
         rows: n,
         _str_ids: str_ids,
         out,
+        list_out,
         distinct,
         columns: core::marker::PhantomData,
     }

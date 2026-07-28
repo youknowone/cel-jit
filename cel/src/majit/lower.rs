@@ -402,6 +402,10 @@ pub struct LoweredF {
     /// builder resolves each against the batch and seeds its register
     /// ([`BatchSeed::scalar_regs`]).
     pub scalar_seeds: Vec<ScalarSeed>,
+    /// Set when the top-level result is a LIST: the row's own value is then its
+    /// element COUNT (in `result_reg`), and the elements themselves were stored
+    /// through this description as the loop ran.
+    pub list_output: Option<ListOutput>,
     /// Operands of the derived `concat#k` columns, indexed by `k`. Each entry's
     /// [`ConcatSide::Derived`] references are all lower indices, so
     /// materializing the table in order resolves them.
@@ -472,6 +476,25 @@ pub struct BatchShape {
     pub seed: BatchSeed,
 }
 
+/// A LIST-valued per-row result: the shape of the ragged output the loop writes.
+///
+/// The same shape a list COLUMN arrives in — a per-row element count plus one
+/// flat buffer per field — because it is the same thing, produced rather than
+/// consumed. The count rides the ordinary per-row output; the elements go to
+/// these buffers, at a cursor that runs across the whole batch.
+#[derive(Debug, Clone)]
+pub struct ListOutput {
+    /// The list the elements are drawn from, whose flattened element count
+    /// bounds how many this can ever write. `None` for a list built from
+    /// nothing the schema declares, which does not arise today.
+    pub source: String,
+    /// One entry per output field, in the order the buffers are seeded.
+    /// `None` names the elements themselves (a list of scalars).
+    pub fields: Vec<(Option<String>, ValType)>,
+    /// Register holding each field buffer's base address, aligned to `fields`.
+    pub base_regs: Vec<usize>,
+}
+
 /// Which int registers a [`BatchShape`]'s words expect to find already filled
 /// in when the mainloop starts.
 ///
@@ -488,6 +511,9 @@ pub struct BatchSeed {
     /// [`BatchReduce::PerRow`]. Data like any column base, so it is seeded and
     /// never an immediate.
     r_out: Option<usize>,
+    /// Register holding each ELEMENT buffer's base address, for a list-valued
+    /// result. Aligned to [`ListOutput::fields`].
+    list_out_regs: Vec<usize>,
     /// Register holding each column's base address, in [`LoweredF::slots`]
     /// order. A ROW column's base lives in the machinery bank; a list ELEMENT
     /// column's lives in the register its lowering reserved.
@@ -529,6 +555,20 @@ impl BatchSeed {
         trap_addr: i64,
         out_addr: i64,
     ) -> Vec<i64> {
+        self.regs_list(bases, scalars, n, trap_addr, out_addr, &[])
+    }
+
+    /// [`BatchSeed::regs_out`] plus one base per ELEMENT buffer, for a
+    /// list-valued result.
+    pub fn regs_list(
+        &self,
+        bases: &[i64],
+        scalars: &[i64],
+        n: i64,
+        trap_addr: i64,
+        out_addr: i64,
+        list_out: &[i64],
+    ) -> Vec<i64> {
         assert_eq!(
             bases.len(),
             self.base_regs.len(),
@@ -559,6 +599,16 @@ impl BatchSeed {
                 "batch seed: PerRow shape needs an output buffer"
             );
             regs[reg] = out_addr;
+        }
+        assert_eq!(
+            list_out.len(),
+            self.list_out_regs.len(),
+            "batch seed: element-buffer arity {} != {} output fields",
+            list_out.len(),
+            self.list_out_regs.len()
+        );
+        for (&addr, &reg) in list_out.iter().zip(&self.list_out_regs) {
+            regs[reg] = addr;
         }
         regs
     }
@@ -593,6 +643,11 @@ impl LoweredF {
     /// about whether the expression lowered — it did, or `lower_typed` would
     /// have said so.
     pub fn sum_reducible(&self) -> Result<(), LowerError> {
+        if self.list_output.is_some() {
+            return Err(LowerError::unsupported(
+                "list-valued result: the batch loop reduces by sum",
+            ));
+        }
         match self.result_bank {
             ValType::Int | ValType::Bool | ValType::UInt | ValType::Float => Ok(()),
             b => Err(LowerError::unsupported(format!(
@@ -650,11 +705,6 @@ impl LoweredF {
     /// evaluator path passes `true` here and the trap word's address to
     /// [`BatchSeed::regs`].
     pub fn batch_sum_shape(&self, with_trap: bool) -> BatchShape {
-        // The accumulate below folds a Str/Timestamp/Duration result into the
-        // int sum, which would add ranks or nanoseconds. Callers must have asked
-        // [`LoweredF::sum_reducible`] first; the public entry points do.
-        self.sum_reducible()
-            .expect("batch_sum_shape on a result the loop's sum cannot consume");
         self.batch_shape(with_trap, BatchReduce::Sum)
     }
 
@@ -664,6 +714,14 @@ impl LoweredF {
     /// takes a result of any bank, which is the whole reason the reduction is a
     /// choice.
     pub fn batch_shape(&self, with_trap: bool, reduce: BatchReduce) -> BatchShape {
+        // The accumulate below would fold a result the sum cannot consume into
+        // the int total — adding string RANKS, nanoseconds, or a collected
+        // list's element COUNT. Every public door asks `sum_reducible` first;
+        // this catches a harness that did not.
+        if reduce == BatchReduce::Sum {
+            self.sum_reducible()
+                .expect("a summing shape on a result the loop's sum cannot consume");
+        }
         let m = self.num_int_regs; // first int machinery register
         let (r_i, r_acc, r_n, r_one, r_stride, r_ea) = (m, m + 1, m + 2, m + 3, m + 4, m + 5);
         let r_trap = m + 6;
@@ -800,6 +858,15 @@ impl LoweredF {
                 r_n,
                 r_trap,
                 r_out,
+                // Only a per-row run writes elements; a sum never reaches them.
+                list_out_regs: match reduce {
+                    BatchReduce::PerRow => self
+                        .list_output
+                        .as_ref()
+                        .map(|o| o.base_regs.clone())
+                        .unwrap_or_default(),
+                    BatchReduce::Sum => Vec::new(),
+                },
                 base_regs,
                 scalar_regs: self.scalar_seeds.iter().map(|s| s.reg).collect(),
                 num_int_regs: total_int_regs,
@@ -845,6 +912,8 @@ struct LowerCtxF<'s> {
     list_loop: Vec<ListLoop>,
     /// Positions within `body` holding a body-relative jump target.
     jump_fixups: Vec<usize>,
+    /// Set when the top-level expression is collected as a list.
+    list_output: Option<ListOutput>,
     schema: &'s Schema,
 }
 
@@ -1016,9 +1085,18 @@ pub fn lower_typed(expr: &IdedExpr, schema: &Schema) -> Result<LoweredF, LowerEr
         elem_map: HashMap::new(),
         list_loop: Vec::new(),
         jump_fixups: Vec::new(),
+        list_output: None,
         schema,
     };
-    let result = compile_t(&mut ctx, expr)?;
+    // A list-valued TOP-LEVEL result is collected rather than declined: the
+    // elements stream to their own buffers and the row's value becomes the
+    // count. Only at the top level — a comprehension nested inside another
+    // expression has no output stream to write to, and its list is a value the
+    // machine still does not have.
+    let result = match collect_list_result(&mut ctx, expr) {
+        Some(r) => r?,
+        None => compile_t(&mut ctx, expr)?,
+    };
     // Note what is NOT checked here: whether the batch loop's sum can consume
     // the result. That is [`LoweredF::sum_reducible`]'s question, and it is a
     // different one — `b ? s : s` lowers to a select over string ids perfectly
@@ -1048,6 +1126,7 @@ pub fn lower_typed(expr: &IdedExpr, schema: &Schema) -> Result<LoweredF, LowerEr
         slots: ctx.slots,
         scalar_seeds: ctx.scalar_seeds,
         concats: ctx.concats,
+        list_output: ctx.list_output,
         temporal_bound,
         jump_fixups: ctx.jump_fixups,
     })
@@ -2725,6 +2804,152 @@ enum AccuMode {
     /// The LENGTH of the list the accumulator would have been, as an int. What
     /// `map` and `filter` build, and the only thing `size` asks of it.
     Length,
+    /// The length AND the elements: each appended element is stored to the
+    /// output buffers at `cursor`, which then advances. The accumulator still
+    /// carries the count, so the row's value is its list's length and the
+    /// elements are found by it.
+    ///
+    /// The cursor runs across the WHOLE batch, not the row — it is initialized
+    /// in the prelude, which runs once before the outer loop, and never reset.
+    /// That is what makes the output flat, exactly like the input's element
+    /// buffer.
+    Collect { cursor: usize },
+}
+
+/// Lower a top-level `list.map(..)` / `list.filter(..)` by COLLECTING it: the
+/// elements stream to their own flat buffers and the row's value is the count.
+///
+/// `None` means "not that shape, lower it the ordinary way". `Some(Err(..))`
+/// means it is that shape but something about it declines.
+fn collect_list_result(ctx: &mut LowerCtxF, expr: &IdedExpr) -> Option<Result<TReg, LowerError>> {
+    let Expr::Comprehension(comp) = &expr.expr else {
+        return None;
+    };
+    // The same `map`/`filter` signature `compile_comprehension_len` checks: an
+    // empty list in, the accumulator straight back out.
+    if !matches!(&comp.accu_init.expr, Expr::List(l) if l.elements.is_empty()) {
+        return None;
+    }
+    if !matches!(&comp.result.expr, Expr::Ident(n) if *n == comp.accu_var) {
+        return None;
+    }
+    let path = resolve_path(&comp.iter_range).ok()?;
+    if !declares_list(ctx.schema, &path) {
+        return None;
+    }
+    Some(collect_list_comprehension(ctx, comp, &path))
+}
+
+fn collect_list_comprehension(
+    ctx: &mut LowerCtxF,
+    comp: &ComprehensionExpr,
+    path: &str,
+) -> Result<TReg, LowerError> {
+    if comp.iter_var2.is_some() {
+        return Err(LowerError::unsupported("two-variable comprehension"));
+    }
+    // What the output's elements look like. `filter` hands back the element
+    // itself, so the output fields are the source's; `map` computes a value,
+    // so there is one unnamed field whose bank the body decides.
+    let appends_element = matches!(
+        &comp.loop_step.expr,
+        Expr::Call(c)
+            if c.args.len() == 3
+                && matches!(&c.args[1].expr, Expr::Call(a)
+                    if a.args.len() == 2
+                        && matches!(&a.args[1].expr, Expr::List(l)
+                            if l.elements.len() == 1
+                                && matches!(&l.elements[0].expr, Expr::Ident(n)
+                                    if *n == comp.iter_var)))
+    );
+    let fields: Vec<(Option<String>, ValType)> = if appends_element {
+        let mut v: Vec<(Option<String>, ValType)> = ctx
+            .schema
+            .iter()
+            .filter_map(|(k, t)| {
+                let (l, f) = elem_slot_source(k)?;
+                (l == path).then(|| (f.map(str::to_string), *t))
+            })
+            .collect();
+        v.sort_by(|x, y| x.0.cmp(&y.0));
+        v
+    } else {
+        // A `map` body's bank is not known until it is compiled, and it has to
+        // be known to seed the buffer. Compiling the body twice would emit it
+        // twice, so the bank is taken from a THROWAWAY lowering of the same
+        // expression against the same schema — same body, same answer, and its
+        // ops are discarded with it.
+        let elem = map_body_bank(ctx, comp, path)?;
+        vec![(None, elem)]
+    };
+    if fields.is_empty() {
+        return Err(LowerError::unsupported(
+            "collected list has no element column",
+        ));
+    }
+
+    // Buffer bases are batch data, so they ride seeded registers like any
+    // column base. The cursor is machinery: initialized once in the prelude,
+    // which runs before the outer loop, and carried across every row.
+    let base_regs: Vec<usize> = fields.iter().map(|_| ctx.fresh(ValType::Int).idx).collect();
+    let cursor = ctx.fresh(ValType::Int);
+    ctx.prelude
+        .extend_from_slice(&[OP_LOAD_CONST, 0, cursor.idx as i64]);
+    ctx.list_output = Some(ListOutput {
+        source: path.to_string(),
+        fields,
+        base_regs,
+    });
+    compile_list_comprehension_mode(ctx, comp, path, AccuMode::Collect { cursor: cursor.idx })
+}
+
+/// The bank a `map` body produces, from a throwaway lowering of the same
+/// comprehension in `Length` mode — which compiles the body and discards it.
+fn map_body_bank(
+    ctx: &LowerCtxF,
+    comp: &ComprehensionExpr,
+    path: &str,
+) -> Result<ValType, LowerError> {
+    let mut probe = LowerCtxF {
+        prelude: Vec::new(),
+        body: Vec::new(),
+        next_int: OVF_FLAG_REG + 1,
+        next_float: 0,
+        slots: Vec::new(),
+        slot_map: HashMap::new(),
+        locals: HashMap::new(),
+        scalar_seeds: Vec::new(),
+        temporal_ops: 0,
+        temporal_consts: Vec::new(),
+        concats: Vec::new(),
+        elem_map: HashMap::new(),
+        list_loop: Vec::new(),
+        jump_fixups: Vec::new(),
+        list_output: None,
+        schema: ctx.schema,
+    };
+    // The appended expression, lowered on its own with the iteration variable
+    // bound — which is what `Length` mode does to it for its errors.
+    let Expr::Call(add) = &comp.loop_step.expr else {
+        return Err(LowerError::unsupported("collected step is not an append"));
+    };
+    let Some(Expr::List(l)) = add.args.get(1).map(|a| &a.expr) else {
+        return Err(LowerError::unsupported("collected step is not an append"));
+    };
+    let e = l
+        .elements
+        .first()
+        .ok_or_else(|| LowerError::unsupported("collected step appends nothing"))?;
+    let len = probe.slot_typed(size_slot_path(path), ValType::Int);
+    let off = probe.slot_typed(offset_slot_path(path), ValType::Int);
+    let _ = (len, off);
+    let ea = probe.fresh(ValType::Int);
+    probe.list_loop.push(ListLoop {
+        iter_var: comp.iter_var.clone(),
+        list: path.to_string(),
+        ea_reg: ea.idx,
+    });
+    Ok(compile_t(&mut probe, e)?.bank)
 }
 
 /// `size(list.map(..))` / `size(list.filter(..))`: the same inner loop, with the
@@ -2785,6 +3010,7 @@ fn compile_len_step(
     step: &IdedExpr,
     comp: &ComprehensionExpr,
     accu: TReg,
+    mode: AccuMode,
 ) -> Result<TReg, LowerError> {
     let accu_var = comp.accu_var.as_str();
     let is_accu = |e: &IdedExpr| matches!(&e.expr, Expr::Ident(n) if n == accu_var);
@@ -2799,10 +3025,17 @@ fn compile_len_step(
                 return Err(LowerError::unsupported("size() of a non-append step"));
             };
             for e in &l.elements {
-                if is_iter(e) {
-                    continue;
+                match mode {
+                    // Collecting: the element's VALUE is the point, so it is
+                    // compiled either way and written out.
+                    AccuMode::Collect { cursor } => emit_element_store(ctx, e, comp, cursor)?,
+                    // Counting: the element is compiled only for the errors it
+                    // can raise, and a bare iteration variable raises none.
+                    _ if is_iter(e) => {}
+                    _ => {
+                        compile_t(ctx, e)?;
+                    }
                 }
-                compile_t(ctx, e)?;
             }
             let delta = emit_int_const(ctx, l.elements.len() as i64);
             Ok(emit_int_bin(ctx, OP_ADD, accu, delta))
@@ -2813,10 +3046,13 @@ fn compile_len_step(
             if c.bank != ValType::Bool {
                 return Err(LowerError::unsupported("filter predicate must be bool"));
             }
-            // The taken arm's own step against a ZERO accumulator is how many
-            // elements the predicate admits, which the select then applies.
+            // Collecting under a predicate: the store runs for every element,
+            // and the cursor advances only where the predicate holds — so a
+            // rejected element writes to the slot the next accepted one will
+            // overwrite. That is what keeps the body straight-line, with no
+            // branch around the store.
             let zero = emit_int_const(ctx, 0);
-            let taken = compile_len_step(ctx, &call.args[1], comp, zero)?;
+            let taken = compile_len_step(ctx, &call.args[1], comp, zero, mode)?;
             let none = emit_int_const(ctx, 0);
             let delta = ctx.fresh(ValType::Int);
             ctx.body.extend_from_slice(&[
@@ -2826,10 +3062,76 @@ fn compile_len_step(
                 none.idx as i64,
                 delta.idx as i64,
             ]);
+            if let AccuMode::Collect { cursor } = mode {
+                // Undo the unconditional advance the store made, where the
+                // predicate rejected.
+                let back = ctx.fresh(ValType::Int);
+                ctx.body.extend_from_slice(&[
+                    OP_SELECT,
+                    c.idx as i64,
+                    zero.idx as i64,
+                    taken.idx as i64,
+                    back.idx as i64,
+                ]);
+                ctx.body.extend_from_slice(&[
+                    OP_SUB,
+                    cursor as i64,
+                    back.idx as i64,
+                    cursor as i64,
+                ]);
+            }
             Ok(emit_int_bin(ctx, OP_ADD, accu, delta))
         }
         _ => Err(LowerError::unsupported("size() of an opaque comprehension")),
     }
+}
+
+/// Write one appended element to the ragged output and advance the cursor.
+///
+/// A record element (`filter`'s bare iteration variable over a record list)
+/// writes one buffer per declared field; a scalar element writes one.
+fn emit_element_store(
+    ctx: &mut LowerCtxF,
+    e: &IdedExpr,
+    comp: &ComprehensionExpr,
+    cursor: usize,
+) -> Result<(), LowerError> {
+    let out = ctx
+        .list_output
+        .clone()
+        .expect("collect mode allocates the output description");
+    let stride = emit_int_const(ctx, 8);
+    let cur = TReg {
+        bank: ValType::Int,
+        idx: cursor,
+    };
+    let ea = emit_int_bin(ctx, OP_MUL, cur, stride);
+    let is_iter = matches!(&e.expr, Expr::Ident(n) if *n == comp.iter_var);
+    for (k, (field, ty)) in out.fields.iter().enumerate() {
+        // `filter` appends the element itself, so each output field is that
+        // element's own field. `map` appends a computed value, which is the
+        // single unnamed field.
+        let v = if is_iter {
+            ctx.iter_var_slot(&comp.iter_var, field.as_deref())?
+                .ok_or_else(|| LowerError::unsupported("collected element is not an element"))?
+        } else {
+            compile_t(ctx, e)?
+        };
+        if v.bank != *ty {
+            return Err(LowerError::unsupported("collected element bank"));
+        }
+        let op = if *ty == ValType::Float {
+            OP_COL_STORE_F
+        } else {
+            OP_COL_STORE
+        };
+        ctx.body
+            .extend_from_slice(&[op, out.base_regs[k] as i64, ea.idx as i64, v.idx as i64]);
+    }
+    let one = emit_int_const(ctx, 1);
+    ctx.body
+        .extend_from_slice(&[OP_ADD, cursor as i64, one.idx as i64, cursor as i64]);
+    Ok(())
 }
 
 /// `x in list` over a DECLARED list column: an inner loop over the row's
@@ -3037,7 +3339,7 @@ fn compile_list_comprehension_mode(
         // The list the step would have built starts empty, so its length starts
         // at zero. `accu_init` is not compiled at all: it is the `[]` the
         // machine has no value for.
-        AccuMode::Length => emit_int_const(ctx, 0),
+        AccuMode::Length | AccuMode::Collect { .. } => emit_int_const(ctx, 0),
     };
     let accu = ctx.fresh(init.bank);
     emit_mov(ctx, init, accu);
@@ -3059,7 +3361,9 @@ fn compile_list_comprehension_mode(
     ctx.locals.insert(comp.accu_var.clone(), accu);
     let step = match mode {
         AccuMode::Value => compile_t(ctx, &comp.loop_step),
-        AccuMode::Length => compile_len_step(ctx, &comp.loop_step, comp, accu),
+        AccuMode::Length | AccuMode::Collect { .. } => {
+            compile_len_step(ctx, &comp.loop_step, comp, accu, mode)
+        }
     };
     ctx.list_loop.pop();
     // Drop only THIS loop's element registers. Each comprehension gets its own

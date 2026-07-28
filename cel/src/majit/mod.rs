@@ -1116,6 +1116,18 @@ mod tests {
                 .collect()
         }
 
+        /// The batch's view of the whole list column.
+        fn view(&self) -> super::batch::ColumnRef<'_> {
+            super::batch::ColumnRef::List {
+                lens: &self.lens,
+                fields: self
+                    .fields
+                    .iter()
+                    .map(|(f, d)| (*f, column_ref(d)))
+                    .collect(),
+            }
+        }
+
         /// The tree-walker's view of row `r`: a list of scalars when the sole
         /// field is unnamed, otherwise a list of records.
         fn row_value(&self, r: usize) -> Value {
@@ -1602,29 +1614,94 @@ mod tests {
     fn column_refs<'c>(
         cols: &'c [(&'c str, ColData)],
     ) -> Vec<(&'c str, super::batch::ColumnRef<'c>)> {
+        cols.iter().map(|(nm, d)| (*nm, column_ref(d))).collect()
+    }
+
+    /// One owned test column as the borrowed view the public `Batch` takes.
+    fn column_ref(d: &ColData) -> super::batch::ColumnRef<'_> {
         use super::batch::ColumnRef;
-        cols.iter()
-            .map(|(nm, d)| {
-                (
-                    *nm,
-                    match d {
-                        ColData::Int(c) => ColumnRef::Int(c),
-                        ColData::Timestamp(c) => ColumnRef::Timestamp(c),
-                        ColData::Duration(c) => ColumnRef::Duration(c),
-                        ColData::Float(c) => ColumnRef::Float(c),
-                        ColData::Str(c) => ColumnRef::Str(c),
-                        // SAFETY: same size, alignment and validity both ways,
-                        // and `ColData::UInt` stores exactly the `u64` bit
-                        // pattern (see `ValType::UInt`). `cols` outlives the
-                        // batch built from these views.
-                        ColData::UInt(c) => ColumnRef::UInt(unsafe {
-                            core::slice::from_raw_parts(c.as_ptr().cast::<u64>(), c.len())
-                        }),
-                        ColData::Bool(_) => panic!("bool column"),
-                    },
-                )
+        match d {
+            ColData::Int(c) => ColumnRef::Int(c),
+            ColData::Timestamp(c) => ColumnRef::Timestamp(c),
+            ColData::Duration(c) => ColumnRef::Duration(c),
+            ColData::Float(c) => ColumnRef::Float(c),
+            ColData::Str(c) => ColumnRef::Str(c),
+            // SAFETY: same size, alignment and validity both ways, and
+            // `ColData::UInt` stores exactly the `u64` bit pattern (see
+            // `ValType::UInt`). The `ColData` outlives the batch built from it.
+            ColData::UInt(c) => ColumnRef::UInt(unsafe {
+                core::slice::from_raw_parts(c.as_ptr().cast::<u64>(), c.len())
+            }),
+            ColData::Bool(_) => panic!("bool column"),
+        }
+    }
+
+    /// A LIST-valued expression's per-row result, against the tree-walker's.
+    fn check_collect_list(expr_src: &str, rows: &[(&str, ColData)], lists: &[(&str, ListCol)]) {
+        use super::batch::{Batch, BatchProgram, Tier};
+        use super::bytecode::float_bank::COMPILES as COMPILES_F;
+
+        let n = lists[0].1.lens.len();
+        let program = Program::compile(expr_src).unwrap();
+        let mut schema: Schema = rows
+            .iter()
+            .map(|(nm, d)| (nm.to_string(), d.ty()))
+            .collect();
+        for (name, lc) in lists {
+            for (field, d) in &lc.fields {
+                let path = match field {
+                    Some(f) => format!("{name}[].{f}"),
+                    None => format!("{name}[]"),
+                };
+                schema.insert(path, d.ty());
+            }
+        }
+        let expected: Vec<Value> = (0..n)
+            .map(|i| {
+                let mut ctx = Context::default();
+                for (name, d) in rows {
+                    ctx.add_variable_from_value(*name, cell_value(d, i));
+                }
+                for (name, lc) in lists {
+                    ctx.add_variable_from_value(*name, lc.row_value(i));
+                }
+                program
+                    .execute(&ctx)
+                    .unwrap_or_else(|e| panic!("execute `{expr_src}`: {e:?}"))
             })
-            .collect()
+            .collect();
+
+        let mut batch = Batch::new(n);
+        for (nm, c) in column_refs(rows) {
+            batch = batch.column(nm, c);
+        }
+        for (nm, lc) in lists {
+            batch = batch.column(*nm, lc.view());
+        }
+        let bp = BatchProgram::from_program(&program, &schema)
+            .unwrap_or_else(|e| panic!("compile `{expr_src}`: {e}"));
+        let bound = bp
+            .bind_per_row(&batch)
+            .unwrap_or_else(|e| panic!("bind `{expr_src}`: {e}"));
+        for tier in [Tier::Clean, Tier::Interpreter, Tier::Jit] {
+            if tier == Tier::Jit {
+                super::bytecode::float_bank::reset_persistent_state();
+            }
+            let before = COMPILES_F.load(Ordering::Relaxed);
+            let got = bound
+                .collect_on(tier)
+                .unwrap_or_else(|e| panic!("{tier:?}: {e}"));
+            assert_eq!(got.len(), n, "{tier:?} row count for `{expr_src}`");
+            for (i, (g, w)) in got.iter().zip(&expected).enumerate() {
+                assert_eq!(g, w, "{tier:?} row {i} of `{expr_src}`");
+            }
+            if tier == Tier::Jit {
+                assert!(
+                    COMPILES_F.load(Ordering::Relaxed) > before,
+                    "collected `{expr_src}` must compile the hot loop"
+                );
+            }
+        }
     }
 
     /// Every row's own value from the per-row batch loop, against the
@@ -3198,6 +3275,82 @@ mod tests {
         }
     }
 
+    /// `list.map(..)` and `list.filter(..)` as a VALUE: a list per row.
+    ///
+    /// The output is RAGGED, the same shape a list column arrives in — a
+    /// per-row element count plus a flat element buffer — so the check is that
+    /// each row's own list equals the tree-walker's, not that some total does.
+    /// Rows are jagged with empties, and `filter` is exercised with predicates
+    /// that admit none, some and all, since the cursor advances only where the
+    /// predicate holds and a wrong rewind would shift every later row.
+    #[test]
+    fn batch_list_valued_results() {
+        let n = 300;
+        let lens = gen_lens(n, 0xC011_3C7E_D000_0001, 3);
+        let total = lens.iter().sum::<i64>() as usize;
+        let nums = gen_i64(total, 0xC011_3C7E_D000_0002, -5, 5);
+        let fs = gen_f64(total, 0xC011_3C7E_D000_0003, -2.0, 2.0);
+        let x = ColData::Int(gen_i64(n, 0xC011_3C7E_D000_0004, -3, 3));
+        let scalars = || {
+            vec![(
+                "nums",
+                record_list(lens.clone(), vec![(None, ColData::Int(nums.clone()))]),
+            )]
+        };
+        for expr in [
+            // `map` writes one element per input element.
+            "nums.map(y, y)",
+            "nums.map(y, y * 2 - 1)",
+            "nums.map(y, y > 0)",
+            "nums.map(y, y + x)",
+            // `filter` writes only what the predicate admits.
+            "nums.filter(y, y > 0)",
+            "nums.filter(y, y > 1000)",
+            "nums.filter(y, y > -1000)",
+            "nums.filter(y, y == x)",
+        ] {
+            check_collect_list(expr, &[("x", x.clone())], &scalars());
+        }
+        // A RECORD element list: `filter` hands back the elements themselves,
+        // so the output carries one buffer per declared field and each row's
+        // elements come back as the maps the tree-walker compares.
+        let price = gen_i64(total, 0xC011_3C7E_D000_0005, 0, 9);
+        let qty = gen_i64(total, 0xC011_3C7E_D000_0006, 0, 9);
+        let items = || {
+            vec![(
+                "items",
+                record_list(
+                    lens.clone(),
+                    vec![
+                        (Some("price"), ColData::Int(price.clone())),
+                        (Some("qty"), ColData::Int(qty.clone())),
+                    ],
+                ),
+            )]
+        };
+        for expr in [
+            "items.filter(i, i.price > 4)",
+            "items.filter(i, i.price > 100)",
+            "items.filter(i, i.price >= 0)",
+            "items.filter(i, i.price > i.qty)",
+            // `map` over a record list projects one field, so the output is a
+            // list of scalars however the input was shaped.
+            "items.map(i, i.price)",
+            "items.map(i, i.price + i.qty)",
+        ] {
+            check_collect_list(expr, &[], &items());
+        }
+        // A float element stream takes the other store.
+        check_collect_list(
+            "fs.map(y, y * 2.0)",
+            &[],
+            &[(
+                "fs",
+                record_list(lens.clone(), vec![(None, ColData::Float(fs.clone()))]),
+            )],
+        );
+    }
+
     /// `a == b` over two list columns: equal lengths, and every element equal
     /// at the same index.
     ///
@@ -3566,9 +3719,12 @@ mod tests {
             "items == items[0]",
             // A scalar column is not iterable, list or not.
             "x.all(y, y > 0)",
-            // `map` / `filter` accumulate a list.
-            "items.map(i, i.price)",
-            "items.filter(i, i.price > 1)",
+            // `map` / `filter` accumulate a list, which is a value on this
+            // machine only as the TOP-LEVEL result, where it becomes a ragged
+            // output column (see `batch_list_valued_results`). Nested inside
+            // another expression there is no output stream to write to.
+            "items.map(i, i.price)[0] > 1",
+            "size(items) > 0 ? items.filter(i, i.price > 1) : items",
         ] {
             let program = Program::compile(expr).unwrap();
             assert!(
@@ -4197,16 +4353,17 @@ mod tests {
             .iter()
             .map(|(c, reason, ex)| format!("\n  {c:5}  {reason}   e.g. `{ex}`"))
             .collect();
-        // What is left: `list.map(..)` / `list.filter(..)` as a VALUE — the
-        // list itself rather than its length. Every per-row output today is one
-        // `i64` per row; a list result needs a RAGGED one, a per-row length
-        // plus a flat element buffer, which is the shape a list column already
-        // arrives in.
-        const AGGREGATE_CEILING: usize = 2;
-        assert!(
-            gap_total <= AGGREGATE_CEILING,
+        // Closed, like the operator sweep: every aggregate expression the
+        // tree-walker answers also lowers. A list-valued result is the last one
+        // to have arrived, as a RAGGED per-row output — a per-row element count
+        // plus a flat buffer per field, which is the shape a list column
+        // already arrives in.
+        //
+        // Zero is a ratchet, not a milestone.
+        assert_eq!(
+            gap_total, 0,
             "{gap_total} of {answered} answered aggregate expressions are declined by \
-             the LOWERING (ceiling {AGGREGATE_CEILING}):{breakdown}",
+             the LOWERING:{breakdown}",
         );
     }
 
