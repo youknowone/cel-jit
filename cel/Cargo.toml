@@ -33,9 +33,9 @@ pastey = "0.2.1"
 #
 # `rev` is https://github.com/youknowone/pyre/pull/834. Bump it deliberately:
 # it is the only thing pinning the JIT tier's behaviour.
-majit-ir = { git = "https://github.com/youknowone/pyre.git", rev = "4c36fb125ca57784200164b3b4c40d673e1079f8", optional = true }
-majit-macros = { git = "https://github.com/youknowone/pyre.git", rev = "4c36fb125ca57784200164b3b4c40d673e1079f8", optional = true }
-majit-metainterp = { git = "https://github.com/youknowone/pyre.git", rev = "4c36fb125ca57784200164b3b4c40d673e1079f8", default-features = false, optional = true }
+majit-ir = { git = "https://github.com/youknowone/pyre.git", rev = "c05bccff72d9dfe787ec17f991cac0808b9173b4", optional = true }
+majit-macros = { git = "https://github.com/youknowone/pyre.git", rev = "c05bccff72d9dfe787ec17f991cac0808b9173b4", optional = true }
+majit-metainterp = { git = "https://github.com/youknowone/pyre.git", rev = "c05bccff72d9dfe787ec17f991cac0808b9173b4", default-features = false, optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.5.1", features = ["html_reports"] }
