@@ -3198,6 +3198,117 @@ mod tests {
         }
     }
 
+    /// `a == b` over two list columns: equal lengths, and every element equal
+    /// at the same index.
+    ///
+    /// The fixtures give the two lists INDEPENDENT lengths, so unequal-length
+    /// rows are common — which is the case that must never walk the longer span
+    /// off the end of the shorter one. Some rows are made identical on purpose,
+    /// since a comparison that is false on every row would pass while proving
+    /// nothing.
+    #[test]
+    fn batch_list_equality() {
+        let n = 400;
+        let lens = gen_lens(n, 0x1157_E9A1_D0DE_0001, 3);
+        let total = lens.iter().sum::<i64>() as usize;
+        // A narrow value range makes real element-wise matches common.
+        let pa = gen_i64(total, 0x1157_E9A1_D0DE_0002, 0, 2);
+        // `b` shares `a`'s lengths on some rows and not others.
+        let blens: Vec<i64> = lens
+            .iter()
+            .enumerate()
+            .map(|(k, &l)| if k % 3 == 0 { l } else { (l + 1) % 4 })
+            .collect();
+        let btotal = blens.iter().sum::<i64>() as usize;
+        let pb = gen_i64(btotal, 0x1157_E9A1_D0DE_0003, 0, 2);
+        let scalars =
+            |lens: Vec<i64>, v: Vec<i64>| record_list(lens, vec![(None, ColData::Int(v))]);
+        for expr in ["a == b", "a != b", "b == a", "a == a", "!(a == b)"] {
+            check_batch_list(
+                expr,
+                &[],
+                &[
+                    ("a", scalars(lens.clone(), pa.clone())),
+                    ("b", scalars(blens.clone(), pb.clone())),
+                ],
+            );
+        }
+        // Record elements compare per FIELD, over the whole declared set.
+        let qa = gen_i64(total, 0x1157_E9A1_D0DE_0004, 0, 2);
+        let qb = gen_i64(btotal, 0x1157_E9A1_D0DE_0005, 0, 2);
+        let recs = |lens: Vec<i64>, x: Vec<i64>, y: Vec<i64>| {
+            record_list(
+                lens,
+                vec![(Some("m"), ColData::Int(x)), (Some("n"), ColData::Int(y))],
+            )
+        };
+        for expr in ["a == b", "a != b"] {
+            check_batch_list(
+                expr,
+                &[],
+                &[
+                    ("a", recs(lens.clone(), pa.clone(), qa.clone())),
+                    ("b", recs(blens.clone(), pb.clone(), qb.clone())),
+                ],
+            );
+        }
+    }
+
+    /// Two comprehensions NESTED, over two independent row-level lists.
+    ///
+    /// This used to bail on the shape alone. The bail conflated two things: a
+    /// list reached THROUGH an element (`i.tags`) really does need per-element
+    /// offsets, but two row-level lists do not — each list's `(offset, size)`
+    /// pair is a row column read once per row, and the inner loop's index is
+    /// its own. So the inner loop runs `size(groups)` times for every element
+    /// of `items`, all off the same row's columns.
+    ///
+    /// The data below is deliberately jagged, with empty rows on both sides, so
+    /// the inner zero-trip guard fires inside a live outer iteration and the
+    /// outer one fires with the inner loop never entered at all.
+    #[test]
+    fn batch_nested_independent_list_comprehensions() {
+        let n = 300;
+        let lens = gen_lens(n, 0x0E57_ED10_D0DE_0001, 3);
+        let total = lens.iter().sum::<i64>() as usize;
+        let price = gen_i64(total, 0x0E57_ED10_D0DE_0002, 0, 20);
+        let glens = gen_lens(n, 0x0E57_ED10_D0DE_0003, 2);
+        let gtotal = glens.iter().sum::<i64>() as usize;
+        let gn = gen_i64(gtotal, 0x0E57_ED10_D0DE_0004, 0, 20);
+        let x = ColData::Int(gen_i64(n, 0x0E57_ED10_D0DE_0005, -5, 5));
+        let cols = || {
+            vec![
+                (
+                    "items",
+                    record_list(
+                        lens.clone(),
+                        vec![(Some("price"), ColData::Int(price.clone()))],
+                    ),
+                ),
+                (
+                    "groups",
+                    record_list(glens.clone(), vec![(Some("n"), ColData::Int(gn.clone()))]),
+                ),
+            ]
+        };
+        for expr in [
+            "items.all(i, groups.exists(g, g.n > i.price))",
+            "items.exists(i, groups.all(g, g.n > i.price))",
+            "items.exists(i, groups.exists(g, g.n == i.price))",
+            // The inner body reads the OUTER element, the inner element and a
+            // row column at once.
+            "items.all(i, groups.exists(g, g.n + i.price > x))",
+            // The outer body mixes the inner loop's answer with its own element.
+            "items.all(i, i.price > 0 && groups.exists(g, g.n > i.price))",
+            // Three levels.
+            "items.all(i, groups.all(g, items.exists(k, k.price > g.n)))",
+            // A nested comprehension whose length is what is wanted.
+            "size(items.filter(i, groups.exists(g, g.n > i.price)))",
+        ] {
+            check_batch_list(expr, &[("x", x.clone())], &cols());
+        }
+    }
+
     /// `size(list.map(..))` and `size(list.filter(..))`, which build a list the
     /// machine has no value for and are asked only how long it is.
     ///
@@ -3440,13 +3551,19 @@ mod tests {
         .into_iter()
         .collect();
         for expr in [
-            // A list of lists needs per-ELEMENT offsets; a flat row column
-            // cannot express those, and one level of nesting is also what keeps
-            // the inner loop body straight-line.
-            "items.all(i, groups.exists(g, g.n > i.price))",
+            // A list reached THROUGH an element needs per-ELEMENT offsets,
+            // which a flat row column cannot express. Two INDEPENDENT row-level
+            // lists do nest — see
+            // `batch_nested_independent_list_comprehensions` — so what bails
+            // here is the element-relative range, not the nesting.
+            "items.all(i, i.tags.exists(t, t > 0))",
+            "items.all(i, i.parts.all(p, p.n > 0))",
             // A list is not a value on this machine — it is a (size, offset)
             // pair plus element columns — so it can never reach a register.
-            "items == items",
+            // (`==` between two list columns is its own loop and DOES lower;
+            // see `batch_list_equality`. What bails is a list as an operand of
+            // anything else.)
+            "items == items[0]",
             // A scalar column is not iterable, list or not.
             "x.all(y, y > 0)",
             // `map` / `filter` accumulate a list.
@@ -3464,6 +3581,8 @@ mod tests {
         for expr in [
             "items.all(i, i.price > x) && groups.exists(g, g.n > 0)",
             "items.all(i, i.price > 0)",
+            // Nesting over two row-level lists is in subset.
+            "items.all(i, groups.exists(g, g.n > i.price))",
             // Both arms of a ternary reduce to the derived length columns.
             "x > 0 ? size(items) : size(groups)",
         ] {
@@ -4078,19 +4197,12 @@ mod tests {
             .iter()
             .map(|(c, reason, ex)| format!("\n  {c:5}  {reason}   e.g. `{ex}`"))
             .collect();
-        // What is left, and what each would take. All four want a
-        // representation the machine does not have, not an instruction it is
-        // missing:
-        //
-        //   * `list.map(..)` / `list.filter(..)` as a VALUE — the list itself
-        //     rather than its length. A per-row output column would have to be
-        //     ragged (a `(len, offset)` pair plus a flat element buffer), where
-        //     today every output is one `i64` per row.
-        //   * `items == items` compares two lists elementwise: a loop over two
-        //     spans in lockstep, where this machine walks one.
-        //   * a nested comprehension needs per-ELEMENT offsets, which a flat
-        //     row column cannot express.
-        const AGGREGATE_CEILING: usize = 4;
+        // What is left: `list.map(..)` / `list.filter(..)` as a VALUE — the
+        // list itself rather than its length. Every per-row output today is one
+        // `i64` per row; a list result needs a RAGGED one, a per-row length
+        // plus a flat element buffer, which is the shape a list column already
+        // arrives in.
+        const AGGREGATE_CEILING: usize = 2;
         assert!(
             gap_total <= AGGREGATE_CEILING,
             "{gap_total} of {answered} answered aggregate expressions are declined by \

@@ -835,8 +835,14 @@ struct LowerCtxF<'s> {
     /// each reloads the column at its own inner index. Sharing one register
     /// would let the second loop read the first loop's last element.
     elem_map: HashMap<(String, usize), TReg>,
-    /// The runtime-list comprehension currently being lowered, if any.
-    list_loop: Option<ListLoop>,
+    /// The runtime-list comprehensions currently being lowered, outermost
+    /// first. A STACK, not a slot: two comprehensions over two INDEPENDENT
+    /// row-level lists nest fine, because each list's `(offset, size)` pair is
+    /// a row column read once per row and the inner loop's index is its own.
+    /// What does not nest is a list reached THROUGH an element, which would
+    /// need per-element offsets a flat row column cannot express — and that
+    /// declines on its own, since such a path is not one the schema declares.
+    list_loop: Vec<ListLoop>,
     /// Positions within `body` holding a body-relative jump target.
     jump_fixups: Vec<usize>,
     schema: &'s Schema,
@@ -949,10 +955,12 @@ impl LowerCtxF<'_> {
         name: &str,
         field: Option<&str>,
     ) -> Result<Option<TReg>, LowerError> {
-        let (list, ea_reg) = match &self.list_loop {
-            Some(l) if l.iter_var == name => (l.list.clone(), l.ea_reg),
-            _ => return Ok(None),
+        // Innermost first, so an inner comprehension's variable shadows an
+        // outer one of the same name.
+        let Some(l) = self.list_loop.iter().rev().find(|l| l.iter_var == name) else {
+            return Ok(None);
         };
+        let (list, ea_reg) = (l.list.clone(), l.ea_reg);
         self.elem_slot(elem_slot_path(&list, field), ea_reg)
             .map(Some)
     }
@@ -1006,7 +1014,7 @@ pub fn lower_typed(expr: &IdedExpr, schema: &Schema) -> Result<LoweredF, LowerEr
         temporal_consts: Vec::new(),
         concats: Vec::new(),
         elem_map: HashMap::new(),
-        list_loop: None,
+        list_loop: Vec::new(),
         jump_fixups: Vec::new(),
         schema,
     };
@@ -2194,6 +2202,24 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
         if call.args.len() != 2 {
             return Err(LowerError::unsupported(format!("{name} arity")));
         }
+        // Two LIST columns compare elementwise. Recognized before the operands
+        // are compiled, because a list operand has no register to compile into.
+        if matches!(name, ops::EQUALS | ops::NOT_EQUALS) {
+            if let (Ok(l), Ok(r)) = (resolve_path(&call.args[0]), resolve_path(&call.args[1])) {
+                if declares_list(ctx.schema, &l) && declares_list(ctx.schema, &r) {
+                    let eq = lower_list_equality(ctx, &l, &r)?;
+                    return Ok(match name {
+                        ops::EQUALS => eq,
+                        _ => {
+                            let d = ctx.fresh(ValType::Bool);
+                            ctx.body
+                                .extend_from_slice(&[OP_NOT, eq.idx as i64, d.idx as i64]);
+                            d
+                        }
+                    });
+                }
+            }
+        }
         let (mut a, mut b) = compile_cmp_operands(ctx, &call.args[0], &call.args[1])?;
         // Operands of two DIFFERENT type classes are never equal and always
         // unequal, whatever the row holds, so `==`/`!=` fold to a constant. The
@@ -2595,6 +2621,101 @@ fn emit_constant_value(ctx: &mut LowerCtxF, v: &Value) -> Result<TReg, LowerErro
     Ok(r)
 }
 
+/// `a == b` over two DECLARED list columns: equal lengths, and every element
+/// equal at the same index.
+///
+/// One loop, not two. Both spans are walked at the SAME index `j`, each off its
+/// own row-level `offset`, so this is the membership loop with a second column
+/// read rather than a new loop shape.
+///
+/// The trip count is `same_len ? len(a) : 0`, computed branchlessly. That is
+/// not an optimization but a safety requirement: walking `len(a)` elements when
+/// `b` is shorter would read off the end of `b`'s span, which no result can
+/// undo.
+///
+/// Element equality is per FIELD, over the field set the schema declares. Two
+/// lists whose element fields differ decline: the tree-walker compares the
+/// elements as maps and answers `false`, and declining leaves that answer to it
+/// rather than guessing at a correspondence.
+fn lower_list_equality(ctx: &mut LowerCtxF, a: &str, b: &str) -> Result<TReg, LowerError> {
+    if !ctx.list_loop.is_empty() {
+        return Err(LowerError::unsupported(
+            "list equality inside a comprehension",
+        ));
+    }
+    // The element fields each list declares, in one order for both.
+    let fields = |list: &str| -> Vec<(Option<String>, ValType)> {
+        let mut v: Vec<(Option<String>, ValType)> = ctx
+            .schema
+            .iter()
+            .filter_map(|(k, t)| {
+                let (l, f) = elem_slot_source(k)?;
+                (l == list).then(|| (f.map(str::to_string), *t))
+            })
+            .collect();
+        v.sort_by(|x, y| x.0.cmp(&y.0));
+        v
+    };
+    let (fa, fb) = (fields(a), fields(b));
+    if fa != fb {
+        return Err(LowerError::unsupported(
+            "list equality over unlike elements",
+        ));
+    }
+
+    let len_a = ctx.slot_typed(size_slot_path(a), ValType::Int);
+    let len_b = ctx.slot_typed(size_slot_path(b), ValType::Int);
+    let off_a = ctx.slot_typed(offset_slot_path(a), ValType::Int);
+    let off_b = ctx.slot_typed(offset_slot_path(b), ValType::Int);
+    let one = emit_int_const(ctx, 1);
+    let stride = emit_int_const(ctx, 8);
+
+    // Unequal lengths settle it, and also make the trip count zero so the loop
+    // never reads past the shorter span.
+    let same_len = emit_bin(ctx, OP_EQ, len_a, len_b, ValType::Bool);
+    let zero = emit_int_const(ctx, 0);
+    let n = ctx.fresh(ValType::Int);
+    ctx.body.extend_from_slice(&[
+        OP_SELECT,
+        same_len.idx as i64,
+        len_a.idx as i64,
+        zero.idx as i64,
+        n.idx as i64,
+    ]);
+
+    // The accumulator is loop-carried, so it lives in a fixed register.
+    let eq = ctx.fresh(ValType::Bool);
+    emit_mov(ctx, same_len, eq);
+    let j = ctx.fresh(ValType::Int);
+    ctx.body
+        .extend_from_slice(&[OP_LOAD_CONST, 0, j.idx as i64]);
+    // Zero-trip guard: two empty lists are equal, and the back-edge is a
+    // do-while.
+    let zero_trip = ctx.emit_jump_if_above(one, n);
+
+    let inner = ctx.body.len();
+    let ia = emit_int_bin(ctx, OP_ADD, off_a, j);
+    let ea_a = emit_int_bin(ctx, OP_MUL, ia, stride);
+    let ib = emit_int_bin(ctx, OP_ADD, off_b, j);
+    let ea_b = emit_int_bin(ctx, OP_MUL, ib, stride);
+    for (field, ty) in &fa {
+        let f = field.as_deref();
+        let va = ctx.elem_slot(elem_slot_path(a, f), ea_a.idx)?;
+        let vb = ctx.elem_slot(elem_slot_path(b, f), ea_b.idx)?;
+        let op = if *ty == ValType::Float { OP_FEQ } else { OP_EQ };
+        let same = emit_bin(ctx, op, va, vb, ValType::Bool);
+        ctx.body
+            .extend_from_slice(&[OP_AND, eq.idx as i64, same.idx as i64, eq.idx as i64]);
+    }
+    ctx.elem_map
+        .retain(|(_, reg), _| *reg != ea_a.idx && *reg != ea_b.idx);
+    ctx.body
+        .extend_from_slice(&[OP_ADD, j.idx as i64, one.idx as i64, j.idx as i64]);
+    ctx.emit_back_edge(n, j, inner);
+    ctx.patch_jump(zero_trip);
+    Ok(eq)
+}
+
 /// What a runtime-list comprehension's accumulator holds.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum AccuMode {
@@ -2730,7 +2851,7 @@ fn lower_runtime_in(
 ) -> Result<TReg, LowerError> {
     // Same one-level rule the comprehension has, for the same reason: a list of
     // lists would need per-element offsets.
-    if ctx.list_loop.is_some() {
+    if !ctx.list_loop.is_empty() {
         return Err(LowerError::unsupported("nested runtime-list membership"));
     }
     let elem_path = elem_slot_path(list, None);
@@ -2900,13 +3021,6 @@ fn compile_list_comprehension_mode(
     list: &str,
     mode: AccuMode,
 ) -> Result<TReg, LowerError> {
-    // A list of lists would need per-ELEMENT offsets; a flat row column cannot
-    // express those, so one level of nesting is the whole subset. This is also
-    // what keeps the inner loop body straight-line, which is what makes
-    // `elem_slot`'s load-at-first-reference dominate every use.
-    if ctx.list_loop.is_some() {
-        return Err(LowerError::unsupported("nested runtime-list comprehension"));
-    }
     let len = ctx.slot_typed(size_slot_path(list), ValType::Int);
     let off = ctx.slot_typed(offset_slot_path(list), ValType::Int);
     let one = emit_int_const(ctx, 1);
@@ -2937,7 +3051,7 @@ fn compile_list_comprehension_mode(
     let inner = ctx.body.len();
     let idx = emit_int_bin(ctx, OP_ADD, off, j);
     let ea = emit_int_bin(ctx, OP_MUL, idx, stride);
-    ctx.list_loop = Some(ListLoop {
+    ctx.list_loop.push(ListLoop {
         iter_var: comp.iter_var.clone(),
         list: list.to_string(),
         ea_reg: ea.idx,
@@ -2947,8 +3061,11 @@ fn compile_list_comprehension_mode(
         AccuMode::Value => compile_t(ctx, &comp.loop_step),
         AccuMode::Length => compile_len_step(ctx, &comp.loop_step, comp, accu),
     };
-    ctx.list_loop = None;
-    ctx.elem_map.clear();
+    ctx.list_loop.pop();
+    // Drop only THIS loop's element registers. Each comprehension gets its own
+    // `ea` register, so keying the retirement on it leaves an enclosing loop's
+    // elements — still live below — exactly where they were.
+    ctx.elem_map.retain(|(_, reg), _| *reg != ea.idx);
     let step = step?;
     if step.bank != accu.bank {
         return Err(LowerError::unsupported(
