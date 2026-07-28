@@ -89,6 +89,18 @@ pub enum BatchError {
         /// The batch's row count.
         rows: usize,
     },
+    /// A `timestamp` or `duration` column carries a value outside the range in
+    /// which this expression's arithmetic agrees with the tree-walker's, whose
+    /// chrono range is wider than i64 nanoseconds. Data-dependent: another
+    /// batch of the same expression may be fine.
+    TemporalOutOfDomain {
+        /// The column's name.
+        name: String,
+        /// The offending value, in nanoseconds.
+        value: i64,
+        /// The largest magnitude this expression's arithmetic can take.
+        bound: i64,
+    },
     /// A row's arithmetic trapped — an `int` overflow or a division by zero,
     /// where the tree-walker raises. No sum is the right answer.
     Trapped,
@@ -106,6 +118,11 @@ impl std::fmt::Display for BatchError {
             BatchError::RowCount { name, len, rows } => {
                 write!(f, "column `{name}` has {len} rows, batch has {rows}")
             }
+            BatchError::TemporalOutOfDomain { name, value, bound } => write!(
+                f,
+                "column `{name}` holds {value}ns, outside the ±{bound}ns range \
+                 this expression's temporal arithmetic is exact in"
+            ),
             BatchError::Trapped => write!(f, "a row trapped (overflow or division by zero)"),
         }
     }
@@ -308,6 +325,19 @@ impl BatchProgram {
                 Plan::Derived(k) => unsafe { derived[*k].column() },
             })
             .collect();
+        // Temporal arithmetic agrees with chrono only inside the domain the
+        // lowering recorded; outside it this batch has no answer, though
+        // another batch of the same expression may.
+        if let Some((k, value)) = self.lowered.temporal_out_of_domain(&columns) {
+            return Err(BatchError::TemporalOutOfDomain {
+                name: self.lowered.slots[k].path.clone(),
+                value,
+                bound: self
+                    .lowered
+                    .temporal_bound
+                    .expect("a bound found the value"),
+            });
+        }
         let run = prepare_batch(&self.lowered, &columns, batch.rows, "BatchProgram::bind");
         Ok(BoundBatch {
             program: self,

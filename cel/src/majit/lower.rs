@@ -349,6 +349,24 @@ pub struct LoweredF {
     /// builder resolves each against the batch and seeds its register
     /// ([`BatchSeed::scalar_regs`]).
     pub scalar_seeds: Vec<ScalarSeed>,
+    /// `Some(b)` when the body does temporal arithmetic: every value in a
+    /// `timestamp` or `duration` column must satisfy `|v| <= b` for this
+    /// program to answer what the tree-walker answers.
+    ///
+    /// Both banks are i64 nanoseconds, but the walker computes in chrono,
+    /// whose `{secs: i64, nanos: i32}` range is far wider — two durations that
+    /// each fit i64 nanoseconds can sum to one that does not, and chrono
+    /// answers it. So a machine add would trap where the walker succeeds, and a
+    /// trap means "the walker raised", which would be a wrong answer rather
+    /// than a missing one.
+    ///
+    /// Narrowing the DOMAIN removes the disagreement instead of papering over
+    /// it: inside `|v| <= i64::MAX / (ops + 1)` no intermediate can leave i64
+    /// nanoseconds, so the two agree exactly, and a batch outside it is refused
+    /// at bind — the existing "evaluate this with `Program::execute`" channel.
+    /// With the usual single operation the bound is ±146 years around the
+    /// epoch.
+    pub temporal_bound: Option<i64>,
     /// Positions **within [`LoweredF::body`]** of jump target words, which the
     /// lowering writes body-relative because it cannot know where the body
     /// lands. [`LoweredF::batch_sum_shape`] relocates each to an
@@ -481,6 +499,31 @@ impl LoweredF {
                 "{b:?}-valued result: the batch loop reduces by sum"
             ))),
         }
+    }
+
+    /// The first temporal value in `columns` outside
+    /// [`LoweredF::temporal_bound`], as `(slot index, value)`.
+    ///
+    /// Data-dependent, so it is a property of the BATCH: the same expression
+    /// over another batch may be fine. Costs one pass over the temporal columns
+    /// and only when the expression does temporal arithmetic at all.
+    pub fn temporal_out_of_domain(
+        &self,
+        columns: &[super::bytecode::Column],
+    ) -> Option<(usize, i64)> {
+        let bound = self.temporal_bound?;
+        for (k, (col, slot)) in columns.iter().zip(&self.slots).enumerate() {
+            if !matches!(slot.ty, ValType::Timestamp | ValType::Duration) {
+                continue;
+            }
+            let super::bytecode::Column::Int(values) = col else {
+                continue;
+            };
+            if let Some(&v) = values.iter().find(|v| v.abs() > bound) {
+                return Some((k, v));
+            }
+        }
+        None
     }
 
     /// Takes column bases already computed, so it cannot rank a batch's
@@ -660,6 +703,12 @@ struct LowerCtxF<'s> {
     locals: HashMap<String, TReg>,
     /// Broadcast scalars referenced by the body, in first-encounter order.
     scalar_seeds: Vec<ScalarSeed>,
+    /// How many temporal `+`/`-` the body emitted. Bounds every intermediate:
+    /// `m` of them combine at most `m + 1` operands.
+    temporal_ops: usize,
+    /// Folded `timestamp(...)` / `duration(...)` constants, which are operands
+    /// too and so must satisfy the same bound the columns do.
+    temporal_consts: Vec<i64>,
     /// Element slots created by the runtime-list comprehension currently being
     /// lowered, keyed by slot path. Scoped to that comprehension on purpose:
     /// two comprehensions over the same list get their OWN registers, since
@@ -833,6 +882,8 @@ pub fn lower_typed(expr: &IdedExpr, schema: &Schema) -> Result<LoweredF, LowerEr
         slot_map: HashMap::new(),
         locals: HashMap::new(),
         scalar_seeds: Vec::new(),
+        temporal_ops: 0,
+        temporal_consts: Vec::new(),
         elem_map: HashMap::new(),
         list_loop: None,
         jump_fixups: Vec::new(),
@@ -844,6 +895,20 @@ pub fn lower_typed(expr: &IdedExpr, schema: &Schema) -> Result<LoweredF, LowerEr
     // different one — `b ? s : s` lowers to a select over string ids perfectly
     // well; there is just no sum of strings for the loop to accumulate. Keeping
     // them apart is what lets a decline say which of the two refused.
+    let temporal_bound = match ctx.temporal_ops {
+        0 => None,
+        m => {
+            let bound = i64::MAX / (m as i64 + 1);
+            // A folded literal is an operand like any other, and its magnitude
+            // is known now rather than at bind, so it is checked now.
+            if let Some(&big) = ctx.temporal_consts.iter().find(|v| v.abs() > bound) {
+                return Err(LowerError::unsupported(format!(
+                    "temporal literal {big}ns is outside the ±{bound}ns arithmetic domain"
+                )));
+            }
+            Some(bound)
+        }
+    };
     Ok(LoweredF {
         prelude: ctx.prelude,
         body: ctx.body,
@@ -853,6 +918,7 @@ pub fn lower_typed(expr: &IdedExpr, schema: &Schema) -> Result<LoweredF, LowerEr
         num_float_regs: ctx.next_float,
         slots: ctx.slots,
         scalar_seeds: ctx.scalar_seeds,
+        temporal_bound,
         jump_fixups: ctx.jump_fixups,
     })
 }
@@ -1151,6 +1217,33 @@ fn cmp_class(bank: ValType) -> CmpClass {
         ValType::Str => CmpClass::Str,
         ValType::Timestamp => CmpClass::Timestamp,
         ValType::Duration => CmpClass::Duration,
+    }
+}
+
+/// The bank `name` produces from temporal operands, or `None` if this is not a
+/// temporal arithmetic overload.
+///
+/// These are exactly the overloads the evaluator reaches, which dispatch on the
+/// LEFT operand through `Adder`/`Subtractor` (`common/types/duration.rs`,
+/// `common/types/timestamp.rs`) — not the wider set `Value::add` in `objects.rs`
+/// appears to offer, which that path does not use. In particular
+/// **`duration + timestamp` is unsupported** even though `timestamp + duration`
+/// is, there is no `duration - timestamp`, and `*` `/` `%` have no temporal
+/// overload at all.
+///
+/// The walker's `timestamp ± duration` additionally rejects a result outside
+/// the cel-spec range (year 1 to 9999). That check cannot fire here: i64
+/// nanoseconds only spans 1677 to 2262, so every representable result is inside
+/// it.
+fn temporal_arith_result(name: &str, a: ValType, b: ValType) -> Option<ValType> {
+    use ValType::{Duration, Timestamp};
+    match (name, a, b) {
+        (ops::ADD, Duration, Duration) => Some(Duration),
+        (ops::ADD, Timestamp, Duration) => Some(Timestamp),
+        (ops::SUBSTRACT, Duration, Duration) => Some(Duration),
+        (ops::SUBSTRACT, Timestamp, Duration) => Some(Timestamp),
+        (ops::SUBSTRACT, Timestamp, Timestamp) => Some(Duration),
+        _ => None,
     }
 }
 
@@ -1565,6 +1658,7 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
         let r = ctx.fresh(ValType::Timestamp);
         ctx.prelude
             .extend_from_slice(&[OP_LOAD_CONST, nanos, r.idx as i64]);
+        ctx.temporal_consts.push(nanos);
         return Ok(r);
     }
     if name == "duration" && call.args.len() == 1 {
@@ -1578,6 +1672,7 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
         let r = ctx.fresh(ValType::Duration);
         ctx.prelude
             .extend_from_slice(&[OP_LOAD_CONST, nanos, r.idx as i64]);
+        ctx.temporal_consts.push(nanos);
         return Ok(r);
     }
 
@@ -1974,6 +2069,22 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
             ]);
             d
         };
+        // Temporal arithmetic. Both banks are i64 nanoseconds, so the operation
+        // itself is the same int add/sub — but the tree-walker's is chrono's,
+        // whose range (`{secs: i64, nanos: i32}`) is far WIDER than i64
+        // nanoseconds, so a machine add can overflow where the walker answers.
+        // What makes the two agree is the bound recorded here and enforced on
+        // the batch's columns: see [`LoweredF::temporal_bound`].
+        if let Some(result_bank) = temporal_arith_result(name, a.bank, b.bank) {
+            // One more `+`/`-` can combine at most one more leaf, so counting
+            // the OPERATIONS bounds every intermediate: a tree of `m` of them
+            // sums at most `m + 1` operands, each at most `temporal_bound`.
+            // `iop` is already this operator's trapping int op, and the trap is
+            // defence in depth — the bound is what makes it unreachable, so a
+            // trap here would mean the bound was not enforced.
+            ctx.temporal_ops += 1;
+            return Ok(emit_trapping(ctx, iop, result_bank));
+        }
         match (a.bank, b.bank) {
             (ValType::Int, ValType::Int) => Ok(emit_trapping(ctx, iop, ValType::Int)),
             (ValType::UInt, ValType::UInt) => Ok(emit_trapping(ctx, uop, ValType::UInt)),

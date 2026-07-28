@@ -2243,10 +2243,12 @@ mod tests {
 
     #[test]
     fn temporal_mixed_bails() {
-        // A timestamp vs duration comparison is NoSuchOverload, a temporal vs
-        // int is a type error, and temporal arithmetic is out of subset — all
-        // bail the LOWERING. A bare temporal column lowers and is refused a
-        // step later, by the sum.
+        // A timestamp vs duration comparison is NoSuchOverload and a temporal vs
+        // int is a type error, so both bail the LOWERING. So do the products
+        // and quotients, which have no temporal overload at all, and
+        // `duration - timestamp`, which CEL does not define even though its
+        // mirror image is. A bare temporal column lowers and is refused a step
+        // later, by the sum.
         let schema: Schema = [
             ("t".to_string(), ValType::Timestamp),
             ("d".to_string(), ValType::Duration),
@@ -2258,16 +2260,108 @@ mod tests {
             let program = Program::compile(expr).unwrap();
             lower_typed(program.expression(), &schema)
         };
-        for expr in ["t < d", "t < i", "t - t", "t + d", "d + d"] {
+        // `d + t` is in the list on purpose: `t + d` lowers, but the evaluator
+        // dispatches on the LEFT operand and `Duration` has no timestamp arm,
+        // so the mirror image is UnsupportedBinaryOperator.
+        for expr in [
+            "t < d", "t < i", "t * d", "d / d", "d % d", "d - t", "t + t", "d + t",
+        ] {
             assert!(
                 lower(expr).is_err(),
-                "`{expr}` must bail the typed lowering (mixed/arith temporal)"
+                "`{expr}` must bail the typed lowering (mixed / undefined overload)"
             );
         }
         assert!(
             lower("t").unwrap().sum_reducible().is_err(),
             "a bare temporal column lowers; the sum is what refuses it"
         );
+    }
+
+    /// Temporal arithmetic, cross-checked against the tree-walker on every
+    /// tier. Both banks are i64 nanoseconds, but the walker computes in chrono,
+    /// so this is the test that the two agree inside the domain the lowering
+    /// narrowed to.
+    #[test]
+    fn batch_temporal_arithmetic() {
+        let n = 3000;
+        // ±20 years around the epoch: comfortably inside the ±146-year bound a
+        // single operation allows, so no batch here is refused.
+        const YEAR: i64 = 365 * 24 * 3_600_000_000_000;
+        let t1 = gen_nanos(n, 0x1111_2222_3333_4444, -20 * YEAR, 40 * YEAR);
+        let t2 = gen_nanos(n, 0x5555_6666_7777_8888, -20 * YEAR, 40 * YEAR);
+        let d1 = gen_nanos(n, 0x9999_AAAA_BBBB_CCCC, -YEAR, 2 * YEAR);
+        let d2 = gen_nanos(n, 0xDDDD_EEEE_FFFF_0000, -YEAR, 2 * YEAR);
+        let pick = |nm: &str| -> ColData {
+            match nm {
+                "t1" => ColData::Timestamp(t1.clone()),
+                "t2" => ColData::Timestamp(t2.clone()),
+                "d1" => ColData::Duration(d1.clone()),
+                "d2" => ColData::Duration(d2.clone()),
+                other => panic!("unknown column `{other}`"),
+            }
+        };
+        for (expr, names) in [
+            ("t1 - t2 > d1", &["t1", "t2", "d1"][..]),
+            ("t2 - t1 <= d2", &["t2", "t1", "d2"][..]),
+            ("t1 + d1 > t2", &["t1", "d1", "t2"][..]),
+            ("t1 - d1 < t2", &["t1", "d1", "t2"][..]),
+            ("d1 + d2 > d1", &["d1", "d2"][..]),
+            ("d1 - d2 < d1", &["d1", "d2"][..]),
+            // A folded literal as one operand, and a two-operation chain.
+            ("t1 + duration('24h') > t2", &["t1", "t2"][..]),
+            ("(t1 - t2) + d1 > d2", &["t1", "t2", "d1", "d2"][..]),
+        ] {
+            let cols: Vec<(&str, ColData)> = names.iter().map(|nm| (*nm, pick(nm))).collect();
+            check_batch_f(expr, &cols);
+        }
+    }
+
+    /// The domain narrowing is what makes the machine and chrono agree, so it
+    /// has to be real: a column outside it must REFUSE, not answer.
+    #[test]
+    fn temporal_arithmetic_refuses_a_batch_outside_its_domain() {
+        use super::batch::{Batch, BatchError, BatchProgram, ColumnRef};
+        let schema: Schema = [
+            ("a".to_string(), ValType::Duration),
+            ("b".to_string(), ValType::Duration),
+        ]
+        .into_iter()
+        .collect();
+        let program = BatchProgram::compile("a + b > a", &schema).expect("temporal add lowers");
+        let bound = program
+            .lowered()
+            .temporal_bound
+            .expect("one add, one bound");
+        assert_eq!(bound, i64::MAX / 2, "one operation combines two operands");
+
+        // Two durations that each FIT i64 nanoseconds but whose sum does not.
+        // chrono answers this; the machine would overflow, so it must refuse.
+        let big = vec![bound + 10];
+        let batch = Batch::new(1)
+            .column("a", ColumnRef::Duration(&big))
+            .column("b", ColumnRef::Duration(&big));
+        assert!(
+            matches!(
+                program.bind(&batch),
+                Err(BatchError::TemporalOutOfDomain { .. })
+            ),
+            "a value past the bound must refuse the batch"
+        );
+        // And the tree-walker really does answer it, which is why refusing —
+        // rather than trapping, which means "the walker raised" — is right.
+        let mut ctx = Context::default();
+        let one = chrono::Duration::nanoseconds(bound + 10);
+        ctx.add_variable_from_value("a", Value::Duration(one));
+        ctx.add_variable_from_value("b", Value::Duration(one));
+        let walker = Program::compile("a + b > a").unwrap();
+        assert_eq!(walker.execute(&ctx).unwrap(), Value::Bool(true));
+
+        // Inside the bound the same expression answers.
+        let ok = vec![bound / 2];
+        let batch = Batch::new(1)
+            .column("a", ColumnRef::Duration(&ok))
+            .column("b", ColumnRef::Duration(&ok));
+        assert_eq!(program.bind(&batch).unwrap().sum().unwrap(), Value::Int(1));
     }
 
     #[test]
@@ -3337,7 +3431,7 @@ mod tests {
         // arithmetic is wider than i64 nanoseconds, so a machine add can
         // overflow where the walker answers. Covering it needs a bind-time
         // domain check, not just an opcode.
-        const GAP_CEILING: usize = 45;
+        const GAP_CEILING: usize = 25;
 
         let (srcs, cols) = sweep_operands();
         let schema: Schema = cols

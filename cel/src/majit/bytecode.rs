@@ -361,6 +361,15 @@ pub fn prepare_batch<'a>(
         }
         assert_eq!(c.len(), n, "{what}: column {k} length {} != {n}", c.len());
     }
+    // Temporal arithmetic is exact only inside the domain the lowering
+    // recorded. Callers on the public path ask first and get a `BatchError`;
+    // reaching here out of domain is a harness bug, and a wrong sum is a worse
+    // outcome than a panic.
+    assert!(
+        lowered.temporal_out_of_domain(columns).is_none(),
+        "{what}: temporal column outside the ±{:?}ns arithmetic domain",
+        lowered.temporal_bound
+    );
     // Rank every string this batch can be asked about — the column values and
     // the expression's literals together — so all of them share one order.
     let dict = StrDict::build(
