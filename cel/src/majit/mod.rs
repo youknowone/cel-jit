@@ -1593,6 +1593,139 @@ mod tests {
         check_batch_f("-b", &[("b", ColData::Bool(flags))]);
     }
 
+    /// Cross-check a batch through the PUBLIC API on all three tiers against
+    /// the tree-walker's per-row sum.
+    ///
+    /// Unlike `check_batch_str` this goes through `BatchProgram::bind`, which
+    /// is what materializes the derived `string(x)` and `concat#k` columns —
+    /// the harnesses that build columns by hand cannot.
+    fn check_bound_batch(expr_src: &str, cols: &[(&str, ColData)]) {
+        use super::batch::{Batch, BatchProgram, ColumnRef, Tier};
+        let n = cols[0].1.len();
+        let schema: Schema = cols
+            .iter()
+            .map(|(nm, d)| (nm.to_string(), d.ty()))
+            .collect();
+        let program = Program::compile(expr_src).unwrap();
+
+        let mut expected = 0i64;
+        for i in 0..n {
+            expected += match program
+                .execute(&row_context(cols, i))
+                .unwrap_or_else(|e| panic!("execute `{expr_src}`: {e:?}"))
+            {
+                Value::Bool(b) => b as i64,
+                Value::Int(v) => v,
+                Value::UInt(v) => v as i64,
+                other => panic!("`{expr_src}`: unexpected {other:?}"),
+            };
+        }
+
+        // Borrowed views, kept alive for the whole bind.
+        let owned: Vec<(&str, ColumnRef)> = cols
+            .iter()
+            .map(|(nm, d)| {
+                (
+                    *nm,
+                    match d {
+                        ColData::Int(c) => ColumnRef::Int(c),
+                        ColData::Timestamp(c) => ColumnRef::Timestamp(c),
+                        ColData::Duration(c) => ColumnRef::Duration(c),
+                        ColData::Float(c) => ColumnRef::Float(c),
+                        ColData::Str(c) => ColumnRef::Str(c),
+                        // SAFETY: same size, alignment and validity both ways,
+                        // and `ColData::UInt` stores exactly the `u64` bit
+                        // pattern (see `ValType::UInt`). `cols` outlives the
+                        // batch built from these views.
+                        ColData::UInt(c) => ColumnRef::UInt(unsafe {
+                            core::slice::from_raw_parts(c.as_ptr().cast::<u64>(), c.len())
+                        }),
+                        ColData::Bool(_) => panic!("`{expr_src}`: bool column"),
+                    },
+                )
+            })
+            .collect();
+        let mut batch = Batch::new(n);
+        for (nm, c) in owned {
+            batch = batch.column(nm, c);
+        }
+
+        let bp = BatchProgram::from_program(&program, &schema)
+            .unwrap_or_else(|e| panic!("compile `{expr_src}`: {e}"));
+        let bound = bp
+            .bind(&batch)
+            .unwrap_or_else(|e| panic!("bind `{expr_src}`: {e}"));
+        for tier in [Tier::Clean, Tier::Interpreter, Tier::Jit] {
+            assert_eq!(
+                bound
+                    .sum_on(tier)
+                    .unwrap_or_else(|e| panic!("{tier:?}: {e}")),
+                Value::Int(expected),
+                "{tier:?} vs stock for `{expr_src}`"
+            );
+        }
+    }
+
+    /// `string(x)` and `string + string` produce CHARACTERS, which the machine
+    /// does not carry — they arrive as columns the batch builder materializes,
+    /// ranked alongside every other string. This is the test that the
+    /// conversion and the concatenation are the evaluator's own.
+    #[test]
+    fn batch_string_construction() {
+        let n = 900;
+        let words = ["admin", "ad", "", "guest", "root"];
+        let s1 = gen_str(n, 0x2468_ACE0_1357_9BDF, &words);
+        let s2 = gen_str(n, 0xFDB9_7531_0ECA_8642, &words);
+        let ints = gen_i64(n, 0x0F1E_2D3C_4B5A_6978, -50, 50);
+        let uints = gen_i64(n, 0x1122_3344_5566_7788, 0, 99);
+        let floats: Vec<f64> = ints.iter().map(|&v| v as f64 / 8.0).collect();
+        const YEAR: i64 = 365 * 24 * 3_600_000_000_000;
+        let ts = gen_nanos(n, 0x9182_7364_5546_3728, -5 * YEAR, 10 * YEAR);
+        let dur = gen_nanos(n, 0x5A5A_6B6B_7C7C_8D8D, -YEAR, 2 * YEAR);
+
+        // `string(x)` over every type CEL defines it on, compared against a
+        // literal and against itself.
+        check_bound_batch(
+            "string(i) == string(i)",
+            &[("i", ColData::Int(ints.clone()))],
+        );
+        check_bound_batch("string(i) < \"0\"", &[("i", ColData::Int(ints.clone()))]);
+        check_bound_batch("string(u) == \"7\"", &[("u", ColData::UInt(uints))]);
+        check_bound_batch("string(f) != \"0\"", &[("f", ColData::Float(floats))]);
+        check_bound_batch("string(s) == s", &[("s", ColData::Str(s1.clone()))]);
+        check_bound_batch(
+            "string(t).startsWith(\"19\")",
+            &[("t", ColData::Timestamp(ts))],
+        );
+        check_bound_batch("size(string(d)) > 3", &[("d", ColData::Duration(dur))]);
+        check_bound_batch("string(6) == \"6\"", &[("i", ColData::Int(ints.clone()))]);
+
+        // Concatenation: column+column, column+literal, literal+column, and a
+        // chain that folds into one derived column.
+        for expr in [
+            "a + b == \"adminguest\"",
+            "a + \"!\" == \"admin!\"",
+            "\"x\" + a != \"xroot\"",
+            "a + \"-\" + b == \"ad-root\"",
+            "(a + b).startsWith(\"ad\")",
+            "size(a + b) > 5",
+            "a + b < \"guest\"",
+        ] {
+            check_bound_batch(
+                expr,
+                &[
+                    ("a", ColData::Str(s1.clone())),
+                    ("b", ColData::Str(s2.clone())),
+                ],
+            );
+        }
+        // And the two mixed: a converted number concatenated with a column.
+        check_bound_batch(
+            "a + string(i) == \"admin7\"",
+            &[("a", ColData::Str(s1)), ("i", ColData::Int(ints))],
+        );
+    }
+
     /// String ordering lowers now that ids are ranks; what still bails is a
     /// string-VALUED result, which is the reduction's limit and not the
     /// comparison's — there is no sum of strings.
@@ -1613,11 +1746,14 @@ mod tests {
         }
         // `a` LOWERS — it is a column read — but its result is a string, and
         // the batch loop reduces by sum. Two separate refusals.
-        assert!(lower("a").unwrap().sum_reducible().is_err());
-        assert!(
-            lower("a + b").is_err(),
-            "concatenation has no characters to produce"
-        );
+        // Both LOWER — `a` is a column read and `a + b` a derived
+        // concatenation column — and both are refused a step later, by the sum.
+        for expr in ["a", "a + b"] {
+            assert!(
+                lower(expr).unwrap().sum_reducible().is_err(),
+                "`{expr}` is string-valued; the sum is what refuses it"
+            );
+        }
     }
 
     /// Ordering over a real batch, cross-checked against the tree-walker across
@@ -2874,7 +3010,6 @@ mod tests {
         // each slot defaults to the int bank.
         for expr in [
             "[1, 2, 3]",
-            "'a' + 'b'",
             "x.size()",
             "1.5 + a",
             "[1, 2, 3].map(x, x * 2)",
@@ -3408,10 +3543,9 @@ mod tests {
     /// A decline only costs coverage where the walker has an answer to give;
     /// where the walker raises, declining is the correct outcome, and counting
     /// it would reward the lowering for refusing expressions CEL rejects. This
-    /// asserts the answerable declines do not GROW: covering another pairing
-    /// lowers the number, and a regression that starts refusing legal
-    /// expressions raises it. The breakdown rides the failure message, so a
-    /// break names the family that moved.
+    /// asserts there are NO answerable declines left: a regression that starts
+    /// refusing legal expressions breaks it. The breakdown rides the failure
+    /// message, so a break names the family that moved.
     ///
     /// ⚠️Counted separately, and reported either way, is the second refusal:
     /// an expression that LOWERS but whose result the batch loop's sum cannot
@@ -3419,19 +3553,17 @@ mod tests {
     /// the lowering's, and folding the two together would let a lowering gain
     /// look like a reduction gain or hide one behind the other.
     #[test]
-    fn coverage_gap_does_not_grow() {
+    fn lowering_declines_nothing_the_walker_answers() {
         use std::collections::BTreeMap;
-        // What is left of the LOWERING gap: a string id is a rank, so ordering
-        // reads it and the four predicates index a bind-time table off it —
-        // but a rank still cannot give back the CHARACTERS, so `s + s` and
-        // `string(x)` have none to produce.
+        // The LOWERING gap is closed: over this matrix, every expression the
+        // tree-walker answers also lowers. The two refusals below it are
+        // separate and stay: the batch loop reduces by SUM, so a Str- or
+        // Timestamp-valued RESULT has nothing to accumulate into, and a batch
+        // whose temporal values leave the i64-nanosecond domain is refused at
+        // BIND, not at lowering.
         //
-        // Temporal arithmetic (`d + d`, `t + d`, `t - t`) declines at the
-        // operator: the operands are i64 nanoseconds but the walker's chrono
-        // arithmetic is wider than i64 nanoseconds, so a machine add can
-        // overflow where the walker answers. Covering it needs a bind-time
-        // domain check, not just an opcode.
-        const GAP_CEILING: usize = 25;
+        // Zero is a ratchet, not a milestone — a decline that reappears here
+        // is a capability this file used to have.
 
         let (srcs, cols) = sweep_operands();
         let schema: Schema = cols
@@ -3510,10 +3642,11 @@ mod tests {
         };
         let breakdown = render(gap);
         let unreduced_breakdown = render(unreduced);
-        assert!(
-            gap_total <= GAP_CEILING,
+        assert_eq!(
+            gap_total,
+            0,
             "{gap_total} of {} sweep expressions are answered by the tree-walker \
-             and declined by the LOWERING (ceiling {GAP_CEILING}):{breakdown}\n\
+             and declined by the LOWERING:{breakdown}\n\
              \n{unreduced_total} more lower but are not sum-reducible:\
              {unreduced_breakdown}",
             exprs.len(),

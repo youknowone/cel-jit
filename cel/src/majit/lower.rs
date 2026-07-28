@@ -187,6 +187,58 @@ pub fn size_slot_source(slot_path: &str) -> Option<&str> {
     slot_path.strip_prefix("size(")?.strip_suffix(')')
 }
 
+/// Slot path of the DERIVED string column for the column at `path` — the
+/// per-row `string(...)` conversion, which needs characters the machine does
+/// not carry and so is materialized by the batch builder, exactly as
+/// [`size_slot_path`]'s length column is.
+pub fn string_slot_path(path: &str) -> String {
+    format!("string({path})")
+}
+
+/// The column path a [`string_slot_path`] key was derived from.
+pub fn string_slot_source(slot_path: &str) -> Option<&str> {
+    slot_path.strip_prefix("string(")?.strip_suffix(')')
+}
+
+/// Slot path of the `k`-th DERIVED concatenation column, whose operands are
+/// [`LoweredF::concats`]`[k]`.
+///
+/// The operands are held in a side table rather than spelled into the path
+/// because one of them can be a LITERAL, and a literal may contain any
+/// character at all — including whatever separator a spelled-out path would
+/// need to be split on.
+pub fn concat_slot_path(k: usize) -> String {
+    format!("concat#{k}")
+}
+
+/// The [`LoweredF::concats`] index a [`concat_slot_path`] key names.
+pub fn concat_slot_index(slot_path: &str) -> Option<usize> {
+    slot_path.strip_prefix("concat#")?.parse().ok()
+}
+
+/// One operand of a derived concatenation column.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConcatSide {
+    /// A `string` column, by schema path.
+    Column(String),
+    /// A literal, the same on every row.
+    Literal(String),
+    /// Another derived concatenation, by its [`LoweredF::concats`] index.
+    /// Always a LOWER index than the spec holding it, since an operand is
+    /// lowered before the operation over it — so materializing the table in
+    /// order resolves every reference.
+    Derived(usize),
+}
+
+/// The two operands of a derived concatenation column.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConcatSpec {
+    /// Left operand.
+    pub left: ConcatSide,
+    /// Right operand.
+    pub right: ConcatSide,
+}
+
 /// Slot path of the DERIVED per-row START INDEX of the list at `path` into its
 /// flattened element columns — Arrow's offsets buffer, and the other half of
 /// the `(offset, size)` pair that locates one row's elements.
@@ -349,6 +401,10 @@ pub struct LoweredF {
     /// builder resolves each against the batch and seeds its register
     /// ([`BatchSeed::scalar_regs`]).
     pub scalar_seeds: Vec<ScalarSeed>,
+    /// Operands of the derived `concat#k` columns, indexed by `k`. Each entry's
+    /// [`ConcatSide::Derived`] references are all lower indices, so
+    /// materializing the table in order resolves them.
+    pub concats: Vec<ConcatSpec>,
     /// `Some(b)` when the body does temporal arithmetic: every value in a
     /// `timestamp` or `duration` column must satisfy `|v| <= b` for this
     /// program to answer what the tree-walker answers.
@@ -709,6 +765,9 @@ struct LowerCtxF<'s> {
     /// Folded `timestamp(...)` / `duration(...)` constants, which are operands
     /// too and so must satisfy the same bound the columns do.
     temporal_consts: Vec<i64>,
+    /// Derived concatenation columns, in the order the batch builder must
+    /// materialize them.
+    concats: Vec<ConcatSpec>,
     /// Element slots created by the runtime-list comprehension currently being
     /// lowered, keyed by slot path. Scoped to that comprehension on purpose:
     /// two comprehensions over the same list get their OWN registers, since
@@ -884,6 +943,7 @@ pub fn lower_typed(expr: &IdedExpr, schema: &Schema) -> Result<LoweredF, LowerEr
         scalar_seeds: Vec::new(),
         temporal_ops: 0,
         temporal_consts: Vec::new(),
+        concats: Vec::new(),
         elem_map: HashMap::new(),
         list_loop: None,
         jump_fixups: Vec::new(),
@@ -918,6 +978,7 @@ pub fn lower_typed(expr: &IdedExpr, schema: &Schema) -> Result<LoweredF, LowerEr
         num_float_regs: ctx.next_float,
         slots: ctx.slots,
         scalar_seeds: ctx.scalar_seeds,
+        concats: ctx.concats,
         temporal_bound,
         jump_fixups: ctx.jump_fixups,
     })
@@ -1303,6 +1364,75 @@ fn emit_str_predicate(ctx: &mut LowerCtxF, pred: StrPredicate, s: TReg) -> TReg 
     ctx.body
         .extend_from_slice(&[OP_COL_LOAD, table.idx as i64, ea.idx as i64, d.idx as i64]);
     d
+}
+
+impl LowerCtxF<'_> {
+    /// Classify one operand of a concatenation, or refuse it.
+    fn concat_side(&mut self, e: &IdedExpr, r: TReg) -> Result<ConcatSide, LowerError> {
+        if let Some(lit) = as_string_literal(e) {
+            return Ok(ConcatSide::Literal(lit.to_string()));
+        }
+        // A register that already IS a derived concatenation, so chains fold
+        // into one table rather than refusing.
+        if let Some(slot) = self.slots.iter().find(|s| s.reg == r.idx) {
+            if let Some(k) = concat_slot_index(&slot.path) {
+                return Ok(ConcatSide::Derived(k));
+            }
+            if slot.ty == ValType::Str {
+                return Ok(ConcatSide::Column(slot.path.clone()));
+            }
+        }
+        Err(LowerError::unsupported(
+            "string concatenation of an operand that is neither a column nor a literal",
+        ))
+    }
+
+    /// The slot path a register arrived in, or `None` if it is not a slot
+    /// (a literal's seeded register, or a computed one).
+    fn slot_path_of(&self, r: TReg) -> Option<String> {
+        self.slots
+            .iter()
+            .find(|s| s.reg == r.idx && s.ty == r.bank)
+            .map(|s| s.path.clone())
+    }
+
+    /// The slot for `spec`, reusing one already recorded so a repeated
+    /// sub-expression materializes a single column.
+    fn concat_slot(&mut self, spec: ConcatSpec) -> TReg {
+        let k = match self.concats.iter().position(|s| *s == spec) {
+            Some(k) => k,
+            None => {
+                self.concats.push(spec);
+                self.concats.len() - 1
+            }
+        };
+        self.slot_typed(concat_slot_path(k), ValType::Str)
+    }
+}
+
+/// `size(e)` where `e` is not a declared column but may still be a DERIVED
+/// string one — a `string(x)` conversion or a concatenation. Those carry
+/// characters too, so their byte length is the same kind of derived column,
+/// keyed on the slot the string arrived in.
+fn size_of_derived_string(ctx: &mut LowerCtxF, e: &IdedExpr) -> Result<TReg, LowerError> {
+    let a = compile_t(ctx, e)?;
+    let path = (a.bank == ValType::Str)
+        .then(|| ctx.slot_path_of(a))
+        .flatten()
+        .ok_or_else(|| LowerError::unsupported("size() of a non-column argument"))?;
+    Ok(ctx.slot_typed(size_slot_path(&path), ValType::Int))
+}
+
+/// A string the lowering knows without looking at the row. Like a written
+/// literal it gets a seeded register rather than an immediate, because its id
+/// is still the batch's to assign.
+fn emit_str_const(ctx: &mut LowerCtxF, text: String) -> TReg {
+    let r = ctx.fresh(ValType::Str);
+    ctx.scalar_seeds.push(ScalarSeed {
+        kind: SeedKind::StrId(text),
+        reg: r.idx,
+    });
+    r
 }
 
 /// A `bool` the lowering knows without looking at the row, hoisted to the
@@ -1700,7 +1830,8 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
         let path = match &call.args[0].expr {
             Expr::Ident(n) if !ctx.locals.contains_key(n) => n.clone(),
             Expr::Select(_) => resolve_path(&call.args[0])?,
-            _ => return Err(LowerError::unsupported("size() of a non-column argument")),
+            // Anything else may still be a derived string.
+            _ => return size_of_derived_string(ctx, &call.args[0]),
         };
         // A `string` column carries its byte length as a derived column, and a
         // LIST column carries its per-row element count as the same derived
@@ -1714,6 +1845,55 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
             ));
         }
         return Ok(ctx.slot_typed(size_slot_path(&path), ValType::Int));
+    }
+
+    // `string(x)`. The conversions are plain Rust formatting
+    // (`common/types/string.rs`): `Int`/`UInt`/`Double` go through
+    // `to_string`, a `Timestamp` through `to_rfc3339`, a `Duration` through
+    // `format_duration`. All of them produce CHARACTERS, which the machine does
+    // not carry — a string is a rank — so the answer arrives the same way
+    // `size(x)` does, as a column the batch builder materializes.
+    //
+    // Note `string(bool)` is NOT among them: the walker's match has no `Bool`
+    // arm and raises a `FunctionError`, so declining here is what agrees.
+    if name == "string" && call.args.len() == 1 {
+        // A literal's conversion is itself a constant, so it folds here — the
+        // same `to_string` the walker would reach, run once instead of per row.
+        // `Boolean` is left out for the same reason as a bool column.
+        if let Expr::Literal(lit) = &call.args[0].expr {
+            let folded = match lit {
+                LiteralValue::String(_) => return compile_t(ctx, &call.args[0]),
+                LiteralValue::Int(i) => i.into_inner().to_string(),
+                LiteralValue::UInt(u) => u.into_inner().to_string(),
+                LiteralValue::Double(f) => f.into_inner().to_string(),
+                LiteralValue::Boolean(_) | LiteralValue::Bytes(_) | LiteralValue::Null => {
+                    return Err(LowerError::unsupported("string() of this literal"))
+                }
+            };
+            return Ok(emit_str_const(ctx, folded));
+        }
+        // Resolve the argument to a column path BEFORE compiling it, so a
+        // decline emits nothing: `compile_t` allocates slots and appends ops.
+        let path = match &call.args[0].expr {
+            Expr::Ident(n) if !ctx.locals.contains_key(n) => n.clone(),
+            Expr::Select(_) => resolve_path(&call.args[0])?,
+            _ => return Err(LowerError::unsupported("string() of a non-column argument")),
+        };
+        return match ctx.schema.get(&path).copied() {
+            // On a string the conversion is the identity, needing no
+            // characters and no derived column: the rank already IS the answer.
+            Some(ValType::Str) => compile_t(ctx, &call.args[0]),
+            Some(
+                ValType::Int
+                | ValType::UInt
+                | ValType::Float
+                | ValType::Timestamp
+                | ValType::Duration,
+            ) => Ok(ctx.slot_typed(string_slot_path(&path), ValType::Str)),
+            _ => Err(LowerError::unsupported(
+                "string() of a bool, list or undeclared column",
+            )),
+        };
     }
 
     // Numeric type conversions. `double`/`int`/`uint` are global (non-member)
@@ -2069,6 +2249,22 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
             ]);
             d
         };
+        // `string + string` is concatenation, which produces CHARACTERS the
+        // machine does not carry — a string is a rank. So, like `string(x)`,
+        // the answer arrives as a column the batch builder materializes, and
+        // ranking it alongside every other string is what gives the result an
+        // id to compare. Two literals fold outright.
+        if name == ops::ADD && a.bank == ValType::Str && b.bank == ValType::Str {
+            if let (Some(x), Some(y)) = (
+                as_string_literal(&call.args[0]),
+                as_string_literal(&call.args[1]),
+            ) {
+                return Ok(emit_str_const(ctx, format!("{x}{y}")));
+            }
+            let left = ctx.concat_side(&call.args[0], a)?;
+            let right = ctx.concat_side(&call.args[1], b)?;
+            return Ok(ctx.concat_slot(ConcatSpec { left, right }));
+        }
         // Temporal arithmetic. Both banks are i64 nanoseconds, so the operation
         // itself is the same int add/sub — but the tree-walker's is chrono's,
         // whose range (`{secs: i64, nanos: i32}`) is far WIDER than i64

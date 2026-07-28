@@ -51,8 +51,8 @@ use std::collections::HashMap;
 
 use super::bytecode::{float_bank, prepare_batch, BatchRun, Column};
 use super::lower::{
-    elem_slot_source, lower_typed, offset_slot_source, size_slot_source, LoweredF, Schema,
-    SlotKind, ValType,
+    concat_slot_index, concat_slot_path, elem_slot_source, lower_typed, offset_slot_source,
+    size_slot_source, string_slot_source, ConcatSide, LoweredF, Schema, SlotKind, ValType,
 };
 use crate::{Program, Value};
 
@@ -346,6 +346,50 @@ impl BatchProgram {
         })
     }
 
+    /// The strings a string-valued SLOT PATH stands for: a declared `string`
+    /// column, a `string(x)` conversion of some other column, or a `concat#k`.
+    ///
+    /// One resolver for all three is what lets them nest — `size(a + string(i))`
+    /// is a length column over a concatenation over a conversion. Recursion
+    /// terminates because a `concat#k` only ever references a LOWER index.
+    fn strings_for(
+        &self,
+        batch: &Batch,
+        path: &str,
+        rows: usize,
+    ) -> Result<Vec<String>, BatchError> {
+        let wrong_type = |name: &str| BatchError::ColumnType {
+            name: name.to_string(),
+            declared: ValType::Str,
+        };
+        if let Some(k) = concat_slot_index(path) {
+            let spec = &self.lowered.concats[k];
+            let side = |s: &ConcatSide| -> Result<Vec<String>, BatchError> {
+                Ok(match s {
+                    ConcatSide::Literal(text) => vec![text.clone(); rows],
+                    ConcatSide::Derived(j) => {
+                        self.strings_for(batch, &concat_slot_path(*j), rows)?
+                    }
+                    ConcatSide::Column(p) => self.strings_for(batch, p, rows)?,
+                })
+            };
+            let (l, r) = (side(&spec.left)?, side(&spec.right)?);
+            return Ok(l.into_iter().zip(r).map(|(a, b)| a + &b).collect());
+        }
+        if let Some(src) = string_slot_source(path) {
+            return column_to_strings(lookup(batch, src)?).ok_or_else(|| wrong_type(src));
+        }
+        match lookup(batch, path)? {
+            ColumnRef::Str(c) if c.len() == rows => Ok(c.to_vec()),
+            ColumnRef::Str(c) => Err(BatchError::RowCount {
+                name: path.to_string(),
+                len: c.len(),
+                rows,
+            }),
+            _ => Err(wrong_type(path)),
+        }
+    }
+
     /// Resolve one slot path to the column that feeds it.
     fn plan_slot<'a>(
         &self,
@@ -354,20 +398,25 @@ impl BatchProgram {
         ty: ValType,
         derived: &mut Vec<DerivedColumn>,
     ) -> Result<Plan<'a>, BatchError> {
-        // `size(x)`: the byte length of a string, or the element count of a list.
+        // `size(x)`: the element count of a list, or the byte length of a
+        // string — which may itself be a derived one.
         if let Some(src) = size_slot_source(path) {
-            let col = lookup(batch, src)?;
-            let buf = match col {
-                ColumnRef::Str(c) => c.iter().map(|s| s.len() as i64).collect(),
-                ColumnRef::List { lens, .. } => lens.to_vec(),
-                _ => {
-                    return Err(BatchError::ColumnType {
-                        name: src.to_string(),
-                        declared: ValType::Str,
-                    })
-                }
-            };
+            if let Ok(ColumnRef::List { lens, .. }) = lookup(batch, src) {
+                derived.push(DerivedColumn::int(lens.to_vec()));
+                return Ok(Plan::Derived(derived.len() - 1));
+            }
+            let buf = self
+                .strings_for(batch, src, batch.rows)?
+                .iter()
+                .map(|s| s.len() as i64)
+                .collect();
             derived.push(DerivedColumn::int(buf));
+            return Ok(Plan::Derived(derived.len() - 1));
+        }
+        // The two string-producing derived columns, which need the characters.
+        if string_slot_source(path).is_some() || concat_slot_index(path).is_some() {
+            let buf = self.strings_for(batch, path, batch.rows)?;
+            derived.push(DerivedColumn::str(buf));
             return Ok(Plan::Derived(derived.len() - 1));
         }
         // `offset(x)`: exclusive prefix sums of a list's element counts.
@@ -403,11 +452,45 @@ impl BatchProgram {
     }
 }
 
+/// `string(col)` per row, or `None` for a column CEL's `string` has no overload
+/// for.
+///
+/// Each arm is the conversion `common/types/string.rs` applies — plain Rust
+/// formatting for the numerics, RFC 3339 for a timestamp, CEL's own duration
+/// spelling for a duration — so doing it per row here rather than per row there
+/// cannot change an answer. A `bool` column is absent on purpose: the walker's
+/// match has no `Bool` arm and raises.
+fn column_to_strings(col: &ColumnRef) -> Option<Vec<String>> {
+    Some(match col {
+        ColumnRef::Int(c) => c.iter().map(|v| v.to_string()).collect(),
+        ColumnRef::UInt(c) => c.iter().map(|v| v.to_string()).collect(),
+        ColumnRef::Float(c) => c.iter().map(|v| v.to_string()).collect(),
+        ColumnRef::Str(c) => c.to_vec(),
+        ColumnRef::Timestamp(c) => c
+            .iter()
+            .map(|&n| {
+                chrono::DateTime::from_timestamp_nanos(n)
+                    .fixed_offset()
+                    .to_rfc3339()
+            })
+            .collect(),
+        ColumnRef::Duration(c) => c
+            .iter()
+            .map(|&n| crate::duration::format_duration(&chrono::Duration::nanoseconds(n)))
+            .collect(),
+        ColumnRef::Bool(_) | ColumnRef::List { .. } => return None,
+    })
+}
+
 /// A column the encoding had to materialize because the caller's data is not
 /// already in the machine's representation. Boxed, so the buffer's address is
 /// fixed the moment it is built and moving the owning `Vec` cannot move it.
 enum DerivedColumn {
     Int(Box<[i64]>),
+    /// A `string(...)` conversion column. Held as strings, not ids: the ids are
+    /// ranks over the whole batch, so `prepare_batch` assigns them alongside
+    /// the caller's own string columns.
+    Str(Box<[String]>),
 }
 
 impl DerivedColumn {
@@ -415,9 +498,14 @@ impl DerivedColumn {
         DerivedColumn::Int(v.into_boxed_slice())
     }
 
+    fn str(v: Vec<String>) -> Self {
+        DerivedColumn::Str(v.into_boxed_slice())
+    }
+
     fn len(&self) -> usize {
         match self {
             DerivedColumn::Int(c) => c.len(),
+            DerivedColumn::Str(c) => c.len(),
         }
     }
 
@@ -431,6 +519,7 @@ impl DerivedColumn {
     unsafe fn column<'a>(&self) -> Column<'a> {
         match self {
             DerivedColumn::Int(c) => Column::Int(unsafe { &*(&**c as *const [i64]) }),
+            DerivedColumn::Str(c) => Column::Str(unsafe { &*(&**c as *const [String]) }),
         }
     }
 }
