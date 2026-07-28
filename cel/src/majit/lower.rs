@@ -466,6 +466,23 @@ impl LoweredF {
     /// flag, so the caller **cannot tell** an overflowed row from a good one.
     /// Only for harnesses whose data is bounded by construction; the evaluator
     /// path ([`super::bytecode::eval_batch_sum_f`]) always passes a trap word.
+    /// Whether the batch loop's running total can consume this result.
+    ///
+    /// The loop accumulates an int count/sum or a float total, so a
+    /// string-valued or temporal-valued result has nothing to accumulate into:
+    /// summing string RANKS or nanosecond counts would be an answer the
+    /// tree-walker never gives. This is the REDUCTION's limit and says nothing
+    /// about whether the expression lowered — it did, or `lower_typed` would
+    /// have said so.
+    pub fn sum_reducible(&self) -> Result<(), LowerError> {
+        match self.result_bank {
+            ValType::Int | ValType::Bool | ValType::UInt | ValType::Float => Ok(()),
+            b => Err(LowerError::unsupported(format!(
+                "{b:?}-valued result: the batch loop reduces by sum"
+            ))),
+        }
+    }
+
     /// Takes column bases already computed, so it cannot rank a batch's
     /// strings; an expression carrying a string literal has no id to seed here
     /// and must go through [`super::bytecode::prepare_batch`], which is handed
@@ -490,6 +507,11 @@ impl LoweredF {
     /// evaluator path passes `true` here and the trap word's address to
     /// [`BatchSeed::regs`].
     pub fn batch_sum_shape(&self, with_trap: bool) -> BatchShape {
+        // The arms below fold a Str/Timestamp/Duration result into the int
+        // accumulate, which would sum ranks or nanoseconds. Callers must have
+        // asked [`LoweredF::sum_reducible`] first; the public entry points do.
+        self.sum_reducible()
+            .expect("batch_sum_shape on a result the loop's sum cannot consume");
         let m = self.num_int_regs; // first int machinery register
         let (r_i, r_acc, r_n, r_one, r_stride, r_ea) = (m, m + 1, m + 2, m + 3, m + 4, m + 5);
         let r_trap = m + 6;
@@ -817,17 +839,11 @@ pub fn lower_typed(expr: &IdedExpr, schema: &Schema) -> Result<LoweredF, LowerEr
         schema,
     };
     let result = compile_t(&mut ctx, expr)?;
-    // A string- or temporal-valued top-level result is not sum-reducible (the
-    // batch loop accumulates an int count or a float total); such an expression
-    // bails to the tree-walker rather than accumulating string ids / nanos.
-    if matches!(
-        result.bank,
-        ValType::Str | ValType::Timestamp | ValType::Duration
-    ) {
-        return Err(LowerError::unsupported(
-            "string/temporal-valued top-level result",
-        ));
-    }
+    // Note what is NOT checked here: whether the batch loop's sum can consume
+    // the result. That is [`LoweredF::sum_reducible`]'s question, and it is a
+    // different one — `b ? s : s` lowers to a select over string ids perfectly
+    // well; there is just no sum of strings for the loop to accumulate. Keeping
+    // them apart is what lets a decline say which of the two refused.
     Ok(LoweredF {
         prelude: ctx.prelude,
         body: ctx.body,

@@ -242,9 +242,12 @@ impl BatchProgram {
     /// [`BatchProgram::compile`] for an already-parsed program, so a caller that
     /// keeps a [`Program`] for the tree-walker does not parse twice.
     pub fn from_program(program: &Program, schema: &Schema) -> Result<Self, BatchError> {
-        Ok(BatchProgram {
-            lowered: lower_typed(program.expression(), schema)?,
-        })
+        let lowered = lower_typed(program.expression(), schema)?;
+        // Two separate refusals, both permanent for this expression: the
+        // lowering could not take it, or it could but this API reduces by sum
+        // and the result is not something a sum consumes.
+        lowered.sum_reducible()?;
+        Ok(BatchProgram { lowered })
     }
 
     /// The lowering, for callers that drive the machine directly.

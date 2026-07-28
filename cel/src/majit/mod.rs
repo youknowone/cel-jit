@@ -1611,12 +1611,13 @@ mod tests {
         for expr in ["a < b", "a <= b", "a > b", "a >= b", "a == b", "a != b"] {
             assert!(lower(expr).is_ok(), "`{expr}` must lower to a rank compare");
         }
-        for expr in ["a", "a + b"] {
-            assert!(
-                lower(expr).is_err(),
-                "`{expr}` is string-valued and not sum-reducible"
-            );
-        }
+        // `a` LOWERS — it is a column read — but its result is a string, and
+        // the batch loop reduces by sum. Two separate refusals.
+        assert!(lower("a").unwrap().sum_reducible().is_err());
+        assert!(
+            lower("a + b").is_err(),
+            "concatenation has no characters to produce"
+        );
     }
 
     /// Ordering over a real batch, cross-checked against the tree-walker across
@@ -2242,9 +2243,10 @@ mod tests {
 
     #[test]
     fn temporal_mixed_bails() {
-        // A timestamp vs duration comparison is NoSuchOverload, a temporal vs int
-        // is a type error, temporal arithmetic is out of subset, and a bare
-        // temporal result is not sum-reducible — all bail to the tree-walker.
+        // A timestamp vs duration comparison is NoSuchOverload, a temporal vs
+        // int is a type error, and temporal arithmetic is out of subset — all
+        // bail the LOWERING. A bare temporal column lowers and is refused a
+        // step later, by the sum.
         let schema: Schema = [
             ("t".to_string(), ValType::Timestamp),
             ("d".to_string(), ValType::Duration),
@@ -2252,13 +2254,20 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        for expr in ["t < d", "t < i", "t - t", "t + d", "d + d", "t"] {
+        let lower = |expr: &str| {
             let program = Program::compile(expr).unwrap();
+            lower_typed(program.expression(), &schema)
+        };
+        for expr in ["t < d", "t < i", "t - t", "t + d", "d + d"] {
             assert!(
-                lower_typed(program.expression(), &schema).is_err(),
-                "`{expr}` must bail the typed lowering (mixed/arith/bare temporal)"
+                lower(expr).is_err(),
+                "`{expr}` must bail the typed lowering (mixed/arith temporal)"
             );
         }
+        assert!(
+            lower("t").unwrap().sum_reducible().is_err(),
+            "a bare temporal column lowers; the sum is what refuses it"
+        );
     }
 
     #[test]
@@ -3120,6 +3129,11 @@ mod tests {
             Ok(l) => l,
             Err(_) => return SweepVerdict::Declined,
         };
+        // Lowering and reduction refuse separately; this harness runs the batch
+        // sum, so it needs both.
+        if lowered.sum_reducible().is_err() {
+            return SweepVerdict::Declined;
+        }
 
         // Columns in SLOT order, materializing the two derived kinds the schema
         // does not declare: a string column's `i64` ids, and a
@@ -3294,7 +3308,8 @@ mod tests {
     }
 
     /// Every expression the sweep matrix can build, bucketed by why the
-    /// lowering declined it — and, of those, how many the tree-walker ANSWERS.
+    /// **lowering** declined it — and, of those, how many the tree-walker
+    /// ANSWERS.
     ///
     /// A decline only costs coverage where the walker has an answer to give;
     /// where the walker raises, declining is the correct outcome, and counting
@@ -3303,27 +3318,26 @@ mod tests {
     /// lowers the number, and a regression that starts refusing legal
     /// expressions raises it. The breakdown rides the failure message, so a
     /// break names the family that moved.
+    ///
+    /// ⚠️Counted separately, and reported either way, is the second refusal:
+    /// an expression that LOWERS but whose result the batch loop's sum cannot
+    /// consume (`LoweredF::sum_reducible`). That is the reduction's limit, not
+    /// the lowering's, and folding the two together would let a lowering gain
+    /// look like a reduction gain or hide one behind the other.
     #[test]
     fn coverage_gap_does_not_grow() {
         use std::collections::BTreeMap;
-        // What is left splits three ways.
-        //
-        // A string id is a RANK now, so ordering reads it; what a rank still
-        // cannot give is the CHARACTERS — `s + s` and `string(x)` have none to
-        // produce, `startsWith` and its three siblings none to inspect.
-        //
-        // The batch loop reduces by SUM, which a string- or temporal-valued
-        // top-level result has no answer for.
+        // What is left of the LOWERING gap: a string id is a rank, so ordering
+        // reads it and the four predicates index a bind-time table off it —
+        // but a rank still cannot give back the CHARACTERS, so `s + s` and
+        // `string(x)` have none to produce.
         //
         // Temporal arithmetic (`d + d`, `t + d`, `t - t`) declines at the
-        // operator, not at the reduction: the operands are i64 nanoseconds but
-        // the walker's chrono arithmetic is wider than i64 nanoseconds, so a
-        // machine add can overflow where the walker answers. Covering it needs a
-        // bind-time domain check, not just an opcode.
-        //
-        // And `-b` is the walker answering `-true` as `false`, which no CEL
-        // overload defines — matching it would put that bug in the JIT tier too.
-        const GAP_CEILING: usize = 66;
+        // operator: the operands are i64 nanoseconds but the walker's chrono
+        // arithmetic is wider than i64 nanoseconds, so a machine add can
+        // overflow where the walker answers. Covering it needs a bind-time
+        // domain check, not just an opcode.
+        const GAP_CEILING: usize = 45;
 
         let (srcs, cols) = sweep_operands();
         let schema: Schema = cols
@@ -3362,30 +3376,52 @@ mod tests {
 
         let mut gap: BTreeMap<String, (usize, String)> = BTreeMap::new();
         let mut gap_total = 0usize;
+        // The second refusal, tracked apart: lowered, but not something the
+        // loop's sum can accumulate.
+        let mut unreduced: BTreeMap<String, (usize, String)> = BTreeMap::new();
+        let mut unreduced_total = 0usize;
         for expr in &exprs {
             let program = Program::compile(expr).unwrap();
-            let Err(e) = lower_typed(program.expression(), &schema) else {
-                continue;
-            };
+            let lowered = lower_typed(program.expression(), &schema);
+            // Only a decline the walker ANSWERS costs anything.
             if (0..rows).any(|k| program.execute(&row_context(&cols, k)).is_err()) {
                 continue;
             }
-            gap_total += 1;
-            let slot = gap.entry(e.reason).or_insert((0, expr.clone()));
+            let reason = match &lowered {
+                Err(e) => {
+                    gap_total += 1;
+                    &mut gap
+                }
+                .entry(e.reason.clone()),
+                Ok(l) => match l.sum_reducible() {
+                    Ok(()) => continue,
+                    Err(e) => {
+                        unreduced_total += 1;
+                        unreduced.entry(e.reason)
+                    }
+                },
+            };
+            let slot = reason.or_insert((0, expr.clone()));
             slot.0 += 1;
         }
 
-        let mut buckets: Vec<(usize, String, String)> =
-            gap.into_iter().map(|(k, (n, ex))| (n, k, ex)).collect();
-        buckets.sort_by_key(|(n, _, _)| std::cmp::Reverse(*n));
-        let breakdown = buckets
-            .iter()
-            .map(|(n, reason, ex)| format!("\n  {n:5}  {reason}   e.g. `{ex}`"))
-            .collect::<String>();
+        let render = |m: BTreeMap<String, (usize, String)>| {
+            let mut buckets: Vec<(usize, String, String)> =
+                m.into_iter().map(|(k, (n, ex))| (n, k, ex)).collect();
+            buckets.sort_by_key(|(n, _, _)| std::cmp::Reverse(*n));
+            buckets
+                .iter()
+                .map(|(n, reason, ex)| format!("\n  {n:5}  {reason}   e.g. `{ex}`"))
+                .collect::<String>()
+        };
+        let breakdown = render(gap);
+        let unreduced_breakdown = render(unreduced);
         assert!(
             gap_total <= GAP_CEILING,
             "{gap_total} of {} sweep expressions are answered by the tree-walker \
-             and declined by the lowering (ceiling {GAP_CEILING}):{breakdown}",
+             and declined by the LOWERING (ceiling {GAP_CEILING}):{breakdown}\n\
+             \n{unreduced_total} more lower but are not sum-reducible:\
+             {unreduced_breakdown}",
             exprs.len(),
         );
     }
