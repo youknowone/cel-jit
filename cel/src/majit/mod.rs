@@ -2287,10 +2287,12 @@ mod tests {
             // Calendar fields have no `duration` overload.
             "d.getDayOfWeek()",
             "d.getFullYear()",
-            // A folded timestamp literal drops the RFC-3339 offset the walker
-            // keeps, so its calendar fields are not ours to answer.
-            "timestamp(\"2024-03-05T06:07:08+09:00\").getHours()",
-            "timestamp(\"2024-03-05T06:07:08Z\").getFullYear()",
+            // A timestamp literal's calendar fields used to bail here, because
+            // folding it to i64 nanoseconds drops the RFC-3339 offset that
+            // `getHours()` reads. They no longer reach that representation at
+            // all: the whole expression is constant, so the walker answers it
+            // and the answer is emitted as an int — offset included. See
+            // `constant_subexpressions_fold_to_the_walkers_answer`.
         ] {
             let program = Program::compile(expr).unwrap();
             assert!(
@@ -2377,7 +2379,9 @@ mod tests {
         for expr in [
             "int(s) > 1",
             "double(s) > 1.0",
-            "int(\"123\") > 1",
+            // `int("123")` is not here: a constant string has no runtime parse
+            // to bail on, because the walker parses it at lowering time and the
+            // machine gets the number. Only a COLUMN of strings bails.
             "int(t) > 1",
             "double(t) > 1.0",
         ] {
@@ -3194,6 +3198,52 @@ mod tests {
         }
     }
 
+    /// `x in list` over a DECLARED list column, which CEL defines as
+    /// `list.exists(e, e == x)` and the lowering builds as the same inner loop.
+    ///
+    /// The cases below cross an empty row (zero trip), a hit on the first
+    /// element, a hit on the last, and no hit at all, so the zero-trip guard and
+    /// the loop-carried accumulator are both exercised on real data rather than
+    /// argued about.
+    #[test]
+    fn batch_runtime_list_membership() {
+        let n = 400;
+        let lens = gen_lens(n, 0x51A5_7C01_D0DE_0001, 3);
+        let total = lens.iter().sum::<i64>() as usize;
+        // A narrow element range against a narrow needle range, so hits and
+        // misses are both common.
+        let nums = gen_i64(total, 0x51A5_7C01_D0DE_0002, 0, 4);
+        let fs = gen_f64(total, 0x51A5_7C01_D0DE_0003, -2.0, 2.0);
+        let x = ColData::Int(gen_i64(n, 0x51A5_7C01_D0DE_0004, 0, 5));
+        let g = ColData::Float(gen_f64(n, 0x51A5_7C01_D0DE_0005, -2.0, 2.0));
+        let ints = || {
+            vec![(
+                "nums",
+                record_list(lens.clone(), vec![(None, ColData::Int(nums.clone()))]),
+            )]
+        };
+        for expr in [
+            "x in nums",
+            "!(x in nums)",
+            "x in nums && x > 0",
+            "size(nums) > 1 && x in nums",
+            // Membership joined with a comprehension over the SAME list: two
+            // inner loops side by side, neither nested in the other.
+            "x in nums || nums.all(y, y > 0)",
+        ] {
+            check_batch_list(expr, &[("x", x.clone())], &ints());
+        }
+        // The float bank takes the other equality op.
+        check_batch_list(
+            "g in fs",
+            &[("g", g.clone())],
+            &[(
+                "fs",
+                record_list(lens.clone(), vec![(None, ColData::Float(fs.clone()))]),
+            )],
+        );
+    }
+
     #[test]
     fn batch_list_scalar_elements() {
         // A list of bare scalars: the loop variable IS the element, so it
@@ -3784,6 +3834,204 @@ mod tests {
              \n{unreduced_total} more lower and go through the per-row door:\
              {unreduced_breakdown}",
             exprs.len(),
+        );
+    }
+
+    /// A subexpression that reads no variable is answered by the tree-walker at
+    /// lowering time and emitted as a constant.
+    ///
+    /// The cases below are all things the machine has no instruction for — a
+    /// list literal indexed, a map's size, a string parsed as an int — so
+    /// without the fold they decline; and the last two are cases the fold gets
+    /// RIGHT where a lowering could not, because it never goes through the
+    /// machine's representation at all: `timestamp(...)` folded to i64
+    /// nanoseconds has lost the RFC-3339 offset that `getHours()` reads, but
+    /// the walker still has it.
+    #[test]
+    fn constant_subexpressions_fold_to_the_walkers_answer() {
+        let cols: Vec<(&str, ColData)> = vec![(
+            "i",
+            ColData::Int(gen_i64(200, 0x0C05_7A17_7F01_D001, -9, 9)),
+        )];
+        for expr in [
+            // Literal aggregates, which have no bank at all.
+            "size([1, 2, 3]) + i",
+            "[1, 2, 3][0] + i",
+            "size({'a': 1, 'b': 2}) + i",
+            "i in [1, 2, 3]",
+            // A constant string parsed to a number: no runtime parse exists.
+            "int('123') + i",
+            "double('1.5') > 0.0 && i > 0",
+            // A constant string produced, then compared against a column.
+            "'a' + 'b' == 'ab' && i > 0",
+            // A comprehension over a literal list, closed under its own
+            // iteration variable.
+            "[1, 2, 3].all(k, k > 0) && i > 0",
+            // The calendar fields of an OFFSET timestamp, which the machine's
+            // nanosecond representation cannot answer and the walker can.
+            "timestamp('2024-03-05T06:07:08+09:00').getHours() + i",
+            "timestamp('2024-03-05T06:07:08+09:00').getFullYear() + i",
+        ] {
+            check_batch_f(expr, &cols);
+        }
+    }
+
+    /// The operator sweep's counterpart over CEL's **aggregate** surface: the
+    /// macros, the membership test, the presence test and the index, over a
+    /// runtime-length list — the constructs the operand matrix cannot build
+    /// because a list is not one of its operands.
+    ///
+    /// Same one property, asked the same way: of the expressions the
+    /// tree-walker ANSWERS, how many does the lowering decline? A decline where
+    /// the walker raises costs nothing and is not counted.
+    #[test]
+    fn aggregate_surface_census() {
+        use std::collections::BTreeMap;
+
+        let n = 40;
+        let lens = gen_lens(n, 0x11A5_7C01_D0DE_0001, 3);
+        let total = lens.iter().sum::<i64>() as usize;
+        let price = gen_i64(total, 0x11A5_7C01_D0DE_0002, 0, 30);
+        let tag = gen_str(total, 0x11A5_7C01_D0DE_0003, &["ab", "cd", "ef"]);
+        let nums = gen_i64(total, 0x11A5_7C01_D0DE_0004, -5, 5);
+        let glens = gen_lens(n, 0x11A5_7C01_D0DE_0005, 2);
+        let gtotal = glens.iter().sum::<i64>() as usize;
+        let gn = gen_i64(gtotal, 0x11A5_7C01_D0DE_0006, 0, 9);
+        let rows: Vec<(&str, ColData)> = vec![
+            ("x", ColData::Int(gen_i64(n, 0x11A5_7C01_D0DE_0007, -5, 5))),
+            (
+                "s",
+                ColData::Str(gen_str(n, 0x11A5_7C01_D0DE_0008, &["ab", "cd", "ef"])),
+            ),
+        ];
+        let lists: Vec<(&str, ListCol)> = vec![
+            (
+                "items",
+                record_list(
+                    lens.clone(),
+                    vec![
+                        (Some("price"), ColData::Int(price.clone())),
+                        (Some("tag"), ColData::Str(tag.clone())),
+                    ],
+                ),
+            ),
+            (
+                "nums",
+                record_list(lens.clone(), vec![(None, ColData::Int(nums.clone()))]),
+            ),
+            (
+                "groups",
+                record_list(glens.clone(), vec![(Some("n"), ColData::Int(gn.clone()))]),
+            ),
+        ];
+
+        let mut schema: Schema = rows
+            .iter()
+            .map(|(nm, d)| (nm.to_string(), d.ty()))
+            .collect();
+        for (name, lc) in &lists {
+            for (field, d) in &lc.fields {
+                let path = match field {
+                    Some(f) => format!("{name}[].{f}"),
+                    None => format!("{name}[]"),
+                };
+                schema.insert(path, d.ty());
+            }
+        }
+        let row_ctx = |i: usize| {
+            let mut ctx = Context::default();
+            for (name, d) in &rows {
+                ctx.add_variable_from_value(*name, cell_value(d, i));
+            }
+            for (name, lc) in &lists {
+                ctx.add_variable_from_value(*name, lc.row_value(i));
+            }
+            ctx
+        };
+
+        let exprs = [
+            // The three boolean macros, which reduce a list to a bool.
+            "items.all(i, i.price > 10)",
+            "items.exists(i, i.price > 25)",
+            "items.exists_one(i, i.price == 7)",
+            "nums.all(y, y > 0)",
+            "nums.exists(y, y < 0)",
+            // A macro whose body reads a row column as well as the element.
+            "items.all(i, i.price > x)",
+            // A macro over a STRING element field.
+            "items.all(i, i.tag == 'ab')",
+            "items.exists(i, i.tag.startsWith('a'))",
+            // Two lists side by side.
+            "items.all(i, i.price > 0) && groups.exists(g, g.n > 5)",
+            // The length, and the length in an arithmetic context.
+            "size(items)",
+            "size(items) > 1",
+            "size(items) + size(groups)",
+            "size(nums) == size(items)",
+            // The constant index.
+            "items[0].price",
+            "items[0].price > x",
+            "nums[0]",
+            // Membership over a literal container, the one `in` form there is.
+            "x in [1, 2, 3]",
+            "s in ['ab', 'zz']",
+            "!(x in [0])",
+            // Membership over a runtime list.
+            "x in nums",
+            "!(x in nums)",
+            "x in nums && x > 0",
+            // The list-producing macros.
+            "size(items.map(i, i.price))",
+            "size(items.filter(i, i.price > 1))",
+            "items.map(i, i.price)",
+            "items.filter(i, i.price > 1)",
+            // Presence, and list-valued comparison.
+            "has(items[0].price)",
+            "items == items",
+            "size(items) == 0",
+            // A literal aggregate as a value.
+            "size([1, 2, 3])",
+            "[1, 2, 3][0]",
+            "size({'a': 1})",
+            // Nesting, which needs per-element offsets.
+            "items.all(i, groups.exists(g, g.n > i.price))",
+        ];
+
+        let mut gap: BTreeMap<String, (usize, String)> = BTreeMap::new();
+        let mut answered = 0usize;
+        for expr in exprs {
+            let program = Program::compile(expr).unwrap();
+            if (0..n).any(|k| program.execute(&row_ctx(k)).is_err()) {
+                continue;
+            }
+            answered += 1;
+            if let Err(e) = lower_typed(program.expression(), &schema) {
+                let slot = gap.entry(e.reason).or_insert((0, expr.to_string()));
+                slot.0 += 1;
+            }
+        }
+        let gap_total: usize = gap.values().map(|(k, _)| k).sum();
+        let mut buckets: Vec<(usize, String, String)> =
+            gap.into_iter().map(|(k, (c, ex))| (c, k, ex)).collect();
+        buckets.sort_by_key(|(c, _, _)| std::cmp::Reverse(*c));
+        let breakdown: String = buckets
+            .iter()
+            .map(|(c, reason, ex)| format!("\n  {c:5}  {reason}   e.g. `{ex}`"))
+            .collect();
+        // What is left, and why each is still open:
+        //
+        //   * `map` / `filter` accumulate a LIST. The machine has no list
+        //     value, so the accumulator has nowhere to live — even where the
+        //     only thing asked of it is its length.
+        //   * `items == items` compares two lists elementwise, which is a loop
+        //     over two spans in lockstep rather than the one this machine walks.
+        //   * a nested comprehension needs per-ELEMENT offsets; a flat row
+        //     column cannot express those.
+        const AGGREGATE_CEILING: usize = 6;
+        assert!(
+            gap_total <= AGGREGATE_CEILING,
+            "{gap_total} of {answered} answered aggregate expressions are declined by \
+             the LOWERING (ceiling {AGGREGATE_CEILING}):{breakdown}",
         );
     }
 

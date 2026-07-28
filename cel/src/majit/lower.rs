@@ -29,7 +29,8 @@
 
 use super::bytecode::*;
 use crate::common::ast::operators as ops;
-use crate::common::ast::{CallExpr, ComprehensionExpr, Expr, IdedExpr, LiteralValue};
+use crate::common::ast::{CallExpr, ComprehensionExpr, EntryExpr, Expr, IdedExpr, LiteralValue};
+use crate::{Context, Value};
 use std::collections::HashMap;
 
 /// Reason a CEL expression could not be lowered to the traceable subset.
@@ -1045,6 +1046,20 @@ pub fn lower_typed(expr: &IdedExpr, schema: &Schema) -> Result<LoweredF, LowerEr
 }
 
 fn compile_t(ctx: &mut LowerCtxF, e: &IdedExpr) -> Result<TReg, LowerError> {
+    // A subexpression that reads no variable has the same value on every row of
+    // every batch, so the tree-walker can answer it once, here. This is the
+    // general form of the folds already scattered through this file (a literal
+    // `duration(...)`, an unrolled `x in [..]`), and it is what lets a literal
+    // aggregate — `size([1, 2, 3])`, `[1, 2, 3][0]` — reach a register the
+    // machine has no list or map to build.
+    //
+    // Only a SUCCESSFUL evaluation folds. A constant that raises is left to the
+    // normal path: `false && (1 / 0 > 0)` never evaluates its right operand in
+    // the tree-walker, and folding eagerly would decline an expression the
+    // walker answers.
+    if let Some(r) = fold_constant(ctx, e) {
+        return r;
+    }
     match &e.expr {
         Expr::Literal(lit) => compile_literal_t(ctx, lit),
         Expr::Ident(name) => {
@@ -2013,7 +2028,15 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
         }
         let elements = match &call.args[1].expr {
             Expr::List(list) => &list.elements,
-            _ => return Err(LowerError::unsupported("@in non-literal container")),
+            // A DECLARED list column has a red length, so there is nothing to
+            // unroll against — the membership test becomes an inner loop, the
+            // same one `exists` gets, which is what `in` means over a list.
+            _ => match resolve_path(&call.args[1]) {
+                Ok(path) if declares_list(ctx.schema, &path) => {
+                    return lower_runtime_in(ctx, &call.args[0], &path)
+                }
+                _ => return Err(LowerError::unsupported("@in non-literal container")),
+            },
         };
         let x = compile_t(ctx, &call.args[0])?;
         if elements.is_empty() {
@@ -2466,6 +2489,172 @@ fn compile_comprehension_t(
         ctx.locals.insert(comp.accu_var.clone(), r);
     }
     Ok(result)
+}
+
+/// Whether `e` reads no variable, so its value is the same on every row.
+///
+/// A comprehension's own iteration and accumulator variables are bound WITHIN
+/// the subtree, so a closed comprehension over a literal list stays closed.
+fn is_constant(e: &IdedExpr, bound: &mut Vec<String>) -> bool {
+    let closed = |x: &IdedExpr, b: &mut Vec<String>| is_constant(x, b);
+    match &e.expr {
+        Expr::Literal(_) => true,
+        Expr::Ident(n) => bound.iter().any(|b| b == n),
+        Expr::Select(sel) => closed(&sel.operand, bound),
+        Expr::List(l) => l.elements.iter().all(|x| is_constant(x, bound)),
+        Expr::Map(m) => m.entries.iter().all(|e| match &e.expr {
+            EntryExpr::MapEntry(kv) => is_constant(&kv.key, bound) && is_constant(&kv.value, bound),
+            // A struct field names a message type this machine has no schema
+            // for, so a struct is never folded.
+            EntryExpr::StructField(_) => false,
+        }),
+        Expr::Call(c) => {
+            c.target.as_deref().is_none_or(|t| is_constant(t, bound))
+                && c.args.iter().all(|a| is_constant(a, bound))
+        }
+        Expr::Comprehension(comp) => {
+            if !is_constant(&comp.iter_range, bound) || !is_constant(&comp.accu_init, bound) {
+                return false;
+            }
+            let depth = bound.len();
+            bound.push(comp.iter_var.clone());
+            if let Some(v) = &comp.iter_var2 {
+                bound.push(v.clone());
+            }
+            bound.push(comp.accu_var.clone());
+            let inner = is_constant(&comp.loop_step, bound) && is_constant(&comp.result, bound);
+            bound.truncate(depth);
+            inner
+        }
+        // A struct literal names a message type this machine has no schema for,
+        // and an unspecified expression has no value at all.
+        Expr::Struct(_) | Expr::Unspecified => false,
+    }
+}
+
+/// Evaluate `e` with the tree-walker and emit its value as a constant, if it
+/// reads no variable and the value lands in a bank the machine has.
+///
+/// `None` means "not a constant, carry on"; `Some(Err(..))` means it IS a
+/// constant but not one this machine can hold — a list, a map, `null` — which
+/// is a decline, since re-lowering it would only reach the same place.
+fn fold_constant(ctx: &mut LowerCtxF, e: &IdedExpr) -> Option<Result<TReg, LowerError>> {
+    // A bare literal is already the cheap path, and a bare identifier is never
+    // constant; skipping both keeps the walk off the hot shapes.
+    if matches!(e.expr, Expr::Literal(_) | Expr::Ident(_)) {
+        return None;
+    }
+    if !is_constant(e, &mut Vec::new()) {
+        return None;
+    }
+    let value = Value::resolve(e, &Context::default()).ok()?;
+    Some(emit_constant_value(ctx, &value))
+}
+
+/// A tree-walker [`Value`] as a register holding it, for the banks the machine
+/// has. The encodings are the ones a COLUMN of that type arrives in, so a
+/// folded constant and a column value compare as themselves.
+fn emit_constant_value(ctx: &mut LowerCtxF, v: &Value) -> Result<TReg, LowerError> {
+    let (bank, word) = match v {
+        Value::Int(i) => (ValType::Int, *i),
+        Value::UInt(u) => (ValType::UInt, *u as i64),
+        Value::Bool(b) => (ValType::Bool, *b as i64),
+        Value::Float(f) => {
+            let r = ctx.fresh(ValType::Float);
+            ctx.prelude
+                .extend_from_slice(&[OP_LOAD_CONST_F, f.to_bits() as i64, r.idx as i64]);
+            return Ok(r);
+        }
+        Value::String(s) => return Ok(emit_str_const(ctx, s.to_string())),
+        Value::Timestamp(t) => (
+            ValType::Timestamp,
+            t.timestamp_nanos_opt()
+                .ok_or_else(|| LowerError::unsupported("folded timestamp outside i64-nanos"))?,
+        ),
+        Value::Duration(d) => (
+            ValType::Duration,
+            d.num_nanoseconds()
+                .ok_or_else(|| LowerError::unsupported("folded duration outside i64-nanos"))?,
+        ),
+        other => {
+            return Err(LowerError::unsupported(format!(
+                "constant of type `{}`",
+                other.type_of()
+            )))
+        }
+    };
+    let r = ctx.fresh(bank);
+    ctx.prelude
+        .extend_from_slice(&[OP_LOAD_CONST, word, r.idx as i64]);
+    Ok(r)
+}
+
+/// `x in list` over a DECLARED list column: an inner loop over the row's
+/// elements, OR-ing `elem == x` into a bool accumulator.
+///
+/// CEL defines membership over a list as exactly `list.exists(e, e == x)`, so
+/// this is the same loop `compile_list_comprehension_t` builds for `exists` —
+/// written out here because `@in` arrives as a call rather than as a
+/// comprehension and has no iteration variable to bind.
+///
+/// The loop runs to completion rather than leaving on the first match. A trace
+/// wants one straight-line body with one back-edge; an early exit would be a
+/// second guard on a data-dependent condition, and the elements are already in
+/// cache.
+fn lower_runtime_in(
+    ctx: &mut LowerCtxF,
+    needle: &IdedExpr,
+    list: &str,
+) -> Result<TReg, LowerError> {
+    // Same one-level rule the comprehension has, for the same reason: a list of
+    // lists would need per-element offsets.
+    if ctx.list_loop.is_some() {
+        return Err(LowerError::unsupported("nested runtime-list membership"));
+    }
+    let elem_path = elem_slot_path(list, None);
+    let ty =
+        ctx.schema.get(&elem_path).copied().ok_or_else(|| {
+            LowerError::unsupported(format!("undeclared element path `{elem_path}`"))
+        })?;
+    // The needle is loop-invariant, so it is compiled before the loop opens.
+    let x = compile_t(ctx, needle)?;
+    if x.bank != ty {
+        // A list whose elements cannot equal the needle's bank is `false` in the
+        // tree-walker rather than an error; declining lets the walker own it.
+        return Err(LowerError::unsupported("@in element bank"));
+    }
+
+    let len = ctx.slot_typed(size_slot_path(list), ValType::Int);
+    let off = ctx.slot_typed(offset_slot_path(list), ValType::Int);
+    let one = emit_int_const(ctx, 1);
+    let stride = emit_int_const(ctx, 8);
+
+    // The accumulator is loop-carried, so it lives in a fixed register.
+    let found = ctx.fresh(ValType::Bool);
+    ctx.body
+        .extend_from_slice(&[OP_LOAD_CONST, 0, found.idx as i64]);
+    let j = ctx.fresh(ValType::Int);
+    ctx.body
+        .extend_from_slice(&[OP_LOAD_CONST, 0, j.idx as i64]);
+    // Zero-trip guard: `x in []` is false, and the back-edge is a do-while.
+    let zero_trip = ctx.emit_jump_if_above(one, len);
+
+    let inner = ctx.body.len();
+    let idx = emit_int_bin(ctx, OP_ADD, off, j);
+    let ea = emit_int_bin(ctx, OP_MUL, idx, stride);
+    let v = ctx.elem_slot(elem_path, ea.idx)?;
+    ctx.elem_map.clear();
+    let eq_op = if ty == ValType::Float { OP_FEQ } else { OP_EQ };
+    let hit = ctx.fresh(ValType::Bool);
+    ctx.body
+        .extend_from_slice(&[eq_op, v.idx as i64, x.idx as i64, hit.idx as i64]);
+    ctx.body
+        .extend_from_slice(&[OP_OR, found.idx as i64, hit.idx as i64, found.idx as i64]);
+    ctx.body
+        .extend_from_slice(&[OP_ADD, j.idx as i64, one.idx as i64, j.idx as i64]);
+    ctx.emit_back_edge(len, j, inner);
+    ctx.patch_jump(zero_trip);
+    Ok(found)
 }
 
 /// `list[k]` / `list[k].field` for a green index `k`: read the row's list
