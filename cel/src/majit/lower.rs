@@ -1902,6 +1902,12 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
         if let Some(lit) = as_string_literal(&call.args[0]) {
             return Ok(emit_int_const(ctx, lit.len() as i64));
         }
+        // `size(list.map(..))` / `size(list.filter(..))`: the accumulator is a
+        // list this machine has no value for, but its LENGTH is an int, and a
+        // length is all `size` asks of it.
+        if let Expr::Comprehension(comp) = &call.args[0].expr {
+            return compile_comprehension_len(ctx, comp);
+        }
         let path = match &call.args[0].expr {
             Expr::Ident(n) if !ctx.locals.contains_key(n) => n.clone(),
             Expr::Select(_) => resolve_path(&call.args[0])?,
@@ -2589,6 +2595,122 @@ fn emit_constant_value(ctx: &mut LowerCtxF, v: &Value) -> Result<TReg, LowerErro
     Ok(r)
 }
 
+/// What a runtime-list comprehension's accumulator holds.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AccuMode {
+    /// The accumulator's own value, in whatever bank `accu_init` lands in.
+    /// What `all`, `exists` and `exists_one` need.
+    Value,
+    /// The LENGTH of the list the accumulator would have been, as an int. What
+    /// `map` and `filter` build, and the only thing `size` asks of it.
+    Length,
+}
+
+/// `size(list.map(..))` / `size(list.filter(..))`: the same inner loop, with the
+/// accumulator carrying the length of the list rather than the list.
+///
+/// A list is not a value on this machine, so `map` and `filter` had no
+/// accumulator and declined outright — even where the only thing asked of the
+/// list was how long it is, which is an int like any other.
+///
+/// ⚠️Reachable ONLY from `size`. An int length is not a substitute for the list
+/// itself; handing this register to any other consumer would answer a list
+/// question with a number.
+fn compile_comprehension_len(
+    ctx: &mut LowerCtxF,
+    comp: &ComprehensionExpr,
+) -> Result<TReg, LowerError> {
+    // `map`/`filter` start from `[]` and hand the accumulator straight back, so
+    // anything else is a comprehension whose length this does not know.
+    match &comp.accu_init.expr {
+        Expr::List(l) if l.elements.is_empty() => {}
+        _ => {
+            return Err(LowerError::unsupported(
+                "size() of a non-list comprehension",
+            ))
+        }
+    }
+    match &comp.result.expr {
+        Expr::Ident(n) if *n == comp.accu_var => {}
+        _ => return Err(LowerError::unsupported("size() of a mapped comprehension")),
+    }
+    if comp.iter_var2.is_some() {
+        return Err(LowerError::unsupported("two-variable comprehension"));
+    }
+    let path = resolve_path(&comp.iter_range)?;
+    if !declares_list(ctx.schema, &path) {
+        return Err(LowerError::unsupported("size() over a non-list range"));
+    }
+    compile_list_comprehension_mode(ctx, comp, &path, AccuMode::Length)
+}
+
+/// One iteration's contribution to a list accumulator's LENGTH.
+///
+/// The two shapes the macros desugar to, and no others:
+///
+/// * `map`    — `@result + [e]`, which appends exactly one element.
+/// * `filter` — `c ? (@result + [e]) : @result`, which appends one or none.
+///
+/// `e` is still compiled and its register discarded. Dropping it would answer
+/// where the tree-walker raises: `items.map(i, 1 / i.price)` over a zero price
+/// is an error, not a length.
+///
+/// The one element NOT compiled is a bare `iter_var`, which is what `filter`
+/// appends. Reading a bound variable cannot raise, so there is no error to
+/// preserve — and a record list has no whole-element column to read it from,
+/// only the fields the schema declares.
+fn compile_len_step(
+    ctx: &mut LowerCtxF,
+    step: &IdedExpr,
+    comp: &ComprehensionExpr,
+    accu: TReg,
+) -> Result<TReg, LowerError> {
+    let accu_var = comp.accu_var.as_str();
+    let is_accu = |e: &IdedExpr| matches!(&e.expr, Expr::Ident(n) if n == accu_var);
+    let is_iter = |e: &IdedExpr| matches!(&e.expr, Expr::Ident(n) if *n == comp.iter_var);
+    let Expr::Call(call) = &step.expr else {
+        return Err(LowerError::unsupported("size() of an opaque comprehension"));
+    };
+    match call.func_name.as_str() {
+        // `@result + [e]`: one element, unconditionally.
+        ops::ADD if call.args.len() == 2 && is_accu(&call.args[0]) => {
+            let Expr::List(l) = &call.args[1].expr else {
+                return Err(LowerError::unsupported("size() of a non-append step"));
+            };
+            for e in &l.elements {
+                if is_iter(e) {
+                    continue;
+                }
+                compile_t(ctx, e)?;
+            }
+            let delta = emit_int_const(ctx, l.elements.len() as i64);
+            Ok(emit_int_bin(ctx, OP_ADD, accu, delta))
+        }
+        // `c ? (@result + [e]) : @result`: one element where `c` holds.
+        ops::CONDITIONAL if call.args.len() == 3 && is_accu(&call.args[2]) => {
+            let c = compile_t(ctx, &call.args[0])?;
+            if c.bank != ValType::Bool {
+                return Err(LowerError::unsupported("filter predicate must be bool"));
+            }
+            // The taken arm's own step against a ZERO accumulator is how many
+            // elements the predicate admits, which the select then applies.
+            let zero = emit_int_const(ctx, 0);
+            let taken = compile_len_step(ctx, &call.args[1], comp, zero)?;
+            let none = emit_int_const(ctx, 0);
+            let delta = ctx.fresh(ValType::Int);
+            ctx.body.extend_from_slice(&[
+                OP_SELECT,
+                c.idx as i64,
+                taken.idx as i64,
+                none.idx as i64,
+                delta.idx as i64,
+            ]);
+            Ok(emit_int_bin(ctx, OP_ADD, accu, delta))
+        }
+        _ => Err(LowerError::unsupported("size() of an opaque comprehension")),
+    }
+}
+
 /// `x in list` over a DECLARED list column: an inner loop over the row's
 /// elements, OR-ing `elem == x` into a bool accumulator.
 ///
@@ -2769,6 +2891,15 @@ fn compile_list_comprehension_t(
     comp: &ComprehensionExpr,
     list: &str,
 ) -> Result<TReg, LowerError> {
+    compile_list_comprehension_mode(ctx, comp, list, AccuMode::Value)
+}
+
+fn compile_list_comprehension_mode(
+    ctx: &mut LowerCtxF,
+    comp: &ComprehensionExpr,
+    list: &str,
+    mode: AccuMode,
+) -> Result<TReg, LowerError> {
     // A list of lists would need per-ELEMENT offsets; a flat row column cannot
     // express those, so one level of nesting is the whole subset. This is also
     // what keeps the inner loop body straight-line, which is what makes
@@ -2787,7 +2918,13 @@ fn compile_list_comprehension_t(
     // The accumulator is loop-carried, so it lives in a FIXED register the step
     // writes back to — `loop_step` lands in a different register each time it
     // is compiled, and here it is compiled once and executed many times.
-    let init = compile_t(ctx, &comp.accu_init)?;
+    let init = match mode {
+        AccuMode::Value => compile_t(ctx, &comp.accu_init)?,
+        // The list the step would have built starts empty, so its length starts
+        // at zero. `accu_init` is not compiled at all: it is the `[]` the
+        // machine has no value for.
+        AccuMode::Length => emit_int_const(ctx, 0),
+    };
     let accu = ctx.fresh(init.bank);
     emit_mov(ctx, init, accu);
     let j = ctx.fresh(ValType::Int);
@@ -2806,7 +2943,10 @@ fn compile_list_comprehension_t(
         ea_reg: ea.idx,
     });
     ctx.locals.insert(comp.accu_var.clone(), accu);
-    let step = compile_t(ctx, &comp.loop_step);
+    let step = match mode {
+        AccuMode::Value => compile_t(ctx, &comp.loop_step),
+        AccuMode::Length => compile_len_step(ctx, &comp.loop_step, comp, accu),
+    };
     ctx.list_loop = None;
     ctx.elem_map.clear();
     let step = step?;

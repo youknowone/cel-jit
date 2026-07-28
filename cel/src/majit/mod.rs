@@ -3198,6 +3198,66 @@ mod tests {
         }
     }
 
+    /// `size(list.map(..))` and `size(list.filter(..))`, which build a list the
+    /// machine has no value for and are asked only how long it is.
+    ///
+    /// The cases below cross an empty row, a predicate that admits none, one
+    /// that admits all, and one that admits some, so the zero-trip guard and
+    /// the conditional length step are both exercised on real data.
+    #[test]
+    fn batch_comprehension_length() {
+        let n = 400;
+        let lens = gen_lens(n, 0x7EA5_7C01_D0DE_0001, 3);
+        let total = lens.iter().sum::<i64>() as usize;
+        let price = gen_i64(total, 0x7EA5_7C01_D0DE_0002, 0, 30);
+        let x = ColData::Int(gen_i64(n, 0x7EA5_7C01_D0DE_0003, -5, 5));
+        let items = || {
+            vec![(
+                "items",
+                record_list(
+                    lens.clone(),
+                    vec![(Some("price"), ColData::Int(price.clone()))],
+                ),
+            )]
+        };
+        for expr in [
+            // `map` preserves the length, whatever the body computes.
+            "size(items.map(i, i.price))",
+            "size(items.map(i, i.price * 2 - 1))",
+            "size(items.map(i, i.price)) == size(items)",
+            // `filter` counts what the predicate admits.
+            "size(items.filter(i, i.price > 10))",
+            "size(items.filter(i, i.price > 1000))",
+            "size(items.filter(i, i.price >= 0))",
+            // The predicate may read a row column as well as the element.
+            "size(items.filter(i, i.price > x))",
+            // And the count is an ordinary int afterwards.
+            "size(items.filter(i, i.price > 10)) > 1",
+            "size(items.filter(i, i.price > 10)) + size(items)",
+        ] {
+            check_batch_list(expr, &[("x", x.clone())], &items());
+        }
+    }
+
+    /// The length mode must not answer where the tree-walker RAISES: the body of
+    /// a `map` is evaluated per element even though only the count is wanted, so
+    /// an element whose body overflows has to trap rather than count.
+    #[test]
+    fn comprehension_length_still_traps_on_the_body() {
+        let n = 60;
+        let lens = gen_lens(n, 0x7EA5_7C01_D0DE_0011, 3);
+        let total = lens.iter().sum::<i64>() as usize;
+        // One element at `i64::MAX` makes `i.price * 2` overflow on the row
+        // that holds it, which is `ExecutionError::Overflow` in the walker.
+        let mut price = gen_i64(total, 0x7EA5_7C01_D0DE_0012, 0, 30);
+        price[total / 2] = i64::MAX;
+        let items = vec![(
+            "items",
+            record_list(lens.clone(), vec![(Some("price"), ColData::Int(price))]),
+        )];
+        check_batch_list_refuses("size(items.map(i, i.price * 2))", &[], &items);
+    }
+
     /// `x in list` over a DECLARED list column, which CEL defines as
     /// `list.exists(e, e == x)` and the lowering builds as the same inner loop.
     ///
@@ -4018,16 +4078,19 @@ mod tests {
             .iter()
             .map(|(c, reason, ex)| format!("\n  {c:5}  {reason}   e.g. `{ex}`"))
             .collect();
-        // What is left, and why each is still open:
+        // What is left, and what each would take. All four want a
+        // representation the machine does not have, not an instruction it is
+        // missing:
         //
-        //   * `map` / `filter` accumulate a LIST. The machine has no list
-        //     value, so the accumulator has nowhere to live — even where the
-        //     only thing asked of it is its length.
-        //   * `items == items` compares two lists elementwise, which is a loop
-        //     over two spans in lockstep rather than the one this machine walks.
-        //   * a nested comprehension needs per-ELEMENT offsets; a flat row
-        //     column cannot express those.
-        const AGGREGATE_CEILING: usize = 6;
+        //   * `list.map(..)` / `list.filter(..)` as a VALUE — the list itself
+        //     rather than its length. A per-row output column would have to be
+        //     ragged (a `(len, offset)` pair plus a flat element buffer), where
+        //     today every output is one `i64` per row.
+        //   * `items == items` compares two lists elementwise: a loop over two
+        //     spans in lockstep, where this machine walks one.
+        //   * a nested comprehension needs per-ELEMENT offsets, which a flat
+        //     row column cannot express.
+        const AGGREGATE_CEILING: usize = 4;
         assert!(
             gap_total <= AGGREGATE_CEILING,
             "{gap_total} of {answered} answered aggregate expressions are declined by \
