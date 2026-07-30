@@ -8,7 +8,9 @@
 //! * **Coverage.** How many of his 18 benchmark expressions this JIT lowers at
 //!   all, and the reason each remaining one declines. An external expression
 //!   set nobody here chose is a harder coverage test than a census of what we
-//!   already support.
+//!   already support. A declining case still gets a row: it is still ANSWERED,
+//!   by the tree-walker through the library's own fallback, and dropping it
+//!   from the table would read as an expression this crate cannot evaluate.
 //! * **Throughput.** For the ones that lower: stock `Program::execute` per row,
 //!   the plain Rust bytecode VM, and the compiled trace, over one batch of
 //!   identical data. Only `majit / clean VM` isolates compilation; the ratio to
@@ -21,18 +23,27 @@
 //! invite a ratio that isolates nothing, so his numbers are not carried here;
 //! his benchmark contributes its EXPRESSIONS, which is what a yardstick is for.
 //!
+//! ⚠️ The `stock` column dropped by up to 2.2x when the activations moved to the
+//! library's `RowReader` (`list_indexing` ~210 -> ~92 ns/row, `real_world_policy`
+//! ~630 -> ~350). That is a HARNESS defect fixed, not an evaluator change: the
+//! old builder called `Context::default()` per row, and `Context::default`
+//! constructs `Env::stdlib()` every call, so 50,000 copies of the standard
+//! library were built and held alive at once. One shared root with a child
+//! scope per row measures the same evaluator without that footprint. Every
+//! ratio to stock in this table is therefore SMALLER than it used to print, and
+//! the older, larger figures should not be quoted.
+//!
 //! Row-vs-element note: `map_list_scaling` and `filter_list_scaling` are the two
 //! cases whose cost scales with a list's length, and this file measures them at
 //! one length. `./bench.sh majit_nested_bench` is the ladder for that shape.
 //!
 //! RELEASE ONLY. Run: `./bench.sh majit_vs_cometkim`.
 
-use std::collections::HashMap;
 use std::hint::black_box;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
-use cel::majit::batch::{Batch, BatchError, BatchProgram, ColumnRef, Tier};
+use cel::majit::batch::{Batch, BatchProgram, ColumnRef, RowReader, Tier};
 use cel::majit::bytecode::float_bank::{reset_persistent_state, COMPILES};
 use cel::majit::lower::{Schema, ValType};
 use cel::{Context, Program, Value};
@@ -74,66 +85,6 @@ impl Col {
             },
         }
     }
-
-    /// Row `r` as the tree-walker sees it.
-    fn value(&self, r: usize) -> Value {
-        match self {
-            Col::Int(c) => Value::Int(c[r]),
-            Col::Bool(c) => Value::Bool(c[r]),
-            Col::Str(c) => Value::from(c[r].as_str()),
-            Col::IntList { lens, elems } => {
-                let len = lens[r] as usize;
-                let off = r * len;
-                Value::from(elems[off..off + len].to_vec())
-            }
-        }
-    }
-}
-
-/// A dotted path tree, so `obj.nested.value` reaches the walker as the nested
-/// maps cometkim's context builds by hand.
-#[derive(Default)]
-struct Node {
-    leaf: Option<Value>,
-    kids: HashMap<String, Node>,
-}
-
-impl Node {
-    fn insert(&mut self, path: &str, value: Value) {
-        match path.split_once('.') {
-            None => self.kids.entry(path.to_string()).or_default().leaf = Some(value),
-            Some((head, rest)) => self
-                .kids
-                .entry(head.to_string())
-                .or_default()
-                .insert(rest, value),
-        }
-    }
-
-    fn value(&self) -> Value {
-        match &self.leaf {
-            Some(v) => v.clone(),
-            None => Value::from(
-                self.kids
-                    .iter()
-                    .map(|(k, n)| (k.clone(), n.value()))
-                    .collect::<HashMap<String, Value>>(),
-            ),
-        }
-    }
-}
-
-/// The activation for row `r`: every column's row value, nested under its path.
-fn row_context(cols: &[(&'static str, Col)], r: usize) -> Context<'static> {
-    let mut root = Node::default();
-    for (name, col) in cols {
-        root.insert(name, col.value(r));
-    }
-    let mut ctx = Context::default();
-    for (name, node) in &root.kids {
-        ctx.add_variable_from_value(name.clone(), node.value());
-    }
-    ctx
 }
 
 #[inline]
@@ -273,7 +224,15 @@ struct Case {
     /// path, so this is the case's input type declaration, not a convenience.
     schema: &'static [(&'static str, ValType)],
     build: Build,
+    /// The functions this case's expression calls, registered on the context
+    /// the tree-walker gets. A registered function is an opaque Rust closure,
+    /// so the lowering — which holds only the schema — declines the expression
+    /// and the walker answers it; without this the walker could not either.
+    register: fn(&mut Context<'static>),
 }
+
+/// The cases that call nothing beyond the standard library.
+fn no_functions(_: &mut Context<'static>) {}
 
 const CASES: &[Case] = &[
     Case {
@@ -281,18 +240,21 @@ const CASES: &[Case] = &[
         src: "1 + 2 * 3 - 4 / 2",
         schema: &[],
         build: no_columns,
+        register: no_functions,
     },
     Case {
         label: "comparison",
         src: "10 > 5 && 3 < 7 || 1 == 1",
         schema: &[],
         build: no_columns,
+        register: no_functions,
     },
     Case {
         label: "conditional",
         src: "x > 10 ? x * 2 : x + 5",
         schema: &[("x", ValType::Int)],
         build: one_int_x,
+        register: no_functions,
     },
     Case {
         label: "nested_expression",
@@ -308,12 +270,14 @@ const CASES: &[Case] = &[
             ("h", ValType::Int),
         ],
         build: nested_operands,
+        register: no_functions,
     },
     Case {
         label: "variable_access/hashmap",
         src: "apple",
         schema: &[("apple", ValType::Bool)],
         build: one_bool_apple,
+        register: no_functions,
     },
     // cometkim benchmarks the same expression shape through a
     // `VariableResolver` instead of the context's map. A resolver is a way of
@@ -324,6 +288,7 @@ const CASES: &[Case] = &[
         src: "banana",
         schema: &[("banana", ValType::Bool)],
         build: one_bool_banana,
+        register: no_functions,
     },
     Case {
         label: "member_access",
@@ -333,60 +298,70 @@ const CASES: &[Case] = &[
             ("obj.other", ValType::Int),
         ],
         build: member_fields,
+        register: no_functions,
     },
     Case {
         label: "list_indexing",
         src: "list[0] + list[5] + list[9]",
         schema: &[("list[]", ValType::Int)],
         build: one_int_list,
+        register: no_functions,
     },
     Case {
         label: "list_filter",
         src: "[1, 2, 3, 4, 5, 6, 7, 8, 9, 10].filter(x, x > 5)",
         schema: &[],
         build: no_columns,
+        register: no_functions,
     },
     Case {
         label: "list_map",
         src: "[1, 2, 3, 4, 5].map(x, x * 2)",
         schema: &[],
         build: no_columns,
+        register: no_functions,
     },
     Case {
         label: "all_comprehension",
         src: "[1, 2, 3, 4, 5].all(x, x > 0)",
         schema: &[],
         build: no_columns,
+        register: no_functions,
     },
     Case {
         label: "exists_comprehension",
         src: "[1, 2, 3, 4, 5].exists(x, x == 3)",
         schema: &[],
         build: no_columns,
+        register: no_functions,
     },
     Case {
         label: "map_list_scaling",
         src: "list.map(x, x * 2)",
         schema: &[("list[]", ValType::Int)],
         build: one_int_list,
+        register: no_functions,
     },
     Case {
         label: "filter_list_scaling",
         src: "list.filter(x, x % 2 == 0)",
         schema: &[("list[]", ValType::Int)],
         build: one_int_list,
+        register: no_functions,
     },
     Case {
         label: "comprehension_scaling",
         src: "items.filter(x, x % 2 == 0).map(x, x * 2)",
         schema: &[("items[]", ValType::Int)],
         build: one_int_list_items,
+        register: no_functions,
     },
     Case {
         label: "string_operations",
         src: r#""hello world".startsWith("hello") && "hello world".endsWith("world") && "hello world".contains("o w")"#,
         schema: &[],
         build: no_columns,
+        register: no_functions,
     },
     Case {
         label: "custom_function",
@@ -398,6 +373,10 @@ const CASES: &[Case] = &[
             ("b", ValType::Int),
         ],
         build: custom_fn_operands,
+        register: |ctx| {
+            ctx.add_function("add", |a: i64, b: i64| a + b);
+            ctx.add_function("multiply", |a: i64, b: i64| a * b);
+        },
     },
     Case {
         label: "real_world_policy",
@@ -414,6 +393,7 @@ const CASES: &[Case] = &[
             ("request.body", ValType::Str),
         ],
         build: policy_request,
+        register: no_functions,
     },
 ];
 
@@ -451,23 +431,30 @@ fn walker_sum(values: &[Value], label: &str) -> Value {
     Value::Int(total)
 }
 
-struct Row {
-    label: &'static str,
-    stock: f64,
+/// What the compiled tiers did, or why they did not run.
+struct Batched {
     clean: f64,
     jit: f64,
     compiles: usize,
 }
 
-fn run_case(case: &Case) -> Result<Row, String> {
-    let program = Program::compile(case.src).map_err(|e| format!("parse error: {e:?}"))?;
+struct Row {
+    label: &'static str,
+    stock: f64,
+    /// `Err` when the expression does not lower: the tree-walker answers it —
+    /// through the library's own fallback, not a hand-written one — and there
+    /// is no compiled tier to put beside a clean one.
+    batch: Result<Batched, String>,
+}
+
+fn run_case(case: &Case) -> Row {
+    let program =
+        Program::compile(case.src).unwrap_or_else(|e| panic!("{}: parse error: {e:?}", case.label));
     let schema: Schema = case
         .schema
         .iter()
         .map(|(p, t)| (p.to_string(), *t))
         .collect();
-    let lowered =
-        BatchProgram::from_program(&program, &schema).map_err(|e| format!("declines: {e}"))?;
 
     let cols = (case.build)(ROWS);
     let mut batch = Batch::new(ROWS);
@@ -478,7 +465,14 @@ fn run_case(case: &Case) -> Result<Row, String> {
     // The stock panel evaluates prebuilt activations: cometkim's benchmark also
     // holds its context fixed outside the timed region, and building one per row
     // inside it would time context construction, not evaluation.
-    let contexts: Vec<Context> = (0..ROWS).map(|r| row_context(&cols, r)).collect();
+    //
+    // They come from the LIBRARY's `RowReader`, over the same `Batch` the
+    // compiled tiers read, so the oracle cannot drift from what the machine is
+    // fed — which is the whole reason the reconstruction moved out of here.
+    let mut base = Context::default();
+    (case.register)(&mut base);
+    let reader = RowReader::new(&batch);
+    let contexts: Vec<Context> = (0..ROWS).map(|r| reader.scope(&base, r)).collect();
     let walked: Vec<Value> = contexts
         .iter()
         .map(|ctx| {
@@ -488,39 +482,58 @@ fn run_case(case: &Case) -> Result<Row, String> {
         })
         .collect();
 
-    let per_row = lowered.lowered().list_output.is_some();
+    let lowered = BatchProgram::from_program(&program, &schema);
+    // A fresh driver, so `compiles` counts this case's loops and not a loop an
+    // earlier case left compiled at the same program address.
+    reset_persistent_state();
+    let bound = match &lowered {
+        Ok(bp) => {
+            let per_row = bp.lowered().list_output.is_some();
+            let b = if per_row {
+                bp.bind_per_row(&batch)
+            } else {
+                bp.bind(&batch)
+            };
+            match b {
+                Ok(b) => Ok((b, per_row)),
+                Err(e) => Err(format!("cannot bind: {e}")),
+            }
+        }
+        Err(e) => Err(format!("declines: {e}")),
+    };
+    let bound = match bound {
+        Ok(b) => Some(b),
+        Err(why) => {
+            return Row {
+                label: case.label,
+                stock: best(time_stock(&program, &contexts)),
+                batch: Err(why),
+            }
+        }
+    };
+    let (bound, per_row) = bound.unwrap();
+
     let expected = if per_row {
         Oracle::PerRow(walked.clone())
     } else {
         Oracle::Sum(walker_sum(&walked, case.label))
     };
 
-    // A fresh driver, so `compiles` counts this case's loops and not a loop an
-    // earlier case left compiled at the same program address.
-    reset_persistent_state();
-    let bound = match if per_row {
-        lowered.bind_per_row(&batch)
-    } else {
-        lowered.bind(&batch)
-    } {
-        Ok(b) => b,
-        Err(BatchError::Lower(e)) => return Err(format!("declines: {e}")),
-        Err(e) => return Err(format!("cannot bind: {e}")),
-    };
-
     // Miscompile gate: all three tiers, and the tree-walker, agree.
     COMPILES.store(0, Ordering::Relaxed);
     for tier in [Tier::Clean, Tier::Interpreter, Tier::Jit] {
         let got = if per_row {
-            bound
-                .collect_on(tier)
-                .map(Oracle::PerRow)
-                .map_err(|e| format!("{}: {tier:?}: {e}", case.label))?
+            Oracle::PerRow(
+                bound
+                    .collect_on(tier)
+                    .unwrap_or_else(|e| panic!("{}: {tier:?}: {e}", case.label)),
+            )
         } else {
-            bound
-                .sum_on(tier)
-                .map(Oracle::Sum)
-                .map_err(|e| format!("{}: {tier:?}: {e}", case.label))?
+            Oracle::Sum(
+                bound
+                    .sum_on(tier)
+                    .unwrap_or_else(|e| panic!("{}: {tier:?}: {e}", case.label)),
+            )
         };
         match (&expected, &got) {
             (Oracle::Sum(a), Oracle::Sum(b)) => {
@@ -546,13 +559,7 @@ fn run_case(case: &Case) -> Result<Row, String> {
     let mut clean = Vec::with_capacity(ROUNDS);
     let mut jit = Vec::with_capacity(ROUNDS);
     for _ in 0..ROUNDS {
-        stock.push(time_ns_per_row(|| {
-            let mut sink = 0usize;
-            for ctx in &contexts {
-                sink ^= black_box(program.execute(black_box(ctx)).is_ok()) as usize;
-            }
-            sink
-        }));
+        stock.push(time_one_stock(&program, &contexts));
         let run = |tier| {
             if per_row {
                 bound.collect_on(tier).map(|_| ())
@@ -564,13 +571,32 @@ fn run_case(case: &Case) -> Result<Row, String> {
         jit.push(time_ns_per_row(|| run(Tier::Jit)));
     }
 
-    Ok(Row {
+    Row {
         label: case.label,
         stock: best(stock),
-        clean: best(clean),
-        jit: best(jit),
-        compiles,
+        batch: Ok(Batched {
+            clean: best(clean),
+            jit: best(jit),
+            compiles,
+        }),
+    }
+}
+
+/// One timed pass of the tree-walker over every prebuilt activation.
+fn time_one_stock(program: &Program, contexts: &[Context]) -> f64 {
+    time_ns_per_row(|| {
+        let mut sink = 0usize;
+        for ctx in contexts {
+            sink ^= black_box(program.execute(black_box(ctx)).is_ok()) as usize;
+        }
+        sink
     })
+}
+
+fn time_stock(program: &Program, contexts: &[Context]) -> Vec<f64> {
+    (0..ROUNDS)
+        .map(|_| time_one_stock(program, contexts))
+        .collect()
 }
 
 fn main() {
@@ -584,25 +610,38 @@ fn main() {
     let mut declined = Vec::new();
     let mut lowered = 0;
     for case in CASES {
-        match run_case(case) {
-            Ok(r) => {
+        let r = run_case(case);
+        match &r.batch {
+            Ok(b) => {
                 lowered += 1;
                 println!(
                     "{:<24} {:>12.1} {:>12.2} {:>12.2} {:>9.2}x {:>9}",
                     r.label,
                     r.stock,
-                    r.clean,
-                    r.jit,
-                    r.clean / r.jit,
-                    r.compiles
+                    b.clean,
+                    b.jit,
+                    b.clean / b.jit,
+                    b.compiles
                 );
             }
-            Err(why) => declined.push((case.label, why)),
+            Err(why) => {
+                // Still measured and still ANSWERED — by the tree-walker,
+                // through the library's fallback. A row missing from the table
+                // would read as an expression this crate cannot evaluate.
+                println!(
+                    "{:<24} {:>12.1} {:>12} {:>12} {:>10} {:>9}",
+                    r.label, r.stock, "-", "walker", "-", "-"
+                );
+                declined.push((case.label, why.clone()));
+            }
         }
     }
 
     println!(
-        "\ncoverage: {lowered}/{} of cometkim's expressions lower",
+        "\ncoverage: {lowered}/{} of cometkim's expressions lower to the compiled tier; \
+         {}/{} are answered",
+        CASES.len(),
+        CASES.len(),
         CASES.len()
     );
     for (label, why) in &declined {
