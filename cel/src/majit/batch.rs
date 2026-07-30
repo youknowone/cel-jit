@@ -68,7 +68,7 @@ use super::lower::{
     ValType,
 };
 use crate::objects::Key;
-use crate::{Program, Value};
+use crate::{Context, Program, Value};
 
 /// Trace threshold [`Tier::Jit`] runs at: the batch loop compiles after this
 /// many iterations. Matches the threshold the benchmarks and tests use.
@@ -118,6 +118,15 @@ pub enum BatchError {
     /// A row's arithmetic trapped — an `int` overflow or a division by zero,
     /// where the tree-walker raises. No sum is the right answer.
     Trapped,
+    /// The tree-walker could not evaluate a row either, on the fallback path.
+    /// A real CEL error, not a limit of the batch model — the expression has no
+    /// value for this row however it is run.
+    Row {
+        /// Which row.
+        row: usize,
+        /// What the walker said.
+        message: String,
+    },
 }
 
 impl std::fmt::Display for BatchError {
@@ -138,6 +147,7 @@ impl std::fmt::Display for BatchError {
                  this expression's temporal arithmetic is exact in"
             ),
             BatchError::Trapped => write!(f, "a row trapped (overflow or division by zero)"),
+            BatchError::Row { row, message } => write!(f, "row {row}: {message}"),
         }
     }
 }
@@ -792,6 +802,217 @@ fn dispatch(tier: Tier, threshold: u32, code: &[i64], regs: &[i64], nf: usize) -
     }
 }
 
+/// Reads a batch's columns back as the values the tree-walker takes.
+///
+/// This is the other half of the batch model's contract. Every [`BatchError`]
+/// means "evaluate this with [`Program::execute`] instead", and without this a
+/// caller has to build that path themselves — including the two parts that are
+/// easy to get wrong:
+///
+/// * A DOTTED column name is a NESTED MAP to the walker, not a variable with a
+///   dot in its name. `obj.nested.value` must arrive as `obj` → `nested` →
+///   `value`, or the walker raises `NoSuchKey` on an expression the batch
+///   answers.
+/// * A list column's row starts at the sum of every earlier row's element
+///   count. Walked per row that is quadratic, so the offsets are computed once
+///   here.
+pub struct RowReader<'a, 'b> {
+    batch: &'b Batch<'a>,
+    /// Exclusive prefix sums of each list column's per-row element counts.
+    offsets: HashMap<&'b str, Vec<i64>>,
+}
+
+/// One level of the variable tree a dotted column name expands to.
+#[derive(Default)]
+struct Node<'b> {
+    leaf: Option<Value>,
+    kids: HashMap<&'b str, Node<'b>>,
+}
+
+impl<'b> Node<'b> {
+    fn insert(&mut self, path: &'b str, v: Value) {
+        match path.split_once('.') {
+            Some((head, rest)) => self.kids.entry(head).or_default().insert(rest, v),
+            None => self.kids.entry(path).or_default().leaf = Some(v),
+        }
+    }
+
+    /// A leaf is its own value; anything else is the map of its children.
+    fn value(self) -> Value {
+        if let Some(v) = self.leaf {
+            return v;
+        }
+        Value::Map(crate::objects::Map {
+            map: std::sync::Arc::new(
+                self.kids
+                    .into_iter()
+                    .map(|(k, n)| (Key::String(std::sync::Arc::new(k.to_string())), n.value()))
+                    .collect(),
+            ),
+        })
+    }
+}
+
+impl<'a, 'b> RowReader<'a, 'b> {
+    pub fn new(batch: &'b Batch<'a>) -> Self {
+        let offsets = batch
+            .columns
+            .iter()
+            .filter_map(|(name, col)| {
+                let ColumnRef::List { lens, .. } = col else {
+                    return None;
+                };
+                let mut acc = 0i64;
+                let offs = lens
+                    .iter()
+                    .map(|&l| {
+                        let o = acc;
+                        acc += l;
+                        o
+                    })
+                    .collect();
+                Some((name.as_str(), offs))
+            })
+            .collect();
+        Self { batch, offsets }
+    }
+
+    /// A CHILD scope of `base` holding `row`'s variables.
+    ///
+    /// A child rather than a fresh context so the caller's own functions and
+    /// variables stay visible: an expression the batch declines for calling a
+    /// registered function is exactly the one that needs them.
+    pub fn scope<'p>(&self, base: &'p Context<'p>, row: usize) -> Context<'p> {
+        let mut tree = Node::default();
+        for (name, col) in &self.batch.columns {
+            tree.insert(name, self.value(name, col, row));
+        }
+        let mut ctx = base.new_inner_scope();
+        for (name, node) in tree.kids {
+            ctx.add_variable_from_value(name, node.value());
+        }
+        ctx
+    }
+
+    /// One column's value at `row` — a scalar, or a list's own elements.
+    fn value(&self, name: &str, col: &ColumnRef<'a>, row: usize) -> Value {
+        let ColumnRef::List { lens, fields } = col else {
+            return cell(col, row);
+        };
+        let start = self.offsets[name][row] as usize;
+        let elems = (0..lens[row] as usize)
+            .map(|j| match fields.as_slice() {
+                // An unnamed field names the elements themselves, so a row's
+                // element IS the scalar rather than a one-entry map.
+                [(None, c)] => cell(c, start + j),
+                _ => Value::Map(crate::objects::Map {
+                    map: std::sync::Arc::new(
+                        fields
+                            .iter()
+                            .filter_map(|(f, c)| {
+                                let f = (*f)?;
+                                Some((
+                                    Key::String(std::sync::Arc::new(f.to_string())),
+                                    cell(c, start + j),
+                                ))
+                            })
+                            .collect(),
+                    ),
+                }),
+            })
+            .collect();
+        Value::List(std::sync::Arc::new(elems))
+    }
+}
+
+/// One scalar cell, as the tree-walker sees it. A temporal column is
+/// nanoseconds, which is the representation the batch declared it in.
+fn cell(col: &ColumnRef, k: usize) -> Value {
+    match col {
+        ColumnRef::Int(c) => Value::Int(c[k]),
+        ColumnRef::Bool(c) => Value::Bool(c[k]),
+        ColumnRef::UInt(c) => Value::UInt(c[k]),
+        ColumnRef::Float(c) => Value::Float(c[k]),
+        ColumnRef::Str(c) => Value::String(std::sync::Arc::new(c[k].clone())),
+        ColumnRef::Timestamp(c) => {
+            Value::Timestamp(chrono::DateTime::from_timestamp_nanos(c[k]).fixed_offset())
+        }
+        ColumnRef::Duration(c) => Value::Duration(chrono::Duration::nanoseconds(c[k])),
+        // A list of lists is not a shape the schema can declare, so a list
+        // column is never a field of another one.
+        ColumnRef::List { .. } => Value::Null,
+    }
+}
+
+/// Which evaluator answered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Answered {
+    /// The lowered bytecode, on the tier that was asked for.
+    Batch,
+    /// The tree-walker, row by row: the expression did not lower, or a row
+    /// trapped.
+    Walker,
+}
+
+/// Every row's value for `program` over `batch` — from the batch tiers where
+/// the expression lowers and no row traps, and from the tree-walker otherwise.
+///
+/// This is the batch model's whole contract in one call. An expression outside
+/// the subset and a trapped row are not outcomes a caller can act on
+/// differently — both mean "the walker owns this" — so they are taken here
+/// rather than handed back, and [`Answered`] says which path ran.
+///
+/// What is still handed back is a real error: a column the expression reads and
+/// the batch does not carry, a column whose type or length disagrees, or a row
+/// the WALKER could not evaluate either.
+///
+/// For a sum, use [`BatchProgram`] directly and fall back with [`RowReader`];
+/// folding per-row values here would hide which of the two ran.
+pub fn eval_per_row(
+    program: &Program,
+    schema: &Schema,
+    batch: &Batch,
+    base: &Context,
+) -> Result<(Vec<Value>, Answered), BatchError> {
+    eval_per_row_on(program, schema, batch, base, Tier::Jit)
+}
+
+/// [`eval_per_row`] on a chosen tier — for a harness comparing them, or a
+/// caller that wants the plain VM.
+pub fn eval_per_row_on(
+    program: &Program,
+    schema: &Schema,
+    batch: &Batch,
+    base: &Context,
+    tier: Tier,
+) -> Result<(Vec<Value>, Answered), BatchError> {
+    let batched = BatchProgram::from_program(program, schema)
+        .and_then(|bp| bp.bind_per_row(batch)?.collect_on(tier));
+    match batched {
+        Ok(v) => Ok((v, Answered::Batch)),
+        // Only the two data-independent-of-the-caller outcomes fall back. A
+        // missing or mistyped column is the caller's own description of the
+        // batch being wrong, and the walker would fail on it too.
+        Err(
+            BatchError::Lower(_) | BatchError::Trapped | BatchError::TemporalOutOfDomain { .. },
+        ) => {
+            let reader = RowReader::new(batch);
+            let values = (0..batch.rows())
+                .map(|row| {
+                    program
+                        .execute(&reader.scope(base, row))
+                        .map_err(|e| BatchError::Row {
+                            row,
+                            message: e.to_string(),
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok((values, Answered::Walker))
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// One stored row result, read back as the CEL value it stands for.
 ///
 /// `distinct` is the batch's strings in rank order and is only consulted for a
@@ -955,5 +1176,122 @@ mod tests {
             program.bind(&batch).unwrap().sum_on(Tier::Clean).unwrap(),
             Value::Int(2)
         );
+    }
+
+    /// The fallback contract: an expression the batch cannot answer is still
+    /// answered, by the tree-walker, over the SAME columns — including the two
+    /// reconstructions a caller would have to get right by hand.
+    #[test]
+    fn the_walker_answers_what_the_batch_refuses() {
+        let s = schema(&[
+            ("x", ValType::Int),
+            ("obj.nested.value", ValType::Int),
+            ("tags[]", ValType::Str),
+        ]);
+        let x = vec![1i64, 2, 3, 4];
+        let nested = vec![10i64, 20, 30, 40];
+        let lens = vec![2i64, 0, 1, 3];
+        let tags: Vec<String> = ["a", "bb", "ccc", "d", "ee", "f"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let batch = Batch::new(4)
+            .column("x", ColumnRef::Int(&x))
+            .column("obj.nested.value", ColumnRef::Int(&nested))
+            .column(
+                "tags",
+                ColumnRef::List {
+                    lens: &lens,
+                    fields: vec![(None, ColumnRef::Str(&tags))],
+                },
+            );
+        let mut base = Context::default();
+        base.add_function("triple", |v: i64| v * 3);
+
+        // In subset: the batch answers, and the dotted name is a column.
+        let p = Program::compile("x + obj.nested.value").unwrap();
+        let (v, who) = eval_per_row(&p, &s, &batch, &base).unwrap();
+        assert_eq!(who, Answered::Batch);
+        assert_eq!(v[2], Value::Int(33));
+
+        // Out of subset (a registered function the lowering cannot see into):
+        // the walker answers, and it needs `obj` as a NESTED MAP and the
+        // caller's own function.
+        let p = Program::compile("triple(obj.nested.value) + x").unwrap();
+        let (v, who) = eval_per_row(&p, &s, &batch, &base).unwrap();
+        assert_eq!(who, Answered::Walker);
+        assert_eq!(
+            v,
+            vec![
+                Value::Int(31),
+                Value::Int(62),
+                Value::Int(93),
+                Value::Int(124)
+            ]
+        );
+
+        // A list column, rebuilt per row from the flattened buffer at the right
+        // offset — row 1 is empty and row 3 starts at element 3.
+        let p = Program::compile("triple(x) > 0 ? tags : tags").unwrap();
+        let (v, who) = eval_per_row(&p, &s, &batch, &base).unwrap();
+        assert_eq!(who, Answered::Walker);
+        let row = |k: usize| match &v[k] {
+            Value::List(l) => l
+                .iter()
+                .map(|e| match e {
+                    Value::String(s) => s.to_string(),
+                    other => panic!("not a string: {other:?}"),
+                })
+                .collect::<Vec<_>>(),
+            other => panic!("not a list: {other:?}"),
+        };
+        assert_eq!(row(0), ["a", "bb"]);
+        assert!(row(1).is_empty());
+        assert_eq!(row(2), ["ccc"]);
+        assert_eq!(row(3), ["d", "ee", "f"]);
+    }
+
+    /// A trapped batch falls back rather than surfacing the trap, and the
+    /// walker's own error surfaces as a row error rather than as a fallback.
+    #[test]
+    fn a_trap_falls_back_and_a_real_error_surfaces() {
+        let s = schema(&[("a", ValType::Int), ("b", ValType::Int)]);
+        let a = vec![10i64, 20, 30, 40, 50, 60, 70, 80, 90, 100];
+        let base = Context::default();
+
+        // Division by zero on one row: the batch traps, the walker answers the
+        // rows it can -- and raises on the one it cannot, which is a row error.
+        let mut b = vec![2i64; 10];
+        b[7] = 0;
+        let batch = Batch::new(10)
+            .column("a", ColumnRef::Int(&a))
+            .column("b", ColumnRef::Int(&b));
+        let p = Program::compile("a / b").unwrap();
+        assert!(matches!(
+            eval_per_row(&p, &s, &batch, &base),
+            Err(BatchError::Row { row: 7, .. })
+        ));
+
+        // The same expression with no zero divisor is answered by the batch.
+        let b = vec![2i64; 10];
+        let batch = Batch::new(10)
+            .column("a", ColumnRef::Int(&a))
+            .column("b", ColumnRef::Int(&b));
+        let (v, who) = eval_per_row(&p, &s, &batch, &base).unwrap();
+        assert_eq!(who, Answered::Batch);
+        assert_eq!(v[0], Value::Int(5));
+    }
+
+    /// A column the expression reads and the batch does not carry is the
+    /// caller's own mistake, not something the walker can rescue.
+    #[test]
+    fn a_missing_column_is_not_fallen_back_on() {
+        let s = schema(&[("a", ValType::Int)]);
+        let batch = Batch::new(2);
+        let p = Program::compile("a + 1").unwrap();
+        assert!(matches!(
+            eval_per_row(&p, &s, &batch, &Context::default()),
+            Err(BatchError::MissingColumn(_))
+        ));
     }
 }
