@@ -417,9 +417,12 @@ const CASES: &[Case] = &[
     },
 ];
 
-fn median(mut v: Vec<f64>) -> f64 {
-    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    v[v.len() / 2]
+/// The MINIMUM over rounds. Other work on the box can only ever make a round
+/// slower, so the fastest round is the one that ran with the least interference
+/// and is the robust estimator of a tier's own cost; a median moves with how
+/// loaded the machine happened to be, which is what makes a ratio unreadable.
+fn best(v: Vec<f64>) -> f64 {
+    v.into_iter().fold(f64::INFINITY, f64::min)
 }
 
 fn time_ns_per_row<T>(mut run: impl FnMut() -> T) -> f64 {
@@ -530,6 +533,14 @@ fn run_case(case: &Case) -> Result<Row, String> {
         }
     }
     let compiles = COMPILES.load(Ordering::Relaxed);
+    // Without this the `majit` column of a case that never compiled would be the
+    // tracing interpreter's number under the compiled tier's heading. The driver
+    // was reset just above, so every case has to compile on its own.
+    assert!(
+        compiles >= 1,
+        "{}: the hot batch loop never compiled",
+        case.label
+    );
 
     let mut stock = Vec::with_capacity(ROUNDS);
     let mut clean = Vec::with_capacity(ROUNDS);
@@ -555,18 +566,16 @@ fn run_case(case: &Case) -> Result<Row, String> {
 
     Ok(Row {
         label: case.label,
-        stock: median(stock),
-        clean: median(clean),
-        jit: median(jit),
+        stock: best(stock),
+        clean: best(clean),
+        jit: best(jit),
         compiles,
     })
 }
 
 fn main() {
     println!("cometkim's benchmark expressions (cel-jit PR #233 benches/comparison.rs)");
-    println!(
-        "{ROWS} rows per case; median of {ROUNDS}; every tier gated against the tree-walker.\n"
-    );
+    println!("{ROWS} rows per case; best of {ROUNDS}; every tier gated against the tree-walker.\n");
     println!(
         "{:<24} {:>12} {:>12} {:>12} {:>10} {:>9}",
         "case", "stock ns/row", "clean ns/row", "majit ns/row", "majit/clean", "compiles"

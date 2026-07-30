@@ -175,10 +175,12 @@ fn request_latency(label: &str, expression: &str, schema: &Schema, samples: &[Re
     black_box(observed);
 
     let stock_ns = median_f64(timings);
-    let subset = if lower_typed(program.expression(), schema).is_ok() {
-        "lowerable"
-    } else {
-        "not lowerable"
+    // Carry the decline REASON, not just the verdict: a schema this harness
+    // declared wrong reads exactly like a structural limit of the subset if all
+    // that is printed is "no".
+    let subset = match lower_typed(program.expression(), schema) {
+        Ok(_) => "lowerable".to_string(),
+        Err(e) => format!("not lowerable: {e}"),
     };
     println!("{label}: {expression}");
     println!("  stock cached Program::execute : {stock_ns:>9.2} ns/eval");

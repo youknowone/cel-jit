@@ -338,6 +338,14 @@ fn main() {
          timed region only until one of them has paid for the loop; the `cmp` column says which"
     );
 
+    // Whether the compiled tier was ever reached. Tracked across the whole run
+    // rather than per shape or per point: the interned program is the same
+    // everywhere here — only the data and the seeded base registers change — so
+    // the first point to trace pays for every later one, and `cmp 0` on a
+    // shape is the normal case, not a miss.
+    let mut swept = 0usize;
+    let mut compiled_somewhere = false;
+
     for (label, len_of) in cases {
         if let Some(filter) = &only {
             if !label.contains(filter.as_str()) {
@@ -399,6 +407,9 @@ fn main() {
             points.push(p);
         }
 
+        swept += points.len();
+        compiled_somewhere |= points.iter().any(|p| p.compiles >= 1);
+
         // Least squares over the whole ladder rather than a two-point slope: one
         // noisy point cannot then invert the fit into a negative per-row cost.
         let (compile, steady_jit) = fit(&points, |p| p.jit);
@@ -444,4 +455,12 @@ fn main() {
             largest.rows,
         );
     }
+
+    // Without this, a run where nothing ever compiled would still print a `jit`
+    // column — the tracing interpreter's, which is the SLOWEST tier here, under
+    // the compiled tier's heading.
+    assert!(
+        swept == 0 || compiled_somewhere,
+        "no swept size compiled the loop, so every `jit` column is the interpreter"
+    );
 }

@@ -212,7 +212,7 @@ mod tests {
         let trap_addr = (&mut *trap) as *mut i64 as i64;
         // One instruction per line: the operand grouping IS the program.
         #[rustfmt::skip]
-        let prog: Vec<i64> = vec![
+        let mut prog: Vec<i64> = vec![
             OP_LOAD_CONST, 0, 0,
             OP_LOAD_CONST, n, 1,
             OP_LOAD_CONST, 0, 2,
@@ -220,13 +220,20 @@ mod tests {
             OP_LOAD_CONST, 1, 4,
             OP_LOAD_CONST, 0, 5,
             OP_LOAD_CONST, trap_addr, 6,
-            // loop_start @ pc = 21
-            OP_ADD_OVF, 2, 3, 2, 5,     // acc = ovfchecked(acc + inc), trap -> r5
-            OP_ADD, 0, 4, 0,            // i = i + 1
-            OP_JUMP_IF_ABOVE, 1, 0, 21, // while n > i
-            OP_TRAP_STORE, 6, 5,        // *trap_addr = trap_flag
-            OP_RETURN, 2,
         ];
+        // Taken from the prelude's length rather than written out: a back-edge
+        // to a hardcoded pc that a prelude edit has moved lands mid-instruction,
+        // which is not a test failure but a program that runs off into the
+        // words after it.
+        let body_pc = prog.len() as i64;
+        #[rustfmt::skip]
+        prog.extend_from_slice(&[
+            OP_ADD_OVF, 2, 3, 2, 5,          // acc = ovfchecked(acc + inc), trap -> r5
+            OP_ADD, 0, 4, 0,                 // i = i + 1
+            OP_JUMP_IF_ABOVE, 1, 0, body_pc, // while n > i
+            OP_TRAP_STORE, 6, 5,             // *trap_addr = trap_flag
+            OP_RETURN, 2,
+        ]);
         let before = COMPILES_F.load(Ordering::Relaxed);
         let jit = run_jit_f(&prog, 7, 0, 3);
         let jit_trap = *trap;
