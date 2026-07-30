@@ -98,11 +98,54 @@
 //! count, not the row count, so the row count is a parameter of
 //! [`bytecode::eval_batch_sum_f`] rather than something read off a column.
 //!
-//! Everything outside this columnar subset — bytes, maps, lists of lists,
-//! list-valued results, member/method calls, `in`, custom functions — is a
-//! structural loss for a batch JIT and returns [`lower::LowerError`], falling
-//! back to the stock tree-walker. The win is confined to what a compiled trace
-//! over aligned columns can express.
+//! ## M7 — list-valued results, fused chains, and the columnar door
+//!
+//! A comprehension whose RESULT is a list is collected rather than folded: the
+//! row loop writes each row's element COUNT to the per-row output, and the
+//! elements go to their own flat buffers at a cursor running across the batch —
+//! the same Arrow layout an input list column arrives in, so the output of one
+//! batch has the shape the next one's input wants. A literal-list source
+//! unrolls (green length); a runtime-list source keeps its red inner loop.
+//!
+//! A CHAINED comprehension (`items.filter(p).map(f)`) is fused into ONE pass
+//! over the base list — predicates ANDed, values threaded — so no intermediate
+//! list is built for a shape the tree-walker materializes.
+//!
+//! `size()` of a loop variable reads a derived ELEMENT column, materialized at
+//! bind alongside the other derived columns (`size(list)`, `offset(list)`,
+//! string ranks, `string(x)`, `concat#k`).
+//!
+//! [`batch::eval_per_row`] answers a REFUSED expression from inside the
+//! library: it evaluates the same [`batch::Batch`] with the tree-walker through
+//! [`batch::RowReader`], which rebuilds each row's activation — including the
+//! two parts a caller gets wrong, a dotted column name being a nested map and a
+//! list row starting at the prefix sum of every earlier row's element count. So
+//! a caller writes one call and gets an answer whether or not the expression
+//! lowered.
+//!
+//! [`batch::BoundBatch::collect_raw`] hands a run's results back as the `i64`
+//! columns the machine wrote instead of a [`crate::Value`] per row. That box is not a
+//! rounding error on the compiled tier: `x * 2 + 1` over 50k rows evaluates a
+//! row in ~1.0ns and spends ~2.4ns more building its `Value`, and
+//! `nums.map(y, y * 2)` over 10-element lists evaluates a row in ~8.8ns and
+//! spends ~59ns more on the per-row `Vec<Value>` and `Arc`. Both tiers pay it,
+//! so it does not cancel in a tier ratio — it dilutes it.
+//!
+//! ## What is still outside
+//!
+//! Bytes, map literals, lists of lists, `has()`, `dyn()` and custom functions
+//! return [`lower::LowerError`], the signal to fall back to the tree-walker. A
+//! registered function is the structural one: it is an opaque Rust closure in
+//! the [`crate::Context`], and the lowering holds only a [`lower::Schema`], so
+//! it cannot know a name is a function, its arity, its argument types or its
+//! result type — and calling it per row would reintroduce exactly the `Value`
+//! marshalling the batch model removes.
+//!
+//! The win is confined to what a compiled trace over aligned columns can
+//! express, which is: the numeric and string scalar subset, `in`, indexing,
+//! timestamps and durations, the string member functions, comprehensions over
+//! literal and runtime lists folding to a value or collecting to a list, and
+//! chains of those.
 
 pub mod batch;
 pub mod bytecode;
