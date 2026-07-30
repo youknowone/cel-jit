@@ -43,7 +43,7 @@ use std::hint::black_box;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
-use cel::majit::batch::{Batch, BatchProgram, ColumnRef, RowReader, Tier};
+use cel::majit::batch::{Batch, BatchProgram, ColumnRef, RawOutput, RowReader, Tier};
 use cel::majit::bytecode::float_bank::{reset_persistent_state, COMPILES};
 use cel::majit::lower::{Schema, ValType};
 use cel::{Context, Program, Value};
@@ -435,7 +435,27 @@ fn walker_sum(values: &[Value], label: &str) -> Value {
 struct Batched {
     clean: f64,
     jit: f64,
+    /// The same two tiers read through `collect_raw`, for a per-row case only.
+    /// A different CONTRACT, not a faster path to the same answer: the consumer
+    /// takes the machine's own columns instead of a `Value` per row.
+    raw: Option<(f64, f64)>,
     compiles: usize,
+}
+
+/// A columnar consumer. It reads the buffers the run wrote and never builds a
+/// `Value`; the sum is only so the run cannot be optimized away.
+fn consume_raw(out: RawOutput<'_>) -> i64 {
+    let add = |a: i64, &b: &i64| a.wrapping_add(b);
+    match out {
+        RawOutput::Scalar { values, .. } => values.iter().fold(0, add),
+        RawOutput::List { lens, fields, .. } => {
+            let n: usize = lens.iter().map(|&c| c.max(0) as usize).sum();
+            fields
+                .iter()
+                .map(|(_, _, buf)| buf[..n].iter().fold(0i64, add))
+                .fold(0, i64::wrapping_add)
+        }
+    }
 }
 
 struct Row {
@@ -558,6 +578,8 @@ fn run_case(case: &Case) -> Row {
     let mut stock = Vec::with_capacity(ROUNDS);
     let mut clean = Vec::with_capacity(ROUNDS);
     let mut jit = Vec::with_capacity(ROUNDS);
+    let mut raw_clean = Vec::with_capacity(ROUNDS);
+    let mut raw_jit = Vec::with_capacity(ROUNDS);
     for _ in 0..ROUNDS {
         stock.push(time_one_stock(&program, &contexts));
         let run = |tier| {
@@ -569,6 +591,14 @@ fn run_case(case: &Case) -> Row {
         };
         clean.push(time_ns_per_row(|| run(Tier::Clean)));
         jit.push(time_ns_per_row(|| run(Tier::Jit)));
+        // Only a per-row case boxes anything per row: a summed case already
+        // returns one `Value` for the whole batch, so there is nothing for the
+        // raw door to take away.
+        if per_row {
+            let raw = |tier| bound.collect_raw_on(tier, consume_raw);
+            raw_clean.push(time_ns_per_row(|| raw(Tier::Clean)));
+            raw_jit.push(time_ns_per_row(|| raw(Tier::Jit)));
+        }
     }
 
     Row {
@@ -577,6 +607,7 @@ fn run_case(case: &Case) -> Row {
         batch: Ok(Batched {
             clean: best(clean),
             jit: best(jit),
+            raw: per_row.then(|| (best(raw_clean), best(raw_jit))),
             compiles,
         }),
     }
@@ -603,8 +634,14 @@ fn main() {
     println!("cometkim's benchmark expressions (cel-jit PR #233 benches/comparison.rs)");
     println!("{ROWS} rows per case; best of {ROUNDS}; every tier gated against the tree-walker.\n");
     println!(
-        "{:<24} {:>12} {:>12} {:>12} {:>10} {:>9}",
-        "case", "stock ns/row", "clean ns/row", "majit ns/row", "majit/clean", "compiles"
+        "{:<24} {:>12} {:>12} {:>12} {:>10} {:>13} {:>9}",
+        "case",
+        "stock ns/row",
+        "clean ns/row",
+        "majit ns/row",
+        "majit/clean",
+        "raw majit/clean",
+        "compiles"
     );
 
     let mut declined = Vec::new();
@@ -614,13 +651,18 @@ fn main() {
         match &r.batch {
             Ok(b) => {
                 lowered += 1;
+                let raw = match b.raw {
+                    Some((c, j)) => format!("{:.2}x", c / j),
+                    None => "-".to_string(),
+                };
                 println!(
-                    "{:<24} {:>12.1} {:>12.2} {:>12.2} {:>9.2}x {:>9}",
+                    "{:<24} {:>12.1} {:>12.2} {:>12.2} {:>9.2}x {:>13} {:>9}",
                     r.label,
                     r.stock,
                     b.clean,
                     b.jit,
                     b.clean / b.jit,
+                    raw,
                     b.compiles
                 );
             }
@@ -629,8 +671,8 @@ fn main() {
                 // through the library's fallback. A row missing from the table
                 // would read as an expression this crate cannot evaluate.
                 println!(
-                    "{:<24} {:>12.1} {:>12} {:>12} {:>10} {:>9}",
-                    r.label, r.stock, "-", "walker", "-", "-"
+                    "{:<24} {:>12.1} {:>12} {:>12} {:>10} {:>13} {:>9}",
+                    r.label, r.stock, "-", "walker", "-", "-", "-"
                 );
                 declined.push((case.label, why.clone()));
             }
@@ -653,5 +695,14 @@ fn main() {
          stock also contains the data-model change (slot resolution, no boxed values), and\n\
          stock is a per-activation evaluator being asked to do a batch, which is not the\n\
          workload it is built for."
+    );
+    println!(
+        "\nThe last five cases return a LIST per row, so `collect` builds a `Vec<Value>`\n\
+         and an `Arc` for every row — on the compiled tier that box costs several times\n\
+         the evaluation it wraps, and both tiers pay it, which is what holds majit/clean\n\
+         near 2-3x there. `raw majit/clean` is the same two tiers read through\n\
+         `collect_raw`, where a columnar consumer takes the machine's own buffers and\n\
+         nothing is boxed. It is not comparable to the stock column, which necessarily\n\
+         produces values."
     );
 }
