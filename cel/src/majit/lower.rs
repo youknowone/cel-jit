@@ -1001,13 +1001,20 @@ impl LowerCtxF<'_> {
     /// keyed on the ADDRESS too: `items[0].price + items[1].price` reads the
     /// same element column at two addresses and must load twice.
     fn elem_slot(&mut self, path: String, ea_reg: usize) -> Result<TReg, LowerError> {
-        if let Some(&r) = self.elem_map.get(&(path.clone(), ea_reg)) {
-            return Ok(r);
-        }
         let ty =
             self.schema.get(&path).copied().ok_or_else(|| {
                 LowerError::unsupported(format!("undeclared element path `{path}`"))
             })?;
+        Ok(self.elem_slot_typed(path, ty, ea_reg))
+    }
+
+    /// [`LowerCtxF::elem_slot`] for an element slot whose type the LOWERING
+    /// knows rather than the schema: the derived `size(<element>)` column,
+    /// which is a count — the element-level twin of [`LowerCtxF::slot_typed`].
+    fn elem_slot_typed(&mut self, path: String, ty: ValType, ea_reg: usize) -> TReg {
+        if let Some(&r) = self.elem_map.get(&(path.clone(), ea_reg)) {
+            return r;
+        }
         let r = self.fresh(ty);
         let base_reg = self.fresh(ValType::Int).idx;
         let op = match ty {
@@ -1023,7 +1030,7 @@ impl LowerCtxF<'_> {
             reg: r.idx,
             kind: SlotKind::Element { base_reg },
         });
-        Ok(r)
+        r
     }
 
     /// Resolve `name` (optionally `.field`) against the list loop being
@@ -2005,6 +2012,10 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
         if let Expr::Comprehension(comp) = &call.args[0].expr {
             return compile_comprehension_len(ctx, comp);
         }
+        // A runtime-list ELEMENT's length, which no row column carries.
+        if let Some(r) = size_of_list_element(ctx, &call.args[0])? {
+            return Ok(r);
+        }
         let path = match &call.args[0].expr {
             Expr::Ident(n) if !ctx.locals.contains_key(n) => n.clone(),
             Expr::Select(_) => resolve_path(&call.args[0])?,
@@ -2561,6 +2572,46 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
             _ => Err(LowerError::unsupported(format!("call `{name}`"))),
         }
     }
+}
+
+/// `size()` of a runtime-list ELEMENT — the loop variable itself, or one of its
+/// declared fields. `None` when the argument is not one.
+///
+/// A row's `size(<string>)` is a derived per-row column; this is the same thing
+/// one level down. The element lengths are a derived column over the FLATTENED
+/// element buffer, read at the address the element itself is read at, so an
+/// element's length costs the same load its value does — and the loop body
+/// still computes no lengths.
+fn size_of_list_element(ctx: &mut LowerCtxF, e: &IdedExpr) -> Result<Option<TReg>, LowerError> {
+    let (name, field) = match &e.expr {
+        Expr::Ident(n) => (n.as_str(), None),
+        Expr::Select(sel) if !sel.test => match &sel.operand.expr {
+            Expr::Ident(n) => (n.as_str(), Some(sel.field.as_str())),
+            _ => return Ok(None),
+        },
+        _ => return Ok(None),
+    };
+    // A local shadows the loop variable, and the unroll binds its own that way.
+    if ctx.locals.contains_key(name) {
+        return Ok(None);
+    }
+    // Innermost first, as everywhere an iteration variable is resolved.
+    let Some(l) = ctx.list_loop.iter().rev().find(|l| l.iter_var == name) else {
+        return Ok(None);
+    };
+    let (list, ea_reg) = (l.list.clone(), l.ea_reg);
+    let elem = elem_slot_path(&list, field);
+    // Only a string element has a length here. A list of lists needs per-element
+    // offsets, which a flat element column cannot express, and a numeric element
+    // has no `size` overload at all.
+    if ctx.schema.get(&elem).copied() != Some(ValType::Str) {
+        return Err(LowerError::unsupported("size() of a non-string element"));
+    }
+    Ok(Some(ctx.elem_slot_typed(
+        size_slot_path(&elem),
+        ValType::Int,
+        ea_reg,
+    )))
 }
 
 /// Green-length comprehension unroll for the typed path (mirrors

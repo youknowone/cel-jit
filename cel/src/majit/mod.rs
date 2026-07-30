@@ -1179,7 +1179,9 @@ mod tests {
         expect_refusal: bool,
     ) {
         use super::bytecode::float_bank::COMPILES as COMPILES_F;
-        use super::lower::{elem_slot_path, elem_slot_source, offset_slot_source, SlotKind};
+        use super::lower::{
+            elem_slot_path, elem_slot_source, offset_slot_source, size_slot_path, SlotKind,
+        };
 
         let program =
             Program::compile(expr_src).unwrap_or_else(|e| panic!("parse `{expr_src}`: {e:?}"));
@@ -1215,6 +1217,20 @@ mod tests {
             lists.iter().map(|(n, lc)| (*n, lc)).collect();
         let offsets: HashMap<&str, Vec<i64>> =
             lists.iter().map(|(n, lc)| (*n, lc.offsets())).collect();
+        // Per-element byte lengths, keyed the way the lowering spells them: the
+        // element-level twin of the row `size(<string>)` column.
+        let elem_sizes: HashMap<String, Vec<i64>> = lists
+            .iter()
+            .flat_map(|(n, lc)| {
+                lc.fields.iter().filter_map(move |(f, d)| match d {
+                    ColData::Str(c) => Some((
+                        size_slot_path(&elem_slot_path(n, *f)),
+                        c.iter().map(|s| s.len() as i64).collect(),
+                    )),
+                    _ => None,
+                })
+            })
+            .collect();
 
         // One column per SLOT: an element column for a `list[]`/`list[].f`
         // slot, the derived length / offset column for `size(list)` /
@@ -1223,6 +1239,16 @@ mod tests {
             .slots
             .iter()
             .map(|slot| {
+                // Outside-in: `size(items[].name)` is a LENGTH key wrapping an
+                // element key, and its `[]` would otherwise read as its own.
+                if let Some(c) = elem_sizes.get(&slot.path) {
+                    assert!(
+                        matches!(slot.kind, SlotKind::Element { .. }),
+                        "slot `{}` must be an element slot for `{expr_src}`",
+                        slot.path
+                    );
+                    return Column::Int(c);
+                }
                 if let Some((list, field)) = elem_slot_source(&slot.path) {
                     assert!(
                         matches!(slot.kind, SlotKind::Element { .. }),
@@ -3257,6 +3283,10 @@ mod tests {
             // `all`/`exists` fold to a value rather than to a list, so they are
             // not a link and end the chain where they appear.
             "nums.filter(y, y > 0).all(y, y > 1)",
+            // Only a STRING element has a length. A numeric one has no `size`
+            // overload, and a list of lists would need per-element offsets a
+            // flat element column cannot express.
+            "nums.all(t, t.size() > 0)",
         ] {
             let program = Program::compile(expr).unwrap();
             assert!(
@@ -3401,6 +3431,68 @@ mod tests {
             &[(
                 "fs",
                 record_list(lens.clone(), vec![(None, ColData::Float(fs.clone()))]),
+            )],
+        );
+    }
+
+    /// `size()` of the LOOP VARIABLE — cometkim's `real_world_policy` asks
+    /// `object.tags.all(t, t.size() <= 16)`.
+    ///
+    /// A row's `size(<string>)` is a derived per-row column; an element's is the
+    /// same thing one level down, a derived column over the flattened element
+    /// buffer read at the address the element itself is read at. The strings are
+    /// deliberately of differing byte lengths, including an empty one and a
+    /// multi-byte one, so a character count would not agree with the walker's
+    /// byte count.
+    #[test]
+    fn batch_list_element_size() {
+        let n = 400;
+        let lens = gen_lens(n, 0x512E_E1E3_0000_0001, 3);
+        let total = lens.iter().sum::<i64>() as usize;
+        let words = ["", "a", "bb", "ccc", "\u{ac00}\u{b098}"];
+        let tags = gen_str(total, 0x512E_E1E3_0000_0002, &words);
+        let scalars = || {
+            vec![(
+                "tags",
+                record_list(lens.clone(), vec![(None, ColData::Str(tags.clone()))]),
+            )]
+        };
+        for expr in [
+            "tags.all(t, t.size() <= 3)",
+            "tags.all(t, size(t) <= 16)",
+            "tags.exists(t, t.size() == 2)",
+            "tags.exists_one(t, t.size() == 6)",
+            // Two reads of the same element length share one load, and the
+            // element's own value is still readable beside it.
+            "tags.all(t, t.size() >= 0 && t.size() < 7)",
+            "tags.all(t, t.size() > 0 || t == \"\")",
+        ] {
+            check_batch_list(expr, &[], &scalars());
+        }
+        // Through the PUBLIC batch API, which materializes the element-length
+        // column itself rather than being handed one.
+        for expr in [
+            "tags.map(t, t.size())",
+            "tags.filter(t, t.size() > 1)",
+            "tags.filter(t, t.size() > 1).map(t, t.size() * 2)",
+        ] {
+            check_collect_list(expr, &[], &scalars());
+        }
+        // A record field's length, alongside the record's other fields.
+        let names = gen_str(total, 0x512E_E1E3_0000_0003, &words);
+        let qty = gen_i64(total, 0x512E_E1E3_0000_0004, 0, 9);
+        check_batch_list(
+            "items.all(i, i.name.size() <= i.qty)",
+            &[],
+            &[(
+                "items",
+                record_list(
+                    lens.clone(),
+                    vec![
+                        (Some("name"), ColData::Str(names)),
+                        (Some("qty"), ColData::Int(qty)),
+                    ],
+                ),
             )],
         );
     }

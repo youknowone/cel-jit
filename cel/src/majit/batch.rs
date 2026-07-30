@@ -451,6 +451,25 @@ impl BatchProgram {
                 derived.push(DerivedColumn::int(lens.to_vec()));
                 return Ok(Plan::Derived(derived.len() - 1));
             }
+            // A list ELEMENT's byte length: one entry per flattened element, so
+            // it is read at the same address the element itself is.
+            if let Some((list, field)) = elem_slot_source(src) {
+                let ColumnRef::List { fields, .. } = lookup(batch, list)? else {
+                    return Err(BatchError::MissingColumn(list.to_string()));
+                };
+                let Some(ColumnRef::Str(c)) =
+                    fields.iter().find(|(f, _)| *f == field).map(|(_, c)| c)
+                else {
+                    return Err(BatchError::ColumnType {
+                        name: src.to_string(),
+                        declared: ValType::Str,
+                    });
+                };
+                derived.push(DerivedColumn::int(
+                    c.iter().map(|s| s.len() as i64).collect(),
+                ));
+                return Ok(Plan::Derived(derived.len() - 1));
+            }
             let buf = self
                 .strings_for(batch, src, batch.rows)?
                 .iter()
