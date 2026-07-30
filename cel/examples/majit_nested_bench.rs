@@ -231,7 +231,11 @@ fn tree_walker_ns_per_eval(
     pool: usize,
 ) -> (f64, usize) {
     let mut base = 0usize;
-    let contexts: Vec<Context<'static>> = (0..pool)
+    // One shared root, a child scope per row. `Context::default` constructs
+    // `Env::stdlib()` on every call, so building one per row would hold `pool`
+    // copies of the standard library alive for the whole timed region.
+    let root = Context::default();
+    let contexts: Vec<Context<'_>> = (0..pool)
         .map(|r| {
             let len = data.lens[r] as usize;
             let items: Vec<Value> = (0..len)
@@ -243,7 +247,7 @@ fn tree_walker_ns_per_eval(
                 })
                 .collect();
             base += len;
-            let mut context = Context::default();
+            let mut context = root.new_inner_scope();
             context.add_variable_from_value("items", items);
             context
         })

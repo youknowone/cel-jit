@@ -51,8 +51,8 @@ const COLD_ROUNDS: usize = 7;
 const JIT_ON: u32 = 8;
 const JIT_OFF: u32 = u32::MAX;
 
-struct RequestSample {
-    context: Context<'static>,
+struct RequestSample<'a> {
+    context: Context<'a>,
     expected: bool,
 }
 
@@ -69,7 +69,7 @@ fn bool_result(program: &Program, context: &Context<'_>) -> bool {
     }
 }
 
-fn auth_samples() -> Vec<RequestSample> {
+fn auth_samples<'a>(root: &'a Context<'a>) -> Vec<RequestSample<'a>> {
     let mut state = 0x2545_F491_4F6C_DD1D;
     (0..REQUEST_SAMPLES)
         .map(|_| {
@@ -83,7 +83,7 @@ fn auth_samples() -> Vec<RequestSample> {
                 ("frozen".to_string(), Value::Bool(frozen)),
             ]);
             let transaction = HashMap::from([("withdrawal".to_string(), Value::Int(withdrawal))]);
-            let mut context = Context::default();
+            let mut context = root.new_inner_scope();
             context.add_variable_from_value("account", account);
             context.add_variable_from_value("transaction", transaction);
             RequestSample { context, expected }
@@ -91,7 +91,7 @@ fn auth_samples() -> Vec<RequestSample> {
         .collect()
 }
 
-fn routing_samples() -> Vec<RequestSample> {
+fn routing_samples<'a>(root: &'a Context<'a>) -> Vec<RequestSample<'a>> {
     let mut state = 0x9E37_79B9_7F4A_7C15;
     let methods = ["GET", "POST", "PUT", "DELETE"];
     let paths = ["/admin/users", "/api/items", "/admin/audit", "/healthz"];
@@ -104,14 +104,14 @@ fn routing_samples() -> Vec<RequestSample> {
                 ("method".to_string(), Value::from(method)),
                 ("path".to_string(), Value::from(path)),
             ]);
-            let mut context = Context::default();
+            let mut context = root.new_inner_scope();
             context.add_variable_from_value("request", request);
             RequestSample { context, expected }
         })
         .collect()
 }
 
-fn validation_samples() -> Vec<RequestSample> {
+fn validation_samples<'a>(root: &'a Context<'a>) -> Vec<RequestSample<'a>> {
     let mut state = 0xD1B5_4A32_D192_ED03;
     (0..REQUEST_SAMPLES)
         .map(|_| {
@@ -127,7 +127,7 @@ fn validation_samples() -> Vec<RequestSample> {
                 ("replicas".to_string(), Value::Int(replicas)),
                 ("tags".to_string(), Value::from(tags)),
             ]);
-            let mut context = Context::default();
+            let mut context = root.new_inner_scope();
             context.add_variable_from_value("object", object);
             RequestSample { context, expected }
         })
@@ -144,7 +144,7 @@ fn median_duration(mut values: Vec<Duration>) -> Duration {
     values[values.len() / 2]
 }
 
-fn request_latency(label: &str, expression: &str, schema: &Schema, samples: &[RequestSample]) {
+fn request_latency(label: &str, expression: &str, schema: &Schema, samples: &[RequestSample<'_>]) {
     let program = Program::compile(expression).expect("compile request expression");
     for sample in samples {
         assert_eq!(
@@ -315,6 +315,11 @@ fn cold_break_even() {
 
 fn main() {
     println!("=== 1. REAL CEL REQUEST LATENCY (primary; compile once/evaluate many) ===");
+    // One shared root, a child scope per sample. `Context::default` constructs
+    // `Env::stdlib()` on every call, so one per sample would hold
+    // `REQUEST_SAMPLES` copies of the standard library alive while they are
+    // cycled through the timed region.
+    let root = Context::default();
     request_latency(
         "authorization",
         "account.balance >= transaction.withdrawal && !account.frozen",
@@ -326,7 +331,7 @@ fn main() {
         .into_iter()
         .map(|(p, t)| (p.to_string(), t))
         .collect(),
-        &auth_samples(),
+        &auth_samples(&root),
     );
     request_latency(
         "HTTP routing",
@@ -338,7 +343,7 @@ fn main() {
         .into_iter()
         .map(|(p, t)| (p.to_string(), t))
         .collect(),
-        &routing_samples(),
+        &routing_samples(&root),
     );
     request_latency(
         "resource validation",
@@ -350,7 +355,7 @@ fn main() {
         .into_iter()
         .map(|(p, t)| (p.to_string(), t))
         .collect(),
-        &validation_samples(),
+        &validation_samples(&root),
     );
 
     println!();
