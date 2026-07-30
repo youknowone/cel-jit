@@ -487,20 +487,24 @@ pub fn prepare_batch_reduce<'a>(
         BatchReduce::PerRow => Some(vec![0i64; n.max(1)].into_boxed_slice()),
     };
     let out_addr = out.as_mut().map_or(0, |b| b.as_mut_ptr() as i64);
-    // A list-valued result writes at most as many elements as the SOURCE list
-    // carries across the whole batch — `map` writes exactly that many, `filter`
-    // fewer — so the source's flattened element column is an exact bound.
+    // A list-valued result writes at most as many elements as its SOURCE offers
+    // across the whole batch — `map` writes exactly that many, `filter` fewer.
+    // For a list column that is its flattened element count; for a literal list
+    // it is the green length, once per row.
     let mut list_out: Vec<Box<[i64]>> = match (reduce, &lowered.list_output) {
         (BatchReduce::PerRow, Some(o)) => {
-            let cap = columns
-                .iter()
-                .zip(&lowered.slots)
-                .filter(|(_, slot)| {
-                    super::lower::elem_slot_source(&slot.path).is_some_and(|(l, _)| l == o.source)
-                })
-                .map(|(c, _)| c.len())
-                .max()
-                .unwrap_or(0);
+            let cap = match &o.source {
+                super::lower::ListSource::Column(src) => columns
+                    .iter()
+                    .zip(&lowered.slots)
+                    .filter(|(_, slot)| {
+                        super::lower::elem_slot_source(&slot.path).is_some_and(|(l, _)| l == *src)
+                    })
+                    .map(|(c, _)| c.len())
+                    .max()
+                    .unwrap_or(0),
+                super::lower::ListSource::Literal(len) => n * len,
+            };
             // One spare, so a batch that writes nothing still has an address.
             o.fields
                 .iter()

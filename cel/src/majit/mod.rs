@@ -3221,17 +3221,20 @@ mod tests {
 
     #[test]
     fn out_of_subset_bails() {
-        // list-returning / string-arith / member-fn on a non-string column /
-        // mixed int-float arithmetic / list-valued comprehension (`map` builds a
-        // list) / comprehension over a non-list column all fall back to the
-        // tree-walker. Every path is undeclared here, so the schema is empty and
-        // each slot defaults to the int bank.
+        // A bare list value / string-arith / member-fn on a non-string column /
+        // mixed int-float arithmetic / a comprehension over a non-list column
+        // all fall back to the tree-walker. Every path is undeclared here, so
+        // the schema is empty and each slot defaults to the int bank.
+        //
+        // A list-valued `map`/`filter` over a literal list is NOT here: it is
+        // collected to the ragged output (`batch_literal_list_valued_results`).
+        // An EMPTY literal one still bails — there is no element to take the
+        // output buffer's bank from.
         for expr in [
             "[1, 2, 3]",
             "x.size()",
             "1.5 + a",
-            "[1, 2, 3].map(x, x * 2)",
-            "[1, 2, 3].filter(x, x > 1)",
+            "[].map(x, x * 2)",
             "x.all(x, x > 0)",
         ] {
             let program = Program::compile(expr).unwrap();
@@ -3356,6 +3359,34 @@ mod tests {
                 record_list(lens.clone(), vec![(None, ColData::Float(fs.clone()))]),
             )],
         );
+    }
+
+    /// The same list-valued `map`/`filter` over a LITERAL list — cometkim's
+    /// `list_map` and `list_filter`. The trip count is green here, so this is
+    /// the unroll rather than the inner loop, but a list is still not a value
+    /// on this machine and the elements still go to the ragged output.
+    ///
+    /// The bodies mix green elements with a per-row column so the case cannot
+    /// pass by folding the whole expression to one constant list.
+    #[test]
+    fn batch_literal_list_valued_results() {
+        let n = 300;
+        let a = ColData::Int(gen_i64(n, 0x117E_2A10_D0DE_0001, -3, 3));
+        for expr in [
+            "[1, 2, 3, 4, 5].map(x, x * 2)",
+            "[1, 2, 3, 4, 5, 6, 7, 8, 9, 10].filter(x, x > 5)",
+            "[1, 2, 3].map(x, x * a)",
+            "[1, 2, 3].map(x, x > a)",
+            "[1, 2, 3, 4, 5].filter(x, x > a)",
+            // Predicates that admit none and all: the cursor advances only
+            // where one holds, and a wrong rewind shifts every later row.
+            "[1, 2, 3].filter(x, x > 1000)",
+            "[1, 2, 3].filter(x, x > -1000)",
+            // The other store.
+            "[1.5, 2.5].map(x, x * 2.0)",
+        ] {
+            check_collect(expr, &[("a", a.clone())]);
+        }
     }
 
     /// `a == b` over two list columns: equal lengths, and every element equal

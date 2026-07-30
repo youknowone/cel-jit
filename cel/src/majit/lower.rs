@@ -482,12 +482,22 @@ pub struct BatchShape {
 /// flat buffer per field — because it is the same thing, produced rather than
 /// consumed. The count rides the ordinary per-row output; the elements go to
 /// these buffers, at a cursor that runs across the whole batch.
+/// Where a collected list's elements are drawn from — which is what bounds how
+/// many the batch can ever write, and so how large the output buffers are.
+#[derive(Debug, Clone)]
+pub enum ListSource {
+    /// A declared list column. Its flattened element count across the whole
+    /// batch is an exact bound: `map` writes exactly that many, `filter` fewer.
+    Column(String),
+    /// A literal list, whose length is green. Every row can append at most that
+    /// many, so the batch can append at most `rows` times it.
+    Literal(usize),
+}
+
 #[derive(Debug, Clone)]
 pub struct ListOutput {
-    /// The list the elements are drawn from, whose flattened element count
-    /// bounds how many this can ever write. `None` for a list built from
-    /// nothing the schema declares, which does not arise today.
-    pub source: String,
+    /// What bounds how many elements this can write.
+    pub source: ListSource,
     /// One entry per output field, in the order the buffers are seeded.
     /// `None` names the elements themselves (a list of scalars).
     pub fields: Vec<(Option<String>, ValType)>,
@@ -2578,15 +2588,40 @@ fn compile_comprehension_t(
         },
     };
 
+    compile_literal_comprehension_mode(ctx, comp, &elements, AccuMode::Value)
+}
+
+/// The green-length unroll, in a chosen accumulator mode.
+///
+/// Straight-line, so unlike [`compile_list_comprehension_mode`] the accumulator
+/// needs no fixed register: each iteration's step simply becomes the next one's
+/// accumulator.
+fn compile_literal_comprehension_mode(
+    ctx: &mut LowerCtxF,
+    comp: &ComprehensionExpr,
+    elements: &[IdedExpr],
+    mode: AccuMode,
+) -> Result<TReg, LowerError> {
     let prev_iter = ctx.locals.remove(&comp.iter_var);
     let prev_accu = ctx.locals.remove(&comp.accu_var);
 
-    let mut accu = compile_t(ctx, &comp.accu_init)?;
-    for elem in &elements {
+    let mut accu = match mode {
+        AccuMode::Value => compile_t(ctx, &comp.accu_init)?,
+        // The list the step would have built starts empty, so its length starts
+        // at zero. `accu_init` is not compiled at all: it is the `[]` the
+        // machine has no value for.
+        AccuMode::Length | AccuMode::Collect { .. } => emit_int_const(ctx, 0),
+    };
+    for elem in elements {
         let x_reg = compile_t(ctx, elem)?;
         ctx.locals.insert(comp.iter_var.clone(), x_reg);
         ctx.locals.insert(comp.accu_var.clone(), accu);
-        accu = compile_t(ctx, &comp.loop_step)?;
+        accu = match mode {
+            AccuMode::Value => compile_t(ctx, &comp.loop_step)?,
+            AccuMode::Length | AccuMode::Collect { .. } => {
+                compile_len_step(ctx, &comp.loop_step, comp, accu, mode)?
+            }
+        };
     }
     ctx.locals.insert(comp.accu_var.clone(), accu);
     let result = compile_t(ctx, &comp.result)?;
@@ -2833,11 +2868,91 @@ fn collect_list_result(ctx: &mut LowerCtxF, expr: &IdedExpr) -> Option<Result<TR
     if !matches!(&comp.result.expr, Expr::Ident(n) if *n == comp.accu_var) {
         return None;
     }
+    // A LITERAL range has a green trip count, so it unrolls; a declared column
+    // has a red one and gets an inner loop. Either way the elements go to the
+    // ragged output, because neither can be a value on this machine.
+    if let Expr::List(l) = &comp.iter_range.expr {
+        return Some(collect_literal_comprehension(ctx, comp, &l.elements));
+    }
     let path = resolve_path(&comp.iter_range).ok()?;
     if !declares_list(ctx.schema, &path) {
         return None;
     }
     Some(collect_list_comprehension(ctx, comp, &path))
+}
+
+/// [`collect_list_comprehension`] for a literal range: the same ragged output,
+/// filled by the unroll rather than by an inner loop.
+///
+/// A literal list has no schema entry to take field names from, so the output
+/// is always a list of scalars — one unnamed field, whose bank the appended
+/// expression decides.
+fn collect_literal_comprehension(
+    ctx: &mut LowerCtxF,
+    comp: &ComprehensionExpr,
+    elements: &[IdedExpr],
+) -> Result<TReg, LowerError> {
+    if comp.iter_var2.is_some() {
+        return Err(LowerError::unsupported("two-variable comprehension"));
+    }
+    let elem = literal_append_bank(ctx, comp, elements)?;
+    let base_regs = vec![ctx.fresh(ValType::Int).idx];
+    let cursor = ctx.fresh(ValType::Int);
+    ctx.prelude
+        .extend_from_slice(&[OP_LOAD_CONST, 0, cursor.idx as i64]);
+    ctx.list_output = Some(ListOutput {
+        source: ListSource::Literal(elements.len()),
+        fields: vec![(None, elem)],
+        base_regs,
+    });
+    compile_literal_comprehension_mode(
+        ctx,
+        comp,
+        elements,
+        AccuMode::Collect { cursor: cursor.idx },
+    )
+}
+
+/// The expression a `map`/`filter` step appends, or `None` if the step is
+/// neither of the two shapes the macros desugar to (`@result + [e]`, and
+/// `c ? (@result + [e]) : @result`).
+fn appended_element(step: &IdedExpr) -> Option<&IdedExpr> {
+    let Expr::Call(call) = &step.expr else {
+        return None;
+    };
+    match call.func_name.as_str() {
+        ops::ADD if call.args.len() == 2 => match &call.args[1].expr {
+            Expr::List(l) => l.elements.first(),
+            _ => None,
+        },
+        ops::CONDITIONAL if call.args.len() == 3 => appended_element(&call.args[1]),
+        _ => None,
+    }
+}
+
+/// The bank a literal-list comprehension appends, from a THROWAWAY lowering of
+/// the appended expression with the iteration variable bound to the list's
+/// first element — same reason as [`map_body_bank`]: the buffer has to be
+/// described before the body is compiled, and compiling the body twice would
+/// emit it twice.
+///
+/// The first element stands for all of them. Where they disagree, the store
+/// itself rejects the mismatch: [`emit_element_store`] compares every element's
+/// bank against this one.
+fn literal_append_bank(
+    ctx: &LowerCtxF,
+    comp: &ComprehensionExpr,
+    elements: &[IdedExpr],
+) -> Result<ValType, LowerError> {
+    let e = appended_element(&comp.loop_step)
+        .ok_or_else(|| LowerError::unsupported("collected step is not an append"))?;
+    let first = elements
+        .first()
+        .ok_or_else(|| LowerError::unsupported("collected list has no element column"))?;
+    let mut probe = probe_ctx(ctx);
+    let x = compile_t(&mut probe, first)?;
+    probe.locals.insert(comp.iter_var.clone(), x);
+    Ok(compile_t(&mut probe, e)?.bank)
 }
 
 fn collect_list_comprehension(
@@ -2896,21 +3011,18 @@ fn collect_list_comprehension(
     ctx.prelude
         .extend_from_slice(&[OP_LOAD_CONST, 0, cursor.idx as i64]);
     ctx.list_output = Some(ListOutput {
-        source: path.to_string(),
+        source: ListSource::Column(path.to_string()),
         fields,
         base_regs,
     });
     compile_list_comprehension_mode(ctx, comp, path, AccuMode::Collect { cursor: cursor.idx })
 }
 
-/// The bank a `map` body produces, from a throwaway lowering of the same
-/// comprehension in `Length` mode — which compiles the body and discards it.
-fn map_body_bank(
-    ctx: &LowerCtxF,
-    comp: &ComprehensionExpr,
-    path: &str,
-) -> Result<ValType, LowerError> {
-    let mut probe = LowerCtxF {
+/// An empty lowering over the same schema, for asking what bank an expression
+/// lands in without emitting it into the real body. Its registers, slots and
+/// ops are all discarded with it; only the answer is kept.
+fn probe_ctx<'a>(ctx: &LowerCtxF<'a>) -> LowerCtxF<'a> {
+    LowerCtxF {
         prelude: Vec::new(),
         body: Vec::new(),
         next_int: OVF_FLAG_REG + 1,
@@ -2927,7 +3039,17 @@ fn map_body_bank(
         jump_fixups: Vec::new(),
         list_output: None,
         schema: ctx.schema,
-    };
+    }
+}
+
+/// The bank a `map` body produces, from a throwaway lowering of the same
+/// comprehension in `Length` mode — which compiles the body and discards it.
+fn map_body_bank(
+    ctx: &LowerCtxF,
+    comp: &ComprehensionExpr,
+    path: &str,
+) -> Result<ValType, LowerError> {
+    let mut probe = probe_ctx(ctx);
     // The appended expression, lowered on its own with the iteration variable
     // bound — which is what `Length` mode does to it for its errors.
     let Expr::Call(add) = &comp.loop_step.expr else {
@@ -3111,11 +3233,17 @@ fn emit_element_store(
         // `filter` appends the element itself, so each output field is that
         // element's own field. `map` appends a computed value, which is the
         // single unnamed field.
-        let v = if is_iter {
+        // Over a runtime list the iteration variable is an element load per
+        // declared field; over a literal one it is the ordinary local the
+        // unroll bound, which compiles like any other expression.
+        let elem_slot = if is_iter {
             ctx.iter_var_slot(&comp.iter_var, field.as_deref())?
-                .ok_or_else(|| LowerError::unsupported("collected element is not an element"))?
         } else {
-            compile_t(ctx, e)?
+            None
+        };
+        let v = match elem_slot {
+            Some(v) => v,
+            None => compile_t(ctx, e)?,
         };
         if v.bank != *ty {
             return Err(LowerError::unsupported("collected element bank"));
