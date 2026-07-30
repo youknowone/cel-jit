@@ -37,7 +37,10 @@ use std::hint::black_box;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use cel::majit::bytecode::float_bank::{clean_interp_seeded_f, run_jit_seeded_f, COMPILES};
+use cel::majit::bytecode::float_bank::{
+    clean_interp_seeded_f, intern_program, run_jit_persistent_f, run_jit_seeded_f, COMPILES,
+    GUARD_FAILS,
+};
 use cel::majit::lower::{lower_typed, Schema, ValType};
 use cel::{Context, Program, Value};
 
@@ -184,7 +187,7 @@ fn request_latency(label: &str, expression: &str, schema: &Schema, samples: &[Re
     };
     println!("{label}: {expression}");
     println!("  stock cached Program::execute : {stock_ns:>9.2} ns/eval");
-    println!("  majit single-activation JIT   :       N/A  (API absent; {subset})");
+    println!("  majit single-activation JIT   :       N/A  (no door; {subset})");
 }
 
 fn make_engine_columns(n: usize) -> (Vec<i64>, Vec<i64>, Vec<i64>) {
@@ -266,6 +269,67 @@ fn engine_only() {
     println!("  JIT-only throughput    : {:>9.2}x", clean_ns / jit_ns);
     println!("  timing scope           : one fresh trace/compile included per batch");
     println!("  correctness            : result={compiled}, compiles={compiles}");
+}
+
+/// The same sweep with the driver the batch API actually runs on: the trace is
+/// compiled once and every later call reuses it, so what is left is the FIXED
+/// cost of entering and leaving compiled code.
+///
+/// It is what decides whether a small batch should reach the compiled tier at
+/// all, and the reason there is no single-activation door: at one row the fixed
+/// cost is the whole evaluation.
+fn warm_break_even() {
+    const SIZES: &[usize] = &[1, 2, 8, 16, 64, 256, 1_024, 4_096, 16_384];
+    let max_n = *SIZES.last().unwrap();
+    let (balance, amount, frozen) = make_engine_columns(max_n);
+
+    println!("persistent driver, compile amortized (the tier the batch API runs):");
+    println!("      rows    clean total      JIT total    JIT/clean  guard fails/call");
+    let mut first_win = None;
+    for &n in SIZES {
+        let (code, regs, nf) = engine_program(n, &balance[..n], &amount[..n], &frozen[..n]);
+        // The words are the same for every size (the row count rides a seeded
+        // register), so interning them keeps one green key across the sweep --
+        // exactly what `BatchProgram` does between batches.
+        let code = intern_program(code);
+        let expected = clean_interp_seeded_f(&code, &regs, nf);
+        // Warm: enough calls that the loop is compiled and stays compiled, so
+        // no call in the timed region pays for a trace.
+        for _ in 0..64 {
+            assert_eq!(run_jit_persistent_f(&code, &regs, nf, JIT_ON), expected);
+        }
+
+        let mut clean_times = Vec::with_capacity(COLD_ROUNDS);
+        let mut jit_times = Vec::with_capacity(COLD_ROUNDS);
+        let g0 = GUARD_FAILS.load(Ordering::Relaxed);
+        let mut calls = 0usize;
+        for _ in 0..COLD_ROUNDS {
+            let start = Instant::now();
+            black_box(clean_interp_seeded_f(&code, &regs, nf));
+            clean_times.push(start.elapsed());
+
+            let start = Instant::now();
+            black_box(run_jit_persistent_f(&code, &regs, nf, JIT_ON));
+            jit_times.push(start.elapsed());
+            calls += 1;
+        }
+        let fails = (GUARD_FAILS.load(Ordering::Relaxed) - g0) as f64 / calls as f64;
+        let clean = median_duration(clean_times);
+        let jit = median_duration(jit_times);
+        if jit <= clean && first_win.is_none() {
+            first_win = Some(n);
+        }
+        println!(
+            "{n:>10}  {:>10.3} us  {:>12.3} us  {:>10.2}x  {fails:>16.2}",
+            clean.as_secs_f64() * 1e6,
+            jit.as_secs_f64() * 1e6,
+            jit.as_secs_f64() / clean.as_secs_f64(),
+        );
+    }
+    match first_win {
+        Some(n) => println!("  first measured JIT win over clean VM: {n} rows"),
+        None => println!("  no measured JIT win over clean VM in this size sweep"),
+    }
 }
 
 fn cold_break_even() {
@@ -365,6 +429,10 @@ fn main() {
     println!();
     println!("=== 3. COLD / BREAK-EVEN AGAINST THE SAME CLEAN VM ===");
     cold_break_even();
+
+    println!();
+    println!("=== 3b. WARM / FIXED PER-CALL COST OF THE COMPILED TIER ===");
+    warm_break_even();
 
     println!();
     println!("No stock/JIT ratio is reported: current majit has no equivalent");
