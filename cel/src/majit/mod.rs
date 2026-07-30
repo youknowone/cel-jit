@@ -3376,6 +3376,24 @@ mod tests {
         ] {
             check_collect_list(expr, &[], &items());
         }
+        // A STRING element stream: the stored ids are ranks over the batch's
+        // strings, so the output can only be read back against the same
+        // ranking the columns were encoded under.
+        let words = ["", "a", "bb", "ccc"];
+        check_collect_list(
+            "tags.filter(t, t == \"bb\")",
+            &[],
+            &[(
+                "tags",
+                record_list(
+                    lens.clone(),
+                    vec![(
+                        None,
+                        ColData::Str(gen_str(total, 0xC011_3C7E_D000_0007, &words)),
+                    )],
+                ),
+            )],
+        );
         // A float element stream takes the other store.
         check_collect_list(
             "fs.map(y, y * 2.0)",

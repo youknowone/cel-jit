@@ -546,9 +546,17 @@ pub fn prepare_batch_reduce<'a>(
         .collect();
     let str_ids: Vec<Box<[i64]>> = str_ids.into_iter().chain(pred_tables).collect();
     // A string-banked per-row output stores ids, which mean nothing without the
-    // order they were ranked in.
-    let distinct: Vec<String> = match (reduce, lowered.result_bank) {
-        (BatchReduce::PerRow, super::lower::ValType::Str) => distinct
+    // order they were ranked in. A COLLECTED list stores them just the same, and
+    // its bank is on the output's fields rather than on the row result — which
+    // is an int count whatever the elements are.
+    let str_result = lowered.result_bank == super::lower::ValType::Str
+        || lowered.list_output.as_ref().is_some_and(|o| {
+            o.fields
+                .iter()
+                .any(|(_, t)| *t == super::lower::ValType::Str)
+        });
+    let distinct: Vec<String> = match (reduce, str_result) {
+        (BatchReduce::PerRow, true) => distinct
             .get_or_insert_with(|| dict.sorted())
             .iter()
             .map(|s| (*s).to_string())
