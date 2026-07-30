@@ -491,18 +491,27 @@ pub fn prepare_batch_reduce<'a>(
     // across the whole batch — `map` writes exactly that many, `filter` fewer.
     // For a list column that is its flattened element count; for a literal list
     // it is the green length, once per row.
+    //
+    // The count is taken from the source's own `size(..)` column rather than
+    // from the length of an element column, because a body that reads no
+    // element at all (`nums.map(y, 1)`) leaves no element column to measure
+    // while still writing one element per input element. `size(..)` is the
+    // loop's trip count, so it is present whatever the body reads.
     let mut list_out: Vec<Box<[i64]>> = match (reduce, &lowered.list_output) {
         (BatchReduce::PerRow, Some(o)) => {
             let cap = match &o.source {
-                super::lower::ListSource::Column(src) => columns
-                    .iter()
-                    .zip(&lowered.slots)
-                    .filter(|(_, slot)| {
-                        super::lower::elem_slot_source(&slot.path).is_some_and(|(l, _)| l == *src)
-                    })
-                    .map(|(c, _)| c.len())
-                    .max()
-                    .unwrap_or(0),
+                super::lower::ListSource::Column(src) => {
+                    let key = super::lower::size_slot_path(src);
+                    columns
+                        .iter()
+                        .zip(&lowered.slots)
+                        .find(|(_, slot)| slot.path == key)
+                        .and_then(|(c, _)| match c {
+                            Column::Int(v) => Some(v.iter().sum::<i64>().max(0) as usize),
+                            _ => None,
+                        })
+                        .unwrap_or(0)
+                }
                 super::lower::ListSource::Literal(len) => n * len,
             };
             // One spare, so a batch that writes nothing still has an address.

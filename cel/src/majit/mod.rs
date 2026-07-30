@@ -3313,6 +3313,11 @@ mod tests {
             "nums.map(y, y * 2 - 1)",
             "nums.map(y, y > 0)",
             "nums.map(y, y + x)",
+            // A body that reads no ELEMENT still writes one element per input
+            // element, so the output is sized by the source's element count and
+            // not by what the body happened to load.
+            "nums.map(y, 1)",
+            "nums.map(y, x)",
             // `filter` writes only what the predicate admits.
             "nums.filter(y, y > 0)",
             "nums.filter(y, y > 1000)",
