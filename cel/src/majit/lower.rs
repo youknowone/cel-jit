@@ -2851,6 +2851,227 @@ enum AccuMode {
     Collect { cursor: usize },
 }
 
+/// One `map`/`filter` level of a comprehension chain.
+///
+/// `items.filter(x, p).map(x, f)` is two comprehensions, the outer one
+/// iterating the inner one's RESULT — a list whose length is data-dependent,
+/// which this machine has no value for. But CEL has no way to name that
+/// intermediate twice: a comprehension result is consumed by exactly one
+/// chained call, so the whole chain is one pass over the base list with each
+/// link's predicate ANDed and each link's value fed to the next. That is what
+/// gets compiled, and the intermediate list never exists.
+struct Link<'a> {
+    /// The link's own iteration variable, bound to what the link before it
+    /// produced.
+    iter_var: &'a str,
+    /// A `filter` predicate, or `None` for a `map`.
+    cond: Option<&'a IdedExpr>,
+    /// The appended expression — a bare `iter_var` for a `filter`, which is
+    /// what makes a `filter` pass its element through unchanged.
+    elem: &'a IdedExpr,
+}
+
+fn is_ident(e: &IdedExpr, name: &str) -> bool {
+    matches!(&e.expr, Expr::Ident(n) if n == name)
+}
+
+/// One chain level, or `None` if this comprehension is not one of the two
+/// shapes the `map`/`filter` macros desugar to.
+fn parse_link(comp: &ComprehensionExpr) -> Option<Link<'_>> {
+    if comp.iter_var2.is_some() {
+        return None;
+    }
+    // `map`/`filter` start from `[]` and hand the accumulator straight back, so
+    // anything else is a comprehension whose elements these are not.
+    if !matches!(&comp.accu_init.expr, Expr::List(l) if l.elements.is_empty()) {
+        return None;
+    }
+    if !is_ident(&comp.result, &comp.accu_var) {
+        return None;
+    }
+    // `c ? (@result + [e]) : @result` for `filter`, `@result + [e]` for `map`.
+    let (cond, append) = match &comp.loop_step.expr {
+        Expr::Call(c)
+            if c.func_name == ops::CONDITIONAL
+                && c.args.len() == 3
+                && is_ident(&c.args[2], &comp.accu_var) =>
+        {
+            (Some(&c.args[0]), &c.args[1])
+        }
+        _ => (None, &comp.loop_step),
+    };
+    let Expr::Call(add) = &append.expr else {
+        return None;
+    };
+    if add.func_name != ops::ADD || add.args.len() != 2 || !is_ident(&add.args[0], &comp.accu_var) {
+        return None;
+    }
+    let Expr::List(l) = &add.args[1].expr else {
+        return None;
+    };
+    let [elem] = &l.elements[..] else {
+        return None;
+    };
+    Some(Link {
+        iter_var: &comp.iter_var,
+        cond,
+        elem,
+    })
+}
+
+/// Flatten a `map`/`filter` chain into its links, innermost first, with the
+/// schema path of the declared list they all read from.
+///
+/// A single `items.map(..)` is a chain of one, so this is the only route into a
+/// collected runtime-list comprehension — chained or not.
+fn chain_links<'a>(
+    schema: &Schema,
+    comp: &'a ComprehensionExpr,
+) -> Option<(String, Vec<Link<'a>>)> {
+    let mut links = Vec::new();
+    let mut cur = comp;
+    let path = loop {
+        links.push(parse_link(cur)?);
+        match &cur.iter_range.expr {
+            Expr::Comprehension(inner) => cur = inner,
+            _ => break resolve_path(&cur.iter_range).ok()?,
+        }
+    };
+    if !declares_list(schema, &path) {
+        return None;
+    }
+    links.reverse();
+    Some((path, links))
+}
+
+/// Compile one fused iteration of a chain over the base loop's element.
+///
+/// Returns the ANDed predicate of every `filter` link — `None` when the chain
+/// is all `map`s — and the value the last link appends, which is `None` when
+/// every link passed the element straight through.
+///
+/// Each link's variable is bound to what the link before it produced: an ALIAS
+/// for the loop's element while the value is still the element itself, and an
+/// ordinary local once a `map` has computed one.
+///
+/// As everywhere else in this loop body, the fold is eager: a later link runs
+/// even for an element an earlier predicate rejected. Where that raises and the
+/// tree-walker would not have looked, the row traps and the walker owns it.
+fn compile_chain(
+    ctx: &mut LowerCtxF,
+    links: &[Link],
+    list: &str,
+    ea_reg: usize,
+) -> Result<(Option<TReg>, Option<TReg>), LowerError> {
+    let depth = ctx.list_loop.len();
+    let saved: Vec<(&str, Option<TReg>)> = links
+        .iter()
+        .map(|l| (l.iter_var, ctx.locals.remove(l.iter_var)))
+        .collect();
+    let r = compile_chain_body(ctx, links, list, ea_reg);
+    ctx.list_loop.truncate(depth);
+    // Reversed, so a name two links share is restored to what it held before
+    // the FIRST of them took it.
+    for (name, prev) in saved.into_iter().rev() {
+        match prev {
+            Some(v) => ctx.locals.insert(name.to_string(), v),
+            None => ctx.locals.remove(name),
+        };
+    }
+    r
+}
+
+fn compile_chain_body(
+    ctx: &mut LowerCtxF,
+    links: &[Link],
+    list: &str,
+    ea_reg: usize,
+) -> Result<(Option<TReg>, Option<TReg>), LowerError> {
+    let mut cond: Option<TReg> = None;
+    let mut value: Option<TReg> = None;
+    for (k, link) in links.iter().enumerate() {
+        // The base loop already registered the first link's variable.
+        if k > 0 {
+            match value {
+                None => ctx.list_loop.push(ListLoop {
+                    iter_var: link.iter_var.to_string(),
+                    list: list.to_string(),
+                    ea_reg,
+                }),
+                Some(v) => {
+                    ctx.locals.insert(link.iter_var.to_string(), v);
+                }
+            }
+        }
+        if let Some(c) = link.cond {
+            let c = compile_t(ctx, c)?;
+            if c.bank != ValType::Bool {
+                return Err(LowerError::unsupported("filter predicate must be bool"));
+            }
+            cond = Some(match cond {
+                None => c,
+                Some(prev) => {
+                    let r = ctx.fresh(ValType::Bool);
+                    ctx.body.extend_from_slice(&[
+                        OP_AND,
+                        prev.idx as i64,
+                        c.idx as i64,
+                        r.idx as i64,
+                    ]);
+                    r
+                }
+            });
+        }
+        if !is_ident(link.elem, link.iter_var) {
+            value = Some(compile_t(ctx, link.elem)?);
+        }
+    }
+    Ok((cond, value))
+}
+
+/// One fused iteration of a collected chain: the element stored, and the
+/// accumulator advanced by one where every predicate holds.
+fn emit_chain_collect(
+    ctx: &mut LowerCtxF,
+    links: &[Link],
+    list: &str,
+    ea_reg: usize,
+    accu: TReg,
+    cursor: usize,
+) -> Result<TReg, LowerError> {
+    let (cond, value) = compile_chain(ctx, links, list, ea_reg)?;
+    let appended = match value {
+        Some(v) => Appended::Value(v),
+        // Every link passed the element through, so what is stored is the
+        // element itself — under the name the BASE loop registered.
+        None => Appended::Element(links[0].iter_var),
+    };
+    emit_element_store(ctx, appended, cursor)?;
+    let one = emit_int_const(ctx, 1);
+    let Some(c) = cond else {
+        return Ok(emit_int_bin(ctx, OP_ADD, accu, one));
+    };
+    // Collecting under a predicate: the store runs for every element, and the
+    // cursor advances only where the predicate holds — so a rejected element
+    // writes to the slot the next accepted one will overwrite. That is what
+    // keeps the body straight-line, with no branch around the store.
+    let zero = emit_int_const(ctx, 0);
+    let delta = ctx.fresh(ValType::Int);
+    ctx.body.extend_from_slice(&[
+        OP_SELECT,
+        c.idx as i64,
+        one.idx as i64,
+        zero.idx as i64,
+        delta.idx as i64,
+    ]);
+    // Undo the unconditional advance the store made, where the predicate
+    // rejected.
+    let back = emit_int_bin(ctx, OP_SUB, one, delta);
+    ctx.body
+        .extend_from_slice(&[OP_SUB, cursor as i64, back.idx as i64, cursor as i64]);
+    Ok(emit_int_bin(ctx, OP_ADD, accu, delta))
+}
+
 /// Lower a top-level `list.map(..)` / `list.filter(..)` by COLLECTING it: the
 /// elements stream to their own flat buffers and the row's value is the count.
 ///
@@ -2874,11 +3095,8 @@ fn collect_list_result(ctx: &mut LowerCtxF, expr: &IdedExpr) -> Option<Result<TR
     if let Expr::List(l) = &comp.iter_range.expr {
         return Some(collect_literal_comprehension(ctx, comp, &l.elements));
     }
-    let path = resolve_path(&comp.iter_range).ok()?;
-    if !declares_list(ctx.schema, &path) {
-        return None;
-    }
-    Some(collect_list_comprehension(ctx, comp, &path))
+    let (path, links) = chain_links(ctx.schema, comp)?;
+    Some(collect_list_comprehension(ctx, comp, &path, &links))
 }
 
 /// [`collect_list_comprehension`] for a literal range: the same ragged output,
@@ -2959,43 +3177,14 @@ fn collect_list_comprehension(
     ctx: &mut LowerCtxF,
     comp: &ComprehensionExpr,
     path: &str,
+    links: &[Link],
 ) -> Result<TReg, LowerError> {
-    if comp.iter_var2.is_some() {
-        return Err(LowerError::unsupported("two-variable comprehension"));
-    }
-    // What the output's elements look like. `filter` hands back the element
-    // itself, so the output fields are the source's; `map` computes a value,
-    // so there is one unnamed field whose bank the body decides.
-    let appends_element = matches!(
-        &comp.loop_step.expr,
-        Expr::Call(c)
-            if c.args.len() == 3
-                && matches!(&c.args[1].expr, Expr::Call(a)
-                    if a.args.len() == 2
-                        && matches!(&a.args[1].expr, Expr::List(l)
-                            if l.elements.len() == 1
-                                && matches!(&l.elements[0].expr, Expr::Ident(n)
-                                    if *n == comp.iter_var)))
-    );
-    let fields: Vec<(Option<String>, ValType)> = if appends_element {
-        let mut v: Vec<(Option<String>, ValType)> = ctx
-            .schema
-            .iter()
-            .filter_map(|(k, t)| {
-                let (l, f) = elem_slot_source(k)?;
-                (l == path).then(|| (f.map(str::to_string), *t))
-            })
-            .collect();
-        v.sort_by(|x, y| x.0.cmp(&y.0));
-        v
-    } else {
-        // A `map` body's bank is not known until it is compiled, and it has to
-        // be known to seed the buffer. Compiling the body twice would emit it
-        // twice, so the bank is taken from a THROWAWAY lowering of the same
-        // expression against the same schema — same body, same answer, and its
-        // ops are discarded with it.
-        let elem = map_body_bank(ctx, comp, path)?;
-        vec![(None, elem)]
+    // What the output's elements look like. A chain that ends by computing a
+    // value has one unnamed field whose bank the chain decides; one that hands
+    // the element back — what `filter` does — has the source's own fields.
+    let fields: Vec<(Option<String>, ValType)> = match chain_value_bank(ctx, links, path)? {
+        Some(elem) => vec![(None, elem)],
+        None => source_fields(ctx.schema, path),
     };
     if fields.is_empty() {
         return Err(LowerError::unsupported(
@@ -3015,7 +3204,27 @@ fn collect_list_comprehension(
         fields,
         base_regs,
     });
-    compile_list_comprehension_mode(ctx, comp, path, AccuMode::Collect { cursor: cursor.idx })
+    compile_list_comprehension_mode(
+        ctx,
+        comp,
+        path,
+        AccuMode::Collect { cursor: cursor.idx },
+        links,
+    )
+}
+
+/// The declared element fields of a list column, in name order — what a chain
+/// of pure `filter`s hands back unchanged.
+fn source_fields(schema: &Schema, path: &str) -> Vec<(Option<String>, ValType)> {
+    let mut v: Vec<(Option<String>, ValType)> = schema
+        .iter()
+        .filter_map(|(k, t)| {
+            let (l, f) = elem_slot_source(k)?;
+            (l == path).then(|| (f.map(str::to_string), *t))
+        })
+        .collect();
+    v.sort_by(|x, y| x.0.cmp(&y.0));
+    v
 }
 
 /// An empty lowering over the same schema, for asking what bank an expression
@@ -3042,36 +3251,30 @@ fn probe_ctx<'a>(ctx: &LowerCtxF<'a>) -> LowerCtxF<'a> {
     }
 }
 
-/// The bank a `map` body produces, from a throwaway lowering of the same
-/// comprehension in `Length` mode — which compiles the body and discards it.
-fn map_body_bank(
+/// The bank a chain's last link appends, or `None` when every link passes the
+/// element through.
+///
+/// The output buffers have to be described before the body is compiled, and
+/// compiling the body twice would emit it twice — so the answer comes from a
+/// THROWAWAY lowering of the same links against the same schema. Same chain,
+/// same answer, and its registers, slots and ops are discarded with it.
+fn chain_value_bank(
     ctx: &LowerCtxF,
-    comp: &ComprehensionExpr,
+    links: &[Link],
     path: &str,
-) -> Result<ValType, LowerError> {
+) -> Result<Option<ValType>, LowerError> {
     let mut probe = probe_ctx(ctx);
-    // The appended expression, lowered on its own with the iteration variable
-    // bound — which is what `Length` mode does to it for its errors.
-    let Expr::Call(add) = &comp.loop_step.expr else {
-        return Err(LowerError::unsupported("collected step is not an append"));
-    };
-    let Some(Expr::List(l)) = add.args.get(1).map(|a| &a.expr) else {
-        return Err(LowerError::unsupported("collected step is not an append"));
-    };
-    let e = l
-        .elements
-        .first()
-        .ok_or_else(|| LowerError::unsupported("collected step appends nothing"))?;
-    let len = probe.slot_typed(size_slot_path(path), ValType::Int);
-    let off = probe.slot_typed(offset_slot_path(path), ValType::Int);
-    let _ = (len, off);
+    probe.slot_typed(size_slot_path(path), ValType::Int);
+    probe.slot_typed(offset_slot_path(path), ValType::Int);
     let ea = probe.fresh(ValType::Int);
     probe.list_loop.push(ListLoop {
-        iter_var: comp.iter_var.clone(),
+        iter_var: links[0].iter_var.to_string(),
         list: path.to_string(),
         ea_reg: ea.idx,
     });
-    Ok(compile_t(&mut probe, e)?.bank)
+    Ok(compile_chain(&mut probe, links, path, ea.idx)?
+        .1
+        .map(|v| v.bank))
 }
 
 /// `size(list.map(..))` / `size(list.filter(..))`: the same inner loop, with the
@@ -3109,10 +3312,13 @@ fn compile_comprehension_len(
     if !declares_list(ctx.schema, &path) {
         return Err(LowerError::unsupported("size() over a non-list range"));
     }
-    compile_list_comprehension_mode(ctx, comp, &path, AccuMode::Length)
+    compile_list_comprehension_mode(ctx, comp, &path, AccuMode::Length, &[])
 }
 
 /// One iteration's contribution to a list accumulator's LENGTH.
+///
+/// In `Collect` mode this is the LITERAL unroll's step — a runtime list's is
+/// fused from its whole chain by [`emit_chain_collect`] instead.
 ///
 /// The two shapes the macros desugar to, and no others:
 ///
@@ -3149,8 +3355,13 @@ fn compile_len_step(
             for e in &l.elements {
                 match mode {
                     // Collecting: the element's VALUE is the point, so it is
-                    // compiled either way and written out.
-                    AccuMode::Collect { cursor } => emit_element_store(ctx, e, comp, cursor)?,
+                    // compiled either way and written out. Over a literal range
+                    // the iteration variable is the ordinary local the unroll
+                    // bound, so it compiles like any other expression.
+                    AccuMode::Collect { cursor } => {
+                        let v = compile_t(ctx, e)?;
+                        emit_element_store(ctx, Appended::Value(v), cursor)?
+                    }
                     // Counting: the element is compiled only for the errors it
                     // can raise, and a bare iteration variable raises none.
                     _ if is_iter(e) => {}
@@ -3208,14 +3419,21 @@ fn compile_len_step(
     }
 }
 
+/// What one collected iteration appends.
+enum Appended<'a> {
+    /// The loop's element itself — what `filter` hands back — named by the
+    /// iteration variable it is bound to. Over a record list that is one
+    /// element load per declared field, which is why it stays a NAME here
+    /// rather than a register.
+    Element(&'a str),
+    /// A value the body computed, which is the single unnamed output field.
+    Value(TReg),
+}
+
 /// Write one appended element to the ragged output and advance the cursor.
-///
-/// A record element (`filter`'s bare iteration variable over a record list)
-/// writes one buffer per declared field; a scalar element writes one.
 fn emit_element_store(
     ctx: &mut LowerCtxF,
-    e: &IdedExpr,
-    comp: &ComprehensionExpr,
+    appended: Appended,
     cursor: usize,
 ) -> Result<(), LowerError> {
     let out = ctx
@@ -3228,22 +3446,14 @@ fn emit_element_store(
         idx: cursor,
     };
     let ea = emit_int_bin(ctx, OP_MUL, cur, stride);
-    let is_iter = matches!(&e.expr, Expr::Ident(n) if *n == comp.iter_var);
     for (k, (field, ty)) in out.fields.iter().enumerate() {
-        // `filter` appends the element itself, so each output field is that
-        // element's own field. `map` appends a computed value, which is the
-        // single unnamed field.
-        // Over a runtime list the iteration variable is an element load per
-        // declared field; over a literal one it is the ordinary local the
-        // unroll bound, which compiles like any other expression.
-        let elem_slot = if is_iter {
-            ctx.iter_var_slot(&comp.iter_var, field.as_deref())?
-        } else {
-            None
-        };
-        let v = match elem_slot {
-            Some(v) => v,
-            None => compile_t(ctx, e)?,
+        let v = match appended {
+            Appended::Element(name) => {
+                ctx.iter_var_slot(name, field.as_deref())?.ok_or_else(|| {
+                    LowerError::unsupported("collected element is not a loop element")
+                })?
+            }
+            Appended::Value(v) => v,
         };
         if v.bank != *ty {
             return Err(LowerError::unsupported("collected element bank"));
@@ -3442,14 +3652,18 @@ fn compile_list_comprehension_t(
     comp: &ComprehensionExpr,
     list: &str,
 ) -> Result<TReg, LowerError> {
-    compile_list_comprehension_mode(ctx, comp, list, AccuMode::Value)
+    compile_list_comprehension_mode(ctx, comp, list, AccuMode::Value, &[])
 }
 
+/// `chain` carries the fused `map`/`filter` links in `Collect` mode, where it
+/// is what the body compiles instead of `comp.loop_step`. The other modes read
+/// the step straight off `comp` and pass an empty chain.
 fn compile_list_comprehension_mode(
     ctx: &mut LowerCtxF,
     comp: &ComprehensionExpr,
     list: &str,
     mode: AccuMode,
+    chain: &[Link],
 ) -> Result<TReg, LowerError> {
     let len = ctx.slot_typed(size_slot_path(list), ValType::Int);
     let off = ctx.slot_typed(offset_slot_path(list), ValType::Int);
@@ -3481,17 +3695,22 @@ fn compile_list_comprehension_mode(
     let inner = ctx.body.len();
     let idx = emit_int_bin(ctx, OP_ADD, off, j);
     let ea = emit_int_bin(ctx, OP_MUL, idx, stride);
+    // The loop's element is bound to the FIRST link's variable: the chain runs
+    // innermost-first, and the outer comprehension's own variable belongs to
+    // its last link.
     ctx.list_loop.push(ListLoop {
-        iter_var: comp.iter_var.clone(),
+        iter_var: chain
+            .first()
+            .map_or(comp.iter_var.as_str(), |l| l.iter_var)
+            .to_string(),
         list: list.to_string(),
         ea_reg: ea.idx,
     });
     ctx.locals.insert(comp.accu_var.clone(), accu);
     let step = match mode {
         AccuMode::Value => compile_t(ctx, &comp.loop_step),
-        AccuMode::Length | AccuMode::Collect { .. } => {
-            compile_len_step(ctx, &comp.loop_step, comp, accu, mode)
-        }
+        AccuMode::Length => compile_len_step(ctx, &comp.loop_step, comp, accu, mode),
+        AccuMode::Collect { cursor } => emit_chain_collect(ctx, chain, list, ea.idx, accu, cursor),
     };
     ctx.list_loop.pop();
     // Drop only THIS loop's element registers. Each comprehension gets its own

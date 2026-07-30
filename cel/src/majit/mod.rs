@@ -3236,10 +3236,31 @@ mod tests {
             "1.5 + a",
             "[].map(x, x * 2)",
             "x.all(x, x > 0)",
+            // A CHAINED comprehension is fused into one pass over the base
+            // list, and a literal range has no such list to iterate.
+            "[1, 2, 3].filter(x, x > 1).map(x, x * 2)",
         ] {
             let program = Program::compile(expr).unwrap();
             assert!(
                 lower_typed(program.expression(), &Schema::new()).is_err(),
+                "`{expr}` must be rejected as out of subset"
+            );
+        }
+        // Over a DECLARED list column, so these decline for what they ask of
+        // the chain rather than for the range not being one.
+        let listed: Schema = [("nums[]".to_string(), ValType::Int)].into_iter().collect();
+        for expr in [
+            // A chain is collected, and only a collected TOP-LEVEL result has
+            // output buffers to stream to. `size` wants the count of an inner
+            // one, which the fused loop does not carry separately.
+            "size(nums.filter(y, y > 0).map(y, y * 2))",
+            // `all`/`exists` fold to a value rather than to a list, so they are
+            // not a link and end the chain where they appear.
+            "nums.filter(y, y > 0).all(y, y > 1)",
+        ] {
+            let program = Program::compile(expr).unwrap();
+            assert!(
+                lower_typed(program.expression(), &listed).is_err(),
                 "`{expr}` must be rejected as out of subset"
             );
         }
@@ -3364,6 +3385,133 @@ mod tests {
                 record_list(lens.clone(), vec![(None, ColData::Float(fs.clone()))]),
             )],
         );
+    }
+
+    /// CHAINED `map`/`filter` over a runtime list — cometkim's
+    /// `comprehension_scaling`. The outer comprehension iterates the inner
+    /// one's result, whose length is data-dependent, so the chain is fused into
+    /// ONE pass over the base list and the intermediate list never exists.
+    ///
+    /// The predicates are ANDed and the values threaded, so a chain that ends
+    /// on a `filter` still hands back the source's elements while one that ends
+    /// on a `map` hands back the computed value — checked both ways, over
+    /// scalar and record lists.
+    ///
+    /// Every link runs for every element, including ones an earlier predicate
+    /// rejected, so an expression whose later link raises on what the earlier
+    /// one filtered out traps rather than answering. See
+    /// `batch_chain_eager_fold_traps`.
+    #[test]
+    fn batch_chained_list_results() {
+        let n = 300;
+        let lens = gen_lens(n, 0xC4A1_0ED0_0000_0001, 3);
+        let total = lens.iter().sum::<i64>() as usize;
+        let nums = gen_i64(total, 0xC4A1_0ED0_0000_0002, -5, 5);
+        let fs = gen_f64(total, 0xC4A1_0ED0_0000_0003, -2.0, 2.0);
+        let x = ColData::Int(gen_i64(n, 0xC4A1_0ED0_0000_0004, -3, 3));
+        let scalars = || {
+            vec![(
+                "nums",
+                record_list(lens.clone(), vec![(None, ColData::Int(nums.clone()))]),
+            )]
+        };
+        for expr in [
+            "nums.filter(y, y % 2 == 0).map(y, y * 2)",
+            "nums.map(y, y * 2).filter(y, y > 0)",
+            // A chain of pure `filter`s never computes a value, so the elements
+            // pass through to the output unchanged.
+            "nums.filter(y, y > 0).filter(y, y < 3)",
+            "nums.map(y, y + 1).map(y, y * 3)",
+            // Three links, and a predicate on each side of a `map`.
+            "nums.filter(y, y > -3).map(y, y * 2).filter(y, y < 4)",
+            // Predicates that admit none and all.
+            "nums.filter(y, y > 1000).map(y, y * 2)",
+            "nums.filter(y, y > -1000).map(y, y * 2)",
+            // The value's bank changes along the chain, and the last link
+            // filters on the bool the `map` produced.
+            "nums.map(y, y > 0).filter(y, y)",
+            // A per-row column read from inside both links.
+            "nums.filter(y, y > x).map(y, y + x)",
+        ] {
+            check_collect_list(expr, &[("x", x.clone())], &scalars());
+        }
+        let price = gen_i64(total, 0xC4A1_0ED0_0000_0005, 0, 9);
+        let qty = gen_i64(total, 0xC4A1_0ED0_0000_0006, 0, 9);
+        let items = || {
+            vec![(
+                "items",
+                record_list(
+                    lens.clone(),
+                    vec![
+                        (Some("price"), ColData::Int(price.clone())),
+                        (Some("qty"), ColData::Int(qty.clone())),
+                    ],
+                ),
+            )]
+        };
+        for expr in [
+            // Ends on a `map`, so the output is a list of scalars.
+            "items.filter(i, i.price > 4).map(i, i.price)",
+            "items.filter(i, i.price > 4).map(i, i.price + i.qty)",
+            // Ends on a `filter`, so the output carries the source's fields.
+            "items.filter(i, i.price > 4).filter(i, i.qty > 4)",
+            "items.filter(i, i.price > i.qty).filter(i, i.price >= 0)",
+        ] {
+            check_collect_list(expr, &[], &items());
+        }
+        // The other store, reached through a chain.
+        check_collect_list(
+            "fs.map(y, y * 2.0).filter(y, y > 0.0)",
+            &[],
+            &[(
+                "fs",
+                record_list(lens.clone(), vec![(None, ColData::Float(fs.clone()))]),
+            )],
+        );
+    }
+
+    /// A chain's links all run for every element, so a later link raises on
+    /// elements an earlier predicate rejected — where the tree-walker, which
+    /// stops at the filter, answers.
+    ///
+    /// The batch does not answer WRONG: the row traps and the whole batch
+    /// refuses, which is the caller's cue to fall back to the walker. This is
+    /// the same eager fold the loop body already is; it is pinned so that a
+    /// change turning the trap into an answer is caught.
+    #[test]
+    fn batch_chain_eager_fold_traps() {
+        use super::batch::{Batch, BatchError, BatchProgram, Tier};
+        let n = 64;
+        let lens = gen_lens(n, 0xEA6E_0F01_D000_0001, 3);
+        let total = lens.iter().sum::<i64>() as usize;
+        // Spans zero, so at least one element is filtered out for being it.
+        let nums = gen_i64(total, 0xEA6E_0F01_D000_0002, -2, 2);
+        let src = "nums.filter(y, y != 0).map(y, 100 / y)";
+        let lc = record_list(lens.clone(), vec![(None, ColData::Int(nums.clone()))]);
+        let schema: Schema = [("nums[]".to_string(), ValType::Int)].into_iter().collect();
+        let program = Program::compile(src).unwrap();
+
+        // The walker answers every row.
+        for i in 0..n {
+            let mut ctx = Context::default();
+            ctx.add_variable_from_value("nums", lc.row_value(i));
+            program
+                .execute(&ctx)
+                .unwrap_or_else(|e| panic!("walker: {e:?}"));
+        }
+
+        let batch = Batch::new(n).column("nums", lc.view());
+        let bp = BatchProgram::from_program(&program, &schema)
+            .unwrap_or_else(|e| panic!("compile: {e}"));
+        let bound = bp
+            .bind_per_row(&batch)
+            .unwrap_or_else(|e| panic!("bind: {e}"));
+        for tier in [Tier::Clean, Tier::Interpreter, Tier::Jit] {
+            assert!(
+                matches!(bound.collect_on(tier), Err(BatchError::Trapped)),
+                "{tier:?} must refuse the batch rather than answer it"
+            );
+        }
     }
 
     /// The same list-valued `map`/`filter` over a LITERAL list — cometkim's
