@@ -803,16 +803,19 @@ impl LoweredF {
             if slot.kind != SlotKind::Row {
                 continue;
             }
-            let op = match slot.ty {
+            // A `bool` column is the caller's own `&[bool]` — one byte per row,
+            // so its effective address is the ROW COUNTER itself and the `* 8`
+            // above does not apply to it.
+            let (op, addr_reg) = match slot.ty {
                 ValType::Int
-                | ValType::Bool
                 | ValType::UInt
                 | ValType::Str
                 | ValType::Timestamp
-                | ValType::Duration => OP_COL_LOAD,
-                ValType::Float => OP_COL_LOAD_F,
+                | ValType::Duration => (OP_COL_LOAD, r_ea),
+                ValType::Bool => (OP_COL_LOAD_B, r_i),
+                ValType::Float => (OP_COL_LOAD_F, r_ea),
             };
-            p.extend_from_slice(&[op, (r_base0 + k) as i64, r_ea as i64, slot.reg as i64]);
+            p.extend_from_slice(&[op, (r_base0 + k) as i64, addr_reg as i64, slot.reg as i64]);
         }
         let body_at = p.len();
         p.extend_from_slice(&self.body);
@@ -936,6 +939,10 @@ struct ListLoop {
     list: String,
     /// Int register holding the inner loop's byte offset `(offset + j) * 8`.
     ea_reg: usize,
+    /// Int register holding the element INDEX `offset + j` — the same address
+    /// for a column whose stride is one byte. The `* 8` above is computed from
+    /// this one, so a byte-column read costs no scaling op of its own.
+    idx_reg: usize,
 }
 
 impl LowerCtxF<'_> {
@@ -1011,18 +1018,38 @@ impl LowerCtxF<'_> {
     /// [`LowerCtxF::elem_slot`] for an element slot whose type the LOWERING
     /// knows rather than the schema: the derived `size(<element>)` column,
     /// which is a count — the element-level twin of [`LowerCtxF::slot_typed`].
+    /// The element INDEX register belonging to the inner loop whose byte offset
+    /// is `ea_reg` — the address a one-byte element column is read at.
+    ///
+    /// Looked up rather than threaded through every chain function: the loop
+    /// that owns `ea_reg` is on the stack whenever one of its elements is being
+    /// read, and a later chain link that aliases the base loop shares both
+    /// registers. Falls back to `ea_reg` only where no loop owns it, which is
+    /// unreachable for an element slot and would read the wrong byte rather
+    /// than the wrong word if it ever were.
+    fn elem_idx_reg(&self, ea_reg: usize) -> usize {
+        self.list_loop
+            .iter()
+            .rev()
+            .find(|l| l.ea_reg == ea_reg)
+            .map_or(ea_reg, |l| l.idx_reg)
+    }
+
     fn elem_slot_typed(&mut self, path: String, ty: ValType, ea_reg: usize) -> TReg {
         if let Some(&r) = self.elem_map.get(&(path.clone(), ea_reg)) {
             return r;
         }
         let r = self.fresh(ty);
         let base_reg = self.fresh(ValType::Int).idx;
-        let op = match ty {
-            ValType::Float => OP_COL_LOAD_F,
-            _ => OP_COL_LOAD,
+        // A `bool` element column is the caller's own `&[bool]`, one byte per
+        // element, so it is read at the element INDEX and not at `index * 8`.
+        let (op, addr_reg) = match ty {
+            ValType::Float => (OP_COL_LOAD_F, ea_reg),
+            ValType::Bool => (OP_COL_LOAD_B, self.elem_idx_reg(ea_reg)),
+            _ => (OP_COL_LOAD, ea_reg),
         };
         self.body
-            .extend_from_slice(&[op, base_reg as i64, ea_reg as i64, r.idx as i64]);
+            .extend_from_slice(&[op, base_reg as i64, addr_reg as i64, r.idx as i64]);
         self.elem_map.insert((path.clone(), ea_reg), r);
         self.slots.push(SlotInfoF {
             path,
@@ -3048,6 +3075,7 @@ fn compile_chain_body(
                     iter_var: link.iter_var.to_string(),
                     list: list.to_string(),
                     ea_reg,
+                    idx_reg: ctx.elem_idx_reg(ea_reg),
                 }),
                 Some(v) => {
                     ctx.locals.insert(link.iter_var.to_string(), v);
@@ -3318,10 +3346,12 @@ fn chain_value_bank(
     probe.slot_typed(size_slot_path(path), ValType::Int);
     probe.slot_typed(offset_slot_path(path), ValType::Int);
     let ea = probe.fresh(ValType::Int);
+    let idx = probe.fresh(ValType::Int);
     probe.list_loop.push(ListLoop {
         iter_var: links[0].iter_var.to_string(),
         list: path.to_string(),
         ea_reg: ea.idx,
+        idx_reg: idx.idx,
     });
     Ok(compile_chain(&mut probe, links, path, ea.idx)?
         .1
@@ -3756,6 +3786,7 @@ fn compile_list_comprehension_mode(
             .to_string(),
         list: list.to_string(),
         ea_reg: ea.idx,
+        idx_reg: idx.idx,
     });
     ctx.locals.insert(comp.accu_var.clone(), accu);
     let step = match mode {

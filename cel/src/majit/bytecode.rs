@@ -166,6 +166,20 @@ pub const OP_COL_STORE: i64 = 54; // [base, ea, src]
 /// then `raw_store_i`) instead of adding a float store to the machine.
 pub const OP_COL_STORE_F: i64 = 55; // [base, ea, fsrc]
 
+/// [`OP_COL_LOAD`] from a ONE-BYTE unsigned column, for a `bool` slot backed by
+/// the caller's own `&[bool]`.
+///
+/// The `ea` is the ROW INDEX itself, not `i * 8`: a byte column's stride is one,
+/// so the row counter already holds the effective address and the machine emits
+/// no scaling op for it at all.
+///
+/// The result is still an `i64` `0`/`1` in the int register file — the width
+/// lives on the load's descr (`majit_raw_load_u8`), not on the value, which is
+/// upstream's arrangement: `jtransform.py:1165-1171` builds the descr from the
+/// LOADED type and `history.py:45-63 getkind` calls every sub-word primitive an
+/// `int`, so nothing downstream of the load has to know the column was narrow.
+pub const OP_COL_LOAD_B: i64 = 56; // [base, ea, dst]
+
 /// Raw native-memory load intrinsic recognized by the `#[jit_interp]` proc
 /// macro (lowered to `raw_load_i`); at the interpreter tier this real fn runs.
 /// `base` is a column buffer's base address, `ea` a byte offset — reading
@@ -180,6 +194,25 @@ fn majit_raw_load_i64(base: i64, ea: i64) -> i64 {
     // SAFETY: `base + ea` addresses element `ea/8` of a live `&[i64]` column
     // whose length the batch builder guarantees covers every row index.
     unsafe { core::ptr::read_unaligned((base as usize).wrapping_add(ea as usize) as *const i64) }
+}
+
+/// One-byte unsigned raw load intrinsic, recognized by the `#[jit_interp]` proc
+/// macro as `raw_load_i` with an ITEMSIZE-1 UNSIGNED array descr; at the
+/// interpreter tier this real fn runs.
+///
+/// Same shape as [`majit_raw_load_i64`] with a narrower descr, which is exactly
+/// how upstream distinguishes them — one `raw_load_i` op whose descr carries the
+/// width, and a backend that widens into the register at the load. `ea` is the
+/// element index, because a byte column's stride is one.
+#[inline]
+fn majit_raw_load_u8(base: i64, ea: i64) -> i64 {
+    // SAFETY: `base + ea` addresses element `ea` of a live `&[bool]` column
+    // whose length the batch builder guarantees covers every row index. `bool`
+    // is one byte and only ever holds `0` or `1`, so reading it as `u8` is
+    // defined and the widened value is already the `0`/`1` the machine wants.
+    unsafe {
+        core::ptr::read_unaligned((base as usize).wrapping_add(ea as usize) as *const u8) as i64
+    }
 }
 
 /// Raw native-memory store intrinsic (`raw_store_i`), the write-side analogue of
@@ -204,6 +237,21 @@ use super::lower::BatchReduce;
 pub enum Column<'a> {
     Int(&'a [i64]),
     Float(&'a [f64]),
+    /// A `bool` column, read where the caller keeps it: ONE BYTE per row.
+    ///
+    /// The register file is still `i64`, and the trace still holds a `0`/`1`
+    /// int — but the load that produces it is a 1-byte unsigned one
+    /// ([`OP_COL_LOAD_B`]), so the column is not copied into an `i64` buffer to
+    /// be read. That copy is what a batch pays twice for: once to build it, and
+    /// again on every run, streaming eight bytes where one carries the value.
+    ///
+    /// `jtransform.py:1165-1171 rewrite_op_raw_load` takes the descr from the
+    /// LOADED type (`arraydescrof(rffi.CArray(T))`), and `history.py:45-63
+    /// getkind` calls every primitive no wider than a word an `int` — so a
+    /// 1-byte load is a `raw_load_i` whose descr says 1, and the backend widens
+    /// it into the register. Nothing about the narrow column reaches the trace
+    /// as a different KIND of value.
+    Bool(&'a [bool]),
     /// A `string` column, handed over as its raw content.
     ///
     /// The machine runs on `i64` ids, but **which** ids is [`prepare_batch`]'s
@@ -220,6 +268,7 @@ impl Column<'_> {
         match self {
             Column::Int(c) => c.len(),
             Column::Float(c) => c.len(),
+            Column::Bool(c) => c.len(),
             Column::Str(c) => c.len(),
         }
     }
@@ -232,18 +281,21 @@ impl Column<'_> {
     fn matches(&self, ty: super::lower::ValType) -> bool {
         use super::lower::ValType;
         // A `uint` slot is backed by an int-bit column (the int register file
-        // carries the raw 64-bit pattern) and a `bool` slot by an int column of
-        // `0`/`1`. A `string` slot takes the strings themselves.
+        // carries the raw 64-bit pattern) and a `string` slot takes the strings
+        // themselves.
+        //
+        // A `bool` slot takes a `bool` column and NOTHING ELSE. The lowering
+        // reads it with a one-byte load at the row index, so an `i64` column of
+        // `0`/`1` under a `bool` slot would be read at one eighth of its stride
+        // and answer with whichever byte happened to be there. That is a silent
+        // wrong answer, which is why the pairing is checked rather than widened.
         matches!(
             (self, ty),
             (
                 Column::Int(_),
-                ValType::Int
-                    | ValType::Bool
-                    | ValType::UInt
-                    | ValType::Timestamp
-                    | ValType::Duration
-            ) | (Column::Float(_), ValType::Float)
+                ValType::Int | ValType::UInt | ValType::Timestamp | ValType::Duration
+            ) | (Column::Bool(_), ValType::Bool)
+                | (Column::Float(_), ValType::Float)
                 | (Column::Str(_), ValType::Str)
         )
     }
@@ -471,6 +523,7 @@ pub fn prepare_batch_reduce<'a>(
         .map(|c| match c {
             Column::Int(x) => x.as_ptr() as i64,
             Column::Float(x) => x.as_ptr() as i64,
+            Column::Bool(x) => x.as_ptr() as i64,
             Column::Str(_) => {
                 let base = str_ids[next_id_col].as_ptr() as i64;
                 next_id_col += 1;
@@ -684,13 +737,13 @@ pub mod float_bank {
     pub static TRACE_ABORTS: AtomicUsize = AtomicUsize::new(0);
 
     use super::{
-        OP_ADD, OP_ADD_OVF, OP_AND, OP_COL_LOAD, OP_COL_LOAD_F, OP_COL_STORE, OP_COL_STORE_F,
-        OP_DIV, OP_DIV_CHK, OP_EQ, OP_F2I, OP_F2U, OP_FADD, OP_FDIV, OP_FEQ, OP_FGE, OP_FGT,
-        OP_FLE, OP_FLT, OP_FMOV, OP_FMUL, OP_FNE, OP_FNEG, OP_FSELECT, OP_FSUB, OP_GE, OP_GT,
-        OP_I2F, OP_JUMP_IF_ABOVE, OP_LE, OP_LOAD_CONST, OP_LOAD_CONST_F, OP_LT, OP_MOD, OP_MOD_CHK,
-        OP_MOV, OP_MUL, OP_MUL_OVF, OP_NE, OP_NEG, OP_NOT, OP_OR, OP_RETURN, OP_RETURN_F,
-        OP_SELECT, OP_SUB, OP_SUB_OVF, OP_TRAP_STORE, OP_U2F, OP_UADD_OVF, OP_UDIV, OP_ULE, OP_ULT,
-        OP_UMOD, OP_UMUL_OVF, OP_USUB_OVF,
+        OP_ADD, OP_ADD_OVF, OP_AND, OP_COL_LOAD, OP_COL_LOAD_B, OP_COL_LOAD_F, OP_COL_STORE,
+        OP_COL_STORE_F, OP_DIV, OP_DIV_CHK, OP_EQ, OP_F2I, OP_F2U, OP_FADD, OP_FDIV, OP_FEQ,
+        OP_FGE, OP_FGT, OP_FLE, OP_FLT, OP_FMOV, OP_FMUL, OP_FNE, OP_FNEG, OP_FSELECT, OP_FSUB,
+        OP_GE, OP_GT, OP_I2F, OP_JUMP_IF_ABOVE, OP_LE, OP_LOAD_CONST, OP_LOAD_CONST_F, OP_LT,
+        OP_MOD, OP_MOD_CHK, OP_MOV, OP_MUL, OP_MUL_OVF, OP_NE, OP_NEG, OP_NOT, OP_OR, OP_RETURN,
+        OP_RETURN_F, OP_SELECT, OP_SUB, OP_SUB_OVF, OP_TRAP_STORE, OP_U2F, OP_UADD_OVF, OP_UDIV,
+        OP_ULE, OP_ULT, OP_UMOD, OP_UMUL_OVF, OP_USUB_OVF,
     };
     use core::sync::atomic::Ordering;
 
@@ -703,6 +756,18 @@ pub mod float_bank {
         // the batch driver keeps alive across the whole run.
         unsafe {
             core::ptr::write_unaligned((base as usize).wrapping_add(ea as usize) as *mut i64, val)
+        }
+    }
+
+    /// One-byte unsigned raw load — see the int-bank
+    /// [`super::majit_raw_load_u8`]. Duplicated here because the `#[jit_interp]`
+    /// macro recognizes the call by name within the traced function's module.
+    #[inline]
+    fn majit_raw_load_u8(base: i64, ea: i64) -> i64 {
+        // SAFETY: `base + ea` addresses element `ea` of a live `&[bool]` column
+        // whose length the batch builder guarantees covers every row index.
+        unsafe {
+            core::ptr::read_unaligned((base as usize).wrapping_add(ea as usize) as *const u8) as i64
         }
     }
 
@@ -1180,6 +1245,12 @@ pub mod float_bank {
                     state.regs[program[pc + 3] as usize] = super::majit_raw_load_i64(base, ea);
                     pc += 4;
                 }
+                OP_COL_LOAD_B => {
+                    let base = state.regs[program[pc + 1] as usize];
+                    let ea = state.regs[program[pc + 2] as usize];
+                    state.regs[program[pc + 3] as usize] = majit_raw_load_u8(base, ea);
+                    pc += 4;
+                }
                 OP_COL_LOAD_F => {
                     let base = state.regs[program[pc + 1] as usize];
                     let ea = state.regs[program[pc + 2] as usize];
@@ -1583,6 +1654,12 @@ pub mod float_bank {
                     let base = regs[program[pc + 1] as usize];
                     let ea = regs[program[pc + 2] as usize];
                     regs[program[pc + 3] as usize] = super::majit_raw_load_i64(base, ea);
+                    pc += 4;
+                }
+                OP_COL_LOAD_B => {
+                    let base = regs[program[pc + 1] as usize];
+                    let ea = regs[program[pc + 2] as usize];
+                    regs[program[pc + 3] as usize] = majit_raw_load_u8(base, ea);
                     pc += 4;
                 }
                 OP_COL_LOAD_F => {

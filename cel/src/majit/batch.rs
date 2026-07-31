@@ -521,9 +521,9 @@ impl BatchProgram {
                 .find(|(f, _)| *f == field)
                 .map(|(_, c)| c)
                 .ok_or_else(|| BatchError::MissingColumn(path.to_string()))?;
-            return encode(col, ty, path, derived);
+            return encode(col, ty, path);
         }
-        encode(lookup(batch, path)?, ty, path, derived)
+        encode(lookup(batch, path)?, ty, path)
     }
 }
 
@@ -606,14 +606,12 @@ enum Plan<'a> {
     Derived(usize),
 }
 
-/// Encode one caller column into the bank its slot reads, checking that the
-/// column is the type the schema declared.
-fn encode<'a>(
-    col: &'a ColumnRef<'a>,
-    ty: ValType,
-    path: &str,
-    derived: &mut Vec<DerivedColumn>,
-) -> Result<Plan<'a>, BatchError> {
+/// Hand one caller column to the bank its slot reads, checking that the column
+/// is the type the schema declared.
+///
+/// Every declared type is now readable where the caller keeps it, so this only
+/// borrows — it materializes nothing and can fail only on a type mismatch.
+fn encode<'a>(col: &'a ColumnRef<'a>, ty: ValType, path: &str) -> Result<Plan<'a>, BatchError> {
     if col.val_type() != Some(ty) {
         return Err(BatchError::ColumnType {
             name: path.to_string(),
@@ -622,29 +620,28 @@ fn encode<'a>(
     }
     // `int`, `timestamp` and `duration` are already `i64` in the machine's
     // representation and are read straight out of the caller's buffer; so is
-    // `uint`, whose raw bit pattern is what the int file carries. `bool` and
-    // `string` are not, so they get a materialized column.
-    let buf: Vec<i64> = match col {
+    // `uint`, whose raw bit pattern is what the int file carries. `bool` is read
+    // where the caller keeps it, ONE BYTE per row, by a load whose descr says
+    // one. Only `string` is not readable in place.
+    match col {
         ColumnRef::Int(c) | ColumnRef::Timestamp(c) | ColumnRef::Duration(c) => {
-            return Ok(Plan::Borrowed(Column::Int(c)))
+            Ok(Plan::Borrowed(Column::Int(c)))
         }
-        ColumnRef::Float(c) => return Ok(Plan::Borrowed(Column::Float(c))),
+        ColumnRef::Float(c) => Ok(Plan::Borrowed(Column::Float(c))),
         ColumnRef::UInt(c) => {
             // SAFETY: `u64` and `i64` have the same size and alignment and every
             // bit pattern is valid for both, and the int register file carries a
             // `uint` as exactly that bit pattern (see `ValType::UInt`), so the
             // column is reinterpreted rather than copied.
             let bits = unsafe { core::slice::from_raw_parts(c.as_ptr().cast::<i64>(), c.len()) };
-            return Ok(Plan::Borrowed(Column::Int(bits)));
+            Ok(Plan::Borrowed(Column::Int(bits)))
         }
-        ColumnRef::Bool(c) => c.iter().map(|&b| b as i64).collect(),
+        ColumnRef::Bool(c) => Ok(Plan::Borrowed(Column::Bool(c))),
         // Strings go to `prepare_batch` as strings: the ids are ranks over the
         // whole batch, which one column cannot compute on its own.
-        ColumnRef::Str(c) => return Ok(Plan::Borrowed(Column::Str(c))),
-        ColumnRef::List { .. } => return Err(BatchError::MissingColumn(path.to_string())),
-    };
-    derived.push(DerivedColumn::int(buf));
-    Ok(Plan::Derived(derived.len() - 1))
+        ColumnRef::Str(c) => Ok(Plan::Borrowed(Column::Str(c))),
+        ColumnRef::List { .. } => Err(BatchError::MissingColumn(path.to_string())),
+    }
 }
 
 fn lookup<'a>(batch: &'a Batch<'a>, name: &str) -> Result<&'a ColumnRef<'a>, BatchError> {
@@ -1428,6 +1425,127 @@ mod tests {
                 })
                 .unwrap();
         }
+    }
+
+    /// A `bool` column is READ WHERE THE CALLER KEEPS IT — one byte per row —
+    /// so its slot's load must use the row index and not `row * 8`.
+    ///
+    /// A `bool` is `0`/`1`, which is exactly the value a wrongly-plumbed load
+    /// is most likely to return by accident, so this pins the ADDRESSING rather
+    /// than the value: the pattern below alternates in a way that a load at
+    /// `row * 8` reproduces only for row 0. Every tier is checked, because the
+    /// clean interpreter, the tracing interpreter and the compiled trace each
+    /// compute the address by their own route.
+    #[test]
+    fn a_bool_column_is_read_a_byte_at_a_time() {
+        let s = schema(&[("b", ValType::Bool), ("x", ValType::Int)]);
+        // 24 rows: more than one 8-byte stride, and `true` in positions that a
+        // stride-8 read would land on `false` for.
+        let b: Vec<bool> = (0..24).map(|i| i % 3 == 0).collect();
+        let x: Vec<i64> = (0..24).collect();
+        let expect: Vec<Value> = b
+            .iter()
+            .zip(&x)
+            .map(|(&f, &v)| Value::Int(if f { v * 2 } else { -v }))
+            .collect();
+        let program = BatchProgram::compile("b ? x * 2 : -x", &s).unwrap();
+        for tier in [Tier::Clean, Tier::Interpreter, Tier::Jit] {
+            let batch = Batch::new(24)
+                .column("b", ColumnRef::Bool(&b))
+                .column("x", ColumnRef::Int(&x));
+            let got = program
+                .bind_per_row(&batch)
+                .unwrap()
+                .collect_on(tier)
+                .unwrap();
+            assert_eq!(got, expect, "{tier:?}");
+        }
+    }
+
+    /// The same one-byte read for a `bool` LIST FIELD, whose address is the
+    /// inner loop's element index rather than the row's.
+    ///
+    /// The element path computes `(offset + j) * 8` for a word column and stops
+    /// at `offset + j` for a byte one, and both live behind the same `ea_reg`,
+    /// so a byte field read at the word address is the mistake this pins. The
+    /// `active` pattern is chosen so a stride-8 read agrees only on element 0.
+    #[test]
+    fn a_bool_list_field_is_read_a_byte_at_a_time() {
+        let s = schema(&[
+            ("items[].price", ValType::Int),
+            ("items[].active", ValType::Bool),
+        ]);
+        let lens = vec![5i64, 0, 7, 3];
+        let total = lens.iter().sum::<i64>() as usize;
+        let price: Vec<i64> = (1..=total as i64).collect();
+        let active: Vec<bool> = (0..total).map(|k| k % 3 != 1).collect();
+        // The walker's answer, computed here from the same flat buffers.
+        let mut at = 0usize;
+        let expect: Vec<Value> = lens
+            .iter()
+            .map(|&n| {
+                let end = at + n as usize;
+                let total: i64 = (at..end).filter(|&k| active[k]).map(|k| price[k]).sum();
+                at = end;
+                Value::Int(total)
+            })
+            .collect();
+        let program =
+            BatchProgram::compile("items.filter(i, i.active).map(i, i.price)", &s).unwrap();
+        for tier in [Tier::Clean, Tier::Interpreter, Tier::Jit] {
+            let batch = Batch::new(lens.len()).column(
+                "items",
+                ColumnRef::List {
+                    lens: &lens,
+                    fields: vec![
+                        (Some("active"), ColumnRef::Bool(&active)),
+                        (Some("price"), ColumnRef::Int(&price)),
+                    ],
+                },
+            );
+            let rows = program
+                .bind_per_row(&batch)
+                .unwrap()
+                .collect_on(tier)
+                .unwrap();
+            // Sum each row's collected prices: the per-element identity is what
+            // the addressing decides, and the sum is wrong the moment one
+            // element is admitted or dropped by the wrong `active` byte.
+            let got: Vec<Value> = rows
+                .iter()
+                .map(|r| match r {
+                    Value::List(items) => Value::Int(
+                        items
+                            .iter()
+                            .map(|v| match v {
+                                Value::Int(i) => *i,
+                                other => panic!("{other:?}"),
+                            })
+                            .sum(),
+                    ),
+                    other => panic!("{other:?}"),
+                })
+                .collect();
+            assert_eq!(got, expect, "{tier:?}");
+        }
+    }
+
+    /// A `bool` slot takes a `bool` column and nothing else.
+    ///
+    /// The load reads one byte at the row index, so an `i64` column of `0`/`1`
+    /// under a `bool` slot would be read at an eighth of its stride and answer
+    /// with whatever byte sat there — a wrong answer, not an error. The bind
+    /// refuses it instead.
+    #[test]
+    fn an_int_column_cannot_back_a_bool_slot() {
+        let s = schema(&[("b", ValType::Bool)]);
+        let program = BatchProgram::compile("b", &s).unwrap();
+        let as_ints = vec![1i64, 0, 1, 0];
+        let batch = Batch::new(4).column("b", ColumnRef::Int(&as_ints));
+        assert!(matches!(
+            program.bind(&batch),
+            Err(BatchError::ColumnType { .. })
+        ));
     }
 
     #[test]

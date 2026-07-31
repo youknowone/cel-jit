@@ -172,13 +172,6 @@ mod tests {
                 Bind::Bool(_) => ValType::Bool,
             }
         }
-
-        fn as_i64(self) -> i64 {
-            match self {
-                Bind::Int(v) => v,
-                Bind::Bool(b) => b as i64,
-            }
-        }
     }
 
     /// Cross-check ONE row: a lowered CEL expression run on both the clean
@@ -188,9 +181,20 @@ mod tests {
     /// one-row batch is the single-row program on this machine — the loop runs
     /// once and the accumulator holds the row's value.
     fn check(expr_src: &str, binds: &[(&str, Bind)]) {
+        // A `bool` binding builds a BOOL column, not an int one holding `0`/`1`:
+        // the machine reads a bool slot with a one-byte load, so the two are not
+        // interchangeable on the way in any more than they are in CEL.
         let cols: Vec<(&str, ColData)> = binds
             .iter()
-            .map(|(n, b)| (*n, ColData::Int(vec![b.as_i64()])))
+            .map(|(n, b)| {
+                (
+                    *n,
+                    match b {
+                        Bind::Bool(v) => ColData::Bool(vec![*v]),
+                        Bind::Int(v) => ColData::Int(vec![*v]),
+                    },
+                )
+            })
             .collect();
         let program =
             Program::compile(expr_src).unwrap_or_else(|e| panic!("parse `{expr_src}`: {e:?}"));
@@ -217,7 +221,21 @@ mod tests {
             other => panic!("`{expr_src}`: unexpected result {other:?}"),
         };
 
-        let columns: Vec<Column> = cols.iter().map(|(_, d)| d.column()).collect();
+        // In SLOT order, not binding order. The two agree only by luck — the
+        // slots are numbered as the lowering first meets each path — and while
+        // every column was an int the mismatch was invisible, because handing
+        // one int column's buffer to another int slot still reads an int.
+        let columns: Vec<Column> = lowered
+            .slots
+            .iter()
+            .map(|slot| {
+                cols.iter()
+                    .find(|(n, _)| *n == slot.path)
+                    .unwrap_or_else(|| panic!("`{expr_src}`: slot `{}` is unbound", slot.path))
+                    .1
+                    .column()
+            })
+            .collect();
         assert_eq!(
             clean_batch_sum_f(&lowered, &columns, 1),
             Some(cel_i),
@@ -475,7 +493,7 @@ mod tests {
                 (
                     *name,
                     if is_bool {
-                        ColData::Bool(c)
+                        ColData::Bool(c.iter().map(|&v| v != 0).collect())
                     } else {
                         ColData::Int(c)
                     },
@@ -643,7 +661,7 @@ mod tests {
         /// [`ValType::Bool`], so `&&`/`!`/`?:` accept it and arithmetic does
         /// not, and the oracle binds a real `Value::Bool` rather than its `0`/`1`
         /// image.
-        Bool(Vec<i64>),
+        Bool(Vec<bool>),
         UInt(Vec<i64>),
         Float(Vec<f64>),
         /// A string column. Handed to the machine as strings; `prepare_batch`
@@ -662,10 +680,10 @@ mod tests {
         fn len(&self) -> usize {
             match self {
                 ColData::Int(c)
-                | ColData::Bool(c)
                 | ColData::UInt(c)
                 | ColData::Timestamp(c)
                 | ColData::Duration(c) => c.len(),
+                ColData::Bool(c) => c.len(),
                 ColData::Float(c) => c.len(),
                 ColData::Str(c) => c.len(),
             }
@@ -684,10 +702,10 @@ mod tests {
         fn column(&self) -> Column<'_> {
             match self {
                 ColData::Int(c)
-                | ColData::Bool(c)
                 | ColData::UInt(c)
                 | ColData::Timestamp(c)
                 | ColData::Duration(c) => Column::Int(c),
+                ColData::Bool(c) => Column::Bool(c),
                 ColData::Float(c) => Column::Float(c),
                 ColData::Str(c) => Column::Str(c),
             }
@@ -745,7 +763,7 @@ mod tests {
     fn cell_value(d: &ColData, k: usize) -> Value {
         match d {
             ColData::Int(c) => Value::Int(c[k]),
-            ColData::Bool(c) => Value::Bool(c[k] != 0),
+            ColData::Bool(c) => Value::Bool(c[k]),
             ColData::UInt(c) => Value::UInt(c[k] as u64),
             ColData::Float(c) => Value::Float(c[k]),
             ColData::Str(c) => Value::String(std::sync::Arc::new(c[k].clone())),
@@ -787,7 +805,20 @@ mod tests {
             "`{expr_src}`: the tree-walker answers every row, so refusing would be wrong"
         );
 
-        let columns: Vec<Column> = cols.iter().map(|(_, d)| d.column()).collect();
+        // In SLOT order — see `check`. The caller's column list is written in
+        // whatever order reads well, and the slots are numbered as the lowering
+        // first meets each path.
+        let columns: Vec<Column> = lowered
+            .slots
+            .iter()
+            .map(|slot| {
+                cols.iter()
+                    .find(|(n, _)| *n == slot.path)
+                    .unwrap_or_else(|| panic!("`{expr_src}`: slot `{}` is unbound", slot.path))
+                    .1
+                    .column()
+            })
+            .collect();
         assert_eq!(
             clean_batch_sum_f(&lowered, &columns, n),
             None,
@@ -862,7 +893,20 @@ mod tests {
             };
         }
 
-        let columns: Vec<Column> = cols.iter().map(|(_, d)| d.column()).collect();
+        // In SLOT order — see `check`. The caller's column list is written in
+        // whatever order reads well, and the slots are numbered as the lowering
+        // first meets each path.
+        let columns: Vec<Column> = lowered
+            .slots
+            .iter()
+            .map(|slot| {
+                cols.iter()
+                    .find(|(n, _)| *n == slot.path)
+                    .unwrap_or_else(|| panic!("`{expr_src}`: slot `{}` is unbound", slot.path))
+                    .1
+                    .column()
+            })
+            .collect();
 
         // Clean two-bank interpreter over the built batch program.
         assert_eq!(
@@ -947,7 +991,20 @@ mod tests {
             };
         }
 
-        let columns: Vec<Column> = cols.iter().map(|(_, d)| d.column()).collect();
+        // In SLOT order — see `check`. The caller's column list is written in
+        // whatever order reads well, and the slots are numbered as the lowering
+        // first meets each path.
+        let columns: Vec<Column> = lowered
+            .slots
+            .iter()
+            .map(|slot| {
+                cols.iter()
+                    .find(|(n, _)| *n == slot.path)
+                    .unwrap_or_else(|| panic!("`{expr_src}`: slot `{}` is unbound", slot.path))
+                    .1
+                    .column()
+            })
+            .collect();
 
         // Clean two-bank interpreter over the built batch program.
         let clean = clean_batch_sum_f(&lowered, &columns, n)
@@ -1679,7 +1736,10 @@ mod tests {
         }
         let n = 600;
         let flags = gen_i64(n, 0x1357_9BDF_2468_ACE0, 0, 1);
-        check_batch_f("-b", &[("b", ColData::Bool(flags))]);
+        check_batch_f(
+            "-b",
+            &[("b", ColData::Bool(flags.iter().map(|&v| v != 0).collect()))],
+        );
     }
 
     /// Cross-check a batch through the PUBLIC API on all three tiers against
@@ -1708,7 +1768,7 @@ mod tests {
             ColData::UInt(c) => ColumnRef::UInt(unsafe {
                 core::slice::from_raw_parts(c.as_ptr().cast::<u64>(), c.len())
             }),
-            ColData::Bool(_) => panic!("bool column"),
+            ColData::Bool(c) => ColumnRef::Bool(c),
         }
     }
 
@@ -2583,6 +2643,24 @@ mod tests {
     /// bank", so `a && b` with `a = 1, b = 2` answered `3` (`OP_AND` is bitwise)
     /// where the tree-walker raises `NoSuchOverload` — a JIT-only answer to an
     /// expression CEL rejects. The lowering must now decline every one of these.
+    /// The bank check on the way into a run is not decoration.
+    ///
+    /// `encode` refuses an `i64` column under a `bool` slot on the public path,
+    /// but the batch drivers are reachable from inside the crate with columns a
+    /// caller assembled by hand — and a `bool` slot reads ONE BYTE at the row
+    /// index, so an `i64` column of `0`/`1` under it would be read at an eighth
+    /// of its stride and answer with whichever byte sat there. The check turns
+    /// that into a stop instead of a wrong number; this is what makes it fire.
+    #[test]
+    #[should_panic(expected = "bank mismatch")]
+    fn an_int_column_under_a_bool_slot_stops_the_run() {
+        let schema: Schema = [("b".to_string(), ValType::Bool)].into_iter().collect();
+        let program = Program::compile("b").unwrap();
+        let lowered = lower_typed(program.expression(), &schema).unwrap();
+        let as_ints = vec![1i64, 0, 1, 0];
+        clean_batch_sum_f(&lowered, &[Column::Int(&as_ints)], 4);
+    }
+
     #[test]
     fn bool_is_a_type_not_an_int() {
         let schema: Schema = [
@@ -4150,8 +4228,8 @@ mod tests {
             ("v", ColData::UInt(vec![2, 4, 8, 5])),
             ("f", ColData::Float(vec![2.5, -0.5, 1.25, 3.0])),
             ("g", ColData::Float(vec![0.5, 4.0, -2.0, 1.5])),
-            ("b", ColData::Bool(vec![1, 0, 1, 0])),
-            ("c", ColData::Bool(vec![1, 1, 0, 0])),
+            ("b", ColData::Bool(vec![true, false, true, false])),
+            ("c", ColData::Bool(vec![true, true, false, false])),
             (
                 "s",
                 ColData::Str(
@@ -4772,7 +4850,7 @@ mod tests {
         let cols: Vec<(&'static str, ColData)> = vec![
             ("i", ColData::Int(vec![7, -3, 11, 2])),
             ("j", ColData::Int(vec![2, 5, -1, 4])),
-            ("b", ColData::Bool(vec![1, 0, 1, 0])),
+            ("b", ColData::Bool(vec![true, false, true, false])),
             (
                 "s",
                 ColData::Str(
@@ -4829,7 +4907,7 @@ mod tests {
     fn logical_operators_absorb_the_other_operand() {
         let cols: Vec<(&'static str, ColData)> = vec![
             ("i", ColData::Int(vec![7, -3, 11, 2])),
-            ("b", ColData::Bool(vec![1, 0, 1, 0])),
+            ("b", ColData::Bool(vec![true, false, true, false])),
             (
                 "s",
                 ColData::Str(
