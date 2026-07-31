@@ -732,16 +732,19 @@ impl LoweredF {
             self.sum_reducible()
                 .expect("a summing shape on a result the loop's sum cannot consume");
         }
+        // The loop's two literals — the row step and the byte stride — are NOT
+        // registers: they ride in the word stream as immediates (see
+        // `OP_ADD_IMM`), which is what keeps them constants inside the trace.
         let m = self.num_int_regs; // first int machinery register
-        let (r_i, r_acc, r_n, r_one, r_stride, r_ea) = (m, m + 1, m + 2, m + 3, m + 4, m + 5);
-        let r_trap = m + 6;
+        let (r_i, r_acc, r_n, r_ea) = (m, m + 1, m + 2, m + 3);
+        let r_trap = m + 4;
         // The output base is a machinery register too, present only where the
         // reduction stores through it.
         let r_out = match reduce {
             BatchReduce::Sum => None,
-            BatchReduce::PerRow => Some(m + 7),
+            BatchReduce::PerRow => Some(m + 5),
         };
-        let r_base0 = m + 7 + usize::from(r_out.is_some());
+        let r_base0 = m + 5 + usize::from(r_out.is_some());
         let total_int_regs = r_base0 + self.slots.len();
         // A float result accumulates into a float register above the body's
         // float bank; an int result uses the int `r_acc` and leaves the float
@@ -751,11 +754,34 @@ impl LoweredF {
             _ => (0, self.num_float_regs),
         };
 
+        // Whether the loop needs the byte-offset induction variable at all.
+        let needs_ea = reduce == BatchReduce::PerRow
+            || self
+                .slots
+                .iter()
+                .any(|slot| slot.kind == SlotKind::Row && slot.ty != ValType::Bool);
+
         let mut p = Vec::new();
         let load_const = |p: &mut Vec<i64>, imm: i64, dst: usize| {
             p.extend_from_slice(&[OP_LOAD_CONST, imm, dst as i64]);
         };
         load_const(&mut p, 0, r_i);
+        // The byte offset is a SECOND induction variable, stepped by its own
+        // stride, rather than `i * 8` recomputed each row. Both forms cost the
+        // same one instruction, but only this one is analyzable: the optimizer
+        // strength-reduces `int_mul(i, 8)` to `int_lshift(i, 3)`
+        // (`autogenintrules.py:387-393 mul_pow2_const`) and
+        // `dependency.py:896-948` builds an `IndexVar` for INT_ADD/SUB/MUL
+        // only — never for a shift. An offset advanced by a constant keeps the
+        // memory references linear in one base var, which is how micronumpy's
+        // iterators walk an array and the reason its loops vectorize.
+        //
+        // A shape with no eight-byte row access — a constant expression, or one
+        // reading only `bool` columns, which address by the row counter — never
+        // reads it, so it does not carry it.
+        if needs_ea {
+            load_const(&mut p, 0, r_ea);
+        }
         // Accumulator init, run once before the merge point. `OP_LOAD_CONST_F`'s
         // `f64::from_bits` must stay out of the traced loop body; here it is in
         // the setup (0.0 has zero bits).
@@ -767,8 +793,6 @@ impl LoweredF {
             // one setup instruction and leaves the bank in one known state.
             _ => load_const(&mut p, 0, r_acc),
         }
-        load_const(&mut p, 1, r_one);
-        load_const(&mut p, 8, r_stride);
         // Overflow trap: the flag starts clear. Where it is published is data,
         // so the address arrives in a seeded register rather than as an
         // immediate, and the epilogue stores through it once the loop is done.
@@ -794,8 +818,6 @@ impl LoweredF {
         p.extend_from_slice(&self.prelude);
 
         let body_pc = p.len();
-        // ea = i * 8 (byte offset of row i in an 8-byte column)
-        p.extend_from_slice(&[OP_MUL, r_i as i64, r_stride as i64, r_ea as i64]);
         // slot_k = *(base_k + ea)   — the red-index columnar read, per bank.
         // Element columns are skipped: their index is the inner loop's, not the
         // row's, so the lowering already emitted their loads inside the body.
@@ -850,7 +872,10 @@ impl LoweredF {
             ],
         };
         p.extend_from_slice(&tail);
-        p.extend_from_slice(&[OP_ADD, r_i as i64, r_one as i64, r_i as i64]);
+        p.extend_from_slice(&[OP_ADD_IMM, r_i as i64, 1, r_i as i64]);
+        if needs_ea {
+            p.extend_from_slice(&[OP_ADD_IMM, r_ea as i64, 8, r_ea as i64]);
+        }
         p.extend_from_slice(&[OP_JUMP_IF_ABOVE, r_n as i64, r_i as i64, body_pc as i64]);
         // Publish the overflow flag. Outside the loop, so it costs the traced
         // body nothing and runs once when the back-edge guard finally exits.
@@ -1341,10 +1366,32 @@ fn emit_int_bin(ctx: &mut LowerCtxF, op: i64, a: TReg, b: TReg) -> TReg {
     d
 }
 
-/// `dst = a <op> k` for a green constant `k` (its load is hoisted to the prelude).
+/// `dst = a <op> k` for a green constant `k`.
+///
+/// `OP_MUL` and `OP_ADD` have immediate forms, and those are the ones to reach
+/// for: the immediate rides in the word stream, which is green, so the traced
+/// op is `int_mul(reg, ConstInt(k))`. Hoisting the constant into a prelude
+/// register instead puts the store outside the merge point, and the in-loop
+/// read is then an opaque input argument — `dependency.py:896-948` builds no
+/// `IndexVar` for it. Any other op still hoists.
 fn emit_int_bin_k(ctx: &mut LowerCtxF, op: i64, a: TReg, k: i64) -> TReg {
-    let kr = emit_int_const(ctx, k);
-    emit_int_bin(ctx, op, a, kr)
+    let imm_op = match op {
+        OP_MUL => Some(OP_MUL_IMM),
+        OP_ADD => Some(OP_ADD_IMM),
+        _ => None,
+    };
+    match imm_op {
+        Some(imm_op) => {
+            let d = ctx.fresh(ValType::Int);
+            ctx.body
+                .extend_from_slice(&[imm_op, a.idx as i64, k, d.idx as i64]);
+            d
+        }
+        None => {
+            let kr = emit_int_const(ctx, k);
+            emit_int_bin(ctx, op, a, kr)
+        }
+    }
 }
 
 /// Nanoseconds in one day — the scale between an instant and its calendar day.
@@ -1564,8 +1611,7 @@ fn emit_str_predicate(ctx: &mut LowerCtxF, pred: StrPredicate, s: TReg) -> TReg 
     });
     // `8` is the element stride, a property of the table and not of the batch,
     // so unlike the table's address it is a genuine immediate.
-    let stride = emit_int_const(ctx, 8);
-    let ea = emit_bin(ctx, OP_MUL, s, stride, ValType::Int);
+    let ea = emit_int_bin_k(ctx, OP_MUL, s, 8);
     let d = ctx.fresh(ValType::Bool);
     ctx.body
         .extend_from_slice(&[OP_COL_LOAD, table.idx as i64, ea.idx as i64, d.idx as i64]);
@@ -2860,7 +2906,6 @@ fn lower_list_equality(ctx: &mut LowerCtxF, a: &str, b: &str) -> Result<TReg, Lo
     let off_a = ctx.slot_typed(offset_slot_path(a), ValType::Int);
     let off_b = ctx.slot_typed(offset_slot_path(b), ValType::Int);
     let one = emit_int_const(ctx, 1);
-    let stride = emit_int_const(ctx, 8);
 
     // Unequal lengths settle it, and also make the trip count zero so the loop
     // never reads past the shorter span.
@@ -2887,9 +2932,9 @@ fn lower_list_equality(ctx: &mut LowerCtxF, a: &str, b: &str) -> Result<TReg, Lo
 
     let inner = ctx.body.len();
     let ia = emit_int_bin(ctx, OP_ADD, off_a, j);
-    let ea_a = emit_int_bin(ctx, OP_MUL, ia, stride);
+    let ea_a = emit_int_bin_k(ctx, OP_MUL, ia, 8);
     let ib = emit_int_bin(ctx, OP_ADD, off_b, j);
-    let ea_b = emit_int_bin(ctx, OP_MUL, ib, stride);
+    let ea_b = emit_int_bin_k(ctx, OP_MUL, ib, 8);
     for (field, ty) in &fa {
         let f = field.as_deref();
         let va = ctx.elem_slot(elem_slot_path(a, f), ea_a.idx)?;
@@ -2902,7 +2947,7 @@ fn lower_list_equality(ctx: &mut LowerCtxF, a: &str, b: &str) -> Result<TReg, Lo
     ctx.elem_map
         .retain(|(_, reg), _| *reg != ea_a.idx && *reg != ea_b.idx);
     ctx.body
-        .extend_from_slice(&[OP_ADD, j.idx as i64, one.idx as i64, j.idx as i64]);
+        .extend_from_slice(&[OP_ADD_IMM, j.idx as i64, 1, j.idx as i64]);
     ctx.emit_back_edge(n, j, inner);
     ctx.patch_jump(zero_trip);
     Ok(eq)
@@ -3128,7 +3173,7 @@ fn emit_chain_collect(
     emit_element_store(ctx, appended, cursor)?;
     let one = emit_int_const(ctx, 1);
     let Some(c) = cond else {
-        return Ok(emit_int_bin(ctx, OP_ADD, accu, one));
+        return Ok(emit_int_bin_k(ctx, OP_ADD, accu, 1));
     };
     // Collecting under a predicate: the store runs for every element, and the
     // cursor advances only where the predicate holds — so a rejected element
@@ -3521,12 +3566,11 @@ fn emit_element_store(
         .list_output
         .clone()
         .expect("collect mode allocates the output description");
-    let stride = emit_int_const(ctx, 8);
     let cur = TReg {
         bank: ValType::Int,
         idx: cursor,
     };
-    let ea = emit_int_bin(ctx, OP_MUL, cur, stride);
+    let ea = emit_int_bin_k(ctx, OP_MUL, cur, 8);
     for (k, (field, ty)) in out.fields.iter().enumerate() {
         let v = match appended {
             Appended::Element(name) => {
@@ -3547,9 +3591,8 @@ fn emit_element_store(
         ctx.body
             .extend_from_slice(&[op, out.base_regs[k] as i64, ea.idx as i64, v.idx as i64]);
     }
-    let one = emit_int_const(ctx, 1);
     ctx.body
-        .extend_from_slice(&[OP_ADD, cursor as i64, one.idx as i64, cursor as i64]);
+        .extend_from_slice(&[OP_ADD_IMM, cursor as i64, 1, cursor as i64]);
     Ok(())
 }
 
@@ -3591,7 +3634,6 @@ fn lower_runtime_in(
     let len = ctx.slot_typed(size_slot_path(list), ValType::Int);
     let off = ctx.slot_typed(offset_slot_path(list), ValType::Int);
     let one = emit_int_const(ctx, 1);
-    let stride = emit_int_const(ctx, 8);
 
     // The accumulator is loop-carried, so it lives in a fixed register.
     let found = ctx.fresh(ValType::Bool);
@@ -3605,7 +3647,7 @@ fn lower_runtime_in(
 
     let inner = ctx.body.len();
     let idx = emit_int_bin(ctx, OP_ADD, off, j);
-    let ea = emit_int_bin(ctx, OP_MUL, idx, stride);
+    let ea = emit_int_bin_k(ctx, OP_MUL, idx, 8);
     let v = ctx.elem_slot(elem_path, ea.idx)?;
     ctx.elem_map.clear();
     let eq_op = if ty == ValType::Float { OP_FEQ } else { OP_EQ };
@@ -3615,7 +3657,7 @@ fn lower_runtime_in(
     ctx.body
         .extend_from_slice(&[OP_OR, found.idx as i64, hit.idx as i64, found.idx as i64]);
     ctx.body
-        .extend_from_slice(&[OP_ADD, j.idx as i64, one.idx as i64, j.idx as i64]);
+        .extend_from_slice(&[OP_ADD_IMM, j.idx as i64, 1, j.idx as i64]);
     ctx.emit_back_edge(len, j, inner);
     ctx.patch_jump(zero_trip);
     Ok(found)
@@ -3679,8 +3721,7 @@ fn lower_const_index(
     let kp1 = emit_int_const(ctx, k + 1);
     let skip = ctx.emit_jump_if_above(kp1, len);
     let idx = emit_int_bin(ctx, OP_ADD, off, kr);
-    let stride = emit_int_const(ctx, 8);
-    let ea = emit_int_bin(ctx, OP_MUL, idx, stride);
+    let ea = emit_int_bin_k(ctx, OP_MUL, idx, 8);
     let v = ctx.elem_slot(elem_path, ea.idx)?;
     emit_mov(ctx, v, out);
     ctx.patch_jump(skip);
@@ -3749,7 +3790,6 @@ fn compile_list_comprehension_mode(
     let len = ctx.slot_typed(size_slot_path(list), ValType::Int);
     let off = ctx.slot_typed(offset_slot_path(list), ValType::Int);
     let one = emit_int_const(ctx, 1);
-    let stride = emit_int_const(ctx, 8);
 
     let prev_iter = ctx.locals.remove(&comp.iter_var);
     let prev_accu = ctx.locals.remove(&comp.accu_var);
@@ -3775,7 +3815,7 @@ fn compile_list_comprehension_mode(
 
     let inner = ctx.body.len();
     let idx = emit_int_bin(ctx, OP_ADD, off, j);
-    let ea = emit_int_bin(ctx, OP_MUL, idx, stride);
+    let ea = emit_int_bin_k(ctx, OP_MUL, idx, 8);
     // The loop's element is bound to the FIRST link's variable: the chain runs
     // innermost-first, and the outer comprehension's own variable belongs to
     // its last link.
@@ -3807,7 +3847,7 @@ fn compile_list_comprehension_mode(
     }
     emit_mov(ctx, step, accu);
     ctx.body
-        .extend_from_slice(&[OP_ADD, j.idx as i64, one.idx as i64, j.idx as i64]);
+        .extend_from_slice(&[OP_ADD_IMM, j.idx as i64, 1, j.idx as i64]);
     ctx.emit_back_edge(len, j, inner);
     ctx.patch_jump(zero_trip);
 

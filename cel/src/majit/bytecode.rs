@@ -180,6 +180,24 @@ pub const OP_COL_STORE_F: i64 = 55; // [base, ea, fsrc]
 /// `int`, so nothing downstream of the load has to know the column was narrow.
 pub const OP_COL_LOAD_B: i64 = 56; // [base, ea, dst]
 
+/// [`OP_MUL`] and [`OP_ADD`] against an IMMEDIATE carried in the word stream.
+///
+/// The second operand is `program[pc + 2]` itself, not a register holding it.
+/// `program` is a green of the mainloop's merge point, so the traced form is
+/// `int_mul(reg, ConstInt(imm))` — a constant the optimizer can fold and, more
+/// to the point, the one shape `dependency.py:896-948` recognizes when it
+/// builds an `IndexVar` for a memory reference. The register form
+/// (`OP_MUL r_i, r_stride`) reads a value stored before the merge point, so
+/// inside the loop it is an opaque input argument: no `IndexVar`, no adjacent
+/// memory refs, and the loop vectorizer declines.
+///
+/// Loop induction and address scaling are the two places a batch loop needs a
+/// literal, and both are literals of the SHAPE, not of the batch — they belong
+/// in the bytecode the same way a register index does.
+pub const OP_MUL_IMM: i64 = 57; // [a, imm, dst]           regs[dst] = regs[a] * imm
+/// [`OP_MUL_IMM`] for addition — the loop's `i += 1` step.
+pub const OP_ADD_IMM: i64 = 58; // [a, imm, dst]           regs[dst] = regs[a] + imm
+
 /// Raw native-memory load intrinsic recognized by the `#[jit_interp]` proc
 /// macro (lowered to `raw_load_i`); at the interpreter tier this real fn runs.
 /// `base` is a column buffer's base address, `ea` a byte offset — reading
@@ -737,13 +755,13 @@ pub mod float_bank {
     pub static TRACE_ABORTS: AtomicUsize = AtomicUsize::new(0);
 
     use super::{
-        OP_ADD, OP_ADD_OVF, OP_AND, OP_COL_LOAD, OP_COL_LOAD_B, OP_COL_LOAD_F, OP_COL_STORE,
-        OP_COL_STORE_F, OP_DIV, OP_DIV_CHK, OP_EQ, OP_F2I, OP_F2U, OP_FADD, OP_FDIV, OP_FEQ,
-        OP_FGE, OP_FGT, OP_FLE, OP_FLT, OP_FMOV, OP_FMUL, OP_FNE, OP_FNEG, OP_FSELECT, OP_FSUB,
-        OP_GE, OP_GT, OP_I2F, OP_JUMP_IF_ABOVE, OP_LE, OP_LOAD_CONST, OP_LOAD_CONST_F, OP_LT,
-        OP_MOD, OP_MOD_CHK, OP_MOV, OP_MUL, OP_MUL_OVF, OP_NE, OP_NEG, OP_NOT, OP_OR, OP_RETURN,
-        OP_RETURN_F, OP_SELECT, OP_SUB, OP_SUB_OVF, OP_TRAP_STORE, OP_U2F, OP_UADD_OVF, OP_UDIV,
-        OP_ULE, OP_ULT, OP_UMOD, OP_UMUL_OVF, OP_USUB_OVF,
+        OP_ADD, OP_ADD_IMM, OP_ADD_OVF, OP_AND, OP_COL_LOAD, OP_COL_LOAD_B, OP_COL_LOAD_F,
+        OP_COL_STORE, OP_COL_STORE_F, OP_DIV, OP_DIV_CHK, OP_EQ, OP_F2I, OP_F2U, OP_FADD, OP_FDIV,
+        OP_FEQ, OP_FGE, OP_FGT, OP_FLE, OP_FLT, OP_FMOV, OP_FMUL, OP_FNE, OP_FNEG, OP_FSELECT,
+        OP_FSUB, OP_GE, OP_GT, OP_I2F, OP_JUMP_IF_ABOVE, OP_LE, OP_LOAD_CONST, OP_LOAD_CONST_F,
+        OP_LT, OP_MOD, OP_MOD_CHK, OP_MOV, OP_MUL, OP_MUL_IMM, OP_MUL_OVF, OP_NE, OP_NEG, OP_NOT,
+        OP_OR, OP_RETURN, OP_RETURN_F, OP_SELECT, OP_SUB, OP_SUB_OVF, OP_TRAP_STORE, OP_U2F,
+        OP_UADD_OVF, OP_UDIV, OP_ULE, OP_ULT, OP_UMOD, OP_UMUL_OVF, OP_USUB_OVF,
     };
     use core::sync::atomic::Ordering;
 
@@ -904,6 +922,18 @@ pub mod float_bank {
                     let b = program[pc + 2] as usize;
                     let d = program[pc + 3] as usize;
                     state.regs[d] = state.regs[a] * state.regs[b];
+                    pc += 4;
+                }
+                OP_MUL_IMM => {
+                    let a = program[pc + 1] as usize;
+                    let d = program[pc + 3] as usize;
+                    state.regs[d] = state.regs[a] * program[pc + 2];
+                    pc += 4;
+                }
+                OP_ADD_IMM => {
+                    let a = program[pc + 1] as usize;
+                    let d = program[pc + 3] as usize;
+                    state.regs[d] = state.regs[a] + program[pc + 2];
                     pc += 4;
                 }
                 OP_ADD_OVF => {
@@ -1419,6 +1449,16 @@ pub mod float_bank {
                 OP_MUL => {
                     regs[program[pc + 3] as usize] =
                         regs[program[pc + 1] as usize] * regs[program[pc + 2] as usize];
+                    pc += 4;
+                }
+                OP_MUL_IMM => {
+                    regs[program[pc + 3] as usize] =
+                        regs[program[pc + 1] as usize] * program[pc + 2];
+                    pc += 4;
+                }
+                OP_ADD_IMM => {
+                    regs[program[pc + 3] as usize] =
+                        regs[program[pc + 1] as usize] + program[pc + 2];
                     pc += 4;
                 }
                 // The reference tier mirrors the fused-ovf None arm (wrapping
