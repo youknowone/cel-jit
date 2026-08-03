@@ -1815,12 +1815,33 @@ pub mod float_bank {
         num_regs: usize,
         num_fregs: usize,
     ) -> majit_metainterp::JitDriver<VmStateF> {
-        // No quasi-immutable state exists here (a fixed batch program over plain
-        // integer and float reds), so skip the periodic loop-invalidation timer:
-        // it has nothing to invalidate and would only force a persistent driver
-        // to re-trace what it already compiled (`jitdriver.rs with_options`).
+        // No quasi-immutable state exists here — a fixed batch program over plain
+        // integer and float reds. The periodic loop-invalidation timer this used
+        // to opt out of via `with_options(threshold, false)` no longer exists:
+        // majit dropped it in favour of revalidating quasi-immutable fields at
+        // the guard, so `new` is now the whole constructor.
         let mut driver: majit_metainterp::JitDriver<VmStateF> =
-            majit_metainterp::JitDriver::with_options(threshold, false);
+            majit_metainterp::JitDriver::new(threshold);
+        // Diagnostic override for the JIT's `retrace_limit`, unset by default.
+        //
+        // `unroll.py:213-220` branches on this limit to decide what a bridge
+        // whose state matches no existing target does: below the limit it
+        // retraces a new specialised loop, at or above it retries with forced
+        // boxes and jumps to the preamble. Which arm ran is not otherwise
+        // observable from outside the tier, and the two behave very differently
+        // on a batch whose inner trip count differs from the traced one
+        // (`tests/majit_shape_change.rs`, `examples/poison.rs`).
+        //
+        // The default stays majit's `DEFAULT_RETRACE_LIMIT`, which is upstream's
+        // shipped `rlib/jit.py:595 retrace_limit: 0` — the 5 at
+        // `warmspot.py:93` is `jittify_and_run`, the test harness. This is an
+        // instrument, NOT a tuning parameter: raising it to move a benchmark
+        // would be tuning away from upstream.
+        if let Ok(v) = std::env::var("CEL_RETRACE_LIMIT") {
+            if let Ok(n) = v.parse::<i64>() {
+                driver.set_param("retrace_limit", n);
+            }
+        }
         driver.set_on_compile_loop(|_green_key, _ops_before, _ops_after| {
             COMPILES.fetch_add(1, Ordering::Relaxed);
         });
