@@ -30,10 +30,34 @@
 //! PyPy returns to ~1.0x on five of the seven off-diagonal cells and majit
 //! returns to ~1.0x on none. The mechanism is that the outer trace bakes the
 //! observed trip count in as a guard (`IntGt(len, k) GuardFalse`); on a shape
-//! change the guard's bridge jumps back into the SAME loop, so every inner
-//! iteration pays a loop entry plus a bridge hop. `compiles` is 0 in every
-//! degraded batch: no artifact is ever built for the second shape, in either
-//! direction. The penalty is symmetric — `64 → 2` is as bad as `2 → 64`.
+//! change the guard's bridge jumps back into the SAME loop. `compiles` is 0 in
+//! every degraded batch: no artifact is ever built for the second shape, in
+//! either direction. The penalty is symmetric — `64 → 2` is as bad as `2 → 64`.
+//!
+//! ## What a ratio cannot tell you (measured 2026-08-04)
+//!
+//! A ratio to a cold control says the two arms differ; it does not say which
+//! side moved. Absolute numbers split the 10-15x in two, and only one half is a
+//! parity gap:
+//!
+//! * The degraded PER-ITERATION cost is at parity — majit 5.44 ns/iter against
+//!   PyPy's 5.02 on `2 → 64`. The bad state is not worse here than upstream.
+//! * The rest is a FIXED per-row cost. Sweeping the measured trip count against
+//!   a trip-64 artifact gives 14.8 / 16.6 / 15.5 / 15.7 / 16.9 ns/row at trips
+//!   1 / 2 / 4 / 8 / 16 where cold is 2.2 / 2.1 / 3.0 / 3.9 / 6.2 — flat, so it
+//!   is ~13 ns paid once per row however little work the row does. Holding the
+//!   measured trip at 1 and sweeping the warm trip instead gives 1.8 (cold) then
+//!   11.8 / 14.4 / 14.6 / 16.0 / 15.0 / 15.1, so it does not scale with the
+//!   artifact either. It is one guard-exit → bridge → loop-re-entry round trip.
+//!
+//! Every number in this file is a CRANELIFT number: `cel`'s `jit` feature
+//! selects `majit-metainterp/cranelift` and nothing else, and on that backend a
+//! guard exit marshals all 23 live values through the jitframe twice per row
+//! where upstream patches the guard's branch straight into a bridge that was
+//! register-allocated against the guard's own fail locations
+//! (`rpython/jit/backend/aarch64/assembler.py:163,200-202,1054-1060`). The
+//! backend control is not available yet — cel's trace panics in the dynasm
+//! register allocator — so how much of the gap is portable is still open.
 //!
 //! ## What this test asserts, and what it deliberately does NOT
 //!
