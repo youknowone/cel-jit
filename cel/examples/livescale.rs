@@ -33,6 +33,17 @@
 //! wider predicate's own work costs 0.8 ns/row across the whole ladder while
 //! the delta grows by 6.8.
 //!
+//! Two limits on how far the fit generalises. The slope is per marshalled SLOT,
+//! not per CEL value: the mainloop's state is two virtualizable arrays
+//! (`regs: [int; virt]`, `fregs: [float; virt]`) and both expand into the live
+//! set, but every arm here has `num_float_regs == 0`, so only the int bank was
+//! swept — a `double` schema puts float slots in the same set and should extend
+//! the same line. And the ~5 ns base is the floor no amount of narrowing can
+//! reach: it is the per-hop dispatch (two acquire loads, two `return_call_indirect`
+//! with Tail prologue/epilogue pairs, two `br_table`s, two shadowstack pop/push,
+//! a frame-depth check), and it alone already exceeds the whole +4.6 ns/row that
+//! the PyPy oracle pays for the same shape change.
+//!
 //! One-run falsifier for "the cost is the cross-artifact edge":
 //! `PYRE_CL_NO_CLOSING_JUMP=1` makes the cranelift backend route the closing
 //! JUMP through the host dispatch loop instead of emitting it in code. At
