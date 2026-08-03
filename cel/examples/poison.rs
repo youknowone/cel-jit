@@ -43,7 +43,43 @@ const LONG: i64 = 64;
 /// compile, which is the whole point of it.
 const SHORT_ROWS: usize = 4_000;
 
-const THRESHOLD: u32 = 8;
+/// cel's `DEFAULT_JIT_THRESHOLD`, overridable with `CEL_THRESHOLD` for one
+/// specific parity question — NOT a tuning knob.
+///
+/// Upstream ships `threshold: 1039` beside `trace_eagerness: 200`
+/// (`rpython/rlib/jit.py:588-590`), and majit matches the eagerness exactly
+/// (`warmstate.rs:259`). cel's 8 therefore inverts upstream's race between the
+/// two: at 8 the OUTER loop compiles after ~8 rows, long before the inner
+/// loop's exit guard has failed the 200 times a bridge needs, so the outer
+/// artifact exists and bakes the observed trip count into it. At upstream's
+/// ratio the bridge lands first and the outer cell never gets hot. Set
+/// `CEL_THRESHOLD` to ask whether reproducing the ratio reproduces the
+/// topology; the default stays 8.
+///
+/// Answer, measured 2026-08-04 at 4000 rows (`warm 64`, settled ns/row, and the
+/// census of which pcs reach `CloseLoop`):
+///
+/// | | threshold 8 | threshold 1039 |
+/// |---|---|---|
+/// | warm-up | `compiles=2 deopts=10` | `compiles=1 deopts=201` |
+/// | pcs that close | 21, 39, 70 | **39, 70 only** |
+/// | measured 1 | 16.4 (cold 2.8) | **2.2** (cold 2.0) |
+/// | measured 2 | 16.0 (cold 3.2) | **15.0** (cold 3.0) |
+///
+/// So the ratio really does decide the topology: at 1039 the outer loop (pc 21)
+/// never closes at all — the inner-exit bridge lands at its 200th guard failure
+/// and absorbs the outer back edge before the outer cell can get hot, which is
+/// upstream's arrangement. But the off-diagonal penalty SURVIVES that change at
+/// measured trip 2 (15.0 against a 3.0 cold), so the trip-baking topology is not
+/// what binds it. What binds it is the price of each cross-artifact edge; see
+/// `livescale.rs`. The default is left at 8 deliberately: moving it would change
+/// a benchmark's number without changing that price.
+fn threshold() -> u32 {
+    std::env::var("CEL_THRESHOLD")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8)
+}
 
 struct ListColumns {
     lens: Vec<i64>,
@@ -97,7 +133,7 @@ fn run_batch(
     GUARD_FAILS.store(0, Ordering::Relaxed);
     TRACE_ABORTS.store(0, Ordering::Relaxed);
     let t0 = Instant::now();
-    let result = eval_batch_sum_f(lowered, &columns, rows, THRESHOLD);
+    let result = eval_batch_sum_f(lowered, &columns, rows, threshold());
     let elapsed = t0.elapsed();
     black_box(result);
     (
@@ -231,7 +267,11 @@ fn main() {
     };
 
     println!("cel poison probe — `{src}`");
-    println!("  rows={rows} rounds={rounds} short_trip={SHORT} long_trip={LONG} short_rows={SHORT_ROWS} threshold={THRESHOLD}");
+    println!(
+        "  rows={rows} rounds={rounds} short_trip={SHORT} long_trip={LONG} \
+         short_rows={SHORT_ROWS} threshold={}",
+        threshold()
+    );
     println!("  oracle={oracle:?}");
     println!(
         "  reference: clean VM {clean_ns:.1} ns/row, uncompiled mainloop {interp_ns:.1} ns/row"

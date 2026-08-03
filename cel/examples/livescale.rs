@@ -33,6 +33,14 @@
 //! wider predicate's own work costs 0.8 ns/row across the whole ladder while
 //! the delta grows by 6.8.
 //!
+//! One-run falsifier for "the cost is the cross-artifact edge":
+//! `PYRE_CL_NO_CLOSING_JUMP=1` makes the cranelift backend route the closing
+//! JUMP through the host dispatch loop instead of emitting it in code. At
+//! measured trip 1 the shape-change delta goes 12.5 → 479.5 ns/row while the
+//! cold arm is untouched (2.3 → 2.8) — cold has no cross-artifact jump to
+//! reroute, so it is the negative control. The settled path is therefore the
+//! in-code transfer, and its price is what the table above decomposes.
+//!
 //! Upstream has no such term. Once a bridge is attached
 //! (`rpython/jit/backend/aarch64/assembler.py:200-202` → `patch_trace`
 //! `:1054-1060`) the failing guard's site is overwritten with a direct branch
