@@ -50,14 +50,54 @@
 //!   11.8 / 14.4 / 14.6 / 16.0 / 15.0 / 15.1, so it does not scale with the
 //!   artifact either. It is one guard-exit → bridge → loop-re-entry round trip.
 //!
-//! Every number in this file is a CRANELIFT number: `cel`'s `jit` feature
+//! Every number this test asserts is a CRANELIFT number: `cel`'s `jit` feature
 //! selects `majit-metainterp/cranelift` and nothing else, and on that backend a
 //! guard exit marshals all 23 live values through the jitframe twice per row
 //! where upstream patches the guard's branch straight into a bridge that was
 //! register-allocated against the guard's own fail locations
-//! (`rpython/jit/backend/aarch64/assembler.py:163,200-202,1054-1060`). The
-//! backend control is not available yet — cel's trace panics in the dynasm
-//! register allocator — so how much of the gap is portable is still open.
+//! (`rpython/jit/backend/aarch64/assembler.py:163,200-202,1054-1060`).
+//!
+//! ## The backend control (measured 2026-08-04)
+//!
+//! Running this same test against `majit-metainterp/dynasm` — real aarch64
+//! machine code, upstream's register allocator, upstream's patched-branch
+//! bridge attachment — says most of the penalty was that edge and not the
+//! trace's shape. Same test, same machine, same session; the `fraction` column
+//! is this file's own "fraction of the clean VM" and is the honest one, since
+//! the two backends have different cold baselines:
+//!
+//! | warm → measured | cranelift | dynasm | PyPy 7.3.22 |
+//! |---|---|---|---|
+//! | 64 → 64 (diagonal) | 0.99x | 1.34x | 1.03x |
+//! | 2 → 2 (diagonal) | 1.00x | 1.42x | 0.97x |
+//! | 3 → 64 | 14.0x | **3.18x** | 1.02x |
+//! | 64 → 2 | 12.5x | **2.50x** | 1.17x |
+//! | 8 → 2 | 10.8x | **3.25x** | 0.92x |
+//! | 2 → 64 | 13.1x | **3.96x** | 5.84x |
+//!
+//! As a fraction of the untraced VM, the degraded cranelift tier is only
+//! 1.4-2.2x faster than no JIT at all (0.445-0.694); the degraded dynasm tier
+//! stays 6.5-11.5x faster (0.087-0.155). So roughly three quarters of the
+//! penalty was the cross-artifact edge. What survives is real and portable:
+//! dynasm still does not return to ~1.0x on the three cells where PyPy does,
+//! and only on `2 → 64` — the one cell PyPy also degrades on — is it ahead.
+//!
+//! Two caveats on that column. The dynasm cells are single runs on a shared
+//! machine, so the two diagonals reading 1.34x/1.42x is noise: the same
+//! comparison under `examples/poison`'s min-of-rounds matrix puts every
+//! diagonal at 1.0x and the off-diagonals at 2.1-4.1x, which is the range to
+//! trust. And cel on dynasm is not yet a sound backend — 5 of 220 `cel` unit
+//! tests miscompile there (a ternary sum, and float/list-valued results
+//! reading back integer bit patterns), so the dynasm column is trustworthy
+//! only because `settled` asserts every timed batch against the clean VM and
+//! this particular predicate answers correctly.
+//!
+//! Reproducing the column needs two edits that are deliberately NOT committed:
+//! flip `cel/Cargo.toml`'s `majit-metainterp/cranelift` to
+//! `majit-metainterp/dynasm`, and `[patch]` the `majit-*` crates at a checkout
+//! carrying pyre `35c51a079a1` ("run the GC rewrite pass whether or not a
+//! collector is installed"), because the pinned revision skips the pass that
+//! lowers `RAW_LOAD_I` and then panics in the dynasm register allocator.
 //!
 //! ## What this test asserts, and what it deliberately does NOT
 //!
