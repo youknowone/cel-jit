@@ -1908,10 +1908,13 @@ impl Value {
                 Ok(Cow::<dyn Val>::Owned(map))
             }
             Expr::Comprehension(comprehension) => {
-                let accu_init = Value::resolve_val(&comprehension.accu_init, ctx)?;
+                // `into_owned` rather than `clone_as_boxed`: the step already
+                // produces an owned accumulator, and deep-copying it again made
+                // the loop cost a second O(n^2) in the accumulator's length.
+                let accu_init = Value::resolve_val(&comprehension.accu_init, ctx)?.into_owned();
                 let iter = Value::resolve_val(&comprehension.iter_range, ctx)?;
                 let mut ctx = ctx.new_inner_scope();
-                ctx.add_variable_as_val(&comprehension.accu_var, accu_init.clone_as_boxed());
+                ctx.add_variable_as_val(&comprehension.accu_var, accu_init);
 
                 let mut items = iter
                     .as_iterable()
@@ -1922,8 +1925,8 @@ impl Value {
                         break;
                     }
                     ctx.add_variable_as_val(&comprehension.iter_var, item.clone_as_boxed());
-                    let accu = Value::resolve_val(&comprehension.loop_step, &ctx)?;
-                    ctx.add_variable_as_val(&comprehension.accu_var, accu.clone_as_boxed());
+                    let accu = Value::resolve_val(&comprehension.loop_step, &ctx)?.into_owned();
+                    ctx.add_variable_as_val(&comprehension.accu_var, accu);
                 }
                 Ok(Cow::<dyn Val>::Owned(
                     Value::resolve_val(&comprehension.result, &ctx)?.into_owned(),

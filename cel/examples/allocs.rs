@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use cel::majit::batch::{Batch, BatchProgram, ColumnRef, Tier};
 use cel::majit::lower::{Schema, ValType};
-use cel::Value;
+use cel::{Context, Program, Value};
 
 /// Counts every allocation the process makes. `dealloc` is deliberately not
 /// counted: the question is how much work the boxing DOES, and a freed
@@ -190,6 +190,121 @@ fn main() {
 
     record_list();
     string_column();
+    tree_walker();
+}
+
+/// The door most callers actually use. `cel::Program::execute` is still the
+/// recursive AST tree-walker, which `cel/src/majit/CONVERGENCE.md` prices at
+/// 1498.89 ns/row against the compiled tier's 22.70. The batch tiers are now
+/// at 1.000 allocs/row, so this arm says what the gap costs in allocations
+/// rather than in a timing that this host cannot measure.
+fn tree_walker() {
+    // A scalar expression first, so the per-NODE cost is separated from the
+    // per-element cost the comprehension adds.
+    walk_scalar();
+    // Swept wide, because the per-element term is only meaningful if the cost
+    // is linear in the element count -- and it is not.
+    for list_len in [5i64, 10, 20, 40, 80] {
+        walk_list(list_len);
+    }
+}
+
+/// `a * 2 + b`: three nodes, two variables, no comprehension.
+///
+/// Reported twice, because `Context::default()` registers the whole standard
+/// function library and a caller that builds one per evaluation pays for that
+/// and not for the expression. The batch door binds once, so the hoisted row
+/// is the one to compare against it.
+fn walk_scalar() {
+    let program = Program::compile("a * 2 + b").expect("compile");
+
+    reset();
+    let mut total = 0i64;
+    for k in 0..ROWS as i64 {
+        let mut ctx = Context::default();
+        ctx.add_variable_from_value("a", Value::Int(k));
+        ctx.add_variable_from_value("b", Value::Int(k % 7));
+        match program.execute(&ctx).expect("execute") {
+            Value::Int(i) => total += i,
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    let (a_fresh, b_fresh) = read();
+    assert_ne!(total, 0);
+
+    let mut ctx = Context::default();
+    reset();
+    let mut total = 0i64;
+    for k in 0..ROWS as i64 {
+        ctx.add_variable_from_value("a", Value::Int(k));
+        ctx.add_variable_from_value("b", Value::Int(k % 7));
+        match program.execute(&ctx).expect("execute") {
+            Value::Int(i) => total += i,
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    let (a_hoisted, b_hoisted) = read();
+    assert_ne!(total, 0);
+
+    println!("\n-- tree-walker (Program::execute), scalar `a * 2 + b` --");
+    for (label, a, b) in [
+        ("Context::default() per row", a_fresh, b_fresh),
+        ("hoisted Context", a_hoisted, b_hoisted),
+    ] {
+        println!(
+            "{:<28} {:>10.3} {:>10.1} {:>12} {:>12}",
+            label,
+            a as f64 / ROWS as f64,
+            b as f64 / ROWS as f64,
+            a,
+            b
+        );
+    }
+}
+
+fn walk_list(list_len: i64) {
+    let elems: Vec<i64> = (0..list_len).map(|k| (k * 7) % 1000).collect();
+
+    let program = Program::compile("list.map(x, x * 2)").expect("compile");
+
+    // Building the input is the caller's cost either way, so it is measured
+    // apart from the evaluation it feeds.
+    reset();
+    let mut inputs = Vec::with_capacity(ROWS);
+    for _ in 0..ROWS {
+        inputs.push(Value::list(
+            elems.iter().map(|&v| Value::Int(v)).collect::<Vec<_>>(),
+        ));
+    }
+    let (a_in, b_in) = read();
+
+    let mut ctx = Context::default();
+    reset();
+    let mut total = 0usize;
+    for input in &inputs {
+        ctx.add_variable_from_value("list", input.clone());
+        match program.execute(&ctx).expect("execute") {
+            Value::List(items) => total += items.len(),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    let (a_exec, b_exec) = read();
+    assert_eq!(total, ROWS * list_len as usize);
+
+    println!("\n-- tree-walker (Program::execute), {list_len} elements per row --");
+    for (label, a, b) in [
+        ("build the input Value", a_in, b_in),
+        ("Program::execute", a_exec, b_exec),
+    ] {
+        println!(
+            "{:<28} {:>10.3} {:>10.1} {:>12} {:>12}",
+            label,
+            a as f64 / ROWS as f64,
+            b as f64 / ROWS as f64,
+            a,
+            b
+        );
+    }
 }
 
 /// A STRING result, scalar and inside a list. `decode` turns a rank into
