@@ -101,6 +101,9 @@ impl StrBank {
 /// record field, so every bank has an unboxed form in exactly one place --
 /// a per-bank asymmetry here is what let a string column cost 19.5 allocations
 /// per row while the int column cost 1.
+///
+/// Cloning one is a reference count per bank, not a copy of the buffer.
+#[derive(Clone)]
 pub enum ValueColumn {
     /// Raw words, read through `bank`.
     Scalar { bank: ScalarBank, words: Arc<[i64]> },
@@ -810,29 +813,22 @@ impl TryIntoValue for Value {
 pub enum ListStorage {
     /// Boxed elements, owned by this list.
     Object(Vec<Value>),
-    /// `column[start .. start + len]`, shared with every other row of the same
-    /// batch. The element is boxed on the way out, which for every bank but a
-    /// string is a `Value` that owns nothing.
-    Column {
-        column: Arc<ValueColumn>,
-        start: usize,
-        len: usize,
-    },
-    /// `schema`'s records `start .. start + len`, shared with every other row
-    /// of the same batch. An element is a [`Map::record`], which costs a
+    /// An unboxed column. The element is boxed on the way out, which for every
+    /// bank but a string is a [`Value`] that owns nothing.
+    Column(ValueColumn),
+    /// A record column. An element is a [`Map::record`], which costs a
     /// reference count and no allocation.
-    Record {
-        schema: Arc<RecordSchema>,
-        start: usize,
-        len: usize,
-    },
+    Record(Arc<RecordSchema>),
 }
 
 impl ListStorage {
+    /// How many elements the whole buffer holds — not how many any one list
+    /// over it has; that is [`ListRef::len`].
     pub fn len(&self) -> usize {
         match self {
             ListStorage::Object(v) => v.len(),
-            ListStorage::Column { len, .. } | ListStorage::Record { len, .. } => *len,
+            ListStorage::Column(c) => c.len(),
+            ListStorage::Record(s) => s.rows(),
         }
     }
 
@@ -840,86 +836,19 @@ impl ListStorage {
         self.len() == 0
     }
 
-    /// The element at `index`, boxed on the way out. `None` past the end.
-    pub fn get(&self, index: usize) -> Option<Value> {
+    /// The element at `index` in the whole buffer, boxed on the way out.
+    fn element_at(&self, index: usize) -> Value {
         match self {
-            ListStorage::Object(v) => v.get(index).cloned(),
-            ListStorage::Column { column, start, len } => {
-                (index < *len).then(|| column.value_at(start + index))
-            }
-            ListStorage::Record { schema, start, len } => {
-                (index < *len).then(|| Value::Map(Map::record(schema.clone(), start + index)))
-            }
+            ListStorage::Object(v) => v[index].clone(),
+            ListStorage::Column(c) => c.value_at(index),
+            ListStorage::Record(s) => Value::Map(Map::record(s.clone(), index)),
         }
-    }
-
-    pub fn iter(&self) -> impl Iterator<Item = Value> + '_ {
-        (0..self.len()).map(move |i| {
-            self.get(i)
-                .expect("index below len() is in bounds by construction")
-        })
-    }
-
-    /// The boxed elements. Free for [`ListStorage::Object`], and the point at
-    /// which an unboxed strategy pays for the representation the rest of the
-    /// language expects.
-    pub fn to_vec(&self) -> Vec<Value> {
-        match self {
-            ListStorage::Object(v) => v.clone(),
-            _ => self.iter().collect(),
-        }
-    }
-
-    /// The elements as an owned `Vec`, moving them when this is already the
-    /// boxed strategy.
-    pub fn into_vec(self) -> Vec<Value> {
-        match self {
-            ListStorage::Object(v) => v,
-            other => other.iter().collect(),
-        }
-    }
-
-    pub fn contains(&self, needle: &Value) -> bool {
-        match self {
-            // The boxed strategy already holds the `Value`s, so comparing them
-            // in place avoids the clone `iter()` owes an unboxed one.
-            ListStorage::Object(v) => v.contains(needle),
-            _ => self.iter().any(|v| &v == needle),
-        }
-    }
-
-    /// Append `other`'s elements. An unboxed strategy that is asked to grow
-    /// becomes the boxed one first, which is what PyPy's strategies do when a
-    /// list stops being homogeneous (`listobject.py` `switch_to_object_strategy`).
-    pub fn extend_from(&mut self, other: &ListStorage) {
-        let mut items = std::mem::take(self).into_vec();
-        items.extend(other.iter());
-        *self = ListStorage::Object(items);
-    }
-
-    /// [`ListStorage::extend_from`] that may MOVE `other`'s elements rather than
-    /// copy them, for a caller that owns it uniquely.
-    pub fn append(&mut self, other: &mut ListStorage) {
-        if let (ListStorage::Object(a), ListStorage::Object(b)) = (&mut *self, &mut *other) {
-            a.append(b);
-            return;
-        }
-        let taken = std::mem::take(other);
-        self.extend_from(&taken);
     }
 }
 
 impl Default for ListStorage {
     fn default() -> Self {
         ListStorage::Object(Vec::new())
-    }
-}
-
-impl Value {
-    /// A list value over `items`, which may be a `Vec<Value>` or an already
-    /// chosen [`ListStorage`] strategy.
-    pub fn list(items: impl Into<ListStorage>) -> Value {
-        Value::List(Arc::new(items.into()))
     }
 }
 
@@ -935,26 +864,187 @@ impl FromIterator<Value> for ListStorage {
     }
 }
 
+/// One list: the window `storage[start .. start + len]`.
+///
+/// The window is what lets a whole batch of rows share ONE buffer. The rows of
+/// a batch are laid out contiguously in the order the run produced them, so a
+/// row is a pair of offsets into the buffer and a reference count — no
+/// allocation at all, where a list that owned its own storage cost one per row.
+///
+/// This is PyPy's list-strategy arrangement — `objspace/std/listobject.py:1886`
+/// `ObjectListStrategy`, `:1939` `IntegerListStrategy`, `:2043`
+/// `FloatListStrategy`: a homogeneous list keeps unboxed storage, and boxing
+/// happens on access rather than on construction.
+///
+/// Every consumer goes through the accessors below rather than matching a
+/// storage variant, so adding a strategy does not reopen the call sites.
+#[derive(Clone)]
+pub struct ListRef {
+    storage: Arc<ListStorage>,
+    /// 32-bit so a `Value` stays 24 bytes. A buffer is checked against this
+    /// bound when the window is built rather than truncated silently.
+    start: u32,
+    len: u32,
+}
+
+impl ListRef {
+    /// The window `storage[start .. start + len]`.
+    pub fn window(storage: Arc<ListStorage>, start: usize, len: usize) -> ListRef {
+        assert!(
+            start + len <= storage.len(),
+            "list window {start}..{} runs past the {} element buffer",
+            start + len,
+            storage.len()
+        );
+        let (Ok(start), Ok(len)) = (u32::try_from(start), u32::try_from(len)) else {
+            panic!(
+                "a list buffer past {} elements cannot be windowed",
+                u32::MAX
+            );
+        };
+        ListRef {
+            storage,
+            start,
+            len,
+        }
+    }
+
+    /// The whole of `storage` as one list.
+    pub fn whole(storage: Arc<ListStorage>) -> ListRef {
+        let len = storage.len();
+        ListRef::window(storage, 0, len)
+    }
+
+    pub fn len(&self) -> usize {
+        self.len as usize
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// The element at `index`, boxed on the way out. `None` past the end.
+    pub fn get(&self, index: usize) -> Option<Value> {
+        (index < self.len()).then(|| self.storage.element_at(self.start as usize + index))
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = Value> + '_ {
+        (0..self.len()).map(move |i| {
+            self.get(i)
+                .expect("index below len() is in bounds by construction")
+        })
+    }
+
+    /// The boxed elements. Free for a whole [`ListStorage::Object`], and the
+    /// point at which an unboxed strategy pays for the representation the rest
+    /// of the language expects.
+    pub fn to_vec(&self) -> Vec<Value> {
+        match self.whole_object() {
+            Some(v) => v.clone(),
+            None => self.iter().collect(),
+        }
+    }
+
+    /// The elements as an owned `Vec`, moving them when this list is the sole
+    /// owner of a boxed buffer it covers entirely.
+    pub fn into_vec(mut self) -> Vec<Value> {
+        if self.whole_object().is_some() {
+            if let Some(ListStorage::Object(v)) = Arc::get_mut(&mut self.storage) {
+                return std::mem::take(v);
+            }
+        }
+        self.iter().collect()
+    }
+
+    pub fn contains(&self, needle: &Value) -> bool {
+        match self.whole_object() {
+            // A boxed buffer already holds the `Value`s, so comparing them in
+            // place avoids the clone `iter()` owes an unboxed one.
+            Some(v) => v.contains(needle),
+            None => self.iter().any(|v| &v == needle),
+        }
+    }
+
+    /// This list's elements followed by `other`'s.
+    ///
+    /// An unboxed strategy that is asked to grow becomes the boxed one first,
+    /// which is what PyPy's strategies do when a list stops being homogeneous
+    /// (`listobject.py` `switch_to_object_strategy`). A window onto a buffer it
+    /// does not own entirely has to copy out — appending in place would grow
+    /// the buffer every other list of the batch is reading.
+    pub fn concat(mut self, other: &ListRef) -> ListRef {
+        if self.whole_object().is_some() {
+            if let Some(ListStorage::Object(items)) = Arc::get_mut(&mut self.storage) {
+                items.extend(other.iter());
+                let len = items.len();
+                self.len = u32::try_from(len).expect("a list past u32::MAX elements");
+                return self;
+            }
+        }
+        let mut items = self.to_vec();
+        items.extend(other.iter());
+        ListRef::from(items)
+    }
+
+    /// Whether both lists read the same buffer.
+    ///
+    /// This is the invariant the batch door depends on: every row of one output
+    /// is a window onto one [`ListStorage`], so a row costs no allocation. It
+    /// is observable rather than private because a change that quietly went
+    /// back to a buffer per row would otherwise pass every test.
+    pub fn shares_storage_with(&self, other: &ListRef) -> bool {
+        Arc::ptr_eq(&self.storage, &other.storage)
+    }
+
+    /// The boxed buffer, when this list is exactly all of one.
+    fn whole_object(&self) -> Option<&Vec<Value>> {
+        match &*self.storage {
+            ListStorage::Object(v) if self.start == 0 && self.len() == v.len() => Some(v),
+            _ => None,
+        }
+    }
+}
+
+impl Default for ListRef {
+    fn default() -> Self {
+        ListRef::from(Vec::new())
+    }
+}
+
+impl<T: Into<ListStorage>> From<T> for ListRef {
+    fn from(items: T) -> Self {
+        ListRef::whole(Arc::new(items.into()))
+    }
+}
+
 /// Element-wise, so two lists are equal when they hold equal values whatever
 /// strategy each of them uses.
-impl PartialEq for ListStorage {
+impl PartialEq for ListRef {
     fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (ListStorage::Object(a), ListStorage::Object(b)) => a == b,
+        match (self.whole_object(), other.whole_object()) {
+            (Some(a), Some(b)) => a == b,
             _ => self.len() == other.len() && self.iter().eq(other.iter()),
         }
     }
 }
 
-impl std::fmt::Debug for ListStorage {
+impl std::fmt::Debug for ListRef {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_list().entries(self.iter()).finish()
     }
 }
 
+impl Value {
+    /// A list value over `items`, which may be a `Vec<Value>` or an already
+    /// chosen [`ListStorage`] strategy.
+    pub fn list(items: impl Into<ListStorage>) -> Value {
+        Value::List(ListRef::from(items.into()))
+    }
+}
+
 #[derive(Clone)]
 pub enum Value {
-    List(Arc<ListStorage>),
+    List(ListRef),
     Map(Map),
 
     Function(Arc<String>, Option<Box<Value>>),
@@ -2100,22 +2190,7 @@ impl ops::Add<Value> for Value {
 
             (Value::Float(l), Value::Float(r)) => Value::Float(l + r).into(),
 
-            (Value::List(mut l), Value::List(mut r)) => {
-                {
-                    // If this is the only reference to `l`, we can append to it in place.
-                    // `l` is replaced with a clone otherwise.
-                    let l = Arc::make_mut(&mut l);
-
-                    // Likewise, if this is the only reference to `r`, we can move its values
-                    // instead of cloning them.
-                    match Arc::get_mut(&mut r) {
-                        Some(r) => l.append(r),
-                        None => l.extend_from(&r),
-                    }
-                }
-
-                Ok(Value::List(l))
-            }
+            (Value::List(l), Value::List(r)) => Ok(Value::List(l.concat(&r))),
             (Value::String(mut l), Value::String(r)) => {
                 // If this is the only reference to `l`, we can append to it in place.
                 // `l` is replaced with a clone otherwise.

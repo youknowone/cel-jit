@@ -1,6 +1,6 @@
 use crate::context::Context;
 use crate::magic::{Arguments, This};
-use crate::objects::{KeyRef, ListStorage, OptionalValue, Value};
+use crate::objects::{KeyRef, ListRef, OptionalValue, Value};
 use crate::resolvers::Resolver;
 use crate::ExecutionError;
 use std::borrow::Cow;
@@ -388,7 +388,7 @@ pub mod time {
 /// An equal comparison takes the later element, which is what the fold this
 /// replaces did, and an incomparable pair is an error rather than a silent
 /// choice.
-fn extremum(args: Arc<ListStorage>, keep: Ordering) -> Result<Value> {
+fn extremum(args: ListRef, keep: Ordering) -> Result<Value> {
     // A lone list argument is operated on element-wise; anything else compares
     // the arguments themselves.
     let items = if args.len() == 1 {

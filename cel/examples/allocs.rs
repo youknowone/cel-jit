@@ -8,14 +8,12 @@
 //! Both doors execute the identical compiled loop
 //! (`BoundBatch::collect_raw_with` runs it either way); the only difference is
 //! what happens to the output. `collect_on` calls `RawOutput::to_values`, which
-//! builds a `Value::List(Arc<Vec<Value>>)` per row; `collect_raw_on` hands the
-//! flat buffers straight to the caller. The DELTA between the two arms is
-//! therefore exactly what boxing costs, with the run subtracted out.
+//! turns each row into a `Value`; `collect_raw_on` hands the flat buffers
+//! straight to the caller. The DELTA between the two arms is therefore exactly
+//! what the boxed representation costs, with the run subtracted out.
 //!
 //! Two list lengths are swept so the per-row term and the per-element term
-//! separate: `Arc::new(vec)` is a fixed pair of allocations per row (the `Arc`
-//! control block and the `Vec` buffer), while an element is a 24-byte `Value`
-//! written into that buffer and allocates only when it owns something.
+//! separate.
 //!
 //! RELEASE ONLY. Run: `./bench.sh allocs`.
 
@@ -98,10 +96,10 @@ fn main() {
     // The representation width decides what an element costs, so it is part
     // of the census rather than something to assume.
     println!(
-        "size_of::<Value>() = {}, size_of::<Map>() = {}, size_of::<ListStorage>() = {}",
+        "size_of::<Value>() = {}, size_of::<Map>() = {}, size_of::<ListRef>() = {}",
         std::mem::size_of::<cel::Value>(),
         std::mem::size_of::<cel::objects::Map>(),
-        std::mem::size_of::<cel::objects::ListStorage>(),
+        std::mem::size_of::<cel::objects::ListRef>(),
     );
     println!("allocation census: collect_on vs collect_raw_on, {ROWS} rows");
     println!("both arms execute the SAME compiled loop; the delta is the boxing\n");
@@ -179,13 +177,12 @@ fn main() {
     }
 
     println!(
-        "\nA boxed `Value::List` cannot cost less than 2 allocations per row: the \
-         `Arc`\ncontrol block and the element buffer are separate, and each \
-         element is a\n24-byte `Value` written into that buffer. An unboxed \
-         `ListStorage` strategy\nshares ONE buffer across the batch and a row \
-         is a slice of it, so the row\ncosts the single `Arc` and the \
-         per-element term drops to the width of the\nbank -- 8 bytes for the \
-         int and float banks."
+        "\nA row that owned its elements cost two allocations -- the `Arc` control \
+         block\nand the element buffer -- plus a 24-byte `Value` per element. A \
+         `ListRef` is a\nWINDOW onto one `ListStorage` the whole batch shares, so \
+         a row costs no\nallocation at all and the bytes above are the output \
+         `Vec<Value>`'s 24 per row\nplus the shared column's 8 per element for \
+         the int and float banks."
     );
 
     record_list();

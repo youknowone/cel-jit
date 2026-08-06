@@ -68,7 +68,7 @@ use super::lower::{
     size_slot_source, string_slot_source, BatchReduce, ConcatSide, LoweredF, Schema, SlotKind,
     ValType,
 };
-use crate::objects::{Key, ListStorage, RecordSchema, ScalarBank, StrBank, ValueColumn};
+use crate::objects::{Key, ListRef, ListStorage, RecordSchema, ScalarBank, StrBank, ValueColumn};
 use crate::{Context, Program, Value};
 
 /// Trace threshold [`Tier::Jit`] runs at: the batch loop compiles after this
@@ -1097,28 +1097,20 @@ impl RawOutput<'_> {
                 match fields.as_slice() {
                     // A list of scalars: the element IS the value, and every
                     // bank has an unboxed column, so the batch's elements
-                    // become ONE shared column and a row is a slice of it. A
-                    // row then costs the single `Arc<ListStorage>` and no
-                    // per-element write, where boxing cost a second allocation
-                    // plus a 24-byte `Value` per element.
+                    // become ONE shared column and a row is a WINDOW onto it.
+                    // A row then costs a reference count and no per-element
+                    // write, where boxing cost two allocations plus a 24-byte
+                    // `Value` per element.
                     [(None, ty, buf)] => {
-                        let column = Arc::new(column_of(*ty, buf, &interned));
+                        let column = Arc::new(ListStorage::Column(column_of(*ty, buf, &interned)));
                         for &count in *lens {
-                            let len = count.max(0) as usize;
-                            // The boxed arm sliced the buffer and so failed
-                            // here on a row length the run never produced; an
-                            // out-of-range slice would otherwise surface as a
+                            // `ListRef::window` carries the bound check: the
+                            // boxed arm sliced the buffer and so failed on a
+                            // row length the run never produced, and an
+                            // out-of-range window would otherwise surface as a
                             // short list.
-                            assert!(
-                                at + len <= column.len(),
-                                "row length {len} at {at} runs past the {} element buffer",
-                                column.len()
-                            );
-                            rows.push(Value::list(ListStorage::Column {
-                                column: Arc::clone(&column),
-                                start: at,
-                                len,
-                            }));
+                            let len = count.max(0) as usize;
+                            rows.push(Value::List(ListRef::window(Arc::clone(&column), at, len)));
                             at += len;
                         }
                     }
@@ -1139,19 +1131,12 @@ impl RawOutput<'_> {
                             .iter()
                             .map(|(_, ty, buf)| column_of(*ty, buf, &interned))
                             .collect();
-                        let schema = Arc::new(RecordSchema::new(keys, columns));
+                        let schema = Arc::new(ListStorage::Record(Arc::new(RecordSchema::new(
+                            keys, columns,
+                        ))));
                         for &count in *lens {
                             let len = count.max(0) as usize;
-                            assert!(
-                                at + len <= schema.rows(),
-                                "row length {len} at {at} runs past the {} record columns",
-                                schema.rows()
-                            );
-                            rows.push(Value::list(ListStorage::Record {
-                                schema: Arc::clone(&schema),
-                                start: at,
-                                len,
-                            }));
+                            rows.push(Value::List(ListRef::window(Arc::clone(&schema), at, len)));
                             at += len;
                         }
                     }
@@ -1467,6 +1452,58 @@ mod tests {
     /// is built the boxed way and the output is a record view over the batch's
     /// own columns, so an equality that passes says the unboxed row reads back
     /// as the entries it stands for.
+    #[test]
+    /// Every row of one output must be a window onto ONE buffer — that is what
+    /// makes a row cost no allocation. Measured at 1.000 allocs/row before and
+    /// 0.001 after (`cargo run --release --example allocs`), but an allocation
+    /// count is not something the test suite can assert, so the sharing itself
+    /// is.
+    fn every_row_of_a_list_output_windows_one_shared_buffer() {
+        let elems = [1i64, 2, 3, 4, 5, 6];
+        let lens = vec![2i64, 3, 1];
+        // The scalar-element arm and the record arm build different storages,
+        // so both are checked.
+        for (source, s, field) in [
+            (
+                "list.map(x, x * 2)",
+                schema(&[("list[]", ValType::Int)]),
+                None,
+            ),
+            (
+                "list.filter(i, i.price > 0)",
+                schema(&[("list[].price", ValType::Int)]),
+                Some("price"),
+            ),
+        ] {
+            let program = BatchProgram::compile(source, &s).unwrap();
+            let batch = Batch::new(lens.len()).column(
+                "list",
+                ColumnRef::List {
+                    lens: &lens,
+                    fields: vec![(field, ColumnRef::Int(&elems))],
+                },
+            );
+            let rows = program
+                .bind_per_row(&batch)
+                .unwrap()
+                .collect_on(Tier::Jit)
+                .unwrap();
+            assert_eq!(rows.len(), 3, "{source}");
+            let Value::List(first) = &rows[0] else {
+                panic!("{source}: not a list");
+            };
+            for (i, row) in rows.iter().enumerate() {
+                let Value::List(row) = row else {
+                    panic!("{source}: row {i} is not a list");
+                };
+                assert!(
+                    first.shares_storage_with(row),
+                    "{source}: row {i} has its own buffer"
+                );
+            }
+        }
+    }
+
     #[test]
     fn a_record_list_collected_as_values_reads_back_every_field() {
         use crate::objects::KeyRef;
