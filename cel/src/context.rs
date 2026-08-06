@@ -248,7 +248,7 @@ impl<'a> Context<'a> {
 impl Default for Context<'_> {
     fn default() -> Self {
         Context::Root {
-            env: Arc::new(Env::stdlib()),
+            env: Env::shared_stdlib(),
             variables: Default::default(),
             functions: Default::default(),
             resolver: None,

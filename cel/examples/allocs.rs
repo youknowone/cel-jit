@@ -290,7 +290,16 @@ fn walk_list(list_len: i64, source: &str) {
     }
     let (a_in, b_in) = read();
 
+    // Binding alone, so the conversion the walker's value universe forces is
+    // separated from the evaluation. `Box<dyn Val>` has no list strategy, so a
+    // `Value::List` is exploded into one box per element on every bind.
     let mut ctx = Context::default();
+    reset();
+    for input in &inputs {
+        ctx.add_variable_from_value("list", input.clone());
+    }
+    let (a_bind, b_bind) = read();
+
     reset();
     let mut total = 0usize;
     for input in &inputs {
@@ -307,7 +316,8 @@ fn walk_list(list_len: i64, source: &str) {
     println!("\n-- tree-walker (Program::execute), {list_len} elements per row, `{source}` --");
     for (label, a, b) in [
         ("build the input Value", a_in, b_in),
-        ("Program::execute", a_exec, b_exec),
+        ("bind it to a Context", a_bind, b_bind),
+        ("bind + Program::execute", a_exec, b_exec),
     ] {
         println!(
             "{:<28} {:>10.3} {:>10.1} {:>12} {:>12}",

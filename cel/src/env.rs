@@ -12,6 +12,7 @@ use std::{
         btree_map::Entry::{Occupied, Vacant},
         BTreeMap,
     },
+    sync::{Arc, OnceLock},
 };
 
 /// An environment for the CEL execution.
@@ -63,6 +64,17 @@ pub struct Env {
 }
 
 impl Env {
+    /// Returns the standard library environment, shared by every caller.
+    ///
+    /// [`Env`] is immutable once built — a [`Context`](crate::Context) only ever
+    /// hands out `&Env` — and [`stdlib`](Self::stdlib) registers several hundred
+    /// overloads, so building one per context is the dominant cost of
+    /// `Context::default()`.
+    pub fn shared_stdlib() -> Arc<Env> {
+        static SHARED: OnceLock<Arc<Env>> = OnceLock::new();
+        Arc::clone(SHARED.get_or_init(|| Arc::new(Env::stdlib())))
+    }
+
     /// Returns the standard library environment.
     ///
     /// This environment contains all the standard functions and types as defined by the
@@ -308,5 +320,19 @@ mod tests {
     #[test]
     fn test_env_default() {
         let _: Arc<dyn Send + Sync> = Arc::new(Env::default());
+    }
+
+    /// Two `Context::default()`s must share one stdlib environment. Rebuilding
+    /// it registers every overload again, which was the whole cost of the call.
+    #[test]
+    fn shared_stdlib_hands_out_one_environment() {
+        assert!(Arc::ptr_eq(&Env::shared_stdlib(), &Env::shared_stdlib()));
+        // ... and it is the same environment `stdlib()` builds.
+        let own = Env::stdlib();
+        let shared = Env::shared_stdlib();
+        assert_eq!(
+            own.functions.keys().collect::<Vec<_>>(),
+            shared.functions.keys().collect::<Vec<_>>()
+        );
     }
 }
