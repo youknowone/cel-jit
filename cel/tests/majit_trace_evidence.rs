@@ -2,8 +2,8 @@
 //! the REAL cel mainloop: it compiles the hot loop, and the compiled code then
 //! RUNS that loop rather than deopting back to the interpreter every iteration.
 //!
-//! This lives in its own test binary because the evidence counters
-//! (`float_bank::COMPILES`, `float_bank::GUARD_FAILS`) are process-global: a
+//! This lives in its own test binary because the evidence counters behind
+//! `float_bank::jit_stats` are process-global: a
 //! concurrently running unit test that drives the same mainloop would land
 //! inside another test's reset-run-assert window. Its own binary plus the
 //! module-local serial guard gives each measurement an exclusive window.
@@ -14,11 +14,9 @@
 
 #![cfg(feature = "jit")]
 
-use std::sync::atomic::Ordering;
-
 use cel::majit::bytecode::float_bank::{
-    interned_program_count, reset_persistent_state, COMPILES, GUARD_FAILS, MAX_INTERNED_PROGRAMS,
-    TRACE_ABORTS,
+    interned_program_count, jit_stats, reset_jit_stats, reset_persistent_state,
+    MAX_INTERNED_PROGRAMS,
 };
 use cel::majit::bytecode::{clean_batch_sum_f, eval_batch_sum_f, Column};
 use cel::majit::lower::{lower_typed, LoweredF, Schema, ValType};
@@ -53,15 +51,25 @@ fn measure_warm(
     n: usize,
 ) -> (usize, usize, usize, Option<i64>) {
     let clean = clean_batch_sum_f(lowered, columns, n);
-    COMPILES.store(0, Ordering::Relaxed);
-    GUARD_FAILS.store(0, Ordering::Relaxed);
-    TRACE_ABORTS.store(0, Ordering::Relaxed);
+    reset_jit_stats();
     let jit = eval_batch_sum_f(lowered, columns, n, 8);
-    let compiles = COMPILES.load(Ordering::Relaxed);
-    let deopts = GUARD_FAILS.load(Ordering::Relaxed);
-    let aborts = TRACE_ABORTS.load(Ordering::Relaxed);
+    let stats = jit_stats();
     assert_eq!(clean, jit, "compiled tier diverged from the oracle tier");
-    (compiles, deopts, aborts, jit)
+    // A trace dropped by a panic inside compilation leaves the tier answering
+    // out of the interpreter, so every other assertion in this file still holds
+    // — the deopt bounds especially, since there is no compiled loop to bail
+    // out of. `internal_compile_panics` is the only counter that sees it.
+    assert_eq!(
+        stats.internal_compile_panics, 0,
+        "{} trace(s) were dropped by a panic inside compilation",
+        stats.internal_compile_panics
+    );
+    (
+        stats.loops_compiled,
+        stats.guard_failures,
+        stats.loops_aborted,
+        jit,
+    )
 }
 
 /// One swept data shape: a label and the per-row element count it produces.
@@ -96,6 +104,19 @@ fn flat_row_loop_stays_in_compiled_code() {
         "[flat] n={n} compiles={compiles} guard_fails={deopts} aborts={aborts} result={result:?}"
     );
     assert!(compiles >= 1, "the row loop must compile");
+    // A loop that compiled and was never ENTERED passes every other assertion
+    // here: the answers still come out of the interpreter, `compiles` is 1, and
+    // `deopts` is 0, which is under the upper bound. That was the state for the
+    // whole window in which the compiled loop was filed under a green key the
+    // back edge does not enter by — the tier was off and this test was green.
+    // Entering the loop once and leaving it once at the end of the batch is a
+    // guard failure, so the honest floor for a single-entry batch is 1.
+    assert!(
+        deopts >= 1,
+        "nothing entered the compiled row loop over {n} rows: {deopts} guard \
+         failures. A loop that compiles and is never entered answers correctly \
+         through the interpreter, so only this bound sees it"
+    );
     assert!(
         deopts <= 16,
         "the compiled row loop must run the rows itself (a constant number of \

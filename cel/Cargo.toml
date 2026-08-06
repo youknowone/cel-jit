@@ -83,6 +83,18 @@ required-features = ["jit"]
 name = "majit_nested_bench"
 required-features = ["jit"]
 
+[[example]]
+name = "jitstats"
+required-features = ["jit"]
+
+[[example]]
+name = "mpprobe"
+required-features = ["jit"]
+
+[[example]]
+name = "allocs"
+required-features = ["jit"]
+
 [features]
 default = ["regex", "chrono"]
 structs = []
@@ -95,13 +107,31 @@ dhat-heap = [ ] # if you are doing heap profiling
 # PoC: meta-tracing JIT tier built on the in-repo `majit` framework (cell-majit,
 # issue #357). Additive and off by default. Applies majit's RPython-style
 # meta-tracer to a traceable CEL evaluation mainloop.
+#
+# `jit` deliberately names NO backend. Cargo features are additive, so a `jit`
+# that named one could never un-name it, and every measurement would silently
+# describe that one backend. `majit-metainterp` is taken with
+# `default-features = false` above, so selecting the backend is the caller's
+# job — the same split pyre uses (`--no-default-features --features dynasm`).
+#
+# Building with a bare `--features jit` is a hard error, not a silent no-JIT
+# build: `majit-metainterp/src/pyjitpl.rs:40-41` has
+# `#[cfg(not(any(feature = "cranelift", feature = "dynasm", target_arch =
+# "wasm32")))] compile_error!(...)`. That matters here — the JIT tier failing
+# open is exactly how a whole backend went unmeasured before.
 jit = [
     "dep:majit-ir",
     "dep:majit-macros",
     "dep:majit-metainterp",
-    "majit-metainterp/cranelift",
     # The temporal columnar subset (timestamp/duration) lowers to i64-nanos
     # columns and constructs `Value::Timestamp`/`Value::Duration` oracles, both
     # of which require chrono.
     "chrono",
 ]
+# Backend selectors. Use one of these, not bare `jit`:
+#   cargo test  -p cel --features jit-dynasm
+#   cargo test  -p cel --features jit-cranelift
+# They are mutually exclusive in intent but additive in Cargo; enabling both
+# lets `majit-metainterp` pick, which is not a configuration to measure from.
+jit-dynasm = ["jit", "majit-metainterp/dynasm"]
+jit-cranelift = ["jit", "majit-metainterp/cranelift"]

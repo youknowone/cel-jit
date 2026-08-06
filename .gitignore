@@ -1,3 +1,5 @@
 /target
 Cargo.lock
 dhat-heap.json
+# Cohabitation-only majit path override (see the file for why it is not committed).
+/.cargo/

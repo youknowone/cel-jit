@@ -59,7 +59,8 @@
 //! (`:163` `rebuild_faillocs_from_descr`, `:167` `prepare_bridge`), and
 //! `llsupport/jump.py remap_frame_layout` emits only the minimal permutation.
 //!
-//! Run: `cargo run --release --example livescale --features jit`
+//! Run: `cargo run --release --example livescale --features jit-cranelift`
+//! (or `jit-dynasm`; `jit` alone names no backend and does not link)
 
 use std::hint::black_box;
 use std::time::{Duration, Instant};

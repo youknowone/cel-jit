@@ -652,7 +652,7 @@ fn main() {
             Ok(b) => {
                 lowered += 1;
                 let raw = match b.raw {
-                    Some((c, j)) => format!("{:.2}x", c / j),
+                    Some((c, j)) => format!("{:.2}x rc={c:.2} rj={j:.2}", c / j),
                     None => "-".to_string(),
                 };
                 println!(

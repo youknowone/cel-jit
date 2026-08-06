@@ -23,7 +23,19 @@
 #   ./bench.sh majit_nested_bench 640000 9   # <max_rows> <rounds>
 #   ./bench.sh majit_columnar_batch    # explicit columnar batch experiment
 #   ./bench.sh majit_vs_cometkim       # explicitly cross-regime historical probe
+#
+# CEL_BACKEND selects the JIT backend: cranelift (default) or dynasm. `jit`
+# alone names none — cargo features are additive, so a `jit` that named one
+# could never un-name it and every number here would silently describe that one
+# backend. A run states which backend it measured, because the two are not
+# interchangeable: they have already diverged on cel three times.
 set -euo pipefail
 cd "$(dirname "$0")"
 ex="${1:-majit_ab}"
-exec cargo run --release --quiet --package cel --features jit --example "$ex" "${@:2}"
+be="${CEL_BACKEND:-cranelift}"
+case "$be" in
+  cranelift|dynasm) ;;
+  *) echo "CEL_BACKEND must be cranelift or dynasm, got '$be'" >&2; exit 2 ;;
+esac
+echo "# backend: $be   example: $ex" >&2
+exec cargo run --release --quiet --package cel --features "jit-$be" --example "$ex" "${@:2}"

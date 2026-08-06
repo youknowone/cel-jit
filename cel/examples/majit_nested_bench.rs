@@ -42,7 +42,8 @@
 //! penalising whichever ran last; and each tier reports the MINIMUM of its
 //! rounds, since interference can only make a round slower. RELEASE ONLY.
 //!
-//! Run: `cargo run --release --example majit_nested_bench --features jit`
+//! Run: `cargo run --release --example majit_nested_bench --features jit-cranelift`
+//! (or `jit-dynasm`; `jit` alone names no backend and does not link)
 //! Optional args: `<max_rows> <rounds>`.
 
 use std::collections::HashMap;

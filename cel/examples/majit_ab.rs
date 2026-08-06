@@ -30,7 +30,8 @@
 //!
 //! No ratio crosses the request/columnar boundary.  RELEASE ONLY.
 //! Run: `./bench.sh` or
-//! `cargo run --release --example majit_ab --features jit`.
+//! `cargo run --release --example majit_ab --features jit-cranelift`
+//! (or `jit-dynasm`; `jit` alone names no backend and does not link).
 
 use std::collections::HashMap;
 use std::hint::black_box;

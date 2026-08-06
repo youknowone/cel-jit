@@ -146,6 +146,34 @@
 //! timestamps and durations, the string member functions, comprehensions over
 //! literal and runtime lists folding to a value or collecting to a list, and
 //! chains of those.
+//!
+//! ## Selecting a backend, and reading what the tier did
+//!
+//! The `jit` feature names NO backend on purpose (`cel/Cargo.toml`): cargo
+//! features are additive, so a `jit` that named one could never un-name it and
+//! every measurement would silently describe that one backend. Use a selector:
+//!
+//! ```text
+//! cargo test -p cel --features jit-dynasm
+//! cargo test -p cel --features jit-cranelift
+//! ```
+//!
+//! A bare `--features jit` is a link error, not a quiet no-JIT build.
+//!
+//! [`bytecode::float_bank::jit_stats`] reads the tier's trace census — loops
+//! and bridges compiled, traces aborted, guard failures, compilation panics,
+//! and trace length before and after the optimizer — in the same key names the
+//! pyre runner prints. `examples/jitstats.rs` prints it as a table over a sweep
+//! of shapes:
+//!
+//! ```text
+//! cargo run -p cel --release --features jit-dynasm    --example jitstats
+//! cargo run -p cel --release --features jit-cranelift --example jitstats
+//! ```
+//!
+//! Run both and diff. The two backends compile the same traces from the same
+//! frontend, so a row that differs is a backend divergence — which is the
+//! defect, not whichever number happens to be smaller.
 
 pub mod batch;
 pub mod bytecode;

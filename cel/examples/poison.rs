@@ -21,7 +21,8 @@
 //!
 //! Rounds are min-of-N per cell: interference can only make a round slower.
 //!
-//! Run: `cargo run --release --example poison --features jit`
+//! Run: `cargo run --release --example poison --features jit-cranelift`
+//! (or `jit-dynasm`; `jit` alone names no backend and does not link)
 //! Optional args: `<rows> <rounds>`
 
 use std::hint::black_box;

@@ -753,6 +753,18 @@ pub mod float_bank {
     /// merge point hot enough to be traced at all; the two have different
     /// causes, and only this counter tells them apart.
     pub static TRACE_ABORTS: AtomicUsize = AtomicUsize::new(0);
+    /// Trace length summed over every compiled loop, before and after the
+    /// optimizer. `set_on_compile_loop` has always been handed both numbers and
+    /// dropped them; the pair is what says whether the boxing the lowerer emits
+    /// survives optimization or is removed by it.
+    pub static TRACE_OPS_BEFORE: AtomicUsize = AtomicUsize::new(0);
+    pub static TRACE_OPS_AFTER: AtomicUsize = AtomicUsize::new(0);
+
+    /// Driver-internal totals absorbed from one-off drivers just before they are
+    /// dropped ([`run_jit_seeded_f`]). Neither has a callback hook, so a driver
+    /// that is not kept in [`DRIVERS`] would otherwise take its tallies with it.
+    static ABSORBED_BRIDGES: AtomicUsize = AtomicUsize::new(0);
+    static ABSORBED_PANICS: AtomicUsize = AtomicUsize::new(0);
 
     use super::{
         OP_ADD, OP_ADD_IMM, OP_ADD_OVF, OP_AND, OP_COL_LOAD, OP_COL_LOAD_B, OP_COL_LOAD_F,
@@ -1842,8 +1854,10 @@ pub mod float_bank {
                 driver.set_param("retrace_limit", n);
             }
         }
-        driver.set_on_compile_loop(|_green_key, _ops_before, _ops_after| {
+        driver.set_on_compile_loop(|_green_key, ops_before, ops_after| {
             COMPILES.fetch_add(1, Ordering::Relaxed);
+            TRACE_OPS_BEFORE.fetch_add(ops_before, Ordering::Relaxed);
+            TRACE_OPS_AFTER.fetch_add(ops_after, Ordering::Relaxed);
         });
         driver.set_on_guard_failure(|_green_key, _a, _b| {
             GUARD_FAILS.fetch_add(1, Ordering::Relaxed);
@@ -1880,7 +1894,13 @@ pub mod float_bank {
         threshold: u32,
     ) -> i64 {
         let mut driver = new_driver_f(threshold, init_regs.len(), num_fregs);
-        run_mainloop_f(&mut driver, program, init_regs, num_fregs)
+        let result = run_mainloop_f(&mut driver, program, init_regs, num_fregs);
+        // The driver dies at the end of this scope, so read the two tallies that
+        // have no callback out of it first.
+        let stats = driver.get_stats();
+        ABSORBED_BRIDGES.fetch_add(stats.bridges_compiled, Ordering::Relaxed);
+        ABSORBED_PANICS.fetch_add(stats.internal_compile_panics as usize, Ordering::Relaxed);
+        result
     }
 
     /// How many distinct batch programs one thread interns before the caches are
@@ -1996,5 +2016,103 @@ pub mod float_bank {
             d.borrow_mut().insert(key, driver);
         });
         result
+    }
+
+    /// One reading of the tier's trace census, in the same five key names the
+    /// pyre runner prints (`pyrex/src/lib.rs`'s `[jit-stats]` line) so a cel
+    /// number and a pyre number are read off the same vocabulary.
+    ///
+    /// The fields do not all share one window, and the difference matters when
+    /// reading a warm measurement:
+    ///
+    /// * `loops_compiled`, `loops_aborted`, `guard_failures`, `trace_ops_*` are
+    ///   the callback counters ([`COMPILES`], [`TRACE_ABORTS`],
+    ///   [`GUARD_FAILS`]), counted since the last [`reset_jit_stats`].
+    /// * `bridges_compiled` and `internal_compile_panics` have no callback, so
+    ///   they are read out of the drivers themselves — the live ones in
+    ///   [`DRIVERS`] plus those already absorbed from one-off drivers. Their
+    ///   window is therefore "since the last [`reset_persistent_state`]", which
+    ///   is the same instant for any caller that resets both.
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub struct JitStats {
+        pub loops_compiled: usize,
+        pub bridges_compiled: usize,
+        pub loops_aborted: usize,
+        pub guard_failures: usize,
+        /// Non-zero means a trace was dropped by a panic inside compilation and
+        /// the tier fell back to the interpreter for it. `pyjitpl.rs:1583-1586`.
+        /// Nothing else reports this: a run that silently stops compiling still
+        /// answers correctly, so every other counter here stays plausible.
+        pub internal_compile_panics: usize,
+        pub trace_ops_before: usize,
+        pub trace_ops_after: usize,
+    }
+
+    impl core::fmt::Display for JitStats {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            write!(
+                f,
+                "loops_compiled={} bridges_compiled={} loops_aborted={} \
+                 guard_failures={} internal_compile_panics={} \
+                 trace_ops_before={} trace_ops_after={}",
+                self.loops_compiled,
+                self.bridges_compiled,
+                self.loops_aborted,
+                self.guard_failures,
+                self.internal_compile_panics,
+                self.trace_ops_before,
+                self.trace_ops_after,
+            )
+        }
+    }
+
+    /// Read the tier's counters. See [`JitStats`] for the two windows.
+    pub fn jit_stats() -> JitStats {
+        let (live_bridges, live_panics) = DRIVERS.with(|d| {
+            d.borrow()
+                .values()
+                .fold((0usize, 0usize), |(b, p), driver| {
+                    let s = driver.get_stats();
+                    (
+                        b + s.bridges_compiled,
+                        p + s.internal_compile_panics as usize,
+                    )
+                })
+        });
+        JitStats {
+            loops_compiled: COMPILES.load(Ordering::Relaxed),
+            bridges_compiled: live_bridges + ABSORBED_BRIDGES.load(Ordering::Relaxed),
+            loops_aborted: TRACE_ABORTS.load(Ordering::Relaxed),
+            guard_failures: GUARD_FAILS.load(Ordering::Relaxed),
+            internal_compile_panics: live_panics + ABSORBED_PANICS.load(Ordering::Relaxed),
+            trace_ops_before: TRACE_OPS_BEFORE.load(Ordering::Relaxed),
+            trace_ops_after: TRACE_OPS_AFTER.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Zero every counter this module owns, opening a fresh measurement window.
+    ///
+    /// This cannot zero the live drivers' own tallies — they belong to the
+    /// drivers, and only [`reset_persistent_state`] drops those. A caller that
+    /// wants both halves aligned calls that first.
+    pub fn reset_jit_stats() {
+        for c in [
+            &COMPILES,
+            &GUARD_FAILS,
+            &TRACE_ABORTS,
+            &TRACE_OPS_BEFORE,
+            &TRACE_OPS_AFTER,
+            &ABSORBED_BRIDGES,
+            &ABSORBED_PANICS,
+        ] {
+            c.store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// Print one `[jit-stats]` line, tagged with `label`, in the format the pyre
+    /// runner uses. `label` names the shape being measured, so a run that sweeps
+    /// several of them stays readable.
+    pub fn print_jit_stats(label: &str) {
+        eprintln!("[jit-stats] {label} {}", jit_stats());
     }
 }
