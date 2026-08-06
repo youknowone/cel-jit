@@ -47,9 +47,109 @@ static MIN_TIMESTAMP: LazyLock<chrono::DateTime<chrono::FixedOffset>> = LazyLock
         .from_utc_datetime(&naive)
 });
 
-#[derive(Debug, PartialEq, Clone)]
+/// How a [`Map`] holds its entries -- the map counterpart of [`ListStorage`].
+#[derive(Clone)]
+pub enum MapStorage {
+    /// An owned table of boxed entries.
+    Object(Arc<HashMap<Key, Value>>),
+    /// One row of a record batch. The field names and the column banks live in
+    /// `schema` and are shared with every other row, so this row is an index
+    /// into them and a field is boxed only when it is read.
+    Record {
+        schema: Arc<RecordSchema>,
+        index: usize,
+    },
+}
+
+/// The field names and column banks shared by every row of a record batch. One
+/// of these is built per output, so a row costs an index into it rather than a
+/// table of its own.
+pub struct RecordSchema {
+    keys: Vec<Key>,
+    columns: Vec<RecordColumn>,
+}
+
+/// One column of a [`RecordSchema`], kept in the batch's own representation.
+pub enum RecordColumn {
+    /// Raw words, read through `bank`.
+    Scalar { bank: ScalarBank, words: Arc<[i64]> },
+    /// Already-boxed values, for a bank with no unboxed representation.
+    Boxed(Arc<[Value]>),
+}
+
+/// How a [`RecordColumn::Scalar`]'s raw words decode.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ScalarBank {
+    Int,
+    UInt,
+    Bool,
+    Float,
+}
+
+impl RecordColumn {
+    fn value_at(&self, index: usize) -> Value {
+        match self {
+            RecordColumn::Scalar { bank, words } => {
+                let word = words[index];
+                match bank {
+                    ScalarBank::Int => Value::Int(word),
+                    ScalarBank::UInt => Value::UInt(word as u64),
+                    ScalarBank::Bool => Value::Bool(word != 0),
+                    ScalarBank::Float => Value::Float(f64::from_bits(word as u64)),
+                }
+            }
+            RecordColumn::Boxed(values) => values[index].clone(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            RecordColumn::Scalar { words, .. } => words.len(),
+            RecordColumn::Boxed(values) => values.len(),
+        }
+    }
+}
+
+impl RecordSchema {
+    /// `keys` names one column of `columns`, and every column holds the same
+    /// number of rows -- the two are what makes an index a whole record.
+    pub fn new(keys: Vec<Key>, columns: Vec<RecordColumn>) -> RecordSchema {
+        assert_eq!(
+            keys.len(),
+            columns.len(),
+            "a record schema names one column per key"
+        );
+        assert!(
+            columns.windows(2).all(|w| w[0].len() == w[1].len()),
+            "a record schema's columns must agree on the row count"
+        );
+        RecordSchema { keys, columns }
+    }
+
+    pub fn field_count(&self) -> usize {
+        self.keys.len()
+    }
+
+    /// How many records the columns hold.
+    pub fn rows(&self) -> usize {
+        self.columns.first().map_or(0, RecordColumn::len)
+    }
+
+    pub fn keys(&self) -> &[Key] {
+        &self.keys
+    }
+
+    /// A record carries a handful of fields, so a scan over the shared names
+    /// beats hashing and needs no table of its own.
+    fn position(&self, key: &(dyn AsKeyRef + '_)) -> Option<usize> {
+        let key = key.as_keyref();
+        self.keys.iter().position(|k| k.as_keyref() == key)
+    }
+}
+
+#[derive(Clone)]
 pub struct Map {
-    pub map: Arc<HashMap<Key, Value>>,
+    storage: MapStorage,
 }
 
 impl PartialOrd for Map {
@@ -59,27 +159,144 @@ impl PartialOrd for Map {
 }
 
 impl Map {
-    pub(crate) fn contains_key(&self, key: &(dyn AsKeyRef + '_)) -> bool {
-        self.map.contains_key(key)
+    /// A map over an owned table of boxed entries.
+    pub fn object(map: Arc<HashMap<Key, Value>>) -> Map {
+        Map {
+            storage: MapStorage::Object(map),
+        }
     }
-    /// Returns a reference to the value corresponding to the key. Implicitly converts between int
-    /// and uint keys.
-    pub fn get(&self, key: &(dyn AsKeyRef + '_)) -> Option<&Value> {
-        self.map.get(key).or_else(|| {
+
+    /// Record `index` of `schema`, which costs a reference count and no
+    /// allocation at all.
+    pub fn record(schema: Arc<RecordSchema>, index: usize) -> Map {
+        debug_assert!(index < schema.rows(), "record index is past the columns");
+        Map {
+            storage: MapStorage::Record { schema, index },
+        }
+    }
+
+    pub fn storage(&self) -> &MapStorage {
+        &self.storage
+    }
+
+    pub fn len(&self) -> usize {
+        match &self.storage {
+            MapStorage::Object(map) => map.len(),
+            MapStorage::Record { schema, .. } => schema.field_count(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub(crate) fn contains_key(&self, key: &(dyn AsKeyRef + '_)) -> bool {
+        match &self.storage {
+            MapStorage::Object(map) => map.contains_key(key),
+            MapStorage::Record { schema, .. } => schema.position(key).is_some(),
+        }
+    }
+
+    /// The value corresponding to the key, boxed on the way out when the
+    /// strategy does not already hold it. Implicitly converts between int and
+    /// uint keys.
+    pub fn get(&self, key: &(dyn AsKeyRef + '_)) -> Option<Cow<'_, Value>> {
+        self.get_exact(key).or_else(|| {
             // Also check keys that are cross type comparable.
             let keyref = key.as_keyref();
             match keyref {
-                KeyRef::Int(k) => {
-                    let converted = u64::try_from(k).ok()?;
-                    self.map.get(&Key::Uint(converted))
-                }
-                KeyRef::Uint(k) => {
-                    let converted = i64::try_from(k).ok()?;
-                    self.map.get(&Key::Int(converted))
-                }
+                KeyRef::Int(k) => self.get_exact(&KeyRef::Uint(u64::try_from(k).ok()?)),
+                KeyRef::Uint(k) => self.get_exact(&KeyRef::Int(i64::try_from(k).ok()?)),
                 _ => None,
             }
         })
+    }
+
+    fn get_exact(&self, key: &(dyn AsKeyRef + '_)) -> Option<Cow<'_, Value>> {
+        match &self.storage {
+            MapStorage::Object(map) => map.get(key).map(Cow::Borrowed),
+            MapStorage::Record { schema, index } => {
+                let field = schema.position(key)?;
+                Some(Cow::Owned(schema.columns[field].value_at(*index)))
+            }
+        }
+    }
+
+    /// The entries. Keys are borrowed from whichever strategy owns them, and a
+    /// value is boxed only when the strategy does not already hold one.
+    pub fn iter(&self) -> MapIter<'_> {
+        match &self.storage {
+            MapStorage::Object(map) => MapIter::Object(map.iter()),
+            MapStorage::Record { schema, index } => MapIter::Record {
+                schema,
+                index: *index,
+                field: 0,
+            },
+        }
+    }
+
+    /// The entries as the owned table the rest of the language expects. Free
+    /// for [`MapStorage::Object`], and the point at which a record row pays for
+    /// the representation it was avoiding.
+    pub fn to_hashmap(&self) -> HashMap<Key, Value> {
+        match &self.storage {
+            MapStorage::Object(map) => (**map).clone(),
+            MapStorage::Record { .. } => self
+                .iter()
+                .map(|(k, v)| (k.clone(), v.into_owned()))
+                .collect(),
+        }
+    }
+}
+
+pub enum MapIter<'a> {
+    Object(std::collections::hash_map::Iter<'a, Key, Value>),
+    Record {
+        schema: &'a RecordSchema,
+        index: usize,
+        field: usize,
+    },
+}
+
+impl<'a> Iterator for MapIter<'a> {
+    type Item = (&'a Key, Cow<'a, Value>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            MapIter::Object(it) => it.next().map(|(k, v)| (k, Cow::Borrowed(v))),
+            MapIter::Record {
+                schema,
+                index,
+                field,
+            } => {
+                let at = *field;
+                let key = schema.keys.get(at)?;
+                *field += 1;
+                Some((key, Cow::Owned(schema.columns[at].value_at(*index))))
+            }
+        }
+    }
+}
+
+/// Entry-wise, so two maps are equal when they hold equal entries whatever
+/// strategy each of them uses.
+impl PartialEq for Map {
+    fn eq(&self, other: &Self) -> bool {
+        match (&self.storage, &other.storage) {
+            (MapStorage::Object(a), MapStorage::Object(b)) => a == b,
+            _ => {
+                self.len() == other.len()
+                    && self
+                        .iter()
+                        .all(|(k, v)| other.get(k).is_some_and(|o| *o == *v))
+            }
+        }
+    }
+}
+
+impl Debug for Map {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_map().entries(self.iter()).finish()
     }
 }
 
@@ -290,9 +507,7 @@ impl<K: Into<Key>, V: Into<Value>> From<HashMap<K, V>> for Map {
         for (k, v) in map {
             new_map.insert(k.into(), v.into());
         }
-        Map {
-            map: Arc::new(new_map),
-        }
+        Map::object(Arc::new(new_map))
     }
 }
 
@@ -528,9 +743,188 @@ impl TryIntoValue for Value {
     }
 }
 
+/// How a list's elements are stored.
+///
+/// A list built element by element owns a `Vec<Value>` and is what every
+/// caller has always had. A list produced by the batch tier instead names a
+/// window into a buffer the whole batch shares: the elements are already laid
+/// out contiguously and unboxed, so a row costs one small allocation and no
+/// per-element write, and an element is boxed only when it is read.
+///
+/// This is PyPy's list-strategy arrangement — `objspace/std/listobject.py:1886`
+/// `ObjectListStrategy`, `:1939` `IntegerListStrategy`, `:2043`
+/// `FloatListStrategy`: a homogeneous list keeps unboxed storage, and boxing
+/// happens on access rather than on construction.
+///
+/// Every consumer goes through the accessors below rather than matching a
+/// variant, so adding a strategy does not reopen the call sites.
+#[derive(Clone)]
+pub enum ListStorage {
+    /// Boxed elements, owned by this list.
+    Object(Vec<Value>),
+    /// `backing[start .. start + len]`, unboxed, shared with every other row of
+    /// the same batch.
+    Int {
+        backing: Arc<[i64]>,
+        start: usize,
+        len: usize,
+    },
+    /// [`ListStorage::Int`] for the float bank.
+    Float {
+        backing: Arc<[f64]>,
+        start: usize,
+        len: usize,
+    },
+    /// `schema`'s records `start .. start + len`, shared with every other row
+    /// of the same batch. An element is a [`Map::record`], which costs a
+    /// reference count and no allocation.
+    Record {
+        schema: Arc<RecordSchema>,
+        start: usize,
+        len: usize,
+    },
+}
+
+impl ListStorage {
+    pub fn len(&self) -> usize {
+        match self {
+            ListStorage::Object(v) => v.len(),
+            ListStorage::Int { len, .. }
+            | ListStorage::Float { len, .. }
+            | ListStorage::Record { len, .. } => *len,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The element at `index`, boxed on the way out. `None` past the end.
+    pub fn get(&self, index: usize) -> Option<Value> {
+        match self {
+            ListStorage::Object(v) => v.get(index).cloned(),
+            ListStorage::Int {
+                backing,
+                start,
+                len,
+            } => (index < *len)
+                .then(|| backing.get(start + index).map(|&v| Value::Int(v)))
+                .flatten(),
+            ListStorage::Float {
+                backing,
+                start,
+                len,
+            } => (index < *len)
+                .then(|| backing.get(start + index).map(|&v| Value::Float(v)))
+                .flatten(),
+            ListStorage::Record { schema, start, len } => {
+                (index < *len).then(|| Value::Map(Map::record(schema.clone(), start + index)))
+            }
+        }
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = Value> + '_ {
+        (0..self.len()).map(move |i| {
+            self.get(i)
+                .expect("index below len() is in bounds by construction")
+        })
+    }
+
+    /// The boxed elements. Free for [`ListStorage::Object`], and the point at
+    /// which an unboxed strategy pays for the representation the rest of the
+    /// language expects.
+    pub fn to_vec(&self) -> Vec<Value> {
+        match self {
+            ListStorage::Object(v) => v.clone(),
+            _ => self.iter().collect(),
+        }
+    }
+
+    /// The elements as an owned `Vec`, moving them when this is already the
+    /// boxed strategy.
+    pub fn into_vec(self) -> Vec<Value> {
+        match self {
+            ListStorage::Object(v) => v,
+            other => other.iter().collect(),
+        }
+    }
+
+    pub fn contains(&self, needle: &Value) -> bool {
+        match self {
+            // The boxed strategy already holds the `Value`s, so comparing them
+            // in place avoids the clone `iter()` owes an unboxed one.
+            ListStorage::Object(v) => v.contains(needle),
+            _ => self.iter().any(|v| &v == needle),
+        }
+    }
+
+    /// Append `other`'s elements. An unboxed strategy that is asked to grow
+    /// becomes the boxed one first, which is what PyPy's strategies do when a
+    /// list stops being homogeneous (`listobject.py` `switch_to_object_strategy`).
+    pub fn extend_from(&mut self, other: &ListStorage) {
+        let mut items = std::mem::take(self).into_vec();
+        items.extend(other.iter());
+        *self = ListStorage::Object(items);
+    }
+
+    /// [`ListStorage::extend_from`] that may MOVE `other`'s elements rather than
+    /// copy them, for a caller that owns it uniquely.
+    pub fn append(&mut self, other: &mut ListStorage) {
+        if let (ListStorage::Object(a), ListStorage::Object(b)) = (&mut *self, &mut *other) {
+            a.append(b);
+            return;
+        }
+        let taken = std::mem::take(other);
+        self.extend_from(&taken);
+    }
+}
+
+impl Default for ListStorage {
+    fn default() -> Self {
+        ListStorage::Object(Vec::new())
+    }
+}
+
+impl Value {
+    /// A list value over `items`, which may be a `Vec<Value>` or an already
+    /// chosen [`ListStorage`] strategy.
+    pub fn list(items: impl Into<ListStorage>) -> Value {
+        Value::List(Arc::new(items.into()))
+    }
+}
+
+impl From<Vec<Value>> for ListStorage {
+    fn from(v: Vec<Value>) -> Self {
+        ListStorage::Object(v)
+    }
+}
+
+impl FromIterator<Value> for ListStorage {
+    fn from_iter<I: IntoIterator<Item = Value>>(iter: I) -> Self {
+        ListStorage::Object(iter.into_iter().collect())
+    }
+}
+
+/// Element-wise, so two lists are equal when they hold equal values whatever
+/// strategy each of them uses.
+impl PartialEq for ListStorage {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (ListStorage::Object(a), ListStorage::Object(b)) => a == b,
+            _ => self.len() == other.len() && self.iter().eq(other.iter()),
+        }
+    }
+}
+
+impl std::fmt::Debug for ListStorage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.iter()).finish()
+    }
+}
+
 #[derive(Clone)]
 pub enum Value {
-    List(Arc<Vec<Value>>),
+    List(Arc<ListStorage>),
     Map(Map),
 
     Function(Arc<String>, Option<Box<Value>>),
@@ -643,7 +1037,7 @@ impl Value {
     pub fn is_zero(&self) -> bool {
         match self {
             Value::List(v) => v.is_empty(),
-            Value::Map(v) => v.map.is_empty(),
+            Value::Map(v) => v.is_empty(),
             Value::Int(0) => true,
             Value::UInt(0) => true,
             Value::Float(f) => *f == 0.0,
@@ -779,7 +1173,7 @@ impl From<&Key> for Key {
 // Convert Vec<T> to Value
 impl<T: Into<Value>> From<Vec<T>> for Value {
     fn from(v: Vec<T>) -> Self {
-        Value::List(v.into_iter().map(|v| v.into()).collect::<Vec<_>>().into())
+        Value::list(v.into_iter().map(|v| v.into()).collect::<Vec<_>>())
     }
 }
 
@@ -878,26 +1272,24 @@ impl TryFrom<&dyn Val> for Value {
             }
             Kind::List => {
                 let list = v.downcast_ref::<CelList>().unwrap().inner();
-                Ok(Value::List(Arc::new(
+                Ok(Value::list(
                     list.iter()
                         .map(|i| i.as_ref().try_into().expect("Not a Value list item"))
-                        .collect(),
-                )))
+                        .collect::<Vec<Value>>(),
+                ))
             }
             Kind::Map => {
                 let map = v.downcast_ref::<CelMap>().unwrap().inner();
-                Ok(Value::Map(Map {
-                    map: Arc::new(
-                        map.iter()
-                            .map(|(k, v)| {
-                                (
-                                    Key::from(k.clone()),
-                                    Value::try_from(v.as_ref()).expect("Not a Value map value"),
-                                )
-                            })
-                            .collect(),
-                    ),
-                }))
+                Ok(Value::Map(Map::object(Arc::new(
+                    map.iter()
+                        .map(|(k, v)| {
+                            (
+                                Key::from(k.clone()),
+                                Value::try_from(v.as_ref()).expect("Not a Value map value"),
+                            )
+                        })
+                        .collect(),
+                ))))
             }
             Kind::Opaque => Ok(Value::Opaque(match v.downcast_ref::<CelOptional>() {
                 None => v.downcast_ref::<OpaqueVal>().unwrap().clone_inner(),
@@ -958,14 +1350,13 @@ impl TryFrom<Value> for Box<dyn Val> {
             Value::Timestamp(ts) => Ok(Box::new(CelTimestamp::from(ts))),
             Value::List(l) => {
                 let result: Result<Vec<Box<dyn Val>>, ExecutionError> =
-                    (*l).clone().into_iter().map(|i| i.try_into()).collect();
+                    l.to_vec().into_iter().map(|i| i.try_into()).collect();
                 Ok(Box::new(CelList::from(result?)))
             }
             Value::Map(map) => {
-                let result: Result<HashMap<CelMapKey, Box<dyn Val>>, ExecutionError> = (*map.map)
-                    .clone()
-                    .into_iter()
-                    .map(|(k, v)| v.clone().try_into().map(|v| (k.clone().into(), v)))
+                let result: Result<HashMap<CelMapKey, Box<dyn Val>>, ExecutionError> = map
+                    .iter()
+                    .map(|(k, v)| v.into_owned().try_into().map(|v| (k.clone().into(), v)))
                     .collect();
                 Ok(Box::new(CelMap::from(result?)))
             }
@@ -995,7 +1386,7 @@ impl Value {
         for expr in expr {
             res.push(Value::resolve(expr, ctx)?);
         }
-        Ok(Value::List(res.into()))
+        Ok(Value::list(res))
     }
 
     pub fn resolve(expr: &Expression, ctx: &Context) -> ResolveResult {
@@ -1590,7 +1981,7 @@ impl ops::Add<Value> for Value {
                     // instead of cloning them.
                     match Arc::get_mut(&mut r) {
                         Some(r) => l.append(r),
-                        None => l.extend(r.iter().cloned()),
+                        None => l.extend_from(&r),
                     }
                 }
 
@@ -1872,7 +2263,7 @@ mod tests {
         let mut context = Context::default();
         let requests = vec![Value::Int(42), Value::Int(42)];
         context
-            .add_variable("requests", Value::List(Arc::new(requests)))
+            .add_variable("requests", Value::list(requests))
             .unwrap();
         context.add_variable("size", Value::Int(3)).unwrap();
         assert_eq!(program.execute(&context).unwrap(), Value::Bool(true));
@@ -1920,9 +2311,7 @@ mod tests {
     fn out_of_bound_list_access() {
         let program = Program::compile("list[10]").unwrap();
         let mut context = Context::default();
-        context
-            .add_variable("list", Value::List(Arc::new(vec![])))
-            .unwrap();
+        context.add_variable("list", Value::list(vec![])).unwrap();
         let result = program.execute(&context);
         assert_eq!(
             result,
@@ -1934,9 +2323,7 @@ mod tests {
     fn out_of_bound_list_access_negative() {
         let program = Program::compile("list[-1]").unwrap();
         let mut context = Context::default();
-        context
-            .add_variable("list", Value::List(Arc::new(vec![])))
-            .unwrap();
+        context.add_variable("list", Value::list(vec![])).unwrap();
         let result = program.execute(&context);
         assert_eq!(
             result,
@@ -1949,7 +2336,7 @@ mod tests {
         let program = Program::compile("list[1u]").unwrap();
         let mut context = Context::default();
         context
-            .add_variable("list", Value::List(Arc::new(vec![1.into(), 2.into()])))
+            .add_variable("list", Value::list(vec![1.into(), 2.into()]))
             .unwrap();
         let result = program.execute(&context);
         assert_eq!(result, Ok(Value::Int(2.into())));
@@ -1965,9 +2352,7 @@ mod tests {
         let indirect: Value = vec.into();
         assert_eq!(
             indirect,
-            Value::List(Arc::new(vec![Value::String(Arc::new(String::from(
-                "example"
-            )))]))
+            Value::list(vec![Value::String(Arc::new(String::from("example")))])
         );
     }
 
@@ -2467,12 +2852,12 @@ mod tests {
                 .expect("Must parse");
             assert_eq!(
                 Value::resolve(&expr, &Context::default()),
-                Ok(Value::List(Arc::new(vec![
+                Ok(Value::list(vec![
                     Value::Int(1),
                     Value::Int(2),
                     Value::Int(3),
                     Value::Int(4)
-                ])))
+                ]))
             );
 
             let expr = Parser::default()
@@ -2481,11 +2866,11 @@ mod tests {
                 .expect("Must parse");
             assert_eq!(
                 Value::resolve(&expr, &Context::default()),
-                Ok(Value::List(Arc::new(vec![
+                Ok(Value::list(vec![
                     Value::Int(1),
                     Value::Int(2),
                     Value::Int(4)
-                ])))
+                ]))
             );
 
             let expr = Parser::default()
@@ -2494,7 +2879,7 @@ mod tests {
                 .expect("Must parse");
             assert_eq!(
                 Value::resolve(&expr, &Context::default()),
-                Ok(Value::List(Arc::new(vec![Value::Int(1), Value::Int(3)])))
+                Ok(Value::list(vec![Value::Int(1), Value::Int(3)]))
             );
 
             let expr = Parser::default()
@@ -2503,7 +2888,7 @@ mod tests {
                 .expect("Must parse");
             assert_eq!(
                 Value::resolve(&expr, &map_ctx),
-                Ok(Value::List(Arc::new(vec![Value::Int(1), Value::Int(3)])))
+                Ok(Value::list(vec![Value::Int(1), Value::Int(3)]))
             );
 
             let expr = Parser::default()
@@ -2512,11 +2897,11 @@ mod tests {
                 .expect("Must parse");
             assert_eq!(
                 Value::resolve(&expr, &map_ctx),
-                Ok(Value::List(Arc::new(vec![
+                Ok(Value::list(vec![
                     Value::Int(1),
                     Value::Int(1),
                     Value::Int(3)
-                ])))
+                ]))
             );
 
             let expr = Parser::default()
@@ -2525,7 +2910,7 @@ mod tests {
                 .expect("Must parse");
             assert_eq!(
                 Value::resolve(&expr, &Context::default()),
-                Ok(Value::List(Arc::new(vec![])))
+                Ok(Value::list(vec![]))
             );
 
             let expr = Parser::default()
@@ -2538,9 +2923,7 @@ mod tests {
             expected_map.insert("c".into(), Value::Int(3));
             assert_eq!(
                 Value::resolve(&expr, &Context::default()),
-                Ok(Value::Map(Map {
-                    map: Arc::from(expected_map)
-                }))
+                Ok(Value::Map(Map::object(Arc::from(expected_map))))
             );
 
             let expr = Parser::default()
@@ -2552,9 +2935,7 @@ mod tests {
             expected_map.insert("b".into(), Value::Int(2));
             assert_eq!(
                 Value::resolve(&expr, &Context::default()),
-                Ok(Value::Map(Map {
-                    map: Arc::from(expected_map)
-                }))
+                Ok(Value::Map(Map::object(Arc::from(expected_map))))
             );
 
             let expr = Parser::default()
@@ -2566,9 +2947,7 @@ mod tests {
             expected_map.insert("c".into(), Value::Int(3));
             assert_eq!(
                 Value::resolve(&expr, &Context::default()),
-                Ok(Value::Map(Map {
-                    map: Arc::from(expected_map)
-                }))
+                Ok(Value::Map(Map::object(Arc::from(expected_map))))
             );
 
             let expr = Parser::default()
@@ -2579,9 +2958,7 @@ mod tests {
             expected_map.insert("a".into(), Value::Int(1));
             assert_eq!(
                 Value::resolve(&expr, &map_ctx),
-                Ok(Value::Map(Map {
-                    map: Arc::from(expected_map)
-                }))
+                Ok(Value::Map(Map::object(Arc::from(expected_map))))
             );
 
             let expr = Parser::default()
@@ -2593,9 +2970,7 @@ mod tests {
             expected_map.insert("y".into(), Value::Int(1));
             assert_eq!(
                 Value::resolve(&expr, &map_ctx),
-                Ok(Value::Map(Map {
-                    map: Arc::from(expected_map)
-                }))
+                Ok(Value::Map(Map::object(Arc::from(expected_map))))
             );
 
             let expr = Parser::default()
@@ -2604,9 +2979,7 @@ mod tests {
                 .expect("Must parse");
             assert_eq!(
                 Value::resolve(&expr, &Context::default()),
-                Ok(Value::Map(Map {
-                    map: Arc::from(HashMap::new())
-                }))
+                Ok(Value::Map(Map::object(Arc::from(HashMap::new()))))
             );
         }
     }

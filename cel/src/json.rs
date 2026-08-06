@@ -6,18 +6,18 @@ use thiserror::Error;
 
 #[derive(Debug, Clone, Error)]
 #[error("unable to convert value to json: {0:?}")]
-pub enum ConvertToJsonError<'a> {
+pub enum ConvertToJsonError {
     /// We cannot convert the CEL value to JSON. Some CEL types (like functions) are
     /// not representable in JSON.
     #[error("unable to convert value to json: {0:?}")]
-    Value(&'a Value),
+    Value(Value),
 
     #[cfg(feature = "chrono")]
     /// The duration is too large to convert to nanoseconds. Any duration of 2^63
     /// nanoseconds or more will overflow. We'll return the duration type in the
     /// error message.
     #[error("duration too large to convert to nanoseconds: {0:?}")]
-    DurationOverflow(&'a Duration),
+    DurationOverflow(Duration),
 }
 
 impl Value {
@@ -33,7 +33,7 @@ impl Value {
     ///
     /// assert_eq!(result, serde_json::Value::Null);
     /// ```
-    pub fn json(&self) -> Result<serde_json::Value, ConvertToJsonError<'_>> {
+    pub fn json(&self) -> Result<serde_json::Value, ConvertToJsonError> {
         Ok(match *self {
             Value::List(ref vec) => serde_json::Value::Array(
                 vec.iter()
@@ -42,7 +42,7 @@ impl Value {
             ),
             Value::Map(ref map) => {
                 let mut obj = serde_json::Map::new();
-                for (k, v) in map.map.iter() {
+                for (k, v) in map.iter() {
                     obj.insert(k.to_string(), v.json()?);
                 }
                 serde_json::Value::Object(obj)
@@ -59,10 +59,10 @@ impl Value {
             #[cfg(feature = "chrono")]
             Value::Duration(ref v) => serde_json::Value::Number(serde_json::Number::from(
                 v.num_nanoseconds()
-                    .ok_or(ConvertToJsonError::DurationOverflow(v))?,
+                    .ok_or(ConvertToJsonError::DurationOverflow(*v))?,
             )),
             Value::Opaque(ref opaque) => (**opaque).json().unwrap_or(serde_json::Value::Null),
-            _ => return Err(ConvertToJsonError::Value(self)),
+            _ => return Err(ConvertToJsonError::Value(self.clone())),
         })
     }
 }
@@ -86,7 +86,7 @@ mod tests {
             (json!(null), CelValue::Null),
             (
                 json!([true, null]),
-                CelValue::List(vec![CelValue::Bool(true), CelValue::Null].into()),
+                CelValue::list(vec![CelValue::Bool(true), CelValue::Null]),
             ),
             (
                 json!({"hello": "world"}),

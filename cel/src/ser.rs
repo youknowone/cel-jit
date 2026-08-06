@@ -424,7 +424,7 @@ impl ser::SerializeSeq for SerializeVec {
     }
 
     fn end(self) -> Result<Value> {
-        Ok(Value::List(Arc::new(self.vec)))
+        Ok(Value::list(self.vec))
     }
 }
 
@@ -473,7 +473,7 @@ impl ser::SerializeTupleVariant for SerializeTupleVariant {
     }
 
     fn end(self) -> Result<Value> {
-        let map = HashMap::from_iter([(self.name, Arc::new(self.vec))]);
+        let map = HashMap::from_iter([(self.name, Value::list(self.vec))]);
         Ok(map.into())
     }
 }
@@ -1144,11 +1144,8 @@ mod tests {
     fn test_tuples() {
         // Test Tuple serialization
         let tuple = to_value(TestCompoundTypes::Tuple(12, 16)).unwrap();
-        let expected: Value = HashMap::from([(
-            "Tuple",
-            Value::List(Arc::new(vec![12_u64.into(), 16_u64.into()])),
-        )])
-        .into();
+        let expected: Value =
+            HashMap::from([("Tuple", Value::list(vec![12_u64.into(), 16_u64.into()]))]).into();
         let program = Program::compile("test == expected").unwrap();
         let mut context = Context::default();
         context.add_variable("expected", expected).unwrap();

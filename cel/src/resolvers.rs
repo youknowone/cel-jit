@@ -56,6 +56,6 @@ impl Resolver for AllArguments {
         for arg in ctx.args.iter() {
             args.push(arg.as_ref().try_into()?);
         }
-        Ok(Value::List(args.into()))
+        Ok(Value::list(args))
     }
 }

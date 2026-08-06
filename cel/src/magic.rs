@@ -1,5 +1,5 @@
 use crate::macros::{impl_conversions, impl_handler};
-use crate::objects::Opaque;
+use crate::objects::{ListStorage, Opaque};
 use crate::resolvers::{AllArguments, Argument};
 use crate::{ExecutionError, FunctionContext, ResolveResult, Value};
 use std::collections::BTreeMap;
@@ -12,7 +12,7 @@ impl_conversions!(
     Arc<String> => Value::String,
     Arc<Vec<u8>> => Value::Bytes,
     bool => Value::Bool,
-    Arc<Vec<Value>> => Value::List,
+    Arc<ListStorage> => Value::List,
     Arc<dyn Opaque> => Value::Opaque
 );
 
@@ -225,7 +225,7 @@ impl From<Identifier> for String {
 /// }
 /// ```
 #[derive(Clone)]
-pub struct Arguments(pub Arc<Vec<Value>>);
+pub struct Arguments(pub Arc<ListStorage>);
 
 impl<'a> FromContext<'a, '_, '_> for Arguments {
     fn from_context(ctx: &'a mut FunctionContext) -> Result<Self, ExecutionError>

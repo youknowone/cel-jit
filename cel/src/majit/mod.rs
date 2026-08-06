@@ -1281,11 +1281,11 @@ mod tests {
                                 (Key::String(Arc::new(f.to_string())), cell_value(d, k))
                             })
                             .collect();
-                        Value::Map(Map { map: Arc::new(map) })
+                        Value::Map(Map::object(Arc::new(map)))
                     }
                 })
                 .collect();
-            Value::List(Arc::new(elems))
+            Value::list(elems)
         }
     }
 
@@ -5059,7 +5059,7 @@ mod tests {
                 let list: Vec<Value> = elems[off..off + n].iter().map(|v| Value::Int(*v)).collect();
                 off += n;
                 let mut ctx = Context::default();
-                ctx.add_variable_from_value("items", Value::List(list.into()));
+                ctx.add_variable_from_value("items", Value::list(list));
                 total += match program.execute(&ctx).ok()? {
                     Value::Int(i) => i,
                     Value::Bool(b) => b as i64,

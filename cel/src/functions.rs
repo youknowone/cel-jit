@@ -1,6 +1,6 @@
 use crate::context::Context;
 use crate::magic::{Arguments, This};
-use crate::objects::{KeyRef, OptionalValue, Value};
+use crate::objects::{KeyRef, ListStorage, OptionalValue, Value};
 use crate::resolvers::Resolver;
 use crate::ExecutionError;
 use std::borrow::Cow;
@@ -76,7 +76,7 @@ impl<'context, 'call: 'context> FunctionContext<'context, 'call> {
 pub fn size(ftx: &FunctionContext, This(this): This<Value>) -> Result<i64> {
     let size = match this {
         Value::List(l) => l.len(),
-        Value::Map(m) => m.map.len(),
+        Value::Map(m) => m.len(),
         Value::String(s) => s.len(),
         value => return Err(ftx.error(format!("cannot determine the size of {value:?}"))),
     };
@@ -382,52 +382,42 @@ pub mod time {
     }
 }
 
-pub fn max(Arguments(args): Arguments) -> Result<Value> {
-    // If items is a list of values, then operate on the list
+/// The element `keep` orders ahead of every other. `max` and `min` differ only
+/// in that ordering, so the selection itself is written once.
+///
+/// An equal comparison takes the later element, which is what the fold this
+/// replaces did, and an incomparable pair is an error rather than a silent
+/// choice.
+fn extremum(args: Arc<ListStorage>, keep: Ordering) -> Result<Value> {
+    // A lone list argument is operated on element-wise; anything else compares
+    // the arguments themselves.
     let items = if args.len() == 1 {
-        match &args[0] {
-            Value::List(values) => values,
-            _ => return Ok(args[0].clone()),
+        match args.get(0) {
+            Some(Value::List(values)) => values,
+            Some(other) => return Ok(other),
+            None => args,
         }
     } else {
-        &args
+        args
     };
 
-    items
-        .iter()
-        .skip(1)
-        .try_fold(items.first().unwrap_or(&Value::Null), |acc, x| {
-            match acc.partial_cmp(x) {
-                Some(Ordering::Greater) => Ok(acc),
-                Some(_) => Ok(x),
-                None => Err(ExecutionError::ValuesNotComparable(acc.clone(), x.clone())),
-            }
-        })
-        .cloned()
+    let mut best = items.get(0).unwrap_or(Value::Null);
+    for x in items.iter().skip(1) {
+        match best.partial_cmp(&x) {
+            Some(ord) if ord == keep => {}
+            Some(_) => best = x,
+            None => return Err(ExecutionError::ValuesNotComparable(best, x)),
+        }
+    }
+    Ok(best)
+}
+
+pub fn max(Arguments(args): Arguments) -> Result<Value> {
+    extremum(args, Ordering::Greater)
 }
 
 pub fn min(Arguments(args): Arguments) -> Result<Value> {
-    // If items is a list of values, then operate on the list
-    let items = if args.len() == 1 {
-        match &args[0] {
-            Value::List(values) => values,
-            _ => return Ok(args[0].clone()),
-        }
-    } else {
-        &args
-    };
-
-    items
-        .iter()
-        .skip(1)
-        .try_fold(items.first().unwrap_or(&Value::Null), |acc, x| {
-            match acc.partial_cmp(x) {
-                Some(Ordering::Less) => Ok(acc),
-                Some(_) => Ok(x),
-                None => Err(ExecutionError::ValuesNotComparable(acc.clone(), x.clone())),
-            }
-        })
-        .cloned()
+    extremum(args, Ordering::Less)
 }
 
 #[cfg(test)]

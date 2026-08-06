@@ -60,6 +60,7 @@
 //! [`crate::Program::execute`], which owns the error.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use super::bytecode::{float_bank, prepare_batch_reduce, BatchRun, Column};
 use super::lower::{
@@ -67,7 +68,7 @@ use super::lower::{
     size_slot_source, string_slot_source, BatchReduce, ConcatSide, LoweredF, Schema, SlotKind,
     ValType,
 };
-use crate::objects::Key;
+use crate::objects::{Key, ListStorage, RecordColumn, RecordSchema, ScalarBank};
 use crate::{Context, Program, Value};
 
 /// Trace threshold [`Tier::Jit`] runs at: the batch loop compiles after this
@@ -853,14 +854,12 @@ impl<'b> Node<'b> {
         if let Some(v) = self.leaf {
             return v;
         }
-        Value::Map(crate::objects::Map {
-            map: std::sync::Arc::new(
-                self.kids
-                    .into_iter()
-                    .map(|(k, n)| (Key::String(std::sync::Arc::new(k.to_string())), n.value()))
-                    .collect(),
-            ),
-        })
+        Value::Map(crate::objects::Map::object(std::sync::Arc::new(
+            self.kids
+                .into_iter()
+                .map(|(k, n)| (Key::String(std::sync::Arc::new(k.to_string())), n.value()))
+                .collect(),
+        )))
     }
 }
 
@@ -911,28 +910,26 @@ impl<'a, 'b> RowReader<'a, 'b> {
             return cell(col, row);
         };
         let start = self.offsets[name][row] as usize;
-        let elems = (0..lens[row] as usize)
+        let elems: Vec<Value> = (0..lens[row] as usize)
             .map(|j| match fields.as_slice() {
                 // An unnamed field names the elements themselves, so a row's
                 // element IS the scalar rather than a one-entry map.
                 [(None, c)] => cell(c, start + j),
-                _ => Value::Map(crate::objects::Map {
-                    map: std::sync::Arc::new(
-                        fields
-                            .iter()
-                            .filter_map(|(f, c)| {
-                                let f = (*f)?;
-                                Some((
-                                    Key::String(std::sync::Arc::new(f.to_string())),
-                                    cell(c, start + j),
-                                ))
-                            })
-                            .collect(),
-                    ),
-                }),
+                _ => Value::Map(crate::objects::Map::object(std::sync::Arc::new(
+                    fields
+                        .iter()
+                        .filter_map(|(f, c)| {
+                            let f = (*f)?;
+                            Some((
+                                Key::String(std::sync::Arc::new(f.to_string())),
+                                cell(c, start + j),
+                            ))
+                        })
+                        .collect(),
+                ))),
             })
             .collect();
-        Value::List(std::sync::Arc::new(elems))
+        Value::list(elems)
     }
 }
 
@@ -1087,36 +1084,131 @@ impl RawOutput<'_> {
             } => {
                 let mut at = 0usize;
                 let mut rows = Vec::with_capacity(lens.len());
-                for &count in *lens {
-                    let count = count.max(0) as usize;
-                    let items = (at..at + count)
-                        .map(|k| match fields.as_slice() {
-                            // A list of scalars: the element IS the value.
-                            [(None, ty, buf)] => decode(*ty, buf[k], distinct),
-                            // A list of records: one field per buffer, rebuilt
-                            // as the map the tree-walker compares and prints.
-                            fields => Value::Map(
-                                fields
-                                    .iter()
-                                    .map(|(name, ty, buf)| {
-                                        (
-                                            Key::String(std::sync::Arc::new(
-                                                name.unwrap_or_default().to_string(),
-                                            )),
-                                            decode(*ty, buf[k], distinct),
-                                        )
-                                    })
-                                    .collect::<HashMap<_, _>>()
-                                    .into(),
-                            ),
-                        })
-                        .collect::<Vec<_>>();
-                    rows.push(Value::List(std::sync::Arc::new(items)));
-                    at += count;
+                // The field shape is a property of the output, not of a row or
+                // an element, so it is decided once here. Matching it inside
+                // the element loop re-dispatched it per element.
+                match fields.as_slice() {
+                    // A list of scalars whose bank already holds the element
+                    // representation: the batch's elements become ONE shared
+                    // buffer and a row is a slice of it. A row then costs the
+                    // single `Arc<ListStorage>` and no per-element write, where
+                    // boxing cost a second allocation plus a 24-byte `Value`
+                    // per element.
+                    [(None, ValType::Int, buf)] => {
+                        let backing: Arc<[i64]> = Arc::from(*buf);
+                        for &count in *lens {
+                            let len = count.max(0) as usize;
+                            // The boxed arm sliced the buffer and so failed
+                            // here on a row length the run never produced;
+                            // an out-of-range slice would otherwise surface
+                            // as a short list.
+                            assert!(
+                                at + len <= backing.len(),
+                                "row length {len} at {at} runs past the {} element buffer",
+                                backing.len()
+                            );
+                            rows.push(Value::list(ListStorage::Int {
+                                backing: Arc::clone(&backing),
+                                start: at,
+                                len,
+                            }));
+                            at += len;
+                        }
+                    }
+                    // The float bank stores the bits, so the shared buffer is
+                    // built once by the same `f64::from_bits` `decode` applies.
+                    [(None, ValType::Float, buf)] => {
+                        let backing: Arc<[f64]> =
+                            buf.iter().map(|&v| f64::from_bits(v as u64)).collect();
+                        for &count in *lens {
+                            let len = count.max(0) as usize;
+                            // The boxed arm sliced the buffer and so failed
+                            // here on a row length the run never produced;
+                            // an out-of-range slice would otherwise surface
+                            // as a short list.
+                            assert!(
+                                at + len <= backing.len(),
+                                "row length {len} at {at} runs past the {} element buffer",
+                                backing.len()
+                            );
+                            rows.push(Value::list(ListStorage::Float {
+                                backing: Arc::clone(&backing),
+                                start: at,
+                                len,
+                            }));
+                            at += len;
+                        }
+                    }
+                    // A list of scalars in a bank with no unboxed strategy: the
+                    // element IS the value, but it still has to be boxed.
+                    [(None, ty, buf)] => {
+                        let (ty, buf) = (*ty, *buf);
+                        for &count in *lens {
+                            let count = count.max(0) as usize;
+                            let items = buf[at..at + count]
+                                .iter()
+                                .map(|&v| decode(ty, v, distinct))
+                                .collect::<Vec<_>>();
+                            rows.push(Value::list(items));
+                            at += count;
+                        }
+                    }
+                    // A list of records. Every element carries the same field
+                    // names over the same column buffers, so the names and the
+                    // columns become ONE schema for the whole output and an
+                    // element is an index into it. Rebuilding a `HashMap` per
+                    // element cost an `Arc` and a table each, and the field
+                    // names on top of that.
+                    fields => {
+                        let keys: Vec<Key> = fields
+                            .iter()
+                            .map(|(name, _, _)| {
+                                Key::String(Arc::new(name.unwrap_or_default().to_string()))
+                            })
+                            .collect();
+                        let columns = fields
+                            .iter()
+                            .map(|(_, ty, buf)| record_column(*ty, buf, distinct))
+                            .collect();
+                        let schema = Arc::new(RecordSchema::new(keys, columns));
+                        for &count in *lens {
+                            let len = count.max(0) as usize;
+                            assert!(
+                                at + len <= schema.rows(),
+                                "row length {len} at {at} runs past the {} record columns",
+                                schema.rows()
+                            );
+                            rows.push(Value::list(ListStorage::Record {
+                                schema: Arc::clone(&schema),
+                                start: at,
+                                len,
+                            }));
+                            at += len;
+                        }
+                    }
                 }
                 rows
             }
         }
+    }
+}
+
+/// The column a record field becomes: the batch's own words when the bank has
+/// an unboxed representation, and otherwise the boxed values decoded ONCE for
+/// the whole output rather than once per element.
+fn record_column(bank: ValType, words: &[i64], distinct: &[String]) -> RecordColumn {
+    let bank = match bank {
+        ValType::Int => ScalarBank::Int,
+        ValType::UInt => ScalarBank::UInt,
+        ValType::Bool => ScalarBank::Bool,
+        ValType::Float => ScalarBank::Float,
+        other => {
+            return RecordColumn::Boxed(words.iter().map(|&v| decode(other, v, distinct)).collect())
+        }
+    };
+    RecordColumn::Scalar {
+        bank,
+        words: Arc::from(words),
     }
 }
 
@@ -1387,6 +1479,99 @@ mod tests {
         }
     }
 
+    /// The COLLECT door on the same shape, which is the arm the raw test above
+    /// bypasses. Every assertion here crosses the two map strategies: `expect`
+    /// is built the boxed way and the output is a record view over the batch's
+    /// own columns, so an equality that passes says the unboxed row reads back
+    /// as the entries it stands for.
+    #[test]
+    fn a_record_list_collected_as_values_reads_back_every_field() {
+        use crate::objects::KeyRef;
+
+        fn record(fields: &[(&str, i64)]) -> Value {
+            Value::Map(crate::objects::Map::object(Arc::new(
+                fields
+                    .iter()
+                    .map(|(k, v)| (Key::String(Arc::new(k.to_string())), Value::Int(*v)))
+                    .collect(),
+            )))
+        }
+
+        let s = schema(&[
+            ("items[].price", ValType::Int),
+            ("items[].qty", ValType::Int),
+        ]);
+        // The third row is empty, so a row that admits nothing still has to
+        // land as an empty list rather than run off the columns.
+        let lens = vec![2i64, 1, 0];
+        let price = vec![10i64, 3, 7];
+        let qty = vec![1i64, 5, 2];
+        let expect = vec![
+            Value::list(vec![record(&[("price", 10), ("qty", 1)])]),
+            Value::list(vec![record(&[("price", 7), ("qty", 2)])]),
+            Value::list(Vec::<Value>::new()),
+        ];
+
+        // `filter` hands the element back rather than computing one, so the
+        // output is a list of records and `to_values` takes the record arm.
+        let program = BatchProgram::compile("items.filter(i, i.price > 5)", &s).unwrap();
+        for tier in [Tier::Clean, Tier::Interpreter, Tier::Jit] {
+            let batch = Batch::new(lens.len()).column(
+                "items",
+                ColumnRef::List {
+                    lens: &lens,
+                    fields: vec![
+                        (Some("price"), ColumnRef::Int(&price)),
+                        (Some("qty"), ColumnRef::Int(&qty)),
+                    ],
+                },
+            );
+            let rows = program
+                .bind_per_row(&batch)
+                .unwrap()
+                .collect_on(tier)
+                .unwrap();
+            assert_eq!(rows, expect, "{tier:?}");
+
+            // ... and the same entries through the map accessors, so a strategy
+            // that only satisfies the equality is not enough.
+            let Value::List(items) = &rows[0] else {
+                panic!("{tier:?}: row 0 is not a list")
+            };
+            assert_eq!(items.len(), 1);
+            let Some(Value::Map(row)) = items.get(0) else {
+                panic!("{tier:?}: the element is not a map")
+            };
+            assert_eq!(row.len(), 2);
+            assert!(row.contains_key(&KeyRef::String("price")));
+            assert!(!row.contains_key(&KeyRef::String("absent")));
+            assert_eq!(
+                *row.get(&KeyRef::String("price")).unwrap(),
+                Value::Int(10),
+                "{tier:?}"
+            );
+            assert_eq!(
+                *row.get(&KeyRef::String("qty")).unwrap(),
+                Value::Int(1),
+                "{tier:?}"
+            );
+            assert!(row.get(&KeyRef::String("absent")).is_none());
+            let mut entries: Vec<(Key, Value)> = row
+                .iter()
+                .map(|(k, v)| (k.clone(), v.into_owned()))
+                .collect();
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            assert_eq!(
+                entries,
+                vec![
+                    (Key::String(Arc::new("price".to_string())), Value::Int(10)),
+                    (Key::String(Arc::new("qty".to_string())), Value::Int(1)),
+                ],
+                "{tier:?}"
+            );
+        }
+    }
+
     /// A list of RECORDS gets one buffer per field, named and ordered the way
     /// the schema declares them — the caller reads a record column-wise instead
     /// of taking a `Value::Map` per element.
@@ -1518,7 +1703,7 @@ mod tests {
                         items
                             .iter()
                             .map(|v| match v {
-                                Value::Int(i) => *i,
+                                Value::Int(i) => i,
                                 other => panic!("{other:?}"),
                             })
                             .sum(),
