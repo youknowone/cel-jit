@@ -55,7 +55,7 @@ fn arbitrary_value(
                 for _ in 0..length {
                     list.push(arbitrary_value(u, depth)?);
                 }
-                Value::List(Arc::new(list))
+                Value::list(list)
             }
             1u64 => {
                 let length = <u8 as arbitrary::Arbitrary>::arbitrary(u)?;
@@ -63,7 +63,7 @@ fn arbitrary_value(
                 for _ in 0..length {
                     map.insert(arbitrary_key(u)?, arbitrary_value(u, depth)?);
                 }
-                Value::Map(Map { map: Arc::new(map) })
+                Value::Map(Map::object(Arc::new(map)))
             }
             2u64 => Value::Int(arbitrary::Arbitrary::arbitrary(u)?),
             3u64 => Value::UInt(arbitrary::Arbitrary::arbitrary(u)?),
