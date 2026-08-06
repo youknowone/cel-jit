@@ -60,6 +60,10 @@ name = "majit_vs_cometkim"
 required-features = ["jit"]
 
 [[example]]
+name = "majit_vs_cometkim_percall"
+required-features = ["jit"]
+
+[[example]]
 name = "majit_columnar_batch"
 required-features = ["jit"]
 
