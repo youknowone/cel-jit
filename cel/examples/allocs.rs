@@ -203,9 +203,21 @@ fn tree_walker() {
     // per-element cost the comprehension adds.
     walk_scalar();
     // Swept wide, because the per-element term is only meaningful if the cost
-    // is linear in the element count -- and it is not.
+    // is linear in the element count.
     for list_len in [5i64, 10, 20, 40, 80] {
-        walk_list(list_len);
+        walk_list(list_len, "list.map(x, x * 2)");
+    }
+    // At one width, vary the STEP instead: the difference between these is what
+    // the element expression costs, so what remains is the loop's own per-element
+    // cost -- binding the iteration variable and pushing the result.
+    for source in [
+        "list.map(x, x)",
+        "list.map(x, x * 2)",
+        "list.map(x, x * 2 + 1)",
+        "list.filter(x, x >= 0)",
+        "list.filter(x, x < 0)",
+    ] {
+        walk_list(40, source);
     }
 }
 
@@ -262,10 +274,10 @@ fn walk_scalar() {
     }
 }
 
-fn walk_list(list_len: i64) {
+fn walk_list(list_len: i64, source: &str) {
     let elems: Vec<i64> = (0..list_len).map(|k| (k * 7) % 1000).collect();
 
-    let program = Program::compile("list.map(x, x * 2)").expect("compile");
+    let program = Program::compile(source).expect("compile");
 
     // Building the input is the caller's cost either way, so it is measured
     // apart from the evaluation it feeds.
@@ -289,9 +301,10 @@ fn walk_list(list_len: i64) {
         }
     }
     let (a_exec, b_exec) = read();
-    assert_eq!(total, ROWS * list_len as usize);
+    // `filter(x, x < 0)` keeps nothing; every other source keeps everything.
+    assert_eq!(total % list_len as usize, 0);
 
-    println!("\n-- tree-walker (Program::execute), {list_len} elements per row --");
+    println!("\n-- tree-walker (Program::execute), {list_len} elements per row, `{source}` --");
     for (label, a, b) in [
         ("build the input Value", a_in, b_in),
         ("Program::execute", a_exec, b_exec),

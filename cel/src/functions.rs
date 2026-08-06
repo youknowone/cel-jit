@@ -484,6 +484,19 @@ mod tests {
                 "map to list",
                 r#"{'John': 'smart'}.map(key, key) == ['John']"#,
             ),
+            ("map empty list", "[].map(x, x * 2) == []"),
+            (
+                "map list filter, nothing kept",
+                "[1, 3, 5].map(y, y % 2 == 0, y + 1) == []",
+            ),
+            (
+                "map list filter, everything kept",
+                "[2, 4].map(y, y % 2 == 0, y + 1) == [3, 5]",
+            ),
+            (
+                "map preserves order",
+                "[3, 1, 2].map(x, x * 10) == [30, 10, 20]",
+            ),
         ]
         .iter()
         .for_each(assert_script);
@@ -491,9 +504,29 @@ mod tests {
 
     #[test]
     fn test_filter() {
-        [("filter list", "[1, 2, 3].filter(x, x > 2) == [3]")]
-            .iter()
-            .for_each(assert_script);
+        [
+            ("filter list", "[1, 2, 3].filter(x, x > 2) == [3]"),
+            ("filter empty list", "[].filter(x, x > 2) == []"),
+            ("filter keeps nothing", "[1, 2, 3].filter(x, x > 9) == []"),
+            (
+                "filter keeps everything",
+                "[1, 2, 3].filter(x, x > 0) == [1, 2, 3]",
+            ),
+            (
+                "filter preserves order",
+                "[3, 1, 2].filter(x, x > 1) == [3, 2]",
+            ),
+            (
+                "nested filter",
+                "[[1, 2], [3, 4]].filter(x, x.filter(y, y > 2) != []) == [[3, 4]]",
+            ),
+            (
+                "filter then map",
+                "[1, 2, 3, 4].filter(x, x % 2 == 0).map(x, x * 3) == [6, 12]",
+            ),
+        ]
+        .iter()
+        .for_each(assert_script);
     }
 
     #[test]

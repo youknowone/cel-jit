@@ -355,7 +355,7 @@ impl Type {
 /// Will return `Result::Ok` if the type check succeeded with the actual Box to the
 /// `Box<T>`. `Result::Err` with the `Box<dyn Val>` back to the caller should the type check
 /// fail.
-fn cast_boxed<T: Val>(value: Box<dyn Val>) -> Result<Box<T>, Box<dyn Val>> {
+pub(crate) fn cast_boxed<T: Val>(value: Box<dyn Val>) -> Result<Box<T>, Box<dyn Val>> {
     if <dyn Any>::is::<T>(&*value) {
         let temp_container = &mut Some(value);
         // SAFETY: just checked whether we are pointing to the correct type, and we can rely on

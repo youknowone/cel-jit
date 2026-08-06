@@ -46,6 +46,24 @@ pub enum Context<'a> {
     },
 }
 
+/// Binds `name`, reusing the key the map already owns when the name is bound.
+///
+/// Re-binding is the loop case — a comprehension rebinds its iteration
+/// variable once per element — and `BTreeMap::insert` takes an owned key, so
+/// it allocates a fresh `String` on every pass over a name it already holds.
+fn bind(
+    variables: &mut BTreeMap<String, Box<dyn Val>>,
+    name: impl Into<String> + AsRef<str>,
+    value: Box<dyn Val>,
+) {
+    match variables.get_mut(name.as_ref()) {
+        Some(slot) => *slot = value,
+        None => {
+            variables.insert(name.into(), value);
+        }
+    }
+}
+
 impl<'a> Context<'a> {
     pub fn add_variable<S, V>(
         &mut self,
@@ -53,41 +71,21 @@ impl<'a> Context<'a> {
         value: V,
     ) -> Result<(), <V as TryIntoValue>::Error>
     where
-        S: Into<String>,
+        S: Into<String> + AsRef<str>,
         V: TryIntoValue,
     {
-        match self {
-            Context::Root { variables, .. } => {
-                let value = value.try_into_value()?;
-                let value: Box<dyn Val> = value.try_into().unwrap();
-                variables.insert(name.into(), value);
-            }
-            Context::Child { variables, .. } => {
-                let value = value.try_into_value()?;
-                let value: Box<dyn Val> = value.try_into().unwrap();
-                variables.insert(name.into(), value);
-            }
-        }
+        let value = value.try_into_value()?;
+        self.add_variable_as_val(name, value.try_into().unwrap());
         Ok(())
     }
 
     pub fn add_variable_from_value<S, V>(&mut self, name: S, value: V)
     where
-        S: Into<String>,
+        S: Into<String> + AsRef<str>,
         V: Into<Value>,
     {
-        match self {
-            Context::Root { variables, .. } => {
-                let value = value.into();
-                let value: Box<dyn Val> = value.try_into().unwrap();
-                variables.insert(name.into(), value);
-            }
-            Context::Child { variables, .. } => {
-                let value = value.into();
-                let value: Box<dyn Val> = value.try_into().unwrap();
-                variables.insert(name.into(), value);
-            }
-        }
+        let value: Value = value.into();
+        self.add_variable_as_val(name, value.try_into().unwrap());
     }
 
     /// Binds a variable to a custom [`Val`] implementation directly, without
@@ -119,16 +117,13 @@ impl<'a> Context<'a> {
     /// ```
     pub fn add_variable_as_val<S>(&mut self, name: S, value: Box<dyn Val>)
     where
-        S: Into<String>,
+        S: Into<String> + AsRef<str>,
     {
-        match self {
-            Context::Root { variables, .. } => {
-                variables.insert(name.into(), value);
-            }
-            Context::Child { variables, .. } => {
-                variables.insert(name.into(), value);
-            }
-        }
+        let variables = match self {
+            Context::Root { variables, .. } => variables,
+            Context::Child { variables, .. } => variables,
+        };
+        bind(variables, name, value);
     }
 
     pub fn set_variable_resolver(&mut self, r: &'a dyn VariableResolver) {

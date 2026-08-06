@@ -1,4 +1,4 @@
-use crate::common::ast::{operators, EntryExpr, Expr};
+use crate::common::ast::{operators, ComprehensionExpr, EntryExpr, Expr, LiteralValue};
 use crate::common::types::bool::Bool;
 use crate::common::types::*;
 use crate::common::value::Val;
@@ -1410,6 +1410,68 @@ impl TryFrom<Value> for Box<dyn Val> {
     }
 }
 
+/// The append shape the `map` and `filter` macros expand their loop step to.
+///
+/// `map(x, f(x))` expands to the step `@result + [f(x)]`, and `filter(x, c)`
+/// (and `map`'s three-argument form) wraps that in `c ? @result + [..] :
+/// @result`. Evaluated as written, each step builds a whole new accumulator to
+/// append one element, so a comprehension over n elements copies n^2/2 of them
+/// — and a rejected element costs a copy too, because the else-branch resolves
+/// the accumulator and the loop then takes it by value.
+///
+/// Recognising the shape lets the element be pushed onto the accumulator the
+/// loop already holds, and lets a rejected element cost nothing.
+struct AccuAppend<'a> {
+    /// The `filter`'s condition, when the step is the conditional form.
+    guard: Option<&'a Expression>,
+    /// The single element the step appends.
+    element: &'a Expression,
+}
+
+impl<'a> AccuAppend<'a> {
+    fn of(comprehension: &'a ComprehensionExpr) -> Option<Self> {
+        // The accumulator is held outside the context on this path, so nothing
+        // evaluated per iteration may read it. The loop condition is the one
+        // place a step of this shape still could — `exists` and `all` stop on
+        // it — and both macros here emit a constant `true`.
+        match &comprehension.loop_cond.expr {
+            Expr::Literal(LiteralValue::Boolean(b)) if *b.inner() => {}
+            _ => return None,
+        }
+        let accu_var = comprehension.accu_var.as_str();
+        let is_accu = |expr: &Expression| matches!(&expr.expr, Expr::Ident(n) if n == accu_var);
+
+        let (guard, step) = match &comprehension.loop_step.expr {
+            Expr::Call(call)
+                if call.func_name == operators::CONDITIONAL
+                    && call.args.len() == 3
+                    && is_accu(&call.args[2]) =>
+            {
+                (Some(&call.args[0]), &call.args[1])
+            }
+            _ => (None, &comprehension.loop_step),
+        };
+
+        let Expr::Call(call) = &step.expr else {
+            return None;
+        };
+        if call.func_name != operators::ADD || call.args.len() != 2 || !is_accu(&call.args[0]) {
+            return None;
+        }
+        // An optional entry (`[?x]`) appends zero or one element depending on
+        // the value, which is not this shape.
+        match &call.args[1].expr {
+            Expr::List(list) if list.elements.len() == 1 && list.optional_indices.is_empty() => {
+                Some(AccuAppend {
+                    guard,
+                    element: &list.elements[0],
+                })
+            }
+            _ => None,
+        }
+    }
+}
+
 impl Value {
     pub fn resolve_all(expr: &[Expression], ctx: &Context) -> ResolveResult {
         let mut res = Vec::with_capacity(expr.len());
@@ -1911,15 +1973,49 @@ impl Value {
                 // `into_owned` rather than `clone_as_boxed`: the step already
                 // produces an owned accumulator, and deep-copying it again made
                 // the loop cost a second O(n^2) in the accumulator's length.
-                let accu_init = Value::resolve_val(&comprehension.accu_init, ctx)?.into_owned();
+                let mut accu_init = Value::resolve_val(&comprehension.accu_init, ctx)?.into_owned();
                 let iter = Value::resolve_val(&comprehension.iter_range, ctx)?;
                 let mut ctx = ctx.new_inner_scope();
-                ctx.add_variable_as_val(&comprehension.accu_var, accu_init);
 
                 let mut items = iter
                     .as_iterable()
                     .ok_or(ExecutionError::NoSuchOverload)?
                     .iter();
+
+                if let Some(append) = AccuAppend::of(comprehension) {
+                    match cast_boxed::<CelList>(accu_init) {
+                        Ok(list) => {
+                            // The accumulator stays here rather than in the
+                            // context: `@result` is not a name CEL can parse,
+                            // so the guard and the element cannot read it, and
+                            // a nested comprehension binds its own in its own
+                            // scope.
+                            let mut list = list.into_inner();
+                            while let Some(item) = items.next() {
+                                ctx.add_variable_as_val(
+                                    &comprehension.iter_var,
+                                    item.clone_as_boxed(),
+                                );
+                                if let Some(guard) = append.guard {
+                                    if !try_bool(Value::resolve_val(guard, &ctx))? {
+                                        continue;
+                                    }
+                                }
+                                list.push(Value::resolve_val(append.element, &ctx)?.into_owned());
+                            }
+                            ctx.add_variable_as_val(
+                                &comprehension.accu_var,
+                                Box::new(CelList::from(list)),
+                            );
+                            return Ok(Cow::<dyn Val>::Owned(
+                                Value::resolve_val(&comprehension.result, &ctx)?.into_owned(),
+                            ));
+                        }
+                        Err(back) => accu_init = back,
+                    }
+                }
+
+                ctx.add_variable_as_val(&comprehension.accu_var, accu_init);
                 while let Some(item) = items.next() {
                     if !try_bool(Value::resolve_val(&comprehension.loop_cond, &ctx))? {
                         break;
