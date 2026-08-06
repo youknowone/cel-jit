@@ -68,7 +68,7 @@ use super::lower::{
     size_slot_source, string_slot_source, BatchReduce, ConcatSide, LoweredF, Schema, SlotKind,
     ValType,
 };
-use crate::objects::{Key, ListStorage, RecordColumn, RecordSchema, ScalarBank, StrBank};
+use crate::objects::{Key, ListStorage, RecordSchema, ScalarBank, StrBank, ValueColumn};
 use crate::{Context, Program, Value};
 
 /// Trace threshold [`Tier::Jit`] runs at: the batch loop compiles after this
@@ -1095,89 +1095,31 @@ impl RawOutput<'_> {
                 // an element, so it is decided once here. Matching it inside
                 // the element loop re-dispatched it per element.
                 match fields.as_slice() {
-                    // A list of scalars whose bank already holds the element
-                    // representation: the batch's elements become ONE shared
-                    // buffer and a row is a slice of it. A row then costs the
-                    // single `Arc<ListStorage>` and no per-element write, where
-                    // boxing cost a second allocation plus a 24-byte `Value`
-                    // per element.
-                    [(None, ValType::Int, buf)] => {
-                        let backing: Arc<[i64]> = Arc::from(*buf);
-                        for &count in *lens {
-                            let len = count.max(0) as usize;
-                            // The boxed arm sliced the buffer and so failed
-                            // here on a row length the run never produced;
-                            // an out-of-range slice would otherwise surface
-                            // as a short list.
-                            assert!(
-                                at + len <= backing.len(),
-                                "row length {len} at {at} runs past the {} element buffer",
-                                backing.len()
-                            );
-                            rows.push(Value::list(ListStorage::Int {
-                                backing: Arc::clone(&backing),
-                                start: at,
-                                len,
-                            }));
-                            at += len;
-                        }
-                    }
-                    // The float bank stores the bits, so the shared buffer is
-                    // built once by the same `f64::from_bits` `decode` applies.
-                    [(None, ValType::Float, buf)] => {
-                        let backing: Arc<[f64]> =
-                            buf.iter().map(|&v| f64::from_bits(v as u64)).collect();
-                        for &count in *lens {
-                            let len = count.max(0) as usize;
-                            // The boxed arm sliced the buffer and so failed
-                            // here on a row length the run never produced;
-                            // an out-of-range slice would otherwise surface
-                            // as a short list.
-                            assert!(
-                                at + len <= backing.len(),
-                                "row length {len} at {at} runs past the {} element buffer",
-                                backing.len()
-                            );
-                            rows.push(Value::list(ListStorage::Float {
-                                backing: Arc::clone(&backing),
-                                start: at,
-                                len,
-                            }));
-                            at += len;
-                        }
-                    }
-                    // A list of strings: the elements are ranks into the
-                    // output's interned table, so an element is a reference
-                    // count on an `Arc<String>` that already exists.
-                    [(None, ValType::Str, buf)] => {
-                        let bank = Arc::new(StrBank::new(Arc::from(*buf), Arc::clone(&interned)));
-                        for &count in *lens {
-                            let len = count.max(0) as usize;
-                            assert!(
-                                at + len <= bank.len(),
-                                "row length {len} at {at} runs past the {} element buffer",
-                                bank.len()
-                            );
-                            rows.push(Value::list(ListStorage::Str {
-                                bank: Arc::clone(&bank),
-                                start: at,
-                                len,
-                            }));
-                            at += len;
-                        }
-                    }
-                    // A list of scalars in a bank with no unboxed strategy: the
-                    // element IS the value, but it still has to be boxed.
+                    // A list of scalars: the element IS the value, and every
+                    // bank has an unboxed column, so the batch's elements
+                    // become ONE shared column and a row is a slice of it. A
+                    // row then costs the single `Arc<ListStorage>` and no
+                    // per-element write, where boxing cost a second allocation
+                    // plus a 24-byte `Value` per element.
                     [(None, ty, buf)] => {
-                        let (ty, buf) = (*ty, *buf);
+                        let column = Arc::new(column_of(*ty, buf, &interned));
                         for &count in *lens {
-                            let count = count.max(0) as usize;
-                            let items = buf[at..at + count]
-                                .iter()
-                                .map(|&v| decode(ty, v, &interned))
-                                .collect::<Vec<_>>();
-                            rows.push(Value::list(items));
-                            at += count;
+                            let len = count.max(0) as usize;
+                            // The boxed arm sliced the buffer and so failed
+                            // here on a row length the run never produced; an
+                            // out-of-range slice would otherwise surface as a
+                            // short list.
+                            assert!(
+                                at + len <= column.len(),
+                                "row length {len} at {at} runs past the {} element buffer",
+                                column.len()
+                            );
+                            rows.push(Value::list(ListStorage::Column {
+                                column: Arc::clone(&column),
+                                start: at,
+                                len,
+                            }));
+                            at += len;
                         }
                     }
                     // A list of records. Every element carries the same field
@@ -1195,7 +1137,7 @@ impl RawOutput<'_> {
                             .collect();
                         let columns = fields
                             .iter()
-                            .map(|(_, ty, buf)| record_column(*ty, buf, &interned))
+                            .map(|(_, ty, buf)| column_of(*ty, buf, &interned))
                             .collect();
                         let schema = Arc::new(RecordSchema::new(keys, columns));
                         for &count in *lens {
@@ -1223,23 +1165,24 @@ impl RawOutput<'_> {
 /// The column a record field becomes: the batch's own words when the bank has
 /// an unboxed representation, and otherwise the boxed values decoded ONCE for
 /// the whole output rather than once per element.
-fn record_column(bank: ValType, words: &[i64], interned: &Arc<[Arc<String>]>) -> RecordColumn {
+/// The column a bank becomes. Every [`ValType`] has an unboxed form, so this
+/// is total and a new bank cannot quietly fall back to boxing.
+fn column_of(bank: ValType, words: &[i64], interned: &Arc<[Arc<String>]>) -> ValueColumn {
     let bank = match bank {
         ValType::Int => ScalarBank::Int,
         ValType::UInt => ScalarBank::UInt,
         ValType::Bool => ScalarBank::Bool,
         ValType::Float => ScalarBank::Float,
+        ValType::Timestamp => ScalarBank::Timestamp,
+        ValType::Duration => ScalarBank::Duration,
         ValType::Str => {
-            return RecordColumn::Str(Arc::new(StrBank::new(
+            return ValueColumn::Str(Arc::new(StrBank::new(
                 Arc::from(words),
                 Arc::clone(interned),
             )))
         }
-        other => {
-            return RecordColumn::Boxed(words.iter().map(|&v| decode(other, v, interned)).collect())
-        }
     };
-    RecordColumn::Scalar {
+    ValueColumn::Scalar {
         bank,
         words: Arc::from(words),
     }
@@ -1609,6 +1552,65 @@ mod tests {
                 ],
                 "{tier:?}"
             );
+        }
+    }
+
+    /// The temporal banks. They were the last two with no unboxed column, and
+    /// nothing else covers a timestamp or duration ELEMENT list — the existing
+    /// temporal tests all use a scalar column.
+    #[test]
+    fn a_temporal_element_list_decodes_from_the_shared_column() {
+        let lens = vec![2i64, 1];
+        let nanos = vec![1_000_000_000i64, 2_500_000_000, 7_000_000_000];
+
+        let s = schema(&[("at[]", ValType::Timestamp)]);
+        let program =
+            BatchProgram::compile("at.filter(t, t > timestamp(\"1970-01-01T00:00:01Z\"))", &s)
+                .expect("timestamp element list is in the traceable subset");
+        let stamp =
+            |n: i64| Value::Timestamp(chrono::DateTime::from_timestamp_nanos(n).fixed_offset());
+        let expect = vec![
+            Value::list(vec![stamp(2_500_000_000)]),
+            Value::list(vec![stamp(7_000_000_000)]),
+        ];
+        for tier in [Tier::Clean, Tier::Interpreter, Tier::Jit] {
+            let batch = Batch::new(lens.len()).column(
+                "at",
+                ColumnRef::List {
+                    lens: &lens,
+                    fields: vec![(None, ColumnRef::Timestamp(&nanos))],
+                },
+            );
+            let rows = program
+                .bind_per_row(&batch)
+                .unwrap()
+                .collect_on(tier)
+                .unwrap();
+            assert_eq!(rows, expect, "{tier:?}");
+        }
+
+        let s = schema(&[("took[]", ValType::Duration)]);
+        let program = BatchProgram::compile("took.filter(d, d > duration(\"1s\"))", &s)
+            .expect("duration element list is in the traceable subset");
+        let span = |n: i64| Value::Duration(chrono::Duration::nanoseconds(n));
+        let expect = vec![
+            Value::list(vec![span(2_500_000_000)]),
+            Value::list(vec![span(7_000_000_000)]),
+        ];
+        for tier in [Tier::Clean, Tier::Interpreter, Tier::Jit] {
+            let batch = Batch::new(lens.len()).column(
+                "took",
+                ColumnRef::List {
+                    lens: &lens,
+                    fields: vec![(None, ColumnRef::Duration(&nanos))],
+                },
+            );
+            let rows = program
+                .bind_per_row(&batch)
+                .unwrap()
+                .collect_on(tier)
+                .unwrap();
+            assert_eq!(rows, expect, "{tier:?}");
         }
     }
 

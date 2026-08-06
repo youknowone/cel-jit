@@ -66,7 +66,7 @@ pub enum MapStorage {
 /// table of its own.
 pub struct RecordSchema {
     keys: Vec<Key>,
-    columns: Vec<RecordColumn>,
+    columns: Vec<ValueColumn>,
 }
 
 /// A string column: order-preserving ranks into the batch's distinct strings,
@@ -96,55 +96,72 @@ impl StrBank {
     }
 }
 
-/// One column of a [`RecordSchema`], kept in the batch's own representation.
-pub enum RecordColumn {
+/// One column of a batch, in the representation the batch already holds it in.
+/// It is the element source for both an unnamed element list and a named
+/// record field, so every bank has an unboxed form in exactly one place --
+/// a per-bank asymmetry here is what let a string column cost 19.5 allocations
+/// per row while the int column cost 1.
+pub enum ValueColumn {
     /// Raw words, read through `bank`.
     Scalar { bank: ScalarBank, words: Arc<[i64]> },
     /// Ranks into an interned string table.
     Str(Arc<StrBank>),
-    /// Already-boxed values, for a bank with no unboxed representation.
-    Boxed(Arc<[Value]>),
 }
 
-/// How a [`RecordColumn::Scalar`]'s raw words decode.
+/// How a [`ValueColumn::Scalar`]'s raw words decode. One variant per bank a batch
+/// column can carry, so [`Column`] needs no boxed fallback.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ScalarBank {
     Int,
     UInt,
     Bool,
     Float,
+    /// Nanoseconds since the Unix epoch.
+    #[cfg(feature = "chrono")]
+    Timestamp,
+    /// Nanoseconds.
+    #[cfg(feature = "chrono")]
+    Duration,
 }
 
-impl RecordColumn {
-    fn value_at(&self, index: usize) -> Value {
+impl ValueColumn {
+    pub fn value_at(&self, index: usize) -> Value {
         match self {
-            RecordColumn::Scalar { bank, words } => {
+            ValueColumn::Scalar { bank, words } => {
                 let word = words[index];
                 match bank {
                     ScalarBank::Int => Value::Int(word),
                     ScalarBank::UInt => Value::UInt(word as u64),
                     ScalarBank::Bool => Value::Bool(word != 0),
                     ScalarBank::Float => Value::Float(f64::from_bits(word as u64)),
+                    #[cfg(feature = "chrono")]
+                    ScalarBank::Timestamp => Value::Timestamp(
+                        chrono::DateTime::from_timestamp_nanos(word).fixed_offset(),
+                    ),
+                    #[cfg(feature = "chrono")]
+                    ScalarBank::Duration => Value::Duration(chrono::Duration::nanoseconds(word)),
                 }
             }
-            RecordColumn::Str(bank) => bank.value_at(index),
-            RecordColumn::Boxed(values) => values[index].clone(),
+            ValueColumn::Str(bank) => bank.value_at(index),
         }
     }
 
-    fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         match self {
-            RecordColumn::Scalar { words, .. } => words.len(),
-            RecordColumn::Str(bank) => bank.len(),
-            RecordColumn::Boxed(values) => values.len(),
+            ValueColumn::Scalar { words, .. } => words.len(),
+            ValueColumn::Str(bank) => bank.len(),
         }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 
 impl RecordSchema {
     /// `keys` names one column of `columns`, and every column holds the same
     /// number of rows -- the two are what makes an index a whole record.
-    pub fn new(keys: Vec<Key>, columns: Vec<RecordColumn>) -> RecordSchema {
+    pub fn new(keys: Vec<Key>, columns: Vec<ValueColumn>) -> RecordSchema {
         assert_eq!(
             keys.len(),
             columns.len(),
@@ -163,7 +180,7 @@ impl RecordSchema {
 
     /// How many records the columns hold.
     pub fn rows(&self) -> usize {
-        self.columns.first().map_or(0, RecordColumn::len)
+        self.columns.first().map_or(0, ValueColumn::len)
     }
 
     pub fn keys(&self) -> &[Key] {
@@ -793,23 +810,11 @@ impl TryIntoValue for Value {
 pub enum ListStorage {
     /// Boxed elements, owned by this list.
     Object(Vec<Value>),
-    /// `backing[start .. start + len]`, unboxed, shared with every other row of
-    /// the same batch.
-    Int {
-        backing: Arc<[i64]>,
-        start: usize,
-        len: usize,
-    },
-    /// [`ListStorage::Int`] for the float bank.
-    Float {
-        backing: Arc<[f64]>,
-        start: usize,
-        len: usize,
-    },
-    /// `bank`'s strings `start .. start + len`. An element is a reference
-    /// count on an already-interned `Arc<String>`.
-    Str {
-        bank: Arc<StrBank>,
+    /// `column[start .. start + len]`, shared with every other row of the same
+    /// batch. The element is boxed on the way out, which for every bank but a
+    /// string is a `Value` that owns nothing.
+    Column {
+        column: Arc<ValueColumn>,
         start: usize,
         len: usize,
     },
@@ -827,10 +832,7 @@ impl ListStorage {
     pub fn len(&self) -> usize {
         match self {
             ListStorage::Object(v) => v.len(),
-            ListStorage::Int { len, .. }
-            | ListStorage::Float { len, .. }
-            | ListStorage::Str { len, .. }
-            | ListStorage::Record { len, .. } => *len,
+            ListStorage::Column { len, .. } | ListStorage::Record { len, .. } => *len,
         }
     }
 
@@ -842,22 +844,8 @@ impl ListStorage {
     pub fn get(&self, index: usize) -> Option<Value> {
         match self {
             ListStorage::Object(v) => v.get(index).cloned(),
-            ListStorage::Int {
-                backing,
-                start,
-                len,
-            } => (index < *len)
-                .then(|| backing.get(start + index).map(|&v| Value::Int(v)))
-                .flatten(),
-            ListStorage::Float {
-                backing,
-                start,
-                len,
-            } => (index < *len)
-                .then(|| backing.get(start + index).map(|&v| Value::Float(v)))
-                .flatten(),
-            ListStorage::Str { bank, start, len } => {
-                (index < *len).then(|| bank.value_at(start + index))
+            ListStorage::Column { column, start, len } => {
+                (index < *len).then(|| column.value_at(start + index))
             }
             ListStorage::Record { schema, start, len } => {
                 (index < *len).then(|| Value::Map(Map::record(schema.clone(), start + index)))
