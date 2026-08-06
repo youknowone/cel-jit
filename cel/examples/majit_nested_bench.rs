@@ -190,17 +190,25 @@ fn measure_at(
     let mut clean_times = Vec::with_capacity(rounds);
     let mut interp_times = Vec::with_capacity(rounds);
     let mut jit_times = Vec::with_capacity(rounds);
+    // Every timed run is UNWRAPPED. A refused batch returns early, so `.ok()`
+    // here would not report a failure as slow — it would report it as fast, and
+    // the ladder would read as if the tier had got better.
+    let run = |tier| {
+        bound
+            .sum_on(tier)
+            .unwrap_or_else(|e| panic!("{label} @{rows}: {tier:?}: {e}"))
+    };
     for _ in 0..rounds {
         let start = Instant::now();
-        black_box(bound.sum_on(Tier::Clean).ok());
+        black_box(run(Tier::Clean));
         clean_times.push(start.elapsed());
 
         let start = Instant::now();
-        black_box(bound.sum_on(Tier::Interpreter).ok());
+        black_box(run(Tier::Interpreter));
         interp_times.push(start.elapsed());
 
         let start = Instant::now();
-        black_box(bound.sum_on(Tier::Jit).ok());
+        black_box(run(Tier::Jit));
         jit_times.push(start.elapsed());
     }
 
@@ -270,8 +278,10 @@ fn tree_walker_ns_per_eval(
         let mut observed = 0usize;
         for i in 0..TREE_EVALS {
             let context = black_box(&contexts[i % pool]);
-            observed ^=
-                matches!(black_box(program).execute(context), Ok(Value::Bool(true))) as usize;
+            let v = black_box(program)
+                .execute(context)
+                .expect("tree-walk failed inside the timed region");
+            observed ^= matches!(v, Value::Bool(true)) as usize;
         }
         black_box(observed);
         times.push(start.elapsed());

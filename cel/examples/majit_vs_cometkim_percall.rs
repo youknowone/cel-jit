@@ -445,7 +445,18 @@ fn run_case(case: &Case) -> Row {
         case.label
     );
 
-    let stock = per_call(|| program.execute(black_box(&activation)));
+    // Nothing timed in this file may DISCARD a `Result`. A refused evaluation
+    // returns early, so a swallowed error is not a slow number, it is a fast
+    // one — which is exactly what cometkim's own benchmark reports: his
+    // `b.iter(|| black_box(compiled.execute(&ctx)))` never unwraps, and his
+    // backend answers `items.filter(..).map(..)` with
+    // `UndeclaredReference("@result")`, so all four `comprehension_scaling`
+    // rows time a failure and print it as a two-fold speedup.
+    let stock = per_call(|| {
+        program
+            .execute(black_box(&activation))
+            .unwrap_or_else(|e| panic!("{}: stock execute: {e:?}", case.label))
+    });
 
     let lowered = match BatchProgram::from_program(&program, &schema) {
         Ok(bp) => bp,
@@ -507,9 +518,18 @@ fn run_case(case: &Case) -> Row {
     let guard_fails =
         (GUARD_FAILS.load(Ordering::Relaxed) - g0) as f64 / SETTLED as f64;
 
-    let clean = per_call(|| bound.collect_on(Tier::Clean));
-    let majit = per_call(|| bound.collect_on(Tier::Jit));
-    let raw = per_call(|| bound.collect_raw_on(Tier::Jit, consume_raw));
+    let collect = |tier| {
+        bound
+            .collect_on(tier)
+            .unwrap_or_else(|e| panic!("{}: {tier:?}: {e}", case.label))
+    };
+    let clean = per_call(|| collect(Tier::Clean));
+    let majit = per_call(|| collect(Tier::Jit));
+    let raw = per_call(|| {
+        bound
+            .collect_raw_on(Tier::Jit, consume_raw)
+            .unwrap_or_else(|e| panic!("{}: raw: {e}", case.label))
+    });
     let bind = per_call(|| {
         lowered
             .bind_per_row(&batch)

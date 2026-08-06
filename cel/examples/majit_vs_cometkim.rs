@@ -526,7 +526,7 @@ fn run_case(case: &Case) -> Row {
         Err(why) => {
             return Row {
                 label: case.label,
-                stock: best(time_stock(&program, &contexts)),
+                stock: best(time_stock(&program, &contexts, case.label)),
                 batch: Err(why),
             }
         }
@@ -581,13 +581,20 @@ fn run_case(case: &Case) -> Row {
     let mut raw_clean = Vec::with_capacity(ROUNDS);
     let mut raw_jit = Vec::with_capacity(ROUNDS);
     for _ in 0..ROUNDS {
-        stock.push(time_one_stock(&program, &contexts));
+        stock.push(time_one_stock(&program, &contexts, case.label));
+        // Nothing timed here may DISCARD a `Result`. A refused run returns
+        // immediately, so a swallowed error is not a slow number, it is a fast
+        // one — the same failure mode that puts a two-fold speedup on
+        // cometkim's own `comprehension_scaling` rows, where the compiled side
+        // returns `UndeclaredReference("@result")` and his `b.iter` never
+        // unwraps it.
         let run = |tier| {
             if per_row {
                 bound.collect_on(tier).map(|_| ())
             } else {
                 bound.sum_on(tier).map(|_| ())
             }
+            .unwrap_or_else(|e| panic!("{}: {tier:?}: {e}", case.label))
         };
         clean.push(time_ns_per_row(|| run(Tier::Clean)));
         jit.push(time_ns_per_row(|| run(Tier::Jit)));
@@ -595,7 +602,11 @@ fn run_case(case: &Case) -> Row {
         // returns one `Value` for the whole batch, so there is nothing for the
         // raw door to take away.
         if per_row {
-            let raw = |tier| bound.collect_raw_on(tier, consume_raw);
+            let raw = |tier| {
+                bound
+                    .collect_raw_on(tier, consume_raw)
+                    .unwrap_or_else(|e| panic!("{}: {tier:?} raw: {e}", case.label))
+            };
             raw_clean.push(time_ns_per_row(|| raw(Tier::Clean)));
             raw_jit.push(time_ns_per_row(|| raw(Tier::Jit)));
         }
@@ -614,19 +625,25 @@ fn run_case(case: &Case) -> Row {
 }
 
 /// One timed pass of the tree-walker over every prebuilt activation.
-fn time_one_stock(program: &Program, contexts: &[Context]) -> f64 {
+///
+/// The row is UNWRAPPED, not tested for `is_ok`: a raise leaves the walker
+/// early, so tolerating one here would report a batch that failed as a batch
+/// that was fast.
+fn time_one_stock(program: &Program, contexts: &[Context], label: &str) -> f64 {
     time_ns_per_row(|| {
         let mut sink = 0usize;
         for ctx in contexts {
-            sink ^= black_box(program.execute(black_box(ctx)).is_ok()) as usize;
+            let v = black_box(program.execute(black_box(ctx)))
+                .unwrap_or_else(|e| panic!("{label}: stock execute: {e:?}"));
+            sink ^= matches!(v, Value::Bool(true)) as usize;
         }
         sink
     })
 }
 
-fn time_stock(program: &Program, contexts: &[Context]) -> Vec<f64> {
+fn time_stock(program: &Program, contexts: &[Context], label: &str) -> Vec<f64> {
     (0..ROUNDS)
-        .map(|_| time_one_stock(program, contexts))
+        .map(|_| time_one_stock(program, contexts, label))
         .collect()
 }
 
