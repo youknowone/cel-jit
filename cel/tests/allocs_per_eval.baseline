@@ -1,0 +1,85 @@
+# cel — allocations per evaluation. Produced by `tests/allocs_per_eval.rs`.
+#
+# ⚠ THIS FILE IS PER-HOST AND PER-BUILD. It is NOT an absolute contract, and
+#   the test does NOT fail when a row differs from it. Run with
+#   `CEL_ALLOCS_GATE=1` to make a drift fatal — do that in a re-measurement of
+#   ONE change on ONE machine, never as a default CI gate. A row measured under
+#   a different `profile`/`features` pair than the one recorded below is not
+#   comparable to it at all, and the report says so.
+#
+# Bless with `CEL_ALLOCS_BLESS=1 cargo test -p cel --features jit-cranelift \
+#     --test allocs_per_eval`.
+#
+# `regvm/*` rows exist only when a `jit` backend feature is on. A run without
+# one reports them as not measured rather than as zero.
+#
+# Format: <label> TAB <allocations per evaluation>
+#! profile = dev
+#! features = regex,chrono,jit
+#! host = aarch64-macos
+#! rounds = 3
+
+probe/nothing	0.000
+probe/one-box-per-eval	1.000
+probe/other-thread-allocating	0.000
+walker/simple_arithmetic	4.000
+walker/comparison	4.000
+walker/conditional	2.000
+walker/nested_expression	7.000
+walker/variable_access/hashmap	0.000
+walker/variable_access/resolver	1.000
+walker/member_access	10.000
+walker/list_indexing	2.000
+walker/list_filter	59.000
+walker/list_map	37.000
+walker/all_comprehension	36.000
+walker/exists_comprehension	33.000
+walker/map_list_scaling/1	14.000
+walker/map_list_scaling/10	43.000
+walker/map_list_scaling/100	316.000
+walker/map_list_scaling/1000	3019.000
+walker/map_list_scaling/10000	30023.000
+walker/filter_list_scaling/1	16.000
+walker/filter_list_scaling/10	52.000
+walker/filter_list_scaling/100	415.000
+walker/filter_list_scaling/1000	4018.000
+walker/filter_list_scaling/10000	40022.000
+walker/comprehension_scaling/10	77.000
+walker/comprehension_scaling/50	301.000
+walker/comprehension_scaling/100	578.000
+walker/comprehension_scaling/500	2782.000
+walker/string_operations	8.000
+walker/custom_function	5.000
+walker/real_world_policy	33.000
+bind/clone-only/1	0.000
+bind/list-to-context/1	4.000
+bind/clone-only/10	0.000
+bind/list-to-context/10	12.000
+bind/clone-only/100	0.000
+bind/list-to-context/100	102.000
+bind/clone-only/1000	0.000
+bind/list-to-context/1000	1002.000
+comprehension/bind+exec/map/10	55.000
+comprehension/bind+exec/filter/10	64.000
+comprehension/bind+exec/chained/10	89.000
+comprehension/bind+exec/all/10	58.000
+comprehension/bind+exec/exists/10	40.000
+comprehension/bind+exec/size/10	55.000
+comprehension/bind+exec/map/100	418.000
+comprehension/bind+exec/filter/100	517.000
+comprehension/bind+exec/chained/100	680.000
+comprehension/bind+exec/all/100	508.000
+comprehension/bind+exec/exists/100	130.000
+comprehension/bind+exec/size/100	418.000
+regvm/clean/arith/n=1	1.000
+regvm/jit/arith/n=1	1.000
+regvm/clean/arith/n=1000	1.000
+regvm/jit/arith/n=1000	66.000
+regvm/clean/policy/n=1	1.000
+regvm/jit/policy/n=1	1.000
+regvm/clean/policy/n=1000	1.000
+regvm/jit/policy/n=1000	66.000
+regvm/clean/float/n=1	2.000
+regvm/jit/float/n=1	2.000
+regvm/clean/float/n=1000	2.000
+regvm/jit/float/n=1000	68.000

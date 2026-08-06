@@ -51,6 +51,16 @@ dhat = { version = "0.3.3" }
 name = "runtime"
 harness = false
 
+# The P0.a allocation instrument. `harness = false` is load-bearing, not style:
+# it installs a `#[global_allocator]`, and the default libtest runner is
+# multi-threaded, so a process-global counter would race across concurrently
+# running tests. `--test-threads=1` cannot be spelled in a manifest, so owning
+# `main` is the only way a plain `cargo test` is correct by construction. The
+# counter it reports is thread-local as well; see the file header.
+[[test]]
+name = "allocs_per_eval"
+harness = false
+
 [[example]]
 name = "majit_ab"
 required-features = ["jit"]
