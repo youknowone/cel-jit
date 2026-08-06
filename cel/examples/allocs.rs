@@ -189,6 +189,92 @@ fn main() {
     );
 
     record_list();
+    string_column();
+}
+
+/// A STRING result, scalar and inside a list. `decode` turns a rank into
+/// `Value::String(Arc::new(distinct[rank].clone()))`, which is a `String` and
+/// an `Arc` per value even though the batch holds only a handful of distinct
+/// strings -- the whole point of the rank encoding.
+fn string_column() {
+    const LIST_LEN: i64 = 10;
+    // Few distinct strings, many rows: the shape the rank encoding is for.
+    let names: Vec<String> = (0..ROWS).map(|k| format!("name-{}", k % 8)).collect();
+    let schema: Schema = [("name".to_string(), ValType::Str)].into_iter().collect();
+    let program = BatchProgram::compile("name", &schema).unwrap_or_else(|e| panic!("lower: {e:?}"));
+    let batch = Batch::new(ROWS).column("name", ColumnRef::Str(&names));
+    let bound = program.bind_per_row(&batch).expect("bind");
+    let _ = bound.collect_on(Tier::Jit).expect("warmup");
+
+    println!(
+        "\n-- scalar string result, {} distinct over {ROWS} rows --",
+        8
+    );
+
+    reset();
+    let boxed = bound.collect_on(Tier::Jit).expect("collect");
+    let (a_boxed, b_boxed) = read();
+    assert_eq!(boxed.len(), ROWS);
+    drop(boxed);
+    println!(
+        "{:<28} {:>10.3} {:>10.1} {:>12} {:>12}",
+        "collect_on (boxed)",
+        a_boxed as f64 / ROWS as f64,
+        b_boxed as f64 / ROWS as f64,
+        a_boxed,
+        b_boxed
+    );
+
+    // The same bank inside a list, which takes the scalar arm of `to_values`
+    // and so has no unboxed strategy today.
+    let lens: Vec<i64> = vec![LIST_LEN; ROWS];
+    let elems: Vec<String> = (0..ROWS as i64 * LIST_LEN)
+        .map(|k| format!("name-{}", k % 8))
+        .collect();
+    let schema: Schema = [("tags[]".to_string(), ValType::Str)].into_iter().collect();
+    let program = match BatchProgram::compile("tags.filter(t, t != \"name-0\")", &schema) {
+        Ok(p) => p,
+        Err(e) => {
+            println!("\n-- string list -- NOT LOWERABLE: {e:?}");
+            return;
+        }
+    };
+    let batch = Batch::new(ROWS).column(
+        "tags",
+        ColumnRef::List {
+            lens: &lens,
+            fields: vec![(None, ColumnRef::Str(&elems))],
+        },
+    );
+    let bound = program.bind_per_row(&batch).expect("bind");
+    let _ = bound.collect_on(Tier::Jit).expect("warmup");
+
+    println!("\n-- string list, {LIST_LEN} elements per row --");
+
+    reset();
+    let boxed = bound.collect_on(Tier::Jit).expect("collect");
+    let (a_boxed, b_boxed) = read();
+    assert_eq!(boxed.len(), ROWS);
+
+    reset();
+    let checksum = boxed.len();
+    let (a_walk, b_walk) = read();
+    assert_ne!(checksum, 0);
+    drop(boxed);
+
+    for (label, a, b) in [
+        ("collect_on (boxed)", a_boxed, b_boxed),
+        ("+ walk every element", a_walk, b_walk),
+    ] {
+        println!(
+            "{:<28} {:>10.3} {:>10.1} {:>12} {:>12}",
+            label,
+            a as f64 / ROWS as f64,
+            b as f64 / ROWS as f64,
+            a,
+            b
+        );
+    }
 }
 
 /// The other shape `to_values` decodes: a list of RECORDS, which

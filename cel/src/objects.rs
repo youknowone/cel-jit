@@ -69,10 +69,39 @@ pub struct RecordSchema {
     columns: Vec<RecordColumn>,
 }
 
+/// A string column: order-preserving ranks into the batch's distinct strings,
+/// which are interned once so a value costs a reference count. The rank
+/// encoding exists so a string column compares as an integer, and rebuilding
+/// the `String` per value gave that back.
+pub struct StrBank {
+    codes: Arc<[i64]>,
+    interned: Arc<[Arc<String>]>,
+}
+
+impl StrBank {
+    pub fn new(codes: Arc<[i64]>, interned: Arc<[Arc<String>]>) -> StrBank {
+        StrBank { codes, interned }
+    }
+
+    pub fn len(&self) -> usize {
+        self.codes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.codes.is_empty()
+    }
+
+    fn value_at(&self, index: usize) -> Value {
+        Value::String(self.interned[self.codes[index] as usize].clone())
+    }
+}
+
 /// One column of a [`RecordSchema`], kept in the batch's own representation.
 pub enum RecordColumn {
     /// Raw words, read through `bank`.
     Scalar { bank: ScalarBank, words: Arc<[i64]> },
+    /// Ranks into an interned string table.
+    Str(Arc<StrBank>),
     /// Already-boxed values, for a bank with no unboxed representation.
     Boxed(Arc<[Value]>),
 }
@@ -98,6 +127,7 @@ impl RecordColumn {
                     ScalarBank::Float => Value::Float(f64::from_bits(word as u64)),
                 }
             }
+            RecordColumn::Str(bank) => bank.value_at(index),
             RecordColumn::Boxed(values) => values[index].clone(),
         }
     }
@@ -105,6 +135,7 @@ impl RecordColumn {
     fn len(&self) -> usize {
         match self {
             RecordColumn::Scalar { words, .. } => words.len(),
+            RecordColumn::Str(bank) => bank.len(),
             RecordColumn::Boxed(values) => values.len(),
         }
     }
@@ -775,6 +806,13 @@ pub enum ListStorage {
         start: usize,
         len: usize,
     },
+    /// `bank`'s strings `start .. start + len`. An element is a reference
+    /// count on an already-interned `Arc<String>`.
+    Str {
+        bank: Arc<StrBank>,
+        start: usize,
+        len: usize,
+    },
     /// `schema`'s records `start .. start + len`, shared with every other row
     /// of the same batch. An element is a [`Map::record`], which costs a
     /// reference count and no allocation.
@@ -791,6 +829,7 @@ impl ListStorage {
             ListStorage::Object(v) => v.len(),
             ListStorage::Int { len, .. }
             | ListStorage::Float { len, .. }
+            | ListStorage::Str { len, .. }
             | ListStorage::Record { len, .. } => *len,
         }
     }
@@ -817,6 +856,9 @@ impl ListStorage {
             } => (index < *len)
                 .then(|| backing.get(start + index).map(|&v| Value::Float(v)))
                 .flatten(),
+            ListStorage::Str { bank, start, len } => {
+                (index < *len).then(|| bank.value_at(start + index))
+            }
             ListStorage::Record { schema, start, len } => {
                 (index < *len).then(|| Value::Map(Map::record(schema.clone(), start + index)))
             }

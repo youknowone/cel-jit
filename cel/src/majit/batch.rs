@@ -68,7 +68,7 @@ use super::lower::{
     size_slot_source, string_slot_source, BatchReduce, ConcatSide, LoweredF, Schema, SlotKind,
     ValType,
 };
-use crate::objects::{Key, ListStorage, RecordColumn, RecordSchema, ScalarBank};
+use crate::objects::{Key, ListStorage, RecordColumn, RecordSchema, ScalarBank, StrBank};
 use crate::{Context, Program, Value};
 
 /// Trace threshold [`Tier::Jit`] runs at: the batch loop compiles after this
@@ -1076,7 +1076,10 @@ impl RawOutput<'_> {
                 ty,
                 values,
                 distinct,
-            } => values.iter().map(|&v| decode(*ty, v, distinct)).collect(),
+            } => {
+                let interned = intern(distinct);
+                values.iter().map(|&v| decode(*ty, v, &interned)).collect()
+            }
             RawOutput::List {
                 lens,
                 fields,
@@ -1084,6 +1087,10 @@ impl RawOutput<'_> {
             } => {
                 let mut at = 0usize;
                 let mut rows = Vec::with_capacity(lens.len());
+                // The distinct strings are interned once for the whole output.
+                // Free when the output has none: an empty `Arc<[_]>` does not
+                // allocate, and no arm below reads it.
+                let interned = intern(distinct);
                 // The field shape is a property of the output, not of a row or
                 // an element, so it is decided once here. Matching it inside
                 // the element loop re-dispatched it per element.
@@ -1139,6 +1146,26 @@ impl RawOutput<'_> {
                             at += len;
                         }
                     }
+                    // A list of strings: the elements are ranks into the
+                    // output's interned table, so an element is a reference
+                    // count on an `Arc<String>` that already exists.
+                    [(None, ValType::Str, buf)] => {
+                        let bank = Arc::new(StrBank::new(Arc::from(*buf), Arc::clone(&interned)));
+                        for &count in *lens {
+                            let len = count.max(0) as usize;
+                            assert!(
+                                at + len <= bank.len(),
+                                "row length {len} at {at} runs past the {} element buffer",
+                                bank.len()
+                            );
+                            rows.push(Value::list(ListStorage::Str {
+                                bank: Arc::clone(&bank),
+                                start: at,
+                                len,
+                            }));
+                            at += len;
+                        }
+                    }
                     // A list of scalars in a bank with no unboxed strategy: the
                     // element IS the value, but it still has to be boxed.
                     [(None, ty, buf)] => {
@@ -1147,7 +1174,7 @@ impl RawOutput<'_> {
                             let count = count.max(0) as usize;
                             let items = buf[at..at + count]
                                 .iter()
-                                .map(|&v| decode(ty, v, distinct))
+                                .map(|&v| decode(ty, v, &interned))
                                 .collect::<Vec<_>>();
                             rows.push(Value::list(items));
                             at += count;
@@ -1168,7 +1195,7 @@ impl RawOutput<'_> {
                             .collect();
                         let columns = fields
                             .iter()
-                            .map(|(_, ty, buf)| record_column(*ty, buf, distinct))
+                            .map(|(_, ty, buf)| record_column(*ty, buf, &interned))
                             .collect();
                         let schema = Arc::new(RecordSchema::new(keys, columns));
                         for &count in *lens {
@@ -1196,14 +1223,20 @@ impl RawOutput<'_> {
 /// The column a record field becomes: the batch's own words when the bank has
 /// an unboxed representation, and otherwise the boxed values decoded ONCE for
 /// the whole output rather than once per element.
-fn record_column(bank: ValType, words: &[i64], distinct: &[String]) -> RecordColumn {
+fn record_column(bank: ValType, words: &[i64], interned: &Arc<[Arc<String>]>) -> RecordColumn {
     let bank = match bank {
         ValType::Int => ScalarBank::Int,
         ValType::UInt => ScalarBank::UInt,
         ValType::Bool => ScalarBank::Bool,
         ValType::Float => ScalarBank::Float,
+        ValType::Str => {
+            return RecordColumn::Str(Arc::new(StrBank::new(
+                Arc::from(words),
+                Arc::clone(interned),
+            )))
+        }
         other => {
-            return RecordColumn::Boxed(words.iter().map(|&v| decode(other, v, distinct)).collect())
+            return RecordColumn::Boxed(words.iter().map(|&v| decode(other, v, interned)).collect())
         }
     };
     RecordColumn::Scalar {
@@ -1212,13 +1245,20 @@ fn record_column(bank: ValType, words: &[i64], distinct: &[String]) -> RecordCol
     }
 }
 
-fn decode(bank: ValType, v: i64, distinct: &[String]) -> Value {
+/// The batch's distinct strings, interned once per output. A `Value::String`
+/// is then a reference count rather than a fresh `String` and `Arc` per value,
+/// which is what the rank encoding exists to make possible.
+fn intern(distinct: &[String]) -> Arc<[Arc<String>]> {
+    distinct.iter().map(|s| Arc::new(s.clone())).collect()
+}
+
+fn decode(bank: ValType, v: i64, interned: &[Arc<String>]) -> Value {
     match bank {
         ValType::Int => Value::Int(v),
         ValType::UInt => Value::UInt(v as u64),
         ValType::Bool => Value::Bool(v != 0),
         ValType::Float => Value::Float(f64::from_bits(v as u64)),
-        ValType::Str => Value::String(std::sync::Arc::new(distinct[v as usize].clone())),
+        ValType::Str => Value::String(interned[v as usize].clone()),
         ValType::Timestamp => {
             Value::Timestamp(chrono::DateTime::from_timestamp_nanos(v).fixed_offset())
         }
@@ -1568,6 +1608,113 @@ mod tests {
                     (Key::String(Arc::new("qty".to_string())), Value::Int(1)),
                 ],
                 "{tier:?}"
+            );
+        }
+    }
+
+    /// A string element list. The elements are ranks into the output's
+    /// interned table, so two equal strings must come back as the SAME `Arc` —
+    /// which is the property the rank encoding is there to preserve and the
+    /// one an equality check alone would not catch.
+    #[test]
+    fn a_string_list_collected_as_values_shares_one_arc_per_distinct_string() {
+        let s = schema(&[("tags[]", ValType::Str)]);
+        let lens = vec![3i64, 1];
+        let tags: Vec<String> = ["a", "b", "a", "c"].iter().map(|t| t.to_string()).collect();
+        let text = |t: &str| Value::String(Arc::new(t.to_string()));
+        let expect = vec![
+            Value::list(vec![text("a"), text("a")]),
+            Value::list(vec![text("c")]),
+        ];
+
+        let program = BatchProgram::compile("tags.filter(t, t != \"b\")", &s).unwrap();
+        for tier in [Tier::Clean, Tier::Interpreter, Tier::Jit] {
+            let batch = Batch::new(lens.len()).column(
+                "tags",
+                ColumnRef::List {
+                    lens: &lens,
+                    fields: vec![(None, ColumnRef::Str(&tags))],
+                },
+            );
+            let rows = program
+                .bind_per_row(&batch)
+                .unwrap()
+                .collect_on(tier)
+                .unwrap();
+            assert_eq!(rows, expect, "{tier:?}");
+
+            let Value::List(items) = &rows[0] else {
+                panic!("{tier:?}: row 0 is not a list")
+            };
+            let (Some(Value::String(first)), Some(Value::String(second))) =
+                (items.get(0), items.get(1))
+            else {
+                panic!("{tier:?}: the elements are not strings")
+            };
+            assert!(
+                Arc::ptr_eq(&first, &second),
+                "{tier:?}: two equal strings are not the same interned Arc"
+            );
+        }
+    }
+
+    /// A record whose field is a string: the column is ranks into the same
+    /// interned table, read back through the map accessors.
+    #[test]
+    fn a_record_lists_string_field_reads_back_from_the_interned_table() {
+        use crate::objects::KeyRef;
+
+        let s = schema(&[
+            ("items[].name", ValType::Str),
+            ("items[].price", ValType::Int),
+        ]);
+        let lens = vec![2i64, 1];
+        let name: Vec<String> = ["x", "y", "x"].iter().map(|t| t.to_string()).collect();
+        let price = vec![10i64, 3, 7];
+
+        let program = BatchProgram::compile("items.filter(i, i.price > 5)", &s).unwrap();
+        for tier in [Tier::Clean, Tier::Interpreter, Tier::Jit] {
+            let batch = Batch::new(lens.len()).column(
+                "items",
+                ColumnRef::List {
+                    lens: &lens,
+                    fields: vec![
+                        (Some("name"), ColumnRef::Str(&name)),
+                        (Some("price"), ColumnRef::Int(&price)),
+                    ],
+                },
+            );
+            let rows = program
+                .bind_per_row(&batch)
+                .unwrap()
+                .collect_on(tier)
+                .unwrap();
+
+            // Rows 0 and 1 each admit one element, and both name the same
+            // string, so the two reads must land on one interned `Arc`.
+            let mut names = Vec::new();
+            for (row, want_price) in rows.iter().zip([10i64, 7]) {
+                let Value::List(items) = row else {
+                    panic!("{tier:?}: not a list")
+                };
+                let Some(Value::Map(record)) = items.get(0) else {
+                    panic!("{tier:?}: the element is not a map")
+                };
+                assert_eq!(
+                    *record.get(&KeyRef::String("price")).unwrap(),
+                    Value::Int(want_price),
+                    "{tier:?}"
+                );
+                let Value::String(got) = record.get(&KeyRef::String("name")).unwrap().into_owned()
+                else {
+                    panic!("{tier:?}: the name field is not a string")
+                };
+                assert_eq!(*got, "x", "{tier:?}");
+                names.push(got);
+            }
+            assert!(
+                Arc::ptr_eq(&names[0], &names[1]),
+                "{tier:?}: the same string in two rows is not the same interned Arc"
             );
         }
     }
