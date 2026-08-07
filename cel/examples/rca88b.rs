@@ -1645,8 +1645,8 @@ fn long_horizon(label: &str, lowered: &LoweredF) {
 fn small_n_constant(label: &str, lowered: &LoweredF) {
     println!("\nProbe N — {label}: test the per-call constant where it is not negligible");
     println!(
-        "  {:>4} {:>9} {:>7} {:>9} {:>9} {:>10} {:>6} {:>6} {:>7}",
-        "n", "portal", "brdg@", "pre", "post", "post pred", "loops", "brdg", "entry?"
+        "  {:>4} {:>9} {:>7} {:>9} {:>9} {:>9} {:>10} {:>6} {:>6} {:>7}",
+        "n", "portal", "brdg@", "early", "pre", "post", "post pred", "loops", "brdg", "entry?"
     );
 
     const CALLS: usize = 700;
@@ -1688,13 +1688,17 @@ fn small_n_constant(label: &str, lowered: &LoweredF) {
             f64::NAN
         };
         let post = mean(CALLS - 20..CALLS);
+        // Well after the loop compiles (threshold is 8 back edges) and well
+        // before any bridge. At n=2 there is no `pre` window to read, because
+        // no bridge is ever compiled — this is the only view of that arm.
+        let early = mean(20..40);
         // The cranelift/dynasm slopes differ, so predict with whichever this
         // binary was built against rather than hard-coding one backend.
         let slope = if cfg!(feature = "jit-cranelift") { 23.0 } else { 20.0 };
         let pred = slope * (n as f64 - 1.0) + 4.0;
 
         println!(
-            "  {n:>4} {portal:>9} {brdg_at:>7} {pre:>9.1} {post:>9.1} {pred:>10.1} {:>6} {:>6} \
+            "  {n:>4} {portal:>9} {brdg_at:>7} {early:>9.1} {pre:>9.1} {post:>9.1} {pred:>10.1} {:>6} {:>6} \
              {:>7}",
             s.loops_compiled,
             s.bridges_compiled,
