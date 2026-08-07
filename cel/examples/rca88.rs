@@ -222,6 +222,15 @@ fn main() {
     .collect();
     let flat = lower("price >= 100 && qty < 50", &flat_schema);
     ratio_vs_n("flat price >= 100 && qty < 50", &flat, 0, true);
+
+    // #88's own `a + b * 2` probe, on the n axis. It is the same shape CLASS as
+    // the predicate above — straight-line body inside the row loop, one compiled
+    // loop — but a pure-arithmetic body, so a wall here cannot be blamed on the
+    // comparisons or the logical-and. It is the shape that reported
+    // `gfails/call == 0.00` at rows=64, i.e. the case the terminal-loop-exit
+    // hypothesis predicts should have NO wall.
+    let arith = lower("price + qty * 2", &flat_schema);
+    ratio_vs_n("arith price + qty * 2", &arith, 0, true);
     println!("load after ratio_vs_n:  {}", loadavg());
 }
 
@@ -387,8 +396,15 @@ fn cold_vs_warm(lowered: &LoweredF) {
 /// terminal loop exit — the `+1` in `guard_failures = trace_eagerness *
 /// bridges + 1`. If so, the wall should track `gfails/call`.
 ///
-/// RESULT — that hypothesis is REFUTED, by anti-correlation rather than by a
-/// null. Over four runs (both backends, two rounds each, host load 20-80):
+/// RESULT — that hypothesis is REFUTED twice over.
+///
+/// (1) By its own falsifiable prediction. The hypothesis predicts that the
+/// `a + b * 2` shape, which reports `gfails/call == 0.00`, has no wall. It has
+/// one: `price + qty * 2` at n=10 measures **25.30x (cranelift) / 25.08x
+/// (dynasm)** with `gfails/call == 0.00` on both. Within 1% of each other.
+///
+/// (2) By anti-correlation rather than by a null. Over four runs (both
+/// backends, two rounds each, host load 20-80):
 /// `gfails/call` reads 0.00 at n = 10/100/1000, which is exactly where the
 /// wall is (warm ratio 22-57x at n=10), and reads 1.00 at n = 10000/100000,
 /// which is exactly where the wall is gone (warm ratio 0.05-0.18, the JIT
@@ -406,6 +422,21 @@ fn cold_vs_warm(lowered: &LoweredF) {
 ///   Those two columns exist only to close that alternative;
 /// - break-even is n ~= 330-500 rows (flat) and n ~= 65-115 rows (nested).
 ///
+/// THE FLOOR CHECK, and why the small-n end is the contamination-prone one: a
+/// timer or setup floor added to BOTH arms drags the ratio toward 1.0, so it
+/// would HIDE this blow-up rather than manufacture it. Two guards:
+/// - `reps` sizes each timed sample (2000 calls at n=10); the smallest timed
+///   region in the table is ~20 µs against a ~40 ns `Instant` granularity.
+/// - `clean ns/el` is the tell. On the nested shape it reads 11.46 / 10.68 /
+///   10.20 / 10.45 / 10.28 (cranelift) — flat within 12% across a 10 000x
+///   range in n, so the clean arm is still measuring row work at n=10. The two
+///   single-loop shapes instead show ~17.6-19.7 at n=10 against a ~8-9
+///   plateau, i.e. the CLEAN tier has its own ~95 ns per-call constant.
+///
+/// That constant is shared by both arms, so correcting for it makes the wall
+/// LARGER, not smaller: at arith n=10, `(4452.8 - 95) / (176.0 - 95)` = 53.8x
+/// against the 25.3x reported. Every ratio here is a lower bound.
+///
 /// The residual: at n=10 nested, 62 µs/call buys 80 elements of work that the
 /// clean tier does in 1.2 µs, with zero compiles, zero aborts, zero guard
 /// failures and (per the allocation sweep above) zero allocations. Every
@@ -415,7 +446,7 @@ fn cold_vs_warm(lowered: &LoweredF) {
 fn ratio_vs_n(label: &str, lowered: &LoweredF, per_row: i64, flat: bool) {
     println!("\n{label}: jit/clean vs n (per_row={per_row}), min of interleaved rounds");
     println!(
-        "{:>8} {:>10} {:>10} {:>11} {:>11} {:>7} {:>7} {:>11} {:>11} {:>11}",
+        "{:>8} {:>10} {:>10} {:>11} {:>11} {:>7} {:>7} {:>11} {:>11} {:>11} {:>11} {:>6}",
         "n",
         "cold ratio",
         "warm ratio",
@@ -425,7 +456,9 @@ fn ratio_vs_n(label: &str, lowered: &LoweredF, per_row: i64, flat: bool) {
         "guard",
         "gfails/call",
         "loops/call",
-        "aborts/call"
+        "aborts/call",
+        "clean ns/el",
+        "reps"
     );
 
     for n in [10usize, 100, 1_000, 10_000, 100_000] {
@@ -507,9 +540,17 @@ fn ratio_vs_n(label: &str, lowered: &LoweredF, per_row: i64, flat: bool) {
             best_cold = best_cold.min(t.elapsed().as_nanos() as f64);
         }
 
+        // The floor check. A timer/setup floor added to BOTH arms drags the
+        // ratio toward 1.0 and would HIDE the blow-up, so the small-n end is
+        // the most contamination-prone, not the least. `clean ns/el` is the
+        // tell: if it stays in the same range as at large n, the clean arm is
+        // still measuring row work rather than the harness. `reps` is the
+        // inner repetition count each timed sample covers, reported so the
+        // reader can size the timed region instead of trusting it.
+        let elems_per_call = if flat { n } else { n * per_row as usize };
         println!(
             "{n:>8} {:>10.2} {:>10.3} {best_clean:>11.1} {best_warm:>11.1} {:>7} {:>7} \
-             {:>11.2} {:>11.2} {:>11.2}",
+             {:>11.2} {:>11.2} {:>11.2} {:>11.2} {reps:>6}",
             best_cold / best_cold_clean,
             best_warm / best_clean,
             compiled.loops_compiled,
@@ -517,6 +558,7 @@ fn ratio_vs_n(label: &str, lowered: &LoweredF, per_row: i64, flat: bool) {
             per_call,
             loops_per_call,
             aborts_per_call,
+            best_clean / elems_per_call as f64,
         );
     }
 }
