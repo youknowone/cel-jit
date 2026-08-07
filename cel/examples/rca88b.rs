@@ -114,29 +114,43 @@ use cel::majit::bytecode::{clean_batch_sum_f, eval_batch_sum_f, Column};
 use cel::majit::lower::{lower_typed, LoweredF, Schema, ValType};
 use cel::Program;
 
+/// Allocations of exactly `s` bytes land in bucket `s`; anything larger lands in
+/// bucket 0. A `HashMap` keyed by size would allocate from inside the allocator,
+/// so this is a flat array of `Cell` and never allocates at all.
+const SIZE_MAX_EXACT: usize = 1024;
+const SIZE_BUCKETS: usize = SIZE_MAX_EXACT + 1;
+
 std::thread_local! {
     static LOCAL_ALLOCS: Cell<u64> = const { Cell::new(0) };
+    /// Off by default: every probe that reports ns/call would otherwise pay for
+    /// the histogram, and the timing probes are the ones already at issue.
+    static SIZES_ON: Cell<bool> = const { Cell::new(false) };
+    static LOCAL_SIZES: [Cell<u64>; SIZE_BUCKETS] = [const { Cell::new(0) }; SIZE_BUCKETS];
 }
 static GLOBAL_ALLOCS: AtomicU64 = AtomicU64::new(0);
 
 struct Counting;
 
 #[inline]
-fn bump() {
+fn bump(size: usize) {
     GLOBAL_ALLOCS.fetch_add(1, Ordering::Relaxed);
     let _ = LOCAL_ALLOCS.try_with(|c| c.set(c.get() + 1));
+    if SIZES_ON.try_with(Cell::get).unwrap_or(false) {
+        let idx = if size > SIZE_MAX_EXACT { 0 } else { size };
+        let _ = LOCAL_SIZES.try_with(|h| h[idx].set(h[idx].get() + 1));
+    }
 }
 
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        bump();
+        bump(layout.size());
         unsafe { System.alloc(layout) }
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         unsafe { System.dealloc(ptr, layout) }
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        bump();
+        bump(new_size);
         unsafe { System.realloc(ptr, layout, new_size) }
     }
 }
@@ -149,6 +163,76 @@ fn metered<T>(f: impl FnOnce() -> T) -> (T, u64) {
     let out = f();
     let after = LOCAL_ALLOCS.with(Cell::get);
     (out, after - before)
+}
+
+/// Reads the running per-size totals with recording switched off: the `Vec` this
+/// builds is itself an allocation, and it would otherwise be counted into the
+/// bucket it is reading.
+fn sizes_snapshot() -> Vec<u64> {
+    let was = SIZES_ON.with(|c| c.replace(false));
+    let out = LOCAL_SIZES.with(|h| h.iter().map(Cell::get).collect());
+    SIZES_ON.with(|c| c.set(was));
+    out
+}
+
+/// `metered`, plus the per-size breakdown of the same interval. The caller is
+/// expected to check that the histogram sums to the count — they are collected
+/// by two independent paths through `bump`, so a mismatch means the interval was
+/// not the one it claims to be.
+fn metered_sizes<T>(f: impl FnOnce() -> T) -> (T, u64, Vec<u64>) {
+    // Both snapshots allocate a 1025-element `Vec`, so the count has to be read
+    // INSIDE them — bracketing the other way charges `f` for the instrument.
+    let before = sizes_snapshot();
+    let before_n = LOCAL_ALLOCS.with(Cell::get);
+    SIZES_ON.with(|c| c.set(true));
+    let out = f();
+    SIZES_ON.with(|c| c.set(false));
+    let after_n = LOCAL_ALLOCS.with(Cell::get);
+    let after = sizes_snapshot();
+    let delta = after.iter().zip(&before).map(|(a, b)| a - b).collect();
+    (out, after_n - before_n, delta)
+}
+
+fn hist_diff(a: &[u64], b: &[u64]) -> Vec<i64> {
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| *x as i64 - *y as i64)
+        .collect()
+}
+
+/// `None` when the histogram does not divide evenly. That is the interesting
+/// answer: `d` identical units cannot produce a bucket count indivisible by `d`,
+/// so a `None` refutes "the entries are alike" at the size level even where the
+/// per-call totals fit perfectly.
+fn hist_div(h: &[i64], d: i64) -> Option<Vec<i64>> {
+    h.iter()
+        .all(|c| c % d == 0)
+        .then(|| h.iter().map(|c| c / d).collect())
+}
+
+fn hist_line(h: &[i64]) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mut total: i64 = 0;
+    for (size, &c) in h.iter().enumerate() {
+        if c == 0 {
+            continue;
+        }
+        total += c;
+        // Bucket 0 is the overflow bucket, not a zero-byte request.
+        if size == 0 {
+            parts.push(format!(">{SIZE_MAX_EXACT}B x{c}"));
+        } else {
+            parts.push(format!("{size}B x{c}"));
+        }
+    }
+    if parts.is_empty() {
+        return "total 0".to_string();
+    }
+    format!("total {total:>5}  =  {}", parts.join("  "))
+}
+
+fn hist_u(h: &[u64]) -> String {
+    hist_line(&h.iter().map(|&c| c as i64).collect::<Vec<_>>())
 }
 
 const THRESHOLD: u32 = 8;
@@ -1780,11 +1864,243 @@ fn regime_installed_at(label: &str, lowered: &LoweredF) {
     }
 }
 
+/// One measured regime: the calls that agree on `(loops, bridges, guard
+/// failures this call, allocations)`.
+struct Regime {
+    loops: usize,
+    brdg: usize,
+    /// `guard_failures` DELTA for the call, not the cumulative counter. This is
+    /// the model's `G` read off the instrument instead of solved for.
+    gf: usize,
+    allocs: u64,
+    calls: usize,
+    first_call: usize,
+    hist: Vec<u64>,
+}
+
+/// Groups a run's calls by `(bridges_compiled, allocations)` and keeps one
+/// histogram per group. No fixed windows: probe N reported 86 against a true 84
+/// at n=5 by reading an index on an axis whose landmark moves.
+fn regimes(lowered: &LoweredF, n: usize, calls: usize, threshold: u32) -> Vec<Regime> {
+    let (price, qty) = flat_columns(n);
+    let columns = vec![Column::Int(&price), Column::Int(&qty)];
+
+    reset_persistent_state();
+    reset_jit_stats();
+    let mut out: Vec<Regime> = Vec::new();
+    let mut prev_gf = jit_stats().guard_failures;
+    for k in 0..calls {
+        let (_, a, hist) =
+            metered_sizes(|| black_box(eval_batch_sum_f(lowered, &columns, n, threshold)));
+        let s = jit_stats();
+        let gf = s.guard_failures - prev_gf;
+        prev_gf = s.guard_failures;
+        // The two counters come through independent paths in `bump`, so a
+        // disagreement means the interval measured is not the one claimed.
+        let summed: u64 = hist.iter().sum();
+        assert_eq!(
+            summed,
+            a,
+            "n={n} call {}: histogram sums to {summed}, count says {a}",
+            k + 1
+        );
+        match out
+            .iter_mut()
+            .find(|r| r.brdg == s.bridges_compiled && r.gf == gf && r.allocs == a)
+        {
+            Some(r) => r.calls += 1,
+            None => out.push(Regime {
+                loops: s.loops_compiled,
+                brdg: s.bridges_compiled,
+                gf,
+                allocs: a,
+                calls: 1,
+                first_call: k + 1,
+                hist,
+            }),
+        }
+    }
+    out
+}
+
+/// Picks the regime a run spends the most calls in, among those at `brdg`.
+/// Selecting by population rather than by a predicted allocation count keeps the
+/// model out of its own decomposition.
+fn dominant(rs: &[Regime], brdg: usize) -> Option<&Regime> {
+    rs.iter().filter(|r| r.brdg == brdg).max_by_key(|r| r.calls)
+}
+
+/// Probe P. The E/G model fits twelve cells exactly and still says nothing about
+/// what is INSIDE a compiled entry: the fit is over per-call totals, so any
+/// residual sitting within the per-entry price is invisible to it by
+/// construction. Counting harder cannot reach it — the counts are already exact.
+///
+/// So this stops counting allocations and starts typing them. The allocator
+/// already sees a `Layout` on every call and throws the size away; recording it
+/// turns each of the three unexplained constants into a subtraction over
+/// histograms rather than over scalars:
+///
+/// * the **42** = (n=10 pre-bridge) − (n=2), both at one entry per call;
+/// * the **42 again** = (n=10 at brdg=1) − (n=10 at brdg=2), a different pair of
+///   regimes entirely. If these two disagree, the 42 is two mechanisms that
+///   happen to share a magnitude, and `G` is a label rather than a variable.
+/// * the **per-entry 23** = [(n=10, 9 entries) − (n=2, 1 entry)] / 8;
+/// * the **per-row portal 12** = [portal(10) − portal(2)] / 8, which decides
+///   whether `23 = 12 + 11` is a nesting or just an arithmetic coincidence — if
+///   the two signatures are disjoint by size, the additive story is dead
+///   structurally and not merely unproven.
+///
+/// ⚠ This can decompose the model. It cannot confirm it.
+fn alloc_size_signature(label: &str, lowered: &LoweredF) {
+    println!("\nProbe P — {label}: what are the allocations, by size?");
+
+    const CALLS: usize = 900;
+
+    let mut portal: Vec<(usize, u64, Vec<u64>)> = Vec::new();
+    for n in [2usize, 10] {
+        let (price, qty) = flat_columns(n);
+        let columns = vec![Column::Int(&price), Column::Int(&qty)];
+        reset_persistent_state();
+        for _ in 0..8 {
+            black_box(eval_batch_sum_f(lowered, &columns, n, NEVER));
+        }
+        let (_, a, hist) =
+            metered_sizes(|| black_box(eval_batch_sum_f(lowered, &columns, n, NEVER)));
+        portal.push((n, a, hist));
+    }
+
+    println!("\n  portal arm (never compiles):");
+    for (n, a, hist) in &portal {
+        println!("    n={n:<4} allocs {a:>5}   {}", hist_u(hist));
+    }
+
+    let r2 = regimes(lowered, 2, CALLS, THRESHOLD);
+    let r10 = regimes(lowered, 10, CALLS, THRESHOLD);
+
+    for (n, rs) in [(2usize, &r2), (10usize, &r10)] {
+        println!("\n  compiled arm, n={n} over {CALLS} calls — every distinct regime:");
+        println!(
+            "    {:>6} {:>5} {:>8} {:>7} {:>7}   histogram",
+            "brdg", "gf", "allocs", "calls", "first"
+        );
+        for r in rs.iter() {
+            println!(
+                "    {:>6} {:>5} {:>8} {:>7} {:>7}   {}",
+                r.brdg,
+                r.gf,
+                r.allocs,
+                r.calls,
+                r.first_call,
+                hist_u(&r.hist)
+            );
+        }
+    }
+
+    // Two of cranelift's per-entry allocations read 64 B / 200 B at n=2 and
+    // 96 B / 216 B at n=10, so a per-ENTRY structure is sized by the whole
+    // batch. Two n points cannot tell a linear law from a coincidence, and they
+    // cannot tell "sized by n" from "sized by the trace", so sweep n and carry
+    // the trace op counts alongside.
+    let slope = if cfg!(feature = "jit-cranelift") {
+        23i64
+    } else {
+        20
+    };
+    println!("\n  size law — steady regimes only (>=20 calls), swept over n:");
+    println!("  `E` is solved from allocs = {slope}E + 42*gf + 4 with the MEASURED gf, so it is");
+    println!("  one unknown in one equation — a non-integer E refutes the model outright.");
+    println!(
+        "    {:>4} {:>6} {:>5} {:>5} {:>8} {:>7} {:>7} {:>8} {:>8}   histogram",
+        "n", "loops", "brdg", "gf", "allocs", "calls", "E", "ops_bef", "ops_aft"
+    );
+    for n in [2usize, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12] {
+        let rs = regimes(lowered, n, CALLS, THRESHOLD);
+        let s = jit_stats();
+        for r in rs.iter().filter(|r| r.calls >= 20) {
+            let rest = r.allocs as i64 - 42 * r.gf as i64 - 4;
+            let e = if rest % slope == 0 {
+                format!("{}", rest / slope)
+            } else {
+                format!("{:.2}!", rest as f64 / slope as f64)
+            };
+            println!(
+                "    {n:>4} {:>6} {:>5} {:>5} {:>8} {:>7} {e:>7} {:>8} {:>8}   {}",
+                r.loops,
+                r.brdg,
+                r.gf,
+                r.allocs,
+                r.calls,
+                s.trace_ops_before,
+                s.trace_ops_after,
+                hist_u(&r.hist)
+            );
+        }
+    }
+
+    println!("\n  --- decomposition ---");
+
+    let base = dominant(&r2, 0);
+    let pre = dominant(&r10, 0);
+    let post1 = dominant(&r10, 1);
+    let post2 = r10.iter().filter(|r| r.brdg >= 2).max_by_key(|r| r.calls);
+
+    if let (Some(base), Some(pre)) = (base, pre) {
+        let d = hist_diff(&pre.hist, &base.hist);
+        println!(
+            "\n  guard exit, route 1 (n=10 pre-bridge {} − n=2 {}):",
+            pre.allocs, base.allocs
+        );
+        println!("    {}", hist_line(&d));
+    }
+    if let (Some(p1), Some(p2)) = (post1, post2) {
+        let d = hist_diff(&p1.hist, &p2.hist);
+        println!(
+            "\n  guard exit, route 2 (n=10 brdg=1 {} − brdg>=2 {}):",
+            p1.allocs, p2.allocs
+        );
+        println!("    {}", hist_line(&d));
+    }
+    if let (Some(base), Some(p2)) = (base, post2) {
+        // n=10 post-bridge runs n−1 = 9 entries per call against n=2's 1, so the
+        // difference is 8 entries with the harness constant and the guard exit
+        // both cancelled.
+        let d = hist_diff(&p2.hist, &base.hist);
+        println!(
+            "\n  8 compiled entries (n=10 brdg>=2 {} − n=2 {}):",
+            p2.allocs, base.allocs
+        );
+        println!("    {}", hist_line(&d));
+        match hist_div(&d, 8) {
+            Some(per) => println!("    per entry:   {}", hist_line(&per)),
+            None => println!("    ⛔ NOT divisible by 8 — the 9 entries are not alike by size"),
+        }
+    }
+    if portal.len() == 2 {
+        let d = hist_diff(&portal[1].2, &portal[0].2);
+        println!(
+            "\n  8 portal back edges (portal n=10 {} − n=2 {}):",
+            portal[1].1, portal[0].1
+        );
+        println!("    {}", hist_line(&d));
+        match hist_div(&d, 8) {
+            Some(per) => println!("    per row:     {}", hist_line(&per)),
+            None => println!("    ⛔ NOT divisible by 8 — the 9 rows are not alike by size"),
+        }
+    }
+}
+
 fn main() {
     let schema = flat_schema();
     let arith = lower("price + qty * 2", &schema);
 
     println!("load before probes: {}", loadavg());
+    // Probe P indexes by call index from a cold driver, same as M/N/O, and it is
+    // the only probe that turns the size histogram on. `RCA88B_SIZES=1`.
+    if std::env::var_os("RCA88B_SIZES").is_some() {
+        alloc_size_signature("arith price + qty * 2", &arith);
+        println!("\nload after probes:  {}", loadavg());
+        return;
+    }
     // Probe M is the same cold-driver axis as J/K/L but 13x longer, so it gets
     // its own gate: the question it settles is #122's "permanently", which does
     // not need the three shorter probes to have run first.
