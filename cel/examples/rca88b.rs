@@ -790,8 +790,17 @@ fn reconstruct_probe_b() {
 fn warmup_degradation() {
     println!("\nProbe G — how many compiled calls until the artifact stops paying?");
     println!(
-        "{:>8} {:>10} {:>12} {:>12} {:>10} {:>6} {:>13}",
-        "n", "warmups", "warm ns", "never ns", "warm/nvr", "brdg", "gfails/call"
+        "{:>8} {:>10} {:>12} {:>12} {:>10} {:>5} {:>6} {:>13} {:>7} {:>9}",
+        "n",
+        "warmups",
+        "warm ns",
+        "never ns",
+        "warm/nvr",
+        "dL",
+        "brdg",
+        "gfails/call",
+        "aborts",
+        "abrt/call"
     );
 
     let schema = flat_schema();
@@ -817,7 +826,9 @@ fn warmup_degradation() {
             best_never = best_never.min(t.elapsed().as_nanos() as f64 / reps as f64);
         }
 
-        for warmups in [1usize, 2, 4, 8, 16, 32, 64, 128, 512] {
+        for warmups in [
+            1usize, 2, 4, 8, 16, 32, 64, 128, 192, 256, 320, 384, 448, 512,
+        ] {
             reset_persistent_state();
             reset_jit_stats();
             for _ in 0..warmups {
@@ -834,11 +845,19 @@ fn warmup_degradation() {
             }
             let after = jit_stats();
             println!(
-                "{n:>8} {warmups:>10} {best_warm:>12.1} {best_never:>12.1} {:>10.3} {:>6} \
-                 {:>13.3}",
+                "{n:>8} {warmups:>10} {best_warm:>12.1} {best_never:>12.1} {:>10.3} {:>5} \
+                 {:>6} {:>13.3} {:>7} {:>9.3}",
                 best_warm / best_never,
+                after.loops_compiled - before.loops_compiled,
                 after.bridges_compiled - before.bridges_compiled,
                 (after.guard_failures - before.guard_failures) as f64 / (41 * reps) as f64,
+                // `loops_aborted` is the discriminator for "re-arms tracing and
+                // never compiles": an artifact that stopped being entered leaves
+                // the back edge to arm tracing on every call, and a walk that
+                // cannot close shows up here and nowhere else. It is already
+                // exported and has never been read on this axis.
+                after.loops_aborted - before.loops_aborted,
+                (after.loops_aborted - before.loops_aborted) as f64 / (41 * reps) as f64,
             );
         }
     }
