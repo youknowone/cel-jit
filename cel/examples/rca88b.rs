@@ -1651,7 +1651,7 @@ fn small_n_constant(label: &str, lowered: &LoweredF) {
 
     const CALLS: usize = 700;
 
-    for n in [2usize, 3, 5, 8, 10] {
+    for n in [2usize, 3, 5, 6, 7, 8, 10] {
         let (price, qty) = flat_columns(n);
         let columns = vec![Column::Int(&price), Column::Int(&qty)];
 
