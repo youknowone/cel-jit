@@ -1047,8 +1047,6 @@ pub enum Value {
     List(ListRef),
     Map(Map),
 
-    Function(Arc<String>, Option<Box<Value>>),
-
     // Atoms
     Int(i64),
     UInt(u64),
@@ -1071,7 +1069,6 @@ impl Debug for Value {
         match self {
             Value::List(l) => write!(f, "List({:?})", l),
             Value::Map(m) => write!(f, "Map({:?})", m),
-            Value::Function(name, func) => write!(f, "Function({:?}, {:?})", name, func),
             Value::Int(i) => write!(f, "Int({:?})", i),
             Value::UInt(u) => write!(f, "UInt({:?})", u),
             Value::Float(d) => write!(f, "Float({:?})", d),
@@ -1094,7 +1091,6 @@ impl Debug for Value {
 pub enum ValueType {
     List,
     Map,
-    Function,
     Int,
     UInt,
     Float,
@@ -1114,7 +1110,6 @@ impl Display for ValueType {
         match self {
             ValueType::List => write!(f, "list"),
             ValueType::Map => write!(f, "map"),
-            ValueType::Function => write!(f, "function"),
             ValueType::Int => write!(f, "int"),
             ValueType::UInt => write!(f, "uint"),
             ValueType::Float => write!(f, "float"),
@@ -1136,7 +1131,6 @@ impl Value {
         match self {
             Value::List(_) => ValueType::List,
             Value::Map(_) => ValueType::Map,
-            Value::Function(_, _) => ValueType::Function,
             Value::Int(_) => ValueType::Int,
             Value::UInt(_) => ValueType::UInt,
             Value::Float(_) => ValueType::Float,
@@ -1190,7 +1184,6 @@ impl PartialEq for Value {
         match (self, other) {
             (Value::Map(a), Value::Map(b)) => a == b,
             (Value::List(a), Value::List(b)) => a == b,
-            (Value::Function(a1, a2), Value::Function(b1, b2)) => a1 == b1 && a2 == b2,
             (Value::Int(a), Value::Int(b)) => a == b,
             (Value::UInt(a), Value::UInt(b)) => a == b,
             (Value::Float(a), Value::Float(b)) => a == b,
@@ -1495,7 +1488,6 @@ impl TryFrom<Value> for Box<dyn Val> {
             Value::Struct(s) => Ok(Arc::try_unwrap(s)
                 .map(|s| Box::new(s) as Box<dyn Val>)
                 .unwrap_or_else(|arc| arc.clone_as_boxed())),
-            _ => Err(ExecutionError::UnsupportedTargetType { target: value }),
         }
     }
 }

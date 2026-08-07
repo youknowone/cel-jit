@@ -58,6 +58,9 @@
 //!   are distinguishable but the last-ulp behaviour of a long chain is not
 //!   pinned beyond what that rendering shows.
 //! * **Parse-error detail.** A syntax case pins only that compilation failed.
+//! * **`Value::Struct`** (the `structs` feature) and any opaque other than
+//!   `OptionalValue`. `render` handles both so the file builds with those
+//!   features on, but no corpus case exercises them.
 //! * **Anything behind a cargo feature that is off.** Cases carry `cfg:` and
 //!   are skipped when the feature is absent; the corresponding coverage
 //!   requirements are dropped with them, and the run says so.
@@ -127,10 +130,6 @@ fn render(value: &Value) -> String {
             entries.sort();
             format!("map{{{}}}", entries.join(", "))
         }
-        Value::Function(name, target) => match target {
-            Some(t) => format!("function({name}, {})", render(t)),
-            None => format!("function({name})"),
-        },
         Value::Opaque(o) => match o.downcast_ref::<OptionalValue>() {
             Some(opt) => match opt.value() {
                 Some(v) => format!("optional({})", render(v)),
@@ -145,14 +144,19 @@ fn render(value: &Value) -> String {
         },
         #[cfg(feature = "chrono")]
         Value::Timestamp(t) => format!("timestamp({})", t.to_rfc3339()),
+        // Rendered so the arm exists under `--features structs`; the corpus
+        // carries no struct case (see this file's header).
         #[cfg(feature = "structs")]
         Value::Struct(s) => {
-            let mut fields: Vec<String> = s
-                .fields()
-                .map(|(name, v)| format!("{name}: {}", render(v)))
+            let fields: Vec<String> = s
+                .field_values()
+                .into_iter()
+                .map(|(name, v)| match Value::try_from(v.as_ref()) {
+                    Ok(v) => format!("{name}: {}", render(&v)),
+                    Err(_) => format!("{name}: <unconvertible>"),
+                })
                 .collect();
-            fields.sort();
-            format!("struct({}{{{}}})", s.type_name(), fields.join(", "))
+            format!("struct({}{{{}}})", s.name(), fields.join(", "))
         }
     }
 }
@@ -421,7 +425,6 @@ const FEATURE_GATED_COVERAGE: &[(&str, &str)] = &[
     ("duration", "chrono"),
     ("timestamp", "chrono"),
     ("regex", "regex"),
-    ("struct", "structs"),
 ];
 
 fn cfg_enabled(name: &str) -> bool {
