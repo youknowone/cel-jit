@@ -123,6 +123,20 @@ impl<'a> Context<'a> {
     /// A hit is a [`Value`] clone, which for the compound variants is a
     /// refcount bump. It used to convert a boxed trait object on every read,
     /// and that conversion deep-copied a bound list or map.
+    ///
+    /// A miss on the whole chain falls back to the type identifiers
+    /// ([`crate::common::types::r#type::type_ident`]): `int`, `string`,
+    /// `null_type` and the rest are values in CEL, not only the names of
+    /// conversion functions. The fallback is **last** on purpose -- a bound
+    /// variable named `int` shadows the type, which is the order the spec
+    /// states for the analogous case and `objects.rs:1541` quotes: a local
+    /// variable "shadows any identifier named `x` in ancestor scopes or the
+    /// package namespace". Consulting it first would make the type names
+    /// unshadowable.
+    ///
+    /// It costs a string match only where the answer was previously
+    /// `UndeclaredReference`, because every bound name is found before the
+    /// chain bottoms out.
     pub fn get_variable<S>(&self, name: S) -> Option<Value>
     where
         S: AsRef<str>,
@@ -141,11 +155,16 @@ impl<'a> Context<'a> {
                     .cloned()
                     .or_else(|| parent.get_variable(name))
             }),
+            // The base case of the recursion, so a `Child` reaches this through
+            // `parent.get_variable` and the type identifiers stay behind every
+            // scope at every depth.
             Context::Root {
                 variables,
                 resolver,
                 ..
-            } => from_resolver(resolver).or_else(|| variables.get(name).cloned()),
+            } => from_resolver(resolver)
+                .or_else(|| variables.get(name).cloned())
+                .or_else(|| crate::common::types::r#type::type_ident(name)),
         }
     }
 

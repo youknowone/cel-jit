@@ -73,6 +73,65 @@ pub(crate) fn stdlib(env: &mut crate::Env) {
         .expect("Must be unique id");
 }
 
+/// Resolves a bare type identifier -- `int`, `string`, `null_type` -- to the
+/// type value it denotes.
+///
+/// CEL keeps the function namespace and the identifier namespace separate:
+/// `int(1.9)` is a call on the conversion overload `common/types/int.rs`
+/// registers, while bare `int` is an identifier that has to resolve to a value.
+/// The two spellings share a name and neither disturbs the other, because
+/// nothing resolves a callee through [`Context::get_variable`] -- the call path
+/// goes to `get_function` in both evaluators (`objects.rs:1526`,
+/// `vm/interp.rs:669`). Without the identifier half, langdef.md's own worked
+/// example for this function, `type(type(1)) == type(string)`, cannot be
+/// written at all.
+///
+/// [`Context::get_variable`] consults this only after the whole context chain
+/// has missed, so a bound variable named `int` shadows the type. That order is
+/// the spec's, quoted at `objects.rs:1541` for the analogous case: a local
+/// variable "shadows any identifier named `x` in ancestor scopes or the package
+/// namespace".
+///
+/// The names are exactly those the oracle corpus already pins as `type(x)`
+/// answers -- the spec's spellings, per its own note that the null family is
+/// `null_type` and not `null` -- minus the two that are not identifiers.
+/// `google.protobuf.Duration` and `google.protobuf.Timestamp` parse as an
+/// `Expr::Select` over an `Ident`, so they arrive at a different resolution
+/// path entirely. `dyn` is absent for a different reason: it is never a
+/// `type(x)` answer, and `common/types/dyn.rs:15` already spends the name on
+/// the function namespace.
+///
+/// ⚠ `optional_type` is an extension in CEL proper, not core, and is bound here
+/// because `env.rs:89` installs the optional stdlib unconditionally. If that
+/// ever becomes feature-gated, this entry has to be gated with it, or the
+/// identifier outlives the type it denotes.
+pub(crate) fn type_ident(name: &str) -> Option<Value> {
+    use super::{
+        BOOL_TYPE, BYTES_TYPE, DOUBLE_TYPE, INT_TYPE, LIST_TYPE, MAP_TYPE, NULL_TYPE,
+        OPTIONAL_TYPE, STRING_TYPE, TYPE_TYPE, UINT_TYPE,
+    };
+    // Matched on the literal rather than scanned out of a table of the
+    // constants: `Type` has no `Clone` -- only the hand-written `ToOwned` at
+    // `mod.rs:60`, because `parameters` is a `Cow` -- so a `&'static [Type]`
+    // cannot be promoted. `ident_keys_are_the_types_own_names` holds each arm's
+    // key to the name of the type that arm returns, so the two cannot drift.
+    let denoted = match name {
+        "bool" => BOOL_TYPE,
+        "bytes" => BYTES_TYPE,
+        "double" => DOUBLE_TYPE,
+        "int" => INT_TYPE,
+        "list" => LIST_TYPE,
+        "map" => MAP_TYPE,
+        "null_type" => NULL_TYPE,
+        "optional_type" => OPTIONAL_TYPE,
+        "string" => STRING_TYPE,
+        "type" => TYPE_TYPE,
+        "uint" => UINT_TYPE,
+        _ => return None,
+    };
+    Some(Value::Opaque(Arc::new(TypeValue(denoted))))
+}
+
 #[cfg(test)]
 mod tests {
     use super::TypeValue;
@@ -95,6 +154,41 @@ mod tests {
                 .to_owned(),
             other => panic!("`{expr}` answered {other:?}, not a type value"),
         }
+    }
+
+    /// Every arm's key is the name of the type that arm returns, so an
+    /// identifier and the type it denotes cannot drift apart -- a mistyped key
+    /// makes the lookup miss rather than answer the wrong type. Same reason
+    /// `name_agrees_with_type_type` below exists.
+    #[test]
+    fn ident_keys_are_the_types_own_names() {
+        use crate::common::types::{
+            BOOL_TYPE, BYTES_TYPE, DOUBLE_TYPE, INT_TYPE, LIST_TYPE, MAP_TYPE, NULL_TYPE,
+            OPTIONAL_TYPE, STRING_TYPE, TYPE_TYPE, UINT_TYPE,
+        };
+        let bound = [
+            BOOL_TYPE,
+            BYTES_TYPE,
+            DOUBLE_TYPE,
+            INT_TYPE,
+            LIST_TYPE,
+            MAP_TYPE,
+            NULL_TYPE,
+            OPTIONAL_TYPE,
+            STRING_TYPE,
+            TYPE_TYPE,
+            UINT_TYPE,
+        ];
+        assert_eq!(bound.len(), 11, "a name was added or dropped without a row");
+        for t in bound {
+            let name = t.name().to_owned();
+            let Some(Value::Opaque(o)) = super::type_ident(&name) else {
+                panic!("`{name}` does not resolve as an identifier");
+            };
+            let got = o.downcast_ref::<TypeValue>().expect("a type value");
+            assert_eq!(got.cel_type(), &t, "`{name}` denotes the wrong type");
+        }
+        assert!(super::type_ident("no_such_type").is_none());
     }
 
     #[test]

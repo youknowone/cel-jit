@@ -426,6 +426,9 @@ const REQUIRED_COVERAGE: &[(&str, usize)] = &[
     ("comprehension_nested", 1),
     ("map_range", 3),
     ("type_fn", 3),
+    // The identifier half of `type`, separate from the function half above: a
+    // corpus that only ever spells a type as `type(x)` never exercises it.
+    ("type_ident", 6),
     ("dyn_fn", 1),
     ("conversion", 4),
     ("string_fn", 4),

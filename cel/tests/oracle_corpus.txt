@@ -658,7 +658,14 @@ feat: type_fn
 want: type(type)
 
 # Type values compare by the type they denote, so two ints agree and an int and
-# a uint do not. The spec's own example is the third row.
+# a uint do not.
+#
+# The third row is NOT the spec's example, and does not have its answer. Its
+# example is `type(type(1)) == type(string)` -> true; the row below is
+# `type(type(1)) == type("a")` -> false, which compares `type` against `string`.
+# The spec's spelling needs the bare identifier `string`, which did not resolve
+# when this block was written -- the comment is a scar from that. It is in the
+# type-identifier block further down.
 
 expr: type(1) == type(2)
 feat: type_fn equality
@@ -687,6 +694,70 @@ want: bool(false)
 expr: type(1, 2)
 feat: type_fn error
 want: error(UndeclaredReference: type)
+
+# ---------------------------------------------------------------------------
+# The type identifiers
+# ---------------------------------------------------------------------------
+#
+# A type is a value, so the names have to resolve as identifiers and not only as
+# conversion functions. `int(1.9)` in the conversion block below is a call on the
+# overload; bare `int` here is an identifier. The two spellings share one name
+# and neither disturbs the other, because a callee is resolved through
+# `get_function` and an identifier through `get_variable`. The identifier is the
+# last thing `get_variable` tries, so a bound variable named `int` shadows the
+# type; the arity row above stays an `UndeclaredReference` for the same reason,
+# since the call path never consults the identifier at all.
+
+expr: type(1) == int
+feat: type_ident type_fn equality
+want: bool(true)
+
+expr: type("a") == string
+feat: type_ident type_fn equality literal_string
+want: bool(true)
+
+expr: type(1) == string
+feat: type_ident type_fn equality
+want: bool(false)
+
+# langdef.md's own worked example for `type()`, unwritable until the identifiers
+# resolved. `type(1)` is `int` and `int`'s type is `type`; `string` is a type
+# value and its type is `type` as well.
+
+expr: type(type(1)) == type(string)
+feat: type_ident type_fn equality
+want: bool(true)
+
+expr: type(xs) == list
+feat: type_ident type_fn equality variable
+want: bool(true)
+
+# Not `null`: langdef.md names the family `null_type`.
+
+expr: type(null) == null_type
+feat: type_ident type_fn equality literal_null
+want: bool(true)
+
+expr: type(type(1)) == type
+feat: type_ident type_fn equality
+want: bool(true)
+
+# An identifier on its own, with no `type()` call anywhere: the identifier half
+# is what is under test, so at least one row must not lean on the function.
+
+expr: int == int
+feat: type_ident equality
+want: bool(true)
+
+expr: int == uint
+feat: type_ident equality
+want: bool(false)
+
+# A type value's own type is `type`, whichever type it denotes.
+
+expr: type(int)
+feat: type_ident type_fn
+want: type(type)
 
 expr: dyn(1)
 feat: dyn_fn
