@@ -161,6 +161,10 @@ impl From<HashMap<Key, Box<dyn Val>>> for DefaultMap {
     }
 }
 
+// `KeyRef` and `AsKeyRef` live in `crate::objects`, the universe that
+// survives; this module had a byte-identical second copy of both.
+use crate::objects::{AsKeyRef, KeyRef};
+
 #[derive(Debug, Eq, Clone)]
 pub enum Key {
     Bool(CelBool),
@@ -204,19 +208,6 @@ impl Key {
     }
 }
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
-pub enum KeyRef<'a> {
-    Int(i64),
-    Uint(u64),
-    Bool(bool),
-    String(&'a str),
-}
-
-/// Trait for converting to a borrowed [`KeyRef`] for efficient lookups.
-pub trait AsKeyRef {
-    fn as_keyref(&self) -> KeyRef<'_>;
-}
-
 impl AsKeyRef for Key {
     fn as_keyref(&self) -> KeyRef<'_> {
         match self {
@@ -249,39 +240,6 @@ impl AsKeyRef for CelUInt {
 impl AsKeyRef for CelBool {
     fn as_keyref(&self) -> KeyRef<'_> {
         KeyRef::Bool(*self.inner())
-    }
-}
-
-impl<'a> AsKeyRef for KeyRef<'a> {
-    fn as_keyref(&self) -> KeyRef<'a> {
-        *self
-    }
-}
-
-/// Trait object implementations for `dyn AsKeyRef` to enable hashing and comparison.
-impl<'a> PartialEq for dyn AsKeyRef + 'a {
-    fn eq(&self, other: &Self) -> bool {
-        self.as_keyref().eq(&other.as_keyref())
-    }
-}
-
-impl<'a> Eq for dyn AsKeyRef + 'a {}
-
-impl<'a> Hash for dyn AsKeyRef + 'a {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.as_keyref().hash(state)
-    }
-}
-
-impl<'a> PartialOrd for dyn AsKeyRef + 'a {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl<'a> Ord for dyn AsKeyRef + 'a {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.as_keyref().cmp(&other.as_keyref())
     }
 }
 
