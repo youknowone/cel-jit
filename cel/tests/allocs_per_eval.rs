@@ -81,6 +81,18 @@
 //! drift from the baseline into a failure; it is OFF by default **on purpose**
 //! — see the header of `tests/allocs_per_eval.baseline`.
 //!
+//! Because the gate is off by default, a run that checked everything and a run
+//! that checked nothing exit 0 and print the same table. This target is also
+//! `harness = false`, so there is no `test result:` line to fall back on. The
+//! LAST line says which of the two happened — `GATED PASS` or `NOT GATED` —
+//! and how many baseline rows were actually compared. Read that line, not the
+//! exit status: the failure mode here is absence read as success.
+//!
+//! Blessing refuses when a baseline row would stop being checked, because a
+//! blessing is the only thing that can shrink the corpus and the baseline is
+//! the only record of how big it was. `CEL_ALLOCS_BLESS_SHRINK=1` says the
+//! shrink is intended.
+//!
 //! Each configuration has its own baseline file, named from the `jit` and `vm`
 //! features (`allocs_per_eval[.jit][.vm].baseline`) — see [`baseline_path`].
 //! Those are the two features that change what a run *means*: `jit` decides
@@ -1045,6 +1057,22 @@ fn main() {
     );
 
     if bless {
+        // A blessing records whatever it measured. If the corpus shrank -- a row
+        // deleted, a group that stopped being built -- the smaller set becomes the
+        // reference, every gated run afterwards passes, and it passes while
+        // checking less. Nothing downstream can notice: the baseline is the only
+        // record of how many rows there were supposed to be, and blessing is what
+        // rewrites it. `missing` is the exact set that would stop being checked.
+        assert!(
+            !comparable
+                || missing.is_empty()
+                || std::env::var_os("CEL_ALLOCS_BLESS_SHRINK").is_some(),
+            "refusing to bless: {} baseline row(s) would stop being checked: {:?}. \
+             This reduces what the gate covers. Set CEL_ALLOCS_BLESS_SHRINK=1 if the \
+             corpus really did shrink on purpose.",
+            missing.len(),
+            missing
+        );
         write_baseline(&rows);
         return;
     }
@@ -1091,6 +1119,46 @@ fn main() {
             "CEL_ALLOCS_GATE=1 and {} row(s) were not stable across {ROUNDS} rounds: {:?}",
             unstable.len(),
             unstable
+        );
+    }
+
+    // Every way this instrument can go silent, and where each one is answered.
+    // A list rather than a claim about the paths that happened to be checked:
+    // adding a way to go silent means adding a line here, which is visible;
+    // leaving a property unstated is not.
+    //
+    //   baseline absent or empty ............. refused above, gate only
+    //   blessed under other features ......... refused above, gate only
+    //   a baseline row no longer measured .... refused above, gate only
+    //   a row drifted ........................ refused above, gate only
+    //   a row unstable across rounds ......... refused above, gate only
+    //   the meter counts nothing, or itself .. the three probes, ALWAYS fatal
+    //   the corpus shrank and was blessed .... refused on the bless path
+    //   the run never gated at all ........... the line below
+    //
+    // The last one is why this prints on the success path. Everything above is
+    // silent when it is satisfied, so a passing run and a run that compared
+    // nothing produce the same output, and `$?` is the same too. This binary is
+    // `harness = false`, so there is no `test result:` line to fall back on: a
+    // reader scanning for trouble has only what is printed here. A guard that
+    // says nothing when it passes cannot be told from one that never ran.
+    let compared = rows.iter().filter(|r| base.contains_key(&r.label)).count();
+    let path = baseline_path();
+    if gate {
+        println!(
+            "\nallocs_per_eval: GATED PASS — {compared} of {} baseline rows compared \
+             against {}, 0 drifted, 0 unstable.",
+            base.len(),
+            path.display(),
+        );
+    } else {
+        println!(
+            "\nallocs_per_eval: NOT GATED — {compared} of {} baseline rows compared \
+             against {}, {} drifted. A drift is REPORTED, NOT FATAL: that baseline is \
+             per-host (see its header). Re-run with CEL_ALLOCS_GATE=1 to make one fail.",
+            base.len(),
+            path.display(),
+            drifted.len(),
         );
     }
 }
