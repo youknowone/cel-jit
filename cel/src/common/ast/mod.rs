@@ -1,4 +1,4 @@
-use crate::common::types::{CelBool, CelBytes, CelDouble, CelInt, CelNull, CelString, CelUInt};
+use crate::common::types::{CelBool, CelBytes, CelDouble, CelInt, CelString, CelUInt, CEL_NULL};
 use crate::common::value::Val;
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -53,13 +53,12 @@ pub enum LiteralValue {
 
 impl LiteralValue {
     pub fn to_val<'a>(&'a self) -> Cow<'a, dyn Val> {
-        // todo refactor to return Cow::Borrowed
         match &self {
             LiteralValue::Boolean(b) => Cow::Borrowed(b),
             LiteralValue::Bytes(b) => Cow::Borrowed(b),
             LiteralValue::Double(f) => Cow::Borrowed(f),
             LiteralValue::Int(i) => Cow::Borrowed(i),
-            LiteralValue::Null => Cow::<dyn Val>::Owned(Box::new(CelNull)),
+            LiteralValue::Null => Cow::Borrowed(&CEL_NULL),
             LiteralValue::String(s) => Cow::Borrowed(s),
             LiteralValue::UInt(ui) => Cow::Borrowed(ui),
         }

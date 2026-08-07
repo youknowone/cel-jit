@@ -34,6 +34,7 @@ pub use list::DefaultList as CelList;
 pub use map::DefaultMap as CelMap;
 pub use map::Key as CelMapKey;
 pub use null::Null as CelNull;
+pub use null::NULL as CEL_NULL;
 pub use optional::Optional as CelOptional;
 #[cfg(feature = "structs")]
 pub use r#struct::Struct as CelStruct;
