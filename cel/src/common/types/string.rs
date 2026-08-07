@@ -150,9 +150,7 @@ fn string_contains<'a>(args: Vec<Cow<'a, dyn Val>>) -> Result<Cow<'a, dyn Val>, 
                 got: arg.get_type().name().to_string(),
                 want: super::STRING_TYPE.name().to_string(),
             }),
-            Some(needle) => Ok(Cow::<dyn Val>::Owned(Box::new(CelBool::from(
-                s.contains(needle.inner()),
-            )))),
+            Some(needle) => Ok(super::cel_bool(s.contains(needle.inner()))),
         },
     }
 }

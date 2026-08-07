@@ -1597,18 +1597,14 @@ impl Value {
                         operators::LOGICAL_OR => {
                             let left = try_bool(Value::resolve_val(&call.args[0], ctx));
                             return if Ok(true) == left {
-                                Ok(Cow::<dyn Val>::Owned(Box::new(CelBool::from(true))))
+                                Ok(bool(true))
                             } else {
                                 let right = Value::resolve_val(&call.args[1], ctx)?
                                     .downcast_ref::<CelBool>()
                                     .map(|b| *b.inner());
                                 match (left, right) {
-                                    (Ok(false), Some(right)) => {
-                                        Ok(Cow::<dyn Val>::Owned(Box::new(CelBool::from(right))))
-                                    }
-                                    (Err(_), Some(true)) => {
-                                        Ok(Cow::<dyn Val>::Owned(Box::new(CelBool::from(true))))
-                                    }
+                                    (Ok(false), Some(right)) => Ok(bool(right)),
+                                    (Err(_), Some(true)) => Ok(bool(true)),
                                     (left, _) => Err(left.err().unwrap_or(NoSuchOverload)),
                                 }
                             };
@@ -1616,18 +1612,14 @@ impl Value {
                         operators::LOGICAL_AND => {
                             let left = try_bool(Value::resolve_val(&call.args[0], ctx));
                             return if Ok(false) == left {
-                                Ok(Cow::<dyn Val>::Owned(Box::new(CelBool::from(false))))
+                                Ok(bool(false))
                             } else {
                                 let right = Value::resolve_val(&call.args[1], ctx)?
                                     .downcast_ref::<CelBool>()
                                     .map(|b| *b.inner());
                                 match (left, right) {
-                                    (Ok(true), Some(right)) => {
-                                        Ok(Cow::<dyn Val>::Owned(Box::new(CelBool::from(right))))
-                                    }
-                                    (Err(_), Some(false)) => {
-                                        Ok(Cow::<dyn Val>::Owned(Box::new(CelBool::from(false))))
-                                    }
+                                    (Ok(true), Some(right)) => Ok(bool(right)),
+                                    (Err(_), Some(false)) => Ok(bool(false)),
                                     (left, _) => Err(left.err().unwrap_or(NoSuchOverload)),
                                 }
                             };
@@ -2159,7 +2151,7 @@ impl Value {
 }
 
 fn bool<'a>(boolean: bool) -> Cow<'a, dyn Val> {
-    Cow::<dyn Val>::Owned(Box::new(CelBool::from(boolean)))
+    crate::common::types::cel_bool(boolean)
 }
 
 fn try_bool(val: Result<Cow<dyn Val>, ExecutionError>) -> Result<bool, ExecutionError> {

@@ -23,6 +23,7 @@ pub(crate) mod uint;
 
 use crate::common::traits::TraitSet;
 use crate::common::value::Val;
+pub(crate) use bool::borrowed as cel_bool;
 pub use bool::Bool as CelBool;
 pub use bytes::Bytes as CelBytes;
 pub use double::Double as CelDouble;

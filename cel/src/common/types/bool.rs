@@ -2,10 +2,26 @@ use crate::common::traits::{Comparer, Negator, Zeroer};
 use crate::common::types::Type;
 use crate::common::value::Val;
 use crate::ExecutionError;
+use std::borrow::Cow;
 use std::ops::Deref;
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, PartialOrd, Ord)]
 pub struct Bool(bool);
+
+/// The two inhabitants of [`Bool`], so a boolean result can be borrowed rather
+/// than boxed. `Bool` wraps a `bool` and nothing else, so these two cover it.
+pub static TRUE: Bool = Bool(true);
+pub static FALSE: Bool = Bool(false);
+
+/// A borrowed `Cow` over [`TRUE`] or [`FALSE`].
+///
+/// Every evaluation that answers a comparison, a membership test or a macro
+/// went through `Box::new(Bool::from(..))` before this existed, which is one
+/// allocation per boolean the walker produces.
+pub(crate) fn borrowed<'a>(value: bool) -> Cow<'a, dyn Val> {
+    let val: &'static dyn Val = if value { &TRUE } else { &FALSE };
+    Cow::Borrowed(val)
+}
 
 impl Bool {
     pub fn negate(&self) -> Self {
