@@ -109,6 +109,14 @@ required-features = ["jit"]
 name = "allocs"
 required-features = ["jit"]
 
+[[example]]
+name = "livescale"
+required-features = ["jit"]
+
+[[example]]
+name = "poison"
+required-features = ["jit"]
+
 [features]
 default = ["regex", "chrono"]
 structs = []
