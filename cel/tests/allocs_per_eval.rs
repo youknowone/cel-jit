@@ -1006,6 +1006,37 @@ fn main() {
         write_baseline(&rows);
         return;
     }
+    // `drifted` only ever holds rows that were IN the baseline, so every way of
+    // arriving with no usable baseline -- file absent, file empty, blessed under
+    // another feature set -- leaves it empty and passes the gate having compared
+    // nothing. Refuse those first; a gate that cannot fail is worse than no gate,
+    // because it reports success.
+    if gate && base.is_empty() {
+        panic!(
+            "CEL_ALLOCS_GATE=1 but {} holds no rows — every row read as `new` and \
+             nothing was compared. Bless it in this configuration first.",
+            baseline_path().display()
+        );
+    }
+    if gate && !comparable {
+        panic!(
+            "CEL_ALLOCS_GATE=1 but {} was blessed under features={:?} and this run is \
+             features={:?} — the comparison is meaningless, so it is not a pass.",
+            baseline_path().display(),
+            meta.get("features").map(String::as_str).unwrap_or("?"),
+            features(),
+        );
+    }
+    // A row that vanishes from the corpus is not a row that agreed with the
+    // baseline. With one baseline per row set this list is empty in both
+    // configurations, so anything in it means a case stopped being built.
+    if gate && !missing.is_empty() {
+        panic!(
+            "CEL_ALLOCS_GATE=1 and {} baseline row(s) were not measured at all: {:?}",
+            missing.len(),
+            missing
+        );
+    }
     if gate && !drifted.is_empty() {
         panic!(
             "CEL_ALLOCS_GATE=1 and {} row(s) drifted from the baseline: {:?}",
