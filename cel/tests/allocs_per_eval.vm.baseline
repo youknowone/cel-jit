@@ -1,0 +1,88 @@
+# cel — allocations per evaluation. Produced by `tests/allocs_per_eval.rs`.
+#
+# ⚠ THIS FILE IS PER-HOST. It is NOT an absolute contract, and the test does NOT
+#   fail when a row differs from it. Run with `CEL_ALLOCS_GATE=1` to make a drift
+#   fatal — do that in a re-measurement of ONE change on ONE machine, never as a
+#   default CI gate.
+#
+# There is one baseline per (jit, vm) combination, because those are the two
+# features that change what a run MEANS rather than what it costs -- `jit` adds
+# the `regvm/*` rows, and `vm` decides which evaluator every `walker/*` row
+# measures. Sharing a file between two of these lets a blessing under one
+# overwrite the other's reference without a word:
+#
+#   allocs_per_eval.baseline         walker, no jit backend -- `cargo test -p cel`
+#   allocs_per_eval.vm.baseline      bytecode VM, no jit backend
+#   allocs_per_eval.jit.baseline     walker, a jit backend -- adds `regvm/*`
+#   allocs_per_eval.jit.vm.baseline  bytecode VM, a jit backend
+#
+# Bless the one matching your configuration:
+#
+#   CEL_ALLOCS_BLESS=1 cargo test -p cel --test allocs_per_eval
+#   CEL_ALLOCS_BLESS=1 cargo test -p cel --features vm --test allocs_per_eval
+#   CEL_ALLOCS_BLESS=1 cargo test -p cel --features jit-cranelift \
+#       --test allocs_per_eval
+#
+# A run whose `features` differ from the pair recorded below is not comparable
+# and the report says so. `profile` is recorded but does not invalidate a
+# comparison: dev and release were measured identical on every row.
+#
+# Format: <label> TAB <allocations per evaluation>
+#! profile = dev
+#! features = regex,chrono,vm
+#! host = aarch64-macos
+#! rounds = 3
+
+probe/nothing	0.000
+probe/one-box-per-eval	1.000
+probe/other-thread-allocating	0.000
+walker/simple_arithmetic	1.000
+walker/comparison	2.000
+walker/conditional	1.000
+walker/nested_expression	1.000
+walker/variable_access/hashmap	1.000
+walker/variable_access/resolver	1.000
+walker/member_access	1.000
+walker/list_indexing	1.000
+walker/list_filter	11.000
+walker/list_map	10.000
+walker/all_comprehension	8.000
+walker/exists_comprehension	8.000
+walker/map_list_scaling/1	6.000
+walker/map_list_scaling/10	8.000
+walker/map_list_scaling/100	11.000
+walker/map_list_scaling/1000	14.000
+walker/map_list_scaling/10000	18.000
+walker/filter_list_scaling/1	6.000
+walker/filter_list_scaling/10	7.000
+walker/filter_list_scaling/100	10.000
+walker/filter_list_scaling/1000	13.000
+walker/filter_list_scaling/10000	17.000
+walker/comprehension_scaling/10	12.000
+walker/comprehension_scaling/50	16.000
+walker/comprehension_scaling/100	18.000
+walker/comprehension_scaling/500	22.000
+walker/string_operations	8.000
+walker/member_call_on_variable	11.000
+walker/custom_function	3.000
+walker/real_world_policy	7.000
+bind/clone-only/1	0.000
+bind/list-to-context/1	0.000
+bind/clone-only/10	0.000
+bind/list-to-context/10	0.000
+bind/clone-only/100	0.000
+bind/list-to-context/100	0.000
+bind/clone-only/1000	0.000
+bind/list-to-context/1000	0.000
+comprehension/bind+exec/map/10	8.000
+comprehension/bind+exec/filter/10	7.000
+comprehension/bind+exec/chained/10	12.000
+comprehension/bind+exec/all/10	5.000
+comprehension/bind+exec/exists/10	5.000
+comprehension/bind+exec/size/10	9.000
+comprehension/bind+exec/map/100	11.000
+comprehension/bind+exec/filter/100	10.000
+comprehension/bind+exec/chained/100	18.000
+comprehension/bind+exec/all/100	5.000
+comprehension/bind+exec/exists/100	5.000
+comprehension/bind+exec/size/100	12.000

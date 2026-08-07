@@ -81,11 +81,13 @@
 //! drift from the baseline into a failure; it is OFF by default **on purpose**
 //! — see the header of `tests/allocs_per_eval.baseline`.
 //!
-//! Each of those two configurations has its own baseline file
-//! (`allocs_per_eval.baseline` and `allocs_per_eval.jit.baseline`) because they
-//! measure different corpora. One file would leave whichever configuration it
-//! was not blessed under comparing against nothing, which is a gate that cannot
-//! fail rather than a gate that passes.
+//! Each configuration has its own baseline file, named from the `jit` and `vm`
+//! features (`allocs_per_eval[.jit][.vm].baseline`) — see [`baseline_path`].
+//! Those are the two features that change what a run *means*: `jit` decides
+//! which rows exist, `vm` decides which evaluator the `walker/*` rows measure.
+//! One shared file would let a blessing under either overwrite the other's
+//! reference, and leave the loser comparing against numbers that were never its
+//! own — a gate that cannot fail rather than a gate that passes.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -730,17 +732,33 @@ fn regvm_group(_out: &mut Vec<Row>) {}
 // baseline
 // ---------------------------------------------------------------------------
 
-/// One baseline per row set, so both invocations anyone actually makes are
-/// gated: a plain `cargo test -p cel` and a `--features jit-cranelift` run
-/// measure different corpora, and a single file could only ever cover one of
-/// them. A baseline that no real configuration can compare against is a gate
-/// that cannot fail.
+/// The baseline file for this configuration, named from the two features that
+/// change what a run *means* rather than merely what it costs.
+///
+/// `jit` decides which rows exist — it is what builds `regvm/*`. `vm` decides
+/// which evaluator every `walker/*` row measures. Either one sharing a file with
+/// its opposite gives a blessing under one configuration the power to overwrite
+/// the other's reference, silently, and the loser then compares against numbers
+/// that were never its own.
+///
+/// The name is *built* from the two rather than chosen by an if-else chain, so
+/// it is total over the matrix: adding a third such feature cannot accidentally
+/// leave two combinations sharing a file.
+///
+/// No other feature appears here on purpose. `regex`, `chrono`, `json`, `bytes`
+/// and `structs` neither add rows nor change which evaluator runs, so splitting
+/// on them would multiply files without separating anything; a run that differs
+/// in one of those is caught by the `features` header instead, which refuses the
+/// comparison outright under `CEL_ALLOCS_GATE=1`.
 fn baseline_path() -> std::path::PathBuf {
-    let name = if cfg!(feature = "jit") {
-        "tests/allocs_per_eval.jit.baseline"
-    } else {
-        "tests/allocs_per_eval.baseline"
-    };
+    let mut name = String::from("tests/allocs_per_eval");
+    if cfg!(feature = "jit") {
+        name.push_str(".jit");
+    }
+    if cfg!(feature = "vm") {
+        name.push_str(".vm");
+    }
+    name.push_str(".baseline");
     std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(name)
 }
 
@@ -839,15 +857,21 @@ const BASELINE_HEADER: &str = "\
 #   fatal — do that in a re-measurement of ONE change on ONE machine, never as a
 #   default CI gate.
 #
-# There are TWO baselines, one per row set, because there are two invocations
-# people actually make and a single file can only cover one of them:
+# There is one baseline per (jit, vm) combination, because those are the two
+# features that change what a run MEANS rather than what it costs -- `jit` adds
+# the `regvm/*` rows, and `vm` decides which evaluator every `walker/*` row
+# measures. Sharing a file between two of these lets a blessing under one
+# overwrite the other's reference without a word:
 #
-#   allocs_per_eval.baseline      no jit backend, 52 rows -- `cargo test -p cel`
-#   allocs_per_eval.jit.baseline  a jit backend,  64 rows -- adds `regvm/*`
+#   allocs_per_eval.baseline         walker, no jit backend -- `cargo test -p cel`
+#   allocs_per_eval.vm.baseline      bytecode VM, no jit backend
+#   allocs_per_eval.jit.baseline     walker, a jit backend -- adds `regvm/*`
+#   allocs_per_eval.jit.vm.baseline  bytecode VM, a jit backend
 #
 # Bless the one matching your configuration:
 #
 #   CEL_ALLOCS_BLESS=1 cargo test -p cel --test allocs_per_eval
+#   CEL_ALLOCS_BLESS=1 cargo test -p cel --features vm --test allocs_per_eval
 #   CEL_ALLOCS_BLESS=1 cargo test -p cel --features jit-cranelift \\
 #       --test allocs_per_eval
 #
