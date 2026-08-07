@@ -11,6 +11,11 @@
 //! It replaces the old `majit::smoke` mainloop, a second hand-written
 //! `#[jit_interp]` register machine that proved the same properties on a
 //! synthetic bytecode that evaluated no CEL.
+//!
+//! ⚠ The three address-ownership tests below replaced one that could not fail
+//! in any tree: it swept a single comparison, so every program it built shared
+//! one `DRIVERS` key. The invariant had no failing-capable test, which is
+//! exactly why deleting the mechanism that enforced it looked safe.
 
 #![cfg(feature = "jit")]
 
