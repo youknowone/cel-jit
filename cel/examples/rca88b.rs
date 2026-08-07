@@ -2284,6 +2284,85 @@ fn threshold_control(label: &str, lowered: &LoweredF) {
     }
 }
 
+/// Probe R. Probe Q turns the artifact's size into an EXTERNAL lever: at n=4 the
+/// optimized loop is 13 ops under threshold 12 and 25 under threshold 8, and
+/// nothing else about the run differs — same expression, same batch, same rows
+/// per call, same driver constructor. That is the A/B the size question has been
+/// missing, and it is much sharper than comparing two n.
+///
+/// Probe P's note reads two cranelift per-entry sizes at 64 B / 200 B (n=2)
+/// against 96 B / 216 B (n=10) and concludes "a per-ENTRY structure is sized by
+/// the whole batch". Between two n, "sized by the batch" and "sized by the
+/// optimized trace" are the same column; here they are not. If either size
+/// tracks the trace, it moves across this pair with n held; if neither does, the
+/// growth from 13 ops to 25 costs nothing at runtime and Probe P's reading is
+/// about n after all.
+///
+/// The totals are known to agree in advance — Probe Q reads 73/73 at n=4, 96/96
+/// at n=5 — so this is a pure reshuffle test. A zero diff is a real answer, not
+/// a failed measurement.
+///
+/// ⚠ A histogram is a MULTISET. When two buckets empty and two fill, the diff
+/// says which sizes moved and cannot say which size BECAME which: `64→96 with
+/// 200→216` and `64→216 with 200→96` produce the same four columns. So this
+/// probe establishes WHICH SIZES ARE TRACE-SENSITIVE and how many there are;
+/// pairing them, and hence any per-allocation growth law, needs identity at the
+/// allocation site and is not derivable from here.
+fn size_against_trace_length(label: &str, lowered: &LoweredF) {
+    println!("\nProbe R — {label}: does any allocation SIZE track the optimized trace?");
+
+    const CALLS: usize = 900;
+
+    // Each row is (n, flat threshold, grown threshold), read off Probe Q. Both
+    // members are single-loop cells: a MIXED cell runs two artifacts at once and
+    // could not attribute a difference to either.
+    for (n, t_flat, t_grown) in [(4usize, 12u32, 8u32), (5, 8, 9), (6, 5, 8)] {
+        println!("\n  n={n}: threshold {t_flat} (13 ops) vs threshold {t_grown} (25 ops)");
+        let mut arms: Vec<(u32, u64, usize, usize, Vec<u64>)> = Vec::new();
+        for t in [t_flat, t_grown] {
+            let (rs, cs) = census(lowered, n, CALLS, t);
+            let ops: Vec<String> = cs
+                .iter()
+                .map(|c| format!("{}->{}", c.ops_before, c.ops_after))
+                .collect();
+            let r = rs
+                .iter()
+                .filter(|r| r.calls >= 20)
+                .max_by_key(|r| r.calls)
+                .expect("no regime holds 20 calls");
+            println!(
+                "    t={t:<3} trace {:<12} allocs {:>5}  gf {}  calls {}",
+                ops.join(","),
+                r.allocs,
+                r.gf,
+                r.calls
+            );
+            println!("      {}", hist_u(&r.hist));
+            arms.push((t, r.allocs, r.gf, r.calls, r.hist.clone()));
+        }
+        // A difference in `gf` would mean the two arms are not the same
+        // exit-kind mix, and the histogram diff would then be reading the guard
+        // exit rather than the trace length.
+        if arms[0].2 != arms[1].2 {
+            println!(
+                "    ⛔ gf differs ({} vs {}) — this pair cannot isolate the trace length",
+                arms[0].2, arms[1].2
+            );
+            continue;
+        }
+        let d = hist_diff(&arms[0].4, &arms[1].4);
+        let moved = d.iter().filter(|&&c| c != 0).count();
+        if moved == 0 {
+            println!("    buckets that moved: NONE — no size is trace-sensitive");
+        } else {
+            println!(
+                "    buckets that moved ({moved}, flat − grown): {}",
+                hist_line(&d)
+            );
+        }
+    }
+}
+
 fn main() {
     let schema = flat_schema();
     let arith = lower("price + qty * 2", &schema);
@@ -2301,6 +2380,20 @@ fn main() {
     // same gate.
     if std::env::var_os("RCA88B_THRESHOLD").is_some() {
         threshold_control("arith price + qty * 2", &arith);
+        println!("\nload after probes:  {}", loadavg());
+        return;
+    }
+    // Probe R needs Probe Q's threshold lever and P's histogram, and it is the
+    // only probe that reads the two against each other.
+    if std::env::var_os("RCA88B_PAIR").is_some() {
+        size_against_trace_length("arith price + qty * 2", &arith);
+        // A second expression moves the op counts off 13/25 without touching the
+        // back-edge arithmetic the flat/grown lever runs on. If a size is a
+        // function of the trace it has to move here too, and by a different
+        // amount; if it reads the same 64/96 against a different pair of op
+        // counts, it is keyed on something the two expressions share.
+        let long = lower("price + qty * 2 + price * 3 + qty", &schema);
+        size_against_trace_length("arith price + qty*2 + price*3 + qty", &long);
         println!("\nload after probes:  {}", loadavg());
         return;
     }
