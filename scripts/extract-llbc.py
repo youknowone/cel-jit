@@ -36,6 +36,7 @@ one. After editing `<pyre-root>/scripts/llbc_extract.py`, re-extract with
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -90,13 +91,22 @@ SPECS: dict[str, CrateSpec] = {
         # cel's dependency graph is resolved through a git rev for the majit
         # crates, so a `cargo metadata` walk would need the network on a cold
         # cache and would return no path dependencies anyway. The artefact's
-        # declared inputs are exactly cel's own tracked sources plus the
-        # lockfile (which pins the majit rev).
+        # declared inputs are cel's own tracked sources.
+        #
+        # ⛔ This comment used to end "plus the lockfile (which pins the majit
+        # rev)", and that was false: `Cargo.lock` is gitignored here, so the
+        # `BASE_PATHSPECS` entry naming it matched nothing and the rev was never
+        # hashed. It was the stated reason for skipping the more expensive
+        # `cargo metadata` walk, so the cheaper option was justified by coverage
+        # that did not exist. See `refuse_inert_pathspecs` below, and #119 for
+        # the still-open question of how to cover it.
         #
         # ⚠ The majit rev IS an input: `run_mainloop_f`'s signature names
         # `majit_metainterp::JitDriver<VmStateF>`, so majit's type layouts land
-        # in `cel.ullbc`. `Cargo.lock` covers the DECLARED rev. It does not
-        # cover the uncommitted `.cargo/config.toml` `[patch]` that redirects
+        # in `cel.ullbc` — and `majit-macros` is a proc macro, so it changes
+        # cel's own item bodies, not merely layouts. NOTHING currently
+        # fingerprints any of that. It is also not covered by the uncommitted
+        # `.cargo/config.toml` `[patch]` that redirects
         # those git deps to the enclosing pyre worktree while cel-jit lives
         # inside it — a local override this driver cannot see, and one that has
         # been observed to come and go under a concurrent session. When the
@@ -152,14 +162,76 @@ SPECS: dict[str, CrateSpec] = {
 # Only the whole-crate artefact by default; `cel-portals` is opt-in.
 DEFAULT_CRATES = ["cel"]
 
+# ⛔ `Cargo.lock` is NOT here, and its absence is deliberate rather than an
+# oversight. It is gitignored in this repo (`.gitignore:2`), and the engine
+# builds its input set as `ls_files() | ls_files("--others",
+# "--exclude-standard")` — tracked ∪ untracked-not-ignored — so an ignored file
+# is in neither. Naming it produced the appearance of coverage and nothing else.
+# Listing it again would restore the appearance, not the coverage; covering it
+# for real needs a channel the engine does not have (#119).
 BASE_PATHSPECS = [
-    "Cargo.lock",
     "Cargo.toml",
     "scripts/extract-llbc.py",
 ]
 
 
+def refuse_inert_pathspecs(pathspecs: list[str], label: str) -> None:
+    """Refuse a declared fingerprint input that cannot contribute anything.
+
+    A pathspec is only an input if `git` will list a file under it, because the
+    engine's `fingerprint_inputs` asks git and nothing else. A pathspec matching
+    zero files is therefore a silent no-op — and a no-op that READS as coverage
+    everywhere a human looks: in this list, in the comments that cite it, and in
+    the design decisions that rest on it. `Cargo.lock` sat here doing nothing
+    while a comment eight lines up called it an input.
+
+    Refusing is the cheaper half of the fix and catches the whole class: it
+    would have fired the day either offender was added. Actually covering an
+    ignored-but-load-bearing file is the other half and needs the engine (#119).
+
+    The two failure modes need different remedies, so the message separates
+    them: a path that EXISTS but is ignored is a coverage hole, a path that does
+    not exist is a typo or a file that moved.
+    """
+
+    def git_lists(*args: str) -> bool:
+        result = subprocess.run(
+            ["git", "-C", str(ROOT), *args],
+            check=True,
+            stdout=subprocess.PIPE,
+        )
+        return bool(result.stdout.strip())
+
+    inert: list[tuple[str, bool]] = []
+    for spec in pathspecs:
+        tracked = git_lists("ls-files", "--", spec)
+        untracked = git_lists("ls-files", "--others", "--exclude-standard", "--", spec)
+        if not (tracked or untracked):
+            inert.append((spec, (ROOT / spec).exists()))
+    if not inert:
+        return
+
+    lines = [f"extract-llbc.py: {label} declares pathspecs that match no file:"]
+    for spec, on_disk in inert:
+        if on_disk:
+            lines.append(
+                f"  {spec!r} — EXISTS on disk but git will not list it (ignored?),"
+                f" so it contributes nothing to the fingerprint."
+                f" Either stop declaring it or cover it another way; do not"
+                f" leave it here reading as coverage."
+            )
+        else:
+            lines.append(
+                f"  {spec!r} — does not exist. Renamed, moved, or a typo:"
+                f" whatever it was meant to fingerprint is now unfingerprinted."
+            )
+    raise SystemExit("\n".join(lines))
+
+
 def main() -> None:
+    refuse_inert_pathspecs(BASE_PATHSPECS, "BASE_PATHSPECS")
+    for name, spec in SPECS.items():
+        refuse_inert_pathspecs(spec.fingerprint_pathspecs, f"SPECS[{name!r}]")
     run_cli(
         SPECS,
         DEFAULT_CRATES,
