@@ -1,10 +1,8 @@
 use crate::common::types::CelInt;
 use crate::common::value::Val;
 use crate::ExecutionError;
-use std::any::Any;
 use std::borrow::Cow;
 use std::cmp::Ordering;
-use std::fmt::Debug;
 
 pub type TraitSet = u16;
 
@@ -108,10 +106,6 @@ pub trait Indexer {
     fn get<'a>(&'a self, _idx: &dyn Val) -> Result<Cow<'a, dyn Val>, ExecutionError>;
 
     fn steal(self: Box<Self>, _idx: &dyn Val) -> Result<Box<dyn Val>, ExecutionError>;
-}
-
-pub trait Lister: Debug + Any {
-    fn as_indexer(&self) -> &dyn Indexer;
 }
 
 pub(crate) mod adapter {
