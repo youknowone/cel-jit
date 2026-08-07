@@ -733,6 +733,31 @@ fn regvm_group(out: &mut Vec<Row>) {
             // sits, not a property of the tier, and it stops being true if
             // WARMUP or ITERS grows.
             let bridges = after.bridges_compiled - before.bridges_compiled;
+            // The comment above ends "that stops being true if WARMUP or ITERS
+            // grows", and this is what makes that enforceable rather than
+            // advisory. Note it cannot be spelled as a consistency check
+            // between the label and `bridges`: the label is DEFINED as
+            // `compiled == 0 && bridges == 0` three lines down, so asserting
+            // that a WARM row has `bridges == 0` restates the definition and
+            // can never fail. What is not definitional is that the WINDOW is
+            // sized to end before the first bridge -- a property of WARMUP,
+            // ITERS and ROUNDS, not of the label.
+            //
+            // Testing the effect rather than `calls < 200` keeps this correct
+            // if the schedule itself moves (CEL_TRACE_EAGERNESS).
+            //
+            // A numeric drift here can be silenced by re-blessing; this cannot.
+            assert_eq!(
+                bridges, 0,
+                "regvm/jit/{}/n={n} is documented and blessed as a PRE-BRIDGE row, \
+                 but its {calls}-call window now spans {bridges} guard bridge(s). \
+                 The row no longer measures the regime its baseline records. \
+                 Shrink the window (WARMUP={WARMUP} ITERS={ITERS} ROUNDS={ROUNDS}) \
+                 or move the row to regvm/jit-steady/*, which measures post-bridge \
+                 on purpose. Do not re-bless: the number would be right for a \
+                 different regime than the row's name and comment claim.",
+                case.label
+            );
             out[first].detail = format!(
                 "over {calls} calls: compiled={compiled} bridges={bridges} aborted={} \
                  guard_fails={} — {}",
