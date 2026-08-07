@@ -75,6 +75,90 @@ fn measure_warm(
 /// One swept data shape: a label and the per-row element count it produces.
 type Shape = (&'static str, fn(usize) -> i64);
 
+/// `rlib/jit.py:590` / `warmstate.rs:259 DEFAULT_TRACE_EAGERNESS`.
+///
+/// A guard does not bridge on its first failure: each failure ticks its own
+/// counter by `1/trace_eagerness` and the bridge is attached when that counter
+/// crosses 1.0 (`compile.py:783-784`, ported at `pyjitpl.rs:10937` ->
+/// `warmstate.rs:1191-1193`). The counter is keyed per guard, so a batch's whole
+/// deopt bill is `trace_eagerness` for every guard that ever goes hot — a
+/// constant in the ROWS, which is the property a deopt budget exists to pin.
+///
+/// Budgeting a fixed small number instead asserts that no guard in the shape
+/// ever goes hot, which is unreachable for anything that bridges at all. That is
+/// what the old constant-16 budgets asserted, and they were recorded when the
+/// inner element loop was still inlined into the outer row trace and there was
+/// no separate inner-loop exit guard to warm up.
+const TRACE_EAGERNESS: usize = 200;
+
+/// Guards that are still mid-warmup when the batch ends: they have ticked
+/// without having attached a bridge yet, so they cost failures that
+/// `bridges_compiled` does not yet account for.
+///
+/// 2 is read off the widest shape pinned below rather than chosen. `spread
+/// 0..32` attaches 1 bridge at 4000 rows and 3 from 20000 rows up, so exactly
+/// two more guards were part-warmed when the short batch ended — 451 deopts
+/// against `1 * 200 + 2 * 200 + 1`. Every other shape here needs less.
+///
+/// It is NOT "a shape with many distinct trip counts leaves a couple", which is
+/// the plausible-sounding version and is measured false: the inner loop's exit
+/// is one guard however varied the lengths are, so breadth does not multiply
+/// guards. Widening the spread makes the count go DOWN, not up — 0..32 gives
+/// 451, 0..200 gives 240, 0..2000 gives 204, all at 4000 rows with 1 bridge.
+/// What 2 tracks is how far behind `bridges_compiled` runs at a short batch
+/// size, nothing about the data's shape.
+const WARMING_SLACK: usize = 2;
+
+/// The deopt budget for a batch that attached `bridges` bridges: every failure
+/// is either warmup toward some guard's bridge or the batch's own final exit.
+///
+/// This is independent of the row count by construction, so a per-row bail —
+/// the regression these tests exist to catch — blows it at every batch size.
+///
+/// **That bound has been shown to fire, not just argued to.** Forcing the defect
+/// back in by making bridging impossible (a temporary `trace_eagerness` override
+/// of 10_000_000 inside `float_bank::new_driver_f`, so no guard's counter can
+/// ever cross 1.0 within the batch) turns every guard exit into a raw bail:
+///
+/// | shape | rows | bridges | deopts | budget | |
+/// |---|---|---|---|---|---|
+/// | per_row=3 | 4000 | 0 | 3997 | 401 | fires |
+/// | per_row=3 | 100000 | 0 | 99997 | 401 | fires |
+/// | per_row=8 | 4000 | 0 | 3999 | 401 | fires |
+/// | per_row=8 | 100000 | 0 | 99999 | 401 | fires |
+/// | cycle 4..12 | 100000 | 0 | 99998 | 401 | fires |
+///
+/// Deopts land on `rows - 1` to `rows - 3` and scale 1:1 with the batch while the
+/// budget does not move at all, so the gate fires by 10x at the smallest size
+/// these tests use and by 250x at the largest. Those forced counts also match the
+/// signature this shape had when the defect was live — "3996 / 3999 over 4000
+/// rows", recorded on `nested_list_loop_deopt_census` below — so what the control
+/// reproduces is the real failure mode, not a synthetic one.
+///
+/// Two other levers were tried first and do NOT reproduce it, which is worth
+/// knowing before reaching for them (`examples/rca91.rs` runs all of this):
+///
+///  * **Widening the trip-count spread**, on the theory that many distinct trip
+///    counts means many distinct guards, none reaching `trace_eagerness`. It does
+///    not — see [`WARMING_SLACK`]. Guard failures can only exceed
+///    `trace_eagerness * n_guards` if bridging itself fails, and no data shape
+///    can make that happen.
+///  * **`CEL_RETRACE_LIMIT`**, the one pre-existing env knob on this path. At 0
+///    (the shipped default, `rlib/jit.py:595`) and 1 the counts are unchanged. At
+///    5 they rise to 1401 with 5 bridges, which lands *exactly* on
+///    `warmup_budget(5)` and passes — a different tier configuration, not the
+///    defect. At 100 a single case runs past 10 minutes.
+///
+/// Note that `trace_eagerness` is not the only parameter that can render a whole
+/// mechanism inert this way: `loop_longevity` is effectively 0 against an
+/// upstream default of 1000 (`rlib/jit.py:594`), so compiled loops are never
+/// retired at all. That is a separate defect, filed as #106, and it is mentioned
+/// here only so a reader of this budget knows the answer to "what else is
+/// parameterised like this".
+fn warmup_budget(bridges: usize) -> usize {
+    TRACE_EAGERNESS * (bridges + WARMING_SLACK) + 1
+}
+
 fn lower(src: &str, schema: &Schema) -> LoweredF {
     let program = Program::compile(src).unwrap_or_else(|e| panic!("parse `{src}`: {e:?}"));
     lower_typed(program.expression(), schema).unwrap_or_else(|e| panic!("lower_typed `{src}`: {e}"))
@@ -337,16 +421,23 @@ fn list_columns(per_row: i64, rows: usize) -> (Vec<i64>, Vec<i64>, Vec<i64>) {
 /// puts an inner element loop inside the row loop with each back-edge its own
 /// `can_enter_jit` point. Sweeping the inner trip count:
 ///
-/// | elements/row | compiles | guard_fails | aborts |
-/// |---|---|---|---|
-/// | 0 | 1 | 1 | 0 |
-/// | 1 | 1 | 1 | 0 |
-/// | 2 | 2 | 1 | 0 |
-/// | 3 | 2 | 6 | 0 |
-/// | 8 | 2 | 9 | 0 |
+/// | elements/row | compiles | bridges | guard_fails | aborts |
+/// |---|---|---|---|---|
+/// | 0 | 1 | 0 | 1   | 0 |
+/// | 1 | 1 | 0 | 1   | 0 |
+/// | 2 | 2 | 0 | 1   | 0 |
+/// | 3 | 2 | 2 | 401 | 0 |
+/// | 8 | 2 | 1 | 201 | 0 |
 ///
 /// At 0 and 1 the inner back-edge is never taken, so there is only one loop.
 /// From 2 both loops compile and the batch deopts a constant number of times.
+///
+/// `guard_fails` is `TRACE_EAGERNESS * bridges + 1` on every row of that table,
+/// and `bridges` — not the trip count, not its parity — is the whole
+/// discriminator: per_row=2 and per_row=3 both compile two loops and both
+/// short-circuit at a varying element, and they differ only in that no guard
+/// goes hot at 2 while two do at 3. The counts are identical at 4000, 20000 and
+/// 100000 rows on both backends.
 ///
 /// This used to cost **one deopt per row** from trip count 3 up (3996 / 3999
 /// over 4000 rows), on two stacked `majit-metainterp` defects:
@@ -405,16 +496,20 @@ fn nested_list_loop_deopt_census() {
             Column::Int(&elems),
         ];
         let (compiles, deopts, aborts, result) = measure(&lowered, &columns, rows);
+        let bridges = jit_stats().bridges_compiled;
         eprintln!(
             "[nested] per_row={per_row} rows={rows} compiles={compiles} \
-             guard_fails={deopts} aborts={aborts} result={result:?}"
+             bridges={bridges} guard_fails={deopts} aborts={aborts} result={result:?}"
         );
         assert_eq!(aborts, 0, "per_row={per_row}: no trace should be refused");
+        let budget = warmup_budget(bridges);
         assert!(
-            deopts <= 16,
-            "per_row={per_row}: the batch should deopt a constant number of \
-             times, got {deopts} over {rows} rows — that is a per-row bail back \
-             to the interpreter"
+            deopts <= budget,
+            "per_row={per_row}: the batch should deopt a number of times that is \
+             a constant in the rows, got {deopts} over {rows} rows against a \
+             warmup budget of {budget} ({bridges} bridge(s) x {TRACE_EAGERNESS} \
+             + {WARMING_SLACK} part-warmed + 1 final exit) — that is a per-row \
+             bail back to the interpreter"
         );
         let expected_compiles = if per_row < 2 { 1 } else { 2 };
         assert_eq!(
@@ -434,14 +529,19 @@ fn nested_list_loop_deopt_census() {
 /// alternating lengths used to deopt on every second row, and a 0..32 spread on
 /// most rows:
 ///
-/// | lengths | guard_fails | aborts | was |
-/// |---|---|---|---|
-/// | 8, 8, 8, …      | 9    | 0 | 9 |
-/// | 8, 9, 8, 9, …   | 210  | 0 | 50004 / 1 abort |
-/// | 4..12 cycling   | 1609 | 0 | 88888 / 8 aborts |
-/// | 0..32 spread    | 959  | 4 | 165621 / 12 aborts |
+/// | lengths | bridges | guard_fails | aborts | was |
+/// |---|---|---|---|---|
+/// | 8, 8, 8, …      | 1 | 201 | 0 | 9 |
+/// | 8, 9, 8, 9, …   | 1 | 201 | 0 | 50004 / 1 abort |
+/// | 4..12 cycling   | 1 | 201 | 0 | 88888 / 8 aborts |
+/// | 0..32 spread    | 1 | 451 | 0 | 165621 / 12 aborts |
 ///
 /// (`was` = 100k rows before the bridge fix; the counts here are 4000 rows.)
+///
+/// Every row is `TRACE_EAGERNESS * bridges + 1` plus the failures of guards not
+/// yet warm — the spread's 451 is one attached bridge and two guards still
+/// warming, which do attach by 20000 rows. None of it scales with the rows: the
+/// same four shapes give the same counts at 20000 and 100000.
 /// The exit guard now forms a bridge instead of deopting forever:
 /// `#[jit_interp]` states with a `[.. ; virt]` array never rebuilt
 /// `virtualizable_boxes` at bridge entry (`pyjitpl.py:3449
@@ -476,14 +576,14 @@ fn nested_list_loop_varying_trip_count() {
     .collect();
     let lowered = lower("items.all(i, i.price > 10)", &schema);
 
-    let cases: [(Shape, usize); 4] = [
-        (("constant 8", |_| 8), 16),
-        (("alternating 8/9", |r| if r % 2 == 0 { 8 } else { 9 }), 400),
-        (("cycle 4..12", |r| 4 + (r % 9) as i64), 2_000),
-        (("spread 0..32", |r| ((r * 2654435761) % 32) as i64), 1_200),
+    let cases: [Shape; 4] = [
+        ("constant 8", |_| 8),
+        ("alternating 8/9", |r| if r % 2 == 0 { 8 } else { 9 }),
+        ("cycle 4..12", |r| 4 + (r % 9) as i64),
+        ("spread 0..32", |r| ((r * 2654435761) % 32) as i64),
     ];
 
-    for ((label, len_of), deopt_budget) in cases {
+    for (label, len_of) in cases {
         let lens: Vec<i64> = (0..rows).map(len_of).collect();
         let mut offsets = Vec::with_capacity(rows);
         let mut total = 0i64;
@@ -498,15 +598,27 @@ fn nested_list_loop_varying_trip_count() {
             Column::Int(&elems),
         ];
         let (compiles, deopts, aborts, result) = measure(&lowered, &columns, rows);
+        let bridges = jit_stats().bridges_compiled;
         eprintln!(
-            "[varying] {label} rows={rows} compiles={compiles} guard_fails={deopts} \
-             aborts={aborts} result={result:?}"
+            "[varying] {label} rows={rows} compiles={compiles} bridges={bridges} \
+             guard_fails={deopts} aborts={aborts} result={result:?}"
         );
         assert_eq!(compiles, 2, "{label}: both loops must compile");
+        // A shape whose inner trip count varies must still bridge its exit
+        // guard, and `bridges_compiled` is the only counter that says whether it
+        // did. Without it a batch that bridges on schedule and one that bails
+        // per row are both just "a lot of deopts".
         assert!(
-            deopts <= deopt_budget,
-            "{label}: got {deopts} deopts over {rows} rows (budget {deopt_budget}) \
-             — the exit guard is not bridging"
+            bridges >= 1,
+            "{label}: {deopts} deopts over {rows} rows and not one bridge \
+             attached — the exit guard is not bridging"
+        );
+        let budget = warmup_budget(bridges);
+        assert!(
+            deopts <= budget,
+            "{label}: got {deopts} deopts over {rows} rows against a warmup \
+             budget of {budget} ({bridges} bridge(s) x {TRACE_EAGERNESS} + \
+             {WARMING_SLACK} part-warmed + 1 final exit) — that is a per-row bail"
         );
     }
 }
