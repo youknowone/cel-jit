@@ -180,14 +180,41 @@ impl ExecutionError {
 #[derive(Debug)]
 pub struct Program {
     expression: Expression,
+    /// The code object this program runs, built once here rather than per
+    /// evaluation.
+    ///
+    /// A `Result` field rather than a widened `Program::compile` error, and
+    /// eager rather than a lazy cell, for three reasons:
+    ///
+    /// * the program **owns** its code outright, which is the arrangement a
+    ///   greens-keyed JIT cell needs -- neither a lazily filled cell nor a
+    ///   side table keyed on the expression;
+    /// * `Program::compile`'s signature stays `Result<_, ParseErrors>` in both
+    ///   feature builds. Widening it would make the public API depend on
+    ///   whether `vm` is on, which is not a choice a caller makes;
+    /// * a compile failure on an expression that *parsed* is unreachable in
+    ///   practice -- the compiler's coverage over parseable CEL is total, and
+    ///   the remaining `CompileError` variants are program-size limits -- so
+    ///   the error path is a formality that should not shape the API.
+    #[cfg(feature = "vm")]
+    code: Result<vm::CelCode, vm::CompileError>,
 }
 
 impl Program {
     pub fn compile(source: &str) -> Result<Program, ParseErrors> {
         let parser = Parser::default();
-        parser
-            .parse(source)
-            .map(|expression| Program { expression })
+        parser.parse(source).map(Program::from_expression)
+    }
+
+    #[cfg(not(feature = "vm"))]
+    fn from_expression(expression: Expression) -> Program {
+        Program { expression }
+    }
+
+    #[cfg(feature = "vm")]
+    fn from_expression(expression: Expression) -> Program {
+        let code = vm::compile(&expression);
+        Program { expression, code }
     }
 
     /// Evaluate the program.
@@ -195,20 +222,23 @@ impl Program {
     /// With the `vm` feature this is a thin wrapper over the bytecode VM's
     /// dispatch loop, and with it off it is the tree walker. The two are held
     /// to the same answers by the differential corpus in `tests/oracle.rs`.
-    ///
-    /// The VM path compiles a code object per call, which is not the shape it
-    /// will keep: a code object is meant to be built once and reused, and the
-    /// bind step that makes that possible is a later change. Nothing here is a
-    /// statement about the VM's cost.
     #[cfg(not(feature = "vm"))]
     pub fn execute(&self, context: &Context) -> ResolveResult {
         Value::resolve(&self.expression, context)
     }
 
     /// Evaluate the program. See the non-`vm` build of this method.
+    ///
+    /// Nothing is compiled here: the code object was built by
+    /// [`Program::compile`]. A compilation that failed is reported now because
+    /// that is where the caller is looking, and because the alternative would
+    /// change `Program::compile`'s error type under a cargo feature.
     #[cfg(feature = "vm")]
     pub fn execute(&self, context: &Context) -> ResolveResult {
-        crate::vm::eval(&self.expression, context)
+        match &self.code {
+            Ok(code) => vm::cel_eval_loop(code, context),
+            Err(e) => Err(ExecutionError::InternalError(format!("compiling: {e}"))),
+        }
     }
 
     /// Returns the variables and functions referenced by the CEL program
