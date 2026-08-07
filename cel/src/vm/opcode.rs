@@ -169,6 +169,18 @@ pub enum OpCode {
     Jump,
     /// Pop an operand; jump to `a` when it is false.
     JumpIfFalse,
+    /// Jump to `a` when the top operand is an empty optional, leaving it on
+    /// the stack.
+    ///
+    /// An optional container answers a plain index on its own -- `opt_none[k]`
+    /// is `optional.none` -- and it answers *before* the key is evaluated, so
+    /// `opt_none[1 / 0]` does not divide. That order is unobservable in a tree
+    /// walker, which reaches the container first because it recurses; a flat
+    /// stream has to say it.
+    ///
+    /// The operand is left in place rather than replaced with a fresh
+    /// `optional.none`, because an empty optional is what the result is.
+    JumpIfOptNone,
     /// Pop an operand; jump to `a` when it is true.
     JumpIfTrue,
     /// The left half of `&&`: pop the left operand into logic slot `a`. When
@@ -216,6 +228,7 @@ impl OpCode {
             | OpCode::StructSetOptional
             | OpCode::Jump
             | OpCode::JumpIfFalse
+            | OpCode::JumpIfOptNone
             | OpCode::JumpIfTrue
             | OpCode::AndMerge
             | OpCode::OrMerge => 1,
@@ -310,7 +323,10 @@ impl OpCode {
             // untouched, and the compiler restores the depth itself.
             OpCode::CallQualified => (arity(1), 1),
 
-            OpCode::Jump => (0, 0),
+            // Both paths leave the operand where it is: the falling-through
+            // one because the index still needs it, the jumping one because
+            // an empty optional is the answer.
+            OpCode::Jump | OpCode::JumpIfOptNone => (0, 0),
             // Declared for the falling-through path, where the operand moves
             // into the logic slot. The short-circuiting path pushes the
             // answer instead, so both paths reach the merge one deep.

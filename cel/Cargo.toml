@@ -126,6 +126,14 @@ regex = ["dep:regex"]
 chrono = ["dep:chrono"]
 dhat-heap = [ ] # if you are doing heap profiling
 
+# Route `Program::execute` through the bytecode VM instead of the tree walker.
+#
+# Off by default while the two evaluators coexist. The differential oracle runs
+# BOTH regardless of this flag -- it calls each door directly -- so turning the
+# feature off does not turn the VM's gate off. What the flag decides is which
+# evaluator a *caller* gets.
+vm = []
+
 # PoC: meta-tracing JIT tier built on the in-repo `majit` framework (cell-majit,
 # issue #357). Additive and off by default. Applies majit's RPython-style
 # meta-tracer to a traceable CEL evaluation mainloop.

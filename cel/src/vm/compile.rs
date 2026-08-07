@@ -342,8 +342,6 @@ fn simple_operator(name: &str) -> Option<(OpCode, usize)> {
         operators::GREATER => (OpCode::Greater, 2),
         operators::GREATER_EQUALS => (OpCode::GreaterEquals, 2),
         operators::IN => (OpCode::In, 2),
-        operators::INDEX => (OpCode::Index, 2),
-        operators::OPT_INDEX => (OpCode::OptIndex, 2),
         operators::LOGICAL_NOT => (OpCode::Not, 1),
         operators::NEGATE => (OpCode::Negate, 1),
         operators::NOT_STRICTLY_FALSE => (OpCode::NotStrictlyFalse, 1),
@@ -370,6 +368,8 @@ impl Compiler {
                 operators::LOGICAL_AND => return self.short_circuit(call, OpCode::And, id),
                 operators::LOGICAL_OR => return self.short_circuit(call, OpCode::Or, id),
                 operators::OPT_SELECT => return self.opt_select(call, id),
+                operators::INDEX => return self.index(call, OpCode::Index, id),
+                operators::OPT_INDEX => return self.index(call, OpCode::OptIndex, id),
                 _ => {}
             }
         }
@@ -420,12 +420,14 @@ impl Compiler {
     /// the logic slot. The right operand is deliberately outside that range:
     /// an error there propagates, matching the walker's `?`.
     ///
-    ///     [handler start]
-    ///       <a>
-    ///     [handler end]   And   logic, L_short   ; a -> logic; false short-circuits
-    ///     [handler land]  <b>
-    ///                     AndMerge logic          ; combine, or raise
-    ///     L_short:
+    /// ```text
+    /// [handler start]
+    ///   <a>
+    /// [handler end]   And   logic, L_short   ; a -> logic; false short-circuits
+    /// [handler land]  <b>
+    ///                 AndMerge logic          ; combine, or raise
+    /// L_short:
+    /// ```
     ///
     /// Each operator gets its own logic slot, because a nested `&&` in the
     /// right operand writes its own between this one's write and read.
@@ -465,6 +467,23 @@ impl Compiler {
         // The slot is dead once the merge has read it, so a sibling operator
         // reuses it rather than growing the record.
         self.next_logic = logic;
+        Ok(())
+    }
+
+    /// `a[b]` and `a[?b]`.
+    ///
+    /// Not a plain two-operand operator, because an optional container decides
+    /// the whole expression by itself and does so *before* the key runs:
+    /// `opt_none[1 / 0]` is `optional.none`, not a division error. The guard
+    /// is what puts that order into a stream that would otherwise evaluate
+    /// both operands and only then look at either.
+    fn index(&mut self, call: &CallExpr, op: OpCode, id: u64) -> Result<(), CompileError> {
+        self.check_arity(call, 2, id)?;
+        self.expr(&call.args[0])?;
+        let none = self.emit_forward(OpCode::JumpIfOptNone, id)?;
+        self.expr(&call.args[1])?;
+        self.emit(op, &[], id)?;
+        self.patch_to_here(none);
         Ok(())
     }
 

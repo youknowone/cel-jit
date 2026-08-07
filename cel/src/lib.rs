@@ -190,8 +190,25 @@ impl Program {
             .map(|expression| Program { expression })
     }
 
+    /// Evaluate the program.
+    ///
+    /// With the `vm` feature this is a thin wrapper over the bytecode VM's
+    /// dispatch loop, and with it off it is the tree walker. The two are held
+    /// to the same answers by the differential corpus in `tests/oracle.rs`.
+    ///
+    /// The VM path compiles a code object per call, which is not the shape it
+    /// will keep: a code object is meant to be built once and reused, and the
+    /// bind step that makes that possible is a later change. Nothing here is a
+    /// statement about the VM's cost.
+    #[cfg(not(feature = "vm"))]
     pub fn execute(&self, context: &Context) -> ResolveResult {
         Value::resolve(&self.expression, context)
+    }
+
+    /// Evaluate the program. See the non-`vm` build of this method.
+    #[cfg(feature = "vm")]
+    pub fn execute(&self, context: &Context) -> ResolveResult {
+        crate::vm::eval(&self.expression, context)
     }
 
     /// Returns the variables and functions referenced by the CEL program

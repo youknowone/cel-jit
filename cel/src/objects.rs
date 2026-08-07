@@ -1720,17 +1720,17 @@ impl Value {
 }
 
 /// Wraps `value` in an `optional`.
-fn optional_of(value: Value) -> Value {
+pub(crate) fn optional_of(value: Value) -> Value {
     Value::Opaque(Arc::new(OptionalValue::of(value)))
 }
 
 /// The empty `optional`.
-fn optional_none() -> Value {
+pub(crate) fn optional_none() -> Value {
     Value::Opaque(Arc::new(OptionalValue::none()))
 }
 
 /// Views `value` as an optional, if it is one.
-fn as_optional(value: &Value) -> Option<&OptionalValue> {
+pub(crate) fn as_optional(value: &Value) -> Option<&OptionalValue> {
     match value {
         Value::Opaque(o) => o.downcast_ref::<OptionalValue>(),
         _ => None,
@@ -1781,6 +1781,16 @@ fn mismatch_is_no_such_overload(op: &'static str, value: &Value) -> bool {
 fn binary_op(op: &'static str, call: &CallExpr, ctx: &Context) -> Result<Value, ExecutionError> {
     let lhs = Value::resolve_value(&call.args[0], ctx)?;
     let rhs = Value::resolve_value(&call.args[1], ctx)?;
+    binary_values(op, lhs, rhs)
+}
+
+/// The operand-level half of [`binary_op`], shared with the bytecode VM, whose
+/// operands arrive from the stack rather than from an expression.
+pub(crate) fn binary_values(
+    op: &'static str,
+    lhs: Value,
+    rhs: Value,
+) -> Result<Value, ExecutionError> {
     let rewrite = mismatch_is_no_such_overload(op, &lhs);
     let result = match op {
         "add" => lhs + rhs,
@@ -1826,6 +1836,15 @@ fn compare_op(
 ) -> Result<Value, ExecutionError> {
     let lhs = Value::resolve_value(&call.args[0], ctx)?;
     let rhs = Value::resolve_value(&call.args[1], ctx)?;
+    compare_values(lhs, rhs, accept)
+}
+
+/// The operand-level half of [`compare_op`], shared with the bytecode VM.
+pub(crate) fn compare_values(
+    lhs: Value,
+    rhs: Value,
+    accept: impl FnOnce(Ordering) -> bool,
+) -> Result<Value, ExecutionError> {
     if !has_comparer(&lhs) {
         return Err(ExecutionError::NoSuchOverload);
     }
@@ -1835,7 +1854,7 @@ fn compare_op(
     Ok(Value::Bool(accept(ordering)))
 }
 
-fn value_negate(value: Value) -> Result<Value, ExecutionError> {
+pub(crate) fn value_negate(value: Value) -> Result<Value, ExecutionError> {
     match value {
         Value::Int(i) => i
             .checked_neg()
@@ -1850,7 +1869,7 @@ fn value_negate(value: Value) -> Result<Value, ExecutionError> {
 }
 
 /// Converts `value` into a map key.
-fn value_key(value: Value) -> Result<Key, ExecutionError> {
+pub(crate) fn value_key(value: Value) -> Result<Key, ExecutionError> {
     match value {
         Value::Int(i) => Ok(Key::Int(i)),
         Value::UInt(u) => Ok(Key::Uint(u)),
@@ -1864,7 +1883,7 @@ fn value_key(value: Value) -> Result<Key, ExecutionError> {
 ///
 /// `KeyRef::String` borrows, so a map field select costs no allocation. Going
 /// through [`value_index`] would build an `Arc<String>` per access.
-fn value_field(container: &Value, field: &str) -> Result<Value, ExecutionError> {
+pub(crate) fn value_field(container: &Value, field: &str) -> Result<Value, ExecutionError> {
     match container {
         Value::Map(map) => map
             .get(&KeyRef::String(field))
@@ -1881,7 +1900,7 @@ fn value_field(container: &Value, field: &str) -> Result<Value, ExecutionError> 
 }
 
 /// `container[key]`, for every container the walker can index.
-fn value_index(container: &Value, key: &Value) -> Result<Value, ExecutionError> {
+pub(crate) fn value_index(container: &Value, key: &Value) -> Result<Value, ExecutionError> {
     match container {
         Value::List(list) => {
             let idx = match key {
@@ -1948,7 +1967,7 @@ fn key_display(key: &Key) -> String {
 ///
 /// A needle that cannot be a map key is an error rather than a miss, which is
 /// why the conversion is propagated instead of folded into `false`.
-fn value_contains(container: &Value, needle: &Value) -> Result<bool, ExecutionError> {
+pub(crate) fn value_contains(container: &Value, needle: &Value) -> Result<bool, ExecutionError> {
     match container {
         Value::List(list) => Ok(list.contains(needle)),
         Value::Map(map) => Ok(map.contains_key(&value_key(needle.clone())?)),
@@ -1957,7 +1976,7 @@ fn value_contains(container: &Value, needle: &Value) -> Result<bool, ExecutionEr
 }
 
 /// The elements a comprehension iterates over.
-fn value_iter(value: &Value) -> Result<Vec<Value>, ExecutionError> {
+pub(crate) fn value_iter(value: &Value) -> Result<Vec<Value>, ExecutionError> {
     match value {
         Value::List(list) => Ok(list.to_vec()),
         Value::Map(map) => Ok(map_keys(map)),

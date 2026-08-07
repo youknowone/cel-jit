@@ -42,9 +42,26 @@
 pub mod code;
 pub mod compile;
 pub mod error;
+pub mod interp;
 pub mod opcode;
 
 pub use code::{CelCode, Handler};
 pub use compile::{compile, CompileError, CompileErrorKind};
 pub use error::{CelErr, CelResult, ColdId, NameId};
+pub use interp::cel_eval_loop;
 pub use opcode::{OpCode, OPCODE_COUNT};
+
+use crate::common::ast::IdedExpr;
+use crate::{Context, ExecutionError, Value};
+
+/// Compile `expr` and run it: the whole VM as one door.
+///
+/// The signature matches the tree walker's so the differential oracle can hold
+/// the two to the same corpus. A compile failure is not an evaluation error,
+/// so it deliberately renders as an internal one rather than as anything the
+/// corpus could accidentally expect.
+pub fn eval(expr: &IdedExpr, ctx: &Context) -> Result<Value, ExecutionError> {
+    let code =
+        compile(expr).map_err(|e| ExecutionError::InternalError(format!("compiling: {e}")))?;
+    cel_eval_loop(&code, ctx)
+}

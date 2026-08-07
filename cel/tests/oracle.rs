@@ -100,10 +100,16 @@ struct Evaluator {
 /// frozen expectation for whatever replaces this one. A second row goes back
 /// here the moment there is a second door — the bytecode VM of P4 onwards — and
 /// nothing else about this file has to change for that.
-const EVALUATORS: &[Evaluator] = &[Evaluator {
-    name: "value-walker",
-    eval: Value::resolve_value,
-}];
+const EVALUATORS: &[Evaluator] = &[
+    Evaluator {
+        name: "value-walker",
+        eval: Value::resolve_value,
+    },
+    Evaluator {
+        name: "bytecode-vm",
+        eval: cel::vm::eval,
+    },
+];
 
 // ---------------------------------------------------------------------------
 // the canonical rendering — the ONLY code that reads a `Value`'s shape
