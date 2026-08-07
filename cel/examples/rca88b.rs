@@ -1615,6 +1615,99 @@ fn long_horizon(label: &str, lowered: &LoweredF) {
     println!("  staying flat at its call-220 value means the step is permanent as filed.");
 }
 
+/// Probe N. Probe M fitted `allocs/call = a*(n-1) + b` over n = 10/100/1000 and
+/// got exact integers: portal `12(n-1)+4`, pre-bridge `69` (CL) / `66` (DYN),
+/// post-bridge `23(n-1)+4` (CL) / `20(n-1)+4` (DYN). The load-bearing reading is
+/// that **`b` falls 69 -> 4 across the bridge**, i.e. the compiled entry price
+/// stops being paid.
+///
+/// ⛔ That reading is the *weakest* part of the fit. At n=1000 the constant term
+/// is 0.02% of the total, so the n=1000 point barely constrains it; `b` is
+/// carried almost entirely by n=10. **A fitted constant must be tested where it
+/// dominates, not where it rounds away.**
+///
+/// So this runs the same axis at n = 2, 3, 5, 8, where `b` is 6-25% of the
+/// total — and it yields a discriminator that needs **no model at all**:
+///
+/// ```text
+/// n=2 post-bridge is predicted at 23*1 + 4 = 27 allocations/call,
+/// which is BELOW the pre-bridge entry price of 69/call.
+/// ```
+///
+/// If the artifact still paid its compiled entry after the bridge, the total
+/// could not fall below 69 no matter what the per-back-edge term is. So a
+/// post-bridge reading under 69 at n=2 refutes "the entry is still paid" by
+/// inequality, independent of whether the linear model is right.
+///
+/// ⚠ `loops` is printed because the inference dies if the loop never compiles at
+/// these row counts: an uncompiled arm would read the portal's `12(n-1)+4`,
+/// which at n=2 is 16 — also under 69, and for the wrong reason.
+fn small_n_constant(label: &str, lowered: &LoweredF) {
+    println!("\nProbe N — {label}: test the per-call constant where it is not negligible");
+    println!(
+        "  {:>4} {:>9} {:>7} {:>9} {:>9} {:>10} {:>6} {:>6} {:>7}",
+        "n", "portal", "brdg@", "pre", "post", "post pred", "loops", "brdg", "entry?"
+    );
+
+    const CALLS: usize = 700;
+
+    for n in [2usize, 3, 5, 8, 10] {
+        let (price, qty) = flat_columns(n);
+        let columns = vec![Column::Int(&price), Column::Int(&qty)];
+
+        reset_persistent_state();
+        for _ in 0..8 {
+            black_box(eval_batch_sum_f(lowered, &columns, n, NEVER));
+        }
+        let (_, portal) = metered(|| black_box(eval_batch_sum_f(lowered, &columns, n, NEVER)));
+
+        reset_persistent_state();
+        reset_jit_stats();
+        let mut allocs: Vec<u64> = Vec::with_capacity(CALLS);
+        // ⛔ The first version of this probe read fixed windows and was wrong at
+        // n=5: probe M already showed the first bridge lands at a different call
+        // index for different n, so a fixed "pre" window silently sampled the
+        // post-bridge regime. Locate the bridge instead of assuming it.
+        let mut brdg_at = 0usize;
+        for k in 0..CALLS {
+            let (_, a) = metered(|| black_box(eval_batch_sum_f(lowered, &columns, n, THRESHOLD)));
+            allocs.push(a);
+            if brdg_at == 0 && jit_stats().bridges_compiled > 0 {
+                brdg_at = k + 1;
+            }
+        }
+        let s = jit_stats();
+        let mean = |r: std::ops::Range<usize>| -> f64 {
+            let len = r.len() as f64;
+            allocs[r].iter().sum::<u64>() as f64 / len
+        };
+        // 20 calls ending just before the bridge, and the last 20 of the run.
+        let pre = if brdg_at > 21 {
+            mean(brdg_at - 21..brdg_at - 1)
+        } else {
+            f64::NAN
+        };
+        let post = mean(CALLS - 20..CALLS);
+        // The cranelift/dynasm slopes differ, so predict with whichever this
+        // binary was built against rather than hard-coding one backend.
+        let slope = if cfg!(feature = "jit-cranelift") { 23.0 } else { 20.0 };
+        let pred = slope * (n as f64 - 1.0) + 4.0;
+
+        println!(
+            "  {n:>4} {portal:>9} {brdg_at:>7} {pre:>9.1} {post:>9.1} {pred:>10.1} {:>6} {:>6} \
+             {:>7}",
+            s.loops_compiled,
+            s.bridges_compiled,
+            if post < pre { "GONE" } else { "n/a" },
+        );
+    }
+    println!(
+        "\n  `entry? GONE` with loops>0 means the post-bridge total is below the pre-bridge \
+         entry price,"
+    );
+    println!("  so the compiled entry cannot still be being paid — an inequality, not a fit.");
+}
+
 fn main() {
     let schema = flat_schema();
     let arith = lower("price + qty * 2", &schema);
@@ -1625,6 +1718,7 @@ fn main() {
     // not need the three shorter probes to have run first.
     if std::env::var_os("RCA88B_LONG").is_some() {
         long_horizon("arith price + qty * 2", &arith);
+        small_n_constant("arith price + qty * 2", &arith);
         println!("\nload after probes:  {}", loadavg());
         return;
     }
