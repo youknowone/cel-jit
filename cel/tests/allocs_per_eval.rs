@@ -724,11 +724,21 @@ fn regvm_group(out: &mut Vec<Row>) {
             // number and a misleading one.
             let calls = WARMUP + ITERS * ROUNDS as u32;
             let compiled = after.loops_compiled - before.loops_compiled;
+            // `bridges` is here because it was not, and its absence was a hole:
+            // a bridge compiled inside the window is compile-side work, and a
+            // note column reporting only `compiled`/`aborted` reads it as WARM.
+            // #116 measured that the first guard bridge lands at call 200 --
+            // past this window, which ends at call 89 -- so the rows below are
+            // pre-bridge by 111 calls. That is a fact about where the window
+            // sits, not a property of the tier, and it stops being true if
+            // WARMUP or ITERS grows.
+            let bridges = after.bridges_compiled - before.bridges_compiled;
             out[first].detail = format!(
-                "over {calls} calls: compiled={compiled} aborted={} guard_fails={} — {}",
+                "over {calls} calls: compiled={compiled} bridges={bridges} aborted={} \
+                 guard_fails={} — {}",
                 after.loops_aborted - before.loops_aborted,
                 after.guard_failures - before.guard_failures,
-                if compiled == 0 {
+                if compiled == 0 && bridges == 0 {
                     "WARM (compiled before this, or never)"
                 } else {
                     "NOT WARM: the tier compiled during the measurement"
@@ -892,6 +902,32 @@ const BASELINE_HEADER: &str = "\
 # A run whose `features` differ from the pair recorded below is not comparable
 # and the report says so. `profile` is recorded but does not invalidate a
 # comparison: dev and release were measured identical on every row.
+#
+# ⚠ THE JIT BACKEND IS DELIBERATELY NOT IN THE KEY, and the two legs DISAGREE:
+#   the `regvm/jit/*/n=1000` rows read 66/66/68 on cranelift and 63/63/65 on
+#   dynasm. That is not an under-specified key -- it is a finding, and putting
+#   `backend` in the filename would declare it expected and hide it. #116
+#   measured which side of the compile/run boundary it sits on
+#   (`cel/examples/rca116.rs`), and it is RUN-time on both:
+#
+#     * the loop is compiled before the window opens (`loops_compiled` = 1 after
+#       one priming call) and nothing compiles inside it;
+#     * both backends compile the SAME trace -- `trace_ops` 13->25 / 30->55 /
+#       11->21, identical per case;
+#     * allocations per call are invariant over window lengths 1..64, exactly
+#       linear in the call count, so no part of the figure is amortized one-off
+#       work -- a single call already costs the full 66 (or 63);
+#     * `float` never compiles a bridge at all in 449 calls and still shows the
+#       same 3-allocation gap.
+#
+#   So: one program, one trace, one guard failure per call, three more
+#   allocations per call on cranelift. Attribution of those three is open.
+#
+# ⚠ AND THESE ROWS SAMPLE A PLATEAU THE ARTIFACT LEAVES. The `regvm/jit/*`
+#   window covers calls 65..89. The first guard bridge lands at call 200, after
+#   which the same rows cost 23020 (cranelift) / 20023 (dynasm) allocations per
+#   call -- 349x and 317x these numbers -- and never come back. The figures
+#   below are the pre-bridge cost, not the artifact's steady state.
 #
 # Format: <label> TAB <allocations per evaluation>
 ";
