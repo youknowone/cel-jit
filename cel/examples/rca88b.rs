@@ -1745,7 +1745,10 @@ fn regime_installed_at(label: &str, lowered: &LoweredF) {
 
         reset_persistent_state();
         reset_jit_stats();
-        println!("\n  n={n}   (steady-state model predicts {})", 23 * (n - 1) + 4);
+        println!(
+            "\n  n={n}   (steady-state model predicts {})",
+            23 * (n - 1) + 4
+        );
         println!(
             "  {:>5} {:>8} {:>7} {:>6} {:>8}",
             "call", "allocs", "loops", "brdg", "gfails"
@@ -1765,7 +1768,11 @@ fn regime_installed_at(label: &str, lowered: &LoweredF) {
                     s.loops_compiled,
                     s.bridges_compiled,
                     s.guard_failures,
-                    if moved && k > 0 { "  <- counter moved" } else { "" },
+                    if moved && k > 0 {
+                        "  <- counter moved"
+                    } else {
+                        ""
+                    },
                 );
             }
             prev = now;
