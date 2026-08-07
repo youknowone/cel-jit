@@ -1551,6 +1551,11 @@ fn temporal_arith_result(name: &str, a: ValType, b: ValType) -> Option<ValType> 
     match (name, a, b) {
         (ops::ADD, Duration, Duration) => Some(Duration),
         (ops::ADD, Timestamp, Duration) => Some(Timestamp),
+        // `+` on a timestamp and a duration commutes, and the tree-walker
+        // answers both orders (`objects.rs` `Duration`/`Timestamp` add arms).
+        // Only this order was missing here, so `d + t` was declined while
+        // `t + d` lowered.
+        (ops::ADD, Duration, Timestamp) => Some(Timestamp),
         (ops::SUBSTRACT, Duration, Duration) => Some(Duration),
         (ops::SUBSTRACT, Timestamp, Duration) => Some(Timestamp),
         (ops::SUBSTRACT, Timestamp, Timestamp) => Some(Duration),
@@ -2630,8 +2635,26 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
                     ValType::Bool => unreachable!("handled above"),
                     ValType::UInt => return Err(LowerError::unsupported("unary negate on uint")),
                     ValType::Str => return Err(LowerError::unsupported("unary negate on string")),
-                    ValType::Timestamp | ValType::Duration => {
-                        return Err(LowerError::unsupported("unary negate on temporal"))
+                    // `-duration` is CEL and the walker answers it
+                    // (`objects.rs` `Value::Duration(d) => Value::Duration(-d)`);
+                    // `-timestamp` has no overload, so the walker raises and
+                    // there is no answer to agree with.
+                    //
+                    // The bank is i64 nanoseconds, so the negate is the int
+                    // one. Counting the operation is what keeps it exact:
+                    // `temporal_bound` is `i64::MAX / (ops + 1)`, and every
+                    // temporal column is checked against it before the batch
+                    // runs, so `|v| <= bound < i64::MAX` and `-v` cannot
+                    // overflow. Left uncounted, an expression whose ONLY
+                    // temporal operation is this one would carry no bound at
+                    // all, and `-i64::MIN` would wrap where chrono's
+                    // `{secs, nanos}` does not.
+                    ValType::Duration => {
+                        ctx.temporal_ops += 1;
+                        OP_NEG
+                    }
+                    ValType::Timestamp => {
+                        return Err(LowerError::unsupported("unary negate on timestamp"))
                     }
                 };
                 let d = ctx.fresh(a.bank);

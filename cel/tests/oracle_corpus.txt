@@ -667,6 +667,20 @@ feat: timestamp duration
 cfg: chrono
 want: timestamp(2023-01-01T01:00:00+00:00)
 
+# Negating a duration is CEL, negating a timestamp is not. Only the first has
+# an answer to agree on, and until it was pinned the batch lowering declined it
+# while the tree-walker answered.
+
+expr: -duration("1h")
+feat: duration arith
+cfg: chrono
+want: duration(-3600000000000ns)
+
+expr: -duration("1h") + duration("90m")
+feat: duration arith
+cfg: chrono
+want: duration(1800000000000ns)
+
 # ---------------------------------------------------------------------------
 # Opaque
 # ---------------------------------------------------------------------------

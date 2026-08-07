@@ -2788,17 +2788,24 @@ mod tests {
             let program = Program::compile(expr).unwrap();
             lower_typed(program.expression(), &schema)
         };
-        // `d + t` is in the list on purpose: `t + d` lowers, but the evaluator
-        // dispatches on the LEFT operand and `Duration` has no timestamp arm,
-        // so the mirror image is UnsupportedBinaryOperator.
-        for expr in [
-            "t < d", "t < i", "t * d", "d / d", "d % d", "d - t", "t + t", "d + t",
-        ] {
+        // `d - t` stays: CEL defines `timestamp - duration` and
+        // `timestamp - timestamp`, but not its mirror. `t + t` likewise has no
+        // overload.
+        for expr in ["t < d", "t < i", "t * d", "d / d", "d % d", "d - t", "t + t"] {
             assert!(
                 lower(expr).is_err(),
                 "`{expr}` must bail the typed lowering (mixed / undefined overload)"
             );
         }
+        // `d + t` is NOT in that list, and used to be. The old `dyn Val`
+        // duration adder refused a timestamp, so the mirror image of `t + d`
+        // was UnsupportedBinaryOperator; deleting that walker made both orders
+        // answer the sum, which is what CEL defines. Asserting the positive
+        // keeps the case covered in the direction it now goes.
+        assert!(
+            lower("d + t").is_ok(),
+            "`d + t` lowers: `+` on a timestamp and a duration commutes"
+        );
         assert!(
             lower("t").unwrap().sum_reducible().is_err(),
             "a bare temporal column lowers; the sum is what refuses it"
