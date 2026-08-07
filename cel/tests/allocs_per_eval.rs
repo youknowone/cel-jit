@@ -51,6 +51,10 @@
 //!   outside the window. That is cometkim's per-call regime
 //!   (`examples/majit_vs_cometkim_percall.rs`), reproduced here so a number
 //!   here can be read beside one there.
+//!   ⚠ The prefix is this row's key, not a claim about which evaluator ran:
+//!   `--features vm` points `Program::execute` at the bytecode VM, and these
+//!   rows then measure that instead. `features` in the header is what tells
+//!   the two apart, which is why it carries `vm`.
 //! * `bind/*` — one `Context::add_variable_from_value(name, Value::List(..))`
 //!   and nothing else. This is task #82's shape.
 //! * `comprehension/*` — one bind PLUS one execute, which is what a caller with
@@ -791,6 +795,15 @@ fn features() -> String {
     }
     if cfg!(feature = "structs") {
         on.push("structs");
+    }
+    // `vm` swaps which evaluator `Program::execute` runs, so it changes what
+    // every `walker/*` row measures. Omitting it made a VM run and a walker run
+    // report the same feature set and compare against the same baseline, which
+    // is not a drift to explain but a category error — and, in the direction
+    // that costs more, a baseline re-recorded under `vm` would have been
+    // accepted by walker runs without a word.
+    if cfg!(feature = "vm") {
+        on.push("vm");
     }
     if cfg!(feature = "jit") {
         on.push("jit");
