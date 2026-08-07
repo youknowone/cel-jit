@@ -158,6 +158,19 @@ expr: [1] + [2]
 feat: arith literal_list
 want: list[int(1), int(2)]
 
+# Both of these changed when the `dyn Val` walker was deleted, and both moved
+# toward the CEL spec. `+` on a list required both sides to be lists, but the
+# old list adder iterated whatever it was handed, so a map contributed its keys.
+
+expr: [1] + {"a": 1}
+feat: arith literal_list literal_map error
+want: error(NoSuchOverload)
+
+expr: duration("1s") + timestamp("2020-01-01T00:00:00Z")
+feat: arith duration timestamp
+cfg: chrono
+want: timestamp(2020-01-01T00:00:01+00:00)
+
 expr: 9223372036854775807 + 1
 feat: arith_overflow error
 want: error(Overflow: add)
