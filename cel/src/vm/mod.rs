@@ -38,9 +38,11 @@
 //! extra invariant to get wrong.
 
 pub mod code;
+pub mod compile;
 pub mod error;
 pub mod opcode;
 
 pub use code::CelCode;
+pub use compile::{compile, CompileError, CompileErrorKind};
 pub use error::{CelErr, CelResult, ColdId, NameId};
 pub use opcode::{OpCode, OPCODE_COUNT};

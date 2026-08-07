@@ -63,24 +63,37 @@ pub enum OpCode {
     OptSelect,
 
     // -- aggregate construction -------------------------------------------
-    /// Pop `a` elements, push a list.
-    BuildList,
-    /// Pop an optional and append its value to the list beneath it, or leave
-    /// the list unchanged when the optional is empty.
+    //
+    // Uniformly incremental: allocate empty, then one append per element.
+    // The alternative -- a single `BuildList n` that pops its elements at
+    // once -- needs a second, different encoding as soon as one element is
+    // optional, because whether an element contributes is only known once it
+    // has been evaluated. One shape that always works beats two shapes and a
+    // rule for choosing between them.
+    /// Push an empty list.
+    NewList,
+    /// Pop a value and append it to the list beneath it.
+    ListAppend,
+    /// Pop an optional; append its value to the list beneath it, or leave the
+    /// list unchanged when the optional is empty.
     ///
     /// `ListExpr::optional_indices` is compile-time data, so the compiler
-    /// selects this per element instead of carrying the index set into the
-    /// program and testing it per iteration.
+    /// selects between this and [`OpCode::ListAppend`] per element instead of
+    /// carrying the index set into the program and testing it per iteration.
     ListAppendOptional,
-    /// Pop `2 * a` operands (key, value interleaved), push a map.
-    BuildMap,
-    /// Pop an optional value and a key, inserting into the map beneath them
-    /// only when the optional is non-empty.
+    /// Push an empty map.
+    NewMap,
+    /// Pop a value and a key, inserting them into the map beneath them.
+    MapInsert,
+    /// Pop an optional value and a key, inserting only when the optional is
+    /// non-empty.
     MapInsertOptional,
-    /// Pop `2 * a` operands (field id, value interleaved), push a struct of
-    /// the message type named `names[b]`.
-    BuildStruct,
-    /// The struct-literal counterpart of [`OpCode::MapInsertOptional`].
+    /// Push an empty struct of the message type named `names[a]`.
+    NewStruct,
+    /// Pop a value into field `names[a]` of the struct beneath it.
+    StructSet,
+    /// Pop an optional into field `names[a]` of the struct beneath it,
+    /// leaving the field unset when the optional is empty.
     StructSetOptional,
 
     // -- binary operators -------------------------------------------------
@@ -115,13 +128,41 @@ pub enum OpCode {
     CallHost,
     /// Pop `b` arguments and a receiver, call method `names[a]` on it.
     CallMethod,
-    /// Pop `b` arguments, call the namespaced function `names[a]`.
+    /// Try the namespaced function `names[a]` over `b` arguments: on a hit,
+    /// pop them, push the result and jump to `c`; on a miss, leave the stack
+    /// alone and fall through to the receiver-call path the compiler emitted
+    /// after it.
     ///
-    /// Distinguishing this from [`OpCode::CallMethod`] is compile-time work
-    /// here. The walker asks the question on every member call whose receiver
-    /// parses as an identifier, because `math.max(x)` and `s.startsWith(x)`
-    /// have the same shape.
+    /// `names[a]` is the *joined* name, built once at compile time. The
+    /// walker asks this question on every member call whose receiver parses
+    /// as an identifier -- `math.max(x)` and `s.startsWith(x)` have the same
+    /// shape -- and joining the two names per evaluation is an allocation.
+    ///
+    /// The miss path must not have evaluated the receiver yet, because
+    /// `optional.of(1)` names no variable `optional`.
     CallQualified,
+
+    // -- iteration --------------------------------------------------------
+    //
+    // A comprehension is the only construct that loops, and these are what
+    // let it do so without a host call per iteration: `size(x)` reached
+    // through `CallHost` would be a residual call inside the loop body.
+    /// Pop a value, push the sequence a one-variable comprehension iterates:
+    /// a list's elements, or a map's keys.
+    IterElems,
+    /// Pop a value, push the sequence a two-variable comprehension iterates
+    /// as its first variable: a list's *indices*, or a map's keys.
+    ///
+    /// Distinct from [`OpCode::IterElems`] only for lists, where
+    /// `xs.all(i, v, ...)` binds `i` to the index and `v` to the element.
+    IterKeys,
+    /// Pop a sequence, push its length as an int.
+    IterLen,
+    /// Pop an index and a sequence, push the element at that index.
+    ///
+    /// The index is produced by the compiler's own counter, so it is in range
+    /// by construction rather than by a check.
+    IterAt,
 
     // -- control flow -----------------------------------------------------
     /// Jump to `a`.
@@ -130,9 +171,15 @@ pub enum OpCode {
     JumpIfFalse,
     /// Pop an operand; jump to `a` when it is true.
     JumpIfTrue,
-    /// Short-circuit `&&`: see the note on error absorption below.
+    /// Short-circuit `&&`: when the operand on top is false, jump to `a`
+    /// leaving it; otherwise pop it and fall through to the right operand.
+    ///
+    /// Error absorption is not expressed by this instruction. See the module
+    /// documentation: the intended mechanism is a handler table over the left
+    /// operand's instruction range, which adds to this shape rather than
+    /// replacing it.
     And,
-    /// Short-circuit `||`.
+    /// Short-circuit `||`, mirroring [`OpCode::And`].
     Or,
     /// Stop, returning the top of the stack.
     Return,
@@ -153,23 +200,27 @@ impl OpCode {
             | OpCode::GetField
             | OpCode::HasField
             | OpCode::OptSelect
-            | OpCode::BuildList
-            | OpCode::BuildMap
+            | OpCode::NewStruct
+            | OpCode::StructSet
+            | OpCode::StructSetOptional
             | OpCode::Jump
             | OpCode::JumpIfFalse
             | OpCode::JumpIfTrue
             | OpCode::And
             | OpCode::Or => 1,
 
-            OpCode::BuildStruct | OpCode::CallHost | OpCode::CallMethod | OpCode::CallQualified => {
-                2
-            }
+            OpCode::CallHost | OpCode::CallMethod => 2,
+
+            OpCode::CallQualified => 3,
 
             OpCode::Index
             | OpCode::OptIndex
+            | OpCode::NewList
+            | OpCode::ListAppend
             | OpCode::ListAppendOptional
+            | OpCode::NewMap
+            | OpCode::MapInsert
             | OpCode::MapInsertOptional
-            | OpCode::StructSetOptional
             | OpCode::Add
             | OpCode::Sub
             | OpCode::Mul
@@ -185,6 +236,10 @@ impl OpCode {
             | OpCode::Not
             | OpCode::Negate
             | OpCode::NotStrictlyFalse
+            | OpCode::IterElems
+            | OpCode::IterKeys
+            | OpCode::IterLen
+            | OpCode::IterAt
             | OpCode::Return => 0,
         }
     }
@@ -192,6 +247,63 @@ impl OpCode {
     /// The width of this instruction, opcode word included.
     pub const fn width(self) -> u32 {
         1 + self.operands()
+    }
+
+    /// How many operands this instruction pops and pushes, on the path that
+    /// falls through to the next instruction.
+    ///
+    /// Exhaustive for the same reason [`OpCode::operands`] is: the compiler's
+    /// `max_stack` walk is only as trustworthy as this table, and an opcode
+    /// added without a declared effect would silently under-size the operand
+    /// stack rather than fail to build.
+    ///
+    /// `operands` is the instruction's operand words, because a call's arity
+    /// is one of them.
+    pub fn stack_effect(self, operands: &[u32]) -> (u32, u32) {
+        // Argument counts live in the second operand word of the call forms.
+        let arity = |index: usize| operands.get(index).copied().unwrap_or(0);
+        match self {
+            OpCode::LoadConst | OpCode::LoadVar | OpCode::LoadLocal => (0, 1),
+            OpCode::NewList | OpCode::NewMap | OpCode::NewStruct => (0, 1),
+
+            OpCode::StoreLocal | OpCode::Return => (1, 0),
+            OpCode::ListAppend | OpCode::ListAppendOptional => (1, 0),
+            OpCode::StructSet | OpCode::StructSetOptional => (1, 0),
+            OpCode::MapInsert | OpCode::MapInsertOptional => (2, 0),
+
+            OpCode::GetField | OpCode::HasField | OpCode::OptSelect => (1, 1),
+            OpCode::Not | OpCode::Negate | OpCode::NotStrictlyFalse => (1, 1),
+            OpCode::IterElems | OpCode::IterKeys | OpCode::IterLen => (1, 1),
+
+            OpCode::Index | OpCode::OptIndex | OpCode::IterAt => (2, 1),
+            OpCode::Add
+            | OpCode::Sub
+            | OpCode::Mul
+            | OpCode::Div
+            | OpCode::Mod
+            | OpCode::Equals
+            | OpCode::NotEquals
+            | OpCode::Less
+            | OpCode::LessEquals
+            | OpCode::Greater
+            | OpCode::GreaterEquals
+            | OpCode::In => (2, 1),
+
+            OpCode::CallHost => (arity(1), 1),
+            // The receiver is pushed last, above the arguments, because it is
+            // evaluated only after the namespaced lookup has missed.
+            OpCode::CallMethod => (arity(1) + 1, 1),
+            // Declared for the path that *jumps*, which is the one that
+            // reaches the merge. The falling-through path leaves the stack
+            // untouched, and the compiler restores the depth itself.
+            OpCode::CallQualified => (arity(1), 1),
+
+            OpCode::Jump => (0, 0),
+            // The jumping path of `And`/`Or` leaves the operand in place; the
+            // falling-through path pops it, and the two paths meet at the
+            // same depth because the right operand pushes one.
+            OpCode::JumpIfFalse | OpCode::JumpIfTrue | OpCode::And | OpCode::Or => (1, 0),
+        }
     }
 }
 
@@ -237,7 +349,16 @@ mod tests {
         for word in 0..OPCODE_COUNT {
             let op = OpCode::from_word(word).unwrap();
             assert!(op.width() >= 1, "{op:?} has no opcode word");
-            assert!(op.operands() <= 2, "{op:?} declares an unexpected arity");
+            assert!(op.operands() <= 3, "{op:?} declares an unexpected arity");
         }
+    }
+
+    /// A call's declared pop count follows its arity operand, which is what
+    /// makes the `max_stack` walk correct for calls at all.
+    #[test]
+    fn call_stack_effects_follow_the_arity_operand() {
+        assert_eq!(OpCode::CallHost.stack_effect(&[0, 3]), (3, 1));
+        assert_eq!(OpCode::CallQualified.stack_effect(&[0, 0]), (0, 1));
+        assert_eq!(OpCode::CallMethod.stack_effect(&[0, 2]), (3, 1));
     }
 }
