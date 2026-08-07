@@ -1421,6 +1421,98 @@ fn step_moves_with_threshold(label: &str, lowered: &LoweredF) {
     );
 }
 
+/// Probe L. Probes J and K established **when** — the first guard bridge, at
+/// `trace_eagerness` calls after the loop compiles. This asks **what runs
+/// afterwards**, on the axis they fixed, and it needs no held file.
+///
+/// The discriminator is #111's allocation instrument, whose two reference
+/// points are already measured and which is exact and load-independent: the
+/// compiled artifact allocates **0 per row** (69 per call, flat in n) and the
+/// never-compiles portal allocates **~12 per row**. So across call 200:
+///
+/// * allocations/row rising toward 12 ⇒ the rows are being **interpreted** and
+///   the artifact is not executing;
+/// * allocations/row staying ~0 ⇒ the rows are **not** being interpreted, so
+///   the penalty lives inside compiled execution.
+///
+/// ⚠ Read the second case exactly as far as it goes: ~0 licenses *"not
+/// interpretation"*, **not** *"executes cleanly"*. An artifact that is entered
+/// and then bails per row through a path that does not allocate would also read
+/// ~0, and this probe cannot separate that from a slower compiled body.
+///
+/// `trace_ops_before` / `trace_ops_after` ride along because #122 names them as
+/// the next cheap external read and they have never been sampled across call
+/// 200. Buckets are Probe J's (20 calls) so the two tables index alike.
+fn execution_by_allocation(label: &str, lowered: &LoweredF) {
+    println!("\nProbe L — {label}: WHAT executes after the first bridge? (allocations/row)");
+
+    const CALLS: usize = 460;
+    const BUCKET: usize = 20;
+
+    for n in [10usize, 100, 1_000] {
+        let (price, qty) = flat_columns(n);
+        let columns = vec![Column::Int(&price), Column::Int(&qty)];
+
+        // The two yardsticks, measured here rather than quoted, so the row is
+        // read against this binary and this n instead of #111's table.
+        reset_persistent_state();
+        for _ in 0..8 {
+            black_box(eval_batch_sum_f(lowered, &columns, n, NEVER));
+        }
+        let (_, never_a) = metered(|| black_box(eval_batch_sum_f(lowered, &columns, n, NEVER)));
+        let (_, clean_a) = metered(|| black_box(clean_batch_sum_f(lowered, &columns, n)));
+
+        println!(
+            "\n  n={n}  never-compiles {:.3} allocs/row, clean {:.3} allocs/row",
+            never_a as f64 / n as f64,
+            clean_a as f64 / n as f64,
+        );
+        println!(
+            "  {:>12} {:>12} {:>12} {:>6} {:>8} {:>9} {:>9}",
+            "calls", "allocs/call", "allocs/row", "brdg", "gfails", "ops_pre", "ops_post"
+        );
+
+        reset_persistent_state();
+        reset_jit_stats();
+        let mut allocs: Vec<u64> = Vec::with_capacity(CALLS);
+        let mut marks = Vec::with_capacity(CALLS / BUCKET);
+        for k in 0..CALLS {
+            let (_, a) = metered(|| black_box(eval_batch_sum_f(lowered, &columns, n, THRESHOLD)));
+            allocs.push(a);
+            if (k + 1) % BUCKET == 0 {
+                let s = jit_stats();
+                marks.push((
+                    k + 1,
+                    s.bridges_compiled,
+                    s.guard_failures,
+                    s.trace_ops_before,
+                    s.trace_ops_after,
+                ));
+            }
+        }
+
+        for &(end, brdg, gfails, ops_pre, ops_post) in &marks {
+            let start = end - BUCKET;
+            let sum: u64 = allocs[start..end].iter().sum();
+            let per_call = sum as f64 / BUCKET as f64;
+            println!(
+                "  {:>12} {per_call:>12.1} {:>12.3} {brdg:>6} {gfails:>8} {ops_pre:>9} \
+                 {ops_post:>9}",
+                format!("{}-{}", start + 1, end),
+                per_call / n as f64,
+            );
+        }
+    }
+    println!(
+        "\n  allocs/row rising toward the never-compiles figure across call 200 means the \
+         rows are being INTERPRETED;"
+    );
+    println!(
+        "  staying ~0 means they are not, and the penalty is inside compiled execution \
+         (which is NOT the same as executing cleanly)."
+    );
+}
+
 fn main() {
     let schema = flat_schema();
     let arith = lower("price + qty * 2", &schema);
@@ -1432,6 +1524,10 @@ fn main() {
     if std::env::var_os("RCA88B_STEP").is_some() {
         cost_by_call_index("arith price + qty * 2", &arith);
         step_moves_with_threshold("arith price + qty * 2", &arith);
+        // Same gate for the same reason: Probe L indexes by call index from a
+        // cold driver, so it cannot follow a probe that has already interned
+        // programs in the pool.
+        execution_by_allocation("arith price + qty * 2", &arith);
         println!("\nload after probes:  {}", loadavg());
         return;
     }
