@@ -117,6 +117,27 @@ required-features = ["jit"]
 name = "poison"
 required-features = ["jit"]
 
+# The RCA probes. Declared for the same reason as everything above: a file under
+# `examples/` with no `[[example]]` block is still auto-discovered, just with no
+# `required-features`, so `cargo check --all-targets` builds it in EVERY feature
+# configuration. All three open `use cel::majit`, which `src/lib.rs:23` gates on
+# `jit`, so undeclared they broke 9 of the 13 rows of `scripts/feature-matrix.sh`
+# with `E0433: cannot find majit in cel`. Nothing pointed at them: the only CI
+# step that builds `examples/` is `cargo clippy --all-features --all-targets`,
+# and `--all-features` is the one configuration in which a missing
+# `required-features` cannot manifest.
+[[example]]
+name = "rca88"
+required-features = ["jit"]
+
+[[example]]
+name = "rca88b"
+required-features = ["jit"]
+
+[[example]]
+name = "rca91"
+required-features = ["jit"]
+
 [features]
 default = ["regex", "chrono"]
 structs = []
