@@ -2,6 +2,13 @@
 
 Status: design, not implemented. Written 2026-07-26.
 
+Superseded in part, 2026-08-07. Evaluator 1 below is no longer
+`Value::resolve_val` returning `Cow<'a, dyn Val>`: the trait-object universe has
+been deleted and `Program::execute` runs `Value::resolve_value`, which walks the
+`Value` enum. Everything this document says about `dyn Val`, `Cow` lifetimes and
+`downcast_ref` describes the tree as it stood on 2026-07-26. The two-evaluator
+problem itself is unchanged.
+
 ## The problem
 
 cel-jit currently has **two evaluators**:

@@ -82,13 +82,13 @@ impl<'a> Context<'a> {
 
     /// Binds an application type that CEL treats as an opaque handle.
     ///
-    /// Replaces `add_variable_as_val`, which took a `Box<dyn Val>`. Equality
+    /// Replaces `add_variable_as_val`, which took a boxed trait object. Equality
     /// and the runtime type name go through [`Opaque`]; CEL cannot index,
     /// iterate or size the value, so member access on it is `NoSuchOverload`.
     /// A backing object whose members should resolve on access — a protobuf
     /// message, a database row — is not expressible this way, because
-    /// [`Opaque`] carries no accessors. That capability left with `dyn Val`
-    /// and returns with the class-based value family.
+    /// [`Opaque`] carries no accessors. That capability left with the trait
+    /// universe and returns with the class-based value family.
     pub fn add_variable_as_opaque<S>(&mut self, name: S, value: Arc<dyn Opaque>)
     where
         S: AsRef<str>,
@@ -121,8 +121,8 @@ impl<'a> Context<'a> {
     /// Reads a bound variable.
     ///
     /// A hit is a [`Value`] clone, which for the compound variants is a
-    /// refcount bump. It used to convert a `Box<dyn Val>` on every read, and
-    /// that conversion deep-copied a bound list or map.
+    /// refcount bump. It used to convert a boxed trait object on every read,
+    /// and that conversion deep-copied a bound list or map.
     pub fn get_variable<S>(&self, name: S) -> Option<Value>
     where
         S: AsRef<str>,

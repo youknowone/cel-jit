@@ -3,7 +3,6 @@ use crate::magic::{Arguments, This};
 use crate::objects::{KeyRef, ListRef, OptionalValue, Value};
 use crate::resolvers::Resolver;
 use crate::ExecutionError;
-use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::convert::TryInto;
 use std::sync::Arc;
@@ -286,7 +285,6 @@ pub fn matches(
     }
 }
 
-use crate::common::value::Val;
 #[cfg(feature = "chrono")]
 pub use time::duration;
 

@@ -2,10 +2,9 @@
 //! `majit` framework (a Rust port of RPython's tracing JIT). Tracked as
 //! cell-majit (issue #357).
 //!
-//! majit does not attach to cel-rust's live `Value::resolve_val` evaluator:
-//! that path returns `Cow<'a, dyn Val>` and dispatches through trait objects /
-//! `downcast_ref`, which is outside the restricted Rust subset the
-//! `#[jit_interp]` front-end can meta-trace. (majit's other front-end,
+//! majit does not attach to cel-rust's live `Value::resolve_value` evaluator:
+//! that path is a recursive AST walk over an owning enum, which is outside the
+//! restricted Rust subset the `#[jit_interp]` front-end can meta-trace. (majit's other front-end,
 //! `majit-translate`, traces real Rust from LLBC and does handle class
 //! dispatch; `CONVERGENCE.md` in this directory is the plan for getting cel
 //! onto it.) Instead, a CEL `Program` (a fixed AST = green constant) is

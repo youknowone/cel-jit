@@ -1,14 +1,6 @@
-use std::{borrow::Cow, collections::BTreeMap, sync::Arc};
+use std::collections::BTreeMap;
 
-use crate::{
-    common::{
-        traits::{Indexer, Zeroer},
-        types::{CelString, Type},
-        value::Val,
-    },
-    objects::Value,
-    ExecutionError,
-};
+use crate::{common::types::Type, objects::Value};
 
 /// A CEL struct value.
 ///
@@ -59,62 +51,6 @@ impl Struct {
 
     /// Whether the struct carries no fields, which is its zero value.
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-}
-
-impl Val for Struct {
-    fn get_type(&self) -> &Type {
-        &self.r#type
-    }
-
-    fn clone_as_boxed(&self) -> Box<dyn Val> {
-        Box::new(Self {
-            r#type: Type::new_struct(self.name().to_owned()),
-            entries: self.entries.clone(),
-        })
-    }
-
-    fn as_indexer(&self) -> Option<&dyn crate::common::traits::Indexer> {
-        Some(self)
-    }
-
-    fn into_indexer(self: Box<Self>) -> Option<Box<dyn crate::common::traits::Indexer>> {
-        Some(self)
-    }
-
-    fn as_zeroer(&self) -> Option<&dyn Zeroer> {
-        Some(self)
-    }
-
-    fn equals(&self, other: &dyn Val) -> bool {
-        other
-            .downcast_ref::<Struct>()
-            .is_some_and(|other| self == other)
-    }
-}
-
-impl Indexer for Struct {
-    fn get<'a>(&'a self, idx: &dyn Val) -> Result<Cow<'a, dyn Val>, crate::ExecutionError> {
-        if let Some(field) = idx.downcast_ref::<CelString>() {
-            self.field_value(field.inner())
-                .ok_or_else(|| ExecutionError::NoSuchKey(Arc::new(String::from(field.inner()))))
-                .and_then(|v| Ok(Cow::<dyn Val>::Owned(v.clone().try_into()?)))
-        } else {
-            Err(ExecutionError::UnsupportedIndex(
-                idx.try_into()?,
-                (self as &dyn Val).try_into()?,
-            ))
-        }
-    }
-
-    fn steal(self: Box<Self>, idx: &dyn Val) -> Result<Box<dyn Val>, crate::ExecutionError> {
-        self.get(idx).map(Cow::into_owned)
-    }
-}
-
-impl Zeroer for Struct {
-    fn is_zero_value(&self) -> bool {
         self.entries.is_empty()
     }
 }

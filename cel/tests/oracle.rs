@@ -33,7 +33,7 @@
 //! registered evaluator and the frozen data.
 //!
 //! P2 used it exactly that way: `resolve_value` was registered beside the
-//! `dyn Val` walker, the two were held to the same 161 cases while the new one
+//! `dyn Val` walker, the two were held to the whole corpus while the new one
 //! was built arm by arm, and the walker row was removed only once it was
 //! deleted. The list holds one row again today; that is a statement about the
 //! crate, not about this file.

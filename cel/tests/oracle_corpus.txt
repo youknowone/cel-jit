@@ -845,3 +845,50 @@ want: int(2023)
 expr: 1 +
 feat: syntax_error
 want: parse_error
+
+# Cross-type numeric equality. Value's `PartialEq` compares int/uint/double by
+# numeric value, and these cases replace the per-wrapper `test_equals` unit
+# tests that went with the trait universe.
+
+expr: 1 == 1u
+feat: equality literal_int literal_uint
+want: bool(true)
+
+expr: 1 == 1.0
+feat: equality literal_int literal_double
+want: bool(true)
+
+expr: -1 == 1u
+feat: equality literal_int literal_uint
+want: bool(false)
+
+expr: 1u == 1.0
+feat: equality literal_uint literal_double
+want: bool(true)
+
+expr: 42 == 42.2
+feat: equality literal_int literal_double
+want: bool(false)
+
+expr: i == 42.0
+feat: equality variable literal_double
+want: bool(true)
+
+expr: u == 7
+feat: equality variable literal_int
+want: bool(true)
+
+expr: 42 == '42'
+feat: equality literal_int literal_string
+want: bool(false)
+
+# NaN compares unequal to every number including itself, the assertions the
+# deleted per-wrapper `test_equals` carried.
+
+expr: 42 == double('nan')
+feat: equality literal_int conversion
+want: bool(false)
+
+expr: double('nan') == double('nan')
+feat: equality conversion
+want: bool(false)

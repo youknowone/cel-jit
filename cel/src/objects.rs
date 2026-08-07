@@ -1,6 +1,5 @@
 use crate::common::ast::{operators, CallExpr, ComprehensionExpr, EntryExpr, Expr, LiteralValue};
 use crate::common::types::*;
-use crate::common::value::Val;
 use crate::context::Context;
 use crate::ExecutionError::NoSuchOverload;
 use crate::{ExecutionError, Expression, FunctionContext};
@@ -358,28 +357,6 @@ pub enum Key {
     String(Arc<String>),
 }
 
-impl From<CelMapKey> for Key {
-    fn from(value: CelMapKey) -> Self {
-        match value {
-            CelMapKey::Bool(b) => b.into_inner().into(),
-            CelMapKey::Int(i) => i.into_inner().into(),
-            CelMapKey::String(s) => s.into_inner().into(),
-            CelMapKey::UInt(u) => u.into_inner().into(),
-        }
-    }
-}
-
-impl From<Key> for CelMapKey {
-    fn from(key: Key) -> Self {
-        match key {
-            Key::Int(i) => CelMapKey::from(i),
-            Key::Uint(u) => CelMapKey::from(u),
-            Key::Bool(b) => CelMapKey::from(b),
-            Key::String(s) => CelMapKey::from(s.as_str()),
-        }
-    }
-}
-
 /// A borrowed version of [`Key`] that avoids allocating for lookups.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
 pub enum KeyRef<'a> {
@@ -671,54 +648,6 @@ impl dyn Opaque {
     pub fn downcast_ref<T: Any>(&self) -> Option<&T> {
         let any: &dyn Any = self;
         any.downcast_ref()
-    }
-}
-
-struct OpaqueVal {
-    r#type: Type,
-    val: Arc<dyn Opaque>,
-}
-
-impl Debug for OpaqueVal {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "OpaqueVal<{}>", self.val.runtime_type_name())
-    }
-}
-
-impl Val for OpaqueVal {
-    fn get_type(&self) -> &Type {
-        &self.r#type
-    }
-
-    fn equals(&self, other: &dyn Val) -> bool {
-        if other.get_type() != self.get_type() {
-            false
-        } else {
-            match other.downcast_ref::<OpaqueVal>() {
-                None => false,
-                Some(other) => self.val.opaque_eq(other.val.deref()),
-            }
-        }
-    }
-
-    fn clone_as_boxed(&self) -> Box<dyn Val> {
-        Box::new(Self {
-            r#type: Type::new_opaque_type(self.val.runtime_type_name().to_owned()),
-            val: self.val.clone(),
-        })
-    }
-}
-
-impl OpaqueVal {
-    fn new(val: Arc<dyn Opaque>) -> Self {
-        Self {
-            r#type: Type::new_opaque_type(val.runtime_type_name().to_owned()),
-            val,
-        }
-    }
-
-    fn clone_inner(&self) -> Arc<dyn Opaque> {
-        self.val.clone()
     }
 }
 
@@ -1357,141 +1286,6 @@ impl From<Value> for ResolveResult {
     }
 }
 
-impl TryFrom<&dyn Val> for Value {
-    type Error = ExecutionError;
-    fn try_from(v: &dyn Val) -> Result<Self, Self::Error> {
-        match v.get_type().kind() {
-            Kind::Boolean => Ok(Value::Bool(*v.downcast_ref::<CelBool>().unwrap().inner())),
-            Kind::Int => Ok(Value::Int(*v.downcast_ref::<CelInt>().unwrap().inner())),
-            Kind::UInt => Ok(Value::UInt(*v.downcast_ref::<CelUInt>().unwrap().inner())),
-            Kind::Double => Ok(Value::Float(
-                *v.downcast_ref::<CelDouble>().unwrap().inner(),
-            )),
-            Kind::String => Ok(Value::String(Arc::new(
-                v.downcast_ref::<CelString>().unwrap().inner().to_string(),
-            ))),
-            Kind::NullType => Ok(Value::Null),
-            Kind::Bytes => Ok(Value::Bytes(Arc::new(
-                v.downcast_ref::<CelBytes>().unwrap().inner().to_vec(),
-            ))),
-            #[cfg(feature = "chrono")]
-            Kind::Duration => Ok(Value::Duration(
-                *v.downcast_ref::<CelDuration>().unwrap().inner(),
-            )),
-            #[cfg(feature = "chrono")]
-            Kind::Timestamp => {
-                let ts = v.downcast_ref::<CelTimestamp>().unwrap().inner();
-                Ok(Value::Timestamp(*ts))
-            }
-            Kind::List => {
-                let list = v.downcast_ref::<CelList>().unwrap().inner();
-                Ok(Value::list(
-                    list.iter()
-                        .map(|i| i.as_ref().try_into().expect("Not a Value list item"))
-                        .collect::<Vec<Value>>(),
-                ))
-            }
-            Kind::Map => {
-                let map = v.downcast_ref::<CelMap>().unwrap().inner();
-                Ok(Value::Map(Map::object(Arc::new(
-                    map.iter()
-                        .map(|(k, v)| {
-                            (
-                                Key::from(k.clone()),
-                                Value::try_from(v.as_ref()).expect("Not a Value map value"),
-                            )
-                        })
-                        .collect(),
-                ))))
-            }
-            Kind::Opaque => Ok(Value::Opaque(match v.downcast_ref::<CelOptional>() {
-                None => v.downcast_ref::<OpaqueVal>().unwrap().clone_inner(),
-                Some(opt) => {
-                    let opt: Option<Result<Value, _>> = opt.option().map(|v| v.try_into());
-                    match opt {
-                        None => Arc::new(OptionalValue::none()),
-                        Some(t) => match t {
-                            Ok(v) => Arc::new(OptionalValue::of(v)),
-                            Err(_) => Arc::new(OptionalValue::none()),
-                        },
-                    }
-                }
-            })),
-            _ => {
-                #[cfg(feature = "structs")]
-                {
-                    if let Some(v) = v.downcast_ref::<CelStruct>() {
-                        use crate::common::value::Downcast;
-
-                        return match v.clone_as_boxed().downcast::<CelStruct>() {
-                            Ok(v) => Ok(Value::Struct(Arc::new(*v))),
-                            Err(v) => Err(ExecutionError::InternalError(format!(
-                                "Not a Struct: `{v:?}`"
-                            ))),
-                        };
-                    }
-                }
-                if let Some(opaque) = v.downcast_ref::<OpaqueVal>() {
-                    Ok(Value::Opaque(opaque.val.clone()))
-                } else {
-                    Err(ExecutionError::UnexpectedType {
-                        got: v.get_type().name().to_string(),
-                        want:
-                            "(BOOL|INT|UINT|DOUBLE|STRING|NULL|BYTES|TIMESTAMP|DURATION|LIST|MAP)"
-                                .to_string(),
-                    })
-                }
-            }
-        }
-    }
-}
-
-impl TryFrom<Value> for Box<dyn Val> {
-    type Error = ExecutionError;
-    fn try_from(value: Value) -> Result<Self, Self::Error> {
-        match value {
-            Value::Bool(b) => Ok(Box::new(CelBool::from(b))),
-            Value::Int(i) => Ok(Box::new(CelInt::from(i))),
-            Value::UInt(u) => Ok(Box::new(CelUInt::from(u))),
-            Value::Float(f) => Ok(Box::new(CelDouble::from(f))),
-            Value::String(s) => Ok(Box::new(CelString::from(s.as_str()))),
-            Value::Null => Ok(Box::new(CelNull)),
-            Value::Bytes(b) => Ok(Box::new(CelBytes::from(b.as_slice().to_vec()))),
-            #[cfg(feature = "chrono")]
-            Value::Duration(d) => Ok(Box::new(CelDuration::from(d))),
-            #[cfg(feature = "chrono")]
-            Value::Timestamp(ts) => Ok(Box::new(CelTimestamp::from(ts))),
-            Value::List(l) => {
-                let result: Result<Vec<Box<dyn Val>>, ExecutionError> =
-                    l.to_vec().into_iter().map(|i| i.try_into()).collect();
-                Ok(Box::new(CelList::from(result?)))
-            }
-            Value::Map(map) => {
-                let result: Result<HashMap<CelMapKey, Box<dyn Val>>, ExecutionError> = map
-                    .iter()
-                    .map(|(k, v)| v.into_owned().try_into().map(|v| (k.clone().into(), v)))
-                    .collect();
-                Ok(Box::new(CelMap::from(result?)))
-            }
-            Value::Opaque(o) => {
-                let v: Box<dyn Val> = if let Some(value) = o.downcast_ref::<OptionalValue>() {
-                    match value.inner() {
-                        None => Box::new(CelOptional::none()),
-                        Some(v) => Box::new(CelOptional::of(v.clone().try_into()?)),
-                    }
-                } else {
-                    Box::new(OpaqueVal::new(o))
-                };
-                Ok(v)
-            }
-            #[cfg(feature = "structs")]
-            Value::Struct(s) => Ok(Arc::try_unwrap(s)
-                .map(|s| Box::new(s) as Box<dyn Val>)
-                .unwrap_or_else(|arc| arc.clone_as_boxed())),
-        }
-    }
-}
-
 /// The append shape the `map` and `filter` macros expand their loop step to.
 ///
 /// `map(x, f(x))` expands to the step `@result + [f(x)]`, and `filter(x, c)`
@@ -1569,10 +1363,9 @@ impl Value {
 
     /// Evaluates `expr` entirely within the [`Value`] universe.
     ///
-    /// Mirrors [`Value::resolve_val`] arm for arm without ever constructing a
-    /// `Box<dyn Val>`, except at the host-function boundary, which still takes
-    /// its arguments as `Cow<dyn Val>`. Both walkers are held to the same
-    /// answers by the differential corpus in `tests/oracle.rs`.
+    /// The crate's only walker. It was built arm for arm against the trait-object
+    /// walker it replaced, the two held to the same answers by the differential
+    /// corpus in `tests/oracle.rs`, which still gates this one alone.
     pub fn resolve_value(expr: &Expression, ctx: &Context) -> Result<Value, ExecutionError> {
         match &expr.expr {
             Expr::Literal(literal) => Ok(literal.to_value()),
@@ -1942,11 +1735,6 @@ fn try_bool_value(val: Result<Value, ExecutionError>) -> Result<bool, ExecutionE
     }
 }
 
-/// Resolves a call's arguments and bridges them into the `dyn Val` universe.
-///
-/// The env overload table and [`FunctionContext`] both still take
-/// `Cow<dyn Val>`; this is the only place [`Value::resolve_value`] touches the
-/// old universe.
 /// Resolves a call's arguments into the values the overload table matches on.
 fn resolve_args(args: &[Expression], ctx: &Context) -> Result<Vec<Value>, ExecutionError> {
     args.iter()
@@ -2106,12 +1894,16 @@ fn value_index(container: &Value, key: &Value) -> Result<Value, ExecutionError> 
                 .ok_or_else(|| ExecutionError::NoSuchKey(Arc::new(key_display(&k))))
         }
         #[cfg(feature = "structs")]
-        Value::Struct(s) => {
-            use crate::common::traits::Indexer;
-            let boxed: Box<dyn Val> = key.clone().try_into()?;
-            s.get(boxed.as_ref())
-                .and_then(|v| Value::try_from(v.as_ref()))
-        }
+        Value::Struct(s) => match key {
+            Value::String(field) => s
+                .field_value(field)
+                .cloned()
+                .ok_or_else(|| ExecutionError::NoSuchKey(Arc::new(field.as_str().to_owned()))),
+            other => Err(ExecutionError::UnsupportedIndex(
+                other.clone(),
+                container.clone(),
+            )),
+        },
         _ => Err(ExecutionError::NoSuchOverload),
     }
 }
@@ -2669,13 +2461,12 @@ mod tests {
     }
 
     mod opaque {
-        use crate::objects::{Map, Opaque, OpaqueVal, OptionalValue};
+        use crate::objects::{Map, Opaque, OptionalValue};
         use crate::parser::Parser;
         use crate::{Context, ExecutionError, FunctionContext, Program, Value};
         use serde::Serialize;
         use std::collections::HashMap;
         use std::fmt::Debug;
-        use std::ops::Deref;
         use std::sync::Arc;
 
         #[derive(Debug, Eq, PartialEq, Serialize)]
@@ -3182,14 +2973,10 @@ mod tests {
 
     #[cfg(feature = "structs")]
     mod structs {
-        use std::borrow::Cow;
         use std::sync::Arc;
 
         use crate::{
-            common::{
-                types::{self, CelBool, CelInt, CelString, CelStruct},
-                value::Val,
-            },
+            common::types::{self, CelStruct},
             env::StructDef,
             Context, Env, ExecutionError, Program, Value,
         };

@@ -287,9 +287,9 @@ fn walk_list(list_len: i64, source: &str) {
     }
     let (a_in, b_in) = read();
 
-    // Binding alone, so the conversion the walker's value universe forces is
-    // separated from the evaluation. `Box<dyn Val>` has no list strategy, so a
-    // `Value::List` is exploded into one box per element on every bind.
+    // Binding alone, so any conversion the bind forces is separated from the
+    // evaluation. The context stores `Value` directly, so a `Value::List` is
+    // bound by cloning its handle and keeps whichever strategy it arrived with.
     let mut ctx = Context::default();
     reset();
     for input in &inputs {
