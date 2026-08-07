@@ -159,10 +159,7 @@ fn render(value: &Value) -> String {
             let fields: Vec<String> = s
                 .field_values()
                 .into_iter()
-                .map(|(name, v)| match Value::try_from(v.as_ref()) {
-                    Ok(v) => format!("{name}: {}", render(&v)),
-                    Err(_) => format!("{name}: <unconvertible>"),
-                })
+                .map(|(name, v)| format!("{name}: {}", render(&v)))
                 .collect();
             format!("struct({}{{{}}})", s.name(), fields.join(", "))
         }

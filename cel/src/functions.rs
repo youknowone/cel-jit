@@ -18,18 +18,18 @@ type Result<T> = std::result::Result<T, ExecutionError>;
 #[derive(Clone)]
 pub struct FunctionContext<'context, 'call: 'context> {
     pub name: &'call str,
-    pub this: Option<Cow<'context, dyn Val>>,
+    pub this: Option<Value>,
     pub ptx: &'context Context<'context>,
-    pub args: Vec<Cow<'context, dyn Val>>,
+    pub args: Vec<Value>,
     pub arg_idx: usize,
 }
 
 impl<'context, 'call: 'context> FunctionContext<'context, 'call> {
     pub fn new(
         name: &'call str,
-        this: Option<Cow<'context, dyn Val>>,
+        this: Option<Value>,
         ptx: &'context Context<'context>,
-        args: Vec<Cow<'context, dyn Val>>,
+        args: Vec<Value>,
     ) -> Self {
         Self {
             name,

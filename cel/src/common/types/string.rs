@@ -3,11 +3,13 @@ use crate::common::types::{CelBool, CelBytes, CelDouble, CelInt, CelUInt, Kind, 
 #[cfg(feature = "chrono")]
 use crate::common::types::{CelDuration, CelTimestamp};
 use crate::common::value::{Downcast, Val};
+use crate::objects::Value;
 use crate::ExecutionError;
 use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::ops::Deref;
 use std::string::String as StdString;
+use std::sync::Arc;
 
 #[derive(Clone, Debug, Default, Eq, Hash, PartialEq, PartialOrd, Ord)]
 pub struct String(StdString);
@@ -137,98 +139,67 @@ impl<'a> TryFrom<&'a dyn Val> for &'a str {
     }
 }
 
-fn string_contains<'a>(args: Vec<Cow<'a, dyn Val>>) -> Result<Cow<'a, dyn Val>, ExecutionError> {
-    let target = &args[0];
-    let arg = &args[1];
-    match target.downcast_ref::<String>() {
-        None => Err(ExecutionError::UnexpectedType {
-            got: target.get_type().name().to_string(),
-            want: super::STRING_TYPE.name().to_string(),
-        }),
-        Some(s) => match arg.downcast_ref::<String>() {
-            None => Err(ExecutionError::UnexpectedType {
-                got: arg.get_type().name().to_string(),
-                want: super::STRING_TYPE.name().to_string(),
-            }),
-            Some(needle) => Ok(super::cel_bool(s.contains(needle.inner()))),
-        },
+/// Reads an argument the overload declared as `string`.
+fn expect_string(value: &Value) -> Result<&str, ExecutionError> {
+    match value {
+        Value::String(s) => Ok(s.as_str()),
+        other => Err(super::type_error(other, &super::STRING_TYPE)),
     }
 }
 
-fn ends_with_string<'a>(args: Vec<Cow<'a, dyn Val>>) -> Result<Cow<'a, dyn Val>, ExecutionError> {
-    super::binary_fn(
-        args,
-        super::STRING_TYPE,
-        super::STRING_TYPE,
-        |target: &String, needle: &String| {
-            Ok(Box::new(CelBool::from(target.ends_with(needle.inner()))))
-        },
-    )
+fn string_contains(args: Vec<Value>) -> Result<Value, ExecutionError> {
+    let target = expect_string(&args[0])?;
+    let needle = expect_string(&args[1])?;
+    Ok(Value::Bool(target.contains(needle)))
 }
 
-fn starts_with_string<'a>(args: Vec<Cow<'a, dyn Val>>) -> Result<Cow<'a, dyn Val>, ExecutionError> {
-    super::binary_fn(
-        args,
-        super::STRING_TYPE,
-        super::STRING_TYPE,
-        |target: &String, needle: &String| {
-            Ok(Box::new(CelBool::from(target.starts_with(needle.inner()))))
-        },
-    )
+fn ends_with_string(args: Vec<Value>) -> Result<Value, ExecutionError> {
+    let target = expect_string(&args[0])?;
+    let needle = expect_string(&args[1])?;
+    Ok(Value::Bool(target.ends_with(needle)))
+}
+
+fn starts_with_string(args: Vec<Value>) -> Result<Value, ExecutionError> {
+    let target = expect_string(&args[0])?;
+    let needle = expect_string(&args[1])?;
+    Ok(Value::Bool(target.starts_with(needle)))
 }
 
 #[cfg(feature = "regex")]
-fn matches<'a>(args: Vec<Cow<'a, dyn Val>>) -> Result<Cow<'a, dyn Val>, ExecutionError> {
-    super::binary_fn(
-        args,
-        super::STRING_TYPE,
-        super::STRING_TYPE,
-        |this: &String, regex: &String| match regex::Regex::new(regex.inner()) {
-            Ok(re) => Ok(Box::new(CelBool::from(re.is_match(this.inner())))),
-            Err(err) => Err(ExecutionError::FunctionError {
-                function: "matches".to_string(),
-                message: format!("'{}' not a valid regex:\n{err}", regex.inner()),
-            }),
-        },
-    )
-}
-
-fn string<'a>(args: Vec<Cow<'a, dyn Val>>) -> Result<Cow<'a, dyn Val>, ExecutionError> {
-    let mut args = args;
-    let arg = args.remove(0).into_owned();
-    let ret: Result<Box<String>, Box<dyn Val>> = match arg.get_type().kind() {
-        Kind::String => arg.downcast::<String>(),
-        Kind::Int => arg
-            .downcast::<CelInt>()
-            .map(|arg| Box::new(String::from(arg.to_string()))),
-        Kind::UInt => arg
-            .downcast::<CelUInt>()
-            .map(|arg| Box::new(String::from(arg.to_string()))),
-        Kind::Double => arg
-            .downcast::<CelDouble>()
-            .map(|arg| Box::new(String::from(arg.to_string()))),
-        Kind::Bytes => arg.downcast::<CelBytes>().map(|arg| {
-            Box::new(String::from(
-                StdString::from_utf8_lossy(arg.inner()).as_ref(),
-            ))
-        }),
-        #[cfg(feature = "chrono")]
-        Kind::Timestamp => arg
-            .downcast::<CelTimestamp>()
-            .map(|ts| Box::new(String::from(ts.inner().to_rfc3339()))),
-        #[cfg(feature = "chrono")]
-        Kind::Duration => arg
-            .downcast::<CelDuration>()
-            .map(|arg| Box::new(String::from(crate::duration::format_duration(arg.inner())))),
-        _ => Err(arg),
-    };
-    match ret {
-        Ok(ret) => Ok(Cow::<dyn Val>::Owned(ret)),
-        Err(arg) => Err(ExecutionError::FunctionError {
-            function: "string".to_owned(),
-            message: format!("cannot convert {arg:?} to string"),
+fn matches(args: Vec<Value>) -> Result<Value, ExecutionError> {
+    let this = expect_string(&args[0])?;
+    let pattern = expect_string(&args[1])?;
+    match regex::Regex::new(pattern) {
+        Ok(re) => Ok(Value::Bool(re.is_match(this))),
+        Err(err) => Err(ExecutionError::FunctionError {
+            function: "matches".to_string(),
+            message: format!("'{pattern}' not a valid regex:\n{err}"),
         }),
     }
+}
+
+fn string(mut args: Vec<Value>) -> Result<Value, ExecutionError> {
+    let arg = args.remove(0);
+    let converted = match &arg {
+        Value::String(_) => return Ok(arg),
+        Value::Int(i) => i.to_string(),
+        Value::UInt(u) => u.to_string(),
+        Value::Float(f) => f.to_string(),
+        Value::Bytes(b) => StdString::from_utf8_lossy(b).into_owned(),
+        #[cfg(feature = "chrono")]
+        Value::Timestamp(ts) => ts.to_rfc3339(),
+        #[cfg(feature = "chrono")]
+        Value::Duration(d) => crate::duration::format_duration(d),
+        // Unreachable through the overload table, which declares `string` only
+        // over the families above.
+        other => {
+            return Err(ExecutionError::FunctionError {
+                function: "string".to_owned(),
+                message: format!("cannot convert {other:?} to string"),
+            })
+        }
+    };
+    Ok(Value::String(Arc::new(converted)))
 }
 
 pub(crate) fn stdlib(env: &mut crate::Env) {

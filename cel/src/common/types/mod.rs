@@ -23,6 +23,7 @@ pub(crate) mod uint;
 
 use crate::common::traits::TraitSet;
 use crate::common::value::Val;
+use crate::objects::{OptionalValue, Value};
 pub(crate) use bool::borrowed as cel_bool;
 pub use bool::Bool as CelBool;
 pub use bytes::Bytes as CelBytes;
@@ -91,8 +92,12 @@ impl ToOwned for Type {
 
 impl Type {
     /// Returns true if the given value can be assigned to this type.
-    pub fn is_assignable(&self, val: &dyn Val) -> bool {
-        if self == val.get_type() {
+    ///
+    /// `Kind::Opaque` delegates to its first parameter, so `OPTIONAL_TYPE` —
+    /// parameterised on `DYN_TYPE` — accepts every value, and the optional
+    /// overloads are therefore selected on name and arity alone.
+    pub fn is_assignable(&self, val: &Value) -> bool {
+        if self.matches(val) {
             true
         } else {
             match self.kind() {
@@ -104,6 +109,42 @@ impl Type {
                 _ => false,
             }
         }
+    }
+
+    /// Whether `self` is exactly the value's own type, without building it.
+    ///
+    /// Every family reports a shared constant except the two that carry a name:
+    /// an opaque handle names its host type, and a struct names itself.
+    fn matches(&self, val: &Value) -> bool {
+        let constant = match val {
+            Value::Bool(_) => &BOOL_TYPE,
+            Value::Int(_) => &INT_TYPE,
+            Value::UInt(_) => &UINT_TYPE,
+            Value::Float(_) => &DOUBLE_TYPE,
+            Value::String(_) => &STRING_TYPE,
+            Value::Bytes(_) => &BYTES_TYPE,
+            Value::Null => &NULL_TYPE,
+            Value::List(_) => &LIST_TYPE,
+            Value::Map(_) => &MAP_TYPE,
+            #[cfg(feature = "chrono")]
+            Value::Duration(_) => &DURATION_TYPE,
+            #[cfg(feature = "chrono")]
+            Value::Timestamp(_) => &TIMESTAMP_TYPE,
+            #[cfg(feature = "structs")]
+            Value::Struct(s) => return self == s.cel_type(),
+            Value::Opaque(o) => {
+                return if o.downcast_ref::<OptionalValue>().is_some() {
+                    self == &OPTIONAL_TYPE
+                } else {
+                    // The shape `Type::new_opaque_type` builds for a host value.
+                    self.kind == Kind::Opaque
+                        && self.parameters.is_empty()
+                        && self.trait_mask == 0
+                        && self.runtime_type_name == o.runtime_type_name()
+                };
+            }
+        };
+        self == constant
     }
 }
 
@@ -369,49 +410,71 @@ pub(crate) fn cast_boxed<T: Val>(value: Box<dyn Val>) -> Result<Box<T>, Box<dyn 
     Err(value)
 }
 
-type UnaryFn<A> = fn(&A) -> Result<Box<dyn Val>, ExecutionError>;
-type BinaryFn<A, B> = fn(&A, &B) -> Result<Box<dyn Val>, ExecutionError>;
-
-fn unary_fn<'a, A: Val>(
-    args: Vec<Cow<'a, dyn Val>>,
-    type_a: Type,
-    func: UnaryFn<A>,
-) -> Result<Cow<'a, dyn Val>, ExecutionError> {
-    let arg = &args[0];
-    match arg.downcast_ref::<A>() {
-        None => Err(ExecutionError::UnexpectedType {
-            got: arg.get_type().name().to_string(),
-            want: type_a.name().to_string(),
-        }),
-        Some(arg) => Ok(Cow::<dyn Val>::Owned(func(arg)?)),
-    }
-}
-
-fn binary_fn<'a, A: Val, B: Val>(
-    args: Vec<Cow<'a, dyn Val>>,
-    type_a: Type,
-    type_b: Type,
-    func: BinaryFn<A, B>,
-) -> Result<Cow<'a, dyn Val>, ExecutionError> {
-    let arg1 = &args[0];
-    let arg2 = &args[1];
-    match arg1.downcast_ref::<A>() {
-        None => Err(ExecutionError::UnexpectedType {
-            got: arg1.get_type().name().to_string(),
-            want: type_a.name().to_string(),
-        }),
-        Some(arg1) => match arg2.downcast_ref::<B>() {
-            None => Err(ExecutionError::UnexpectedType {
-                got: arg2.get_type().name().to_string(),
-                want: type_b.name().to_string(),
-            }),
-            Some(arg2) => Ok(Cow::<dyn Val>::Owned(func(arg1, arg2)?)),
+/// The CEL type name of a value, as `UnexpectedType` reports it.
+///
+/// This is `Type::name` of the value's own type. It is deliberately not
+/// [`ValueType`](crate::objects::ValueType)'s `Display`, which spells the same
+/// families `float`, `duration` and `null`.
+pub(crate) fn type_name(value: &Value) -> String {
+    match value {
+        Value::Bool(_) => BOOL_TYPE.name().to_owned(),
+        Value::Int(_) => INT_TYPE.name().to_owned(),
+        Value::UInt(_) => UINT_TYPE.name().to_owned(),
+        Value::Float(_) => DOUBLE_TYPE.name().to_owned(),
+        Value::String(_) => STRING_TYPE.name().to_owned(),
+        Value::Bytes(_) => BYTES_TYPE.name().to_owned(),
+        Value::Null => NULL_TYPE.name().to_owned(),
+        Value::List(_) => LIST_TYPE.name().to_owned(),
+        Value::Map(_) => MAP_TYPE.name().to_owned(),
+        #[cfg(feature = "chrono")]
+        Value::Duration(_) => DURATION_TYPE.name().to_owned(),
+        #[cfg(feature = "chrono")]
+        Value::Timestamp(_) => TIMESTAMP_TYPE.name().to_owned(),
+        #[cfg(feature = "structs")]
+        Value::Struct(s) => s.name().to_owned(),
+        Value::Opaque(o) => match o.downcast_ref::<OptionalValue>() {
+            Some(_) => OPTIONAL_TYPE.name().to_owned(),
+            None => o.runtime_type_name().to_owned(),
         },
     }
 }
 
-fn noop<'a>(args: Vec<Cow<'a, dyn Val>>) -> Result<Cow<'a, dyn Val>, ExecutionError> {
-    let mut args = args;
-    let ts = args.remove(0);
-    Ok(ts)
+/// The value's own CEL type.
+///
+/// Returns it owned because the two named families build theirs per instance;
+/// overload matching uses [`Type::is_assignable`], which needs no allocation.
+pub(crate) fn type_of(value: &Value) -> Type {
+    match value {
+        Value::Bool(_) => BOOL_TYPE.to_owned(),
+        Value::Int(_) => INT_TYPE.to_owned(),
+        Value::UInt(_) => UINT_TYPE.to_owned(),
+        Value::Float(_) => DOUBLE_TYPE.to_owned(),
+        Value::String(_) => STRING_TYPE.to_owned(),
+        Value::Bytes(_) => BYTES_TYPE.to_owned(),
+        Value::Null => NULL_TYPE.to_owned(),
+        Value::List(_) => LIST_TYPE.to_owned(),
+        Value::Map(_) => MAP_TYPE.to_owned(),
+        #[cfg(feature = "chrono")]
+        Value::Duration(_) => DURATION_TYPE.to_owned(),
+        #[cfg(feature = "chrono")]
+        Value::Timestamp(_) => TIMESTAMP_TYPE.to_owned(),
+        #[cfg(feature = "structs")]
+        Value::Struct(s) => s.cel_type().to_owned(),
+        Value::Opaque(o) => match o.downcast_ref::<OptionalValue>() {
+            Some(_) => OPTIONAL_TYPE.to_owned(),
+            None => Type::new_opaque_type(o.runtime_type_name().to_owned()),
+        },
+    }
+}
+
+/// The mismatch an overload reports when its argument is not the declared type.
+pub(crate) fn type_error(got: &Value, want: &Type) -> ExecutionError {
+    ExecutionError::UnexpectedType {
+        got: type_name(got),
+        want: want.name().to_owned(),
+    }
+}
+
+fn noop(mut args: Vec<Value>) -> Result<Value, ExecutionError> {
+    Ok(args.remove(0))
 }

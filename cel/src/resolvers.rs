@@ -37,7 +37,7 @@ impl Resolver for Argument {
             .args
             .get(index)
             .ok_or_else(|| ExecutionError::invalid_argument_count(index + 1, ctx.args.len()))?;
-        arg.as_ref().try_into()
+        Ok(arg.clone())
     }
 }
 
@@ -52,10 +52,6 @@ pub(crate) struct AllArguments;
 
 impl Resolver for AllArguments {
     fn resolve(&self, ctx: &FunctionContext) -> ResolveResult {
-        let mut args = Vec::with_capacity(ctx.args.len());
-        for arg in ctx.args.iter() {
-            args.push(arg.as_ref().try_into()?);
-        }
-        Ok(Value::list(args))
+        Ok(Value::list(ctx.args.clone()))
     }
 }

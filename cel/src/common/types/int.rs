@@ -2,6 +2,7 @@ use crate::common::traits::Negator;
 use crate::common::traits::{self, Comparer};
 use crate::common::types::{CelDouble, CelString, CelUInt, Kind, Type};
 use crate::common::value::{Downcast, Val};
+use crate::objects::Value;
 use crate::ExecutionError;
 use std::borrow::Cow;
 use std::cmp::Ordering;
@@ -226,37 +227,24 @@ impl<'a> TryFrom<&'a dyn Val> for &'a i64 {
     }
 }
 
-fn int<'a>(args: Vec<Cow<'a, dyn Val>>) -> Result<Cow<'a, dyn Val>, ExecutionError> {
-    let mut args = args;
-    let arg = args.remove(0).into_owned();
-    let ret: Result<Box<Int>, Box<dyn Val>> = match arg.get_type().kind() {
-        Kind::Int => arg.downcast::<Int>(),
-        Kind::UInt => arg
-            .downcast::<CelUInt>()
-            .map(|arg| Box::new(Int::from(*arg.inner() as i64))),
-        Kind::Double => arg
-            .downcast::<CelDouble>()
-            .map(|arg| Box::new(Int::from(*arg.inner() as i64))),
-        Kind::String => match arg.downcast::<CelString>() {
-            Err(arg) => Err(arg),
-            Ok(arg) => match arg.inner().parse::<i64>() {
-                Ok(arg) => Ok(Box::new(Int::from(arg))),
-                Err(e) => {
-                    return Err(ExecutionError::FunctionError {
-                        function: "int".to_owned(),
-                        message: format!("string parse error: {e}"),
-                    })
-                }
-            },
+fn int(mut args: Vec<Value>) -> Result<Value, ExecutionError> {
+    let arg = args.remove(0);
+    match arg {
+        Value::Int(_) => Ok(arg),
+        Value::UInt(u) => Ok(Value::Int(u as i64)),
+        Value::Float(f) => Ok(Value::Int(f as i64)),
+        Value::String(s) => match s.parse::<i64>() {
+            Ok(parsed) => Ok(Value::Int(parsed)),
+            Err(e) => Err(ExecutionError::FunctionError {
+                function: "int".to_owned(),
+                message: format!("string parse error: {e}"),
+            }),
         },
-        _ => Err(arg),
-    };
-
-    match ret {
-        Ok(ret) => Ok(Cow::<dyn Val>::Owned(ret)),
-        Err(arg) => Err(ExecutionError::FunctionError {
+        // Unreachable through the overload table, which declares `int` only
+        // over the four families above.
+        other => Err(ExecutionError::FunctionError {
             function: "double".to_owned(),
-            message: format!("cannot convert {arg:?} to double"),
+            message: format!("cannot convert {other:?} to double"),
         }),
     }
 }

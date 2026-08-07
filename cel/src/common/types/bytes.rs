@@ -5,6 +5,7 @@ use crate::Value;
 use crate::{common::traits, ExecutionError};
 use std::borrow::Cow;
 use std::ops::Deref;
+use std::sync::Arc;
 use traits::{Adder, Comparer};
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -129,21 +130,18 @@ impl<'a> TryFrom<&'a dyn Val> for &'a [u8] {
     }
 }
 
-fn bytes_to_bytes<'a>(args: Vec<Cow<'a, dyn Val>>) -> Result<Cow<'a, dyn Val>, ExecutionError> {
-    let mut args = args;
+fn bytes_to_bytes(mut args: Vec<Value>) -> Result<Value, ExecutionError> {
     Ok(args.remove(0))
 }
 
-fn string_to_bytes<'a>(args: Vec<Cow<'a, dyn Val>>) -> Result<Cow<'a, dyn Val>, ExecutionError> {
-    let mut args = args;
-    let arg = args.remove(0).into_owned();
-    match arg.downcast::<CelString>() {
-        Ok(arg) => {
-            let value = arg.into_inner().into_bytes();
-            Ok(Cow::<dyn Val>::Owned(Box::new(Bytes::from(value))))
+fn string_to_bytes(mut args: Vec<Value>) -> Result<Value, ExecutionError> {
+    match args.remove(0) {
+        Value::String(s) => {
+            let value = Arc::try_unwrap(s).unwrap_or_else(|s| s.as_str().to_owned());
+            Ok(Value::Bytes(Arc::new(value.into_bytes())))
         }
-        Err(e) => Err(ExecutionError::UnexpectedType {
-            got: e.get_type().name().to_owned(),
+        other => Err(ExecutionError::UnexpectedType {
+            got: super::type_name(&other),
             want: "Bytes".to_owned(),
         }),
     }

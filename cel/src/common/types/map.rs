@@ -163,6 +163,7 @@ impl From<HashMap<Key, Box<dyn Val>>> for DefaultMap {
 
 // `KeyRef` and `AsKeyRef` live in `crate::objects`, the universe that
 // survives; this module had a byte-identical second copy of both.
+use crate::objects::Value;
 use crate::objects::{AsKeyRef, KeyRef};
 
 #[derive(Debug, Eq, Clone)]

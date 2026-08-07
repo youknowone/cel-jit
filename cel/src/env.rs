@@ -2,12 +2,11 @@ use crate::common::{
     decls::FunctionDecl,
     functions::Function,
     types::{self, Type},
-    value::Val,
 };
+use crate::objects::Value;
 #[cfg(feature = "structs")]
 use crate::{common::types::CelStruct, ExecutionError};
 use std::{
-    borrow::Cow,
     collections::{
         btree_map::Entry::{Occupied, Vacant},
         BTreeMap,
@@ -28,13 +27,13 @@ use std::{
 /// ```
 /// #[cfg(feature = "structs")]
 /// {
-/// use cel::{Env, StructDef, common::types, common::types::CelString};
+/// use cel::{Env, StructDef, Value, common::types};
 ///
 /// let mut env = Env::stdlib();
 /// env.add_struct(
 ///     StructDef::new("cel.MyStruct".to_owned())
 ///         .add_field("some_field".to_owned(), types::STRING_TYPE)
-///         .add_field_with_default("with_default".to_owned(), Box::new(CelString::from("default_value")))
+///         .add_field_with_default("with_default".to_owned(), Value::from("default_value"))
 /// );
 /// }
 /// ```
@@ -44,16 +43,16 @@ use std::{
 /// You can add custom function overloads to the environment.
 ///
 /// ```
-/// use cel::{Env, common::types, common::value::Val};
-/// use std::borrow::Cow;
+/// use cel::{Env, Value, common::types};
 ///
 /// let mut env = Env::stdlib();
 ///
 /// // Define a function that takes an integer and returns its square.
 /// env.add_overload("square", "int_square", vec![types::INT_TYPE], |args| {
-///     let val = args[0].downcast_ref::<cel::common::types::CelInt>().unwrap();
-///     let result: Box<dyn Val> = Box::new(cel::common::types::CelInt::from(val.inner() * val.inner()));
-///     Ok(Cow::Owned(result))
+///     match args[0] {
+///         Value::Int(v) => Ok(Value::Int(v * v)),
+///         _ => unreachable!("the overload declares a single int"),
+///     }
 /// }).unwrap();
 /// ```
 #[derive(Default)]
@@ -129,7 +128,7 @@ impl Env {
     }
 
     /// Finds a global function overload that matches the given name and arguments.
-    pub fn find_overload(&self, name: &str, args: &[Cow<dyn Val>]) -> Option<Function> {
+    pub fn find_overload(&self, name: &str, args: &[Value]) -> Option<Function> {
         match self.functions.get(name) {
             None => None,
             Some(fn_decl) => fn_decl.find_overload(false, args),
@@ -171,11 +170,7 @@ impl Env {
     }
 
     /// Finds a member function overload that matches the given name and arguments.
-    pub(crate) fn find_member_overload(
-        &self,
-        name: &str,
-        args: &[Cow<dyn Val>],
-    ) -> Option<Function> {
+    pub(crate) fn find_member_overload(&self, name: &str, args: &[Value]) -> Option<Function> {
         match self.functions.get(name) {
             None => None,
             Some(fn_decl) => fn_decl.find_overload(true, args),
@@ -204,20 +199,20 @@ impl Env {
 /// # Example
 ///
 /// ```
-/// use cel::{Env, StructDef, common::types, common::types::CelString};
+/// use cel::{Env, StructDef, Value, common::types};
 ///
 /// let mut env = Env::stdlib();
 /// env.add_struct(
 ///     StructDef::new("MyStruct".to_owned())
 ///         .add_field("some_field".to_owned(), types::STRING_TYPE)
-///         .add_field_with_default("with_default".to_owned(), Box::new(CelString::from("default_value")))
+///         .add_field_with_default("with_default".to_owned(), Value::from("default_value"))
 /// );
 /// ```
 #[cfg(feature = "structs")]
 pub struct StructDef {
     name: String,
     fields: BTreeMap<String, Type>,
-    defaults: BTreeMap<String, Box<dyn Val>>,
+    defaults: BTreeMap<String, Value>,
 }
 
 #[cfg(feature = "structs")]
@@ -249,12 +244,12 @@ impl StructDef {
     /// of the field is automatically inferred from the default value. When the
     /// struct is instantiated in a CEL expression, this field may be omitted, in
     /// which case the default value will be used.
-    pub fn add_field_with_default(self, field: String, default: Box<dyn Val>) -> Self {
-        self.insert_field(field, default.get_type().to_owned(), Some(default))
+    pub fn add_field_with_default(self, field: String, default: Value) -> Self {
+        self.insert_field(field, types::type_of(&default), Some(default))
     }
 
     /// Internal method to insert a field into the struct definition.
-    fn insert_field(self, field: String, t: Type, default: Option<Box<dyn Val>>) -> Self {
+    fn insert_field(self, field: String, t: Type, default: Option<Value>) -> Self {
         let mut def = self;
         def.fields.insert(field.clone(), t);
         if let Some(default) = default {
@@ -278,7 +273,7 @@ impl StructDef {
     #[cfg(feature = "structs")]
     pub(crate) fn new_struct(
         &self,
-        fields: BTreeMap<String, std::borrow::Cow<dyn Val>>,
+        fields: BTreeMap<String, Value>,
     ) -> Result<CelStruct, ExecutionError> {
         let mut s = CelStruct::new(self.name.clone());
         let mut fields = fields;
@@ -286,15 +281,15 @@ impl StructDef {
             if let Some(value) = fields.remove(field) {
                 s.add_field_value(field.clone(), value);
             } else {
-                s.add_field_value(field.clone(), Cow::Owned(default.clone_as_boxed()));
+                s.add_field_value(field.clone(), default.clone());
             }
         }
         for (field, value) in fields {
             match self.fields.get(&field) {
                 Some(t) => {
-                    if t != value.get_type() {
+                    if *t != types::type_of(&value) {
                         return Err(ExecutionError::UnexpectedType {
-                            got: value.get_type().name().to_owned(),
+                            got: types::type_name(&value),
                             want: format!("{} for field {field} in {}", t.name(), self.name),
                         });
                     }

@@ -196,37 +196,24 @@ impl<'a> TryFrom<&'a dyn Val> for &'a f64 {
     }
 }
 
-fn double<'a>(args: Vec<Cow<'a, dyn Val>>) -> Result<Cow<'a, dyn Val>, ExecutionError> {
-    let mut args = args;
-    let arg = args.remove(0).into_owned();
-    let ret: Result<Box<Double>, Box<dyn Val>> = match arg.get_type().kind() {
-        Kind::Double => arg.downcast::<Double>(),
-        Kind::Int => arg
-            .downcast::<CelInt>()
-            .map(|arg| Box::new(Double::from(*arg.inner() as f64))),
-        Kind::UInt => arg
-            .downcast::<CelUInt>()
-            .map(|arg| Box::new(Double::from(*arg.inner() as f64))),
-        Kind::String => match arg.downcast::<CelString>() {
-            Err(arg) => Err(arg),
-            Ok(arg) => match arg.inner().parse::<f64>() {
-                Ok(arg) => Ok(Box::new(Double::from(arg))),
-                Err(e) => {
-                    return Err(ExecutionError::FunctionError {
-                        function: "double".to_owned(),
-                        message: format!("string parse error: {e}"),
-                    })
-                }
-            },
+fn double(mut args: Vec<Value>) -> Result<Value, ExecutionError> {
+    let arg = args.remove(0);
+    match arg {
+        Value::Float(_) => Ok(arg),
+        Value::Int(i) => Ok(Value::Float(i as f64)),
+        Value::UInt(u) => Ok(Value::Float(u as f64)),
+        Value::String(s) => match s.parse::<f64>() {
+            Ok(parsed) => Ok(Value::Float(parsed)),
+            Err(e) => Err(ExecutionError::FunctionError {
+                function: "double".to_owned(),
+                message: format!("string parse error: {e}"),
+            }),
         },
-        _ => Err(arg),
-    };
-
-    match ret {
-        Ok(ret) => Ok(Cow::<dyn Val>::Owned(ret)),
-        Err(arg) => Err(ExecutionError::FunctionError {
+        // Unreachable through the overload table, which declares `double` only
+        // over the four families above.
+        other => Err(ExecutionError::FunctionError {
             function: "double".to_owned(),
-            message: format!("cannot convert {arg:?} to double"),
+            message: format!("cannot convert {other:?} to double"),
         }),
     }
 }

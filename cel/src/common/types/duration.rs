@@ -141,36 +141,36 @@ impl<'a> TryFrom<&'a dyn Val> for &'a chrono::Duration {
     }
 }
 
-fn millis<'a>(args: Vec<Cow<'a, dyn Val>>) -> Result<Cow<'a, dyn Val>, ExecutionError> {
-    super::unary_fn(args, super::DURATION_TYPE, |ts: &Duration| {
-        Ok(Box::new(CelInt::from(ts.inner().num_milliseconds())))
-    })
+/// Reads the receiver an accessor overload declared as `google.protobuf.Duration`.
+fn expect_duration(value: &Value) -> Result<&chrono::Duration, ExecutionError> {
+    match value {
+        Value::Duration(d) => Ok(d),
+        other => Err(super::type_error(other, &super::DURATION_TYPE)),
+    }
 }
 
-fn seconds<'a>(args: Vec<Cow<'a, dyn Val>>) -> Result<Cow<'a, dyn Val>, ExecutionError> {
-    super::unary_fn(args, super::DURATION_TYPE, |ts: &Duration| {
-        Ok(Box::new(CelInt::from(ts.inner().num_seconds())))
-    })
+/// Builds an accessor overload that projects one integer field out of a duration.
+macro_rules! duration_accessor {
+    ($name:ident, $method:ident) => {
+        fn $name(args: Vec<Value>) -> Result<Value, ExecutionError> {
+            Ok(Value::Int(expect_duration(&args[0])?.$method()))
+        }
+    };
 }
 
-fn minutes<'a>(args: Vec<Cow<'a, dyn Val>>) -> Result<Cow<'a, dyn Val>, ExecutionError> {
-    super::unary_fn(args, super::DURATION_TYPE, |ts: &Duration| {
-        Ok(Box::new(CelInt::from(ts.inner().num_minutes())))
-    })
-}
+duration_accessor!(millis, num_milliseconds);
+duration_accessor!(seconds, num_seconds);
+duration_accessor!(minutes, num_minutes);
+duration_accessor!(hours, num_hours);
 
-fn hours<'a>(args: Vec<Cow<'a, dyn Val>>) -> Result<Cow<'a, dyn Val>, ExecutionError> {
-    super::unary_fn(args, super::DURATION_TYPE, |ts: &Duration| {
-        Ok(Box::new(CelInt::from(ts.inner().num_hours())))
-    })
-}
-
-fn duration<'a>(args: Vec<Cow<'a, dyn Val>>) -> Result<Cow<'a, dyn Val>, ExecutionError> {
-    super::unary_fn(args, super::STRING_TYPE, |value: &CelString| {
-        let (_, duration) = crate::duration::parse_duration(value.inner())
-            .map_err(|e| ExecutionError::function_error("duration", e.to_string()))?;
-        Ok(Box::new(Duration::from(duration)))
-    })
+fn duration(args: Vec<Value>) -> Result<Value, ExecutionError> {
+    let text = match &args[0] {
+        Value::String(s) => s.as_str(),
+        other => return Err(super::type_error(other, &super::STRING_TYPE)),
+    };
+    let (_, parsed) = crate::duration::parse_duration(text)
+        .map_err(|e| ExecutionError::function_error("duration", e.to_string()))?;
+    Ok(Value::Duration(parsed))
 }
 
 pub(crate) fn stdlib(env: &mut crate::Env) {

@@ -247,37 +247,24 @@ impl<'a> TryFrom<&'a dyn Val> for &'a u64 {
     }
 }
 
-fn uint<'a>(args: Vec<Cow<'a, dyn Val>>) -> Result<Cow<'a, dyn Val>, ExecutionError> {
-    let mut args = args;
-    let arg = args.remove(0).into_owned();
-    let ret: Result<Box<UInt>, Box<dyn Val>> = match arg.get_type().kind() {
-        Kind::UInt => arg.downcast::<UInt>(),
-        Kind::Int => arg
-            .downcast::<CelInt>()
-            .map(|arg| Box::new(UInt::from(*arg.inner() as u64))),
-        Kind::Double => arg
-            .downcast::<CelDouble>()
-            .map(|arg| Box::new(UInt::from(*arg.inner() as u64))),
-        Kind::String => match arg.downcast::<CelString>() {
-            Err(arg) => Err(arg),
-            Ok(arg) => match arg.inner().parse::<u64>() {
-                Ok(arg) => Ok(Box::new(UInt::from(arg))),
-                Err(e) => {
-                    return Err(ExecutionError::FunctionError {
-                        function: "int".to_owned(),
-                        message: format!("string parse error: {e}"),
-                    })
-                }
-            },
+fn uint(mut args: Vec<Value>) -> Result<Value, ExecutionError> {
+    let arg = args.remove(0);
+    match arg {
+        Value::UInt(_) => Ok(arg),
+        Value::Int(i) => Ok(Value::UInt(i as u64)),
+        Value::Float(f) => Ok(Value::UInt(f as u64)),
+        Value::String(s) => match s.parse::<u64>() {
+            Ok(parsed) => Ok(Value::UInt(parsed)),
+            Err(e) => Err(ExecutionError::FunctionError {
+                function: "int".to_owned(),
+                message: format!("string parse error: {e}"),
+            }),
         },
-        _ => Err(arg),
-    };
-
-    match ret {
-        Ok(ret) => Ok(Cow::<dyn Val>::Owned(ret)),
-        Err(arg) => Err(ExecutionError::FunctionError {
+        // Unreachable through the overload table, which declares `uint` only
+        // over the four families above.
+        other => Err(ExecutionError::FunctionError {
             function: "double".to_owned(),
-            message: format!("cannot convert {arg:?} to double"),
+            message: format!("cannot convert {other:?} to double"),
         }),
     }
 }

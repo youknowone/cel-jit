@@ -109,18 +109,27 @@ pub trait Indexer {
 }
 
 pub(crate) mod adapter {
-    use std::borrow::Cow;
+    use crate::common::types::type_name;
+    use crate::objects::Value;
+    use crate::ExecutionError;
 
-    use crate::{common::value::Val, ExecutionError};
-
-    pub fn sizer_size<'a>(args: Vec<Cow<'a, dyn Val>>) -> Result<Cow<'a, dyn Val>, ExecutionError> {
-        let target = &args[0];
-        match target.as_sizer() {
-            None => Err(ExecutionError::UnexpectedType {
-                got: target.get_type().name().to_owned(),
-                want: "missing trait Sizer".to_owned(),
-            }),
-            Some(sizer) => Ok(Cow::<dyn Val>::Owned(Box::new(sizer.size()))),
-        }
+    /// Backs every `size` overload: `size(x)` and `x.size()` for the four
+    /// families whose type carries `SIZER_TYPE`.
+    pub fn sizer_size(args: Vec<Value>) -> Result<Value, ExecutionError> {
+        let size = match &args[0] {
+            // Byte length, not the character count the spec asks for. Preserved
+            // from the trait implementation this replaces.
+            Value::String(s) => s.len(),
+            Value::Bytes(b) => b.len(),
+            Value::List(l) => l.len(),
+            Value::Map(m) => m.len(),
+            other => {
+                return Err(ExecutionError::UnexpectedType {
+                    got: type_name(other),
+                    want: "missing trait Sizer".to_owned(),
+                })
+            }
+        };
+        Ok(Value::Int(size as i64))
     }
 }

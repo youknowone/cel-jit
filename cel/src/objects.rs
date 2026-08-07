@@ -1728,7 +1728,7 @@ impl Value {
                     None => {
                         let args = resolve_args(&call.args, ctx)?;
                         if let Some(op) = ctx.env().find_overload(&call.func_name, &args) {
-                            return op(args)?.as_ref().try_into();
+                            return op(args);
                         }
                         let func = ctx.get_function(call.func_name.as_str()).ok_or_else(|| {
                             ExecutionError::UndeclaredReference(call.func_name.clone().into())
@@ -1742,7 +1742,7 @@ impl Value {
                             Expr::Ident(prefix) => {
                                 let qualified_name = format!("{prefix}.{}", call.func_name);
                                 if let Some(op) = ctx.env().find_overload(&qualified_name, &args) {
-                                    return op(args)?.as_ref().try_into();
+                                    return op(args);
                                 }
                                 ctx.get_function(&qualified_name)
                             }
@@ -1752,11 +1752,11 @@ impl Value {
                             None => {
                                 let target = Value::resolve_value(target, ctx)?;
                                 let mut args = args;
-                                args.insert(0, Cow::Owned(target.try_into()?));
+                                args.insert(0, target);
                                 if let Some(op) =
                                     ctx.env().find_member_overload(&call.func_name, &args)
                                 {
-                                    return op(args)?.as_ref().try_into();
+                                    return op(args);
                                 }
                                 let target = args.remove(0);
                                 let func =
@@ -1899,7 +1899,7 @@ impl Value {
                             EntryExpr::StructField(expr) => {
                                 let f = expr.field.clone();
                                 let v = Value::resolve_value(&expr.value, ctx)?;
-                                fields.insert(f, Cow::Owned(TryInto::<Box<dyn Val>>::try_into(v)?));
+                                fields.insert(f, v);
                             }
                             EntryExpr::MapEntry(entry) => {
                                 return Err(ExecutionError::InternalError(format!(
@@ -1947,16 +1947,11 @@ fn try_bool_value(val: Result<Value, ExecutionError>) -> Result<bool, ExecutionE
 /// The env overload table and [`FunctionContext`] both still take
 /// `Cow<dyn Val>`; this is the only place [`Value::resolve_value`] touches the
 /// old universe.
-fn resolve_args<'a>(
-    args: &[Expression],
-    ctx: &Context,
-) -> Result<Vec<Cow<'a, dyn Val>>, ExecutionError> {
-    let mut out = Vec::with_capacity(args.len());
-    for arg in args {
-        let value = Value::resolve_value(arg, ctx)?;
-        out.push(Cow::Owned(TryInto::<Box<dyn Val>>::try_into(value)?));
-    }
-    Ok(out)
+/// Resolves a call's arguments into the values the overload table matches on.
+fn resolve_args(args: &[Expression], ctx: &Context) -> Result<Vec<Value>, ExecutionError> {
+    args.iter()
+        .map(|arg| Value::resolve_value(arg, ctx))
+        .collect()
 }
 
 /// Whether an incompatible right-hand side makes `op` on this receiver answer
@@ -2702,12 +2697,9 @@ mod tests {
         #[test]
         fn test_opaque_fn() {
             pub fn my_fn(ftx: &FunctionContext) -> Result<Value, ExecutionError> {
-                if let Some(Some(opaque)) = ftx.this.as_ref().map(|v| v.downcast_ref::<OpaqueVal>())
-                {
-                    if opaque.val.runtime_type_name() == "my_struct" {
+                if let Some(Value::Opaque(opaque)) = ftx.this.as_ref() {
+                    if opaque.runtime_type_name() == "my_struct" {
                         Ok(opaque
-                            .val
-                            .deref()
                             .downcast_ref::<MyStruct>()
                             .unwrap()
                             .field
@@ -2715,7 +2707,7 @@ mod tests {
                             .into())
                     } else {
                         Err(ExecutionError::UnexpectedType {
-                            got: opaque.val.runtime_type_name().to_string(),
+                            got: opaque.runtime_type_name().to_string(),
                             want: "my_struct".to_string(),
                         })
                     }
@@ -3228,19 +3220,16 @@ mod tests {
             match value {
                 Value::Struct(s) => {
                     assert_eq!(s.name(), "cel.Problem");
-                    assert_eq!(
-                        s.field_value("solved"),
-                        Some(&CelBool::from(true) as &dyn Val)
-                    );
-                    assert_eq!(s.field_value("answer"), Some(&CelInt::from(42) as &dyn Val));
+                    assert_eq!(s.field_value("solved"), Some(&Value::Bool(true)));
+                    assert_eq!(s.field_value("answer"), Some(&Value::Int(42)));
                     assert_eq!(s.field_values().len(), 2);
                     assert_eq!(
                         s.field_values().get("solved").cloned(),
-                        Some(Arc::new(CelBool::from(true)) as Arc<dyn Val>)
+                        Some(Value::Bool(true))
                     );
                     assert_eq!(
                         s.field_values().get("answer").cloned(),
-                        Some(Arc::new(CelInt::from(42)) as Arc<dyn Val>)
+                        Some(Value::Int(42))
                     );
                 }
                 _ => panic!("This can't be!"),
@@ -3282,7 +3271,10 @@ mod tests {
             env.add_struct(
                 StructDef::new(String::from("cel.MyStruct"))
                     .add_field("some".into(), types::STRING_TYPE)
-                    .add_field_with_default("here".into(), Box::new(CelString::from("yes"))),
+                    .add_field_with_default(
+                        "here".into(),
+                        Value::String(Arc::new("yes".to_owned())),
+                    ),
             );
             let program = Program::compile("cel.MyStruct { some: 'value' }.here").unwrap();
             let result = program.execute(&Context::with_env(env.into()));
@@ -3295,7 +3287,10 @@ mod tests {
             env.add_struct(
                 StructDef::new(String::from("cel.MyStruct"))
                     .add_field("some".into(), types::STRING_TYPE)
-                    .add_field_with_default("here".into(), Box::new(CelString::from("yes"))),
+                    .add_field_with_default(
+                        "here".into(),
+                        Value::String(Arc::new("yes".to_owned())),
+                    ),
             );
             let program =
                 Program::compile("cel.MyStruct { some: 'value', here: 'totally' }.here").unwrap();
@@ -3315,12 +3310,9 @@ mod tests {
             let mut my_struct = CelStruct::new("cel.MyStruct".to_owned());
             my_struct.add_field_value(
                 "name".to_owned(),
-                Cow::<dyn Val>::Owned(Box::new(CelString::from("test"))),
+                Value::String(Arc::new("test".to_owned())),
             );
-            my_struct.add_field_value(
-                "value".to_owned(),
-                Cow::<dyn Val>::Owned(Box::new(CelInt::from(42))),
-            );
+            my_struct.add_field_value("value".to_owned(), Value::Int(42));
 
             let mut context = Context::with_env(Arc::new(env));
             context
@@ -3385,12 +3377,9 @@ mod tests {
             let mut my_struct = CelStruct::new("cel.MyStruct".to_owned());
             my_struct.add_field_value(
                 "name".to_owned(),
-                Cow::<dyn Val>::Owned(Box::new(CelString::from("test"))),
+                Value::String(Arc::new("test".to_owned())),
             );
-            my_struct.add_field_value(
-                "value".to_owned(),
-                Cow::<dyn Val>::Owned(Box::new(CelInt::from(42))),
-            );
+            my_struct.add_field_value("value".to_owned(), Value::Int(42));
 
             let mut context = Context::with_env(Arc::new(env));
             context

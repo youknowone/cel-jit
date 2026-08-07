@@ -1,6 +1,7 @@
 use crate::common::traits::Zeroer;
 use crate::common::types::{self, CelBool, Type, OPTIONAL_TYPE};
 use crate::common::value::Val;
+use crate::objects::{OptionalValue, Value};
 use crate::ExecutionError;
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -117,75 +118,80 @@ impl From<Optional> for Option<Arc<dyn Val>> {
     }
 }
 
-fn optional_none<'a>(_args: Vec<Cow<'a, dyn Val>>) -> Result<Cow<'a, dyn Val>, ExecutionError> {
-    Ok(Cow::<dyn Val>::Owned(Box::new(Optional::none())))
+/// Reads the receiver an overload declared as `optional_type`.
+fn expect_optional(value: &Value) -> Result<&OptionalValue, ExecutionError> {
+    match value {
+        Value::Opaque(o) => o.downcast_ref::<OptionalValue>(),
+        _ => None,
+    }
+    .ok_or_else(|| super::type_error(value, &OPTIONAL_TYPE))
 }
 
-fn optional_of<'a>(args: Vec<Cow<'a, dyn Val>>) -> Result<Cow<'a, dyn Val>, ExecutionError> {
-    let mut args = args;
-    let value = args.remove(0);
-    Ok(Cow::<dyn Val>::Owned(Box::new(Optional::of(
-        value.into_owned(),
-    ))))
+/// Whether a value is its type's zero, as `optional.ofNonZeroValue` tests it.
+///
+/// Deliberately not [`Value::is_zero`], which answers `false` for the epoch
+/// timestamp and for a field-less struct where this answers `true`.
+fn is_zero_value(value: &Value) -> bool {
+    match value {
+        Value::Bool(b) => !b,
+        Value::Int(i) => *i == 0,
+        Value::UInt(u) => *u == 0,
+        Value::Float(f) => *f == 0.0,
+        Value::String(s) => s.is_empty(),
+        Value::Bytes(b) => b.is_empty(),
+        Value::Null => true,
+        Value::List(l) => l.is_empty(),
+        Value::Map(m) => m.is_empty(),
+        #[cfg(feature = "chrono")]
+        Value::Duration(d) => d.is_zero(),
+        #[cfg(feature = "chrono")]
+        Value::Timestamp(ts) => ts.timestamp_nanos_opt().is_some_and(|ns| ns == 0),
+        #[cfg(feature = "structs")]
+        Value::Struct(s) => s.is_empty(),
+        // An optional, and any host handle, declares no zero value.
+        Value::Opaque(_) => false,
+    }
 }
 
-fn optional_of_non_zero_value<'a>(
-    args: Vec<Cow<'a, dyn Val>>,
-) -> Result<Cow<'a, dyn Val>, ExecutionError> {
-    match args[0].as_zeroer().is_some_and(Zeroer::is_zero_value) {
+fn optional_none(_args: Vec<Value>) -> Result<Value, ExecutionError> {
+    Ok(Value::Opaque(Arc::new(OptionalValue::none())))
+}
+
+fn optional_of(mut args: Vec<Value>) -> Result<Value, ExecutionError> {
+    Ok(Value::Opaque(Arc::new(OptionalValue::of(args.remove(0)))))
+}
+
+fn optional_of_non_zero_value(args: Vec<Value>) -> Result<Value, ExecutionError> {
+    match is_zero_value(&args[0]) {
         true => optional_none(args),
         false => optional_of(args),
     }
 }
 
-fn optional_value<'a>(args: Vec<Cow<'a, dyn Val>>) -> Result<Cow<'a, dyn Val>, ExecutionError> {
-    // TODO: This can be optimized to avoid cloning and "just" pass the `Cow`
-    // but we either need to deal with the `Arc` case or wait until that's all ripped out!
-    let mut args = args;
-    args.remove(0)
-        .downcast_ref::<Optional>()
-        .expect("must be `CelOptional`")
-        .option()
-        .map(|v| Cow::Owned(v.to_owned()))
+fn optional_value(mut args: Vec<Value>) -> Result<Value, ExecutionError> {
+    expect_optional(&args.remove(0))?
+        .inner()
+        .cloned()
         .ok_or_else(|| ExecutionError::function_error("value", "optional.none() dereference"))
 }
 
-fn optional_has_value<'a>(args: Vec<Cow<'a, dyn Val>>) -> Result<Cow<'a, dyn Val>, ExecutionError> {
-    super::unary_fn(args, OPTIONAL_TYPE, |opt: &Optional| {
-        Ok(Box::new(CelBool::from(opt.option().is_some())))
-    })
+fn optional_has_value(args: Vec<Value>) -> Result<Value, ExecutionError> {
+    Ok(Value::Bool(expect_optional(&args[0])?.inner().is_some()))
 }
 
-fn optional_or_optional<'a>(
-    args: Vec<Cow<'a, dyn Val>>,
-) -> Result<Cow<'a, dyn Val>, ExecutionError> {
-    let mut args = args;
+fn optional_or_optional(mut args: Vec<Value>) -> Result<Value, ExecutionError> {
     let other = args.remove(1);
     let this = args.remove(0);
-    if this
-        .downcast_ref::<Optional>()
-        .expect("Must be an `Optional`")
-        .option()
-        .is_some()
-    {
-        Ok(this)
-    } else {
-        Ok(other)
+    match expect_optional(&this)?.inner().is_some() {
+        true => Ok(this),
+        false => Ok(other),
     }
 }
 
-fn optional_or_value<'a>(args: Vec<Cow<'a, dyn Val>>) -> Result<Cow<'a, dyn Val>, ExecutionError> {
-    // TODO: This can be optimized to avoid cloning and "just" pass the `Cow`
-    // but we either need to deal with the `Arc` case or wait until that's all ripped out!
-    let mut args = args;
+fn optional_or_value(mut args: Vec<Value>) -> Result<Value, ExecutionError> {
     let other = args.remove(1);
-    Ok(args
-        .remove(0)
-        .downcast_ref::<Optional>()
-        .expect("must be `CelOptional`")
-        .option()
-        .map(|v| Cow::Owned(v.to_owned()))
-        .unwrap_or(other))
+    let this = args.remove(0);
+    Ok(expect_optional(&this)?.inner().cloned().unwrap_or(other))
 }
 
 pub(crate) fn stdlib(env: &mut crate::Env) {
@@ -241,13 +247,14 @@ pub(crate) fn stdlib(env: &mut crate::Env) {
 
 #[cfg(test)]
 mod tests {
-    use crate::common::types::{self, CelInt, CelString};
+    use crate::common::types;
+    use crate::objects::Value;
 
+    /// `OPTIONAL_TYPE` is parameterised on `dyn`, so it accepts every value and
+    /// the optional overloads are selected on name and arity alone.
     #[test]
     fn is_assignable() {
-        let s = CelString::from("foo");
-        assert!(types::OPTIONAL_TYPE.is_assignable(&s));
-        let i = CelInt::from(42);
-        assert!(types::OPTIONAL_TYPE.is_assignable(&i));
+        assert!(types::OPTIONAL_TYPE.is_assignable(&Value::String("foo".to_owned().into())));
+        assert!(types::OPTIONAL_TYPE.is_assignable(&Value::Int(42)));
     }
 }
