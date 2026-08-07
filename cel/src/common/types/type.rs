@@ -14,6 +14,16 @@ use crate::ExecutionError;
 /// it. A new variant would oblige every exhaustive `match` on `Value` — the
 /// walker, the bytecode VM, the JIT lowering — to answer for a family that has
 /// no behaviour beyond equality and its own name.
+///
+/// ⚠ The **derived** `Debug` is load-bearing, and not for debugging.
+/// `Value`'s own `Debug` renders an opaque as `Opaque<{runtime_type_name}>({..})`
+/// (`objects.rs:1011`), and this value's `runtime_type_name` is `type` for every
+/// type it denotes — so the `{..}` half, which is this derive, is the ONLY thing
+/// distinguishing `type(1)` from `type('a')` in that rendering.
+/// `tests/vm_walker_sweep.rs` compares evaluators by `Debug` and carries
+/// `type()` rows for exactly this reason. Replacing the derive with a
+/// hand-written impl that prints only the name would make that gate compare
+/// equal strings for every type value and stop discriminating, silently.
 #[derive(Debug, Eq, PartialEq)]
 pub struct TypeValue(Type);
 

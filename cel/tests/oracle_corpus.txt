@@ -631,6 +631,20 @@ expr: type(opt_some)
 feat: type_fn optional variable
 want: type(optional_type)
 
+# The two names most often got wrong, so both evaluators are held to them here
+# rather than by a walker-only unit test: the temporal families are named for
+# their protobuf messages, NOT `duration` and `timestamp`.
+
+expr: type(duration("1s"))
+feat: type_fn duration
+cfg: chrono
+want: type(google.protobuf.Duration)
+
+expr: type(timestamp("2020-01-01T00:00:00Z"))
+feat: type_fn timestamp
+cfg: chrono
+want: type(google.protobuf.Timestamp)
+
 # "those values (`int`, `string`, etc.) also have a type: the type `type`, which
 # is an expression by itself which in turn also has type `type`" — langdef.md.
 # A type value is therefore a fixed point, not a tower.
