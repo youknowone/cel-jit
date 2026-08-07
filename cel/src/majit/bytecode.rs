@@ -1947,12 +1947,29 @@ pub mod float_bank {
     /// [`MAX_INTERNED_PROGRAMS`] recycles the caches first, so retained memory
     /// is bounded by the cap rather than by the number of distinct expressions
     /// the thread has seen. That is a wholesale flush, not upstream's per-loop
-    /// retirement: `memmgr.py:23-69 MemoryManager` ages individual loops out of
-    /// `alive_loops`, and majit ports it (`memmgr.rs`, reachable through the
-    /// `loop_longevity` parameter) but nothing drives it — no counterpart of
-    /// `pyjitpl.py:2348 try_to_free_some_loops` calls `next_generation` or
-    /// `keep_loop_alive` outside its own tests, so per-loop ages never advance.
-    /// Until that is wired, a cap on this side is what bounds the growth.
+    /// retirement (`memmgr.py:23-69 MemoryManager` ages individual loops out of
+    /// `alive_loops`), and two things keep it that way.
+    ///
+    /// Retirement is scoped to compiled **loop tokens**: `alive_loops` holds
+    /// `Arc<JitCellToken>`, and that is what `next_generation` hands back
+    /// (`memmgr.rs:55-61`, `:208`). These program words and the `DRIVERS` map
+    /// are not in it, so no `loop_longevity` setting would bound this cache. It
+    /// does not reclaim cel's compiled loops today either, though the port is
+    /// driven: `pyjitpl.rs:10229 try_to_free_some_loops` calls
+    /// `next_generation` and runs at `:4171`, `:12582` and `:13039`, and
+    /// `keep_loop_alive` runs at six sites. What stops it is the default —
+    /// majit builds the manager with `max_age` 0 (`warmstate.rs:475-476`,
+    /// against upstream's 1000 at `rpython/rlib/jit.py:594`), which parks
+    /// `next_check` at -1 where the monotonically rising `current_generation`
+    /// never meets it (`memmgr.rs:124-125`, `:210`), and cel sets only
+    /// `retrace_limit`.
+    ///
+    /// The cap also underwrites the address-stability invariant documented on
+    /// `PROGRAMS`: the green key is the program **pointer** plus pc, so an
+    /// entry freed on its own would let a freshly interned program land on the
+    /// freed address and pick up another program's compiled loop. That is why
+    /// the flush is wholesale, and why it takes `DRIVERS` with it
+    /// ([`reset_persistent_state`]).
     pub fn intern_program(code: Vec<i64>) -> std::rc::Rc<[i64]> {
         let recycle = PROGRAMS.with(|p| {
             let p = p.borrow();
