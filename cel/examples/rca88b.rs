@@ -69,6 +69,40 @@
 //!
 //! ⇒ At n=10 the compiled arm (4907 ns) is **worse than never compiling at all**
 //! (2424 ns). Break-even between the two majit arms is n ~= 22.
+//!
+//! **Probe C — trace length is a REAL but MINORITY term, and it does not
+//! explain the two-loop shapes at all.**
+//!
+//! ⛔ READ THE SCOPE FIRST: only the `warm n=10` and `warm n=1000` columns are
+//! trustworthy. `warm n=100` is contradicted by Probe B **in the same binary,
+//! same run, same expression** — Probe B reads 4230 ns at n=100 for
+//! `price + qty * 2` where Probe C reads 19289, a 4.6x disagreement, while the
+//! two probes agree to 0.5% at n=10 (4433 vs 4454) and 6% at n=1000 (3417 vs
+//! 3213). The `lin@100` residual column is what caught it: it reads 4.1-5.2 for
+//! every single-loop row, and the fitted `ns/row` comes out NEGATIVE, which no
+//! positive per-row cost can produce. **`fixed/call` and `ns/row` are therefore
+//! derived from a bad point and must not be quoted.** Cause unknown; the two
+//! probes differ only in harness structure (Probe B interleaves three arms,
+//! Probe C two). Eliminated: a refused batch falling back to the other
+//! evaluator (#54) — the tier-agreement assertion added here does not fire.
+//!
+//! On the cross-validated `warm n=10` column, all eight single-loop rows fit
+//! one line across THREE shape families (arithmetic, boolean, single-loop
+//! comprehension):
+//!
+//! **per-call cost ~= 3.83 µs + 27.3 ns x trace_ops**
+//!
+//! So the lead's hypothesis is half right, and the half that fails matters
+//! more. Trace length is real — but over a 3.3x range in `ops_post` (15 -> 49)
+//! the cost rises only 22%, so it explains ~0.93 µs of a 4.2-5.2 µs cost. The
+//! dominant **3.83 µs is constant** in trace length.
+//!
+//! The two-loop rows sit 2.4x / 3.4x / 10.4x ABOVE that line, and `ops_post`
+//! actively mispredicts them: `pr=8` has the second-SMALLEST trace in the whole
+//! table (24 ops) and the LARGEST cost (46.8 µs). Within that family the cost
+//! is ~585-622 ns per inner ELEMENT (12441/20, 18020/30, 46764/80), flat to 6%.
+//! So what separates the shapes is `loops_compiled` 1 -> 2 and the per-element
+//! crossing between the two artifacts (#76), **not** trace length.
 
 use std::hint::black_box;
 
@@ -270,12 +304,233 @@ fn population_sweep(label: &str, target_src: &str) {
     );
 }
 
+/// Probe C. Probe B showed the compiled arm carries a fixed per-call cost that
+/// does not scale with n. This asks what it DOES scale with.
+///
+/// The prompt is a discrepancy already sitting in the rca88 data: at n=10 the
+/// single-loop shapes cost ~3.3-5.6 µs per call and the nested shape ~50 µs.
+/// **An 11x difference between shapes, in a quantity that is flat in n.** A
+/// pure per-call boundary constant would be identical for both, so the cost is
+/// not a constant — it scales with something about the artifact.
+///
+/// Everything needed to test that is already exported: `loops_compiled`,
+/// `bridges_compiled` and `trace_ops_before` / `trace_ops_after` are in cel's
+/// `JitStats`. Hold n at 10, walk a complexity ladder, and read the per-call
+/// cost against each.
+///
+/// n is reported at 10 AND 100 because the claim being tested is about a term
+/// that does not scale with work — if the two columns track each other, what is
+/// tabulated is the fixed cost rather than the row work.
+fn artifact_scaling() {
+    println!("\nProbe C — does the per-call cost scale with the ARTIFACT?");
+    println!(
+        "{:<34} {:>6} {:>5} {:>8} {:>8} {:>10} {:>11} {:>11} {:>11} {:>10} {:>9} {:>8}",
+        "expression",
+        "loops",
+        "brdg",
+        "ops_pre",
+        "ops_post",
+        "clean n=10",
+        "warm n=10",
+        "warm n=100",
+        "warm n=1000",
+        "fixed/call",
+        "ns/row",
+        "lin@100"
+    );
+
+    let flat = flat_schema();
+    let nested: Schema = [
+        ("size(items)".to_string(), ValType::Int),
+        ("offset(items)".to_string(), ValType::Int),
+        ("items[].price".to_string(), ValType::Int),
+    ]
+    .into_iter()
+    .collect();
+
+    // (label, source, schema, per_row) — per_row 0 means the flat shape.
+    let ladder: Vec<(&str, &str, &Schema, i64)> = vec![
+        ("price", "price", &flat, 0),
+        ("price + qty", "price + qty", &flat, 0),
+        ("price + qty * 2", "price + qty * 2", &flat, 0),
+        ("+ price * 3", "price + qty * 2 + price * 3", &flat, 0),
+        (
+            "+ qty * 4",
+            "price + qty * 2 + price * 3 + qty * 4",
+            &flat,
+            0,
+        ),
+        (
+            "+ price * 5",
+            "price + qty * 2 + price * 3 + qty * 4 + price * 5",
+            &flat,
+            0,
+        ),
+        (
+            "price >= 100 && qty < 50",
+            "price >= 100 && qty < 50",
+            &flat,
+            0,
+        ),
+        (
+            "&& price < 300 && qty > 2",
+            "price >= 100 && qty < 50 && price < 300 && qty > 2",
+            &flat,
+            0,
+        ),
+        (
+            "all(i, i.price > 10) pr=1",
+            "items.all(i, i.price > 10)",
+            &nested,
+            1,
+        ),
+        (
+            "all(i, i.price > 10) pr=2",
+            "items.all(i, i.price > 10)",
+            &nested,
+            2,
+        ),
+        (
+            "all(i, i.price > 10) pr=3",
+            "items.all(i, i.price > 10)",
+            &nested,
+            3,
+        ),
+        (
+            "all(i, i.price > 10) pr=8",
+            "items.all(i, i.price > 10)",
+            &nested,
+            8,
+        ),
+    ];
+
+    for (label, src, schema, per_row) in ladder {
+        let lowered = lower(src, schema);
+        let mut warm_at = [0.0f64; 3];
+        let mut clean_at = 0.0f64;
+        let mut stats = None;
+
+        for (slot, n) in [10usize, 100, 1_000].into_iter().enumerate() {
+            let (lens, offsets, elems);
+            // The flat ladder varies how many distinct fields the expression
+            // touches, so the column count has to come from the lowering rather
+            // than be assumed: `price` alone binds one slot, `price + qty` two,
+            // and `eval_batch_sum_f` asserts the two agree.
+            // Byte-for-byte the generator `flat_columns` uses, extended for a
+            // third-or-later slot. Probe B and rca88 both feed exactly these
+            // values, and Probe C initially did not — which is the one input
+            // difference between two measurements of the same expression at the
+            // same n that disagreed 5328 vs 17257 ns.
+            let flat_data: Vec<Vec<i64>> = (0..lowered.slots.len())
+                .map(|c| match c {
+                    0 => (0..n as i64).map(|i| (i * 37) % 200).collect(),
+                    1 => (0..n as i64).map(|i| (i * 11) % 100).collect(),
+                    _ => (0..n as i64).map(|i| (i * (37 + c as i64)) % 200).collect(),
+                })
+                .collect();
+            let columns: Vec<Column> = if per_row == 0 {
+                flat_data.iter().map(|v| Column::Int(v)).collect()
+            } else {
+                lens = vec![per_row; n];
+                let mut off = Vec::with_capacity(n);
+                let mut total = 0i64;
+                for &l in &lens {
+                    off.push(total);
+                    total += l;
+                }
+                offsets = off;
+                elems = (0..total.max(1)).map(|k| (k * 7) % 40).collect::<Vec<_>>();
+                vec![
+                    Column::Int(&lens),
+                    Column::Int(&offsets),
+                    Column::Int(&elems),
+                ]
+            };
+
+            reset_persistent_state();
+            reset_jit_stats();
+
+            // The control this probe was missing. `eval_batch_sum_f` returns an
+            // Option, and a refused batch re-runs every row in the OTHER
+            // evaluator (#54) — which would inflate a timing by exactly the
+            // kind of factor seen here while every counter stayed plausible.
+            // Assert the tiers agree BEFORE trusting any number below.
+            let want = clean_batch_sum_f(&lowered, &columns, n);
+            let got = eval_batch_sum_f(&lowered, &columns, n, THRESHOLD);
+            assert_eq!(
+                got, want,
+                "{label} @ n={n}: jit tier disagrees with clean tier \
+                 (None means the batch refused and fell back)"
+            );
+
+            for _ in 0..64 {
+                black_box(eval_batch_sum_f(&lowered, &columns, n, THRESHOLD));
+            }
+            if slot == 0 {
+                stats = Some(jit_stats());
+            }
+
+            let reps = (20_000 / n).max(1);
+            let mut best_clean = f64::MAX;
+            let mut best_warm = f64::MAX;
+            for _ in 0..41 {
+                let t = std::time::Instant::now();
+                for _ in 0..reps {
+                    black_box(clean_batch_sum_f(&lowered, &columns, n));
+                }
+                best_clean = best_clean.min(t.elapsed().as_nanos() as f64 / reps as f64);
+
+                let t = std::time::Instant::now();
+                for _ in 0..reps {
+                    black_box(eval_batch_sum_f(&lowered, &columns, n, THRESHOLD));
+                }
+                best_warm = best_warm.min(t.elapsed().as_nanos() as f64 / reps as f64);
+            }
+            warm_at[slot] = best_warm;
+            if slot == 0 {
+                clean_at = best_clean;
+            }
+        }
+
+        let s = stats.expect("stats captured at n=10");
+        // Three points, so the per-call and per-row terms can be SEPARATED
+        // instead of assumed. Fit over the outer two (n=10, n=1000); `warm
+        // n=100` is then a residual check that the model is linear at all.
+        let per_row = (warm_at[2] - warm_at[0]) / 990.0;
+        let fixed = warm_at[0] - 10.0 * per_row;
+        let predicted_100 = fixed + 100.0 * per_row;
+        println!(
+            "{label:<34} {:>6} {:>5} {:>8} {:>8} {clean_at:>10.1} {:>11.1} {:>11.1} \
+             {:>11.1} {:>10.1} {:>9.1} {:>8.2}",
+            s.loops_compiled,
+            s.bridges_compiled,
+            s.trace_ops_before,
+            s.trace_ops_after,
+            warm_at[0],
+            warm_at[1],
+            warm_at[2],
+            fixed,
+            per_row,
+            warm_at[1] / predicted_100,
+        );
+    }
+    println!(
+        "  Read `warm n=10` against ops_post and against loops. Tracking ops_post \
+         means the cost is trace-length-driven;"
+    );
+    println!(
+        "  a step at loops 1->2 with ops_post flat means it is per-ARTIFACT. \
+         `warm n=100` ~= `warm n=10` confirms the column is the fixed term."
+    );
+}
+
 fn main() {
     let schema = flat_schema();
     let arith = lower("price + qty * 2", &schema);
 
     println!("load before probes: {}", loadavg());
     artifact_or_boundary("arith price + qty * 2", &arith);
+    artifact_scaling();
     population_sweep("arith price + qty * 2", "price + qty * 2");
     println!("\nload after probes:  {}", loadavg());
 }
