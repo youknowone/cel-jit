@@ -1,0 +1,774 @@
+# The differential oracle's corpus — CEL source and the frozen answer.
+#
+# This file is DATA. Nothing in it is Rust and nothing in it is CEL beyond the
+# `expr:` line itself; the `want:` notation is a canonical rendering defined by
+# `render()`/`render_error()` in tests/oracle.rs and by nothing else. That is
+# deliberate: an oracle written as a second evaluator gets rewritten by the same
+# commit that rewrites the subject, and the gate disappears without anyone
+# noticing. A text file does not.
+#
+# ---------------------------------------------------------------------------
+# Record format
+# ---------------------------------------------------------------------------
+#
+#   expr: <CEL source, one line>
+#   feat: <space separated tags from REQUIRED_COVERAGE>
+#   want: <canonical rendering of the expected Value, or error(...)>
+#   cfg:  <optional cargo feature this case needs>
+#
+# Records are separated by a blank line. `#` starts a comment line.
+#
+# ---------------------------------------------------------------------------
+# The bindings every case sees (built by `fixed_context()` in oracle.rs)
+# ---------------------------------------------------------------------------
+#
+#   i        int    42
+#   neg      int    -7
+#   u        uint   7
+#   d        double 1.5
+#   b        bool   true
+#   s        string "hello"
+#   by       bytes  b"hi"
+#   nil      null
+#   xs       list   [1, 2, 3, 4]
+#   strs     list   ["a", "bb", "ccc"]
+#   empty    list   []
+#   m        map    {"a": 1, "b": 2}
+#   nested   map    {"inner": {"k": 5}}
+#   people   list   [{"name": "ann", "age": 30}, {"name": "bob", "age": 20}]
+#   opt_some optional(9)
+#   opt_none optional.none
+#
+#   double_it(int) -> int      host function, doubles its argument
+#   boom(int) -> error         host function that always fails
+#
+# ---------------------------------------------------------------------------
+# Literals
+# ---------------------------------------------------------------------------
+
+expr: 1
+feat: literal_int
+want: int(1)
+
+expr: -3
+feat: literal_int
+want: int(-3)
+
+expr: 7u
+feat: literal_uint
+want: uint(7)
+
+expr: 0u
+feat: literal_uint
+want: uint(0)
+
+expr: 1.5
+feat: literal_double
+want: double(1.5)
+
+expr: -0.25
+feat: literal_double
+want: double(-0.25)
+
+expr: true
+feat: literal_bool
+want: bool(true)
+
+expr: false
+feat: literal_bool
+want: bool(false)
+
+expr: "hi"
+feat: literal_string
+want: string("hi")
+
+expr: ""
+feat: literal_string
+want: string("")
+
+expr: b"hi"
+feat: literal_bytes
+want: bytes(6869)
+
+expr: null
+feat: literal_null
+want: null
+
+expr: null == null
+feat: literal_null equality
+want: bool(true)
+
+expr: [1, 2, 3]
+feat: literal_list
+want: list[int(1), int(2), int(3)]
+
+expr: []
+feat: literal_list
+want: list[]
+
+expr: {"a": 1, "b": 2}
+feat: literal_map
+want: map{string("a"): int(1), string("b"): int(2)}
+
+expr: {}
+feat: literal_map
+want: map{}
+
+# ---------------------------------------------------------------------------
+# Arithmetic
+# ---------------------------------------------------------------------------
+
+expr: 1 + 2
+feat: arith
+want: int(3)
+
+expr: 7 - 9
+feat: arith
+want: int(-2)
+
+expr: 6 * 7
+feat: arith
+want: int(42)
+
+expr: 7 / 2
+feat: arith
+want: int(3)
+
+expr: 7 % 3
+feat: arith
+want: int(1)
+
+expr: -i
+feat: arith variable
+want: int(-42)
+
+expr: 1u + 2u
+feat: arith literal_uint
+want: uint(3)
+
+expr: 1.5 + 2.5
+feat: arith literal_double
+want: double(4.0)
+
+expr: "a" + "b"
+feat: arith literal_string
+want: string("ab")
+
+expr: [1] + [2]
+feat: arith literal_list
+want: list[int(1), int(2)]
+
+expr: 9223372036854775807 + 1
+feat: arith_overflow error
+want: error(Overflow: add)
+
+expr: -9223372036854775807 - 2
+feat: arith_overflow error
+want: error(Overflow: sub)
+
+expr: 1 / 0
+feat: arith_div_zero error
+want: error(DivisionByZero)
+
+expr: 1 % 0
+feat: arith_div_zero error
+want: error(RemainderByZero)
+
+# ---------------------------------------------------------------------------
+# Comparison and equality
+# ---------------------------------------------------------------------------
+
+expr: 1 < 2
+feat: compare
+want: bool(true)
+
+expr: 2 <= 2
+feat: compare
+want: bool(true)
+
+expr: 3 > 4
+feat: compare
+want: bool(false)
+
+expr: 3 >= 3
+feat: compare
+want: bool(true)
+
+expr: "a" < "b"
+feat: compare literal_string
+want: bool(true)
+
+expr: 1.0 > 0.0
+feat: compare literal_double
+want: bool(true)
+
+expr: 1 < uint(2)
+feat: compare_hetero conversion
+want: bool(true)
+
+expr: 1 < 1.1
+feat: compare_hetero
+want: bool(true)
+
+expr: uint(0) > -10
+feat: compare_hetero conversion
+want: bool(true)
+
+expr: 1 == 1
+feat: equality
+want: bool(true)
+
+expr: 1 != 2
+feat: equality
+want: bool(true)
+
+expr: {} == []
+feat: equality literal_map literal_list
+want: bool(false)
+
+expr: [1, 2] == [1, 2]
+feat: equality literal_list
+want: bool(true)
+
+expr: double('NaN') == double('NaN')
+feat: equality literal_double conversion
+want: bool(false)
+
+# ---------------------------------------------------------------------------
+# Logic and the ternary
+# ---------------------------------------------------------------------------
+
+expr: true && false
+feat: logic_and
+want: bool(false)
+
+expr: true && true
+feat: logic_and
+want: bool(true)
+
+expr: false && undefined_name
+feat: logic_and error
+want: bool(false)
+
+expr: true || false
+feat: logic_or
+want: bool(true)
+
+expr: false || false
+feat: logic_or
+want: bool(false)
+
+expr: true || undefined_name
+feat: logic_or error
+want: bool(true)
+
+expr: !true
+feat: logic_not
+want: bool(false)
+
+expr: !(1 == 2)
+feat: logic_not equality
+want: bool(true)
+
+expr: true ? 1 : 2
+feat: ternary
+want: int(1)
+
+expr: false ? 1 : 2
+feat: ternary
+want: int(2)
+
+expr: i > 0 ? "pos" : "neg"
+feat: ternary compare variable
+want: string("pos")
+
+# ---------------------------------------------------------------------------
+# Indexing and field selection
+# ---------------------------------------------------------------------------
+
+expr: xs[0]
+feat: index_list variable
+want: int(1)
+
+expr: xs[3]
+feat: index_list variable
+want: int(4)
+
+expr: [10, 20][1]
+feat: index_list literal_list
+want: int(20)
+
+expr: m["a"]
+feat: index_map variable
+want: int(1)
+
+expr: {"k": 9}["k"]
+feat: index_map literal_map
+want: int(9)
+
+expr: {1: "one"}[1]
+feat: index_map literal_map
+want: string("one")
+
+expr: m.a
+feat: field_select variable
+want: int(1)
+
+expr: nested.inner.k
+feat: field_select variable
+want: int(5)
+
+expr: {"x": {"y": 3}}.x.y
+feat: field_select literal_map
+want: int(3)
+
+# ---------------------------------------------------------------------------
+# `in`
+# ---------------------------------------------------------------------------
+
+expr: 1 in xs
+feat: in_operator variable
+want: bool(true)
+
+expr: 9 in xs
+feat: in_operator variable
+want: bool(false)
+
+expr: "a" in m
+feat: in_operator variable
+want: bool(true)
+
+expr: "z" in m
+feat: in_operator variable
+want: bool(false)
+
+# ---------------------------------------------------------------------------
+# size()
+# ---------------------------------------------------------------------------
+
+expr: size(xs)
+feat: size variable
+want: int(4)
+
+expr: size(s)
+feat: size variable
+want: int(5)
+
+expr: size(m)
+feat: size variable
+want: int(2)
+
+expr: size(empty)
+feat: size variable
+want: int(0)
+
+# ---------------------------------------------------------------------------
+# Macros
+# ---------------------------------------------------------------------------
+
+expr: has(m.a)
+feat: macro_has variable
+want: bool(true)
+
+expr: has(m.z)
+feat: macro_has variable
+want: bool(false)
+
+expr: has(nested.inner)
+feat: macro_has variable
+want: bool(true)
+
+expr: xs.all(x, x > 0)
+feat: macro_all variable
+want: bool(true)
+
+expr: xs.all(x, x > 2)
+feat: macro_all variable
+want: bool(false)
+
+expr: xs.exists(x, x == 3)
+feat: macro_exists variable
+want: bool(true)
+
+expr: xs.exists(x, x == 9)
+feat: macro_exists variable
+want: bool(false)
+
+expr: xs.exists_one(x, x == 3)
+feat: macro_exists_one variable
+want: bool(true)
+
+expr: xs.exists_one(x, x > 2)
+feat: macro_exists_one variable
+want: bool(false)
+
+expr: xs.map(x, x * 2)
+feat: macro_map variable
+want: list[int(2), int(4), int(6), int(8)]
+
+expr: strs.map(x, size(x))
+feat: macro_map size variable
+want: list[int(1), int(2), int(3)]
+
+expr: people.map(p, p.name)
+feat: macro_map field_select variable
+want: list[string("ann"), string("bob")]
+
+expr: xs.filter(x, x % 2 == 0)
+feat: macro_filter variable
+want: list[int(2), int(4)]
+
+expr: people.filter(p, p.age > 25)
+feat: macro_filter field_select variable
+want: list[map{string("age"): int(30), string("name"): string("ann")}]
+
+expr: xs.filter(x, x > 1).map(x, x * 10)
+feat: comprehension_nested macro_map macro_filter variable
+want: list[int(20), int(30), int(40)]
+
+# ---------------------------------------------------------------------------
+# type() and dyn()
+# ---------------------------------------------------------------------------
+#
+# KNOWN DEVIATION FROM THE CEL SPEC. `type()` is a standard CEL function and it
+# is not implemented: nothing registers it, so it resolves as an undeclared
+# name. `dyn()` next to it IS registered (common/types/dyn.rs). These three
+# cases pin the gap rather than hide it — implementing `type()` will fail them,
+# which is the correct moment to update this file.
+
+expr: type(1)
+feat: type_fn error
+want: error(UndeclaredReference: type)
+
+expr: type("a")
+feat: type_fn error
+want: error(UndeclaredReference: type)
+
+expr: type(xs)
+feat: type_fn error variable
+want: error(UndeclaredReference: type)
+
+expr: dyn(1)
+feat: dyn_fn
+want: int(1)
+
+expr: dyn(xs)[0]
+feat: dyn_fn index_list variable
+want: int(1)
+
+# ---------------------------------------------------------------------------
+# Conversions
+# ---------------------------------------------------------------------------
+
+expr: int(1.9)
+feat: conversion
+want: int(1)
+
+expr: uint(3)
+feat: conversion
+want: uint(3)
+
+expr: double(3)
+feat: conversion
+want: double(3.0)
+
+expr: string(1)
+feat: conversion
+want: string("1")
+
+expr: bytes("hi")
+feat: conversion literal_bytes
+want: bytes(6869)
+
+# ---------------------------------------------------------------------------
+# String functions
+# ---------------------------------------------------------------------------
+
+expr: s.startsWith("he")
+feat: string_fn variable
+want: bool(true)
+
+expr: s.endsWith("lo")
+feat: string_fn variable
+want: bool(true)
+
+expr: s.contains("ell")
+feat: string_fn variable
+want: bool(true)
+
+expr: s.contains("zzz")
+feat: string_fn variable
+want: bool(false)
+
+expr: s.matches("h.*o")
+feat: regex string_fn variable
+cfg: regex
+want: bool(true)
+
+# ---------------------------------------------------------------------------
+# Optional
+# ---------------------------------------------------------------------------
+
+expr: opt_some
+feat: optional variable
+want: optional(int(9))
+
+expr: opt_none
+feat: optional variable
+want: optional.none
+
+expr: optional.of(3)
+feat: optional
+want: optional(int(3))
+
+expr: optional.none()
+feat: optional
+want: optional.none
+
+expr: opt_some.value()
+feat: optional variable
+want: int(9)
+
+expr: opt_some.hasValue()
+feat: optional variable
+want: bool(true)
+
+expr: opt_none.hasValue()
+feat: optional variable
+want: bool(false)
+
+expr: opt_some.orValue(0)
+feat: optional variable
+want: int(9)
+
+# `Parser::default()` has optional syntax OFF, so `Program::compile` — the door
+# a caller holds — cannot parse `_[?_]` at all. `parse: optional` selects the
+# configured parser; without it these two would only ever pin `parse_error`.
+
+expr: m[?"a"]
+feat: opt_syntax index_map optional variable
+parse: optional
+want: optional(int(1))
+
+expr: m[?"z"]
+feat: opt_syntax index_map optional variable
+parse: optional
+want: optional.none
+
+expr: m[?"a"]
+feat: opt_syntax variable
+want: parse_error
+
+# ---------------------------------------------------------------------------
+# Duration and timestamp
+# ---------------------------------------------------------------------------
+
+expr: duration("1h")
+feat: duration
+cfg: chrono
+want: duration(3600000000000ns)
+
+expr: duration("90s")
+feat: duration
+cfg: chrono
+want: duration(90000000000ns)
+
+expr: duration("1h") > duration("30m")
+feat: duration compare
+cfg: chrono
+want: bool(true)
+
+expr: timestamp("2023-01-01T00:00:00Z")
+feat: timestamp
+cfg: chrono
+want: timestamp(2023-01-01T00:00:00+00:00)
+
+expr: timestamp("2023-01-01T00:00:00Z") < timestamp("2024-01-01T00:00:00Z")
+feat: timestamp compare
+cfg: chrono
+want: bool(true)
+
+expr: timestamp("2023-01-01T00:00:00Z") + duration("1h")
+feat: timestamp duration
+cfg: chrono
+want: timestamp(2023-01-01T01:00:00+00:00)
+
+# ---------------------------------------------------------------------------
+# Opaque
+# ---------------------------------------------------------------------------
+
+# KNOWN BUG, pinned deliberately. `impl Val for Optional`
+# (common/types/optional.rs) does not override `equals`, and the default
+# `Val::equals` (common/value.rs) returns `false` unconditionally — so an
+# optional never equals anything, including itself. The first two cases are
+# WRONG ANSWERS by the CEL spec; they are frozen here so the bug cannot move
+# silently, and fixing it must update this file.
+
+expr: opt_some == opt_some
+feat: opaque optional equality variable
+want: bool(false)
+
+expr: optional.of(3) == optional.of(3)
+feat: opaque optional equality
+want: bool(false)
+
+expr: opt_some == opt_none
+feat: opaque optional equality variable
+want: bool(false)
+
+# ---------------------------------------------------------------------------
+# Host functions
+# ---------------------------------------------------------------------------
+
+expr: double_it(21)
+feat: host_function
+want: int(42)
+
+expr: double_it(i)
+feat: host_function variable
+want: int(84)
+
+expr: boom(1)
+feat: host_function error
+want: error(FunctionError: boom)
+
+# ---------------------------------------------------------------------------
+# Errors
+# ---------------------------------------------------------------------------
+
+expr: xs[10]
+feat: error index_list variable
+want: error(IndexOutOfBounds)
+
+expr: m["z"]
+feat: error index_map variable
+want: error(NoSuchKey: z)
+
+expr: undefined_name
+feat: error variable
+want: error(UndeclaredReference: undefined_name)
+
+expr: 1 + "a"
+feat: error arith
+want: error(NoSuchOverload)
+
+expr: nosuchfn(1)
+feat: error
+want: error(UndeclaredReference: nosuchfn)
+
+# The operator reaches the error as its method name (`sub`), not as its CEL
+# overload id (`_-_`).
+expr: "a" - "b"
+feat: error arith
+want: error(UnsupportedBinaryOperator: sub)
+
+expr: 1 && true
+feat: error logic_and
+want: error(NoSuchOverload)
+
+# Selecting a field on a list is routed through list indexing, so the failure
+# names the index types rather than a missing field.
+expr: xs.z
+feat: error field_select variable
+want: error(UnexpectedType: got=string want=int|uint)
+
+expr: !nil
+feat: error logic_not variable
+want: error(NoSuchOverload)
+
+expr: has(nil.x)
+feat: error macro_has variable
+want: error(NoSuchOverload)
+
+expr: double_it()
+feat: error host_function
+want: error(InvalidArgumentCount: expected=1 actual=0)
+
+expr: u - 9u
+feat: error arith_overflow
+want: error(Overflow: sub)
+
+# ---------------------------------------------------------------------------
+# Values that are containers, and the non-scalar results the walker builds
+# ---------------------------------------------------------------------------
+
+expr: people[0]
+feat: index_list field_select variable
+want: map{string("age"): int(30), string("name"): string("ann")}
+
+expr: nested.inner
+feat: field_select variable
+want: map{string("k"): int(5)}
+
+expr: [1,2] + xs
+feat: arith literal_list variable
+want: list[int(1), int(2), int(1), int(2), int(3), int(4)]
+
+expr: b"ab" + b"cd"
+feat: arith literal_bytes
+want: bytes(61626364)
+
+expr: size(by)
+feat: size variable literal_bytes
+want: int(2)
+
+# The three-argument comprehension macro: filter and transform in one pass.
+expr: xs.map(x, x > 2, x * 100)
+feat: macro_map macro_filter variable
+want: list[int(300), int(400)]
+
+expr: strs.exists_one(x, size(x) == 2)
+feat: macro_exists_one size variable
+want: bool(true)
+
+expr: m.size()
+feat: size variable
+want: int(2)
+
+expr: xs[1u]
+feat: index_list literal_uint variable
+want: int(2)
+
+expr: i in m
+feat: in_operator variable
+want: bool(false)
+
+expr: nil == 0
+feat: equality literal_null variable
+want: bool(false)
+
+expr: int("12")
+feat: conversion
+want: int(12)
+
+# Double division does not error; it produces the IEEE result.
+expr: 1.0 / 0.0
+feat: arith literal_double
+want: double(inf)
+
+expr: 0.0 / 0.0
+feat: arith literal_double
+want: double(nan)
+
+expr: s.matches("^z")
+feat: regex string_fn variable
+cfg: regex
+want: bool(false)
+
+expr: duration("1h30m")
+feat: duration
+cfg: chrono
+want: duration(5400000000000ns)
+
+expr: timestamp("2023-05-04T06:07:08Z").getFullYear()
+feat: timestamp
+cfg: chrono
+want: int(2023)
+
+# ---------------------------------------------------------------------------
+# Syntax
+# ---------------------------------------------------------------------------
+
+expr: 1 +
+feat: syntax_error
+want: parse_error
