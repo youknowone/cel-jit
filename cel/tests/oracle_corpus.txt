@@ -275,6 +275,97 @@ expr: true || undefined_name
 feat: logic_or error
 want: bool(true)
 
+# `&&` and `||` are commutative over errors: an error on either side is
+# absorbed when the *other* side decides the result. The six cases above only
+# ever put the error on the right, where plain short-circuiting already skips
+# it, so none of them can tell absorption apart from short-circuiting. These
+# put it on the left, where the operator has to evaluate both sides and then
+# discard a real error.
+
+expr: undefined_name && false
+feat: logic_and error
+want: bool(false)
+
+expr: undefined_name && true
+feat: logic_and error
+want: error(UndeclaredReference: undefined_name)
+
+expr: undefined_name || true
+feat: logic_or error
+want: bool(true)
+
+expr: undefined_name || false
+feat: logic_or error
+want: error(UndeclaredReference: undefined_name)
+
+expr: undefined_name && undefined_name
+feat: logic_and error
+want: error(UndeclaredReference: undefined_name)
+
+# The absorbed error is raised deep inside the left operand rather than by
+# resolving a name, so recognising it cannot be a property of the operand's
+# shape.
+
+expr: (1 / 0 == 1) && false
+feat: logic_and arith error
+want: bool(false)
+
+# A non-bool operand is an overload failure, and on the *left* that failure is
+# absorbed exactly like any other error -- `1 && false` is `false`. So "is this
+# a bool" is not a precondition the operator can check before deciding; it is
+# one more outcome the merge weighs against the other side.
+
+expr: true && 1
+feat: logic_and error
+want: error(NoSuchOverload)
+
+expr: 1 && false
+feat: logic_and error
+want: bool(false)
+
+expr: 1 && true
+feat: logic_and error
+want: error(NoSuchOverload)
+
+expr: 1 && 2
+feat: logic_and error
+want: error(NoSuchOverload)
+
+expr: 1 || true
+feat: logic_or error
+want: bool(true)
+
+expr: 1 || false
+feat: logic_or error
+want: error(NoSuchOverload)
+
+# The right operand is *not* under the absorption: an error raised there
+# propagates even when the left one already failed, and it is the error the
+# caller sees. Absorption is a property of one side, not of the operator.
+
+expr: 1 && undefined_name
+feat: logic_and error
+want: error(UndeclaredReference: undefined_name)
+
+expr: undefined_name && (1 / 0 == 1)
+feat: logic_and arith error
+want: error(DivisionByZero)
+
+# Nested, so that whichever operator absorbs an error has to be the innermost
+# one still able to discard it.
+
+expr: (undefined_name && false) && true
+feat: logic_and error
+want: bool(false)
+
+expr: true && (undefined_name && false)
+feat: logic_and error
+want: bool(false)
+
+expr: (undefined_name && true) || true
+feat: logic_and logic_or error
+want: bool(true)
+
 expr: !true
 feat: logic_not
 want: bool(false)
@@ -748,10 +839,6 @@ want: error(UndeclaredReference: nosuchfn)
 expr: "a" - "b"
 feat: error arith
 want: error(UnsupportedBinaryOperator: sub)
-
-expr: 1 && true
-feat: error logic_and
-want: error(NoSuchOverload)
 
 # Selecting a field on a list is routed through list indexing, so the failure
 # names the index types rather than a missing field.
