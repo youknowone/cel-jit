@@ -1513,11 +1513,121 @@ fn execution_by_allocation(label: &str, lowered: &LoweredF) {
     );
 }
 
+/// Probe M. Probes J/K/L all stop at call 460, and #122's headline says the
+/// first bridge slows the artifact **permanently**. Probe G's own rows say
+/// otherwise, and the arithmetic is decidable without a new hypothesis.
+///
+/// Probe G at n=10 uses `reps = 2000` and 41 rounds, so **every one of its
+/// 82 000 calls except the first ~199 is past call 200**. Under a two-regime
+/// model (pre 3 870 ns, post 9 214 ns) the *lowest* value it could report is the
+/// first round's mixture,
+///
+/// ```text
+/// (199 * 3870 + 1801 * 9214) / 2000 = 8682 ns/call
+/// ```
+///
+/// and every later round is a flat 9 214. It reports **4 984-5 386**. That is
+/// 1.74x below the minimum the two-regime model permits, so the model is
+/// incomplete: something keeps changing after call 460. The same gap sits in the
+/// other two columns and in the same direction — n=100 reads ~50 000 against a
+/// post-bridge 68 400, n=1000 reads ~880 000 against 1 040 000.
+///
+/// So this extends the call-index axis to 6 000 calls and carries **both**
+/// instruments, because they answer different questions on the same run:
+/// ns/row tests "permanent" for #122, allocs/row tracks the post-bridge
+/// composition for #125. Windows are the 20 calls ending at each mark, so they
+/// are Probe J's buckets placed where the axis is interesting rather than every
+/// 20 calls forever.
+fn long_horizon(label: &str, lowered: &LoweredF) {
+    println!("\nProbe M — {label}: is the first bridge's step PERMANENT?");
+
+    const MARKS: [usize; 16] = [
+        20, 100, 180, 200, 220, 260, 320, 400, 420, 500, 700, 1_000, 1_500, 2_500, 4_000, 6_000,
+    ];
+    const WIN: usize = 20;
+
+    for (n, calls) in [(10usize, 6_000usize), (100, 3_000), (1_000, 800)] {
+        let (price, qty) = flat_columns(n);
+        let columns = vec![Column::Int(&price), Column::Int(&qty)];
+
+        // Both yardsticks measured here, against this binary and this n.
+        reset_persistent_state();
+        for _ in 0..8 {
+            black_box(eval_batch_sum_f(lowered, &columns, n, NEVER));
+        }
+        let (_, never_a) = metered(|| black_box(eval_batch_sum_f(lowered, &columns, n, NEVER)));
+        let t = std::time::Instant::now();
+        for _ in 0..64 {
+            black_box(eval_batch_sum_f(lowered, &columns, n, NEVER));
+        }
+        let never_ns = t.elapsed().as_nanos() as f64 / 64.0;
+
+        println!(
+            "\n  n={n}  never-compiles {never_ns:.0} ns/call ({:.1} ns/row, {:.3} allocs/row)",
+            never_ns / n as f64,
+            never_a as f64 / n as f64,
+        );
+        println!(
+            "  {:>12} {:>11} {:>10} {:>11} {:>7} {:>7} {:>6} {:>8}",
+            "calls", "ns/call", "ns/row", "allocs/row", "vs pre", "vs nvr", "brdg", "gfails"
+        );
+
+        reset_persistent_state();
+        reset_jit_stats();
+        let mut per_call: Vec<(f64, u64)> = Vec::with_capacity(calls);
+        let mut marks = Vec::new();
+        for k in 0..calls {
+            let t = std::time::Instant::now();
+            let (_, a) = metered(|| black_box(eval_batch_sum_f(lowered, &columns, n, THRESHOLD)));
+            per_call.push((t.elapsed().as_nanos() as f64, a));
+            if MARKS.contains(&(k + 1)) {
+                let s = jit_stats();
+                marks.push((k + 1, s.bridges_compiled, s.guard_failures));
+            }
+        }
+
+        let window = |end: usize| -> (f64, f64) {
+            let slice = &per_call[end - WIN..end];
+            let ns = slice.iter().map(|c| c.0).sum::<f64>() / WIN as f64;
+            let al = slice.iter().map(|c| c.1).sum::<u64>() as f64 / WIN as f64;
+            (ns, al)
+        };
+        // The last window before the first bridge is the reference every ratio
+        // in this table is read against.
+        let (pre_ns, _) = window(200);
+
+        for &(end, brdg, gfails) in &marks {
+            let (ns, al) = window(end);
+            println!(
+                "  {:>12} {ns:>11.0} {:>10.1} {:>11.3} {:>7.2} {:>7.2} {brdg:>6} {gfails:>8}",
+                format!("{}-{}", end - WIN + 1, end),
+                ns / n as f64,
+                al / n as f64,
+                ns / pre_ns,
+                ns / never_ns,
+            );
+        }
+    }
+    println!(
+        "\n  `vs pre` falling back toward 1.00 as calls grow means the step DECAYS and \
+         'permanently' is wrong;"
+    );
+    println!("  staying flat at its call-220 value means the step is permanent as filed.");
+}
+
 fn main() {
     let schema = flat_schema();
     let arith = lower("price + qty * 2", &schema);
 
     println!("load before probes: {}", loadavg());
+    // Probe M is the same cold-driver axis as J/K/L but 13x longer, so it gets
+    // its own gate: the question it settles is #122's "permanently", which does
+    // not need the three shorter probes to have run first.
+    if std::env::var_os("RCA88B_LONG").is_some() {
+        long_horizon("arith price + qty * 2", &arith);
+        println!("\nload after probes:  {}", loadavg());
+        return;
+    }
     // Probes H and I need a clean process: both index cost by CALL INDEX from a
     // cold driver, and every earlier probe leaves compiled programs interned in
     // the pool. `RCA88B_STEP=1` runs them alone.
