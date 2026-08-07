@@ -1694,7 +1694,11 @@ fn small_n_constant(label: &str, lowered: &LoweredF) {
         let early = mean(20..40);
         // The cranelift/dynasm slopes differ, so predict with whichever this
         // binary was built against rather than hard-coding one backend.
-        let slope = if cfg!(feature = "jit-cranelift") { 23.0 } else { 20.0 };
+        let slope = if cfg!(feature = "jit-cranelift") {
+            23.0
+        } else {
+            20.0
+        };
         let pred = slope * (n as f64 - 1.0) + 4.0;
 
         println!(
@@ -1712,6 +1716,63 @@ fn small_n_constant(label: &str, lowered: &LoweredF) {
     println!("  so the compiled entry cannot still be being paid — an inequality, not a fit.");
 }
 
+/// Probe O. Probe N found that **n=2 never compiles a bridge in 700 calls** and
+/// yet sits at `23(n−1)+4` — the *steady-state* value — from call 21 onward,
+/// where n=10 sits at the pre-bridge constant of 69 until its bridge at call
+/// ~201. So at n=2 the per-back-edge regime exists with no bridge, which refutes
+/// the bridge as *necessary* for it.
+///
+/// Probe N never looked below call 21, so "it changes at 21" was never measured;
+/// the loop compiles at ~call 8 (threshold is 8 back edges, and n=2 takes one
+/// back edge per call). This resolves every call from 1 to 40 individually.
+///
+/// The discriminator:
+///
+/// * n=2 reads 27 from the call `loops_compiled` first moves ⇒ **the regime is
+///   installed at LOOP COMPILE, not at the bridge**, and at n≥3 the bridge is
+///   where it becomes visible rather than what causes it.
+/// * n=2 reads 69 for a while and steps later, with no bridge ⇒ a third
+///   installer, and both #128's bridge and loop compile are off the hook.
+///
+/// n=10 rides along as the control: same axis, same instrument, and its regime
+/// is known to change at the bridge instead.
+fn regime_installed_at(label: &str, lowered: &LoweredF) {
+    println!("\nProbe O — {label}: WHEN is the per-back-edge regime installed?");
+
+    for n in [2usize, 10] {
+        let (price, qty) = flat_columns(n);
+        let columns = vec![Column::Int(&price), Column::Int(&qty)];
+
+        reset_persistent_state();
+        reset_jit_stats();
+        println!("\n  n={n}   (steady-state model predicts {})", 23 * (n - 1) + 4);
+        println!(
+            "  {:>5} {:>8} {:>7} {:>6} {:>8}",
+            "call", "allocs", "loops", "brdg", "gfails"
+        );
+        let mut prev = (usize::MAX, usize::MAX);
+        for k in 0..40 {
+            let (_, a) = metered(|| black_box(eval_batch_sum_f(lowered, &columns, n, THRESHOLD)));
+            let s = jit_stats();
+            let now = (s.loops_compiled, s.bridges_compiled);
+            // Print every call up to 16, then only where a counter moves or the
+            // allocation count changes — the transition is what this is for.
+            let moved = now.0 != prev.0 || now.1 != prev.1;
+            if k < 16 || moved {
+                println!(
+                    "  {:>5} {a:>8} {:>7} {:>6} {:>8}{}",
+                    k + 1,
+                    s.loops_compiled,
+                    s.bridges_compiled,
+                    s.guard_failures,
+                    if moved && k > 0 { "  <- counter moved" } else { "" },
+                );
+            }
+            prev = now;
+        }
+    }
+}
+
 fn main() {
     let schema = flat_schema();
     let arith = lower("price + qty * 2", &schema);
@@ -1723,6 +1784,7 @@ fn main() {
     if std::env::var_os("RCA88B_LONG").is_some() {
         long_horizon("arith price + qty * 2", &arith);
         small_n_constant("arith price + qty * 2", &arith);
+        regime_installed_at("arith price + qty * 2", &arith);
         println!("\nload after probes:  {}", loadavg());
         return;
     }
