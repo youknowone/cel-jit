@@ -191,9 +191,14 @@ const ITERS: u32 = 8;
 /// #122 places the first guard bridge at call 200 exactly and a call index that
 /// is off by one is a call index that cannot be compared to that.
 const PRIMED: u32 = 1;
-/// Far enough past call 200 that the first guard bridge is inside the ladder
-/// with room on both sides of it.
-const WINDOWS: u32 = 48;
+/// 750 windows of 8 reaches call ~6065.
+///
+/// It was 48 (call ~449), which was enough to see the first two bridges and NOT
+/// enough to call anything that follows them a steady state. #127 has to pick a
+/// window to record as the post-bridge cost, and picking one inside an axis that
+/// stops shortly after it is the same mistake #127 exists to fix: a plateau is
+/// only a plateau as far as you looked.
+const WINDOWS: u32 = 750;
 const N: usize = 1000;
 
 enum Col {
@@ -346,7 +351,12 @@ fn phase1(case: &Case, fx: &Fixture) {
         at_seam.internal_compile_panics
     );
     let mut prev = at_seam;
-    let mut baseline_per_call: Option<f64> = None;
+    // Compared against the PREVIOUS window, not the first. Against the first,
+    // every window after a step carries the marker and 700 identical rows read
+    // as 700 events; against the previous, the marker means "a transition
+    // happened here", which is what the ladder is for. Every row still prints --
+    // this changes the annotation, not the population.
+    let mut prev_per_call: Option<f64> = None;
     for w in 0..WINDOWS {
         let first_call = PRIMED + WARMUP + w * ITERS;
         let meter = Meter::start();
@@ -358,10 +368,11 @@ fn phase1(case: &Case, fx: &Fixture) {
         let d = Delta::between(&prev, &now);
         prev = now;
         let per_call = local as f64 / ITERS as f64;
-        let base = *baseline_per_call.get_or_insert(per_call);
+        let moved = prev_per_call.is_some_and(|p| (per_call - p).abs() > f64::EPSILON);
+        prev_per_call = Some(per_call);
         let mark = if !d.compile_side_quiet() {
             "  <== COMPILE-SIDE ACTIVITY"
-        } else if (per_call - base).abs() > f64::EPSILON {
+        } else if moved {
             "  <== allocs/call MOVED with the compile side quiet"
         } else {
             ""

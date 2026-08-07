@@ -745,6 +745,74 @@ fn regvm_group(out: &mut Vec<Row>) {
                 }
             );
             reset_persistent_state();
+
+            // #127. The row above measures calls 65..89. The artifact leaves
+            // that plateau at call 200, when its first guard bridge compiles,
+            // and never returns: measured over 750 windows to call 6065
+            // (`examples/rca116.rs`), the tail from call 401 is 708 windows of
+            // 22978.000 (cranelift) / 19981.000 (dynasm) allocations per call
+            // with no further bridge. So the corpus had NO row in the regime the
+            // artifact occupies for all but its first 400 calls, and a
+            // regression there would move nothing.
+            //
+            // Only at n = 1000. At n = 1 the tier never compiles at all (the
+            // `regvm/jit/*/n=1` rows equal their `clean` twins and report
+            // `guard_fails=0`), so there is no post-bridge regime to sample and
+            // a second row would duplicate the first.
+            if n == 1_000 {
+                /// Past both bridges — the second lands in calls 393..401 — and
+                /// inside the measured tail, which runs to at least call 6065.
+                const STEADY_WARMUP: u32 = 448;
+
+                reset_persistent_state();
+                let got = run_jit_persistent_f(&code, &regs, nf, JIT_ON);
+                assert_eq!(
+                    got, expected,
+                    "regvm/jit-steady/{}/n={n}: compiled tier diverged from the clean VM",
+                    case.label
+                );
+                reset_jit_stats();
+                // Warmed by hand rather than through `bench`, to get the seam
+                // `bench` cannot give: every compile is behind us when the meter
+                // opens, so `bridges` in the window means "none happened here"
+                // and not "we could not tell warm-up from measurement".
+                for _ in 0..STEADY_WARMUP {
+                    black_box(run_jit_persistent_f(&code, &regs, nf, JIT_ON));
+                }
+                let at_seam = jit_stats();
+                let first = out.len();
+                bench(
+                    out,
+                    format!("regvm/jit-steady/{}/n={n}", case.label),
+                    0,
+                    ITERS,
+                    || {
+                        black_box(run_jit_persistent_f(&code, &regs, nf, JIT_ON));
+                    },
+                );
+                let after = jit_stats();
+                // `bridges_before` is the discriminator between this row and the
+                // one above: both windows see zero bridges, and only the count
+                // ALREADY compiled says which side of the threshold the window
+                // sits on. Reading it is the difference between a row that
+                // describes its regime and one that merely has a name.
+                out[first].detail = format!(
+                    "warmed to call {}, then {} calls: bridges_before={} in_window={} \
+                     compiled_in_window={} guard_fails={} — {}",
+                    STEADY_WARMUP + 1,
+                    ITERS * ROUNDS as u32,
+                    at_seam.bridges_compiled,
+                    after.bridges_compiled - at_seam.bridges_compiled,
+                    after.loops_compiled - at_seam.loops_compiled,
+                    after.guard_failures - at_seam.guard_failures,
+                    if at_seam.bridges_compiled == 0 {
+                        "NO BRIDGE EVER COMPILED — this case has no post-bridge regime"
+                    } else {
+                        "STEADY: past every bridge"
+                    }
+                );
+                reset_persistent_state();
+            }
         }
     }
 }
