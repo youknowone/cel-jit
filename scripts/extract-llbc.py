@@ -45,7 +45,6 @@ messages. See `EXTERNAL_INPUTS` for what is in the second set and why.
 from __future__ import annotations
 
 import os
-import subprocess
 import sys
 from pathlib import Path
 
@@ -111,7 +110,8 @@ SPECS: dict[str, CrateSpec] = {
         #     gitignored here, so the `BASE_PATHSPECS` entry naming it matched
         #     nothing (#132). It was the stated justification for skipping the
         #     more expensive walk, so the cheap option rested on coverage that
-        #     did not exist. `refuse_inert_pathspecs` now refuses that shape.
+        #     did not exist. The engine's `refuse_inert_pathspecs` now refuses
+        #     that shape for every driver, not just this one.
         #   * "a walk … would return no path dependencies anyway" — MEASURED
         #     false while the `[patch]` below is on: the walk returns a 10-crate
         #     closure, 9 of them out-of-root under `<pyre-root>/majit`. The
@@ -249,84 +249,22 @@ OPTIONAL_EXTERNAL_INPUTS = [
 ]
 
 
-def refuse_inert_pathspecs(pathspecs: list[str], label: str) -> None:
-    """Refuse a declared fingerprint input that cannot contribute anything.
-
-    A pathspec is only an input if `git` will list a file under it, because the
-    engine's `fingerprint_inputs` asks git and nothing else. A pathspec matching
-    zero files is therefore a silent no-op — and a no-op that READS as coverage
-    everywhere a human looks: in this list, in the comments that cite it, and in
-    the design decisions that rest on it. `Cargo.lock` sat here doing nothing
-    while a comment eight lines up called it an input.
-
-    Refusing is the cheaper half of the fix and catches the whole class: it
-    would have fired the day either offender was added. Actually covering an
-    ignored-but-load-bearing file is the other half and needs the engine (#119).
-
-    The two failure modes need different remedies, so the message separates
-    them: a path that EXISTS but is ignored is a coverage hole, a path that does
-    not exist is a typo or a file that moved.
-    """
-
-    def git_lists(*args: str) -> bool:
-        result = subprocess.run(
-            ["git", "-C", str(ROOT), *args],
-            check=True,
-            stdout=subprocess.PIPE,
-        )
-        return bool(result.stdout.strip())
-
-    # ⛔ The DECISION is git's, and only git's. `Path.exists()` below feeds the
-    # message and nothing else — do not "simplify" this to an existence test.
-    # `Cargo.lock` is the standing counterexample: it EXISTS on disk and is
-    # invisible to `git ls-files` because it is ignored, which is the entire
-    # defect this function was written for. Filesystem-reachable and
-    # git-reachable are different predicates, and every check that conflates
-    # them answers a question nobody asked.
-    #
-    # ⛔ NOT AN INCONSISTENCY WITH ITS SIBLING, so do not unify the two.
-    # `refuse_absent_external_inputs` uses `exists()` as its DECISION, and that
-    # is correct there for the same reason it is wrong here: an external input
-    # is hashed by reading its bytes, so whether it is on disk IS the question,
-    # while a pathspec only ever becomes an input by way of `git ls-files`. The
-    # rule is one question, one oracle — not a house preference for either call.
-    inert: list[tuple[str, bool]] = []
-    for spec in pathspecs:
-        tracked = git_lists("ls-files", "--", spec)
-        untracked = git_lists("ls-files", "--others", "--exclude-standard", "--", spec)
-        if not (tracked or untracked):
-            inert.append((spec, (ROOT / spec).exists()))
-    if not inert:
-        return
-
-    lines = [f"extract-llbc.py: {label} declares pathspecs that match no file:"]
-    for spec, on_disk in inert:
-        if on_disk:
-            lines.append(
-                f"  {spec!r} — EXISTS on disk but git will not list it (ignored?),"
-                f" so it contributes nothing to the fingerprint."
-                f" Either stop declaring it or cover it another way; do not"
-                f" leave it here reading as coverage."
-            )
-        else:
-            lines.append(
-                f"  {spec!r} — does not exist. Renamed, moved, or a typo:"
-                f" whatever it was meant to fingerprint is now unfingerprinted."
-            )
-    raise SystemExit("\n".join(lines))
-
-
 def refuse_absent_external_inputs(inputs: list[Path]) -> None:
     """Refuse a declared external input that is not on disk.
 
-    The mirror of `refuse_inert_pathspecs`, and a SEPARATE function because the
-    two interrogate different oracles. That one asks git, because a pathspec is
-    an input only if `git ls-files` will list it, and it uses the filesystem for
-    the message alone. This one asks the filesystem, because an external input
-    is hashed by reading its bytes — the same reason the engine probe at the top
-    of this file is an `is_file()`. Conflating the two predicates is what #132
-    was; keeping each question with its own oracle is the fix, not preferring
-    one call over the other.
+    ⛔ THIS FUNCTION USES `exists()` AS ITS VERDICT, and the engine's
+    `refuse_inert_pathspecs` pointedly does not — it refuses on git's answer and
+    lets `exists()` pick only the wording. That is not an inconsistency to
+    reconcile, so do not make the two agree. One question, one oracle: a
+    pathspec becomes an input only by way of `git ls-files`, so git decides
+    there; an external input is hashed by reading its bytes, so being on disk IS
+    the question here. It is the same reason the engine probe at the top of this
+    file is an `is_file()`. Conflating the two predicates is what #132 was, and
+    the rule that came out of it is not "prefer git" — it is that the defect was
+    using `exists()` to answer a question about git.
+
+    The sibling now lives in the engine rather than beside this function, so
+    nothing local shows the contrast. That is why it is spelled out here.
 
     The engine hashes a missing external input as `<absent>`, which is right for
     one its dependency walk DISCOVERED: a deleted dependency has to move the
@@ -353,9 +291,13 @@ def refuse_absent_external_inputs(inputs: list[Path]) -> None:
 
 
 def main() -> None:
-    refuse_inert_pathspecs(BASE_PATHSPECS, "BASE_PATHSPECS")
-    for name, spec in SPECS.items():
-        refuse_inert_pathspecs(spec.fingerprint_pathspecs, f"SPECS[{name!r}]")
+    # No inert-pathspec check here: `run_cli` runs the engine's own
+    # `refuse_inert_pathspecs` before every subcommand, over `base_pathspecs`
+    # and every spec's `fingerprint_pathspecs` — the same scope this driver used
+    # to check for itself. Verified against cel's real declaration rather than
+    # assumed: it passes as declared, and refuses both an ignored-file entry and
+    # a typo'd one, in each of the two scopes. Only the external-input guard is
+    # still driver-local, because the engine has no equivalent.
     refuse_absent_external_inputs(EXTERNAL_INPUTS)
     run_cli(
         SPECS,
