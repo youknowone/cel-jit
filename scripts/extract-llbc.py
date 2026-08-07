@@ -25,12 +25,21 @@ Locating the engine and Charon:
     `CHARON_DEST`, defaulting to `<pyre-root>/../.pyre-build/charon/<platform>`;
     install it with `<pyre-root>/scripts/install-charon.py`.
 
-⚠ FINGERPRINT SCOPE. The stamp covers cel's own tracked sources, this driver,
-the resolved cargo/charon flags, and the installed Charon version (the engine
-reads `.installed-version`). It does NOT cover the engine module itself — that
-file lives in the pyre repository, and `git ls-files` cannot reach outside this
-one. After editing `<pyre-root>/scripts/llbc_extract.py`, re-extract with
-`--force` (or `LLBC_FORCE_REEXTRACT=1`).
+⚠ FINGERPRINT SCOPE. The stamp has two source fields, because this artefact has
+two kinds of input and only one of them is reachable by a pathspec:
+
+  * `source=` — cel's own tracked sources, this driver, the resolved
+    cargo/charon flags, and the installed Charon version (the engine reads
+    `.installed-version`). Resolved through `git ls-files`, run in THIS repo.
+  * `external=` — everything `git ls-files` structurally cannot name: the
+    engine module in the pyre repository, the patched `majit` workspace, and
+    the two gitignored files that decide what gets built (`Cargo.lock`,
+    `.cargo/config.toml`). Declared by `EXTERNAL_INPUTS` below and hashed by
+    content.
+
+The split is not cosmetic: a `--check` failure names the field, so "my own
+sources moved" and "a dependency in another checkout moved" are different
+messages. See `EXTERNAL_INPUTS` for what is in the second set and why.
 """
 
 from __future__ import annotations
@@ -88,31 +97,37 @@ SPECS: dict[str, CrateSpec] = {
         # the parser — parsing happens once, in `Program::compile`, outside
         # any JIT portal.
         charon_args=["--opaque", "cel::parser"],
-        # cel's dependency graph is resolved through a git rev for the majit
-        # crates, so a `cargo metadata` walk would need the network on a cold
-        # cache and would return no path dependencies anyway. The artefact's
-        # declared inputs are cel's own tracked sources.
+        # Declared rather than walked: cel's manifest resolves the majit crates
+        # through a git rev, so a `cargo metadata` walk needs the network on a
+        # cold cache. This list is the half of the input set that lives in this
+        # repo; the majit half is declared out-of-band in `EXTERNAL_INPUTS`,
+        # because `git ls-files` run here cannot name a path in another
+        # repository at all.
         #
-        # ⛔ This comment used to end "plus the lockfile (which pins the majit
-        # rev)", and that was false: `Cargo.lock` is gitignored here, so the
-        # `BASE_PATHSPECS` entry naming it matched nothing and the rev was never
-        # hashed. It was the stated reason for skipping the more expensive
-        # `cargo metadata` walk, so the cheaper option was justified by coverage
-        # that did not exist. See `refuse_inert_pathspecs` below, and #119 for
-        # the still-open question of how to cover it.
+        # ⛔ Two claims that used to stand here were false, and both said the
+        # coverage was wider than it was:
         #
-        # ⚠ The majit rev IS an input: `run_mainloop_f`'s signature names
+        #   * "plus the lockfile (which pins the majit rev)" — `Cargo.lock` is
+        #     gitignored here, so the `BASE_PATHSPECS` entry naming it matched
+        #     nothing (#132). It was the stated justification for skipping the
+        #     more expensive walk, so the cheap option rested on coverage that
+        #     did not exist. `refuse_inert_pathspecs` now refuses that shape.
+        #   * "a walk … would return no path dependencies anyway" — MEASURED
+        #     false while the `[patch]` below is on: the walk returns a 10-crate
+        #     closure, 9 of them out-of-root under `<pyre-root>/majit`. The
+        #     claim was only ever true of an unpatched build.
+        #
+        # ⚠ The majit sources ARE an input: `run_mainloop_f`'s signature names
         # `majit_metainterp::JitDriver<VmStateF>`, so majit's type layouts land
         # in `cel.ullbc` — and `majit-macros` is a proc macro, so it changes
-        # cel's own item bodies, not merely layouts. NOTHING currently
-        # fingerprints any of that. It is also not covered by the uncommitted
-        # `.cargo/config.toml` `[patch]` that redirects
-        # those git deps to the enclosing pyre worktree while cel-jit lives
-        # inside it — a local override this driver cannot see, and one that has
-        # been observed to come and go under a concurrent session. When the
-        # patch is on and off you get two different `cel.ullbc` for one
-        # fingerprint. Re-extract with `--force` after toggling it, and read
-        # the extraction log: a patched build compiles
+        # cel's own item bodies, not merely layouts. The `.cargo/config.toml`
+        # `[patch]` that redirects those git deps to the enclosing pyre worktree
+        # is itself gitignored, and has been observed to come and go under a
+        # concurrent session; with the patch on and off you get two different
+        # `cel.ullbc`. All three of those — the majit tree, the patch file, the
+        # lockfile — are in `EXTERNAL_INPUTS` now, so toggling the patch moves
+        # `external=` and `--check` reports stale on its own. To confirm which
+        # build you got, read the extraction log: a patched build compiles
         # `majit-* (…/pyre-wasmi/majit/…)`, an unpatched one compiles
         # `majit-* (https://github.com/youknowone/pyre.git?rev=…)`.
         fingerprint_pathspecs=[
@@ -167,11 +182,70 @@ DEFAULT_CRATES = ["cel"]
 # builds its input set as `ls_files() | ls_files("--others",
 # "--exclude-standard")` — tracked ∪ untracked-not-ignored — so an ignored file
 # is in neither. Naming it produced the appearance of coverage and nothing else.
-# Listing it again would restore the appearance, not the coverage; covering it
-# for real needs a channel the engine does not have (#119).
+# Listing it again would restore the appearance, not the coverage. It is covered
+# now, through `EXTERNAL_INPUTS` below, which hashes by content instead of
+# asking git — the only channel that can reach a file git refuses to list.
 BASE_PATHSPECS = [
     "Cargo.toml",
     "scripts/extract-llbc.py",
+]
+
+
+# Inputs hashed into `external=` instead of `source=`, because `git ls-files`
+# run in THIS repo cannot name any of them: three live in the pyre checkout, and
+# two are gitignored here. Absolute paths; the engine puts a root-relative label
+# in the digest, so relocating the whole `<super>/{pyre,cel-jit}` cohabitation as
+# a unit does not move the fingerprint, while rearranging the repos relative to
+# each other does.
+EXTERNAL_INPUTS = [
+    # The extraction engine. Its code decides what Charon is asked to translate
+    # and how the stamp is computed, so editing it changes the artefact — and
+    # it is one directory outside this repo, which is the whole reason the
+    # `external=` channel exists (#119).
+    PYRE_ROOT / "scripts" / "llbc_extract.py",
+    # The patched majit workspace, declared WHOLE and not crate by crate. That
+    # is deliberate over-coverage: an edit under `majit/` that cel's build never
+    # compiles costs one re-extraction, whereas any of the three ways a
+    # hand-maintained crate list goes silently wrong costs a wrong answer.
+    # Measured, all three, on this tree:
+    #
+    #   * MEMBERSHIP IS FEATURE-DEPENDENT. `cargo metadata --features
+    #     jit-cranelift` gives a 10-crate closure whose 9 out-of-root members
+    #     include `majit-backend-cranelift` and NOT `majit-backend-dynasm`.
+    #     `jit-dynasm` — this driver's default `CARGO_FEATURES` — swaps them.
+    #     One static list is wrong for one of the two backends.
+    #   * A NEW CRATE IN THE CLOSURE IS INVISIBLE to a list written today: the
+    #     `[patch]` names three crates and the other six arrive as their path
+    #     deps, so majit can grow the set without touching anything here.
+    #   * A PER-CRATE `src/` LIST WOULD MISS `majit-macros` ENTIRELY. Deriving
+    #     one the way the engine's walk does drops it, because the walk filters
+    #     targets by `{"lib","bin","custom-build"} & kinds` and a proc macro's
+    #     kind is `["proc-macro"]`. That is not hypothetical — pyre's own
+    #     `--list-inputs` is 699 entries containing exactly one `majit-macros`
+    #     path, its `Cargo.toml`, and no source file. It is also the worst crate
+    #     to miss: a proc macro's expansion IS the extracted crate's bodies.
+    #
+    # ⚠ The path is hardcoded while the truth lives in `.cargo/config.toml`'s
+    # `[patch]`. Re-pointing the patch at a different tree is DETECTED (that
+    # file is declared below, so the digest moves), but not FOLLOWED — the new
+    # tree would be undeclared until this line is updated. With the patch off
+    # entirely, majit comes from the git rev in `Cargo.lock`, also declared, and
+    # this entry then over-covers a tree that is not an input.
+    PYRE_ROOT / "majit",
+]
+
+# Declared separately because absence is a legitimate state that this driver
+# must keep working in, and is itself a fingerprint-relevant signal: the engine
+# hashes a missing entry as `<absent>`, so patch-on and patch-off produce
+# different digests. `refuse_absent_external_inputs` therefore does not apply.
+OPTIONAL_EXTERNAL_INPUTS = [
+    # Gitignored (`.gitignore:2`), and the reason #132 existed: it pins the
+    # majit git rev plus every crates.io version cel resolves.
+    ROOT / "Cargo.lock",
+    # The `[patch]` override, gitignored (`.gitignore:8`). Declared as the
+    # DIRECTORY so a second file appearing beside `config.toml` (cargo also
+    # reads an extensionless `config`) is covered without editing this list.
+    ROOT / ".cargo",
 ]
 
 
@@ -235,10 +309,47 @@ def refuse_inert_pathspecs(pathspecs: list[str], label: str) -> None:
     raise SystemExit("\n".join(lines))
 
 
+def refuse_absent_external_inputs(inputs: list[Path]) -> None:
+    """Refuse a declared external input that is not on disk.
+
+    The mirror of `refuse_inert_pathspecs`, and a SEPARATE function because the
+    two interrogate different oracles. That one asks git, because a pathspec is
+    an input only if `git ls-files` will list it, and it uses the filesystem for
+    the message alone. This one asks the filesystem, because an external input
+    is hashed by reading its bytes — the same reason the engine probe at the top
+    of this file is an `is_file()`. Conflating the two predicates is what #132
+    was; keeping each question with its own oracle is the fix, not preferring
+    one call over the other.
+
+    The engine hashes a missing external input as `<absent>`, which is right for
+    one its dependency walk DISCOVERED: a deleted dependency has to move the
+    digest. It is wrong for one a driver DECLARED, because there a typo and a
+    deletion are indistinguishable, and the typo's digest is stable, non-empty
+    and covers nothing — #132's failure with the sign flipped, inert there and
+    alive-but-empty here. `OPTIONAL_EXTERNAL_INPUTS` holds the entries whose
+    absence really is a state rather than a mistake.
+    """
+    absent = [path for path in inputs if not path.exists()]
+    if not absent:
+        return
+
+    lines = ["extract-llbc.py: EXTERNAL_INPUTS names paths that do not exist:"]
+    for path in absent:
+        lines.append(
+            f"  {path} — the engine would hash it as `<absent>`, so this entry"
+            f" would contribute a constant while the rest of the set kept the"
+            f" digest moving, and nothing would ever say so. Fix the path, or"
+            f" move it to OPTIONAL_EXTERNAL_INPUTS if being absent is a state"
+            f" this repo is meant to build in."
+        )
+    raise SystemExit("\n".join(lines))
+
+
 def main() -> None:
     refuse_inert_pathspecs(BASE_PATHSPECS, "BASE_PATHSPECS")
     for name, spec in SPECS.items():
         refuse_inert_pathspecs(spec.fingerprint_pathspecs, f"SPECS[{name!r}]")
+    refuse_absent_external_inputs(EXTERNAL_INPUTS)
     run_cli(
         SPECS,
         DEFAULT_CRATES,
@@ -247,6 +358,7 @@ def main() -> None:
         base_pathspecs=BASE_PATHSPECS,
         charon_root=PYRE_ROOT,
         layout_targets=(),
+        external_inputs=tuple(EXTERNAL_INPUTS + OPTIONAL_EXTERNAL_INPUTS),
     )
 
 
