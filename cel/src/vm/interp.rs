@@ -64,6 +64,12 @@ enum Operand {
     /// The `names` index of the message type, and the fields set so far. The
     /// type is checked when the struct is opened, so that a bad type name
     /// fails before the field expressions run, as it does in the walker.
+    ///
+    /// Without the `structs` feature that same check refuses every struct
+    /// literal outright, so `open_struct` -- the only constructor -- never
+    /// returns and this variant is genuinely unreachable in that build. The
+    /// arms below still have to compile, which is what the attribute is for.
+    #[cfg_attr(not(feature = "structs"), allow(dead_code))]
     Struct(NameId, BTreeMap<String, Value>),
 }
 

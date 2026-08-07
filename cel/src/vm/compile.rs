@@ -570,6 +570,85 @@ impl Compiler {
     }
 }
 
+/// A comprehension whose step only ever appends one element to its own
+/// accumulator -- what `map` and `filter` expand to.
+///
+/// This is the compile-time twin of the walker's `AccuAppend` (`objects.rs`),
+/// and it exists for the same reason: the general lowering rebuilds the
+/// accumulator once per element, because `@result + [x]` is a list
+/// concatenation. That is a fresh buffer and a full copy per iteration, so an
+/// *n*-element `map` costs O(n^2) copying where the shape only ever needed a
+/// push. The walker has recognised it since before the VM existed; without the
+/// same recognition here the VM is asymptotically slower than the evaluator it
+/// replaces, which no amount of dispatch tuning can make up.
+///
+/// The preconditions are the walker's, restated:
+///
+/// * the loop condition is the literal `true`, so nothing can break early and
+///   observe a partial accumulator (`exists` and `all` do break, and are not
+///   this shape);
+/// * the step is `@result + [elem]`, optionally wrapped in
+///   `guard ? @result + [elem] : @result`, which is `filter`;
+/// * the appended literal holds exactly one element and no optional index,
+///   because `[?x]` appends zero or one depending on the value.
+struct AccuAppend<'a> {
+    /// `filter`'s condition, when the step is the conditional form.
+    guard: Option<&'a IdedExpr>,
+    /// The single element the step appends.
+    element: &'a IdedExpr,
+}
+
+impl<'a> AccuAppend<'a> {
+    fn of(comp: &'a ComprehensionExpr) -> Option<Self> {
+        // A second variable is bound from the range per iteration; the parser
+        // never emits one, and this shape has never been measured with it.
+        if comp.iter_var2.is_some() {
+            return None;
+        }
+        match &comp.loop_cond.expr {
+            Expr::Literal(LiteralValue::Boolean(b)) if *b => {}
+            _ => return None,
+        }
+        // The accumulator has to start as a list, and it has to be a list the
+        // compiler can see: the emitted program builds it on the operand stack
+        // rather than storing it, so `[]` must be a literal and not a value
+        // that merely turns out to be a list at run time.
+        if !matches!(&comp.accu_init.expr, Expr::List(_)) {
+            return None;
+        }
+
+        let accu_var = comp.accu_var.as_str();
+        let is_accu = |e: &IdedExpr| matches!(&e.expr, Expr::Ident(n) if n == accu_var);
+
+        let (guard, step) = match &comp.loop_step.expr {
+            Expr::Call(call)
+                if call.func_name == operators::CONDITIONAL
+                    && call.args.len() == 3
+                    && is_accu(&call.args[2]) =>
+            {
+                (Some(&call.args[0]), &call.args[1])
+            }
+            _ => (None, &comp.loop_step),
+        };
+
+        let Expr::Call(call) = &step.expr else {
+            return None;
+        };
+        if call.func_name != operators::ADD || call.args.len() != 2 || !is_accu(&call.args[0]) {
+            return None;
+        }
+        match &call.args[1].expr {
+            Expr::List(list) if list.elements.len() == 1 && list.optional_indices.is_empty() => {
+                Some(AccuAppend {
+                    guard,
+                    element: &list.elements[0],
+                })
+            }
+            _ => None,
+        }
+    }
+}
+
 impl Compiler {
     /// A comprehension, which is the only construct that emits a back edge.
     ///
@@ -577,6 +656,9 @@ impl Compiler {
     /// neither can refer to the variables the comprehension binds -- and
     /// `result` inside it, because it refers to the accumulator.
     fn comprehension(&mut self, comp: &ComprehensionExpr, id: u64) -> Result<(), CompileError> {
+        if let Some(append) = AccuAppend::of(comp) {
+            return self.appending_comprehension(comp, &append, id);
+        }
         let two_variable = comp.iter_var2.is_some();
 
         self.expr(&comp.iter_range)?;
@@ -655,6 +737,103 @@ impl Compiler {
 
         self.patch_to_here(exhausted);
         self.patch_to_here(broke);
+        self.expr(&comp.result)?;
+
+        self.close_scope(mark);
+        Ok(())
+    }
+
+    /// The [`AccuAppend`] shape: the accumulator is a builder on the operand
+    /// stack, and each iteration pushes one element into it.
+    ///
+    /// This is the same device a list *literal* already uses -- `NewList` plus
+    /// one `ListAppend` per element, with the in-progress aggregate living on
+    /// the stack as an `Operand::List` the append mutates in place. The only
+    /// new thing is a loop around the appends, so no opcode is added and the
+    /// dispatch loop is untouched.
+    ///
+    /// ```text
+    ///   <iter_range>  IterElems  StoreLocal source
+    ///   <accu_init>                       ; a list literal: leaves the builder
+    ///   LoadConst 0   StoreLocal index
+    /// top:
+    ///   LoadLocal index  LoadLocal source  IterLen  Less  JumpIfFalse done
+    ///   LoadLocal source  LoadLocal index  IterAt   StoreLocal iter_var
+    ///   [<guard> JumpIfFalse skip]
+    ///   <element>  ListAppend            ; the push, straight into the builder
+    /// skip:
+    ///   LoadLocal index  LoadConst 1  Add  StoreLocal index  Jump top
+    /// done:
+    ///   StoreLocal accu                  ; finishes the builder into a Value
+    ///   <result>
+    /// ```
+    ///
+    /// The accumulator's name is declared only *after* the loop. That is not
+    /// tidiness: it is what makes `@result` unreadable from the element and the
+    /// guard, which is this shape's precondition. A read compiles to `LoadVar`
+    /// and fails as an undeclared reference -- the same answer the walker gives,
+    /// which holds its accumulator outside the context on this path.
+    fn appending_comprehension(
+        &mut self,
+        comp: &ComprehensionExpr,
+        append: &AccuAppend<'_>,
+        id: u64,
+    ) -> Result<(), CompileError> {
+        self.expr(&comp.iter_range)?;
+
+        let mark = self.open_scope();
+
+        self.emit(OpCode::IterElems, &[], id)?;
+        let source = self.declare_hidden(id)?;
+        self.emit(OpCode::StoreLocal, &[source], id)?;
+
+        // Leaves the builder on the stack, where it stays for the whole loop.
+        self.expr(&comp.accu_init)?;
+
+        let index = self.declare_hidden(id)?;
+        let zero = self.add_const(Value::Int(0), id)?;
+        self.emit(OpCode::LoadConst, &[zero], id)?;
+        self.emit(OpCode::StoreLocal, &[index], id)?;
+
+        let iter_var = self.declare(&comp.iter_var, id)?;
+
+        let top = self.here();
+        self.emit(OpCode::LoadLocal, &[index], id)?;
+        self.emit(OpCode::LoadLocal, &[source], id)?;
+        self.emit(OpCode::IterLen, &[], id)?;
+        self.emit(OpCode::Less, &[], id)?;
+        let exhausted = self.emit_forward(OpCode::JumpIfFalse, id)?;
+
+        self.emit(OpCode::LoadLocal, &[source], id)?;
+        self.emit(OpCode::LoadLocal, &[index], id)?;
+        self.emit(OpCode::IterAt, &[], id)?;
+        self.emit(OpCode::StoreLocal, &[iter_var], id)?;
+
+        let skipped = match append.guard {
+            Some(guard) => {
+                self.expr(guard)?;
+                Some(self.emit_forward(OpCode::JumpIfFalse, id)?)
+            }
+            None => None,
+        };
+
+        self.expr(append.element)?;
+        self.emit(OpCode::ListAppend, &[], id)?;
+
+        if let Some(skipped) = skipped {
+            self.patch_to_here(skipped);
+        }
+
+        let one = self.add_const(Value::Int(1), id)?;
+        self.emit(OpCode::LoadLocal, &[index], id)?;
+        self.emit(OpCode::LoadConst, &[one], id)?;
+        self.emit(OpCode::Add, &[], id)?;
+        self.emit(OpCode::StoreLocal, &[index], id)?;
+        self.emit(OpCode::Jump, &[top], id)?;
+
+        self.patch_to_here(exhausted);
+        let accu = self.declare(&comp.accu_var, id)?;
+        self.emit(OpCode::StoreLocal, &[accu], id)?;
         self.expr(&comp.result)?;
 
         self.close_scope(mark);
@@ -909,6 +1088,116 @@ mod tests {
             .handler_for(inner_merge)
             .expect("the inner merge is covered");
         assert_eq!(handler.start, 0, "{}", code.disassemble());
+    }
+
+    fn count(code: &CelCode, op: OpCode) -> usize {
+        opcodes(code).iter().filter(|o| **o == op).count()
+    }
+
+    /// `map` and `filter` push into the accumulator instead of rebuilding it.
+    ///
+    /// The property is stated as an opcode census rather than a timing, because
+    /// the cost being removed is a *copy* and the shape is what decides whether
+    /// it happens. `Add` is the discriminator: the general lowering emits one
+    /// for the step's `@result + [x]` and one for the index increment, so a
+    /// single `Add` is exactly the claim that the concatenation is gone.
+    #[test]
+    fn map_and_filter_append_rather_than_concatenate() {
+        for source in [
+            "xs.map(x, x * 2)",
+            "xs.filter(x, x > 1)",
+            "xs.map(x, x > 1, x * 10)",
+        ] {
+            let code = code_of(source);
+            assert_eq!(
+                count(&code, OpCode::Add),
+                1,
+                "{source} still concatenates:\n{}",
+                code.disassemble()
+            );
+            assert_eq!(
+                count(&code, OpCode::ListAppend),
+                1,
+                "{source} should append exactly once per iteration:\n{}",
+                code.disassemble()
+            );
+            // The accumulator lives on the operand stack, so nothing reads it
+            // back per iteration; the one store is the finish after the loop.
+            assert_eq!(
+                count(&code, OpCode::NewList),
+                1,
+                "{source} should build one accumulator:\n{}",
+                code.disassemble()
+            );
+        }
+    }
+
+    /// The macros that are NOT this shape keep the general lowering, so the
+    /// recogniser cannot be quietly widened into something that breaks them.
+    ///
+    /// `all` and `exists` break early on the accumulator, and `exists_one`
+    /// counts into an int; none of the three may reach the append path.
+    #[test]
+    fn breaking_and_counting_macros_keep_the_general_lowering() {
+        for source in [
+            "xs.all(x, x > 0)",
+            "xs.exists(x, x > 0)",
+            "xs.exists_one(x, x > 0)",
+        ] {
+            let code = code_of(source);
+            assert_eq!(
+                count(&code, OpCode::ListAppend),
+                0,
+                "{source} is not an appending comprehension:\n{}",
+                code.disassemble()
+            );
+        }
+    }
+
+    /// The accumulator's name is not in scope inside the loop.
+    ///
+    /// That is the precondition the whole shape rests on -- the accumulator is
+    /// a builder on the operand stack, so a per-iteration read could not see
+    /// it. `@result` is not parseable, so the only way to state this is to
+    /// build the tree; the check is that the name compiles to a context lookup
+    /// (`LoadVar`) and not to a slot, which is the walker's behaviour too.
+    #[test]
+    fn the_accumulator_is_not_readable_from_the_loop_body() {
+        let Expr::Comprehension(base) = code_source("xs.map(x, x)") else {
+            panic!("the macro expands to a comprehension");
+        };
+        let mut comp = *base;
+        let accu = comp.accu_var.clone();
+
+        // `@result + [@result]`: the element reads the accumulator.
+        let Expr::Call(step) = &mut comp.loop_step.expr else {
+            panic!("`map` steps through `+`");
+        };
+        let Expr::List(appended) = &mut step.args[1].expr else {
+            panic!("`map` appends a one element literal");
+        };
+        appended.elements[0] = IdedExpr {
+            id: 99,
+            expr: Expr::Ident(accu.clone()),
+        };
+
+        let code = compile(&IdedExpr {
+            id: 0,
+            expr: Expr::Comprehension(Box::new(comp)),
+        })
+        .expect("compiles");
+
+        let looked_up: Vec<&str> = code
+            .instructions()
+            .filter(|(_, op, _)| *op == OpCode::LoadVar)
+            .map(|(_, _, operands)| code.name(NameId(operands[0])).unwrap())
+            .collect();
+        assert!(
+            looked_up.contains(&accu.as_str()),
+            "the accumulator must resolve as a free variable inside the loop, \
+             not as the slot it only occupies after it: {looked_up:?}\n{}",
+            code.disassemble()
+        );
     }
 
     fn parse_expr(source: &str) -> IdedExpr {
