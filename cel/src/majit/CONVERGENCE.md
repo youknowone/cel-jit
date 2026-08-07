@@ -7,7 +7,10 @@ Superseded in part, 2026-08-07. Evaluator 1 below is no longer
 been deleted and `Program::execute` runs `Value::resolve_value`, which walks the
 `Value` enum. Everything this document says about `dyn Val`, `Cow` lifetimes and
 `downcast_ref` describes the tree as it stood on 2026-07-26. The two-evaluator
-problem itself is unchanged.
+problem itself is unchanged. One consequence is not merely descriptive: the
+document's argument that Step 1 pays for itself on speed was an argument against
+the deleted walker, and measurement against the new one refutes it. See the note
+under Step 1.
 
 ## The problem
 
@@ -76,9 +79,21 @@ about the JIT at all:
 > **cel must gain a real bytecode compiler and a bytecode VM over full
 > `Value`s, and that VM must become `Program::execute`.**
 
-This step is independently justifiable — a flat bytecode VM normally beats a
-`Cow<dyn Val>` recursive walk on its own — and it is the step that makes
-everything after it possible.
+It is the step that makes everything after it possible.
+
+> **This paragraph used to say the step was independently justifiable, because a
+> flat bytecode VM normally beats a `Cow<dyn Val>` recursive walk on its own.
+> That justification is void and the claim is now false.** It was written against
+> the `Cow<dyn Val>` walker, and P2 deleted that walker. Measured against its
+> replacement, `Value::resolve_value`, the VM's *run* half — compilation
+> excluded, the code object owned by the `Program` — costs 1.5–3.9x the walker on
+> flat expressions. Step 1 is therefore a performance regression on flat CEL, and
+> has to be argued on convergence alone: it is the prerequisite for Steps 2–4,
+> not a win in itself. The deficit is tracked as its own item.
+>
+> The one place the VM already wins is the comprehension accumulator, and only
+> since it stopped rebuilding the result list per element: `xs.map(x, ..)` over
+> 10 000 rows fell from 50 018 allocations to 18, against the walker's 19.
 
 ## Plan
 
