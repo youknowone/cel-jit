@@ -881,7 +881,10 @@ fn main() {
         println!(
             "⚠ {} was blessed under features={} — the `base` and `Δ` columns below \n\
              are NOT comparable to this run. Re-bless it in this configuration.",
-            baseline_path().file_name().unwrap_or_default().display(),
+            baseline_path()
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy(),
             meta.get("features").map(String::as_str).unwrap_or("?"),
         );
     }
