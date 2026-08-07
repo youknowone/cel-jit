@@ -23,7 +23,7 @@
 #
 # Format: <label> TAB <allocations per evaluation>
 #! profile = dev
-#! features = regex,chrono
+#! features = regex,chrono,jit
 #! host = aarch64-macos
 #! rounds = 3
 
@@ -79,3 +79,15 @@ comprehension/bind+exec/chained/100	22.000
 comprehension/bind+exec/all/100	4.000
 comprehension/bind+exec/exists/100	4.000
 comprehension/bind+exec/size/100	13.000
+regvm/clean/arith/n=1	1.000
+regvm/jit/arith/n=1	1.000
+regvm/clean/arith/n=1000	1.000
+regvm/jit/arith/n=1000	66.000
+regvm/clean/policy/n=1	1.000
+regvm/jit/policy/n=1	1.000
+regvm/clean/policy/n=1000	1.000
+regvm/jit/policy/n=1000	66.000
+regvm/clean/float/n=1	2.000
+regvm/jit/float/n=1	2.000
+regvm/clean/float/n=1000	2.000
+regvm/jit/float/n=1000	68.000

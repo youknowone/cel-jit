@@ -76,6 +76,12 @@
 //! `CEL_ALLOCS_BLESS=1` rewrites the baseline. `CEL_ALLOCS_GATE=1` turns a
 //! drift from the baseline into a failure; it is OFF by default **on purpose**
 //! — see the header of `tests/allocs_per_eval.baseline`.
+//!
+//! Each of those two configurations has its own baseline file
+//! (`allocs_per_eval.baseline` and `allocs_per_eval.jit.baseline`) because they
+//! measure different corpora. One file would leave whichever configuration it
+//! was not blessed under comparing against nothing, which is a gate that cannot
+//! fail rather than a gate that passes.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -708,8 +714,18 @@ fn regvm_group(_out: &mut Vec<Row>) {}
 // baseline
 // ---------------------------------------------------------------------------
 
+/// One baseline per row set, so both invocations anyone actually makes are
+/// gated: a plain `cargo test -p cel` and a `--features jit-cranelift` run
+/// measure different corpora, and a single file could only ever cover one of
+/// them. A baseline that no real configuration can compare against is a gate
+/// that cannot fail.
 fn baseline_path() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/allocs_per_eval.baseline")
+    let name = if cfg!(feature = "jit") {
+        "tests/allocs_per_eval.jit.baseline"
+    } else {
+        "tests/allocs_per_eval.baseline"
+    };
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(name)
 }
 
 /// `label -> allocations per evaluation`, plus the `key: value` header fields.
@@ -793,18 +809,26 @@ fn write_baseline(rows: &[Row]) {
 const BASELINE_HEADER: &str = "\
 # cel — allocations per evaluation. Produced by `tests/allocs_per_eval.rs`.
 #
-# ⚠ THIS FILE IS PER-HOST AND PER-BUILD. It is NOT an absolute contract, and
-#   the test does NOT fail when a row differs from it. Run with
-#   `CEL_ALLOCS_GATE=1` to make a drift fatal — do that in a re-measurement of
-#   ONE change on ONE machine, never as a default CI gate. A row measured under
-#   a different `profile`/`features` pair than the one recorded below is not
-#   comparable to it at all, and the report says so.
+# ⚠ THIS FILE IS PER-HOST. It is NOT an absolute contract, and the test does NOT
+#   fail when a row differs from it. Run with `CEL_ALLOCS_GATE=1` to make a drift
+#   fatal — do that in a re-measurement of ONE change on ONE machine, never as a
+#   default CI gate.
 #
-# Bless with `CEL_ALLOCS_BLESS=1 cargo test -p cel --features jit-cranelift \\
-#     --test allocs_per_eval`.
+# There are TWO baselines, one per row set, because there are two invocations
+# people actually make and a single file can only cover one of them:
 #
-# `regvm/*` rows exist only when a `jit` backend feature is on. A run without
-# one reports them as not measured rather than as zero.
+#   allocs_per_eval.baseline      no jit backend, 52 rows -- `cargo test -p cel`
+#   allocs_per_eval.jit.baseline  a jit backend,  64 rows -- adds `regvm/*`
+#
+# Bless the one matching your configuration:
+#
+#   CEL_ALLOCS_BLESS=1 cargo test -p cel --test allocs_per_eval
+#   CEL_ALLOCS_BLESS=1 cargo test -p cel --features jit-cranelift \\
+#       --test allocs_per_eval
+#
+# A run whose `features` differ from the pair recorded below is not comparable
+# and the report says so. `profile` is recorded but does not invalidate a
+# comparison: dev and release were measured identical on every row.
 #
 # Format: <label> TAB <allocations per evaluation>
 ";
@@ -833,14 +857,28 @@ fn main() {
         std::env::consts::ARCH,
         std::env::consts::OS
     );
-    let comparable = meta.get("profile").map(String::as_str) == Some(profile())
-        && meta.get("features").map(String::as_str) == Some(&features());
+    // Only the feature set invalidates a comparison: it decides which rows exist
+    // and which code paths are compiled in. `profile` does not -- dev and release
+    // were measured row-for-row identical on all 52 JIT-free rows, which is what
+    // an allocation COUNT should do. It is still reported, and a difference gets
+    // a note rather than blacking out the `base` and `Δ` columns; suppressing
+    // them for a difference that does not affect the numbers is how a baseline
+    // ends up comparable to nothing anyone runs.
+    let comparable = meta.get("features").map(String::as_str) == Some(&features());
     if !base.is_empty() && !comparable {
         println!(
-            "⚠ baseline was blessed under profile={} features={} — the `base` and `Δ` \n\
-             columns below are NOT comparable to this run.",
-            meta.get("profile").map(String::as_str).unwrap_or("?"),
+            "⚠ {} was blessed under features={} — the `base` and `Δ` columns below \n\
+             are NOT comparable to this run. Re-bless it in this configuration.",
+            baseline_path().file_name().unwrap_or_default().display(),
             meta.get("features").map(String::as_str).unwrap_or("?"),
+        );
+    }
+    if !base.is_empty() && meta.get("profile").map(String::as_str) != Some(profile()) {
+        println!(
+            "note: baseline blessed under profile={}, this run is {} — allocation \n\
+             counts do not vary with the profile, so the columns still compare.",
+            meta.get("profile").map(String::as_str).unwrap_or("?"),
+            profile(),
         );
     }
     println!();
