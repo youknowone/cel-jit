@@ -243,9 +243,29 @@ fn build(case: &Case) -> Fixture {
         })
         .collect();
     let bases: Vec<i64> = cols.iter().map(Col::base).collect();
+
+    // Priced to settle a cross-probe discrepancy, and the answer REFUTED the
+    // reason for pricing it. `rca88b`'s Probe L meters `eval_batch_sum_f`, which
+    // goes through the batch-assembly door; this probe and the `regvm/jit/*`
+    // baseline rows assemble once and then meter `run_jit_persistent_f` alone.
+    // The door was the obvious candidate for the 3-allocation gap between the
+    // two probes' absolute figures (69/66 there, 66/63 here).
+    //
+    // It is not: the door costs 9, and 9 on BOTH backends. The probes also run
+    // different programs, so their absolute per-call figures were never
+    // comparable in the first place. What IS comparable, and what survives, is
+    // the cranelift-minus-dynasm difference INSIDE each probe: 3 there, 3 here,
+    // on three cases and two harness shapes.
+    let meter = Meter::start();
     let (shape, regs) = lowered.batch_sum_program(&bases, N as i64);
     let nf = shape.num_float_regs;
     let code = shape.code.clone();
+    let (assembly, _) = meter.stop();
+    println!(
+        "   batch_sum_program + Arc clone for {}/n={N}: {assembly} allocations",
+        case.label
+    );
+
     let expected = clean_interp_seeded_f(&code, &regs, nf);
     Fixture {
         code,
