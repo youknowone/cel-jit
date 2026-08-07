@@ -227,12 +227,21 @@ impl<'a> Vm<'a> {
         }
     }
 
+    /// The refusal a build without the `structs` feature owes a struct
+    /// literal. Raised where the literal is *opened*, so nothing inside it
+    /// runs first; `close_struct` keeps it only because `finish` is total over
+    /// [`Operand`].
+    #[cfg(not(feature = "structs"))]
+    fn no_structs_feature(&mut self, name: NameId) -> CelErr {
+        let type_name = self.code.name(name).unwrap_or("?");
+        self.park(ExecutionError::InternalError(format!(
+            "Found struct {type_name}, feature not enabled!"
+        )))
+    }
+
     #[cfg(not(feature = "structs"))]
     fn close_struct(&mut self, name: NameId, _fields: BTreeMap<String, Value>) -> CelResult<Value> {
-        let type_name = self.code.name(name).unwrap_or("?");
-        Err(self.park(ExecutionError::InternalError(format!(
-            "Found struct {type_name}, feature not enabled!"
-        ))))
+        Err(self.no_structs_feature(name))
     }
 
     /// The `n` topmost operands, in the order they were pushed.
@@ -635,10 +644,13 @@ impl<'a> Vm<'a> {
         Ok(())
     }
 
+    /// Without the feature there is no struct to build, and the walker says so
+    /// on reaching the node -- before any field expression runs. Deferring the
+    /// refusal to the close would report a field's error instead:
+    /// `cel.MyStruct { x: 1 / 0 }` answered `DivisionByZero`.
     #[cfg(not(feature = "structs"))]
     fn open_struct(&mut self, name: NameId) -> CelResult<()> {
-        self.stack.push(Operand::Struct(name, BTreeMap::new()));
-        Ok(())
+        Err(self.no_structs_feature(name))
     }
 
     fn call_global(&mut self, name: NameId, args: Vec<Value>) -> CelResult<Value> {

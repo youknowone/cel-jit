@@ -1533,7 +1533,16 @@ impl Value {
                     Some(target) => {
                         let args = resolve_args(&call.args, ctx)?;
                         let qualified_func = match &target.expr {
-                            Expr::Ident(prefix) => {
+                            // A comprehension variable shadows the package
+                            // namespace, so a receiver the enclosing macro
+                            // bound is a value and never a namespace:
+                            // `xs.all(optional, optional.of(1))` calls `of` on
+                            // the element. langdef.md, name resolution -- "in a
+                            // comprehension like `[1].exists(x, x == 1)`, `x` is
+                            // a local variable which shadows any identifier
+                            // named `x` in ancestor scopes or the package
+                            // namespace".
+                            Expr::Ident(prefix) if !ctx.is_comprehension_variable(prefix) => {
                                 // A namespaced call (`math.max(x)`) and a member
                                 // call on a variable (`s.startsWith(x)`) parse
                                 // identically, so every one of the latter asks

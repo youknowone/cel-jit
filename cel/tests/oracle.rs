@@ -62,12 +62,15 @@
 //!   are distinguishable but the last-ulp behaviour of a long chain is not
 //!   pinned beyond what that rendering shows.
 //! * **Parse-error detail.** A syntax case pins only that compilation failed.
-//! * **`Value::Struct`** (the `structs` feature) and any opaque other than
+//! * **A successfully built `Value::Struct`**, and any opaque other than
 //!   `OptionalValue`. `render` handles both so the file builds with those
-//!   features on, but no corpus case exercises them.
+//!   features on; the corpus reaches a struct literal only to pin *when* the
+//!   type is refused, because `fixed_context` registers no struct definition.
 //! * **Anything behind a cargo feature that is off.** Cases carry `cfg:` and
 //!   are skipped when the feature is absent; the corresponding coverage
-//!   requirements are dropped with them, and the run says so.
+//!   requirements are dropped with them, and the run says so. A leading `!`
+//!   negates, so a divergence that only appears with a feature OFF can be
+//!   pinned as the same expression with two answers.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -425,6 +428,7 @@ const REQUIRED_COVERAGE: &[(&str, usize)] = &[
     ("duration", 3),
     ("timestamp", 3),
     ("opaque", 2),
+    ("struct_literal", 3),
     ("host_function", 2),
     ("error", 8),
     ("variable", 3),
@@ -448,6 +452,20 @@ fn cfg_enabled(name: &str) -> bool {
         "json" => cfg!(feature = "json"),
         "bytes" => cfg!(feature = "bytes"),
         other => panic!("corpus names an unknown cfg `{other}`"),
+    }
+}
+
+/// Whether a case's `cfg:` selects this build, where a leading `!` negates.
+///
+/// The negation is not symmetry for its own sake. A divergence between two
+/// evaluators can be *feature-shaped* — the two answered differently only with
+/// a feature OFF — and a corpus that can only say "needs feature X" has no way
+/// to pin the answer a build WITHOUT it must give. That is exactly how the
+/// struct-literal refusal ordering stayed invisible.
+fn case_selected(cfg: &str) -> bool {
+    match cfg.strip_prefix('!') {
+        Some(name) => !cfg_enabled(name),
+        None => cfg_enabled(cfg),
     }
 }
 
@@ -557,7 +575,7 @@ fn corpus_agrees_with_every_evaluator() {
 
     for case in &cases {
         if let Some(cfg) = &case.cfg {
-            if !cfg_enabled(cfg) {
+            if !case_selected(cfg) {
                 skipped += 1;
                 continue;
             }
@@ -601,7 +619,7 @@ fn public_door_agrees() {
         if case.parse.is_some() {
             continue; // `Program::compile` cannot express these; see `parse:`.
         }
-        if case.cfg.as_deref().map(cfg_enabled) == Some(false) {
+        if case.cfg.as_deref().map(case_selected) == Some(false) {
             continue;
         }
         let Ok(program) = Program::compile(&case.expr) else {
@@ -640,7 +658,7 @@ fn every_required_feature_is_covered() {
 
     let mut unknown = Vec::new();
     for case in &cases {
-        let live = case.cfg.as_deref().map(cfg_enabled).unwrap_or(true);
+        let live = case.cfg.as_deref().map(case_selected).unwrap_or(true);
         for feat in &case.feats {
             match counts.get_mut(feat.as_str()) {
                 Some(slot) => {
@@ -686,12 +704,18 @@ fn corpus_is_well_formed() {
     let cases = parse_corpus();
     assert!(!cases.is_empty(), "the corpus is empty");
 
-    // Keyed on the parser too: the same source under a different parser
-    // configuration is a different case, not a duplicate.
-    let mut seen: BTreeMap<(&str, Option<&str>), usize> = BTreeMap::new();
+    // Keyed on the parser and the feature configuration too: the same source
+    // under a different `parse:` or `cfg:` is a different case, not a
+    // duplicate. A feature-shaped divergence is stated as one expression with
+    // two answers, so without `cfg` in the key it could not be written down.
+    let mut seen: BTreeMap<(&str, Option<&str>, Option<&str>), usize> = BTreeMap::new();
     let mut dupes = Vec::new();
     for case in &cases {
-        let key = (case.expr.as_str(), case.parse.as_deref());
+        let key = (
+            case.expr.as_str(),
+            case.parse.as_deref(),
+            case.cfg.as_deref(),
+        );
         if let Some(first) = seen.insert(key, case.line) {
             dupes.push(format!(
                 "  line {} repeats the expression first seen at line {first}: {}",

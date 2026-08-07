@@ -1050,3 +1050,68 @@ want: bool(false)
 expr: double('nan') == double('nan')
 feat: equality conversion
 want: bool(false)
+
+# ---------------------------------------------------------------------------
+# Struct literals — WHEN the type is refused, not what it builds
+# ---------------------------------------------------------------------------
+#
+# `fixed_context()` registers no struct definition, so every one of these is a
+# refusal. That is the point: the refusal has to come from OPENING the literal,
+# before any field expression runs. The VM used to defer it to the close, so
+# `cel.MyStruct { x: 1 / 0 }` answered the field's error instead of the type's.
+#
+# Each expression appears twice, once per `structs` setting, because the two
+# builds refuse with different errors and a one-sided corpus cannot say so.
+
+expr: cel.MyStruct {}
+feat: struct_literal error
+want: error(UnexpectedType: got=cel.MyStruct want=known struct)
+cfg: structs
+
+expr: cel.MyStruct {}
+feat: struct_literal error
+want: error(InternalError)
+cfg: !structs
+
+expr: cel.MyStruct { x: 1 }
+feat: struct_literal error
+want: error(UnexpectedType: got=cel.MyStruct want=known struct)
+cfg: structs
+
+expr: cel.MyStruct { x: 1 }
+feat: struct_literal error
+want: error(InternalError)
+cfg: !structs
+
+expr: cel.MyStruct { x: 1 / 0 }
+feat: struct_literal error
+want: error(UnexpectedType: got=cel.MyStruct want=known struct)
+cfg: structs
+
+expr: cel.MyStruct { x: 1 / 0 }
+feat: struct_literal error
+want: error(InternalError)
+cfg: !structs
+
+# ---------------------------------------------------------------------------
+# A comprehension variable shadows the package namespace
+# ---------------------------------------------------------------------------
+#
+# Decided by cel-spec, doc/langdef.md (name resolution), not by the incumbent:
+# "in a comprehension like `[1].exists(x, x == 1)`, `x` is a local variable
+# which shadows any identifier named `x` in ancestor scopes or the package
+# namespace". So a receiver a macro bound is a VALUE, never a namespace, and
+# `optional.of(...)` inside `xs.all(optional, ...)` is a member call `of` on the
+# element -- which no overload accepts.
+#
+# The tree walker used to probe the namespace unconditionally and answer
+# `bool(true)` here; the bytecode VM never did. The walker was changed to the
+# spec's answer, so this row records a behaviour change, not a preserved one.
+
+expr: xs.all(optional, optional.of(1) == optional.of(1))
+feat: macro_all optional error
+want: error(UndeclaredReference: of)
+
+expr: xs.map(size, size)
+feat: macro_map variable
+want: list[int(1), int(2), int(3), int(4)]

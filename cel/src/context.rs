@@ -149,6 +149,24 @@ impl<'a> Context<'a> {
         }
     }
 
+    /// Whether `name` is bound by an enclosing comprehension.
+    ///
+    /// The iteration and accumulator variables live in the `Child` scopes
+    /// `new_inner_scope` mints; the `Root`'s variables are the activation the
+    /// caller supplied. The distinction is load-bearing at exactly one place --
+    /// a call whose receiver is a bare identifier -- because a comprehension
+    /// variable shadows the package namespace, so `xs.all(optional,
+    /// optional.of(1))` is a member call on the element rather than the
+    /// namespaced `optional.of`.
+    pub(crate) fn is_comprehension_variable(&self, name: &str) -> bool {
+        match self {
+            Context::Root { .. } => false,
+            Context::Child {
+                variables, parent, ..
+            } => variables.contains_key(name) || parent.is_comprehension_variable(name),
+        }
+    }
+
     pub(crate) fn env(&self) -> &Env {
         match self {
             Context::Root { env, .. } => env.as_ref(),
