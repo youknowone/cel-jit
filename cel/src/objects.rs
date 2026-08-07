@@ -1225,6 +1225,7 @@ impl PartialOrd for Value {
             (Value::UInt(a), Value::UInt(b)) => Some(a.cmp(b)),
             (Value::Float(a), Value::Float(b)) => a.partial_cmp(b),
             (Value::String(a), Value::String(b)) => Some(a.cmp(b)),
+            (Value::Bytes(a), Value::Bytes(b)) => Some(a.cmp(b)),
             (Value::Bool(a), Value::Bool(b)) => Some(a.cmp(b)),
             (Value::Null, Value::Null) => Some(Ordering::Equal),
             #[cfg(feature = "chrono")]
@@ -1564,7 +1565,7 @@ impl Value {
     }
 
     pub fn resolve(expr: &Expression, ctx: &Context) -> ResolveResult {
-        Self::resolve_val(expr, ctx)?.as_ref().try_into()
+        Self::resolve_value(expr, ctx)
     }
 
     #[inline(always)]
@@ -2353,17 +2354,19 @@ impl Value {
                 .ok_or_else(|| ExecutionError::UndeclaredReference(Arc::new(name.to_string())))?,
             Expr::Select(select) => {
                 let left = Value::resolve_value(select.operand.deref(), ctx)?;
-                let key = Value::String(Arc::new(select.field.as_str().to_string()));
+                let field = select.field.as_str();
 
                 if select.test {
                     match &left {
-                        Value::Map(_) => Ok(Value::Bool(value_contains(&left, &key)?)),
+                        Value::Map(map) => {
+                            Ok(Value::Bool(map.contains_key(&KeyRef::String(field))))
+                        }
                         #[cfg(feature = "structs")]
-                        Value::Struct(_) => Ok(Value::Bool(value_index(&left, &key).is_ok())),
-                        _ => value_index(&left, &key),
+                        Value::Struct(_) => Ok(Value::Bool(value_field(&left, field).is_ok())),
+                        _ => value_field(&left, field),
                     }
                 } else {
-                    value_index(&left, &key)
+                    value_field(&left, field)
                 }
             }
             Expr::List(list_expr) => {
@@ -2531,38 +2534,36 @@ fn resolve_args<'a>(
     Ok(out)
 }
 
-/// Whether the `dyn Val` receiver for `value` carries `op` at all.
+/// Whether an incompatible right-hand side makes `op` on this receiver answer
+/// `NoSuchOverload` rather than `UnsupportedBinaryOperator`.
 ///
-/// The walker reports a failed binary operator two different ways: a receiver
-/// whose type has no such operator answers `UnsupportedBinaryOperator`, while a
-/// receiver that has the operator but was handed an incompatible right-hand
-/// side answers `NoSuchOverload`. [`Value`]'s native operators collapse both
-/// into `UnsupportedBinaryOperator`, so the split is reconstructed here from
-/// which types implement each capability trait in `common/types`.
-fn receiver_has_operator(op: &'static str, value: &Value) -> bool {
+/// Each operator trait in `common/types` picks its own error for a right-hand
+/// side it cannot handle, and they do not agree: `Int` answers `NoSuchOverload`
+/// for all five arithmetic operators, `List` does for `add` and `Duration` for
+/// `sub`, and every other receiver answers `UnsupportedBinaryOperator`. That
+/// split is not a rule anyone stated — it is which error each impl happened to
+/// be written with — but it is observable, so it is reproduced rather than
+/// tidied. [`Value`]'s native operators answer `UnsupportedBinaryOperator`
+/// throughout, so only the listed cases are rewritten.
+///
+/// Derived by sweeping every (receiver, operator, argument) triple through both
+/// evaluators, not by reading the impls: a capability trait's terminal error is
+/// easy to misattribute to a neighbouring impl.
+fn mismatch_is_no_such_overload(op: &'static str, value: &Value) -> bool {
     #[cfg(feature = "chrono")]
-    let temporal = matches!(value, Value::Duration(_) | Value::Timestamp(_));
+    let duration_sub = matches!(value, Value::Duration(_)) && op == "sub";
     #[cfg(not(feature = "chrono"))]
-    let temporal = false;
+    let duration_sub = false;
 
-    let numeric = matches!(value, Value::Int(_) | Value::UInt(_) | Value::Float(_));
-    match op {
-        "add" => {
-            numeric
-                || temporal
-                || matches!(value, Value::String(_) | Value::Bytes(_) | Value::List(_))
-        }
-        "sub" => numeric || temporal,
-        "mul" | "div" => numeric,
-        "rem" => matches!(value, Value::Int(_) | Value::UInt(_)),
-        _ => false,
-    }
+    matches!(value, Value::Int(_))
+        || (matches!(value, Value::List(_)) && op == "add")
+        || duration_sub
 }
 
 fn binary_op(op: &'static str, call: &CallExpr, ctx: &Context) -> Result<Value, ExecutionError> {
     let lhs = Value::resolve_value(&call.args[0], ctx)?;
     let rhs = Value::resolve_value(&call.args[1], ctx)?;
-    let receiver_has = receiver_has_operator(op, &lhs);
+    let rewrite = mismatch_is_no_such_overload(op, &lhs);
     let result = match op {
         "add" => lhs + rhs,
         "sub" => lhs - rhs,
@@ -2572,11 +2573,32 @@ fn binary_op(op: &'static str, call: &CallExpr, ctx: &Context) -> Result<Value, 
         _ => unreachable!("unknown binary operator {op}"),
     };
     match result {
-        Err(ExecutionError::UnsupportedBinaryOperator(..)) if receiver_has => {
+        Err(ExecutionError::UnsupportedBinaryOperator(..)) if rewrite => {
             Err(ExecutionError::NoSuchOverload)
         }
         other => other,
     }
+}
+
+/// Whether the receiver carries an ordering at all.
+///
+/// `PartialOrd for Value` orders `Null` against `Null` and would order a list
+/// or a map by falling through, where `common/types` gives those no `Comparer`,
+/// so ordering them is `NoSuchOverload`.
+fn has_comparer(value: &Value) -> bool {
+    #[cfg(feature = "chrono")]
+    if matches!(value, Value::Duration(_) | Value::Timestamp(_)) {
+        return true;
+    }
+    matches!(
+        value,
+        Value::Int(_)
+            | Value::UInt(_)
+            | Value::Float(_)
+            | Value::String(_)
+            | Value::Bytes(_)
+            | Value::Bool(_)
+    )
 }
 
 fn compare_op(
@@ -2586,6 +2608,9 @@ fn compare_op(
 ) -> Result<Value, ExecutionError> {
     let lhs = Value::resolve_value(&call.args[0], ctx)?;
     let rhs = Value::resolve_value(&call.args[1], ctx)?;
+    if !has_comparer(&lhs) {
+        return Err(ExecutionError::NoSuchOverload);
+    }
     let ordering = lhs
         .partial_cmp(&rhs)
         .ok_or(ExecutionError::NoSuchOverload)?;
@@ -2613,10 +2638,27 @@ fn value_key(value: Value) -> Result<Key, ExecutionError> {
         Value::UInt(u) => Ok(Key::Uint(u)),
         Value::Bool(b) => Ok(Key::Bool(b)),
         Value::String(s) => Ok(Key::String(s)),
-        other => Err(ExecutionError::UnexpectedType {
-            got: other.type_of().to_string(),
-            want: "int|uint|bool|string".to_string(),
+        other => Err(ExecutionError::unsupported_key_type(other)),
+    }
+}
+
+/// `container.field`, looked up without materializing the field name.
+///
+/// `KeyRef::String` borrows, so a map field select costs no allocation. Going
+/// through [`value_index`] would build an `Arc<String>` per access.
+fn value_field(container: &Value, field: &str) -> Result<Value, ExecutionError> {
+    match container {
+        Value::Map(map) => map
+            .get(&KeyRef::String(field))
+            .map(|v| v.into_owned())
+            .ok_or_else(|| ExecutionError::NoSuchKey(Arc::new(field.to_string()))),
+        Value::List(_) => Err(ExecutionError::UnexpectedType {
+            got: ValueType::String.to_string(),
+            want: format!("{}|{}", ValueType::Int, ValueType::UInt),
         }),
+        #[cfg(feature = "structs")]
+        Value::Struct(_) => value_index(container, &Value::String(Arc::new(field.to_string()))),
+        _ => Err(ExecutionError::NoSuchOverload),
     }
 }
 
@@ -2681,13 +2723,13 @@ fn key_display(key: &Key) -> String {
 }
 
 /// `needle in container`.
+///
+/// A needle that cannot be a map key is an error rather than a miss, which is
+/// why the conversion is propagated instead of folded into `false`.
 fn value_contains(container: &Value, needle: &Value) -> Result<bool, ExecutionError> {
     match container {
         Value::List(list) => Ok(list.contains(needle)),
-        Value::Map(map) => match value_key(needle.clone()) {
-            Ok(k) => Ok(map.contains_key(&k)),
-            Err(_) => Ok(false),
-        },
+        Value::Map(map) => Ok(map.contains_key(&value_key(needle.clone())?)),
         _ => Err(ExecutionError::NoSuchOverload),
     }
 }
