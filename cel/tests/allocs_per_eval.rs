@@ -434,6 +434,18 @@ fn cometkim_cases() -> Vec<WalkerCase> {
         "string_operations",
         r#""hello world".startsWith("hello") && "hello world".endsWith("world") && "hello world".contains("o w")"#,
     ));
+    // The same three calls as `string_operations`, on a variable rather than on
+    // a literal. `string_operations` reaches the member-call path with an
+    // `Expr::Member`-free literal target, which is a different arm from the one
+    // an ordinary `s.startsWith(..)` takes -- and no other row in this corpus
+    // takes that arm, so the whole corpus was blind to its cost (task #98).
+    cases.push(WalkerCase {
+        setup: Box::new(|ctx| ctx.add_variable_from_value("s", Value::from("hello world"))),
+        ..walker_case(
+            "member_call_on_variable",
+            r#"s.startsWith("hello") && s.endsWith("world") && s.contains("o w")"#,
+        )
+    });
     cases.push(WalkerCase {
         setup: Box::new(|ctx| {
             for (name, v) in [("x", 10i64), ("y", 20), ("a", 5), ("b", 3)] {
