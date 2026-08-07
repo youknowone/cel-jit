@@ -1878,23 +1878,62 @@ struct Regime {
     hist: Vec<u64>,
 }
 
+/// One compiled loop, recovered as a per-call delta over the cumulative
+/// counters. `COMPILES` / `TRACE_OPS_BEFORE` / `TRACE_OPS_AFTER` are all
+/// `fetch_add` (`bytecode.rs:1868-1870`), so a run that compiles two loops
+/// reports their SUM and a reader who takes the total for "the size of the
+/// artifact" reads 13+25 as one 38-op trace.
+struct Compile {
+    /// The call the counters moved on. Two loops compiling within one call are
+    /// one event with `loops == 2`: nothing finer is observable from outside,
+    /// and splitting them would invent an ordering.
+    call: usize,
+    loops: usize,
+    ops_before: usize,
+    ops_after: usize,
+}
+
 /// Groups a run's calls by `(bridges_compiled, allocations)` and keeps one
 /// histogram per group. No fixed windows: probe N reported 86 against a true 84
 /// at n=5 by reading an index on an axis whose landmark moves.
 fn regimes(lowered: &LoweredF, n: usize, calls: usize, threshold: u32) -> Vec<Regime> {
+    census(lowered, n, calls, threshold).0
+}
+
+/// The regime table and the compile log off ONE run. They have to come from the
+/// same run: the two are read against each other, and a second run would be a
+/// second population of compiled artifacts.
+fn census(
+    lowered: &LoweredF,
+    n: usize,
+    calls: usize,
+    threshold: u32,
+) -> (Vec<Regime>, Vec<Compile>) {
     let (price, qty) = flat_columns(n);
     let columns = vec![Column::Int(&price), Column::Int(&qty)];
 
     reset_persistent_state();
     reset_jit_stats();
     let mut out: Vec<Regime> = Vec::new();
+    let mut compiles: Vec<Compile> = Vec::new();
     let mut prev_gf = jit_stats().guard_failures;
+    let mut prev_c = (0usize, 0usize, 0usize);
     for k in 0..calls {
         let (_, a, hist) =
             metered_sizes(|| black_box(eval_batch_sum_f(lowered, &columns, n, threshold)));
         let s = jit_stats();
         let gf = s.guard_failures - prev_gf;
         prev_gf = s.guard_failures;
+        let now_c = (s.loops_compiled, s.trace_ops_before, s.trace_ops_after);
+        if now_c.0 != prev_c.0 {
+            compiles.push(Compile {
+                call: k + 1,
+                loops: now_c.0 - prev_c.0,
+                ops_before: now_c.1 - prev_c.1,
+                ops_after: now_c.2 - prev_c.2,
+            });
+        }
+        prev_c = now_c;
         // The two counters come through independent paths in `bump`, so a
         // disagreement means the interval measured is not the one claimed.
         let summed: u64 = hist.iter().sum();
@@ -1920,7 +1959,7 @@ fn regimes(lowered: &LoweredF, n: usize, calls: usize, threshold: u32) -> Vec<Re
             }),
         }
     }
-    out
+    (out, compiles)
 }
 
 /// Picks the regime a run spends the most calls in, among those at `brdg`.
@@ -2089,6 +2128,162 @@ fn alloc_size_signature(label: &str, lowered: &LoweredF) {
     }
 }
 
+/// Probe Q. Probe P's sweep reads `trace_ops_after` as 13 at n ∈ {2,3,5} and 25
+/// everywhere else in 2..=12, and `(n−1)` divides the threshold 8 at exactly
+/// {2,3,5,9}. Eleven values with no exception, identical on both backends — and
+/// a fit with no exception, taken at ONE setting of the divisor, is the shape
+/// that has one more variable in it. Two points determine a line.
+///
+/// The threshold is an external lever and `DRIVERS` keys on it, so each setting
+/// gets its own driver and its own artifact. That makes the fit directly
+/// testable:
+///
+/// * if the law is `(n−1) | threshold`, the flat set MOVES with the threshold —
+///   {2,3,4,5,7,13} at 12, {2,4,10} at 9, {2,8} at 7;
+/// * if 8 is a constant of the machinery that the threshold merely coincides
+///   with, the flat set stays {2,3,5,9} at every setting.
+///
+/// t=9 and t=7 are the sharp settings: both predict n=3 and n=5 GROW, which the
+/// constant-8 reading forbids. t=16 is deliberately included as the weak
+/// control — inside n ≤ 17 it predicts {2,3,5,9,17}, which agrees with 8 on
+/// every value but 17, so it separates "divides" from "is at most 8" and
+/// nothing else.
+///
+/// The reading is `ops_after` against `ops_before` per compile, not against the
+/// literal 13/25: the question is whether the optimizer GREW the trace, and a
+/// hard-coded pair of numbers would only be readable on this one expression.
+fn threshold_control(label: &str, lowered: &LoweredF) {
+    println!("\nProbe Q — {label}: does the flat-trace set follow the THRESHOLD?");
+
+    const CALLS: usize = 900;
+    const NS: std::ops::RangeInclusive<usize> = 2..=17;
+
+    // 3/4/5 and 18/24 are not about the divisor law — they separate the two
+    // readings of MIXED. Every MIXED cell in 6..=16 has `t/(n−1) <= 2` AND
+    // `n >= 7`, and those two are confounded there: the smallest n with a ratio
+    // of 1 is n = t+1 >= 7. t=3/4/5 put a ratio of 1 at n = 4/5/6, and t=18/24
+    // put a ratio of 3 and 4 at n = 7 and n = 7/9. If MIXED follows the ratio,
+    // the first three flip and the last two do not; if it follows n, the
+    // reverse.
+    for threshold in [3u32, 4, 5, 6, 7, 8, 9, 10, 12, 16, 18, 24] {
+        println!("\n  threshold {threshold} — predicted flat where (n−1) | {threshold}");
+        println!(
+            "    {:>4} {:>9} {:>7} {:>9} {:>8} {:>4} {:>4} {:>6}   {}",
+            "n",
+            "(n−1)|t",
+            "loops",
+            "verdict",
+            "allocs",
+            "gf",
+            "E",
+            "first",
+            "compiles (call: before -> after)"
+        );
+        let mut predicted: Vec<usize> = Vec::new();
+        let mut flat: Vec<usize> = Vec::new();
+        let mut mixed: Vec<usize> = Vec::new();
+        let mut model_breaks: Vec<usize> = Vec::new();
+        for n in NS {
+            let (rs, cs) = census(lowered, n, CALLS, threshold);
+            let divides = (threshold as usize) % (n - 1) == 0;
+            if divides {
+                predicted.push(n);
+            }
+            let loops: usize = cs.iter().map(|c| c.loops).sum();
+            // Read per compile, so a run that compiles one flat and one grown
+            // loop is reported as neither — Probe P's n=9 summed them to 38 and
+            // printed that on all five of its regimes.
+            let any_flat = cs.iter().any(|c| c.ops_after == c.ops_before);
+            let any_grown = cs.iter().any(|c| c.ops_after > c.ops_before);
+            let verdict = match (any_flat, any_grown) {
+                (true, false) => {
+                    flat.push(n);
+                    "FLAT"
+                }
+                (false, true) => "GROWN",
+                (true, true) => {
+                    mixed.push(n);
+                    "MIXED"
+                }
+                (false, false) => "none",
+            };
+            let detail = cs
+                .iter()
+                .map(|c| {
+                    let many = if c.loops > 1 {
+                        format!(" [{} loops]", c.loops)
+                    } else {
+                        String::new()
+                    };
+                    format!("{}: {}->{}{many}", c.call, c.ops_before, c.ops_after)
+                })
+                .collect::<Vec<_>>()
+                .join("  ");
+            // #125's model, re-solved at every threshold. The artifact halving
+            // is a fact about the TRACE; whether it moves the per-call
+            // allocation bill is a separate question, and assuming it does not
+            // would be assuming the answer.
+            let slope = if cfg!(feature = "jit-cranelift") {
+                23i64
+            } else {
+                20
+            };
+            let steady = rs
+                .iter()
+                .filter(|r| r.calls >= 20)
+                .max_by_key(|r| r.calls)
+                .expect("no regime holds 20 calls");
+            let rest = steady.allocs as i64 - 42 * steady.gf as i64 - 4;
+            let e = if rest % slope == 0 {
+                format!("{}", rest / slope)
+            } else {
+                format!("{:.2}!", rest as f64 / slope as f64)
+            };
+            // NOT `E == n−1`: the dominant regime is whichever one holds the
+            // most calls, and at (t=10, n=6) that is a gf=1 regime reading
+            // 138 = 23*4 + 42*1 + 4 — an integer E of 4 against 5 back edges.
+            // The invariant the model actually asserts is that every back edge
+            // is accounted for, as a compiled entry OR as a guard exit.
+            if rest % slope != 0 || rest / slope + steady.gf as i64 != (n - 1) as i64 {
+                model_breaks.push(n);
+            }
+            println!(
+                "    {n:>4} {:>9} {loops:>7} {verdict:>9} {:>8} {:>4} {e:>4} {:>6}   {detail}",
+                if divides { "yes" } else { "no" },
+                steady.allocs,
+                steady.gf,
+                steady.first_call,
+            );
+        }
+        println!("    predicted flat: {predicted:?}");
+        println!("    observed  flat: {flat:?}   mixed: {mixed:?}");
+        // MIXED counts as agreement only where it is predicted: a run that
+        // compiles both shapes has produced the flat artifact, which is what
+        // the predicate claims. Where it is NOT predicted it is a miss.
+        let agrees = predicted
+            .iter()
+            .all(|n| flat.contains(n) || mixed.contains(n))
+            && flat.iter().all(|n| predicted.contains(n))
+            && mixed.iter().all(|n| predicted.contains(n));
+        println!(
+            "    => {}",
+            if agrees {
+                "AGREES with (n−1) | threshold"
+            } else {
+                "⛔ DISAGREES with (n−1) | threshold"
+            }
+        );
+        println!(
+            "    => {}",
+            if model_breaks.is_empty() {
+                "E + gf = n−1 in the dominant steady regime at every n".to_string()
+            } else {
+                format!("⛔ E + gf != n−1 at {model_breaks:?}")
+            }
+        );
+    }
+}
+
 fn main() {
     let schema = flat_schema();
     let arith = lower("price + qty * 2", &schema);
@@ -2098,6 +2293,14 @@ fn main() {
     // the only probe that turns the size histogram on. `RCA88B_SIZES=1`.
     if std::env::var_os("RCA88B_SIZES").is_some() {
         alloc_size_signature("arith price + qty * 2", &arith);
+        println!("\nload after probes:  {}", loadavg());
+        return;
+    }
+    // Probe Q sweeps the threshold, which is part of the `DRIVERS` key, so it
+    // interns a driver per setting — same cold-driver requirement as P, and the
+    // same gate.
+    if std::env::var_os("RCA88B_THRESHOLD").is_some() {
+        threshold_control("arith price + qty * 2", &arith);
         println!("\nload after probes:  {}", loadavg());
         return;
     }
