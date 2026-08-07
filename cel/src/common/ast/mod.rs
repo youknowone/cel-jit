@@ -1,7 +1,4 @@
-use crate::common::types::{CelBool, CelBytes, CelDouble, CelInt, CelString, CelUInt, CEL_NULL};
-use crate::common::value::Val;
 use crate::objects::Value;
-use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -44,43 +41,30 @@ pub enum Expr {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum LiteralValue {
-    Boolean(CelBool),
-    Bytes(CelBytes),
-    Double(CelDouble),
-    Int(CelInt),
+    Boolean(bool),
+    Bytes(Arc<Vec<u8>>),
+    Double(f64),
+    Int(i64),
     Null,
-    String(CelString),
-    UInt(CelUInt),
+    String(Arc<String>),
+    UInt(u64),
 }
 
 impl LiteralValue {
     /// The [`Value`] this literal denotes.
     ///
-    /// `String` and `Bytes` allocate here because the literal owns a plain
-    /// `std::string::String`/`Vec<u8>` while [`Value`] holds an `Arc`. Once
-    /// `to_val` is gone the literal can hold the `Arc` itself and this becomes
-    /// a refcount bump.
+    /// A refcount bump for the two owning variants, a copy for the rest. The
+    /// literal holds the same representation [`Value`] does so that evaluating
+    /// one allocates nothing.
     pub fn to_value(&self) -> Value {
         match self {
-            LiteralValue::Boolean(b) => Value::Bool(*b.inner()),
-            LiteralValue::Bytes(b) => Value::Bytes(Arc::new(b.inner().to_vec())),
-            LiteralValue::Double(f) => Value::Float(*f.inner()),
-            LiteralValue::Int(i) => Value::Int(*i.inner()),
+            LiteralValue::Boolean(b) => Value::Bool(*b),
+            LiteralValue::Bytes(b) => Value::Bytes(b.clone()),
+            LiteralValue::Double(f) => Value::Float(*f),
+            LiteralValue::Int(i) => Value::Int(*i),
             LiteralValue::Null => Value::Null,
-            LiteralValue::String(s) => Value::String(Arc::new(s.inner().to_string())),
-            LiteralValue::UInt(ui) => Value::UInt(*ui.inner()),
-        }
-    }
-
-    pub fn to_val<'a>(&'a self) -> Cow<'a, dyn Val> {
-        match &self {
-            LiteralValue::Boolean(b) => Cow::Borrowed(b),
-            LiteralValue::Bytes(b) => Cow::Borrowed(b),
-            LiteralValue::Double(f) => Cow::Borrowed(f),
-            LiteralValue::Int(i) => Cow::Borrowed(i),
-            LiteralValue::Null => Cow::Borrowed(&CEL_NULL),
-            LiteralValue::String(s) => Cow::Borrowed(s),
-            LiteralValue::UInt(ui) => Cow::Borrowed(ui),
+            LiteralValue::String(s) => Value::String(s.clone()),
+            LiteralValue::UInt(u) => Value::UInt(*u),
         }
     }
 }

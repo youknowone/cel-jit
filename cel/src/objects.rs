@@ -1517,7 +1517,7 @@ impl<'a> AccuAppend<'a> {
         // place a step of this shape still could — `exists` and `all` stop on
         // it — and both macros here emit a constant `true`.
         match &comprehension.loop_cond.expr {
-            Expr::Literal(LiteralValue::Boolean(b)) if *b.inner() => {}
+            Expr::Literal(LiteralValue::Boolean(b)) if *b => {}
             _ => return None,
         }
         let accu_var = comprehension.accu_var.as_str();

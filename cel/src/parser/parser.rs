@@ -2159,31 +2159,22 @@ ERROR: <input>:1:24: unsupported syntax '?'
                 Expr::Literal(val) => match val {
                     LiteralValue::String(s) => &format!(
                         "\"{}\"^#{}:{}#",
-                        s.inner(),
+                        s.as_str(),
                         expr.id,
                         "*expr.Constant_StringValue"
                     ),
                     LiteralValue::Boolean(b) => {
-                        &format!("{}^#{}:{}#", b.inner(), expr.id, "*expr.Constant_BoolValue")
+                        &format!("{}^#{}:{}#", b, expr.id, "*expr.Constant_BoolValue")
                     }
-                    LiteralValue::Int(i) => &format!(
-                        "{}^#{}:{}#",
-                        i.inner(),
-                        expr.id,
-                        "*expr.Constant_Int64Value"
-                    ),
-                    LiteralValue::UInt(u) => &format!(
-                        "{}u^#{}:{}#",
-                        u.inner(),
-                        expr.id,
-                        "*expr.Constant_Uint64Value"
-                    ),
-                    LiteralValue::Double(f) => &format!(
-                        "{}^#{}:{}#",
-                        f.inner(),
-                        expr.id,
-                        "*expr.Constant_DoubleValue"
-                    ),
+                    LiteralValue::Int(i) => {
+                        &format!("{}^#{}:{}#", i, expr.id, "*expr.Constant_Int64Value")
+                    }
+                    LiteralValue::UInt(u) => {
+                        &format!("{}u^#{}:{}#", u, expr.id, "*expr.Constant_Uint64Value")
+                    }
+                    LiteralValue::Double(f) => {
+                        &format!("{}^#{}:{}#", f, expr.id, "*expr.Constant_DoubleValue")
+                    }
                     LiteralValue::Bytes(bytes) => &format!(
                         "b\"{}\"^#{}:{}#",
                         String::from_utf8_lossy(bytes),
