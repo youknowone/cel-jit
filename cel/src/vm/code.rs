@@ -25,6 +25,33 @@ pub struct CelCode {
     pub n_slots: u32,
     /// Depth the operand stack reaches, from the abstract-interpretation walk.
     pub max_stack: u32,
+    /// How many logic slots the program uses, one per `&&`/`||`.
+    pub n_logic: u32,
+    /// Where an error raised inside a short-circuit operator's *left* operand
+    /// is caught. Innermost match wins.
+    pub handlers: Vec<Handler>,
+}
+
+/// One entry of the handler table.
+///
+/// CEL's `&&` and `||` absorb an error on either side when the other side
+/// decides the result, so an error raised anywhere inside the left operand
+/// has to reach the merge rather than unwind past it. A tree walker gets this
+/// by not applying `?` to its recursive call; a flat instruction stream needs
+/// to say which instructions the merge is willing to catch for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Handler {
+    /// First instruction covered.
+    pub start: u32,
+    /// One past the last instruction covered -- the merge's own left half.
+    pub end: u32,
+    /// Where to resume: the first instruction of the right operand.
+    pub land: u32,
+    /// Logic slot the caught error is recorded in.
+    pub logic: u32,
+    /// Operand-stack depth to restore, which is the depth before the left
+    /// operand was evaluated.
+    pub depth: u32,
 }
 
 impl CelCode {
@@ -69,6 +96,17 @@ impl CelCode {
         })
     }
 
+    /// The innermost handler covering `pc`, if any.
+    ///
+    /// Innermost wins so that a nested `&&` inside another's left operand
+    /// absorbs into its own merge rather than the outer one.
+    pub fn handler_for(&self, pc: u32) -> Option<&Handler> {
+        self.handlers
+            .iter()
+            .filter(|h| h.start <= pc && pc < h.end)
+            .min_by_key(|h| h.end - h.start)
+    }
+
     /// A one-instruction-per-line rendering, for test assertions and
     /// debugging.
     pub fn disassemble(&self) -> String {
@@ -106,8 +144,8 @@ mod tests {
             ],
             consts: vec![Value::Int(1)],
             names: vec!["a".into(), "b".into(), "size".into()],
-            n_slots: 0,
             max_stack: 2,
+            ..CelCode::default()
         };
 
         let decoded: Vec<_> = code

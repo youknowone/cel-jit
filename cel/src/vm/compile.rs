@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use super::code::CelCode;
+use super::code::{CelCode, Handler};
 use super::error::NameId;
 use super::opcode::OpCode;
 use crate::common::ast::{
@@ -82,6 +82,12 @@ struct Compiler {
     next_slot: u32,
     /// High-water mark of `next_slot`, which is the activation record's size.
     n_slots: u32,
+    /// Next free logic slot, restored when a short-circuit operator's merge
+    /// has read it, so siblings share one slot and only nested ones stack.
+    next_logic: u32,
+    /// High-water mark of `next_logic`.
+    n_logic: u32,
+    handlers: Vec<Handler>,
     depth: i64,
     max_stack: i64,
 }
@@ -94,6 +100,8 @@ impl Compiler {
             names: self.names,
             n_slots: self.n_slots,
             max_stack: u32::try_from(self.max_stack).unwrap_or(u32::MAX),
+            n_logic: self.n_logic,
+            handlers: self.handlers,
         })
     }
 
@@ -402,17 +410,61 @@ impl Compiler {
 
     /// `a && b` and `a || b`.
     ///
-    /// The instruction shape is the ordinary short-circuit one. It does not
-    /// express CEL's error absorption -- `error && false` is `false` -- which
-    /// is deliberately unresolved; see the module documentation. The intended
-    /// mechanism adds a handler over the left operand's range and leaves this
-    /// emission unchanged.
+    /// Both operands are evaluated unless the left one decides the result on
+    /// its own, and an error in the left operand is *recorded* rather than
+    /// raised, because the right operand may still discard it:
+    /// `undefined_name && false` is `false`.
+    ///
+    /// So the left operand runs under a handler covering exactly its own
+    /// instructions, landing on the right operand with the error already in
+    /// the logic slot. The right operand is deliberately outside that range:
+    /// an error there propagates, matching the walker's `?`.
+    ///
+    ///     [handler start]
+    ///       <a>
+    ///     [handler end]   And   logic, L_short   ; a -> logic; false short-circuits
+    ///     [handler land]  <b>
+    ///                     AndMerge logic          ; combine, or raise
+    ///     L_short:
+    ///
+    /// Each operator gets its own logic slot, because a nested `&&` in the
+    /// right operand writes its own between this one's write and read.
     fn short_circuit(&mut self, call: &CallExpr, op: OpCode, id: u64) -> Result<(), CompileError> {
         self.check_arity(call, 2, id)?;
+
+        let logic = self.next_logic;
+        self.next_logic = logic.checked_add(1).ok_or(CompileError {
+            kind: CompileErrorKind::TooLarge("logic slot count"),
+            id,
+        })?;
+        self.n_logic = self.n_logic.max(self.next_logic);
+
+        let depth = u32::try_from(self.depth).unwrap_or(0);
+        let start = self.here();
         self.expr(&call.args[0])?;
-        let to_end = self.emit_forward(op, id)?;
+        let end = self.here();
+
+        let at = self.emit(op, &[logic, u32::MAX], id)?;
+        let land = self.here();
+        self.handlers.push(Handler {
+            start,
+            end,
+            land,
+            logic,
+            depth,
+        });
+
         self.expr(&call.args[1])?;
-        self.patch_to_here(to_end);
+        let merge = match op {
+            OpCode::And => OpCode::AndMerge,
+            _ => OpCode::OrMerge,
+        };
+        self.emit(merge, &[logic], id)?;
+        self.patch_to_here(at as usize + 2);
+
+        // The slot is dead once the merge has read it, so a sibling operator
+        // reuses it rather than growing the record.
+        self.next_logic = logic;
         Ok(())
     }
 
@@ -755,6 +807,89 @@ mod tests {
         let ops = opcodes(&code_of("xs.all(x, x > 0)"));
         assert!(ops.contains(&OpCode::IterElems), "{ops:?}");
         assert!(!ops.contains(&OpCode::IterKeys), "{ops:?}");
+    }
+
+    /// The handler covers the left operand and stops short of the right one,
+    /// which is the whole of CEL's asymmetry: an error on the left is absorbed
+    /// and an error on the right is raised.
+    #[test]
+    fn a_short_circuit_handler_covers_the_left_operand_only() {
+        let code = code_of("a && b");
+        assert_eq!(code.handlers.len(), 1, "{}", code.disassemble());
+        let handler = code.handlers[0];
+
+        let and = code
+            .instructions()
+            .find(|(_, op, _)| *op == OpCode::And)
+            .map(|(pc, _, operands)| (pc, operands.to_vec()))
+            .expect("`&&` emits an And");
+        let merge = code
+            .instructions()
+            .find(|(_, op, _)| *op == OpCode::AndMerge)
+            .map(|(pc, _, _)| pc)
+            .expect("`&&` emits an AndMerge");
+
+        assert_eq!(handler.start, 0, "the left operand starts the program");
+        assert_eq!(handler.end, and.0, "the handler ends where the left does");
+        assert_eq!(handler.land, and.0 + OpCode::And.width());
+        assert_eq!(handler.depth, 0);
+        assert_eq!(handler.logic, and.1[0], "the And writes the slot it covers");
+
+        assert!(code.handler_for(0).is_some(), "the left operand is covered");
+        assert!(
+            code.handler_for(handler.land).is_none(),
+            "the right operand is not: its errors propagate"
+        );
+        assert!(code.handler_for(merge).is_none());
+        // The short-circuit target is past the merge, so both paths arrive at
+        // the same depth.
+        assert_eq!(and.1[1], merge + OpCode::AndMerge.width());
+    }
+
+    /// Nested operators need distinct slots, because the outer one writes its
+    /// slot before the inner one has finished with its own.
+    #[test]
+    fn nested_short_circuits_do_not_share_a_logic_slot() {
+        let code = code_of("(a && b) && c");
+        assert_eq!(code.n_logic, 2, "{}", code.disassemble());
+
+        let slots: Vec<u32> = code
+            .instructions()
+            .filter(|(_, op, _)| *op == OpCode::And)
+            .map(|(_, _, operands)| operands[0])
+            .collect();
+        assert_eq!(slots.len(), 2);
+        assert_ne!(slots[0], slots[1], "{}", code.disassemble());
+
+        // The inner operator's own left operand is covered by the inner
+        // handler, which is the shorter of the two covering it.
+        let inner = code.handler_for(0).expect("instruction 0 is covered");
+        assert_eq!(inner.end - inner.start, 2, "{}", code.disassemble());
+    }
+
+    /// Two operators that cannot be live at once share a slot, for the same
+    /// reason sibling comprehensions share activation-record slots.
+    #[test]
+    fn sibling_short_circuits_share_a_logic_slot() {
+        assert_eq!(code_of("a && b").n_logic, 1);
+        assert_eq!(code_of("(a && b) || (c && d)").n_logic, 2);
+    }
+
+    /// An error raised by the inner operator's *merge* is still the outer
+    /// operator's left operand, so it has to be absorbed by the outer one.
+    /// This is the `(1 && true) && false` shape.
+    #[test]
+    fn an_inner_merge_is_inside_the_outer_handler() {
+        let code = code_of("(a && b) && c");
+        let inner_merge = code
+            .instructions()
+            .find(|(_, op, _)| *op == OpCode::AndMerge)
+            .map(|(pc, _, _)| pc)
+            .expect("the inner `&&` merges first");
+        let handler = code
+            .handler_for(inner_merge)
+            .expect("the inner merge is covered");
+        assert_eq!(handler.start, 0, "{}", code.disassemble());
     }
 
     fn parse_expr(source: &str) -> IdedExpr {

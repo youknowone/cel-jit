@@ -171,16 +171,27 @@ pub enum OpCode {
     JumpIfFalse,
     /// Pop an operand; jump to `a` when it is true.
     JumpIfTrue,
-    /// Short-circuit `&&`: when the operand on top is false, jump to `a`
-    /// leaving it; otherwise pop it and fall through to the right operand.
+    /// The left half of `&&`: pop the left operand into logic slot `a`. When
+    /// it is exactly `false`, push `false` and jump to `b`; otherwise fall
+    /// through to the right operand.
     ///
-    /// Error absorption is not expressed by this instruction. See the module
-    /// documentation: the intended mechanism is a handler table over the left
-    /// operand's instruction range, which adds to this shape rather than
-    /// replacing it.
+    /// A non-bool operand is not a short circuit -- it is recorded as an
+    /// overload failure and decided at the merge, because `true && 1` and
+    /// `1 && true` are both errors while `error && false` is `false`.
     And,
-    /// Short-circuit `||`, mirroring [`OpCode::And`].
+    /// The left half of `||`, mirroring [`OpCode::And`]: short-circuits on
+    /// `true`.
     Or,
+    /// The merge of `&&`: pop the right operand, combine it with logic slot
+    /// `a`, push the result or raise.
+    ///
+    /// This is where CEL's commutativity over errors lives. A left-hand error
+    /// is *discarded* when the right operand decides the result, so the merge
+    /// has to be able to turn a recorded error into a successful `false` --
+    /// which is why the left half records rather than raises.
+    AndMerge,
+    /// The merge of `||`, mirroring [`OpCode::AndMerge`].
+    OrMerge,
     /// Stop, returning the top of the stack.
     Return,
 }
@@ -206,10 +217,10 @@ impl OpCode {
             | OpCode::Jump
             | OpCode::JumpIfFalse
             | OpCode::JumpIfTrue
-            | OpCode::And
-            | OpCode::Or => 1,
+            | OpCode::AndMerge
+            | OpCode::OrMerge => 1,
 
-            OpCode::CallHost | OpCode::CallMethod => 2,
+            OpCode::CallHost | OpCode::CallMethod | OpCode::And | OpCode::Or => 2,
 
             OpCode::CallQualified => 3,
 
@@ -272,6 +283,7 @@ impl OpCode {
             OpCode::MapInsert | OpCode::MapInsertOptional => (2, 0),
 
             OpCode::GetField | OpCode::HasField | OpCode::OptSelect => (1, 1),
+            OpCode::AndMerge | OpCode::OrMerge => (1, 1),
             OpCode::Not | OpCode::Negate | OpCode::NotStrictlyFalse => (1, 1),
             OpCode::IterElems | OpCode::IterKeys | OpCode::IterLen => (1, 1),
 
@@ -299,9 +311,9 @@ impl OpCode {
             OpCode::CallQualified => (arity(1), 1),
 
             OpCode::Jump => (0, 0),
-            // The jumping path of `And`/`Or` leaves the operand in place; the
-            // falling-through path pops it, and the two paths meet at the
-            // same depth because the right operand pushes one.
+            // Declared for the falling-through path, where the operand moves
+            // into the logic slot. The short-circuiting path pushes the
+            // answer instead, so both paths reach the merge one deep.
             OpCode::JumpIfFalse | OpCode::JumpIfTrue | OpCode::And | OpCode::Or => (1, 0),
         }
     }
