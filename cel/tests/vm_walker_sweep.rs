@@ -241,8 +241,26 @@ const SHAPES: &[&str] = &[
     "double(3)",
     "string(1)",
     "bytes(\"ab\")",
-    "type(1)",
     "int(\"nope\")",
+    // `type()` returns an opaque whose *runtime type name* is `type` for every
+    // answer, so a comparison key built from that name cannot tell `type(1)`
+    // from `type("a")`. This gate compares `Debug`, which carries the whole
+    // `Type`, and these rows are here to keep that true.
+    "type(1)",
+    "type(\"a\")",
+    "type(1.5)",
+    "type(true)",
+    "type(null)",
+    "type(xs)",
+    "type(m)",
+    "type(by)",
+    "type(opt_some)",
+    "type(type(1))",
+    "type(1) == type(2)",
+    "type(1) == type(\"a\")",
+    "type(undeclared_name)",
+    "type(1 / 0)",
+    "type(1).zzz",
     "duration(\"1s\") + duration(\"2s\")",
     "timestamp(\"2020-01-01T00:00:00Z\") + duration(\"1s\")",
     "timestamp(\"2020-01-01T00:00:00Z\") - timestamp(\"2019-01-01T00:00:00Z\")",
