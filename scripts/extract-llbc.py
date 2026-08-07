@@ -202,6 +202,13 @@ def refuse_inert_pathspecs(pathspecs: list[str], label: str) -> None:
         )
         return bool(result.stdout.strip())
 
+    # ⛔ The DECISION is git's, and only git's. `Path.exists()` below feeds the
+    # message and nothing else — do not "simplify" this to an existence test.
+    # `Cargo.lock` is the standing counterexample: it EXISTS on disk and is
+    # invisible to `git ls-files` because it is ignored, which is the entire
+    # defect this function was written for. Filesystem-reachable and
+    # git-reachable are different predicates, and every check that conflates
+    # them answers a question nobody asked.
     inert: list[tuple[str, bool]] = []
     for spec in pathspecs:
         tracked = git_lists("ls-files", "--", spec)
