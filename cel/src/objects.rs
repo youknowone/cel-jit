@@ -1,5 +1,6 @@
 use crate::common::ast::{operators, CallExpr, ComprehensionExpr, EntryExpr, Expr, LiteralValue};
-use crate::common::types::*;
+#[cfg(feature = "structs")]
+use crate::common::types::CelStruct;
 use crate::context::Context;
 use crate::ExecutionError::NoSuchOverload;
 use crate::{ExecutionError, Expression, FunctionContext};

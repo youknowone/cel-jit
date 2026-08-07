@@ -1,5 +1,4 @@
 use crate::common::traits::{self};
-#[cfg(feature = "chrono")]
 use crate::objects::Value;
 use crate::ExecutionError;
 use std::string::String as StdString;

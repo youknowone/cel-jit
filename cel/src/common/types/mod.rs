@@ -20,10 +20,8 @@ pub(crate) mod timestamp;
 pub(crate) mod uint;
 
 use crate::objects::{OptionalValue, Value};
-#[cfg(feature = "chrono")]
 #[cfg(feature = "structs")]
 pub use r#struct::Struct as CelStruct;
-#[cfg(feature = "chrono")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Kind {
     Unspecified,

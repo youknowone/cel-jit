@@ -977,6 +977,7 @@ mod tests {
     use super::{Duration, Timestamp};
     use crate::{objects::Key, to_value, Value};
     use crate::{Context, Program};
+    #[cfg(feature = "chrono")]
     use chrono::FixedOffset;
     use serde::Serialize;
     use serde_bytes::Bytes;
