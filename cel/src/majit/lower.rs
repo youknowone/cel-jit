@@ -433,6 +433,35 @@ pub struct LoweredF {
     /// lands. [`LoweredF::batch_sum_shape`] relocates each to an
     /// absolute program address once it does.
     pub jump_fixups: Vec<usize>,
+    /// The batch shapes this program can build, built at most once each and
+    /// owned here, indexed by [`shape_slot`].
+    ///
+    /// This is what makes the words' **address** stable: the `#[jit_interp]`
+    /// green key is the program pointer plus pc, so a program rebuilt per bind
+    /// gets a new key per bind and loses the compiled loop every time. Owning
+    /// them for the life of the `LoweredF` — whose lifetime is the host's,
+    /// because the host holds the `BatchProgram` — makes the address stable by
+    /// construction rather than by a side table that must never free one entry.
+    ///
+    /// `OnceLock` rather than a lock or a `RefCell` so `LoweredF` stays `Sync`:
+    /// a shape is immutable once built, the key has four values, and racing
+    /// initializers agree because only one wins and the loser's words are
+    /// dropped before anyone can key on them.
+    shapes: [std::sync::OnceLock<BatchShape>; 4],
+}
+
+/// Index of the memo slot for one `(with_trap, reduce)` pair.
+///
+/// Total over the product rather than over the pairs seen in practice: three of
+/// the four are live today (`batch_sum_program` builds `(false, Sum)`), and a
+/// table sized to the observed set would break the moment the fourth is asked
+/// for.
+const fn shape_slot(with_trap: bool, reduce: BatchReduce) -> usize {
+    let r = match reduce {
+        BatchReduce::Sum => 0,
+        BatchReduce::PerRow => 1,
+    };
+    (with_trap as usize) * 2 + r
 }
 
 /// A batch program's words plus the register banks they run on.
@@ -466,9 +495,17 @@ pub enum BatchReduce {
     PerRow,
 }
 
+#[derive(Debug, Clone)]
 pub struct BatchShape {
-    /// The program words.
-    pub code: Vec<i64>,
+    /// The program words, owned by the [`LoweredF`] that built them.
+    ///
+    /// An `Arc` rather than a `Vec` because the **address** is load-bearing, not
+    /// just the contents: the `#[jit_interp]` green key is the program pointer
+    /// plus pc (`trace_ctx.rs` `green_key_raw`), so a caller that needs an owned
+    /// handle takes a refcount bump and keeps the identity the compiled loop was
+    /// filed under. `Arc` and not `Rc` because [`LoweredF`] is `Sync` and a
+    /// memoized shape is shared, not per-thread.
+    pub code: std::sync::Arc<[i64]>,
     /// Float-bank register count the program runs on. The int-bank count is
     /// [`BatchSeed`]'s, since the only thing that needs it is building the bank.
     pub num_float_regs: usize,
@@ -512,6 +549,7 @@ pub struct ListOutput {
 /// `guard_value`, and a guard that fails on every batch generates a bridge per
 /// batch (`rlib/jit.py`, `promote`) — per-batch recompilation under another
 /// name.
+#[derive(Debug, Clone)]
 pub struct BatchSeed {
     /// Register holding the row count.
     r_n: usize,
@@ -703,7 +741,10 @@ impl LoweredF {
         );
         let shape = self.batch_sum_shape(false);
         let regs = shape.seed.regs(bases, &[], n, 0);
-        (shape, regs)
+        // Cloned rather than borrowed so this door keeps its by-value signature.
+        // The clone shares the words by refcount, so the ADDRESS the green key
+        // is taken over is the same one the memo holds.
+        (shape.clone(), regs)
     }
 
     /// Build the batch program's words and the layout of the registers its
@@ -714,7 +755,7 @@ impl LoweredF {
     /// address it writes to is data and rides in a seeded register, so the
     /// evaluator path passes `true` here and the trap word's address to
     /// [`BatchSeed::regs`].
-    pub fn batch_sum_shape(&self, with_trap: bool) -> BatchShape {
+    pub fn batch_sum_shape(&self, with_trap: bool) -> &BatchShape {
         self.batch_shape(with_trap, BatchReduce::Sum)
     }
 
@@ -723,7 +764,20 @@ impl LoweredF {
     /// [`BatchReduce::PerRow`] has no `sum_reducible` precondition: a store
     /// takes a result of any bank, which is the whole reason the reduction is a
     /// choice.
-    pub fn batch_shape(&self, with_trap: bool, reduce: BatchReduce) -> BatchShape {
+    ///
+    /// Built at most once per `(with_trap, reduce)` and owned by `self`
+    /// thereafter, so every batch of this program runs words at the **same
+    /// address** and the compiled loop the green key names survives from batch
+    /// to batch. See [`LoweredF::shapes`].
+    pub fn batch_shape(&self, with_trap: bool, reduce: BatchReduce) -> &BatchShape {
+        self.shapes[shape_slot(with_trap, reduce)]
+            .get_or_init(|| self.build_batch_shape(with_trap, reduce))
+    }
+
+    /// [`LoweredF::batch_shape`]'s builder. Split out so the memo above holds
+    /// the only call: a second caller would mint a second address for one
+    /// program, which is the defect the memo exists to prevent.
+    fn build_batch_shape(&self, with_trap: bool, reduce: BatchReduce) -> BatchShape {
         // The accumulate below would fold a result the sum cannot consume into
         // the int total — adding string RANKS, nanoseconds, or a collected
         // list's element COUNT. Every public door asks `sum_reducible` first;
@@ -890,7 +944,7 @@ impl LoweredF {
             (BatchReduce::PerRow, _) => p.extend_from_slice(&[OP_RETURN, r_i as i64]),
         }
         BatchShape {
-            code: p,
+            code: p.into(),
             num_float_regs: total_float_regs,
             seed: BatchSeed {
                 r_n,
@@ -1198,6 +1252,7 @@ pub fn lower_typed(expr: &IdedExpr, schema: &Schema) -> Result<LoweredF, LowerEr
         list_output: ctx.list_output,
         temporal_bound,
         jump_fixups: ctx.jump_fixups,
+        shapes: std::array::from_fn(|_| std::sync::OnceLock::new()),
     })
 }
 

@@ -5,7 +5,8 @@
 //! `nested_loop_deopts_are_a_warmup_cost_not_a_per_row_cost` compares two batch
 //! SIZES of the same shape. Neither covers a driver that has already compiled
 //! for a different SHAPE — which is what a long-lived process does, since the
-//! driver and the interned program outlive a call.
+//! driver outlives a call and the program words outlive it with the `LoweredF`
+//! that owns them.
 //!
 //! ## The gap this pins (measured 2026-08-04, majit @ PR 960)
 //!

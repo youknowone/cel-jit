@@ -1614,10 +1614,12 @@ mod tests {
     /// it reaches the machine in a seeded register, and no word of the program
     /// carries it.
     ///
-    /// This is what keeps the warm driver warm. `prepare_batch` interns the code
-    /// words and the JIT keys its compiled loop on them, so a per-batch value
-    /// baked into an immediate would re-key the trace on every batch and compile
-    /// the loop again each time. And the id IS per-batch now that it is a rank:
+    /// This is what keeps the warm driver warm. `prepare_batch` binds the code
+    /// words the lowering owns and the JIT keys its compiled loop on them, so a
+    /// per-batch value baked into an immediate would re-key the trace on every
+    /// batch and compile the loop again each time — the words would differ, and
+    /// a differing program cannot be the same allocation. And the id IS
+    /// per-batch now that it is a rank:
     /// `"m"` is id 1 among `["a", "m", "z"]` and id 0 among `["m", "z"]`.
     ///
     /// The assertion that pins it: two expressions differing ONLY in the literal

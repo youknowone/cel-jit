@@ -578,7 +578,7 @@ fn comprehension_group(out: &mut Vec<Row>) {
 #[cfg(feature = "jit")]
 fn regvm_group(out: &mut Vec<Row>) {
     use cel::majit::bytecode::float_bank::{
-        clean_interp_seeded_f, intern_program, jit_stats, reset_jit_stats, reset_persistent_state,
+        clean_interp_seeded_f, jit_stats, reset_jit_stats, reset_persistent_state,
         run_jit_persistent_f,
     };
     use cel::majit::lower::{lower_typed, Schema, ValType};
@@ -657,9 +657,11 @@ fn regvm_group(out: &mut Vec<Row>) {
             let bases: Vec<i64> = cols.iter().map(Col::base).collect();
             let (shape, regs) = lowered.batch_sum_program(&bases, n as i64);
             let nf = shape.num_float_regs;
-            // Interned, because the `#[jit_interp]` green key is the program
-            // POINTER: a fresh `Vec` per call would never reuse a compiled loop.
-            let code = intern_program(shape.code);
+            // A refcount bump on words the lowering owns. The `#[jit_interp]`
+            // green key is the program POINTER, so what matters is that this is
+            // the same allocation on every call — which it is, because the
+            // `LoweredF` built it once and still holds it.
+            let code = shape.code.clone();
 
             let expected = clean_interp_seeded_f(&code, &regs, nf);
             bench(

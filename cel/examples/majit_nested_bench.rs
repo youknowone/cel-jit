@@ -15,9 +15,10 @@
 //!   the same loop carrying the meta-tracer's instrumentation but never
 //!   compiling. The gap `clean → interp` is what the tier costs when it never
 //!   pays off.
-//! * `jit`    — the same mainloop at `threshold = 8`. The driver and the
-//!   interned program outlive a run, so only the first run to reach the merge
-//!   point pays for tracing and compiling; the `cmp` column says which one did.
+//! * `jit`    — the same mainloop at `threshold = 8`. The driver outlives a run
+//!   and the program words outlive it with the owner that built them, so only
+//!   the first run to reach the merge point pays for tracing and compiling; the
+//!   `cmp` column says which one did.
 //!
 //! A single batch size still cannot separate "the compiled code is slow" from
 //! "the batch was too short to pay for compiling", so each shape is swept over a
@@ -349,12 +350,12 @@ fn main() {
 
     println!("items.all(i, i.price > 10) — {rounds} interleaved rounds per point");
     println!(
-        "the driver and the interned program outlive a run, so trace + compile are inside the \
+        "the driver and the program words outlive a run, so trace + compile are inside the \
          timed region only until one of them has paid for the loop; the `cmp` column says which"
     );
 
     // Whether the compiled tier was ever reached. Tracked across the whole run
-    // rather than per shape or per point: the interned program is the same
+    // rather than per shape or per point: the program is the same allocation
     // everywhere here — only the data and the seeded base registers change — so
     // the first point to trace pays for every later one, and `cmp 0` on a
     // shape is the normal case, not a miss.

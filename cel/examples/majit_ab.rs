@@ -39,8 +39,7 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use cel::majit::bytecode::float_bank::{
-    clean_interp_seeded_f, intern_program, run_jit_persistent_f, run_jit_seeded_f, COMPILES,
-    GUARD_FAILS,
+    clean_interp_seeded_f, run_jit_persistent_f, run_jit_seeded_f, COMPILES, GUARD_FAILS,
 };
 use cel::majit::lower::{lower_typed, Schema, ValType};
 use cel::{Context, Program, Value};
@@ -204,12 +203,17 @@ fn make_engine_columns(n: usize) -> (Vec<i64>, Vec<i64>, Vec<i64>) {
     (balance, amount, frozen)
 }
 
+/// The words come back as an `Arc` the caller owns, not as a `Vec`: the
+/// `LoweredF` built inside is dropped on return, and the JIT's green key is the
+/// program POINTER, so whoever wants one key across several calls has to hold
+/// that allocation. `warm_break_even` does; `cold_break_even` deliberately does
+/// not.
 fn engine_program(
     n: usize,
     balance: &[i64],
     amount: &[i64],
     frozen: &[i64],
-) -> (Vec<i64>, Vec<i64>, usize) {
+) -> (std::sync::Arc<[i64]>, Vec<i64>, usize) {
     let program =
         Program::compile("balance >= amount && !frozen").expect("compile engine expression");
     // `frozen` is a `bool` column — stored as `0`/`1` in the int file like the
@@ -287,12 +291,24 @@ fn warm_break_even() {
     println!("persistent driver, compile amortized (the tier the batch API runs):");
     println!("      rows    clean total      JIT total    JIT/clean  guard fails/call");
     let mut first_win = None;
+    let mut program: Option<std::sync::Arc<[i64]>> = None;
     for &n in SIZES {
-        let (code, regs, nf) = engine_program(n, &balance[..n], &amount[..n], &frozen[..n]);
+        let (words, regs, nf) = engine_program(n, &balance[..n], &amount[..n], &frozen[..n]);
         // The words are the same for every size (the row count rides a seeded
-        // register), so interning them keeps one green key across the sweep --
-        // exactly what `BatchProgram` does between batches.
-        let code = intern_program(code);
+        // register), so ONE allocation is reused across the sweep. The JIT's
+        // green key is the program POINTER, so rebuilding the words per size
+        // would mint a new key at every point; holding one owner instead is
+        // exactly what a `LoweredF` gives `BatchProgram` between batches.
+        let code = match &program {
+            Some(p) => {
+                assert_eq!(&p[..], &words[..], "n={n}: the program words changed");
+                std::sync::Arc::clone(p)
+            }
+            None => {
+                program = Some(std::sync::Arc::clone(&words));
+                words
+            }
+        };
         let expected = clean_interp_seeded_f(&code, &regs, nf);
         // Warm: enough calls that the loop is compiled and stays compiled, so
         // no call in the timed region pays for a trace.

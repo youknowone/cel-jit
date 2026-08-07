@@ -54,8 +54,8 @@ fn lower(src: &str, schema: &Schema) -> LoweredF {
 
 /// Run one shape from cold and print its row.
 ///
-/// `reset_persistent_state` drops this thread's drivers and interned programs,
-/// which is also what zeroes the two driver-sourced counters — so it and
+/// `reset_persistent_state` drops this thread's drivers, which is also what
+/// zeroes the two driver-sourced counters — so it and
 /// `reset_jit_stats` are called together, and the row covers exactly this shape.
 fn census(label: &str, src: &str, lowered: &LoweredF, columns: &[Column], n: usize) {
     reset_persistent_state();

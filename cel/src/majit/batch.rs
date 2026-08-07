@@ -655,8 +655,11 @@ fn lookup<'a>(batch: &'a Batch<'a>, name: &str) -> Result<&'a ColumnRef<'a>, Bat
 /// A [`BatchProgram`] bound to one batch of data: run it as many times as you
 /// like, on whichever [`Tier`].
 ///
-/// Not `Send`: the trace driver and the interned programs are thread-local, so
-/// a bound batch belongs to the thread that bound it.
+/// Not `Send`: the trace driver is thread-local (`float_bank::DRIVERS`), so a
+/// bound batch belongs to the thread that bound it. The program words are no
+/// longer part of that reason — the [`super::lower::LoweredF`] owns them and
+/// hands out an `Arc` — but the conclusion is unchanged, because `DRIVERS`
+/// alone establishes it.
 pub struct BoundBatch<'a, 'b> {
     program: &'b BatchProgram,
     /// Which reduction the program was prepared with. A run answers through the
@@ -805,7 +808,13 @@ fn threshold_for(tier: Tier) -> u32 {
     }
 }
 
-fn dispatch(tier: Tier, threshold: u32, code: &[i64], regs: &[i64], nf: usize) -> i64 {
+fn dispatch(
+    tier: Tier,
+    threshold: u32,
+    code: &std::sync::Arc<[i64]>,
+    regs: &[i64],
+    nf: usize,
+) -> i64 {
     match tier {
         Tier::Clean => float_bank::clean_interp_seeded_f(code, regs, nf),
         Tier::Interpreter | Tier::Jit => {

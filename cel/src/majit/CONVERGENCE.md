@@ -523,9 +523,36 @@ repeat, and both had to go:
    recompilation renamed.
 2. `run_mainloop_f` built its own `JitDriver`, so the compiled loop died with the
    call. The mainloop now takes `&mut JitDriver`, and `float_bank` keeps drivers
-   in a thread-local map plus interns the program words, so the address the key
-   is built from stays put. This is the wasmi kernel's arrangement
-   (`kernel.rs:1610`, `:3677-3689`).
+   in a thread-local map, so the driver outlives the call. This is the wasmi
+   kernel's arrangement (`kernel.rs:1610`, `:3677-3689`).
+
+   The address the key is built from stays put for a separate reason, and it
+   takes **two** things, which is the part worth stating because getting one of
+   them was measured to give wrong answers.
+
+   The green key stores the code pointer AS A NUMBER (`with_typed_decision_key`,
+   `key.values[2] = code_ptr as i64`), so two programs that ever hold one address
+   build byte-identical keys and `comparekey` finds them EQUAL. That is a true
+   collision, not a hash collision: there is no residual field to disagree on,
+   and it surfaces as an earlier expression's answer rather than a crash.
+
+   1. `LoweredF` builds each `BatchShape` once, behind a `OnceLock`, and *owns*
+      the words, so the address cannot move under a live loop.
+   2. A pooled driver holds an `Arc` on every program it has been keyed on
+      (`float_bank::PooledDriver`), so the address cannot be *recycled* under one
+      either.
+
+   (1) alone is not enough and this was demonstrated, not argued: with the words
+   owned by the lowering but not held by the driver, `majit::tests::
+   batch_string_construction` goes from green to a run-varying wrong answer,
+   because `DRIVERS` outlives every `LoweredF`. **An owner closes an
+   address-recycling hazard only if it outlives every key that names it.**
+   `a_dead_programs_address_does_not_carry_its_compiled_loop` pins it.
+
+   An earlier arrangement interned the words in a capped thread-local table.
+   That table's retention — never freeing one entry, and taking `DRIVERS` with
+   it when the cap flushed — was doing (2)'s job by accident; it read like a
+   cache and was load-bearing as an ownership edge.
 
 Same binary, same box, five shapes over the same ladder:
 

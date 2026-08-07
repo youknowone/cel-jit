@@ -371,15 +371,17 @@ impl<'s> StrDict<'s> {
     }
 }
 
-/// One batch of rows, prepared: the interned program words, the seeded initial
-/// register bank (column bases, row count, trap address) and the trap word
-/// itself. Everything that depends on the expression and the data but not on
-/// the tier, built once so a caller running the same batch more than once — a
-/// benchmark sweeping tiers, a cross-tier check — pays for it once.
+/// One batch of rows, prepared: a handle on the program words, the seeded
+/// initial register bank (column bases, row count, trap address) and the trap
+/// word itself. Everything that depends on the expression and the data but not
+/// on the tier, built once so a caller running the same batch more than once —
+/// a benchmark sweeping tiers, a cross-tier check — pays for it once.
 ///
 /// Holds raw base pointers into `columns`, so the borrow is carried in `'a`.
 pub struct BatchRun<'a> {
-    code: std::rc::Rc<[i64]>,
+    /// Shared with the [`super::lower::LoweredF`] that owns it, so the address
+    /// the green key is taken over is the program's own and outlives this run.
+    code: std::sync::Arc<[i64]>,
     init_regs: Vec<i64>,
     num_float_regs: usize,
     /// The word the program publishes the overflow flag to. Boxed so its
@@ -414,7 +416,13 @@ impl<'a> BatchRun<'a> {
     /// Run the prepared batch with `run`, which selects the tier. `None` means a
     /// row trapped (`int` overflow, division by zero), where the tree-walker
     /// raises and no sum is the right answer.
-    pub fn run(&mut self, run: impl FnOnce(&Code, &[i64], usize) -> i64) -> Option<i64> {
+    /// The program reaches `run` as the `Arc` this batch holds, not as a slice:
+    /// a tier that files a compiled loop under its address has to be able to
+    /// hold the words, and only the owning handle lets it.
+    pub fn run(
+        &mut self,
+        run: impl FnOnce(&std::sync::Arc<Code>, &[i64], usize) -> i64,
+    ) -> Option<i64> {
         // A zero-row batch reduces to the accumulator's initial value without
         // entering the loop, and its column bases point at nothing.
         if self.rows == 0 {
@@ -638,10 +646,10 @@ pub fn prepare_batch_reduce<'a>(
         shape
             .seed
             .regs_list(&bases, &scalars, n as i64, trap_addr, out_addr, &list_addrs);
-    // The words are the same for every batch of this expression, so interning
-    // them keeps the JIT's green key — and with it the compiled loop the driver
-    // holds — from changing between batches.
-    let code = float_bank::intern_program(shape.code);
+    // A refcount bump on the words `lowered` owns, not a copy: every batch of
+    // this expression runs the same allocation, so the JIT's green key — and
+    // with it the compiled loop the driver holds — stays put between batches.
+    let code = shape.code.clone();
     BatchRun {
         code,
         init_regs,
@@ -662,7 +670,7 @@ fn batch_sum_with(
     columns: &[Column],
     n: usize,
     what: &str,
-    run: impl FnOnce(&Code, &[i64], usize) -> i64,
+    run: impl FnOnce(&std::sync::Arc<Code>, &[i64], usize) -> i64,
 ) -> Option<i64> {
     prepare_batch(lowered, columns, n, what).run(run)
 }
@@ -710,7 +718,9 @@ pub fn clean_batch_sum_f(
         columns,
         n,
         "clean_batch_sum_f",
-        float_bank::clean_interp_seeded_f,
+        // The oracle tier keys nothing on the address, so it takes the words as
+        // a plain slice and the `Arc` is dropped at the boundary.
+        |code, regs, nf| float_bank::clean_interp_seeded_f(code, regs, nf),
     )
 }
 
@@ -1903,29 +1913,50 @@ pub mod float_bank {
         result
     }
 
-    /// How many distinct batch programs one thread interns before the caches are
-    /// recycled.
+    /// How many distinct programs one pooled driver keeps alive before it is
+    /// flushed whole.
     ///
-    /// The caches grow with the number of distinct EXPRESSIONS a thread has
-    /// evaluated, not with the number of calls, so a host with a fixed set of
-    /// policies never reaches this. What it bounds is a host that compiles CEL
-    /// from untrusted or generated text: each new expression would otherwise add
-    /// a program that is never freed plus a compiled loop that is never retired.
-    pub const MAX_INTERNED_PROGRAMS: usize = 256;
+    /// ⚠ This bound is **not** the upstream mechanism, and it should not be read
+    /// as the port. Upstream needs no such cap because it bounds the population
+    /// two other ways, and majit has neither working:
+    ///
+    /// * JitCells die, because the memory manager retires loops. majit builds it
+    ///   with `max_age` 0 (`warmstate.rs:476 MemoryManager::new(0)`, against
+    ///   `rpython/rlib/jit.py:594`'s default of 1000), which parks the ageing
+    ///   gate where it can never fire. Everything in `memmgr.rs` is faithful;
+    ///   the gate is correctly implementing "disabled".
+    /// * A cell holds its token **weakly** (`warmstate.py:157-199`
+    ///   `wref_procedure_token`), so a retired loop drops out from under it.
+    ///   `BaseJitCell.token` is an `Arc`, not a `Weak`.
+    ///
+    /// So this is a bound cel has to supply itself, standing in for two absent
+    /// invariants, and it stops being necessary the moment either is restored.
+    pub const MAX_PROGRAMS_PER_DRIVER: usize = 256;
+
+    /// One pooled driver together with the programs its compiled loops are
+    /// keyed on.
+    ///
+    /// The pairing is the point. The green key is the program **pointer** plus
+    /// pc, so a compiled loop that outlives the program its key names is a
+    /// loaded gun: the next allocation at that address inherits the loop and
+    /// answers an earlier expression's question. Holding the words here means
+    /// the address cannot be recycled while a key can still name it, and a flush
+    /// drops the loops and the words it keyed them on in one statement.
+    ///
+    /// This is the half that IS orthodox. Upstream's green key names a code
+    /// object the language runtime keeps alive independently of the JIT; this is
+    /// that arrangement at the granularity cel can reach, since majit's cell
+    /// table lives inside `WarmEnterState` and is not reachable from here. It
+    /// errs conservative: a driver holds every program of its register shape,
+    /// where upstream would hold one per cell.
+    struct PooledDriver {
+        driver: majit_metainterp::JitDriver<VmStateF>,
+        /// Keyed by address, which is exactly the identity that must not be
+        /// reused. Two binds of one program collapse to one entry.
+        programs: std::collections::HashMap<usize, std::sync::Arc<Code>>,
+    }
 
     std::thread_local! {
-        /// Batch programs interned by their own words.
-        ///
-        /// The `#[jit_interp]` green key is the program **pointer** plus pc
-        /// (`trace_ctx.rs` `green_key_raw`), so a compiled loop is only reused
-        /// when the next batch runs the same allocation. A batch program's words
-        /// depend only on the expression's shape, so every batch of one
-        /// expression builds identical words and shares this entry. An entry is
-        /// never removed on its own, which is what keeps the address stable —
-        /// only [`MAX_INTERNED_PROGRAMS`] recycles it, together with the drivers.
-        static PROGRAMS: core::cell::RefCell<std::collections::HashSet<std::rc::Rc<[i64]>>> =
-            core::cell::RefCell::new(std::collections::HashSet::new());
-
         /// Drivers kept across calls, keyed by the state shape they were built
         /// for and the threshold they compile at.
         ///
@@ -1936,81 +1967,42 @@ pub mod float_bank {
         /// invocation. The threshold is part of the key so the interpreter tier
         /// (`u32::MAX`) can never pick up the JIT tier's compiled loop.
         static DRIVERS: core::cell::RefCell<
-            std::collections::HashMap<(usize, usize, u32), majit_metainterp::JitDriver<VmStateF>>,
+            std::collections::HashMap<(usize, usize, u32), PooledDriver>,
         > = core::cell::RefCell::new(std::collections::HashMap::new());
     }
 
-    /// Intern a batch program's words, returning a handle whose address stays
-    /// put so the green key built from it does too.
+    /// Drop this thread's persistent drivers, so the next batch traces and
+    /// compiles from cold.
     ///
-    /// Interning a program that would push the thread past
-    /// [`MAX_INTERNED_PROGRAMS`] recycles the caches first, so retained memory
-    /// is bounded by the cap rather than by the number of distinct expressions
-    /// the thread has seen. That is a wholesale flush, not upstream's per-loop
-    /// retirement (`memmgr.py:23-69 MemoryManager` ages individual loops out of
-    /// `alive_loops`), and two things keep it that way.
+    /// One statement is enough because a driver owns both halves of the pairing:
+    /// majit's side is reached by value (`JitDriver` holds `MetaInterp`,
+    /// `jitdriver.rs:1184`, which holds `WarmEnterState` with its cell table and
+    /// `compiled_loops`, `pyjitpl.rs:1091`), and the programs its keys name are
+    /// held in the same [`PooledDriver`]. There is no side table to forget.
     ///
-    /// Retirement is scoped to compiled **loop tokens**: `alive_loops` holds
-    /// `Arc<JitCellToken>`, and that is what `next_generation` hands back
-    /// (`memmgr.rs:55-61`, `:208`). These program words and the `DRIVERS` map
-    /// are not in it, so no `loop_longevity` setting would bound this cache. It
-    /// does not reclaim cel's compiled loops today either, though the port is
-    /// driven: `pyjitpl.rs:10229 try_to_free_some_loops` calls
-    /// `next_generation` and runs at `:4171`, `:12582` and `:13039`, and
-    /// `keep_loop_alive` runs at six sites. What stops it is the default —
-    /// majit builds the manager with `max_age` 0 (`warmstate.rs:475-476`,
-    /// against upstream's 1000 at `rpython/rlib/jit.py:594`), which parks
-    /// `next_check` at -1 where the monotonically rising `current_generation`
-    /// never meets it (`memmgr.rs:124-125`, `:210`), and cel sets only
-    /// `retrace_limit`.
-    ///
-    /// The cap also underwrites the address-stability invariant documented on
-    /// `PROGRAMS`: the green key is the program **pointer** plus pc, so an
-    /// entry freed on its own would let a freshly interned program land on the
-    /// freed address and pick up another program's compiled loop. That is why
-    /// the flush is wholesale, and why it takes `DRIVERS` with it
-    /// ([`reset_persistent_state`]).
-    pub fn intern_program(code: Vec<i64>) -> std::rc::Rc<[i64]> {
-        let recycle = PROGRAMS.with(|p| {
-            let p = p.borrow();
-            p.len() >= MAX_INTERNED_PROGRAMS && !p.contains(&code[..])
-        });
-        if recycle {
-            reset_persistent_state();
-        }
-        PROGRAMS.with(|p| {
-            let mut p = p.borrow_mut();
-            if let Some(interned) = p.get(&code[..]) {
-                return interned.clone();
-            }
-            let interned: std::rc::Rc<[i64]> = code.into();
-            p.insert(interned.clone());
-            interned
-        })
-    }
-
-    /// How many batch programs this thread currently has interned. Bounded by
-    /// [`MAX_INTERNED_PROGRAMS`].
-    pub fn interned_program_count() -> usize {
-        PROGRAMS.with(|p| p.borrow().len())
-    }
-
-    /// Drop this thread's interned programs and persistent drivers, so the next
-    /// batch traces and compiles from cold.
-    ///
-    /// The two caches are cleared together and must always be: a driver's
-    /// compiled loops are keyed on program **addresses**, so keeping the drivers
-    /// while freeing the programs would let a freshly interned program land on a
-    /// freed address and pick up another program's compiled loop.
+    /// That is the property to preserve, not an implementation detail. The
+    /// `#[jit_interp]` green key is the program **pointer** plus pc
+    /// (`trace_ctx.rs` `green_key_raw`), and a typed green key stores that
+    /// pointer as a *number* (`pyjitpl.rs:4404` `with_typed_decision_key`), so
+    /// two programs at one address produce identical keys and `comparekey` finds
+    /// them **equal**. That is a true collision in the identity, not a hash
+    /// collision a comparison can resolve, and it answers an earlier
+    /// expression's question rather than crashing. Anything that frees program
+    /// words without dropping the loops keyed on them reopens it.
     pub fn reset_persistent_state() {
         DRIVERS.with(|d| d.borrow_mut().clear());
-        PROGRAMS.with(|p| p.borrow_mut().clear());
     }
 
     /// [`run_jit_seeded_f`] on a driver that outlives the call, so a program
     /// already compiled by an earlier call runs compiled from its first row.
+    ///
+    /// Takes the program by `Arc` rather than by slice because outliving the
+    /// call is exactly the problem: the driver files a compiled loop under this
+    /// program's address, so it must hold the words for as long as it holds the
+    /// loop. A `&Code` here would let the caller drop the words while the key
+    /// naming them stayed live. See [`PooledDriver`].
     pub fn run_jit_persistent_f(
-        program: &Code,
+        program: &std::sync::Arc<Code>,
         init_regs: &[i64],
         num_fregs: usize,
         threshold: u32,
@@ -2019,19 +2011,38 @@ pub mod float_bank {
         // Take the driver out of the map for the duration of the run instead of
         // holding the borrow across it: a re-entrant call then builds its own
         // driver rather than panicking on the `RefCell`.
-        let mut driver = DRIVERS
+        let mut pooled = DRIVERS
             .with(|d| d.borrow_mut().remove(&key))
-            .unwrap_or_else(|| new_driver_f(threshold, init_regs.len(), num_fregs));
+            .unwrap_or_else(|| PooledDriver {
+                driver: new_driver_f(threshold, init_regs.len(), num_fregs),
+                programs: std::collections::HashMap::new(),
+            });
+        // Before the run, not after: the loop this call may compile is keyed on
+        // the address, so the address has to be pinned by the time it is taken.
+        pooled
+            .programs
+            .insert(program.as_ptr() as usize, std::sync::Arc::clone(program));
         // The store majit decodes guard and resume metadata through is one slot
         // per thread, written when a driver registers its dispatch jitcode. We
         // keep a driver per shape, so aim it back at this one before it can
         // compile anything: another shape's store decodes at the same pcs and
         // returns a mistyped frame count rather than failing.
-        driver.republish_state_field_fvc();
-        let result = run_mainloop_f(&mut driver, program, init_regs, num_fregs);
-        DRIVERS.with(|d| {
-            d.borrow_mut().insert(key, driver);
-        });
+        pooled.driver.republish_state_field_fvc();
+        let result = run_mainloop_f(&mut pooled.driver, program, init_regs, num_fregs);
+        if pooled.programs.len() > MAX_PROGRAMS_PER_DRIVER {
+            // Wholesale, and that is the whole point: the loops and the words
+            // they are keyed on go together, so no key can survive the address
+            // it names. Dropping either alone is the defect
+            // ([`MAX_PROGRAMS_PER_DRIVER`] says why cel has to bound this at
+            // all). Read the two tallies with no callback out of it first.
+            let stats = pooled.driver.get_stats();
+            ABSORBED_BRIDGES.fetch_add(stats.bridges_compiled, Ordering::Relaxed);
+            ABSORBED_PANICS.fetch_add(stats.internal_compile_panics as usize, Ordering::Relaxed);
+        } else {
+            DRIVERS.with(|d| {
+                d.borrow_mut().insert(key, pooled);
+            });
+        }
         result
     }
 
@@ -2089,7 +2100,7 @@ pub mod float_bank {
             d.borrow()
                 .values()
                 .fold((0usize, 0usize), |(b, p), driver| {
-                    let s = driver.get_stats();
+                    let s = driver.driver.get_stats();
                     (
                         b + s.bridges_compiled,
                         p + s.internal_compile_panics as usize,

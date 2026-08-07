@@ -15,8 +15,7 @@
 #![cfg(feature = "jit")]
 
 use cel::majit::bytecode::float_bank::{
-    interned_program_count, jit_stats, reset_jit_stats, reset_persistent_state,
-    MAX_INTERNED_PROGRAMS,
+    jit_stats, reset_jit_stats, reset_persistent_state, MAX_PROGRAMS_PER_DRIVER,
 };
 use cel::majit::bytecode::{clean_batch_sum_f, eval_batch_sum_f, Column};
 use cel::majit::lower::{lower_typed, LoweredF, Schema, ValType};
@@ -33,9 +32,10 @@ fn serial() -> std::sync::MutexGuard<'static, ()> {
 /// `columns` — with the oracle tier's answer asserted equal first, so a
 /// measurement is never taken off a miscompile.
 fn measure(lowered: &LoweredF, columns: &[Column], n: usize) -> (usize, usize, usize, Option<i64>) {
-    // Census one data shape at a time. The driver and the interned program now
-    // outlive a call, so a second shape of the same expression would reuse the
-    // first one's compiled loop, take its exit guard until that guard is hot,
+    // Census one data shape at a time. The driver outlives a call and the
+    // program words outlive it too — the `LoweredF` owns them — so a second
+    // shape of the same expression would reuse the first one's compiled loop,
+    // take its exit guard until that guard is hot,
     // and attach a bridge — real behaviour, but not the per-shape trace census
     // these tests exist to pin. `same_expression_second_batch_reuses_the_loop`
     // covers the reuse path instead.
@@ -222,7 +222,8 @@ fn flat_row_loop_stays_in_compiled_code() {
     );
 }
 
-/// What keeping the driver and the interned program alive across calls buys:
+/// What keeping the driver alive across calls, over a program the lowering
+/// itself owns, buys:
 /// a second batch of the same expression finds its loop already compiled and
 /// does not compile it again.
 ///
@@ -342,45 +343,220 @@ fn alternating_shapes_share_one_thread_state_field_store() {
     }
 }
 
-/// Keeping programs and drivers alive is bounded, not a leak: a thread that
-/// keeps evaluating NEW expressions recycles its caches instead of growing one
-/// never-freed program and one never-retired compiled loop per expression.
+/// Program identity is an ownership property, not a cache policy. The green key
+/// stores the code pointer AS A NUMBER, so two programs that ever hold one
+/// address build byte-identical keys and `comparekey` compares them equal — a
+/// collision no lookup can resolve, because there is nothing left to compare.
+/// What rules it out is that the [`LoweredF`] builds its words once and owns
+/// them: the address cannot move while it is alive, and cannot be handed to a
+/// second program that is also alive.
 ///
-/// Each `a > K` interns its own words (the literal rides in the prelude), so
-/// this walks past the cap and back round. Every answer is still checked
-/// against the oracle, since recycling frees program allocations that compiled
-/// loops were keyed on — dropping the drivers in the same breath is what makes
-/// that safe.
+/// Both halves are asserted here. Every answer is still checked against the
+/// oracle, since a program that moved under a live compiled loop surfaces as a
+/// wrong answer rather than as a crash.
 #[test]
-fn interning_is_bounded_and_survives_recycling() {
+fn a_programs_address_is_stable_and_two_programs_never_share_one() {
+    let _serial = serial();
+    let rows = 512usize;
+    let schema: Schema = [("a".to_string(), ValType::Int)].into_iter().collect();
+    let a: Vec<i64> = (0..rows as i64).collect();
+    let count_gt = |k: i64| (0..rows as i64).filter(|v| *v > k).count() as i64;
+
+    reset_persistent_state();
+
+    // One expression, many warm batches: the address the tier binds must not
+    // move, including across the first batch, which is what builds the words.
+    let lowered = lower("a > 7", &schema);
+    let first = lowered.batch_sum_shape(true).code.as_ptr() as usize;
+    let mut compiled = false;
+    for i in 0..8 {
+        let (compiles, _, aborts, result) = measure_warm(&lowered, &[Column::Int(&a)], rows);
+        compiled |= compiles >= 1;
+        assert_eq!(result, Some(count_gt(7)), "batch {i}: wrong answer");
+        assert_eq!(aborts, 0, "batch {i}: trace refused");
+        assert_eq!(
+            lowered.batch_sum_shape(true).code.as_ptr() as usize,
+            first,
+            "batch {i}: the program words moved under a live compiled loop"
+        );
+    }
+    // Non-vacuity: an address nothing ever keyed on is stable for free. Only a
+    // batch that actually compiled took a green key over this pointer.
+    assert!(
+        compiled,
+        "nothing compiled, so no green key was ever taken over this address"
+    );
+
+    // Distinct expressions, all held alive at once: no two may be handed the
+    // same address. This is the half a cap cannot provide — it freed program
+    // words while the compiled loops keyed on them were still reachable.
+    let mut live = Vec::new();
+    let mut addrs = std::collections::HashSet::new();
+    for k in 0..32i64 {
+        let lowered = lower(&format!("a > {k}"), &schema);
+        let (_, _, aborts, result) = measure_warm(&lowered, &[Column::Int(&a)], rows);
+        assert_eq!(result, Some(count_gt(k)), "k={k}: wrong answer");
+        assert_eq!(aborts, 0, "k={k}: trace refused");
+        let shape = lowered.batch_sum_shape(true);
+        assert!(!shape.code.is_empty(), "k={k}: empty program");
+        assert!(
+            addrs.insert(shape.code.as_ptr() as usize),
+            "k={k}: this address is already held by another live program"
+        );
+        live.push(lowered);
+    }
+    assert_eq!(
+        addrs.len(),
+        live.len(),
+        "every live program must hold its own address"
+    );
+}
+
+/// The half the check above cannot see, and the one that actually bites: a
+/// program that has **died**, whose address the allocator then hands to a
+/// program with DIFFERENT words.
+///
+/// Distinctness among programs held alive together is free — the allocator
+/// guarantees it. The green key names an address, the compiled loop it names
+/// lives in `DRIVERS`, and `DRIVERS` outlives every `LoweredF`. So the question
+/// is not whether two live programs can share an address; it is whether a
+/// compiled loop can outlive the program its key names. Nothing retires it
+/// today (`memmgr`'s `max_age` is 0), so the only thing that can rule it out is
+/// an owner that outlives the key.
+///
+/// The sweep alternates the comparison as well as the literal, and both matter.
+/// Over this schema every one of these lowers to 44 words differing in exactly
+/// two positions: index 13 carries the literal and index 19 the comparison
+/// opcode (`7` for `>`, `9` for `<`). Alternating both keeps the *seeded*
+/// register shape identical — which is what `DRIVERS` is keyed on
+/// (`bytecode.rs`, `(init_regs.len(), num_fregs, threshold)`) — so every program
+/// here lands on ONE driver and can therefore reach another program's compiled
+/// loop. Varying the arity instead (adding a conjunct, hence a second scalar
+/// seed) splits the driver key and the collision cannot occur, which makes for
+/// a test that passes without ever exercising the hazard.
+///
+/// Each round builds a program, runs it warm, and drops it before the next is
+/// built — a host evaluating generated expressions one at a time. Every answer
+/// is checked against the oracle, because this fault does not crash: it
+/// silently answers an EARLIER expression's question. Without the pairing this
+/// test fails on the second program, `a < 1` returning 509 — which is `a > 2`'s
+/// answer over this column.
+#[test]
+fn a_dead_programs_address_does_not_carry_its_compiled_loop() {
+    let _serial = serial();
+    let rows = 512usize;
+    let schema: Schema = [("a".to_string(), ValType::Int)].into_iter().collect();
+    let a: Vec<i64> = (0..rows as i64).collect();
+
+    const PROGRAMS: i64 = 24;
+
+    reset_persistent_state();
+    let mut addrs = std::collections::HashSet::new();
+    let mut compiled = false;
+    for k in 0..PROGRAMS {
+        let (src, expected) = if k % 2 == 0 {
+            let want = (0..rows as i64).filter(|v| *v > k).count() as i64;
+            (format!("a > {k}"), want)
+        } else {
+            let want = (0..rows as i64).filter(|v| *v < k).count() as i64;
+            (format!("a < {k}"), want)
+        };
+        // `lowered` dies at the end of this block, before the next is built.
+        let addr = {
+            let lowered = lower(&src, &schema);
+            for round in 0..3 {
+                let (compiles, _, aborts, result) =
+                    measure_warm(&lowered, &[Column::Int(&a)], rows);
+                compiled |= compiles >= 1;
+                assert_eq!(
+                    result,
+                    Some(expected),
+                    "`{src}` round {round}: wrong answer"
+                );
+                assert_eq!(aborts, 0, "`{src}` round {round}: trace refused");
+            }
+            lowered.batch_sum_shape(true).code.as_ptr() as usize
+        };
+        addrs.insert(addr);
+    }
+    // The invariant itself: every program got its OWN address even though each
+    // was dropped before the next was built. That can only hold because the
+    // driver that could still name them is holding the words — drop that edge
+    // and the allocator hands the same address straight back, which is how this
+    // test fails without the pairing (it fails twice over: a reused address
+    // here, and a wrong answer above, on the second program).
+    assert_eq!(
+        addrs.len() as i64,
+        PROGRAMS,
+        "an address was handed to a second program while a driver could still \
+         name the first"
+    );
+    // Non-vacuity, in the role `interned_program_count() < before` played:
+    // addresses nothing ever keyed on stay distinct for free. Only a batch that
+    // actually compiled put a green key on one.
+    assert!(
+        compiled,
+        "nothing compiled, so no green key was ever taken over these addresses"
+    );
+}
+
+/// Holding every program a driver has keyed on is unbounded on its own, so the
+/// pool flushes a driver that passes [`MAX_PROGRAMS_PER_DRIVER`]. This is that
+/// flush actually firing.
+///
+/// It has to be tested precisely because it is the kind of mechanism that goes
+/// inert without moving a counter: nothing else in this file builds enough
+/// distinct programs to reach it, so an off-by-one or a check on the wrong side
+/// of the reinsert would leave the bound looking present and never running.
+///
+/// The observable is that a program which had already compiled has to compile
+/// AGAIN once the flush drops the driver holding its loop. That also pins the
+/// half that matters: the loops and the words go together, so a survivor is
+/// impossible in either direction.
+#[test]
+fn the_per_driver_program_cap_flushes_loops_and_words_together() {
     let _serial = serial();
     let rows = 64usize;
     let schema: Schema = [("a".to_string(), ValType::Int)].into_iter().collect();
     let a: Vec<i64> = (0..rows as i64).collect();
+    let expected = Some((0..rows as i64).filter(|v| *v > 7).count() as i64);
 
     reset_persistent_state();
-    let mut recycled = false;
-    for k in 0..(MAX_INTERNED_PROGRAMS + 8) {
-        let lowered = lower(&format!("a > {k}"), &schema);
-        let before = interned_program_count();
-        let (_, _, aborts, result) = measure_warm(&lowered, &[Column::Int(&a)], rows);
-        recycled |= interned_program_count() < before;
-        let expected = (0..rows as i64).filter(|v| *v > k as i64).count() as i64;
-        assert_eq!(
-            result,
-            Some(expected),
-            "k={k}: wrong answer after recycling"
-        );
-        assert_eq!(aborts, 0, "k={k}: trace refused");
-        assert!(
-            interned_program_count() <= MAX_INTERNED_PROGRAMS,
-            "k={k}: {} interned programs exceeds the cap",
-            interned_program_count()
-        );
-    }
+    let pinned = lower("a > 7", &schema);
+    let (first, _, _, result) = measure_warm(&pinned, &[Column::Int(&a)], rows);
+    assert_eq!(result, expected, "pinned program: wrong answer");
     assert!(
-        recycled,
-        "the cap never fired, so this asserted nothing about recycling"
+        first >= 1,
+        "the pinned program must compile on its first batch"
+    );
+    let (again, _, _, result) = measure_warm(&pinned, &[Column::Int(&a)], rows);
+    assert_eq!(result, expected, "pinned program: wrong answer while warm");
+    assert_eq!(
+        again, 0,
+        "a warm driver recompiled a program it had already compiled, so the \
+         control for the flush below does not discriminate"
+    );
+
+    // Walk that same driver past its cap. One scalar seed each, exactly like
+    // the pinned program, so every one of these lands on its driver rather
+    // than minting a second.
+    for k in 1000..(1000 + MAX_PROGRAMS_PER_DRIVER as i64 + 8) {
+        let filler = lower(&format!("a > {k}"), &schema);
+        let (_, _, aborts, r) = measure_warm(&filler, &[Column::Int(&a)], rows);
+        assert_eq!(r, Some(0), "filler a > {k}: wrong answer");
+        assert_eq!(aborts, 0, "filler a > {k}: trace refused");
+    }
+
+    let (after, _, _, result) = measure_warm(&pinned, &[Column::Int(&a)], rows);
+    assert_eq!(
+        result, expected,
+        "pinned program: wrong answer after the flush"
+    );
+    assert!(
+        after >= 1,
+        "the cap never fired: the pinned loop survived {} further programs on \
+         its own driver",
+        MAX_PROGRAMS_PER_DRIVER + 8
     );
 }
 
