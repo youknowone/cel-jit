@@ -27,9 +27,9 @@ only new thing is that a consumer can now run it. Every "nothing to compare"
 path — no stamp, empty stamp, stamp missing fields — is a refusal, not a pass,
 because a harness reads the exit status and not the output.
 
-It never extracts. Re-extraction is whole-crate Charon at ~8.4 GB RSS and it
-writes into the working tree, so the refusal names the command and leaves the
-scheduling to you:
+It never extracts. Re-extraction is a whole-crate Charon build — multi-GB RSS,
+and it writes into the working tree — so the refusal names the command and
+leaves the scheduling to you:
 
 ```sh
 CARGO_FEATURES=cranelift scripts/extract-llbc.py --force cel
