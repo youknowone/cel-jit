@@ -140,14 +140,27 @@ const WARMING_SLACK: usize = 2;
 ///
 ///  * **Widening the trip-count spread**, on the theory that many distinct trip
 ///    counts means many distinct guards, none reaching `trace_eagerness`. It does
-///    not — see [`WARMING_SLACK`]. Guard failures can only exceed
-///    `trace_eagerness * n_guards` if bridging itself fails, and no data shape
-///    can make that happen.
+///    not — see [`WARMING_SLACK`].
 ///  * **`CEL_RETRACE_LIMIT`**, the one pre-existing env knob on this path. At 0
 ///    (the shipped default, `rlib/jit.py:595`) and 1 the counts are unchanged. At
-///    5 they rise to 1401 with 5 bridges, which lands *exactly* on
-///    `warmup_budget(5)` and passes — a different tier configuration, not the
-///    defect. At 100 a single case runs past 10 minutes.
+///    5 they rise to 1401 with 5 bridges, which is *exactly* `warmup_budget(5)`:
+///    it passes on equality, **margin zero**. That is a different tier
+///    configuration rather than the defect, but it is the tightest this bound has
+///    been observed, and it is why the slack is not raised to buy headroom — a
+///    fitted constant would hide it, which is what the old 16 was. At 100 a
+///    single case runs past 10 minutes.
+///
+/// **Why a product-side instrument was necessary rather than a shortcut.** A
+/// guard bridges after `trace_eagerness` failures, so the batch's whole bill is
+/// bounded by `trace_eagerness * n_guards` unless a guard fails *without ever
+/// bridging*. This trace has a small fixed number of guards — the inner loop's
+/// exit is one guard regardless of the data — so no input shape can multiply
+/// them, and the two levers above are the only ones reachable from outside.
+/// Reproducing the class therefore requires making bridging itself fail, i.e.
+/// `trace_eagerness` above the batch size; nothing public reaches that parameter
+/// (`cel/src/majit/bytecode.rs` exposes no `set_param` or driver accessor), so
+/// the control has to be built where the driver is. It was added, measured,
+/// reverted by content and checksummed against the pre-edit copy.
 ///
 /// Note that `trace_eagerness` is not the only parameter that can render a whole
 /// mechanism inert this way: `loop_longevity` is effectively 0 against an
