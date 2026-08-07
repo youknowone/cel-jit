@@ -38,6 +38,7 @@ pub mod functions;
 mod magic;
 pub mod objects;
 mod resolvers;
+pub mod vm;
 
 #[cfg(feature = "chrono")]
 mod duration;
