@@ -88,6 +88,7 @@ impl Env {
         types::map::stdlib(&mut env);
         types::optional::stdlib(&mut env);
         types::string::stdlib(&mut env);
+        types::r#type::stdlib(&mut env);
         types::uint::stdlib(&mut env);
 
         #[cfg(feature = "chrono")]

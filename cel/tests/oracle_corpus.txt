@@ -584,22 +584,94 @@ want: bool(true)
 # type() and dyn()
 # ---------------------------------------------------------------------------
 #
-# KNOWN DEVIATION FROM THE CEL SPEC. `type()` is a standard CEL function and it
-# is not implemented: nothing registers it, so it resolves as an undeclared
-# name. `dyn()` next to it IS registered (common/types/dyn.rs). These three
-# cases pin the gap rather than hide it — implementing `type()` will fail them,
-# which is the correct moment to update this file.
+# `type(x)` names the value's own CEL type, and the name is the spec's — which
+# is NOT always the spelling `Value`'s Display uses: the null family is
+# `null_type`, not `null`, and the two temporal families carry their protobuf
+# names. The `type(...)` rendering is the denoted type's name; the type value's
+# own runtime type is `type`, whatever it denotes, which is what closes the
+# recursion below.
 
 expr: type(1)
-feat: type_fn error
-want: error(UndeclaredReference: type)
+feat: type_fn literal_int
+want: type(int)
+
+expr: type(1u)
+feat: type_fn literal_uint
+want: type(uint)
+
+expr: type(1.5)
+feat: type_fn literal_double
+want: type(double)
+
+expr: type(true)
+feat: type_fn literal_bool
+want: type(bool)
 
 expr: type("a")
-feat: type_fn error
-want: error(UndeclaredReference: type)
+feat: type_fn literal_string
+want: type(string)
+
+expr: type(b"hi")
+feat: type_fn literal_bytes
+want: type(bytes)
+
+expr: type(null)
+feat: type_fn literal_null
+want: type(null_type)
 
 expr: type(xs)
-feat: type_fn error variable
+feat: type_fn variable literal_list
+want: type(list)
+
+expr: type(m)
+feat: type_fn variable literal_map
+want: type(map)
+
+expr: type(opt_some)
+feat: type_fn optional variable
+want: type(optional_type)
+
+# "those values (`int`, `string`, etc.) also have a type: the type `type`, which
+# is an expression by itself which in turn also has type `type`" — langdef.md.
+# A type value is therefore a fixed point, not a tower.
+
+expr: type(type(1))
+feat: type_fn
+want: type(type)
+
+expr: type(type(type("a")))
+feat: type_fn
+want: type(type)
+
+# Type values compare by the type they denote, so two ints agree and an int and
+# a uint do not. The spec's own example is the third row.
+
+expr: type(1) == type(2)
+feat: type_fn equality
+want: bool(true)
+
+expr: type(1) == type(1u)
+feat: type_fn equality
+want: bool(false)
+
+expr: type(type(1)) == type("a")
+feat: type_fn equality
+want: bool(false)
+
+expr: type(xs) == type([9, 9])
+feat: type_fn equality variable
+want: bool(true)
+
+# A type is not the string that spells it.
+
+expr: type(1) == "int"
+feat: type_fn equality
+want: bool(false)
+
+# Arity is what the declaration says: `type(A) -> type`, one argument.
+
+expr: type(1, 2)
+feat: type_fn error
 want: error(UndeclaredReference: type)
 
 expr: dyn(1)

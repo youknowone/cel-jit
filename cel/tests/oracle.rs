@@ -75,6 +75,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use cel::common::types::TypeValue;
 use cel::objects::{Key, OptionalValue};
 use cel::parser::{Expression, Parser};
 use cel::{Context, ExecutionError, Program, Value};
@@ -152,7 +153,14 @@ fn render(value: &Value) -> String {
                 Some(v) => format!("optional({})", render(v)),
                 None => "optional.none".to_string(),
             },
-            None => format!("opaque({})", o.runtime_type_name()),
+            // The DENOTED type's name. A type value's own `runtime_type_name`
+            // is `type` for every one of them, so the generic arm below would
+            // render `type(1)` and `type('a')` identically and the corpus could
+            // not tell the two answers apart.
+            None => match o.downcast_ref::<TypeValue>() {
+                Some(t) => format!("type({})", t.name()),
+                None => format!("opaque({})", o.runtime_type_name()),
+            },
         },
         #[cfg(feature = "chrono")]
         Value::Duration(d) => match d.num_nanoseconds() {

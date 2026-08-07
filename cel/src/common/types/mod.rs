@@ -17,11 +17,13 @@ pub(crate) mod string;
 pub(crate) mod r#struct;
 #[cfg(feature = "chrono")]
 pub(crate) mod timestamp;
+pub(crate) mod r#type;
 pub(crate) mod uint;
 
 use crate::objects::{OptionalValue, Value};
 #[cfg(feature = "structs")]
 pub use r#struct::Struct as CelStruct;
+pub use r#type::TypeValue;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Kind {
     Unspecified,
@@ -113,6 +115,11 @@ impl Type {
             Value::Opaque(o) => {
                 return if o.downcast_ref::<OptionalValue>().is_some() {
                     self == &OPTIONAL_TYPE
+                } else if o.downcast_ref::<TypeValue>().is_some() {
+                    // A type value's own type is `type`, not the type it
+                    // denotes, so an overload declared on `TYPE_TYPE` accepts
+                    // `type(1)` and `type('a')` alike.
+                    self == &TYPE_TYPE
                 } else {
                     // The shape `Type::new_opaque_type` builds for a host value.
                     self.kind == Kind::Opaque
@@ -394,6 +401,8 @@ pub(crate) fn type_name(value: &Value) -> String {
         Value::Timestamp(_) => TIMESTAMP_TYPE.name().to_owned(),
         #[cfg(feature = "structs")]
         Value::Struct(s) => s.name().to_owned(),
+        // A type value already reports `type` as its runtime type name, so the
+        // generic arm answers it; it needs no case of its own here.
         Value::Opaque(o) => match o.downcast_ref::<OptionalValue>() {
             Some(_) => OPTIONAL_TYPE.name().to_owned(),
             None => o.runtime_type_name().to_owned(),
@@ -424,6 +433,10 @@ pub(crate) fn type_of(value: &Value) -> Type {
         Value::Struct(s) => s.cel_type().to_owned(),
         Value::Opaque(o) => match o.downcast_ref::<OptionalValue>() {
             Some(_) => OPTIONAL_TYPE.to_owned(),
+            // `type(type(1))` is `type`. Reached through the generic arm too,
+            // since a type value names itself `type` — but as `Kind::Opaque`,
+            // which would not satisfy an overload declared on `TYPE_TYPE`.
+            None if o.downcast_ref::<TypeValue>().is_some() => TYPE_TYPE.to_owned(),
             None => Type::new_opaque_type(o.runtime_type_name().to_owned()),
         },
     }
