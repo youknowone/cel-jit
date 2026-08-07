@@ -283,6 +283,13 @@ def refuse_inert_pathspecs(pathspecs: list[str], label: str) -> None:
     # defect this function was written for. Filesystem-reachable and
     # git-reachable are different predicates, and every check that conflates
     # them answers a question nobody asked.
+    #
+    # ⛔ NOT AN INCONSISTENCY WITH ITS SIBLING, so do not unify the two.
+    # `refuse_absent_external_inputs` uses `exists()` as its DECISION, and that
+    # is correct there for the same reason it is wrong here: an external input
+    # is hashed by reading its bytes, so whether it is on disk IS the question,
+    # while a pathspec only ever becomes an input by way of `git ls-files`. The
+    # rule is one question, one oracle — not a house preference for either call.
     inert: list[tuple[str, bool]] = []
     for spec in pathspecs:
         tracked = git_lists("ls-files", "--", spec)
