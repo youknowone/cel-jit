@@ -217,9 +217,9 @@ impl From<Identifier> for String {
 /// use cel::extractors::Arguments;
 /// pub fn sum(Arguments(args): Arguments) -> Value {
 ///     args.iter().fold(0.0, |acc, val| match val {
-///         Value::Int(x) => *x as f64 + acc,
-///         Value::UInt(x) => *x as f64 + acc,
-///         Value::Float(x) => *x + acc,
+///         Value::Int(x) => x as f64 + acc,
+///         Value::UInt(x) => x as f64 + acc,
+///         Value::Float(x) => x + acc,
 ///         _ => acc,
 ///     }).into()
 /// }
