@@ -56,21 +56,21 @@ impl std::fmt::Display for LowerError {
 /// Extract a plain integer literal, if that is what `e` is.
 fn as_int_literal(e: &IdedExpr) -> Option<i64> {
     match &e.expr {
-        Expr::Literal(LiteralValue::Int(i)) => Some(i.into_inner()),
+        Expr::Literal(LiteralValue::Int(i)) => Some(*i),
         _ => None,
     }
 }
 
 fn as_bool_literal(e: &IdedExpr) -> Option<bool> {
     match &e.expr {
-        Expr::Literal(LiteralValue::Boolean(b)) => Some(b.into_inner()),
+        Expr::Literal(LiteralValue::Boolean(b)) => Some(*b),
         _ => None,
     }
 }
 
 fn as_string_literal(e: &IdedExpr) -> Option<&str> {
     match &e.expr {
-        Expr::Literal(LiteralValue::String(s)) => Some(s.inner()),
+        Expr::Literal(LiteralValue::String(s)) => Some(s.as_str()),
         _ => None,
     }
 }
@@ -1278,31 +1278,28 @@ fn compile_literal_t(ctx: &mut LowerCtxF, lit: &LiteralValue) -> Result<TReg, Lo
         LiteralValue::Int(i) => {
             let r = ctx.fresh(ValType::Int);
             ctx.prelude
-                .extend_from_slice(&[OP_LOAD_CONST, i.into_inner(), r.idx as i64]);
+                .extend_from_slice(&[OP_LOAD_CONST, *i, r.idx as i64]);
             Ok(r)
         }
         LiteralValue::Boolean(b) => {
             let r = ctx.fresh(ValType::Bool);
             ctx.prelude
-                .extend_from_slice(&[OP_LOAD_CONST, b.into_inner() as i64, r.idx as i64]);
+                .extend_from_slice(&[OP_LOAD_CONST, *b as i64, r.idx as i64]);
             Ok(r)
         }
         LiteralValue::Double(f) => {
             let r = ctx.fresh(ValType::Float);
             // The f64 travels as its raw i64 bits; the VM reloads with
             // `f64::from_bits`, so the constant is bit-exact.
-            ctx.prelude.extend_from_slice(&[
-                OP_LOAD_CONST_F,
-                f.into_inner().to_bits() as i64,
-                r.idx as i64,
-            ]);
+            ctx.prelude
+                .extend_from_slice(&[OP_LOAD_CONST_F, f.to_bits() as i64, r.idx as i64]);
             Ok(r)
         }
         LiteralValue::UInt(u) => {
             let r = ctx.fresh(ValType::UInt);
             // The u64 travels as its raw i64 bit pattern in the int register file.
             ctx.prelude
-                .extend_from_slice(&[OP_LOAD_CONST, u.into_inner() as i64, r.idx as i64]);
+                .extend_from_slice(&[OP_LOAD_CONST, *u as i64, r.idx as i64]);
             Ok(r)
         }
         LiteralValue::String(s) => {
@@ -1315,7 +1312,7 @@ fn compile_literal_t(ctx: &mut LowerCtxF, lit: &LiteralValue) -> Result<TReg, Lo
             // against the column strings.
             let r = ctx.fresh(ValType::Str);
             ctx.scalar_seeds.push(ScalarSeed {
-                kind: SeedKind::StrId(s.inner().to_string()),
+                kind: SeedKind::StrId(s.as_str().to_owned()),
                 reg: r.idx,
             });
             Ok(r)
@@ -2125,9 +2122,9 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
         if let Expr::Literal(lit) = &call.args[0].expr {
             let folded = match lit {
                 LiteralValue::String(_) => return compile_t(ctx, &call.args[0]),
-                LiteralValue::Int(i) => i.into_inner().to_string(),
-                LiteralValue::UInt(u) => u.into_inner().to_string(),
-                LiteralValue::Double(f) => f.into_inner().to_string(),
+                LiteralValue::Int(i) => i.to_string(),
+                LiteralValue::UInt(u) => u.to_string(),
+                LiteralValue::Double(f) => f.to_string(),
                 LiteralValue::Boolean(_) | LiteralValue::Bytes(_) | LiteralValue::Null => {
                     return Err(LowerError::unsupported("string() of this literal"))
                 }
