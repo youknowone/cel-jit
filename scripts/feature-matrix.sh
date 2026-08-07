@@ -53,6 +53,61 @@ if [ -z "$FEATURES" ]; then
   exit 2
 fi
 
+# Manifest and target directory must agree, checked BEFORE any matrix row.
+#
+# A file under `cel/examples/` with no `[[example]]` block is still discovered
+# and built by `--all-targets` — just with no `required-features`, so it is
+# compiled in every configuration below. Three of them once broke nine rows with
+# `error[E0433]: cannot find majit in cel`, a symptom that cost a full census
+# and `git merge-base` archaeology to trace back to a manifest omission. Running
+# this first turns that into one line naming the file.
+#
+# Examples specifically, not tests: a test that needs a feature says so in the
+# file (`#![cfg(feature = "jit")]`), but an example is a binary with a `main`
+# and `required-features` is the only place to spell it.
+#
+# Set equality by NAME, in both directions. A count cannot do this: one block
+# naming a file that no longer exists plus one undeclared file net to equal, and
+# the check passes over two defects at once.
+declared_f=$(mktemp)
+on_disk_f=$(mktemp)
+
+awk '/^\[\[example\]\]/ { inblock = 1; next }
+     inblock && /^name[[:space:]]*=/ {
+       match($0, /"[^"]*"/)
+       print substr($0, RSTART + 1, RLENGTH - 2)
+       inblock = 0
+     }' "$MANIFEST" >"$declared_f"
+
+for p in cel/examples/*.rs; do
+  [ -e "$p" ] || continue
+  b=${p##*/}
+  echo "${b%.rs}"
+done >"$on_disk_f"
+
+if [ ! -s "$on_disk_f" ]; then
+  echo "FAIL: no files matched cel/examples/*.rs — the glob broke, not the manifest" >&2
+  rm -f "$declared_f" "$on_disk_f"
+  exit 2
+fi
+
+# `declared` on the left, `on_disk` on the right, each direction named for the
+# defect it is rather than for the set operation.
+undeclared=$(awk 'NR == FNR { d[$0]; next } !($0 in d) { printf "%s ", $0 }' "$declared_f" "$on_disk_f")
+phantom=$(awk 'NR == FNR { k[$0]; next } !($0 in k) { printf "%s ", $0 }' "$on_disk_f" "$declared_f")
+n_disk=$(awk 'END { print NR }' "$on_disk_f")
+rm -f "$declared_f" "$on_disk_f"
+
+if [ -n "$undeclared" ] || [ -n "$phantom" ]; then
+  echo "FAIL: $MANIFEST and cel/examples/ disagree." >&2
+  [ -n "$undeclared" ] && echo "  no [[example]] block, so built in EVERY feature configuration: $undeclared" >&2
+  [ -n "$phantom" ] && echo "  [[example]] block naming a file that does not exist: $phantom" >&2
+  echo "  Add a block (with required-features if it needs one), or drop the stale block." >&2
+  exit 1
+fi
+
+echo "manifest/targets: $n_disk examples on disk, all declared; no block names a missing file"
+
 fail=0
 
 # check <label> <expectation> <cargo args...>
