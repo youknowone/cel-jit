@@ -39,12 +39,33 @@ jobs:
           cargo test --verbose --features json
           cargo test --verbose --features regex
           cargo test --verbose --features chrono
+  jit:
+    name: JIT tier (${{ matrix.backend }})
+    runs-on: ubuntu-latest
+    strategy:
+      # Both legs always report. A backend-specific miscompile is a thing cel
+      # has actually had twice (#57 const_bits_or_panic, #58 five wrong
+      # answers), and fail-fast would let the first failure hide the second
+      # backend's result — which is the state those two were found in.
+      fail-fast: false
+      matrix:
+        backend: [cranelift, dynasm]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      # `jit-<backend>`, never bare `jit`. The `jit` feature names no backend on
+      # purpose, and `majit-metainterp` turns that into a `compile_error!` so
+      # the tier can never fail open into a silently-not-JITting build;
+      # `scripts/feature-matrix.sh` pins that refusal. This step used to run
+      # bare `--features jit`, which stopped compiling when the backend
+      # selectors were split out and was never swept.
+      #
       # The majit tier only reaches its compiled trace in a release build (the
       # tracing interpreter is ~200 ns/row in debug), and its cross-tier
       # assertions compare a compiled answer against the tree-walker's, so a
       # debug run would assert on the interpreter tier alone.
       - name: Run JIT tier tests
-        run: cargo test --release --verbose --features jit
+        run: cargo test --release --verbose --features jit-${{ matrix.backend }}
   fuzz:
     name: Fuzz
     runs-on: ubuntu-latest
