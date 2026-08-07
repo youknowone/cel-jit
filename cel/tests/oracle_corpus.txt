@@ -597,20 +597,19 @@ want: timestamp(2023-01-01T01:00:00+00:00)
 # Opaque
 # ---------------------------------------------------------------------------
 
-# KNOWN BUG, pinned deliberately. `impl Val for Optional`
-# (common/types/optional.rs) does not override `equals`, and the default
-# `Val::equals` (common/value.rs) returns `false` unconditionally — so an
-# optional never equals anything, including itself. The first two cases are
-# WRONG ANSWERS by the CEL spec; they are frozen here so the bug cannot move
-# silently, and fixing it must update this file.
+# `impl Val for Optional` (common/types/optional.rs) overrides `equals` to
+# compare presence and then the wrapped values. Before that override these two
+# cases answered `bool(false)` — the default `Val::equals` (common/value.rs)
+# returns `false` unconditionally, so an optional never equalled anything,
+# including itself.
 
 expr: opt_some == opt_some
 feat: opaque optional equality variable
-want: bool(false)
+want: bool(true)
 
 expr: optional.of(3) == optional.of(3)
 feat: opaque optional equality
-want: bool(false)
+want: bool(true)
 
 expr: opt_some == opt_none
 feat: opaque optional equality variable

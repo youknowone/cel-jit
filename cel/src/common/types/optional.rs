@@ -34,6 +34,17 @@ impl Val for Optional {
             Some(val) => val.clone_as_boxed(),
         }
     }
+
+    fn equals(&self, other: &dyn Val) -> bool {
+        match other.downcast_ref::<Optional>() {
+            None => false,
+            Some(other) => match (self.option(), other.option()) {
+                (None, None) => true,
+                (Some(a), Some(b)) => a.equals(b),
+                _ => false,
+            },
+        }
+    }
 }
 
 impl Optional {
