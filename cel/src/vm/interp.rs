@@ -60,7 +60,12 @@ pub fn cel_eval_loop(code: &CelCode, ctx: &Context) -> Result<Value, ExecutionEr
 enum Operand {
     Value(Value),
     List(Vec<Value>),
-    Map(HashMap<Key, Value>),
+    /// Boxed because an inline [`HashMap`] is 48 bytes and would set the width
+    /// of every entry on the stack, including the [`Operand::Value`] that
+    /// almost all of them are. The box costs one allocation per map literal --
+    /// paid only where a map literal appears -- and takes the entry from 56
+    /// bytes to 32.
+    Map(Box<HashMap<Key, Value>>),
     /// The `names` index of the message type, and the fields set so far. The
     /// type is checked when the struct is opened, so that a bad type name
     /// fails before the field expressions run, as it does in the walker.
@@ -72,6 +77,17 @@ enum Operand {
     #[cfg_attr(not(feature = "structs"), allow(dead_code))]
     Struct(NameId, BTreeMap<String, Value>),
 }
+
+/// The stack entry must stay narrow, because `Vm::new` sizes the operand stack
+/// at `max_stack` entries and almost every one of them holds a bare [`Value`].
+///
+/// Measured: boxing `Map` alone takes this from 56 to 32. Boxing `Struct` as
+/// well changes nothing -- its payload is 32 bytes and the discriminant fits in
+/// the padding after `NameId` -- so a later variant wider than [`Value`] costs
+/// 8 bytes on every entry and fails here rather than in a benchmark.
+const _: () = {
+    assert!(core::mem::size_of::<Operand>() == 32);
+};
 
 struct Vm<'a> {
     code: &'a CelCode,
@@ -210,7 +226,7 @@ impl<'a> Vm<'a> {
         match operand {
             Operand::Value(value) => Ok(value),
             Operand::List(items) => Ok(Value::list(items)),
-            Operand::Map(entries) => Ok(Value::Map(Map::object(Arc::new(entries)))),
+            Operand::Map(entries) => Ok(Value::Map(Map::object(Arc::new(*entries)))),
             Operand::Struct(name, fields) => self.close_struct(name, fields),
         }
     }
@@ -269,7 +285,7 @@ impl<'a> Vm<'a> {
 
     fn map_mut(&mut self) -> CelResult<&mut HashMap<Key, Value>> {
         match self.stack.last_mut() {
-            Some(Operand::Map(entries)) => Ok(entries),
+            Some(Operand::Map(entries)) => Ok(&mut **entries),
             _ => Err(CelErr::InternalError),
         }
     }
@@ -396,7 +412,7 @@ impl<'a> Vm<'a> {
                     OptView::Plain => self.list_mut()?.push(value),
                 }
             }
-            OpCode::NewMap => self.stack.push(Operand::Map(HashMap::new())),
+            OpCode::NewMap => self.stack.push(Operand::Map(Box::new(HashMap::new()))),
             OpCode::MapInsert | OpCode::MapInsertOptional => {
                 let value = self.pop()?;
                 let key = self.pop()?;
