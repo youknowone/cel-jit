@@ -104,7 +104,10 @@ enum Col {
     Str(Vec<String>),
     /// A list of `int`. One row, so `lens` is a single element count and `elems`
     /// is that row's elements.
-    IntList { lens: Vec<i64>, elems: Vec<i64> },
+    IntList {
+        lens: Vec<i64>,
+        elems: Vec<i64>,
+    },
 }
 
 impl Col {
@@ -413,8 +416,8 @@ struct Row {
 }
 
 fn run_case(case: &Case) -> Row {
-    let program =
-        Program::compile(&case.src).unwrap_or_else(|e| panic!("{}: parse error: {e:?}", case.label));
+    let program = Program::compile(&case.src)
+        .unwrap_or_else(|e| panic!("{}: parse error: {e:?}", case.label));
     let schema: Schema = case.schema.iter().cloned().collect();
 
     let mut batch = Batch::new(1);
@@ -513,10 +516,8 @@ fn run_case(case: &Case) -> Row {
     for _ in 0..SETTLED {
         black_box(bound.collect_on(Tier::Jit).expect("settled run"));
     }
-    let aborts =
-        (TRACE_ABORTS.load(Ordering::Relaxed) - a0) as f64 / SETTLED as f64;
-    let guard_fails =
-        (GUARD_FAILS.load(Ordering::Relaxed) - g0) as f64 / SETTLED as f64;
+    let aborts = (TRACE_ABORTS.load(Ordering::Relaxed) - a0) as f64 / SETTLED as f64;
+    let guard_fails = (GUARD_FAILS.load(Ordering::Relaxed) - g0) as f64 / SETTLED as f64;
 
     let collect = |tier| {
         bound
