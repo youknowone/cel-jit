@@ -27,9 +27,9 @@ only new thing is that a consumer can now run it. Every "nothing to compare"
 path — no stamp, empty stamp, stamp missing fields — is a refusal, not a pass,
 because a harness reads the exit status and not the output.
 
-It never extracts. Re-extraction is a whole-crate Charon build — multi-GB RSS,
-and it writes into the working tree — so the refusal names the command and
-leaves the scheduling to you:
+It never extracts. Re-extraction runs a whole-crate Charon build and writes into
+the working tree, so the refusal names the command and leaves the scheduling to
+you:
 
 ```sh
 CARGO_FEATURES=cranelift scripts/extract-llbc.py --force cel
@@ -38,13 +38,27 @@ CARGO_FEATURES=cranelift scripts/extract-llbc.py --force cel
 Point the check at a copy with `LLBC_DEST=<dir>` when the live artefacts must
 not be disturbed (e.g. an extraction is running).
 
-### What re-extraction costs, and what triggers it
+**Do not pipe it and then read `$?`.** A pipeline's status is its *last* stage,
+so `scripts/extract-llbc.py --check cel | tail -40` reports `tail`'s success and
+throws the guard's refusal away. That is not hypothetical: the extraction that
+was believed to be running on 2026-08-07 had died instantly on `permission
+denied`, and the harness recorded exit 0 because the status came from `tail`.
+Run the guard bare and read `$?`, or use `set -o pipefail` / zsh's
+`$pipestatus[1]`.
+
+No cost figure is quoted here on purpose. A whole-crate Charon run against a
+cold cargo cache and one against a warm one are not the same job, and a number
+carried over from the wrong one reads as measured when it is not. Measured on
+this box 2026-08-07, warm: the cargo leg finished in 20.62s and the whole run in
+a few minutes. Treat that as this box on that day, not as the cost.
+
+### What triggers a re-extraction
 
 The stamp covers `Cargo.lock`, `Cargo.toml`, `scripts/extract-llbc.py`,
 `cel/Cargo.toml` and `cel/src/`. **The driver is in that list**, so a
 comment-only edit to `scripts/extract-llbc.py` invalidates a 100 MB artefact and
-demands a multi-GB re-extraction. Keep tooling notes in this file instead — it
-is outside the fingerprint.
+demands a full re-extraction. Keep tooling notes in this file instead — it is
+outside the fingerprint.
 
 Two inputs the stamp cannot see:
 
