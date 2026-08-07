@@ -1005,6 +1005,15 @@ const BASELINE_HEADER: &str = "\
 # and the report says so. `profile` is recorded but does not invalidate a
 # comparison: dev and release were measured identical on every row.
 #
+# ⚠ EVERY CELL IS COMPARED AGAINST ITS OWN CONFIGURATION'S BASELINE. Nothing is
+#   ever subtracted ACROSS these files. A row present in two of them is two
+#   independent measurements of two different programs, and their difference is
+#   not a quantity -- the `jit` and `vm` legs do not share an evaluator, so a
+#   cross-file delta has no denominator in common. This is written here rather
+#   than in a task record on purpose: a blessing regenerates this header from
+#   the template but never reads a task, and the people who bless are exactly
+#   the people who need it.
+#
 # ⚠ THE JIT BACKEND IS DELIBERATELY NOT IN THE KEY, and the two legs DISAGREE:
 #   the `regvm/jit/*/n=1000` rows read 66/66/68 on cranelift and 63/63/65 on
 #   dynasm. That is not an under-specified key -- it is a finding, and putting
@@ -1019,8 +1028,11 @@ const BASELINE_HEADER: &str = "\
 #     * allocations per call are invariant over window lengths 1..64, exactly
 #       linear in the call count, so no part of the figure is amortized one-off
 #       work -- a single call already costs the full 66 (or 63);
-#     * `float` never compiles a bridge at all in 449 calls and still shows the
-#       same 3-allocation gap.
+#     * `float` never compiles a bridge at all in 6065 calls and still shows the
+#       same 3-allocation gap. Its trace IS attempted at the threshold and
+#       ABORTS (`loops_aborted` 0->1 between calls 196 and 206, #133), so the
+#       one elevated window it shows at 193..201 is the aborted trace and not an
+#       installed bridge.
 #
 #   So: one program, one trace, one guard failure per call, three more
 #   allocations per call on cranelift. Attribution of those three is open.
