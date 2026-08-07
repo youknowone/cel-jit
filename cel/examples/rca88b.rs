@@ -1248,7 +1248,7 @@ fn forced_exit_path() {
     );
 }
 
-/// Probe H. Probe G's three `n` columns are not three phenomena — they are the
+/// Probe J. Probe G's three `n` columns are not three phenomena — they are the
 /// same curve sampled at three different `reps` per round (2000 / 200 / 20).
 /// min-of-41 reports the FASTEST round, so a permanent step at some fixed call
 /// index is visible only while some whole round still lies before it. That
@@ -1269,7 +1269,7 @@ fn forced_exit_path() {
 /// says it measured; the question is whether `n` or `reps` is the axis its rows
 /// are indexed by, and those were confounded because `reps = 20_000 / n`.
 fn cost_by_call_index(label: &str, lowered: &LoweredF) {
-    println!("\nProbe H — {label}: per-call cost against CALL INDEX, no min, no rounds");
+    println!("\nProbe J — {label}: per-call cost against CALL INDEX, no min, no rounds");
 
     const CALLS: usize = 460;
     const BUCKET: usize = 20;
@@ -1327,7 +1327,7 @@ fn cost_by_call_index(label: &str, lowered: &LoweredF) {
     );
 }
 
-/// Probe I. The external lever on Probe H's step. `THRESHOLD` is the back-edge
+/// Probe K. The external lever on Probe J's step. `THRESHOLD` is the back-edge
 /// count at which the loop compiles, and back edges are per ROW — so at n rows
 /// per call the loop compiles on call `ceil(THRESHOLD / n)`. Everything that
 /// happens on the guard-failure schedule is then anchored to THAT call, not to
@@ -1348,7 +1348,7 @@ fn cost_by_call_index(label: &str, lowered: &LoweredF) {
 /// pushed past a single call's worth of back edges without also changing the
 /// per-call work.
 fn step_moves_with_threshold(label: &str, lowered: &LoweredF) {
-    println!("\nProbe I — {label}: does Probe H's step follow the COMPILE call? (n=10)");
+    println!("\nProbe K — {label}: does Probe J's step follow the COMPILE call? (n=10)");
     println!(
         "{:>11} {:>14} {:>11} {:>12} {:>13} {:>11} {:>11}",
         "threshold",
