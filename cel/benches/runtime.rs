@@ -69,7 +69,7 @@ pub fn criterion_benchmark(c: &mut Criterion) {
             ctx.add_variable_from_value("apple", true);
             ctx.add_variable_from_value("a", 1);
             ctx.set_variable_resolver(&Resolver);
-            b.iter(|| Value::resolve_val(&ast, &ctx).expect("Eval failed!"))
+            b.iter(|| Value::resolve_value(&ast, &ctx).expect("Eval failed!"))
         });
     }
 }
@@ -94,7 +94,7 @@ pub fn map_macro_benchmark(c: &mut Criterion) {
             let ast = parser.parse("list.map(x, x * 2)").expect("Parsing failed");
             let mut ctx = Context::default();
             ctx.add_variable_from_value("list", list);
-            b.iter(|| Value::resolve_val(&ast, &ctx).expect("Eval failed!"))
+            b.iter(|| Value::resolve_value(&ast, &ctx).expect("Eval failed!"))
         });
     }
     group.finish();

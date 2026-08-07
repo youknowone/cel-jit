@@ -27,12 +27,16 @@
 //!
 //! ## The differential
 //!
-//! `EVALUATORS` is the list of doors under test. Today it holds one, because
-//! the crate has one: `Program::execute`. P2 adds `resolve_value` as a second
-//! entry and changes nothing else — the corpus is already the shared
-//! expectation, so the moment a second evaluator is registered every case in
-//! the file becomes a three-way agreement check between the two evaluators and
-//! the frozen data.
+//! `EVALUATORS` is the list of doors under test, and registering one is the
+//! only change a new evaluator needs on this side — the corpus is already the
+//! shared expectation, so every case becomes an agreement check between each
+//! registered evaluator and the frozen data.
+//!
+//! P2 used it exactly that way: `resolve_value` was registered beside the
+//! `dyn Val` walker, the two were held to the same 161 cases while the new one
+//! was built arm by arm, and the walker row was removed only once it was
+//! deleted. The list holds one row again today; that is a statement about the
+//! crate, not about this file.
 //!
 //! ## Coverage
 //!
@@ -90,30 +94,16 @@ struct Evaluator {
     eval: fn(&Expression, &Context) -> Result<Value, ExecutionError>,
 }
 
-/// The `dyn Val` walker, reached through `resolve_val` rather than through
-/// `Value::resolve`.
+/// The crate has one evaluator again, now that the `dyn Val` walker is gone.
 ///
-/// Naming it explicitly is what keeps the differential alive: `Value::resolve`
-/// is the crate's choke point and is repointed at the `Value`-native evaluator,
-/// so a row spelled `Value::resolve` would silently become a second copy of the
-/// `value-walker` row and the comparison would evaporate while staying green.
-fn walker_via_dyn_val(expr: &Expression, ctx: &Context) -> Result<Value, ExecutionError> {
-    Value::resolve_val(expr, ctx).and_then(|v| Value::try_from(v.as_ref()))
-}
-
-/// `walker` is the `dyn Val` evaluator, `value-walker` the `Value`-native one
-/// that replaces it. Both are checked against the same frozen corpus, so every
-/// case here is a three-way agreement between the two and the data.
-const EVALUATORS: &[Evaluator] = &[
-    Evaluator {
-        name: "walker",
-        eval: walker_via_dyn_val,
-    },
-    Evaluator {
-        name: "value-walker",
-        eval: Value::resolve_value,
-    },
-];
+/// The corpus outlives it: it was written against two evaluators and stays the
+/// frozen expectation for whatever replaces this one. A second row goes back
+/// here the moment there is a second door — the bytecode VM of P4 onwards — and
+/// nothing else about this file has to change for that.
+const EVALUATORS: &[Evaluator] = &[Evaluator {
+    name: "value-walker",
+    eval: Value::resolve_value,
+}];
 
 // ---------------------------------------------------------------------------
 // the canonical rendering — the ONLY code that reads a `Value`'s shape
