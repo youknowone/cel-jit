@@ -501,6 +501,15 @@ fn cometkim_cases() -> Vec<WalkerCase> {
                size(request.body) < 1000000"#,
         )
     });
+    // A map LITERAL, which no other row in this corpus contains -- the rows
+    // whose names say "map" are `.map(x, ..)` comprehensions, and
+    // `variable_access/hashmap` binds a map into the context. So nothing here
+    // emitted `OpCode::NewMap`, and the corpus could not see what a map literal
+    // costs to build (task #130). The nested case keeps two maps open at once,
+    // which is the only shape that reaches `map_mut` with an outer map already
+    // on the stack.
+    cases.push(walker_case("map_literal", r#"{"a": 1, "b": 2}.a"#));
+    cases.push(walker_case("map_literal/nested", r#"{"x": {"y": 3}}.x.y"#));
     cases
 }
 

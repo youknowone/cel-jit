@@ -27,8 +27,34 @@
 # and the report says so. `profile` is recorded but does not invalidate a
 # comparison: dev and release were measured identical on every row.
 #
+# ⚠ THE JIT BACKEND IS DELIBERATELY NOT IN THE KEY, and the two legs DISAGREE:
+#   the `regvm/jit/*/n=1000` rows read 66/66/68 on cranelift and 63/63/65 on
+#   dynasm. That is not an under-specified key -- it is a finding, and putting
+#   `backend` in the filename would declare it expected and hide it. #116
+#   measured which side of the compile/run boundary it sits on
+#   (`cel/examples/rca116.rs`), and it is RUN-time on both:
+#
+#     * the loop is compiled before the window opens (`loops_compiled` = 1 after
+#       one priming call) and nothing compiles inside it;
+#     * both backends compile the SAME trace -- `trace_ops` 13->25 / 30->55 /
+#       11->21, identical per case;
+#     * allocations per call are invariant over window lengths 1..64, exactly
+#       linear in the call count, so no part of the figure is amortized one-off
+#       work -- a single call already costs the full 66 (or 63);
+#     * `float` never compiles a bridge at all in 449 calls and still shows the
+#       same 3-allocation gap.
+#
+#   So: one program, one trace, one guard failure per call, three more
+#   allocations per call on cranelift. Attribution of those three is open.
+#
+# ⚠ AND THESE ROWS SAMPLE A PLATEAU THE ARTIFACT LEAVES. The `regvm/jit/*`
+#   window covers calls 65..89. The first guard bridge lands at call 200, after
+#   which the same rows cost 23020 (cranelift) / 20023 (dynasm) allocations per
+#   call -- 349x and 317x these numbers -- and never come back. The figures
+#   below are the pre-bridge cost, not the artifact's steady state.
+#
 # Format: <label> TAB <allocations per evaluation>
-#! profile = dev
+#! profile = release
 #! features = regex,chrono,vm
 #! host = aarch64-macos
 #! rounds = 3
@@ -66,6 +92,8 @@ walker/string_operations	8.000
 walker/member_call_on_variable	11.000
 walker/custom_function	3.000
 walker/real_world_policy	7.000
+walker/map_literal	4.000
+walker/map_literal/nested	7.000
 bind/clone-only/1	0.000
 bind/list-to-context/1	0.000
 bind/clone-only/10	0.000
