@@ -2791,7 +2791,9 @@ mod tests {
         // `d - t` stays: CEL defines `timestamp - duration` and
         // `timestamp - timestamp`, but not its mirror. `t + t` likewise has no
         // overload.
-        for expr in ["t < d", "t < i", "t * d", "d / d", "d % d", "d - t", "t + t"] {
+        for expr in [
+            "t < d", "t < i", "t * d", "d / d", "d % d", "d - t", "t + t",
+        ] {
             assert!(
                 lower(expr).is_err(),
                 "`{expr}` must bail the typed lowering (mixed / undefined overload)"
