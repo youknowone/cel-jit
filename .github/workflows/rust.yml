@@ -24,6 +24,13 @@ jobs:
         run: cargo build --verbose
       - name: Build with all features
         run: cargo build --verbose --all-features
+      # Every feature `cel/Cargo.toml` advertises, checked on its own. The
+      # three `cargo test --features {json,regex,chrono}` rows below do not
+      # cover this: they are additive on top of the defaults, and the defaults
+      # are `regex` + `chrono`, so all three build the same feature set as a
+      # bare `cargo test`. No single-feature build was ever compiled.
+      - name: Feature matrix
+        run: scripts/feature-matrix.sh
       - name: Clippy
         run: cargo clippy --all-features --all-targets -- -D warnings
       - name: Run tests
