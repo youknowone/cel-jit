@@ -105,7 +105,8 @@
 //! crossing between the two artifacts (#76), **not** trace length.
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::cell::Cell;
+use std::backtrace::Backtrace;
+use std::cell::{Cell, RefCell};
 use std::hint::black_box;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -126,10 +127,39 @@ std::thread_local! {
     /// the histogram, and the timing probes are the ones already at issue.
     static SIZES_ON: Cell<bool> = const { Cell::new(false) };
     static LOCAL_SIZES: [Cell<u64>; SIZE_BUCKETS] = [const { Cell::new(0) }; SIZE_BUCKETS];
+    /// Sizes whose allocation SITE should be recorded. Empty means off, and it
+    /// is empty for every probe but S — capturing a backtrace inside the
+    /// allocator costs far more than the thing being measured.
+    static SITE_SIZES: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
+    /// Re-entrancy guard. `Backtrace::force_capture` allocates, and those
+    /// allocations arrive straight back in `bump`; without this the first
+    /// capture recurses until the stack ends.
+    static IN_CAPTURE: Cell<bool> = const { Cell::new(false) };
+    static SITES: RefCell<Vec<(usize, Backtrace)>> = const { RefCell::new(Vec::new()) };
 }
 static GLOBAL_ALLOCS: AtomicU64 = AtomicU64::new(0);
 
 struct Counting;
+
+/// Records the stack that asked for `size`, when Probe S has armed that size.
+///
+/// Deliberately `#[cold]` and out of line: every allocation in the process tests
+/// the arm, and the probes that report ns/call must not pay for a capture path
+/// they never take.
+#[cold]
+fn record_site(size: usize) {
+    // The guard goes up BEFORE the capture, because the capture's own
+    // allocations re-enter here and would otherwise be recorded as sites of
+    // themselves.
+    if IN_CAPTURE.try_with(|c| c.replace(true)).unwrap_or(true) {
+        return;
+    }
+    // Captured now, symbolized later: `Display` on a `Backtrace` allocates a
+    // great deal more than the capture, and none of it belongs on this path.
+    let bt = Backtrace::force_capture();
+    let _ = SITES.try_with(|s| s.borrow_mut().push((size, bt)));
+    let _ = IN_CAPTURE.try_with(|c| c.set(false));
+}
 
 #[inline]
 fn bump(size: usize) {
@@ -138,6 +168,17 @@ fn bump(size: usize) {
     if SIZES_ON.try_with(Cell::get).unwrap_or(false) {
         let idx = if size > SIZE_MAX_EXACT { 0 } else { size };
         let _ = LOCAL_SIZES.try_with(|h| h[idx].set(h[idx].get() + 1));
+    }
+    // `borrow` never nests: the only re-entry is from the capture itself, and
+    // that path takes `IN_CAPTURE` before it allocates.
+    let armed = SITE_SIZES
+        .try_with(|t| {
+            let t = t.borrow();
+            !t.is_empty() && t.contains(&size)
+        })
+        .unwrap_or(false);
+    if armed {
+        record_site(size);
     }
 }
 
@@ -2363,6 +2404,101 @@ fn size_against_trace_length(label: &str, lowered: &LoweredF) {
     }
 }
 
+/// Probe S. Probe R established that exactly four sizes are trace-sensitive on
+/// cranelift and refused to pair them, because a histogram is a multiset:
+/// `64→96, 200→216` and `64→216, 200→96` are the same four columns. Pairing is a
+/// question about allocation SITES, and this answers it directly — arm the
+/// allocator on those four sizes, run ONE call of each arm, and read back the
+/// stack that asked.
+///
+/// Two sites that agree across the arms are one allocation that got resized;
+/// two that disagree are two allocations, and the pairing follows from the code
+/// rather than from which arrangement looked tidier.
+///
+/// ⚠ Requires debug info to name anything: `cel-jit`'s workspace declares no
+/// `[profile.release]`, so the default is `debug = 0` and every frame
+/// symbolizes to an address. Run with `CARGO_PROFILE_RELEASE_DEBUG=2`. Debug
+/// info does not change optimization, but "does not" is a claim — the probe
+/// re-reads the per-call allocation total in each arm and refuses if it has
+/// moved off the value Probe R measured without it.
+fn allocation_sites(label: &str, lowered: &LoweredF) {
+    println!("\nProbe S — {label}: WHICH SITE allocates the trace-sensitive sizes?");
+
+    // Probe R's n=4 pair, and its four sizes. `expect` is the total Probe R
+    // read for the dominant steady regime in BOTH arms.
+    const N: usize = 4;
+    const WARM: usize = 600;
+    const EXPECT: u64 = 73;
+    let targets = vec![64usize, 96, 200, 216];
+
+    let (price, qty) = flat_columns(N);
+    let columns = vec![Column::Int(&price), Column::Int(&qty)];
+
+    for (arm, threshold) in [("flat  (13 ops)", 12u32), ("grown (25 ops)", 8)] {
+        reset_persistent_state();
+        reset_jit_stats();
+        for _ in 0..WARM {
+            black_box(eval_batch_sum_f(lowered, &columns, N, threshold));
+        }
+        // The steady regime, confirmed on this binary rather than assumed from
+        // Probe R's. A debug-info build that allocated differently would make
+        // every site below a site of something else.
+        let (_, settled) = metered(|| black_box(eval_batch_sum_f(lowered, &columns, N, threshold)));
+        println!("\n  {arm}  threshold {threshold}:  allocs/call {settled}");
+        if settled != EXPECT {
+            println!("    ⛔ REFUSING: Probe R read {EXPECT} here. This is a different program.");
+            continue;
+        }
+
+        SITES.with(|s| s.borrow_mut().clear());
+        SITE_SIZES.with(|t| *t.borrow_mut() = targets.clone());
+        black_box(eval_batch_sum_f(lowered, &columns, N, threshold));
+        SITE_SIZES.with(|t| t.borrow_mut().clear());
+
+        let captured = SITES.with(|s| std::mem::take(&mut *s.borrow_mut()));
+        // Group identical stacks. Symbolization happens here, outside the
+        // allocator, and it allocates heavily.
+        let mut groups: Vec<(usize, String, usize)> = Vec::new();
+        for (size, bt) in &captured {
+            let frames = interesting_frames(&format!("{bt}"));
+            match groups
+                .iter_mut()
+                .find(|(s, f, _)| *s == *size && *f == frames)
+            {
+                Some(g) => g.2 += 1,
+                None => groups.push((*size, frames, 1)),
+            }
+        }
+        groups.sort_by_key(|g| g.0);
+        if groups.is_empty() {
+            println!("    (no target size allocated in this call)");
+        }
+        for (size, frames, count) in &groups {
+            println!("    {size}B x{count}");
+            for f in frames.lines() {
+                println!("        {f}");
+            }
+        }
+    }
+}
+
+/// Keeps the frames that name this system and drops the allocator shim, the
+/// backtrace machinery and libstd. A raw `Backtrace` here is ~60 frames, and
+/// none of the interesting ones are libstd's.
+fn interesting_frames(bt: &str) -> String {
+    bt.lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with("at ") || l.contains("::"))
+        .filter(|l| {
+            (l.contains("majit") || l.contains("cel"))
+                && !l.contains("rca88b")
+                && !l.contains("bump")
+        })
+        .take(14)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn main() {
     let schema = flat_schema();
     let arith = lower("price + qty * 2", &schema);
@@ -2394,6 +2530,14 @@ fn main() {
         // counts, it is keyed on something the two expressions share.
         let long = lower("price + qty * 2 + price * 3 + qty", &schema);
         size_against_trace_length("arith price + qty*2 + price*3 + qty", &long);
+        println!("\nload after probes:  {}", loadavg());
+        return;
+    }
+    // Probe S captures a backtrace from inside the allocator, so it must not
+    // share a process with a probe that reports ns/call. `RCA88B_SITES=1`, and
+    // it needs `CARGO_PROFILE_RELEASE_DEBUG=2` to name anything.
+    if std::env::var_os("RCA88B_SITES").is_some() {
+        allocation_sites("arith price + qty * 2", &arith);
         println!("\nload after probes:  {}", loadavg());
         return;
     }
