@@ -867,6 +867,117 @@ fn warmup_degradation() {
     );
 }
 
+/// Probe H. The standing hypothesis for Probe G's degradation (team-lead) is
+/// **green-key chain growth**: #106 leaves `max_age = 0` so `alive_loops` never
+/// prunes and `gc_cells` has no production caller, #117 has cells chaining off
+/// one bucket with `lookup_chain_with_key` walking the chain, and #90 builds
+/// and hashes the key on **every back edge**. Composed: each back edge pays a
+/// chain walk whose length grows with cumulative compiled population. That
+/// predicts a per-ROW cost, growth with cumulative activity, invisibility to
+/// every exported counter (`get_stats` reads chain HEADS), backend-neutrality,
+/// and — because chains form only on hash collision — a step at large n where
+/// one collision is amplified n-fold.
+///
+/// The clean external test: **hold the target's own warmup fixed and vary the
+/// population that shares its driver.** If cost tracks cumulative population,
+/// the transition moves earlier as `pop` grows; if it tracks calls-since-
+/// compile only, the `pop` columns are flat and the hypothesis is wrong.
+///
+/// ⚠ Probe A already swept population and found FLAT — but at **n=10**, the one
+/// size that does not degrade at any warmup, and at a single shallow warmup.
+/// It could not have seen this. That is why the sweep is two-dimensional here:
+/// a `pop` axis crossed with the `warmups` axis, at the n where the step is
+/// sharp.
+///
+/// Fillers are Probe A's: structurally identical so they lower to the same
+/// register counts and land in the same driver — asserted, not assumed, because
+/// a filler in its own driver would leave the population at 1 and print
+/// "flat" for a reason unrelated to the hypothesis.
+fn population_times_warmup() {
+    println!(
+        "\nProbe H — does the degradation track cumulative POPULATION or calls-since-compile?"
+    );
+    println!(
+        "{:>8} {:>6} {:>10} {:>12} {:>12} {:>10} {:>7} {:>9}",
+        "n", "pop", "warmups", "warm ns", "never ns", "warm/nvr", "loops", "load"
+    );
+
+    let schema = flat_schema();
+    let target = lower("price + qty * 2", &schema);
+
+    for n in [1_000usize, 100] {
+        let (price, qty) = flat_columns(n);
+        let columns = vec![Column::Int(&price), Column::Int(&qty)];
+        let reps = (20_000 / n).max(1);
+
+        reset_persistent_state();
+        for _ in 0..64 {
+            black_box(eval_batch_sum_f(&target, &columns, n, NEVER));
+        }
+        let mut best_never = f64::MAX;
+        for _ in 0..41 {
+            let t = std::time::Instant::now();
+            for _ in 0..reps {
+                black_box(eval_batch_sum_f(&target, &columns, n, NEVER));
+            }
+            best_never = best_never.min(t.elapsed().as_nanos() as f64 / reps as f64);
+        }
+
+        for pop in [1usize, 8, 32, 128] {
+            for warmups in [8usize, 64, 128, 192, 256] {
+                reset_persistent_state();
+                reset_jit_stats();
+
+                // Population first, so the target's own warmup is the only
+                // thing the `warmups` axis moves.
+                let fillers: Vec<LoweredF> = (1..pop)
+                    .map(|k| lower(&format!("price + qty * {}", k + 2), &schema))
+                    .collect();
+                for f in &fillers {
+                    assert_eq!(
+                        (f.num_int_regs, f.num_float_regs),
+                        (target.num_int_regs, target.num_float_regs),
+                        "filler lowers to a different shape than the target, so it \
+                         lands in a different driver and the population never grows"
+                    );
+                    black_box(eval_batch_sum_f(f, &columns, n, THRESHOLD));
+                }
+
+                for _ in 0..warmups {
+                    black_box(eval_batch_sum_f(&target, &columns, n, THRESHOLD));
+                }
+                // Non-vacuity: must read `pop`, or the fillers did not compile
+                // into this driver and the population axis is a no-op.
+                let loops = jit_stats().loops_compiled;
+
+                let mut best_warm = f64::MAX;
+                for _ in 0..41 {
+                    let t = std::time::Instant::now();
+                    for _ in 0..reps {
+                        black_box(eval_batch_sum_f(&target, &columns, n, THRESHOLD));
+                    }
+                    best_warm = best_warm.min(t.elapsed().as_nanos() as f64 / reps as f64);
+                }
+
+                println!(
+                    "{n:>8} {pop:>6} {warmups:>10} {best_warm:>12.1} {best_never:>12.1} \
+                     {:>10.3} {loops:>7} {:>9}",
+                    best_warm / best_never,
+                    loadavg(),
+                );
+            }
+        }
+    }
+    println!(
+        "  `loops` must equal `pop` or the population axis is vacuous. If the \
+         transition moves EARLIER as pop grows, it is cumulative population;"
+    );
+    println!(
+        "  if the pop columns are flat at every warmup, calls-since-compile is \
+         the axis and chain growth is refuted."
+    );
+}
+
 /// Probe E. Probe C measures ~600 ns per inner ELEMENT on `pr=8` at n=10;
 /// rca88 measures **2.275 ns per element** on what is written down as the same
 /// `pr=8` shape at 320 000 elements. That is a 260x discrepancy, and the
@@ -1137,11 +1248,193 @@ fn forced_exit_path() {
     );
 }
 
+/// Probe H. Probe G's three `n` columns are not three phenomena — they are the
+/// same curve sampled at three different `reps` per round (2000 / 200 / 20).
+/// min-of-41 reports the FASTEST round, so a permanent step at some fixed call
+/// index is visible only while some whole round still lies before it. That
+/// predicts:
+///
+/// * n=1000 (reps 20): a sharp step, because a round is 20 calls wide;
+/// * n=100 (reps 200): a smooth monotone ramp, because each round straddles the
+///   step and the pre-step fraction shrinks with warmup;
+/// * n=10 (reps 2000): perfectly flat AT THE POST-STEP VALUE, because no round
+///   is ever mostly pre-step.
+///
+/// All three are Probe G's actual columns. So the instrument, not the artifact,
+/// may be what differs across n — and the way to settle it is to delete the
+/// instrument: time each call individually, against its own call index, with no
+/// min and no aggregation across rounds.
+///
+/// ⛔ This must not be read as "Probe G was wrong". Probe G measured what it
+/// says it measured; the question is whether `n` or `reps` is the axis its rows
+/// are indexed by, and those were confounded because `reps = 20_000 / n`.
+fn cost_by_call_index(label: &str, lowered: &LoweredF) {
+    println!("\nProbe H — {label}: per-call cost against CALL INDEX, no min, no rounds");
+
+    const CALLS: usize = 460;
+    const BUCKET: usize = 20;
+
+    for n in [10usize, 100, 1_000] {
+        println!(
+            "\n  n={n}  {:>12} {:>11} {:>11} {:>11} {:>6} {:>8}",
+            "calls", "mean ns", "min ns", "max ns", "brdg", "gfails"
+        );
+        let (price, qty) = flat_columns(n);
+        let columns = vec![Column::Int(&price), Column::Int(&qty)];
+
+        reset_persistent_state();
+        reset_jit_stats();
+        let mut ns = Vec::with_capacity(CALLS);
+        let mut marks = Vec::with_capacity(CALLS / BUCKET + 1);
+        for k in 0..CALLS {
+            let t = std::time::Instant::now();
+            black_box(eval_batch_sum_f(lowered, &columns, n, THRESHOLD));
+            ns.push(t.elapsed().as_nanos() as f64);
+            // Read the counters only at bucket boundaries: `jit_stats` does not
+            // advance the call counter, but keeping it out of the inner path
+            // keeps the timed sequence identical to an uninstrumented one.
+            if (k + 1) % BUCKET == 0 {
+                let s = jit_stats();
+                marks.push((s.bridges_compiled, s.guard_failures));
+            }
+        }
+
+        let mut baseline = f64::MAX;
+        let mut step_at: Option<usize> = None;
+        for (b, chunk) in ns.chunks(BUCKET).enumerate() {
+            let mean = chunk.iter().sum::<f64>() / chunk.len() as f64;
+            let lo = chunk.iter().cloned().fold(f64::MAX, f64::min);
+            let hi = chunk.iter().cloned().fold(0.0, f64::max);
+            if b < 3 {
+                baseline = baseline.min(mean);
+            } else if step_at.is_none() && mean > 4.0 * baseline {
+                step_at = Some(b * BUCKET + 1);
+            }
+            let (brdg, gf) = marks.get(b).copied().unwrap_or((0, 0));
+            println!(
+                "       {:>12} {mean:>11.1} {lo:>11.1} {hi:>11.1} {brdg:>6} {gf:>8}",
+                format!("{}-{}", b * BUCKET + 1, (b + 1) * BUCKET),
+            );
+        }
+        match step_at {
+            Some(c) => println!("       => 4x step first seen in the bucket starting at call {c}"),
+            None => println!("       => no 4x step anywhere in {CALLS} calls"),
+        }
+    }
+    println!(
+        "  A step at the SAME call index at every n means Probe G's rows are indexed by \
+         `reps`, not by `n`."
+    );
+}
+
+/// Probe I. The external lever on Probe H's step. `THRESHOLD` is the back-edge
+/// count at which the loop compiles, and back edges are per ROW — so at n rows
+/// per call the loop compiles on call `ceil(THRESHOLD / n)`. Everything that
+/// happens on the guard-failure schedule is then anchored to THAT call, not to
+/// call 1: #91's law puts the first bridge `trace_eagerness / gfails-per-call`
+/// calls later.
+///
+/// So raising `THRESHOLD` must slide the step by exactly the number of calls it
+/// delays compilation by, and nothing else about the artifact changes.
+///
+/// * step moves 1:1 with the compile call => it is anchored to CALLS SINCE
+///   COMPILE, and the schedule #122 eliminated as a passenger is back in play
+///   as the clock the step runs on;
+/// * step stays at a fixed absolute call index => it is anchored to process
+///   history, not to the artifact, and the schedule is ruled out a second and
+///   independent time.
+///
+/// n=10 is the sweep size because it is the only one where `THRESHOLD` can be
+/// pushed past a single call's worth of back edges without also changing the
+/// per-call work.
+fn step_moves_with_threshold(label: &str, lowered: &LoweredF) {
+    println!("\nProbe I — {label}: does Probe H's step follow the COMPILE call? (n=10)");
+    println!(
+        "{:>11} {:>14} {:>11} {:>12} {:>13} {:>11} {:>11}",
+        "threshold",
+        "compiles@call",
+        "step@call",
+        "step - cmp",
+        "pre-step ns",
+        "post ns",
+        "post/pre"
+    );
+
+    const N: usize = 10;
+    const CALLS: usize = 700;
+    const BUCKET: usize = 20;
+    let (price, qty) = flat_columns(N);
+    let columns = vec![Column::Int(&price), Column::Int(&qty)];
+
+    for threshold in [8u32, 800, 1_600, 3_000] {
+        reset_persistent_state();
+        reset_jit_stats();
+        let mut ns = Vec::with_capacity(CALLS);
+        // The call on which `loops_compiled` first moves — measured, not
+        // computed from `THRESHOLD / n`, so a different back-edge accounting
+        // shows up as a disagreement instead of being assumed away.
+        let mut compiled_at = 0usize;
+        for k in 0..CALLS {
+            let t = std::time::Instant::now();
+            black_box(eval_batch_sum_f(lowered, &columns, N, threshold));
+            ns.push(t.elapsed().as_nanos() as f64);
+            if compiled_at == 0 && jit_stats().loops_compiled > 0 {
+                compiled_at = k + 1;
+            }
+        }
+
+        let means: Vec<f64> = ns
+            .chunks(BUCKET)
+            .map(|c| c.iter().sum::<f64>() / c.len() as f64)
+            .collect();
+        // Baseline from the buckets after the compile and before any step, so a
+        // late compile does not put its own tracing cost in the baseline.
+        let first = (compiled_at / BUCKET) + 1;
+        let baseline = means[first..(first + 3).min(means.len())]
+            .iter()
+            .cloned()
+            .fold(f64::MAX, f64::min);
+        let step_b = means
+            .iter()
+            .enumerate()
+            .skip(first + 3)
+            .find(|(_, &m)| m > 4.0 * baseline)
+            .map(|(b, _)| b);
+        let post = means[means.len().saturating_sub(3)..].iter().sum::<f64>() / 3.0;
+
+        let (step_at, delta) = match step_b {
+            Some(b) => {
+                let c = b * BUCKET + 1;
+                (c.to_string(), (c as i64 - compiled_at as i64).to_string())
+            }
+            None => ("none".to_string(), "-".to_string()),
+        };
+        println!(
+            "{threshold:>11} {compiled_at:>14} {step_at:>11} {delta:>12} \
+             {baseline:>13.1} {post:>11.1} {:>11.2}",
+            post / baseline,
+        );
+    }
+    println!(
+        "  `step - cmp` constant across thresholds => the step is CALLS SINCE COMPILE. \
+         `step@call` constant => it is process history."
+    );
+}
+
 fn main() {
     let schema = flat_schema();
     let arith = lower("price + qty * 2", &schema);
 
     println!("load before probes: {}", loadavg());
+    // Probes H and I need a clean process: both index cost by CALL INDEX from a
+    // cold driver, and every earlier probe leaves compiled programs interned in
+    // the pool. `RCA88B_STEP=1` runs them alone.
+    if std::env::var_os("RCA88B_STEP").is_some() {
+        cost_by_call_index("arith price + qty * 2", &arith);
+        step_moves_with_threshold("arith price + qty * 2", &arith);
+        println!("\nload after probes:  {}", loadavg());
+        return;
+    }
     // After eliminating warmup count, in-round interleaving and the clean arm,
     // the only difference left between Probe B and Probe F's last row — which
     // are the same structure and read 4.6 us and 48.7 us — is WHERE IN THE
@@ -1162,6 +1455,7 @@ fn main() {
     // minutes on a loaded box — which is also the window in which another
     // session's load can move under the two halves of the comparison.
     warmup_degradation();
+    population_times_warmup();
     if std::env::var_os("RCA88B_FAST").is_some() {
         println!("\nload after probes:  {}", loadavg());
         return;
