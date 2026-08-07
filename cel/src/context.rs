@@ -175,6 +175,39 @@ impl<'a> Context<'a> {
         }
     }
 
+    /// Reads a bound variable as a [`Value`].
+    ///
+    /// The bindings are still stored as `Box<dyn Val>`, so this converts on
+    /// every read. Once `variables` holds [`Value`] directly the conversion
+    /// goes away and the read is a clone.
+    pub(crate) fn get_variable_value<S>(&self, name: S) -> Option<Result<Value, ExecutionError>>
+    where
+        S: AsRef<str>,
+    {
+        let name = name.as_ref();
+        let from_resolver = |resolver: &Option<&'a dyn VariableResolver>| {
+            resolver.and_then(|r| r.resolve(name)).map(Ok)
+        };
+        match self {
+            Context::Child {
+                variables,
+                parent,
+                resolver,
+            } => from_resolver(resolver).or_else(|| {
+                variables
+                    .get(name)
+                    .map(|b| Value::try_from(b.as_ref()))
+                    .or_else(|| parent.get_variable_value(name))
+            }),
+            Context::Root {
+                variables,
+                resolver,
+                ..
+            } => from_resolver(resolver)
+                .or_else(|| variables.get(name).map(|b| Value::try_from(b.as_ref()))),
+        }
+    }
+
     pub(crate) fn env(&self) -> &Env {
         match self {
             Context::Root { env, .. } => env.as_ref(),

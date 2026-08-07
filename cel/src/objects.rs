@@ -1,4 +1,4 @@
-use crate::common::ast::{operators, ComprehensionExpr, EntryExpr, Expr, LiteralValue};
+use crate::common::ast::{operators, CallExpr, ComprehensionExpr, EntryExpr, Expr, LiteralValue};
 use crate::common::types::bool::Bool;
 use crate::common::types::*;
 use crate::common::value::Val;
@@ -2140,6 +2140,565 @@ impl Value {
             Expr::Unspecified => panic!("Can't evaluate Unspecified Expr"),
         }
     }
+
+    /// Evaluates `expr` entirely within the [`Value`] universe.
+    ///
+    /// Mirrors [`Value::resolve_val`] arm for arm without ever constructing a
+    /// `Box<dyn Val>`, except at the host-function boundary, which still takes
+    /// its arguments as `Cow<dyn Val>`. Both walkers are held to the same
+    /// answers by the differential corpus in `tests/oracle.rs`.
+    pub fn resolve_value(expr: &Expression, ctx: &Context) -> Result<Value, ExecutionError> {
+        match &expr.expr {
+            Expr::Literal(literal) => Ok(literal.to_value()),
+            Expr::Call(call) => {
+                if call.args.len() == 3 && call.func_name == operators::CONDITIONAL {
+                    return if try_bool_value(Value::resolve_value(&call.args[0], ctx))? {
+                        Value::resolve_value(&call.args[1], ctx)
+                    } else {
+                        Value::resolve_value(&call.args[2], ctx)
+                    };
+                }
+                if call.args.len() == 2 {
+                    match call.func_name.as_str() {
+                        operators::LOGICAL_OR => {
+                            let left = try_bool_value(Value::resolve_value(&call.args[0], ctx));
+                            return if Ok(true) == left {
+                                Ok(Value::Bool(true))
+                            } else {
+                                let right = match Value::resolve_value(&call.args[1], ctx)? {
+                                    Value::Bool(b) => Some(b),
+                                    _ => None,
+                                };
+                                match (left, right) {
+                                    (Ok(false), Some(right)) => Ok(Value::Bool(right)),
+                                    (Err(_), Some(true)) => Ok(Value::Bool(true)),
+                                    (left, _) => Err(left.err().unwrap_or(NoSuchOverload)),
+                                }
+                            };
+                        }
+                        operators::LOGICAL_AND => {
+                            let left = try_bool_value(Value::resolve_value(&call.args[0], ctx));
+                            return if Ok(false) == left {
+                                Ok(Value::Bool(false))
+                            } else {
+                                let right = match Value::resolve_value(&call.args[1], ctx)? {
+                                    Value::Bool(b) => Some(b),
+                                    _ => None,
+                                };
+                                match (left, right) {
+                                    (Ok(true), Some(right)) => Ok(Value::Bool(right)),
+                                    (Err(_), Some(false)) => Ok(Value::Bool(false)),
+                                    (left, _) => Err(left.err().unwrap_or(NoSuchOverload)),
+                                }
+                            };
+                        }
+                        operators::EQUALS => {
+                            let lhs = Value::resolve_value(&call.args[0], ctx)?;
+                            let rhs = Value::resolve_value(&call.args[1], ctx)?;
+                            return Ok(Value::Bool(lhs == rhs));
+                        }
+                        operators::NOT_EQUALS => {
+                            let lhs = Value::resolve_value(&call.args[0], ctx)?;
+                            let rhs = Value::resolve_value(&call.args[1], ctx)?;
+                            return Ok(Value::Bool(lhs != rhs));
+                        }
+                        operators::INDEX | operators::OPT_INDEX => {
+                            let mut is_optional = call.func_name == operators::OPT_INDEX;
+                            let value = Value::resolve_value(&call.args[0], ctx)?;
+                            let value = match as_optional(&value) {
+                                Some(opt) => {
+                                    is_optional = true;
+                                    match opt.value() {
+                                        Some(v) => v.clone(),
+                                        None => return Ok(optional_none()),
+                                    }
+                                }
+                                None => value,
+                            };
+                            let key = Value::resolve_value(&call.args[1], ctx)?;
+                            let result = value_index(&value, &key);
+                            return if is_optional {
+                                Ok(match result {
+                                    Ok(v) => optional_of(v),
+                                    Err(_) => optional_none(),
+                                })
+                            } else {
+                                result
+                            };
+                        }
+                        operators::OPT_SELECT => {
+                            let operand = Value::resolve_value(&call.args[0], ctx)?;
+                            let field = match Value::resolve_value(&call.args[1], ctx)? {
+                                Value::String(s) => Value::String(s),
+                                _ => {
+                                    return Err(ExecutionError::function_error(
+                                        "_?._",
+                                        "field must be string",
+                                    ))
+                                }
+                            };
+                            return Ok(match as_optional(&operand) {
+                                // `Optional::map` keeps the outer `Some` and
+                                // substitutes `optional.none` for a missing
+                                // field, so a miss nests one optional inside
+                                // another. Mirrored, not corrected, here.
+                                Some(opt) => match opt.value() {
+                                    None => optional_none(),
+                                    Some(inner) => optional_of(
+                                        value_index(inner, &field)
+                                            .unwrap_or_else(|_| optional_none()),
+                                    ),
+                                },
+                                None => optional_of(value_index(&operand, &field)?),
+                            });
+                        }
+                        operators::ADD => return binary_op("add", call, ctx),
+                        operators::SUBSTRACT => return binary_op("sub", call, ctx),
+                        operators::DIVIDE => return binary_op("div", call, ctx),
+                        operators::MULTIPLY => return binary_op("mul", call, ctx),
+                        operators::MODULO => return binary_op("rem", call, ctx),
+                        operators::LESS => {
+                            return compare_op(call, ctx, |o| o == Ordering::Less);
+                        }
+                        operators::LESS_EQUALS => {
+                            return compare_op(call, ctx, |o| o != Ordering::Greater);
+                        }
+                        operators::GREATER => {
+                            return compare_op(call, ctx, |o| o == Ordering::Greater);
+                        }
+                        operators::GREATER_EQUALS => {
+                            return compare_op(call, ctx, |o| o != Ordering::Less);
+                        }
+                        operators::IN => {
+                            let lhs = Value::resolve_value(&call.args[0], ctx)?;
+                            let rhs = Value::resolve_value(&call.args[1], ctx)?;
+                            return Ok(Value::Bool(value_contains(&rhs, &lhs)?));
+                        }
+                        _ => (),
+                    }
+                }
+                if call.args.len() == 1 {
+                    match call.func_name.as_str() {
+                        operators::LOGICAL_NOT => {
+                            return match Value::resolve_value(&call.args[0], ctx)? {
+                                Value::Bool(b) => Ok(Value::Bool(!b)),
+                                _ => Err(ExecutionError::NoSuchOverload),
+                            };
+                        }
+                        operators::NEGATE => {
+                            let val = Value::resolve_value(&call.args[0], ctx)?;
+                            return value_negate(val);
+                        }
+                        operators::NOT_STRICTLY_FALSE => {
+                            return Ok(Value::Bool(
+                                try_bool_value(Value::resolve_value(&call.args[0], ctx))
+                                    .unwrap_or(true),
+                            ));
+                        }
+                        _ => (),
+                    }
+                }
+                match &call.target {
+                    None => {
+                        let args = resolve_args(&call.args, ctx)?;
+                        if let Some(op) = ctx.env().find_overload(&call.func_name, &args) {
+                            return op(args)?.as_ref().try_into();
+                        }
+                        let func = ctx.get_function(call.func_name.as_str()).ok_or_else(|| {
+                            ExecutionError::UndeclaredReference(call.func_name.clone().into())
+                        })?;
+                        let mut ctx = FunctionContext::new(&call.func_name, None, ctx, args);
+                        (func)(&mut ctx)
+                    }
+                    Some(target) => {
+                        let args = resolve_args(&call.args, ctx)?;
+                        let qualified_func = match &target.expr {
+                            Expr::Ident(prefix) => {
+                                let qualified_name = format!("{prefix}.{}", call.func_name);
+                                if let Some(op) = ctx.env().find_overload(&qualified_name, &args) {
+                                    return op(args)?.as_ref().try_into();
+                                }
+                                ctx.get_function(&qualified_name)
+                            }
+                            _ => None,
+                        };
+                        let (target, func, args) = match qualified_func {
+                            None => {
+                                let target = Value::resolve_value(target, ctx)?;
+                                let mut args = args;
+                                args.insert(0, Cow::Owned(target.try_into()?));
+                                if let Some(op) =
+                                    ctx.env().find_member_overload(&call.func_name, &args)
+                                {
+                                    return op(args)?.as_ref().try_into();
+                                }
+                                let target = args.remove(0);
+                                let func =
+                                    ctx.get_function(call.func_name.as_str()).ok_or_else(|| {
+                                        ExecutionError::UndeclaredReference(
+                                            call.func_name.clone().into(),
+                                        )
+                                    })?;
+                                (Some(target), func, args)
+                            }
+                            Some(func) => (None, func, args),
+                        };
+                        let mut ctx = FunctionContext::new(&call.func_name, target, ctx, args);
+                        (func)(&mut ctx)
+                    }
+                }
+            }
+            Expr::Ident(name) => ctx
+                .get_variable_value(name)
+                .ok_or_else(|| ExecutionError::UndeclaredReference(Arc::new(name.to_string())))?,
+            Expr::Select(select) => {
+                let left = Value::resolve_value(select.operand.deref(), ctx)?;
+                let key = Value::String(Arc::new(select.field.as_str().to_string()));
+
+                if select.test {
+                    match &left {
+                        Value::Map(_) => Ok(Value::Bool(value_contains(&left, &key)?)),
+                        #[cfg(feature = "structs")]
+                        Value::Struct(_) => Ok(Value::Bool(value_index(&left, &key).is_ok())),
+                        _ => value_index(&left, &key),
+                    }
+                } else {
+                    value_index(&left, &key)
+                }
+            }
+            Expr::List(list_expr) => {
+                let mut list = Vec::with_capacity(list_expr.elements.len());
+                for (idx, element) in list_expr.elements.iter().enumerate() {
+                    let value = Value::resolve_value(element, ctx)?;
+                    if list_expr.optional_indices.contains(&idx) {
+                        match as_optional(&value) {
+                            Some(opt) => {
+                                if let Some(inner) = opt.value() {
+                                    list.push(inner.clone());
+                                }
+                            }
+                            None => list.push(value),
+                        }
+                    } else {
+                        list.push(value);
+                    }
+                }
+                Ok(Value::list(list))
+            }
+            Expr::Map(map_expr) => {
+                let mut map = HashMap::with_capacity(map_expr.entries.len());
+                for entry in map_expr.entries.iter() {
+                    let (k, v, is_optional) = match &entry.expr {
+                        EntryExpr::StructField(_) => panic!("WAT?"),
+                        EntryExpr::MapEntry(e) => (&e.key, &e.value, e.optional),
+                    };
+                    let key = value_key(Value::resolve_value(k, ctx)?)?;
+                    let value = Value::resolve_value(v, ctx)?;
+
+                    if is_optional {
+                        if let Some(opt) = as_optional(&value) {
+                            if let Some(inner) = opt.value() {
+                                map.insert(key, inner.clone());
+                            }
+                        } else {
+                            map.insert(key, value);
+                        }
+                    } else {
+                        map.insert(key, value);
+                    }
+                }
+                Ok(Value::Map(Map::object(Arc::new(map))))
+            }
+            Expr::Comprehension(comprehension) => {
+                let accu_init = Value::resolve_value(&comprehension.accu_init, ctx)?;
+                let iter = Value::resolve_value(&comprehension.iter_range, ctx)?;
+                let mut ctx = ctx.new_inner_scope();
+                let mut items = value_iter(&iter)?.into_iter();
+
+                if let Some(append) = AccuAppend::of(comprehension) {
+                    if let Value::List(list) = accu_init {
+                        // The accumulator stays here rather than in the
+                        // context: `@result` is not a name CEL can parse, so
+                        // the guard and the element cannot read it, and a
+                        // nested comprehension binds its own in its own scope.
+                        let mut list = list.into_vec();
+                        for item in items {
+                            ctx.add_variable_from_value(&comprehension.iter_var, item);
+                            if let Some(guard) = append.guard {
+                                if !try_bool_value(Value::resolve_value(guard, &ctx))? {
+                                    continue;
+                                }
+                            }
+                            list.push(Value::resolve_value(append.element, &ctx)?);
+                        }
+                        ctx.add_variable_from_value(&comprehension.accu_var, Value::list(list));
+                        return Value::resolve_value(&comprehension.result, &ctx);
+                    }
+                    unreachable!("AccuAppend::of implies a list accumulator");
+                }
+
+                ctx.add_variable_from_value(&comprehension.accu_var, accu_init);
+                for item in items.by_ref() {
+                    if !try_bool_value(Value::resolve_value(&comprehension.loop_cond, &ctx))? {
+                        break;
+                    }
+                    ctx.add_variable_from_value(&comprehension.iter_var, item);
+                    let accu = Value::resolve_value(&comprehension.loop_step, &ctx)?;
+                    ctx.add_variable_from_value(&comprehension.accu_var, accu);
+                }
+                Value::resolve_value(&comprehension.result, &ctx)
+            }
+            Expr::Struct(strct) => {
+                let name = strct.type_name.clone();
+                #[cfg(not(feature = "structs"))]
+                {
+                    Err(ExecutionError::InternalError(format!(
+                        "Found struct {name}, feature not enabled!"
+                    )))
+                }
+                #[cfg(feature = "structs")]
+                {
+                    let struct_def =
+                        ctx.env()
+                            .find_struct(&name)
+                            .ok_or(ExecutionError::UnexpectedType {
+                                got: name.to_owned(),
+                                want: "known struct".to_owned(),
+                            })?;
+                    let mut fields = std::collections::BTreeMap::new();
+                    for entry in &strct.entries {
+                        match &entry.expr {
+                            EntryExpr::StructField(expr) => {
+                                let f = expr.field.clone();
+                                let v = Value::resolve_value(&expr.value, ctx)?;
+                                fields.insert(f, Cow::Owned(TryInto::<Box<dyn Val>>::try_into(v)?));
+                            }
+                            EntryExpr::MapEntry(entry) => {
+                                return Err(ExecutionError::InternalError(format!(
+                                    "Expected struct_field_expr, got {entry:?}"
+                                )))
+                            }
+                        }
+                    }
+                    Ok(Value::Struct(Arc::new(struct_def.new_struct(fields)?)))
+                }
+            }
+            Expr::Unspecified => panic!("Can't evaluate Unspecified Expr"),
+        }
+    }
+}
+
+/// Wraps `value` in an `optional`.
+fn optional_of(value: Value) -> Value {
+    Value::Opaque(Arc::new(OptionalValue::of(value)))
+}
+
+/// The empty `optional`.
+fn optional_none() -> Value {
+    Value::Opaque(Arc::new(OptionalValue::none()))
+}
+
+/// Views `value` as an optional, if it is one.
+fn as_optional(value: &Value) -> Option<&OptionalValue> {
+    match value {
+        Value::Opaque(o) => o.downcast_ref::<OptionalValue>(),
+        _ => None,
+    }
+}
+
+fn try_bool_value(val: Result<Value, ExecutionError>) -> Result<bool, ExecutionError> {
+    match val {
+        Ok(Value::Bool(b)) => Ok(b),
+        Ok(_) => Err(ExecutionError::NoSuchOverload),
+        Err(err) => Err(err),
+    }
+}
+
+/// Resolves a call's arguments and bridges them into the `dyn Val` universe.
+///
+/// The env overload table and [`FunctionContext`] both still take
+/// `Cow<dyn Val>`; this is the only place [`Value::resolve_value`] touches the
+/// old universe.
+fn resolve_args<'a>(
+    args: &[Expression],
+    ctx: &Context,
+) -> Result<Vec<Cow<'a, dyn Val>>, ExecutionError> {
+    let mut out = Vec::with_capacity(args.len());
+    for arg in args {
+        let value = Value::resolve_value(arg, ctx)?;
+        out.push(Cow::Owned(TryInto::<Box<dyn Val>>::try_into(value)?));
+    }
+    Ok(out)
+}
+
+/// Whether the `dyn Val` receiver for `value` carries `op` at all.
+///
+/// The walker reports a failed binary operator two different ways: a receiver
+/// whose type has no such operator answers `UnsupportedBinaryOperator`, while a
+/// receiver that has the operator but was handed an incompatible right-hand
+/// side answers `NoSuchOverload`. [`Value`]'s native operators collapse both
+/// into `UnsupportedBinaryOperator`, so the split is reconstructed here from
+/// which types implement each capability trait in `common/types`.
+fn receiver_has_operator(op: &'static str, value: &Value) -> bool {
+    #[cfg(feature = "chrono")]
+    let temporal = matches!(value, Value::Duration(_) | Value::Timestamp(_));
+    #[cfg(not(feature = "chrono"))]
+    let temporal = false;
+
+    let numeric = matches!(value, Value::Int(_) | Value::UInt(_) | Value::Float(_));
+    match op {
+        "add" => {
+            numeric
+                || temporal
+                || matches!(value, Value::String(_) | Value::Bytes(_) | Value::List(_))
+        }
+        "sub" => numeric || temporal,
+        "mul" | "div" => numeric,
+        "rem" => matches!(value, Value::Int(_) | Value::UInt(_)),
+        _ => false,
+    }
+}
+
+fn binary_op(op: &'static str, call: &CallExpr, ctx: &Context) -> Result<Value, ExecutionError> {
+    let lhs = Value::resolve_value(&call.args[0], ctx)?;
+    let rhs = Value::resolve_value(&call.args[1], ctx)?;
+    let receiver_has = receiver_has_operator(op, &lhs);
+    let result = match op {
+        "add" => lhs + rhs,
+        "sub" => lhs - rhs,
+        "div" => lhs / rhs,
+        "mul" => lhs * rhs,
+        "rem" => lhs % rhs,
+        _ => unreachable!("unknown binary operator {op}"),
+    };
+    match result {
+        Err(ExecutionError::UnsupportedBinaryOperator(..)) if receiver_has => {
+            Err(ExecutionError::NoSuchOverload)
+        }
+        other => other,
+    }
+}
+
+fn compare_op(
+    call: &CallExpr,
+    ctx: &Context,
+    accept: impl FnOnce(Ordering) -> bool,
+) -> Result<Value, ExecutionError> {
+    let lhs = Value::resolve_value(&call.args[0], ctx)?;
+    let rhs = Value::resolve_value(&call.args[1], ctx)?;
+    let ordering = lhs
+        .partial_cmp(&rhs)
+        .ok_or(ExecutionError::NoSuchOverload)?;
+    Ok(Value::Bool(accept(ordering)))
+}
+
+fn value_negate(value: Value) -> Result<Value, ExecutionError> {
+    match value {
+        Value::Int(i) => i
+            .checked_neg()
+            .ok_or_else(|| ExecutionError::Overflow("negate", Value::Int(i), Value::Int(0)))
+            .map(Value::Int),
+        Value::Float(f) => Ok(Value::Float(-f)),
+        Value::Bool(b) => Ok(Value::Bool(!b)),
+        #[cfg(feature = "chrono")]
+        Value::Duration(d) => Ok(Value::Duration(-d)),
+        _ => Err(ExecutionError::NoSuchOverload),
+    }
+}
+
+/// Converts `value` into a map key.
+fn value_key(value: Value) -> Result<Key, ExecutionError> {
+    match value {
+        Value::Int(i) => Ok(Key::Int(i)),
+        Value::UInt(u) => Ok(Key::Uint(u)),
+        Value::Bool(b) => Ok(Key::Bool(b)),
+        Value::String(s) => Ok(Key::String(s)),
+        other => Err(ExecutionError::UnexpectedType {
+            got: other.type_of().to_string(),
+            want: "int|uint|bool|string".to_string(),
+        }),
+    }
+}
+
+/// `container[key]`, for every container the walker can index.
+fn value_index(container: &Value, key: &Value) -> Result<Value, ExecutionError> {
+    match container {
+        Value::List(list) => {
+            let idx = match key {
+                Value::Int(i) => *i as usize,
+                Value::UInt(u) => *u as usize,
+                other => {
+                    return Err(ExecutionError::UnexpectedType {
+                        got: other.type_of().to_string(),
+                        want: format!("{}|{}", ValueType::Int, ValueType::UInt),
+                    })
+                }
+            };
+            list.get(idx)
+                .ok_or_else(|| ExecutionError::IndexOutOfBounds(key.clone()))
+        }
+        Value::Map(map) => {
+            let k = value_key(key.clone())?;
+            map.get(&k)
+                .map(|v| v.into_owned())
+                .ok_or_else(|| ExecutionError::NoSuchKey(Arc::new(key_display(&k))))
+        }
+        #[cfg(feature = "structs")]
+        Value::Struct(s) => {
+            use crate::common::traits::Indexer;
+            let boxed: Box<dyn Val> = key.clone().try_into()?;
+            s.get(boxed.as_ref())
+                .and_then(|v| Value::try_from(v.as_ref()))
+        }
+        _ => Err(ExecutionError::NoSuchOverload),
+    }
+}
+
+/// The keys of `map`, as values a comprehension can bind.
+fn map_keys(map: &Map) -> Vec<Value> {
+    match map.storage() {
+        MapStorage::Object(entries) => entries.keys().map(key_value).collect(),
+        MapStorage::Record { schema, .. } => schema.keys.iter().map(key_value).collect(),
+    }
+}
+
+fn key_value(key: &Key) -> Value {
+    match key {
+        Key::Int(i) => Value::Int(*i),
+        Key::Uint(u) => Value::UInt(*u),
+        Key::Bool(b) => Value::Bool(*b),
+        Key::String(s) => Value::String(s.clone()),
+    }
+}
+
+fn key_display(key: &Key) -> String {
+    match key {
+        Key::Int(i) => i.to_string(),
+        Key::Uint(u) => u.to_string(),
+        Key::Bool(b) => b.to_string(),
+        Key::String(s) => s.as_str().to_string(),
+    }
+}
+
+/// `needle in container`.
+fn value_contains(container: &Value, needle: &Value) -> Result<bool, ExecutionError> {
+    match container {
+        Value::List(list) => Ok(list.contains(needle)),
+        Value::Map(map) => match value_key(needle.clone()) {
+            Ok(k) => Ok(map.contains_key(&k)),
+            Err(_) => Ok(false),
+        },
+        _ => Err(ExecutionError::NoSuchOverload),
+    }
+}
+
+/// The elements a comprehension iterates over.
+fn value_iter(value: &Value) -> Result<Vec<Value>, ExecutionError> {
+    match value {
+        Value::List(list) => Ok(list.to_vec()),
+        Value::Map(map) => Ok(map_keys(map)),
+        _ => Err(ExecutionError::NoSuchOverload),
+    }
 }
 
 fn bool<'a>(boolean: bool) -> Cow<'a, dyn Val> {
@@ -2180,6 +2739,10 @@ impl ops::Add<Value> for Value {
                 // `l` is replaced with a clone otherwise.
                 Arc::make_mut(&mut l).push_str(&r);
                 Ok(Value::String(l))
+            }
+            (Value::Bytes(mut l), Value::Bytes(r)) => {
+                Arc::make_mut(&mut l).extend_from_slice(&r);
+                Ok(Value::Bytes(l))
             }
             #[cfg(feature = "chrono")]
             (Value::Duration(l), Value::Duration(r)) => l

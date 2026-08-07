@@ -90,12 +90,19 @@ struct Evaluator {
     eval: fn(&Expression, &Context) -> Result<Value, ExecutionError>,
 }
 
-/// P2 adds `resolve_value` here as a second row. That is the whole change on
-/// this side — the corpus is already the shared expectation.
-const EVALUATORS: &[Evaluator] = &[Evaluator {
-    name: "walker",
-    eval: Value::resolve,
-}];
+/// `walker` is the `dyn Val` evaluator, `value-walker` the `Value`-native one
+/// that replaces it. Both are checked against the same frozen corpus, so every
+/// case here is a three-way agreement between the two and the data.
+const EVALUATORS: &[Evaluator] = &[
+    Evaluator {
+        name: "walker",
+        eval: Value::resolve,
+    },
+    Evaluator {
+        name: "value-walker",
+        eval: Value::resolve_value,
+    },
+];
 
 // ---------------------------------------------------------------------------
 // the canonical rendering — the ONLY code that reads a `Value`'s shape
@@ -402,6 +409,7 @@ const REQUIRED_COVERAGE: &[(&str, usize)] = &[
     ("macro_map", 3),
     ("macro_filter", 2),
     ("comprehension_nested", 1),
+    ("map_range", 3),
     ("type_fn", 3),
     ("dyn_fn", 1),
     ("conversion", 4),
@@ -409,6 +417,7 @@ const REQUIRED_COVERAGE: &[(&str, usize)] = &[
     ("regex", 1),
     ("optional", 4),
     ("opt_syntax", 2),
+    ("opt_select", 3),
     ("duration", 3),
     ("timestamp", 3),
     ("opaque", 2),

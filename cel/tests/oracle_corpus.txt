@@ -426,6 +426,23 @@ expr: xs.filter(x, x > 1).map(x, x * 10)
 feat: comprehension_nested macro_map macro_filter variable
 want: list[int(20), int(30), int(40)]
 
+# A comprehension whose range is a map iterates its KEYS. The order is the
+# map's iteration order, which is unspecified — `m.map(k, k)` is deliberately
+# NOT pinned here, because the two evaluators build their maps separately and
+# answer `[b, a]` and `[a, b]` for it. Only order-independent results belong.
+
+expr: m.all(k, k == "a" || k == "b")
+feat: macro_all map_range variable
+want: bool(true)
+
+expr: m.map(k, k).size()
+feat: macro_map map_range size variable
+want: int(2)
+
+expr: m.exists(k, k == "a")
+feat: macro_exists map_range variable
+want: bool(true)
+
 # ---------------------------------------------------------------------------
 # type() and dyn()
 # ---------------------------------------------------------------------------
@@ -558,6 +575,26 @@ want: optional.none
 expr: m[?"a"]
 feat: opt_syntax variable
 want: parse_error
+
+# `_?._` — optional field selection. The non-optional-operand arm propagates a
+# missing-field error rather than answering `optional.none`; the
+# optional-operand arm substitutes `optional.none` for the miss and keeps the
+# outer `Some`, so a miss nests one optional inside another.
+
+expr: m.?a
+feat: opt_syntax opt_select optional variable
+parse: optional
+want: optional(int(1))
+
+expr: m.?z
+feat: opt_syntax opt_select optional variable
+parse: optional
+want: error(NoSuchKey: z)
+
+expr: opt_some.?x
+feat: opt_syntax opt_select optional variable
+parse: optional
+want: optional(optional.none)
 
 # ---------------------------------------------------------------------------
 # Duration and timestamp

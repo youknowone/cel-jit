@@ -1,7 +1,9 @@
 use crate::common::types::{CelBool, CelBytes, CelDouble, CelInt, CelString, CelUInt, CEL_NULL};
 use crate::common::value::Val;
+use crate::objects::Value;
 use std::borrow::Cow;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 pub mod operators;
 
@@ -52,6 +54,24 @@ pub enum LiteralValue {
 }
 
 impl LiteralValue {
+    /// The [`Value`] this literal denotes.
+    ///
+    /// `String` and `Bytes` allocate here because the literal owns a plain
+    /// `std::string::String`/`Vec<u8>` while [`Value`] holds an `Arc`. Once
+    /// `to_val` is gone the literal can hold the `Arc` itself and this becomes
+    /// a refcount bump.
+    pub fn to_value(&self) -> Value {
+        match self {
+            LiteralValue::Boolean(b) => Value::Bool(*b.inner()),
+            LiteralValue::Bytes(b) => Value::Bytes(Arc::new(b.inner().to_vec())),
+            LiteralValue::Double(f) => Value::Float(*f.inner()),
+            LiteralValue::Int(i) => Value::Int(*i.inner()),
+            LiteralValue::Null => Value::Null,
+            LiteralValue::String(s) => Value::String(Arc::new(s.inner().to_string())),
+            LiteralValue::UInt(ui) => Value::UInt(*ui.inner()),
+        }
+    }
+
     pub fn to_val<'a>(&'a self) -> Cow<'a, dyn Val> {
         match &self {
             LiteralValue::Boolean(b) => Cow::Borrowed(b),
