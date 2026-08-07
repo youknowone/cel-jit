@@ -1533,11 +1533,20 @@ impl Value {
                         let args = resolve_args(&call.args, ctx)?;
                         let qualified_func = match &target.expr {
                             Expr::Ident(prefix) => {
-                                let qualified_name = format!("{prefix}.{}", call.func_name);
-                                if let Some(op) = ctx.env().find_overload(&qualified_name, &args) {
+                                // A namespaced call (`math.max(x)`) and a member
+                                // call on a variable (`s.startsWith(x)`) parse
+                                // identically, so every one of the latter asks
+                                // this question too and almost always gets no.
+                                // Asking it without joining the two names keeps
+                                // the answer free.
+                                if let Some(op) = ctx.env().find_qualified_overload(
+                                    prefix,
+                                    &call.func_name,
+                                    &args,
+                                ) {
                                     return op(args);
                                 }
-                                ctx.get_function(&qualified_name)
+                                ctx.get_qualified_function(prefix, &call.func_name)
                             }
                             _ => None,
                         };
@@ -2173,6 +2182,36 @@ mod tests {
     use crate::{objects::Key, Context, ExecutionError, Program, Value};
     use std::collections::HashMap;
     use std::sync::Arc;
+
+    /// `math.max(x)` and `s.startsWith(x)` parse the same, so the walker asks
+    /// whether a namespaced function exists before treating the target as a
+    /// receiver. Nothing covered that arm; these pin what it decides.
+    #[test]
+    fn namespaced_call_beats_a_same_named_variable() {
+        let mut ctx = Context::default();
+        ctx.add_function("math.max", |a: i64, b: i64| if a > b { a } else { b });
+        // A variable that shares the namespace's name, and one whose own name is
+        // a prefix of an unrelated stdlib function (`size`, `startsWith`).
+        ctx.add_variable_from_value("math", Value::from("not a namespace"));
+        ctx.add_variable_from_value("s", Value::from("hello world"));
+
+        // The namespaced function wins over the identically named variable.
+        let prog = Program::compile("math.max(2, 3)").unwrap();
+        assert_eq!(Ok(Value::Int(3)), prog.execute(&ctx));
+
+        // A member call on a variable is unaffected, including when its name is
+        // a prefix of a registered non-namespaced function.
+        let prog = Program::compile(r#"s.startsWith("hello")"#).unwrap();
+        assert_eq!(Ok(Value::Bool(true)), prog.execute(&ctx));
+
+        // An unregistered namespaced name falls through to the receiver path
+        // and reports the method, not the joined name.
+        let prog = Program::compile("math.min(2, 3)").unwrap();
+        assert!(matches!(
+            prog.execute(&ctx),
+            Err(ExecutionError::UndeclaredReference(name)) if name.as_str() == "min"
+        ));
+    }
 
     #[test]
     fn test_indexed_map_access() {

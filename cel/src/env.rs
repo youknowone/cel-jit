@@ -135,6 +135,18 @@ impl Env {
         }
     }
 
+    /// [`Env::find_overload`] for a namespaced name, without joining the two
+    /// parts into a `String` the lookup would immediately discard.
+    pub(crate) fn find_qualified_overload(
+        &self,
+        prefix: &str,
+        name: &str,
+        args: &[Value],
+    ) -> Option<Function> {
+        crate::common::get_qualified(&self.functions, prefix, name)
+            .and_then(|fn_decl| fn_decl.find_overload(false, args))
+    }
+
     /// Adds a member function overload to the environment.
     ///
     /// A member function is one that is called using the receiver syntax (e.g., `x.matches(y)`).

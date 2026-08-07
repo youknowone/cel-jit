@@ -296,6 +296,12 @@ impl FunctionRegistry {
     pub(crate) fn get(&self, name: &str) -> Option<&Function> {
         self.functions.get(name)
     }
+
+    /// [`FunctionRegistry::get`] for a namespaced name, without joining the two
+    /// parts into a `String` the lookup would immediately discard.
+    pub(crate) fn get_qualified(&self, prefix: &str, name: &str) -> Option<&Function> {
+        crate::common::get_qualified(&self.functions, prefix, name)
+    }
 }
 
 pub type Function = Box<dyn Fn(&mut FunctionContext) -> ResolveResult + Send + Sync>;

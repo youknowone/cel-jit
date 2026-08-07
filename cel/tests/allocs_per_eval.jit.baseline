@@ -57,7 +57,7 @@ walker/comprehension_scaling/50	20.000
 walker/comprehension_scaling/100	22.000
 walker/comprehension_scaling/500	26.000
 walker/string_operations	3.000
-walker/member_call_on_variable	9.000
+walker/member_call_on_variable	3.000
 walker/custom_function	2.000
 walker/real_world_policy	4.000
 bind/clone-only/1	0.000

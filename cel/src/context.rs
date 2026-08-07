@@ -164,6 +164,15 @@ impl<'a> Context<'a> {
         }
     }
 
+    /// [`Context::get_function`] for a namespaced name, without joining the two
+    /// parts into a `String` the lookup would immediately discard.
+    pub(crate) fn get_qualified_function(&self, prefix: &str, name: &str) -> Option<&Function> {
+        match self {
+            Context::Root { functions, .. } => functions.get_qualified(prefix, name),
+            Context::Child { parent, .. } => parent.get_qualified_function(prefix, name),
+        }
+    }
+
     pub fn add_function<T: 'static, F>(&mut self, name: &str, value: F)
     where
         F: IntoFunction<T> + 'static + Send + Sync,
