@@ -150,6 +150,10 @@ required-features = ["jit"]
 name = "rca125s"
 required-features = ["jit"]
 
+[[example]]
+name = "rca125p"
+required-features = ["jit"]
+
 [features]
 default = ["regex", "chrono"]
 structs = []
