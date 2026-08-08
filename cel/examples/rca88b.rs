@@ -131,6 +131,12 @@ std::thread_local! {
     /// is empty for every probe but S — capturing a backtrace inside the
     /// allocator costs far more than the thing being measured.
     static SITE_SIZES: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
+    /// Capture EVERY allocation's site, regardless of size. Probe T uses this to
+    /// attribute by site rather than by size: the jitframe's size is a function
+    /// of the artifact's frame slots, so arming on `200`/`216` would silently
+    /// stop matching the moment the trace shape moves and report zero rather
+    /// than a miss. Affordable only because a settled call is ~27 allocations.
+    static SITE_ALL: Cell<bool> = const { Cell::new(false) };
     /// Re-entrancy guard. `Backtrace::force_capture` allocates, and those
     /// allocations arrive straight back in `bump`; without this the first
     /// capture recurses until the stack ends.
@@ -171,12 +177,13 @@ fn bump(size: usize) {
     }
     // `borrow` never nests: the only re-entry is from the capture itself, and
     // that path takes `IN_CAPTURE` before it allocates.
-    let armed = SITE_SIZES
-        .try_with(|t| {
-            let t = t.borrow();
-            !t.is_empty() && t.contains(&size)
-        })
-        .unwrap_or(false);
+    let armed = SITE_ALL.try_with(Cell::get).unwrap_or(false)
+        || SITE_SIZES
+            .try_with(|t| {
+                let t = t.borrow();
+                !t.is_empty() && t.contains(&size)
+            })
+            .unwrap_or(false);
     if armed {
         record_site(size);
     }
@@ -2523,6 +2530,88 @@ fn interesting_frames(bt: &str) -> String {
         .join("\n")
 }
 
+/// Probe T. Re-prices #141's jitframe allocation AFTER #128 landed
+/// (`32f3a1b79f7`), which collapsed entries-per-call from n−1 to 1.
+///
+/// #138 priced this site per ENTRY and cel then paid it n−1 times per call, so
+/// the figure filed there is n−1 times the cost cel actually pays today. The
+/// question this settles is not "what does one entry cost" — that has not
+/// changed — but "how does the site scale in n now", which decides whether a
+/// backend free-list is worth building at all.
+///
+/// ⚠ Attribution is by SITE, not by size. The jitframe's byte size is a
+/// function of the artifact's frame slots (200 B / 216 B on `price + qty * 2`
+/// at n=4), so arming on those numbers would stop matching the moment the trace
+/// shape moved and would report a clean zero instead of a miss. Every
+/// allocation in one settled call is captured and grouped by stack instead;
+/// affordable precisely because that call is ~27 allocations.
+///
+/// ⛔ Allocation counts only. No ns/call anywhere in this probe — allocation
+/// counters are deterministic, wall-clock on a loaded box is not, and #101
+/// already established this fixture is load-sensitive enough to mislead.
+fn jitframe_share_after_128(label: &str, lowered: &LoweredF) {
+    println!("\nProbe T — {label}: what does the jitframe cost per CALL after #128?");
+    println!("  (allocation counts only — no timing is taken or reported)");
+
+    const WARM: usize = 600;
+    const THRESHOLD: u32 = 8;
+    // The jitframe is allocated here; matched on the frame, not on a byte size.
+    const JITFRAME_FN: &str = "run_compiled_code_inner";
+
+    println!(
+        "\n     n   allocs/call   jitframe/call   share   allocs/row   entries/call"
+    );
+    for n in [2usize, 4, 8, 16, 32, 64] {
+        let (price, qty) = flat_columns(n);
+        let columns = vec![Column::Int(&price), Column::Int(&qty)];
+
+        reset_persistent_state();
+        reset_jit_stats();
+        for _ in 0..WARM {
+            black_box(eval_batch_sum_f(lowered, &columns, n, THRESHOLD));
+        }
+        let (_, total) = metered(|| black_box(eval_batch_sum_f(lowered, &columns, n, THRESHOLD)));
+
+        // Capture every site for one settled call, then attribute.
+        SITES.with(|s| s.borrow_mut().clear());
+        SITE_ALL.with(|c| c.set(true));
+        black_box(eval_batch_sum_f(lowered, &columns, n, THRESHOLD));
+        SITE_ALL.with(|c| c.set(false));
+
+        let captured = SITES.with(|s| std::mem::take(&mut *s.borrow_mut()));
+        let jitframe = captured
+            .iter()
+            .filter(|(_, bt)| format!("{bt}").contains(JITFRAME_FN))
+            .count();
+
+        // The capture pass and the metered pass are different calls, so they can
+        // legitimately differ; if they do, the share below is not well defined.
+        if captured.len() as u64 != total {
+            println!(
+                "  {n:4}   ⛔ capture saw {} allocations, meter saw {total} — not the same call, \
+                 share not reported",
+                captured.len()
+            );
+            continue;
+        }
+        let share = 100.0 * jitframe as f64 / total as f64;
+        let per_row = total as f64 / n as f64;
+        // ⭐ Non-vacuity control. A flat allocation count across n is exactly what
+        // "no per-row allocation" looks like — and also exactly what "the rows
+        // never ran" looks like. `sum` must grow with n, and the compiled tier
+        // must actually be engaged, or the flatness above means nothing.
+        let sum = eval_batch_sum_f(lowered, &columns, n, THRESHOLD);
+        let loops = jit_stats().loops_compiled;
+        println!(
+            "  {n:4}   {total:11}   {jitframe:13}   {share:4.1}%   {per_row:10.2}   \
+             {jitframe:12}   sum={sum:?} loops={loops}"
+        );
+    }
+    println!(
+        "\n  entries/call == jitframe/call by construction: the site runs exactly once per entry."
+    );
+}
+
 fn main() {
     let schema = flat_schema();
     let arith = lower("price + qty * 2", &schema);
@@ -2562,6 +2651,13 @@ fn main() {
     // it needs `CARGO_PROFILE_RELEASE_DEBUG=2` to name anything.
     if std::env::var_os("RCA88B_SITES").is_some() {
         allocation_sites("arith price + qty * 2", &arith);
+        println!("\nload after probes:  {}", loadavg());
+        return;
+    }
+    // Probe T captures a backtrace per allocation like S, so it gets S's gate
+    // discipline and its `CARGO_PROFILE_RELEASE_DEBUG=2` requirement.
+    if std::env::var_os("RCA88B_SHARE").is_some() {
+        jitframe_share_after_128("arith price + qty * 2", &arith);
         println!("\nload after probes:  {}", loadavg());
         return;
     }
