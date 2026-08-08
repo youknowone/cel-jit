@@ -142,7 +142,7 @@
 //! | `RCA128_SHAPE` | `int` | `int` = `price + qty * 2`; `float` = `x * 1.5 + y` |
 //! | `RCA128_N` | 10 | rows per call |
 //! | `RCA128_CALLS` | 260 | calls after the oracle check |
-//! | `RCA128_REQUIRE` | `bridge` | `bridge` = fail unless one compiled; `loop` = fail unless the loop compiled |
+//! | `RCA128_REQUIRE` | `bridge` | `bridge` = fail unless a bridge compiled; `loop` = fail unless *something* compiled |
 //! | `RCA128_THRESHOLD` | 8 | trace threshold; moving it re-partitions n into peeled/flat (#134) |
 //!
 //! `RCA128_REQUIRE` exists because the probe's controls invert the postcondition.
@@ -152,6 +152,12 @@
 //! reporting that as a negative control would be a fabricated result. So the
 //! control demands `loops_compiled >= 1` instead, and the thing it is *for* is
 //! then free to be zero.
+//!
+//! ⚠ `loop` names the mode, not the artifact's shape. `loops_compiled` counts
+//! every compiled artifact, and a straight-line FINISH trace is one of them
+//! (#137) — so the check cannot tell a peeled loop from a flat trace, and does
+//! not try to. Existence is the whole postcondition. For shape, read `Label` /
+//! `Jump` out of a `MAJIT_LOG=1` dump; no counter carries it.
 
 use std::hint::black_box;
 
@@ -320,10 +326,13 @@ fn main() {
             calls + 1
         ),
         // A shape that never compiles trivially never bridges, so reporting it
-        // as a never-bridging control would be a fabricated negative.
+        // as a never-bridging control would be a fabricated negative. The check
+        // is existence, not shape: `loops_compiled` counts every compiled
+        // artifact, straight-line FINISH traces included (#137), so a flat cell
+        // satisfies it — correctly, because a flat cell did compile.
         "loop" => assert!(
             s.loops_compiled >= 1,
-            "no loop compiled in {} calls — a control that never compiles \
+            "nothing compiled in {} calls — a control that never compiles \
              cannot witness anything about bridges",
             calls + 1
         ),
