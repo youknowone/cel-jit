@@ -161,12 +161,39 @@ fn timer_pair_ns() -> Option<f64> {
     (per_pair > 0.0).then_some(per_pair)
 }
 
-/// Least-squares fit of `total = intercept + slope * n`.
+struct Fit {
+    intercept: f64,
+    slope: f64,
+    worst_abs: f64,
+    worst_rel: f64,
+    /// The n at which the worst residual occurred, and that point's LEVERAGE on
+    /// the slope. Printed together because the pair is the whole point — see below.
+    worst_at: f64,
+    worst_lev: f64,
+    /// The highest-leverage n, its leverage, and the relative residual THERE.
+    lever_at: f64,
+    lever_lev: f64,
+    lever_rel: f64,
+}
+
+/// Least-squares fit of `total = intercept + slope * n`, reported WITH LEVERAGE.
 ///
-/// Returns `(intercept, slope, worst_abs_residual, worst_rel_residual)`. The
-/// residuals are returned rather than kept private because **a slope quoted
-/// without its fit quality is the two-point trap wearing more digits.**
-fn fit(points: &[(f64, f64)]) -> (f64, f64, f64, f64) {
+/// ⛔⛔⛔ A bare worst-residual is a MIS-AIMED diagnostic, and this probe proved it
+/// on its own data. In simple OLS a point's influence on the slope is
+/// `h = (x - x̄)² / Σ(x - x̄)²`, so for the default ladder {10,30,100,300,1000}
+/// (x̄ = 288) the leverages are 11.3 / 9.7 / 5.2 / **0.0** / **73.9** %.
+///
+/// Measured 2026-08-08: the worst residual landed on **n=300 in 15 of 17 rounds**
+/// — the point with **zero** leverage, which mathematically cannot move the slope.
+/// Meanwhile n=1000, which owns 74% of it, excursed 8.0→11.2 µs and the fit simply
+/// FOLLOWED it, absorbing the excursion into the slope and leaving a small residual
+/// behind. So the statistic screamed about the harmless point and stayed silent
+/// about the only one that changes the answer.
+///
+/// ⇒ **A goodness-of-fit number that ignores leverage flags the point that cannot
+/// matter and hides the point that does.** Both are reported now, and the
+/// high-leverage residual is the one to read.
+fn fit(points: &[(f64, f64)]) -> Fit {
     let k = points.len() as f64;
     let sx: f64 = points.iter().map(|p| p.0).sum();
     let sy: f64 = points.iter().map(|p| p.1).sum();
@@ -175,16 +202,48 @@ fn fit(points: &[(f64, f64)]) -> (f64, f64, f64, f64) {
     let denom = k * sxx - sx * sx;
     let slope = (k * sxy - sx * sy) / denom;
     let intercept = (sy - slope * sx) / k;
-    let mut worst_abs: f64 = 0.0;
-    let mut worst_rel: f64 = 0.0;
+
+    let xbar = sx / k;
+    let sst: f64 = points.iter().map(|p| (p.0 - xbar).powi(2)).sum();
+    let leverage = |x: f64| {
+        if sst > 0.0 {
+            (x - xbar).powi(2) / sst
+        } else {
+            0.0
+        }
+    };
+
+    let mut f = Fit {
+        intercept,
+        slope,
+        worst_abs: 0.0,
+        worst_rel: 0.0,
+        worst_at: 0.0,
+        worst_lev: 0.0,
+        lever_at: 0.0,
+        lever_lev: 0.0,
+        lever_rel: 0.0,
+    };
+    let mut best_lev = -1.0;
     for &(x, y) in points {
         let pred = intercept + slope * x;
-        worst_abs = worst_abs.max((y - pred).abs());
-        if y != 0.0 {
-            worst_rel = worst_rel.max(((y - pred) / y).abs());
+        let abs = (y - pred).abs();
+        let rel = if y != 0.0 { abs / y.abs() } else { 0.0 };
+        if abs > f.worst_abs {
+            f.worst_abs = abs;
+            f.worst_rel = rel;
+            f.worst_at = x;
+            f.worst_lev = leverage(x);
+        }
+        let lev = leverage(x);
+        if lev > best_lev {
+            best_lev = lev;
+            f.lever_at = x;
+            f.lever_lev = lev;
+            f.lever_rel = rel;
         }
     }
-    (intercept, slope, worst_abs, worst_rel)
+    f
 }
 
 /// Path, size and mtime of the binary **as it is running**, so the label travels
@@ -309,29 +368,41 @@ fn main() {
             );
         }
 
-        let (ci, cs, ca, cr) = fit(&clean_pts);
-        let (ni, ns_, na, nr) = fit(&never_pts);
-        let (pi, ps, pa, pr) = fit(&comp_pts);
-        println!(
-            "[rca111][fit]   {att} round={round} clean = {ci:.0} ns + {cs:.2} ns/row \
-             (worst residual {ca:.0} ns = {:.1}%)",
-            cr * 100.0
-        );
-        println!(
-            "[rca111][fit]   {att} round={round} never = {ni:.0} ns + {ns_:.2} ns/row \
-             (worst residual {na:.0} ns = {:.1}%)",
-            nr * 100.0
-        );
-        println!(
-            "[rca111][fit]   {att} round={round} comp  = {pi:.0} ns + {ps:.2} ns/row \
-             (worst residual {pa:.0} ns = {:.1}%)  ⚠ accumulating: this arm crosses \
-             its bridge during the sweep",
-            pr * 100.0
-        );
+        let c = fit(&clean_pts);
+        let nv = fit(&never_pts);
+        let cp = fit(&comp_pts);
+        // `lever` is the residual at the point that OWNS the slope; `worst` is the
+        // loudest one, which is routinely the point with no influence at all.
+        for (label, f, note) in [
+            ("clean", &c, ""),
+            ("never", &nv, ""),
+            (
+                "comp ",
+                &cp,
+                "  ⚠ accumulating: this arm crosses its bridge during the sweep",
+            ),
+        ] {
+            println!(
+                "[rca111][fit]   {att} round={round} {label} = {:.0} ns + {:.2} ns/row \
+                 (lever n={:.0} lev={:.0}% resid {:.1}% | worst n={:.0} lev={:.0}% \
+                 resid {:.0} ns = {:.1}%){note}",
+                f.intercept,
+                f.slope,
+                f.lever_at,
+                f.lever_lev * 100.0,
+                f.lever_rel * 100.0,
+                f.worst_at,
+                f.worst_lev * 100.0,
+                f.worst_abs,
+                f.worst_rel * 100.0
+            );
+        }
         println!(
             "[rca111][tax]   {att} round={round} per-row tax = {:.2}x  \
-             (never {ns_:.2} ns/row / clean {cs:.2} ns/row)",
-            ns_ / cs
+             (never {:.2} ns/row / clean {:.2} ns/row)",
+            nv.slope / c.slope,
+            nv.slope,
+            c.slope
         );
     }
 
