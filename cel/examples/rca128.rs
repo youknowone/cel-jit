@@ -143,6 +143,7 @@
 //! | `RCA128_N` | 10 | rows per call |
 //! | `RCA128_CALLS` | 260 | calls after the oracle check |
 //! | `RCA128_REQUIRE` | `bridge` | `bridge` = fail unless one compiled; `loop` = fail unless the loop compiled |
+//! | `RCA128_THRESHOLD` | 8 | trace threshold; moving it re-partitions n into peeled/flat (#134) |
 //!
 //! `RCA128_REQUIRE` exists because the probe's controls invert the postcondition.
 //! The default run is worthless if it never reached the transition, so it demands
@@ -161,6 +162,12 @@ use cel::Program;
 
 /// #122's default arm: the loop compiles inside call 1 at n=10, so the first
 /// bridge lands at call 200 and the step at call 201.
+///
+/// `RCA128_THRESHOLD` overrides it. #134's law is arithmetic in this number —
+/// the optimizer peels unless the back-edge counter trips on a batch boundary,
+/// i.e. unless `(n-1)` divides the threshold — so moving it re-partitions n
+/// into flat and grown, which is the only way to tell that law apart from any
+/// property of the expression.
 const THRESHOLD: u32 = 8;
 
 fn env_usize(key: &str, default: usize) -> usize {
@@ -168,6 +175,15 @@ fn env_usize(key: &str, default: usize) -> usize {
         Ok(v) => v
             .parse()
             .unwrap_or_else(|e| panic!("{key}={v:?} is not a usize: {e}")),
+        Err(_) => default,
+    }
+}
+
+fn env_u32(key: &str, default: u32) -> u32 {
+    match std::env::var(key) {
+        Ok(v) => v
+            .parse()
+            .unwrap_or_else(|e| panic!("{key}={v:?} is not a u32: {e}")),
         Err(_) => default,
     }
 }
@@ -193,6 +209,7 @@ fn main() {
     let n = env_usize("RCA128_N", 10);
     let calls = env_usize("RCA128_CALLS", 260);
     let require = std::env::var("RCA128_REQUIRE").unwrap_or_else(|_| "bridge".to_string());
+    let threshold = env_u32("RCA128_THRESHOLD", THRESHOLD);
 
     // Both column sets are built unconditionally so each borrow outlives the
     // closure below; only one is ever read.
@@ -232,21 +249,36 @@ fn main() {
     // below describes a miscompile rather than an exit path. The int shape has a
     // clean-tier door; the float shape has none, so its oracle is the same door
     // at `threshold = u32::MAX`, which engages majit and never compiles.
+    //
+    // The comparison is repeated on EVERY call, not just once before the loop.
+    // The pre-loop call is call 0: nothing is compiled yet, no guard has failed
+    // and no bridge exists, so a single check there is blind to every tier this
+    // binary exists to observe — a wrong answer that only appears once the
+    // artifact is entered, or once a bridge is attached at `trace_eagerness`,
+    // would leave it green.
     let mut call: Box<dyn FnMut()> = match shape.as_str() {
         "int" => {
             let want = clean_batch_sum_f(&lowered, &columns, n);
-            let got = eval_batch_sum_f(&lowered, &columns, n, THRESHOLD);
+            let got = eval_batch_sum_f(&lowered, &columns, n, threshold);
             assert_eq!(got, want, "jit tier disagrees with clean tier");
-            Box::new(|| {
-                black_box(eval_batch_sum_f(&lowered, &columns, n, THRESHOLD));
+            Box::new(move || {
+                assert_eq!(
+                    black_box(eval_batch_sum_f(&lowered, &columns, n, threshold)),
+                    want,
+                    "jit tier disagrees with clean tier"
+                );
             })
         }
         _ => {
             let want = eval_batch_sum_float(&lowered, &columns, n, u32::MAX);
-            let got = eval_batch_sum_float(&lowered, &columns, n, THRESHOLD);
+            let got = eval_batch_sum_float(&lowered, &columns, n, threshold);
             assert_eq!(got, want, "jit tier disagrees with the never-compiles tier");
-            Box::new(|| {
-                black_box(eval_batch_sum_float(&lowered, &columns, n, THRESHOLD));
+            Box::new(move || {
+                assert_eq!(
+                    black_box(eval_batch_sum_float(&lowered, &columns, n, threshold)),
+                    want,
+                    "jit tier disagrees with the never-compiles tier"
+                );
             })
         }
     };
