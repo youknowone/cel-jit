@@ -43,7 +43,21 @@
 //!
 //! Both branches are informative and neither is the one this probe is "for".
 //!
-//! ## Observed (2026-08-08, 700 calls, n = 2/3/5/8/10, BOTH backends IDENTICAL)
+//! ## Observed — PRE-#128-FIX (2026-08-08, 700 calls, n = 2/3/5/8/10, BOTH backends IDENTICAL)
+//!
+//! ⛔ **This census was taken BEFORE majit `7c141d84175`, the fix it motivated.** Every
+//! regime below describes the tree #128 was filed against, not the current one:
+//! post-fix a back-edge FINISH returns from the portal instead of resuming at
+//! `target_pc`, so `entries/call` and the settled onsets both move. The controls
+//! section further down already labels this table "the pre-fix 700-call census";
+//! the heading did not, so a reader arriving here first had no marker at all.
+//! Post-fix onsets are recorded on #150 (203/202/301/200/349/199, non-monotone).
+//!
+//! ⚠ SHAs in this file are **majit** (the pyre-wasmi repo), not cel-jit, and both
+//! were rewritten by the 2026-08-09 rebase of `cel` onto `origin/main`. They are
+//! restated here at their post-rebase spellings, each verified by
+//! `merge-base --is-ancestor` and identical `patch-id`. A dead SHA still
+//! `git show`s off the old branch, so "it resolves" is not a check.
 //!
 //! Regimes, as emitted (`fi` = `fail_index`; `4294967295` = `u32::MAX`):
 //!
@@ -81,7 +95,35 @@
 //!   no internal back edge to convert. Its one exit is already a `finish`, so
 //!   `gfails = 0`, so the bridge clock never ticks and it can never bridge.
 //!
-//! ## The exit-kind decomposition this yields
+//! ## The exit-kind decomposition this yields — ⛔ FITTED TO IMPORTED FIGURES, NOT MEASURED HERE
+//!
+//! ⛔⛔⛔ **THIS BINARY CANNOT MEASURE A SINGLE NUMBER IN THE TABLE BELOW.** It has
+//! no `#[global_allocator]`, and it says of itself that "this probe times
+//! nothing" (see the run loop). It measures the **exit stream** — `entries/call`,
+//! exit kinds, `is_finish`, `fail_index` — and that is the whole of #128's
+//! evidence and is sound. The `F`/`G`/`C` constants are **allocation** counts
+//! (`F=23` and `C=4` are #125's allocation model, quoted at the top of this
+//! file), imported from other probes' results and fitted here.
+//!
+//! ⛔⛔ **AND "18 of 19 reproduce exactly" IS SELF-CONSISTENCY, NOT VALIDATION.**
+//! The three constants were fitted *to* those same 19 figures, so an exact
+//! reproduction is what a 3-parameter fit over 19 mutually-derived points does.
+//! It says the inputs are consistent with each other under this model. It says
+//! nothing about whether the inputs are right — and the residual **structurally
+//! cannot** tell you: rca125s' known stack-capture arming costs **+1 per compiled
+//! exit**, and a per-exit inflation lands entirely in `F` and `G` (both per-exit)
+//! and not at all in `C` (per call). Inflated inputs would still fit 18 of 19.
+//!
+//! ⚠ **Provenance is UNRECOVERABLE from this file, which is the defect.** The
+//! phrase "published figures" below names no source, no probe and no tree. What
+//! is checkable is the vintage: this table was written 2026-08-08 02:53, and the
+//! rca125s attribution work that surfaced the +1 is 19:11–19:25 the same day — so
+//! **the inflation was not known when these constants were fitted** and nobody
+//! could have corrected for it. `F(cranelift)=23` happens to equal the value #141
+//! later corrected *to* (rca125s read 24), but `G=65` has no such cross-check, and
+//! a table mixing corrected and uncorrected inputs would look exactly this clean.
+//! ⇒ **Do not cite `F`/`G` as measured allocation prices.** Re-derive them against
+//! a named probe and a named tree, or quote the exit-stream results only.
 //!
 //! Three constants per backend reproduce **18 of 19** published per-call and
 //! per-row figures exactly (`F` = an entry ending in `finish`, `G` = an entry
@@ -97,8 +139,17 @@
 //! CL-DYN delta of **3 is per compiled ENTRY** (it is 3 in both `F` and `G`, and
 //! 0 in `C`) rather than per back edge or per call.
 //!
+//! ⭐ The CL-DYN delta is the one reading here that **survives the inflation
+//! question by construction**: a `+1` applied to every exit on both backends
+//! cancels in the difference, so "3 per compiled entry" holds whether or not the
+//! inputs were corrected. It is also the claim that does not depend on the fit.
+//!
 //! ⛔ The one cell that does not reproduce: n=10 dynasm mid-regime reads 24.580
 //! where this predicts 22.600. Every other cell, both backends, is exact.
+//! ⚠ And "mid-regime" is the tell — a mid-regime cell is a transient average, so
+//! this residual may be a window artifact rather than a model failure. See the
+//! `RCA128_SETTLED` section: that detector exists because these very windows
+//! close inside live transients.
 //!
 //! ⛔ It also corrects the reading that "the compiled entry price stops being
 //! paid": per exit a guard failure (65) costs ~2.8x a finish (23), so the entry
@@ -124,7 +175,7 @@
 //! ⭐ **The cause is known and was deliberate: #133.** `OP_RETURN_F` reached for
 //! the inherent `f64::to_bits()`, which `majit-macros` did not recognise as the
 //! bitcast intrinsic, so the dispatch arm degraded to an abort stub and the
-//! bridge trace aborted on reaching it. Fixed in `3b3bb8f15c5`; float now
+//! bridge trace aborted on reaching it. Fixed in majit `84155df5133`; float now
 //! compiles its bridge like the other shapes, and its `gfails` fell 262 -> 201,
 //! landing exactly on the int shape's figure.
 //!
