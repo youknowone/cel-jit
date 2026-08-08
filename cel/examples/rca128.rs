@@ -144,6 +144,7 @@
 //! | `RCA128_CALLS` | 260 | calls after the oracle check |
 //! | `RCA128_REQUIRE` | `bridge` | `bridge` = fail unless a bridge compiled; `loop` = fail unless *something* compiled |
 //! | `RCA128_THRESHOLD` | 8 | trace threshold; moving it re-partitions n into peeled/flat (#134) |
+//! | `RCA128_SETTLED` | `require` | `require` = fail unless the window closes in the settled regime; `allow` = label the reading and continue |
 //!
 //! `RCA128_REQUIRE` exists because the probe's controls invert the postcondition.
 //! The default run is worthless if it never reached the transition, so it demands
@@ -158,6 +159,70 @@
 //! (#137) — so the check cannot tell a peeled loop from a flat trace, and does
 //! not try to. Existence is the whole postcondition. For shape, read `Label` /
 //! `Jump` out of a `MAJIT_LOG=1` dump; no counter carries it.
+//!
+//! ## `RCA128_SETTLED`: the window can close in a regime the run is still leaving
+//!
+//! `RCA128_CALLS` defaults to 260, and **260 is the wrong window for some `n`**.
+//! The regime table above locates the settled onset per `n` — 2 -> call 8,
+//! 3 -> 204, 5 -> 502, 8 -> 401, 10 -> 400 — so on the tree that census was taken
+//! on, the default closed *inside* a live transient for n = 5, 8 and 10 and
+//! printed a mid-regime value with nothing marking it as one.
+//!
+//! ⛔ **Widening the default is not the fix.** Settling is *not monotone in `n`*
+//! (n=5 bridges sooner than n=8 yet settles later — it needs more bridges), so
+//! every constant is wrong for some `n`, and a bigger one just relocates the
+//! silent failure. ⭐ And locating the onsets would only produce a survey that
+//! ages: the post-fix onsets already differ from the pre-fix ones above.
+//!
+//! So the probe answers it **per run**. The settled regime is exactly "`bridges`
+//! stable and `guard_failures` frozen", which is a property this binary can read
+//! directly, so it reads it:
+//!
+//! > **If the window closes while the counters are still moving, say so, or refuse.**
+//!
+//! ### Why the TAIL, and why "distance from the last change" rather than a fraction
+//!
+//! ⚠ **n=3 is the design constraint.** It settles at call 204, so a 260-call
+//! window *is* settled at the end yet *contains* a transition. Testing the whole
+//! run would refuse it — a false refusal on a perfectly good reading. The test
+//! therefore has to look at the tail only.
+//!
+//! ⭐ But "the last X% of the window" is the wrong shape for the tail, because it
+//! makes the verdict a cliff: at 260 calls a 20% tail starts at 209 and n=3 passes,
+//! a 25% tail starts at 196 and n=3 **false-refuses**. That is a constant tuned to
+//! one fixture cell — the very defect this section exists to remove.
+//!
+//! Measuring **how long the counters have been quiet** removes the cliff, because
+//! it is the quantity the controls actually separate on. At the default 260:
+//!
+//! | n | last counter movement | quiet for | verdict |
+//! |---|---|---|---|
+//! | 2 | never moves (`gfails` 0, no bridge) | 260 | ✅ settled |
+//! | 3 | call ~203 | ~57 | ✅ settled |
+//! | 5 | every call (mid regime `102-501`) | **0** | ⛔ refuse |
+//! | 8 | every call (mid regime `201-400`) | **0** | ⛔ refuse |
+//! | 10 | every call (mid regime `201-399`) | **0** | ⛔ refuse |
+//!
+//! The passing and refusing cells are separated by **57 against 0**, so the
+//! threshold is nowhere near either group and no cell is close to flipping. The
+//! choice is `tail = calls / 10` (26 at the default) — **stated here rather than
+//! left implicit in a `>=`**, and the table above is the room it has on each side.
+//!
+//! ### Controls, all collected before the detector was designed
+//!
+//! * **Negative (must refuse), 5 cells**: the pre-fix 700-call census above, read
+//!   at 260 — n=2 pass, n=3 pass, n=5/8/10 refuse.
+//! * **Positive (must pass), 9 cells**: `sizes`' settled sweep at
+//!   n = 2/3/4/5/8/9/16/32/64, where `bridges` and `gfails` are identical at call
+//!   600 and call 700. That puts the last movement at or before 600, so on a
+//!   700-call run every cell is quiet for >= 100 against a 70-call tail.
+//!
+//! ⭐ A diagnostic proved by its own fixture proves nothing; both control sets
+//! predate this code.
+//!
+//! ⚠ **Scope.** This certifies *these two counters* over *the reported window*. A
+//! transient in cost/call or allocations/call is entirely compatible with a pass,
+//! and so is a bridge landing past the end of the run.
 
 use std::hint::black_box;
 
@@ -216,6 +281,7 @@ fn main() {
     let calls = env_usize("RCA128_CALLS", 260);
     let require = std::env::var("RCA128_REQUIRE").unwrap_or_else(|_| "bridge".to_string());
     let threshold = env_u32("RCA128_THRESHOLD", THRESHOLD);
+    let settled_mode = std::env::var("RCA128_SETTLED").unwrap_or_else(|_| "require".to_string());
 
     // Both column sets are built unconditionally so each borrow outlives the
     // closure below; only one is ever read.
@@ -291,12 +357,39 @@ fn main() {
 
     // The markers go to stderr so they interleave with the `[portal-rca]` lines
     // in one stream; two streams would need timestamps to re-order.
+    //
+    // The counters are sampled after every call, so `last_change` is the call at
+    // which the artifact last moved rather than a bound inferred from the two
+    // endpoints. Sampling every call is safe *here* in a way it is not in
+    // `rca88b`'s Probe J: that one keeps `jit_stats()` out of the inner path to
+    // keep a timed sequence identical to an uninstrumented one, and this probe
+    // times nothing — it already runs a full oracle comparison per call.
+    let mut prev = {
+        let s = jit_stats();
+        (s.bridges_compiled, s.guard_failures)
+    };
+    // 0 = "never moved", which is the settled-from-the-start case (n=2).
+    let mut last_change = 0usize;
     for k in 1..=calls {
         eprintln!("@@@CALL {k}");
         call();
+        let s = jit_stats();
+        let now = (s.bridges_compiled, s.guard_failures);
+        if now != prev {
+            last_change = k;
+            prev = now;
+        }
     }
     eprintln!("@@@CALL {}", calls + 1);
     drop(call);
+
+    // The settled regime is `bridges` stable and `guard_failures` frozen, so
+    // "how long have both been quiet" is the whole test. A fraction-of-window
+    // tail would be a cliff at n=3 (see the module docs); this is not, because
+    // the controls separate 57 against 0 on exactly this quantity.
+    let tail = (calls / 10).max(1);
+    let quiet_for = calls - last_change;
+    let settled = quiet_for >= tail;
 
     let s = jit_stats();
     // Printed to stderr so the whole record is one file, and stated as a
@@ -308,7 +401,11 @@ fn main() {
         // truncated or wrapped line still carries it. `env!` not `option_env!`
         // — a missing token must fail the build, not vanish from the line and
         // leave the reading looking unqualified but trustworthy.
-        "majit={} shape={shape} calls={} n={n} loops={} bridges={} gfails={} aborts={}",
+        // `settled` qualifies every counter on this line the same way `majit=`
+        // does: a mid-regime reading is a real plateau, not noise, so it is
+        // labelled rather than suppressed.
+        "majit={} shape={shape} calls={} n={n} loops={} bridges={} gfails={} aborts={} \
+         settled={settled} last_change={last_change} quiet_for={quiet_for} tail={tail}",
         env!("CEL_MAJIT_PROVENANCE"),
         calls + 1,
         s.loops_compiled,
@@ -337,5 +434,32 @@ fn main() {
             calls + 1
         ),
         other => panic!("RCA128_REQUIRE={other:?}; expected `bridge` or `loop`"),
+    }
+
+    // Refusing rather than widening `RCA128_CALLS`: settling is not monotone in
+    // `n`, so every constant window is wrong for some `n`, and a wrong refusal
+    // is auditable where a wrong number is not. `allow` exists because studying
+    // a transient is a legitimate use of this probe — the same reason
+    // `RCA128_REQUIRE` has a second mode — but it must be asked for, so that a
+    // mid-regime reading can never be produced by default and read as settled.
+    match settled_mode.as_str() {
+        "require" => assert!(
+            settled,
+            "the {calls}-call window closed while the artifact was still moving: \
+             counters last changed at call {last_change}, quiet for only \
+             {quiet_for} of a required {tail}. This is a MID regime, not the \
+             settled one. Re-run with a larger RCA128_CALLS, or pass \
+             RCA128_SETTLED=allow if the transient is what you are measuring."
+        ),
+        "allow" => {
+            if !settled {
+                eprintln!(
+                    "@@@WARN rca128: NOT SETTLED — counters last changed at call \
+                     {last_change}, quiet for {quiet_for} of {tail}; every figure \
+                     above describes a mid regime"
+                );
+            }
+        }
+        other => panic!("RCA128_SETTLED={other:?}; expected `require` or `allow`"),
     }
 }
