@@ -162,9 +162,14 @@ fn main() {
     let portal = std::env::var_os("PYRE_PORTAL_RCA").is_some();
 
     let schema = flat_schema();
-    // Same expression as `rca125s`. `threshold` is a parameter, not a name in
-    // the expression — the schema declares only `price` and `qty`.
-    let lowered = lower("price * qty", &schema);
+    // ⛔⛔ THE EXPRESSION IS PART OF THE FIXTURE AND F/G DEPEND ON IT.
+    // `rca128` publishes F=23 G=65 C=4 (cranelift) for ITS shape, which is
+    // `price + qty * 2` (rca128.rs:175) — two operations. `rca125s` and this
+    // probe default to `price * qty`, one operation. Quoting one fixture's
+    // `G - F` against the other's is a fixture mismatch, not a correction — so
+    // the expression is settable and is printed in the config line.
+    let expr = std::env::var("RCA125P_EXPR").unwrap_or_else(|_| "price * qty".to_string());
+    let lowered = lower(&expr, &schema);
     let (price, qty) = flat_columns(n);
     let columns = vec![Column::Int(&price), Column::Int(&qty)];
 
@@ -175,7 +180,7 @@ fn main() {
     // with majit's own `[portal-rca]` lines in ONE stream. Reconstructing the
     // interleaving from two separate streams would be a guess about buffering.
     eprintln!(
-        "[rca125p][config] n={n} threshold={threshold} calls={calls} \
+        "[rca125p][config] n={n} threshold={threshold} calls={calls} expr={expr:?} \
          arm={} portal_rca={portal}",
         if portal {
             "B (exit kinds)"
