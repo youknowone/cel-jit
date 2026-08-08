@@ -298,7 +298,12 @@ fn main() {
     // `RCA128_REQUIRE`, the entries/call columns answer a different question
     // than the one asked.
     let summary = format!(
-        "shape={shape} calls={} n={n} loops={} bridges={} gfails={} aborts={}",
+        // `majit=` FIRST: provenance qualifies every field after it, so a
+        // truncated or wrapped line still carries it. `env!` not `option_env!`
+        // — a missing token must fail the build, not vanish from the line and
+        // leave the reading looking unqualified but trustworthy.
+        "majit={} shape={shape} calls={} n={n} loops={} bridges={} gfails={} aborts={}",
+        env!("CEL_MAJIT_PROVENANCE"),
         calls + 1,
         s.loops_compiled,
         s.bridges_compiled,
