@@ -106,17 +106,50 @@
 //! pre-bridge exactly when `23(n-1) < 65`, i.e. n < 3.8 — which is why n=2 and
 //! n=3 improve and n>=5 degrades.
 //!
-//! ## The negative control (`RCA128_SHAPE=float`)
+//! ## `RCA128_SHAPE=float` — ⛔ NO LONGER THE NEVER-BRIDGING CONTROL
 //!
-//! `x * 1.5 + y` holds **1 entry/call with one counted guard failure for all 260
-//! calls**, both backends — no burst, no `finish` exits, no regime change. A
-//! shape that never bridges never converts its back edge, which is what a
-//! bridge-triggered mechanism requires.
+//! ⛔ **The property this control was SELECTED for is gone, and it was retired by
+//! a fix rather than by drift.** What it used to say — and what the paragraph
+//! here used to assert — was:
 //!
-//! ⭐ And it says why float never bridges: `loops_aborted` goes **0 -> 1 between
-//! call 196 and call 206**, i.e. at the threshold. The bridge trace is attempted
-//! and ABORTS. That is one cause for all three of its properties — the threshold
-//! fires, no bridge compiles, and the cost does not persist.
+//! > `x * 1.5 + y` holds 1 entry/call with one counted guard failure for all 260
+//! > calls, both backends; `loops_aborted` goes 0 -> 1 between call 196 and 206,
+//! > i.e. the bridge trace is attempted at the threshold and ABORTS; no bridge
+//! > compiles in 6065 calls.
+//!
+//! **Every one of those is now false.** Measured 3/3 (calls=260 twice, 700 once),
+//! cranelift: `loops=1 bridges=1 gfails=201 aborts=0` — and at 700 calls that row
+//! is **byte-identical to the `int` row**.
+//!
+//! ⭐ **The cause is known and was deliberate: #133.** `OP_RETURN_F` reached for
+//! the inherent `f64::to_bits()`, which `majit-macros` did not recognise as the
+//! bitcast intrinsic, so the dispatch arm degraded to an abort stub and the
+//! bridge trace aborted on reaching it. Fixed in `3b3bb8f15c5`; float now
+//! compiles its bridge like the other shapes, and its `gfails` fell 262 -> 201,
+//! landing exactly on the int shape's figure.
+//!
+//! ⛔⛔ **Do not read this as weakening #128.** Two things keep it separate:
+//! * #128's evidence is `entries/call`, the exit-stream census over n = 2/3/5/8/10,
+//!   and a three-config backend A/B. **None of it runs through this shape.**
+//! * #133 pre-registered the falsifier and it did not fire: with the bitcast
+//!   recognition OFF, float still read `bridges=0` *after* `32f3a1b79f7`. So the
+//!   abort was proven **independent of #128's fix**, before this shape changed.
+//!
+//! ⇒ What died is one *corroborating* sentence — "a shape that never bridges
+//! never converts its back edge" — which structurally cannot be run against a
+//! shape that bridges. ⚠ Anyone citing it is citing #133's pre-fix state.
+//!
+//! ## What `float` is still good for
+//!
+//! It remains a valid **null** control for #128's fix: 1 entry/call, flat across
+//! 260 calls, unmoved by the bridge. That is a different claim from "never
+//! bridges" and it is the one to cite. It is also the shape whose trace is a
+//! genuine **peeled loop** (`Label` + `Jump` on `LoopTargetDescr`, verified from a
+//! `MAJIT_LOG=1` dump in #133) — so it is the positive case for #137's caution
+//! that `loops_compiled` cannot tell a peeled loop from a straight-line trace.
+//!
+//! ⚠ There is currently **no never-bridging control in this file.** If one is
+//! needed, it has to be found and re-verified, not assumed — and see #155.
 //!
 //! ## Why n=10 and why a separate file
 //!
