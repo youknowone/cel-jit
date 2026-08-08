@@ -110,10 +110,10 @@ use std::cell::{Cell, RefCell};
 use std::hint::black_box;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use cel::Program;
 use cel::majit::bytecode::float_bank::{jit_stats, reset_jit_stats, reset_persistent_state};
-use cel::majit::bytecode::{Column, clean_batch_sum_f, eval_batch_sum_f};
-use cel::majit::lower::{LoweredF, Schema, ValType, lower_typed};
+use cel::majit::bytecode::{clean_batch_sum_f, eval_batch_sum_f, Column};
+use cel::majit::lower::{lower_typed, LoweredF, Schema, ValType};
+use cel::Program;
 
 /// Allocations of exactly `s` bytes land in bucket `s`; anything larger lands in
 /// bucket 0. A `HashMap` keyed by size would allocate from inside the allocator,
