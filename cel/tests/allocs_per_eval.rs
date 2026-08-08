@@ -1015,7 +1015,7 @@ const BASELINE_HEADER: &str = "\
 #   the people who need it.
 #
 # ⚠ THE JIT BACKEND IS DELIBERATELY NOT IN THE KEY, and the two legs DISAGREE:
-#   the `regvm/jit/*/n=1000` rows read 66/66/68 on cranelift and 63/63/65 on
+#   the `regvm/jit/*/n=1000` rows read 65/65/67 on cranelift and 63/63/65 on
 #   dynasm. That is not an under-specified key -- it is a finding, and putting
 #   `backend` in the filename would declare it expected and hide it. #116
 #   measured which side of the compile/run boundary it sits on
@@ -1027,21 +1027,57 @@ const BASELINE_HEADER: &str = "\
 #       11->21, identical per case;
 #     * allocations per call are invariant over window lengths 1..64, exactly
 #       linear in the call count, so no part of the figure is amortized one-off
-#       work -- a single call already costs the full 66 (or 63);
-#     * `float` never compiles a bridge at all in 6065 calls and still shows the
-#       same 3-allocation gap. Its trace IS attempted at the threshold and
-#       ABORTS (`loops_aborted` 0->1 between calls 196 and 206, #133), so the
-#       one elevated window it shows at 193..201 is the aborted trace and not an
-#       installed bridge.
+#       work -- a single call already costs the full 65 (or 63);
+#     * the gap is uniform across all three cases, so it is not a property of
+#       any one program's shape.
 #
-#   So: one program, one trace, one guard failure per call, three more
-#   allocations per call on cranelift. Attribution of those three is open.
+#   So: one program, one trace, one guard failure per call, two more
+#   allocations per call on cranelift. Attribution of those two is open.
 #
-# ⚠ AND THESE ROWS SAMPLE A PLATEAU THE ARTIFACT LEAVES. The `regvm/jit/*`
-#   window covers calls 65..89. The first guard bridge lands at call 200, after
-#   which the same rows cost 23020 (cranelift) / 20023 (dynasm) allocations per
-#   call -- 349x and 317x these numbers -- and never come back. The figures
-#   below are the pre-bridge cost, not the artifact's steady state.
+#   ⚠ THE GAP WAS 3 AND IS NOW 2, and only one leg moved. #128
+#   (`32f3a1b79f7`, a back-edge FINISH returns from the portal instead of
+#   resuming at `target_pc`) took cranelift 66/66/68 -> 65/65/67 and left
+#   dynasm at 63/63/65 -- measured on the same tree, both legs, at the bless
+#   below. So the divergence is not a fixed constant to be explained once; it
+#   is a quantity that a backend-neutral fix moved on ONE backend. Any future
+#   attribution of the remainder has to account for that asymmetry, and a
+#   re-measurement that reads \"3\" is reading a tree older than `32f3a1b79f7`.
+#
+#   ⛔ The bullet that used to sit here -- \"`float` never compiles a bridge at
+#   all in 6065 calls and still shows the same 3-allocation gap\" -- was TRUE
+#   when written and is now FALSE. That was #133: `float`'s bridge trace
+#   aborted because `OP_RETURN_F` reached for the inherent `f64::to_bits`,
+#   which `majit-macros` did not recognise, so the arm degraded to an abort
+#   stub. Fixed in `3b3bb8f15c5`; `float` now compiles its bridge like the
+#   other two cases. It is kept here as a correction rather than deleted
+#   because the sentence was load-bearing for the argument above -- it was the
+#   evidence that the gap is not bridge-related -- and a reader who remembers
+#   it needs to know it was retired by a fix, not by a re-measurement.
+#
+# ⚠ THESE ROWS STILL SAMPLE A PRE-BRIDGE WINDOW, but the cliff they used to
+#   warn about is GONE. The `regvm/jit/*` window covers calls 65..89 and the
+#   first guard bridge lands at call 200, so the figures below remain the
+#   pre-bridge cost and `regvm/jit-steady/*` remains the row that measures the
+#   artifact's steady state. What changed is the size of the step between them.
+#
+#   This block used to read: \"after which the same rows cost 23020 (cranelift)
+#   / 20023 (dynasm) allocations per call -- 349x and 317x these numbers -- and
+#   never come back\" (#127). That was true and is now FALSE. #128
+#   (`32f3a1b79f7`) found the cause -- the compiled artifact re-entered at
+#   `target_pc` on a back-edge FINISH and re-ran the whole loop, so a call cost
+#   n-1 full compiled runs -- and fixed it. Measured on the same tree as the
+#   bless below:
+#
+#            regvm/jit-steady/*/n=1000     cranelift   dynasm
+#              arith                          24         22
+#              policy                         24         22
+#              float                          26         24
+#
+#   So the post-bridge regime costs ~0.4x the pre-bridge window rather than
+#   349x it, and the steady rows are now BELOW the warm ones. ⛔ Do not restate
+#   the 349x figure from this file's history: it describes a defect that has
+#   been fixed, and the three `jit-steady` rows that carried it are the three
+#   largest deltas in the bless that retired it (-22954, -22954, -42).
 #
 # Format: <label> TAB <allocations per evaluation>
 ";
