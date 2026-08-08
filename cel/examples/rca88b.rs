@@ -110,10 +110,10 @@ use std::cell::{Cell, RefCell};
 use std::hint::black_box;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use cel::majit::bytecode::float_bank::{jit_stats, reset_jit_stats, reset_persistent_state};
-use cel::majit::bytecode::{clean_batch_sum_f, eval_batch_sum_f, Column};
-use cel::majit::lower::{lower_typed, LoweredF, Schema, ValType};
 use cel::Program;
+use cel::majit::bytecode::float_bank::{jit_stats, reset_jit_stats, reset_persistent_state};
+use cel::majit::bytecode::{Column, clean_batch_sum_f, eval_batch_sum_f};
+use cel::majit::lower::{LoweredF, Schema, ValType, lower_typed};
 
 /// Allocations of exactly `s` bytes land in bucket `s`; anything larger lands in
 /// bucket 0. A `HashMap` keyed by size would allocate from inside the allocator,
@@ -2556,12 +2556,86 @@ fn jitframe_share_after_128(label: &str, lowered: &LoweredF) {
     const WARM: usize = 600;
     const THRESHOLD: u32 = 8;
     // The jitframe is allocated here; matched on the frame, not on a byte size.
-    const JITFRAME_FN: &str = "run_compiled_code_inner";
+    //
+    // ⛔ This anchor was `run_compiled_code_inner` and it silently stopped
+    // matching: the release build INLINES that function into its only caller,
+    // so the symbol is absent from every backtrace and the column read 0 in all
+    // nine rows. `run_compiled_code` is the frame that survives, and it is also
+    // a substring of the inner name, so it matches whichever way the inliner
+    // goes.
+    //
+    // ⭐ The lesson is not "pick a better name". #138 moved this probe OFF
+    // size-keyed matching precisely because a size key that stops matching
+    // reports a zero indistinguishable from a real one — and a NAME key has the
+    // identical failure mode. **Any literal key can go stale.** What fixes it is
+    // the anchor check below, which refuses instead of printing 0.
+    const JITFRAME_FN: &str = "run_compiled_code";
 
-    println!(
-        "\n     n   allocs/call   jitframe/call   share   allocs/row   entries/call"
-    );
-    for n in [2usize, 4, 8, 16, 32, 64] {
+    // ⛔ There is no `entries/call` column here any more, and its absence is
+    // deliberate. It used to exist and printed the SAME variable as
+    // `jitframe/call`, under a comment asserting `entries == jitframe "by
+    // construction"` — the E-model's assumption restated as if it were output.
+    // Two columns that cannot disagree cannot corroborate each other.
+    //
+    // What IS measured below is exact and worth having: `jf-execs/call` counts
+    // allocations whose backtrace contains `run_compiled_code_inner`, and that
+    // function allocates the jitframe unconditionally on both its GC and no-GC
+    // arms, so the count is the number of times it ran. Whether one execution of
+    // it equals one "entry" in #122/#128's sense is a separate claim, to be
+    // settled against THEIR instrument, not asserted here.
+    //
+    // ⚠ Do not reach for `majit_trace`'s `loop_entry_counts()` for that: it is
+    // public, has an accessor and tests, and **zero production writers** — the
+    // only caller of `log_loop_entry` is a forwarder in `warmstate.rs:1134` that
+    // nothing calls. It reads empty in every run, which looks exactly like
+    // "no entries".
+    // ⭐ ANCHOR CHECK — the control that was missing, and the reason this probe
+    // printed nine rows of 0 without complaining.
+    //
+    // The old non-vacuity control checked that `sum` grew and a loop compiled,
+    // i.e. that THE WORKLOAD RAN. It never checked that THE FILTER MATCHED. Those
+    // are different questions, and only the first one was being asked — so a
+    // dead anchor produced a green control and a column of zeros.
+    //
+    // A zero here must mean "the jitframe was not allocated", never "the name I
+    // grepped for is gone". Prove the anchor resolves against a run known to
+    // enter compiled code, and refuse the whole probe if it does not.
+    {
+        let (price, qty) = flat_columns(8);
+        let columns = vec![Column::Int(&price), Column::Int(&qty)];
+        reset_persistent_state();
+        for _ in 0..WARM {
+            black_box(eval_batch_sum_f(lowered, &columns, 8, THRESHOLD));
+        }
+        SITES.with(|s| s.borrow_mut().clear());
+        SITE_ALL.with(|c| c.set(true));
+        black_box(eval_batch_sum_f(lowered, &columns, 8, THRESHOLD));
+        SITE_ALL.with(|c| c.set(false));
+        let seen = SITES.with(|s| {
+            s.borrow()
+                .iter()
+                .filter(|(_, bt)| format!("{bt}").contains(JITFRAME_FN))
+                .count()
+        });
+        println!("\n  anchor check: `{JITFRAME_FN}` resolves in {seen} captured stack(s)");
+        if seen == 0 {
+            println!(
+                "  ⛔ REFUSING: the anchor matches nothing on a warmed, compiled call, so every\n  \
+                 `jf-execs` below would read 0 for a reason that says nothing about the jitframe.\n  \
+                 The symbol was most likely inlined or renamed — re-anchor before reading this table."
+            );
+            return;
+        }
+    }
+    println!("\n     n   allocs/call   jf-execs/call   share   allocs/row");
+    // ⛔ AXIS: powers of two ONLY is a structurally blind sweep here. The
+    // alignment law (#134/#137) keys on `(n−1) | threshold`, threshold = 8,
+    // whose divisors are {1,2,4,8}. Exactly one of those is odd, and every
+    // power of two makes `n−1` odd — so a geometric axis can never contain
+    // n ∈ {3,5,9}, which is where the artifact is known to differ (#128 puts
+    // n=5 at E=2). The odd/aligned points below are the whole reason this
+    // sweep exists; do not "tidy" it back to a geometric one.
+    for n in [2usize, 3, 4, 5, 8, 9, 16, 32, 64] {
         let (price, qty) = flat_columns(n);
         let columns = vec![Column::Int(&price), Column::Int(&qty)];
 
@@ -2604,11 +2678,13 @@ fn jitframe_share_after_128(label: &str, lowered: &LoweredF) {
         let loops = jit_stats().loops_compiled;
         println!(
             "  {n:4}   {total:11}   {jitframe:13}   {share:4.1}%   {per_row:10.2}   \
-             {jitframe:12}   sum={sum:?} loops={loops}"
+             sum={sum:?} loops={loops}"
         );
     }
     println!(
-        "\n  entries/call == jitframe/call by construction: the site runs exactly once per entry."
+        "\n  jf-execs/call = executions of `run_compiled_code_inner` in one settled call,\n  \
+         counted by attributing allocations to that frame. It is NOT an entry count until\n  \
+         something independent says the two coincide."
     );
 }
 
