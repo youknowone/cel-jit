@@ -2424,12 +2424,25 @@ fn size_against_trace_length(label: &str, lowered: &LoweredF) {
 fn allocation_sites(label: &str, lowered: &LoweredF) {
     println!("\nProbe S — {label}: WHICH SITE allocates the trace-sensitive sizes?");
 
-    // Probe R's n=4 pair, and its four sizes. `expect` is the total Probe R
-    // read for the dominant steady regime in BOTH arms.
+    // Probe R's n=4 pair, and the sizes it found trace-sensitive plus 16 (one
+    // `DescrRef`).
+    //
+    // ⚠ The unit here is the ENTRY into compiled code, never the call. A call
+    // costs one full compiled run per entry, and how many entries a call makes
+    // is being changed by unrelated work (#128 collapses it from n−1 to 1), so
+    // a pinned per-call total is not a guard — it is a tripwire on somebody
+    // else's fix. Dividing by `n−1` is no better: that hard-codes today's
+    // count. Instead COUNT the entries. The jitframe allocation (200/216 B)
+    // happens exactly once per entry, so its own bucket count *is* the entry
+    // count, self-calibrating against whatever the driver does this week.
     const N: usize = 4;
     const WARM: usize = 600;
-    const EXPECT: u64 = 73;
-    let targets = vec![64usize, 96, 200, 216];
+    /// Sizes allocated once per entry by `run_compiled_code_inner`'s jitframe.
+    /// Their combined count is the measured entry count.
+    const JITFRAME: [usize; 2] = [200, 216];
+    // 200/216 are also the live control: they must capture, or a zero reading
+    // for 64/96 would mean "the arming broke", not "the site is gone".
+    let targets = vec![16usize, 64, 96, 200, 216];
 
     let (price, qty) = flat_columns(N);
     let columns = vec![Column::Int(&price), Column::Int(&qty)];
@@ -2445,10 +2458,6 @@ fn allocation_sites(label: &str, lowered: &LoweredF) {
         // every site below a site of something else.
         let (_, settled) = metered(|| black_box(eval_batch_sum_f(lowered, &columns, N, threshold)));
         println!("\n  {arm}  threshold {threshold}:  allocs/call {settled}");
-        if settled != EXPECT {
-            println!("    ⛔ REFUSING: Probe R read {EXPECT} here. This is a different program.");
-            continue;
-        }
 
         SITES.with(|s| s.borrow_mut().clear());
         SITE_SIZES.with(|t| *t.borrow_mut() = targets.clone());
@@ -2470,11 +2479,26 @@ fn allocation_sites(label: &str, lowered: &LoweredF) {
             }
         }
         groups.sort_by_key(|g| g.0);
+
+        // The self-calibrating denominator, read from this very run.
+        let entries: usize = captured
+            .iter()
+            .filter(|(s, _)| JITFRAME.contains(s))
+            .count();
+        if entries == 0 {
+            println!(
+                "    ⛔ REFUSING: 0 jitframe allocations, so this call never entered \
+                 compiled code (or the arming is broken). Nothing below is per-entry."
+            );
+            continue;
+        }
+        println!("    entries this call: {entries}  (counted, not assumed)");
         if groups.is_empty() {
             println!("    (no target size allocated in this call)");
         }
         for (size, frames, count) in &groups {
-            println!("    {size}B x{count}");
+            let per = *count as f64 / entries as f64;
+            println!("    {size}B x{count}  = {per:.2}/entry");
             for f in frames.lines() {
                 println!("        {f}");
             }
