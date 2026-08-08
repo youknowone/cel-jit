@@ -2688,6 +2688,219 @@ fn jitframe_share_after_128(label: &str, lowered: &LoweredF) {
     );
 }
 
+/// Probe I — #90's OTHER half: the never-compiled arm, where the merge point is
+/// hit per ROW and the rate is the genuinely hot one.
+///
+/// The compiled arm was measured in #90 at **3 allocations per CALL**, because
+/// the portal is entered once per call there. This probe prices the other arm,
+/// which the `68b0d4adbff` commit message names as the real beneficiary.
+///
+/// ## ⭐ The rate is MEASURED by differencing two thresholds
+///
+/// Nothing counts merge-point hits: `JitStats` has `loops_compiled`,
+/// `bridges_compiled`, `loops_aborted`, `guard_failures`, `trace_ops_*` — no
+/// back-edge counter. But the trace threshold *is* a back-edge counter with a
+/// known target, so calls-to-compile inverts it:
+///
+/// ```text
+///     calls_to_compile(T) = T / hits_per_call + c
+/// ```
+///
+/// `c` is a constant offset (the tracing pass, plus whatever precedes the first
+/// merge point). **Differencing two thresholds cancels `c`:**
+///
+/// ```text
+///     hits_per_call = (T2 - T1) / (calls(T2) - calls(T1))
+/// ```
+///
+/// ⛔ Do NOT "simplify" this to `n - 1` from #134. That is precisely the
+/// quantity being measured — substituting it would make the probe restate its
+/// own assumption as output, which is the exact defect deleted from Probe T
+/// (`entries/call` printed `{jitframe}` under a comment asserting they were
+/// equal by construction).
+///
+/// ⛔ A zero denominator is REFUSED, not divided by. If two thresholds compile
+/// on the same call the arithmetic says nothing, and printing anything then
+/// would be a fabricated rate.
+fn interp_arm_merge_point_rate(label: &str, lowered: &LoweredF) {
+    println!("\nProbe I — {label}: what does #90 buy on the NEVER-COMPILED arm?");
+    println!("  (allocation counts only; rate differenced across two thresholds)");
+
+    // Two INDEPENDENT threshold pairs. The wide pair exists because the
+    // denominator of this estimator is a small integer: `calls(T2)-calls(T1)`
+    // lands near `ΔT / rate`, so a rate of ~15 against ΔT=56 leaves a
+    // denominator of 4 and the estimator can only emit 14.0 or 18.7 — printing
+    // either to two decimals is precision the instrument does not have.
+    // Widening ΔT restores resolution where it collapses (large n), and the two
+    // pairs then CHECK EACH OTHER: the constant offset `c` is assumed equal at
+    // both thresholds, and if that assumption fails the pairs disagree.
+    const PAIR_A: (u32, u32) = (8, 64);
+    const PAIR_B: (u32, u32) = (1024, 4096);
+    const WARM: usize = 200;
+    const MAX_CALLS: usize = 20_000;
+    /// n at which the per-hit stacks are itemised. Any n works; a middling one
+    /// keeps the census small enough to symbolize.
+    const CENSUS_N: usize = 8;
+    // Known-present anchor: #90's change lives under this frame, so it must
+    // resolve or the green-key census below is reading nothing.
+    const BACK_EDGE_FN: &str = "back_edge_structured";
+
+    /// Calls until the first loop compiles at `threshold`, or `None`.
+    fn calls_to_compile(lowered: &LoweredF, columns: &[Column], n: usize, t: u32) -> Option<usize> {
+        reset_persistent_state();
+        reset_jit_stats();
+        for c in 1..=MAX_CALLS {
+            black_box(eval_batch_sum_f(lowered, columns, n, t));
+            if jit_stats().loops_compiled > 0 {
+                return Some(c);
+            }
+        }
+        None
+    }
+
+    /// The rate bracket a threshold pair can support, or `None` if it cannot
+    /// support one. `calls(T) = ceil(T/rate) + c`, so the difference `d` sits
+    /// within ±1 of `ΔT/rate` and the honest output is the INTERVAL
+    /// `[ΔT/(d+1), ΔT/(d-1)]`, not a point. `d <= 1` leaves the upper end
+    /// unbounded — that is a refusal, not a wide answer.
+    fn rate_bracket(
+        lowered: &LoweredF,
+        columns: &[Column],
+        n: usize,
+        (t1, t2): (u32, u32),
+    ) -> Option<(f64, f64)> {
+        let c1 = calls_to_compile(lowered, columns, n, t1)?;
+        let c2 = calls_to_compile(lowered, columns, n, t2)?;
+        let d = c2.checked_sub(c1)?;
+        if d <= 1 {
+            return None;
+        }
+        let dt = f64::from(t2 - t1);
+        Some((dt / (d + 1) as f64, dt / (d - 1) as f64))
+    }
+
+    println!(
+        "\n     n   hits/call (ΔT=56)     hits/call (ΔT=3072)   allocs/call   /row   \
+         green-key   under portal   control"
+    );
+    for n in [2usize, 3, 4, 5, 8, 16] {
+        let (price, qty) = flat_columns(n);
+        let columns = vec![Column::Int(&price), Column::Int(&qty)];
+
+        let a = rate_bracket(lowered, &columns, n, PAIR_A);
+        let b = rate_bracket(lowered, &columns, n, PAIR_B);
+        let show = |r: Option<(f64, f64)>| match r {
+            Some((lo, hi)) => format!("{lo:6.2}–{hi:<6.2}"),
+            None => "  REFUSED   ".to_string(),
+        };
+        // The pairs share no threshold and no call window, so a disagreement
+        // falsifies the constant-offset assumption they both rest on.
+        let agree = match (a, b) {
+            (Some((alo, ahi)), Some((blo, bhi))) if alo <= bhi && blo <= ahi => "",
+            (Some(_), Some(_)) => " ⛔ PAIRS DISAGREE",
+            _ => "",
+        };
+
+        // The never-compiled arm, warmed on its own driver.
+        reset_persistent_state();
+        reset_jit_stats();
+        for _ in 0..WARM {
+            black_box(eval_batch_sum_f(lowered, &columns, n, NEVER));
+        }
+        let (_, allocs) = metered(|| black_box(eval_batch_sum_f(lowered, &columns, n, NEVER)));
+        // Non-vacuity for the whole row: if anything compiled, this is not the
+        // never-compiled arm and every number on the line is of something else.
+        let compiled = jit_stats().loops_compiled;
+
+        // Green-key residual over one settled never-compiled call.
+        SITES.with(|s| s.borrow_mut().clear());
+        SITE_ALL.with(|c| c.set(true));
+        black_box(eval_batch_sum_f(lowered, &columns, n, NEVER));
+        SITE_ALL.with(|c| c.set(false));
+        let captured = SITES.with(|s| std::mem::take(&mut *s.borrow_mut()));
+        let anchor = captured
+            .iter()
+            .filter(|(_, bt)| format!("{bt}").contains(BACK_EDGE_FN))
+            .count();
+        let greens = captured
+            .iter()
+            .filter(|(_, bt)| {
+                let s = format!("{bt}");
+                s.contains("GreenKey") || s.contains("green_uhash") || s.contains("__green")
+            })
+            .count();
+
+        let control = if compiled > 0 {
+            format!("⛔ VOID loops={compiled}")
+        } else if anchor == 0 {
+            // The green-key count sits behind this frame, so a dead anchor makes
+            // `greens == 0` mean "I looked nowhere", not "nothing allocated".
+            format!("⛔ ANCHOR DEAD ({BACK_EDGE_FN})")
+        } else {
+            format!("ok loops=0{agree}")
+        };
+        println!(
+            "  {n:4}   {}   {}   {allocs:11}   {:4.1}   {greens:9}   {anchor:12}   {control}",
+            show(a),
+            show(b),
+            allocs as f64 / n as f64,
+        );
+
+        if n != CENSUS_N {
+            continue;
+        }
+        // Itemise ONE call's allocations by stack. The rate above is derived
+        // from thresholds and never looks at a backtrace; this census reads
+        // backtraces and never looks at a threshold. Dividing one by the other
+        // is therefore a cross-check between two instruments that share no
+        // input, not a restatement.
+        let Some((blo, bhi)) = b else {
+            println!("    (no per-hit itemisation: the wide pair refused a rate at n={n})");
+            continue;
+        };
+        let mut groups: Vec<(String, usize)> = Vec::new();
+        for (_, bt) in &captured {
+            let frames = interesting_frames(&format!("{bt}"));
+            match groups.iter_mut().find(|(f, _)| *f == frames) {
+                Some(g) => g.1 += 1,
+                None => groups.push((frames, 1)),
+            }
+        }
+        groups.sort_by(|x, y| y.1.cmp(&x.1));
+        println!(
+            "\n  Per-hit itemisation at n={n} ({} allocations in one settled never-compiled \
+             call,\n  divided by the independently measured {blo:.2}–{bhi:.2} hits/call):",
+            captured.len()
+        );
+        const SHOWN: usize = 14;
+        for (frames, count) in groups.iter().take(SHOWN) {
+            println!(
+                "\n    x{count}  = {:.2}–{:.2} per merge-point hit",
+                *count as f64 / bhi,
+                *count as f64 / blo,
+            );
+            for f in frames.lines().take(4) {
+                println!("        {f}");
+            }
+        }
+        // Never let a truncation read as a complete accounting: state what the
+        // listing does NOT cover, so the groups above can be summed and checked
+        // against the call total rather than trusted to be all of it.
+        let shown: usize = groups.iter().take(SHOWN).map(|g| g.1).sum();
+        println!(
+            "\n    accounted: {shown} of {} allocations in {} groups ({} groups not listed)",
+            captured.len(),
+            groups.len(),
+            groups.len().saturating_sub(SHOWN),
+        );
+    }
+    println!(
+        "\n  hits/call is (T2-T1)/(calls(T2)-calls(T1)) over two disjoint threshold pairs —\n  \
+         differenced, so the constant tracing-pass offset cancels, and bracketed because\n  \
+         the denominator is an integer. #90 removes 3 allocations per hit."
+    );
+}
+
 fn main() {
     let schema = flat_schema();
     let arith = lower("price + qty * 2", &schema);
@@ -2734,6 +2947,14 @@ fn main() {
     // discipline and its `CARGO_PROFILE_RELEASE_DEBUG=2` requirement.
     if std::env::var_os("RCA88B_SHARE").is_some() {
         jitframe_share_after_128("arith price + qty * 2", &arith);
+        println!("\nload after probes:  {}", loadavg());
+        return;
+    }
+    // Probe I captures a backtrace like S and T, so it takes their gate
+    // discipline and their `CARGO_PROFILE_RELEASE_DEBUG=2` requirement — without
+    // debuginfo its anchor check refuses rather than reporting a green zero.
+    if std::env::var_os("RCA88B_INTERP").is_some() {
+        interp_arm_merge_point_rate("arith price + qty * 2", &arith);
         println!("\nload after probes:  {}", loadavg());
         return;
     }
