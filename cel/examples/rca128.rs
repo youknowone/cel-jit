@@ -105,25 +105,44 @@
 //! (`F=23` and `C=4` are #125's allocation model, quoted at the top of this
 //! file), imported from other probes' results and fitted here.
 //!
+//! ⛔⛔⛔ **`F` AND `G` ARE STALE, AND THIS IS MEASURED, NOT SUSPECTED.** #125 rev 5
+//! re-derived the same model on `rca125p` — which *does* own an allocator — at
+//! tree `9a7d0c63ff3`, cranelift:
+//!
+//!     allocs(call) = 19·n_finish + 60·n_guard + 4      residual 0 on 695 of 698
+//!
+//! i.e. **F=19, G=60, C=4** against this table's **23 / 65 / 4**. `C` is unmoved;
+//! `F` and `G` each fell by 4–5 across ~20 commits **in a single day**, and
+//! `G − F` went 42 → 41. The three exceptions to the residual are the loop and two
+//! bridge compilations. ⇒ **the table below is a snapshot of a tree that no longer
+//! exists, and it carries no tree tag saying so.**
+//!
+//! ⛔ Do **not** attribute that movement to the #128 fix. #128 changes how many
+//! entries a call makes; `F` is the price of *one* entry, and its mechanism cannot
+//! reach it — #125 rev 5 retracts exactly that attribution.
+//!
 //! ⛔⛔ **AND "18 of 19 reproduce exactly" IS SELF-CONSISTENCY, NOT VALIDATION.**
 //! The three constants were fitted *to* those same 19 figures, so an exact
 //! reproduction is what a 3-parameter fit over 19 mutually-derived points does.
-//! It says the inputs are consistent with each other under this model. It says
-//! nothing about whether the inputs are right — and the residual **structurally
-//! cannot** tell you: rca125s' known stack-capture arming costs **+1 per compiled
-//! exit**, and a per-exit inflation lands entirely in `F` and `G` (both per-exit)
-//! and not at all in `C` (per call). Inflated inputs would still fit 18 of 19.
+//! It says the inputs are consistent with each other under this model, and nothing
+//! about whether the inputs are right. **The fit stayed exact while `F` and `G`
+//! drifted by 4–5**, which is the demonstration rather than the worry.
 //!
-//! ⚠ **Provenance is UNRECOVERABLE from this file, which is the defect.** The
-//! phrase "published figures" below names no source, no probe and no tree. What
-//! is checkable is the vintage: this table was written 2026-08-08 02:53, and the
-//! rca125s attribution work that surfaced the +1 is 19:11–19:25 the same day — so
-//! **the inflation was not known when these constants were fitted** and nobody
-//! could have corrected for it. `F(cranelift)=23` happens to equal the value #141
-//! later corrected *to* (rca125s read 24), but `G=65` has no such cross-check, and
-//! a table mixing corrected and uncorrected inputs would look exactly this clean.
-//! ⇒ **Do not cite `F`/`G` as measured allocation prices.** Re-derive them against
-//! a named probe and a named tree, or quote the exit-stream results only.
+//! ⚠ **On the arming inflation, scope it precisely — it does NOT apply here.**
+//! The +1-per-compiled-exit was measured on `rca125s`. `rca88b`, which is the
+//! likely source of the quoted figures, **meters before it arms**: Probe S takes
+//! its `allocs/call` through `metered(...)` and only then sets `SITE_SIZES` on a
+//! *separate* invocation, so the capture is disarmed inside the counted window.
+//! ⇒ **"the same arming code is present" is not "it lands inside the counted
+//! window",** and the inflation is at most an unmeasured hypothesis for `rca88b`.
+//! Do not correct these absolutes on that basis. ⭐ It also could not explain
+//! `G − F` moving 42 → 41 in any case: a per-exit constant **cancels in a
+//! difference** between arms with equal exit counts.
+//!
+//! ⚠ **Provenance is not recoverable from this file**, which is the other half of
+//! the defect: the phrase "published figures" below names no probe and no tree.
+//! ⇒ **Do not cite `F`/`G` as current allocation prices.** Use #125 rev 5's
+//! 19/60/4 with its tree, or quote the exit-stream results only.
 //!
 //! Three constants per backend reproduce **18 of 19** published per-call and
 //! per-row figures exactly (`F` = an entry ending in `finish`, `G` = an entry
@@ -139,10 +158,13 @@
 //! CL-DYN delta of **3 is per compiled ENTRY** (it is 3 in both `F` and `G`, and
 //! 0 in `C`) rather than per back edge or per call.
 //!
-//! ⭐ The CL-DYN delta is the one reading here that **survives the inflation
-//! question by construction**: a `+1` applied to every exit on both backends
-//! cancels in the difference, so "3 per compiled entry" holds whether or not the
-//! inputs were corrected. It is also the claim that does not depend on the fit.
+//! ⚠ The CL-DYN delta of 3 is **immune to any per-exit constant** — such a term
+//! cancels in a difference between backends — but that is now a moot defence, and
+//! it is **not** immune to the staleness above: #125 rev 5 re-derived **cranelift
+//! only** (19/60/4), so no post-drift dynasm row exists and `F` and `G` did not
+//! even move together on the side that was re-derived (−4 and −5). ⇒ **"3 per
+//! compiled entry" is untested at any current tree.** Treat it as the *least*
+//! exposed claim here, not as a surviving one.
 //!
 //! ⛔ The one cell that does not reproduce: n=10 dynasm mid-regime reads 24.580
 //! where this predicts 22.600. Every other cell, both backends, is exact.
@@ -152,10 +174,22 @@
 //! close inside live transients.
 //!
 //! ⛔ It also corrects the reading that "the compiled entry price stops being
-//! paid": per exit a guard failure (65) costs ~2.8x a finish (23), so the entry
-//! is paid MORE often at a LOWER unit price. The settled regime is cheaper than
-//! pre-bridge exactly when `23(n-1) < 65`, i.e. n < 3.8 — which is why n=2 and
-//! n=3 improve and n>=5 degrades.
+//! paid": per exit a guard failure costs ~2.8x a finish, so the entry is paid
+//! MORE often at a LOWER unit price. ⚠ The `~2.8x` is `65/23`, i.e. the ratio of
+//! the two coefficients that drifted; at #125 rev 5's 60/19 it reads 3.2x. The
+//! *direction* is what this sentence is for; the multiplier is not quotable.
+//!
+//! ⛔⛔⛔ **AND THE CROSSOVER BELOW IS DEAD — IT DESCRIBES THE PRE-#128 MACHINE.**
+//! It used to read:
+//!
+//! > The settled regime is cheaper than pre-bridge exactly when `23(n-1) < 65`,
+//! > i.e. n < 3.8 — which is why n=2 and n=3 improve and n>=5 degrades.
+//!
+//! That arithmetic needs `n−1` compiled entries in the settled regime, which is
+//! precisely what majit `7c141d84175` removed. **Post-fix the settled regime is
+//! E=1 at every n**, so the `23(n−1)` term does not exist: the settled call beats
+//! the pre-bridge call at **every** n, and there is no crossover and no n>=5
+//! degradation. The sentence was a correct reading of a machine that is gone.
 //!
 //! ## `RCA128_SHAPE=float` — ⛔ NO LONGER THE NEVER-BRIDGING CONTROL
 //!
