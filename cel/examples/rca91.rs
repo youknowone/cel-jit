@@ -11,6 +11,9 @@ use cel::Program;
 
 const THRESHOLD: u32 = 8;
 
+/// A shape: row index to that row's list length, i.e. the inner trip count.
+type LenOf = fn(usize) -> i64;
+
 fn lower(src: &str, schema: &Schema) -> LoweredF {
     let program = Program::compile(src).unwrap_or_else(|e| panic!("parse `{src}`: {e:?}"));
     lower_typed(program.expression(), schema).unwrap_or_else(|e| panic!("lower_typed `{src}`: {e}"))
@@ -79,7 +82,7 @@ fn main() {
         }
     }
 
-    let shapes: [(&str, fn(usize) -> i64); 3] = [
+    let shapes: [(&str, LenOf); 3] = [
         ("alternating 8/9", |r| if r % 2 == 0 { 8 } else { 9 }),
         ("cycle 4..12", |r| 4 + (r % 9) as i64),
         ("spread 0..32", |r| ((r * 2654435761) % 32) as i64),
@@ -103,7 +106,7 @@ fn main() {
     //
     // Row counts are capped here because these shapes allocate `rows * mean_len`
     // elements.
-    let wide: [(&str, fn(usize) -> i64, usize); 4] = [
+    let wide: [(&str, LenOf, usize); 4] = [
         ("spread 0..200", |r| ((r * 2654435761) % 200) as i64, 4_000),
         ("spread 0..200", |r| ((r * 2654435761) % 200) as i64, 20_000),
         (

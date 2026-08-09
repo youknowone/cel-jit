@@ -225,7 +225,7 @@ fn main() {
     let mut marks: Vec<Marks> = vec![zero; calls];
 
     let mut last = zero;
-    for k in 0..calls {
+    for (k, mark) in marks.iter_mut().enumerate() {
         let t = std::time::Instant::now();
         black_box(eval_batch_sum_f(&lowered, &columns, n, threshold));
         ns.push(t.elapsed().as_nanos() as f64);
@@ -242,7 +242,7 @@ fn main() {
                 ops_after: s.trace_ops_after,
             };
         }
-        marks[k] = last;
+        *mark = last;
     }
 
     // Every counter transition, with the call it happened at. This is the

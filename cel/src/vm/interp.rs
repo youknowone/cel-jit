@@ -65,6 +65,12 @@ enum Operand {
     /// almost all of them are. The box costs one allocation per map literal --
     /// paid only where a map literal appears -- and takes the entry from 56
     /// bytes to 32.
+    ///
+    /// `clippy::box_collection` argues the opposite -- that the map is on the
+    /// heap already and the box only adds an allocation. That is the trade
+    /// being made here on purpose, and the width it buys is asserted below, so
+    /// the lint is off for this variant rather than followed.
+    #[allow(clippy::box_collection)]
     Map(Box<HashMap<Key, Value>>),
     /// The `names` index of the message type, and the fields set so far. The
     /// type is checked when the struct is opened, so that a bad type name
@@ -412,7 +418,7 @@ impl<'a> Vm<'a> {
                     OptView::Plain => self.list_mut()?.push(value),
                 }
             }
-            OpCode::NewMap => self.stack.push(Operand::Map(Box::new(HashMap::new()))),
+            OpCode::NewMap => self.stack.push(Operand::Map(Box::default())),
             OpCode::MapInsert | OpCode::MapInsertOptional => {
                 let value = self.pop()?;
                 let key = self.pop()?;

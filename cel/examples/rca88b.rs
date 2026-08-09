@@ -126,7 +126,7 @@ std::thread_local! {
     /// Off by default: every probe that reports ns/call would otherwise pay for
     /// the histogram, and the timing probes are the ones already at issue.
     static SIZES_ON: Cell<bool> = const { Cell::new(false) };
-    static LOCAL_SIZES: [Cell<u64>; SIZE_BUCKETS] = [const { Cell::new(0) }; SIZE_BUCKETS];
+    static LOCAL_SIZES: [Cell<u64>; SIZE_BUCKETS] = const { [const { Cell::new(0) }; SIZE_BUCKETS] };
     /// Sizes whose allocation SITE should be recorded. Empty means off, and it
     /// is empty for every probe but S — capturing a backtrace inside the
     /// allocator costs far more than the thing being measured.
@@ -2216,16 +2216,8 @@ fn threshold_control(label: &str, lowered: &LoweredF) {
     for threshold in [3u32, 4, 5, 6, 7, 8, 9, 10, 12, 16, 18, 24] {
         println!("\n  threshold {threshold} — predicted flat where (n−1) | {threshold}");
         println!(
-            "    {:>4} {:>9} {:>7} {:>9} {:>8} {:>4} {:>4} {:>6}   {}",
-            "n",
-            "(n−1)|t",
-            "loops",
-            "verdict",
-            "allocs",
-            "gf",
-            "E",
-            "first",
-            "compiles (call: before -> after)"
+            "    {:>4} {:>9} {:>7} {:>9} {:>8} {:>4} {:>4} {:>6}   compiles (call: before -> after)",
+            "n", "(n−1)|t", "loops", "verdict", "allocs", "gf", "E", "first"
         );
         let mut predicted: Vec<usize> = Vec::new();
         let mut flat: Vec<usize> = Vec::new();
@@ -2866,7 +2858,7 @@ fn interp_arm_merge_point_rate(label: &str, lowered: &LoweredF) {
                 None => groups.push((frames, 1)),
             }
         }
-        groups.sort_by(|x, y| y.1.cmp(&x.1));
+        groups.sort_by_key(|y| std::cmp::Reverse(y.1));
         println!(
             "\n  Per-hit itemisation at n={n} ({} allocations in one settled never-compiled \
              call,\n  divided by the independently measured {blo:.2}–{bhi:.2} hits/call):",

@@ -936,7 +936,7 @@ impl gen::CELVisitorCompat<'_> for Parser {
                 Err(e) => return self.report_error(token, Some(e), "invalid int literal"),
             };
             self.helper
-                .next_expr(token, Expr::Literal(LiteralValue::Int(val.into())))
+                .next_expr(token, Expr::Literal(LiteralValue::Int(val)))
         } else {
             self.report_error::<ParseError, _>(&ctx.start(), None, "Incomplete Int!")
         }
@@ -955,7 +955,7 @@ impl gen::CELVisitorCompat<'_> for Parser {
                 Err(e) => return self.report_error(token, Some(e), "invalid uint literal"),
             };
             self.helper
-                .next_expr(token, Expr::Literal(LiteralValue::UInt(val.into())))
+                .next_expr(token, Expr::Literal(LiteralValue::UInt(val)))
         } else {
             self.report_error::<ParseError, _>(&ctx.start(), None, "Incomplete Uint!")
         }
@@ -967,7 +967,7 @@ impl gen::CELVisitorCompat<'_> for Parser {
             match string.parse::<f64>() {
                 Ok(d) if d.is_finite() => self
                     .helper
-                    .next_expr(token, Expr::Literal(LiteralValue::Double(d.into()))),
+                    .next_expr(token, Expr::Literal(LiteralValue::Double(d))),
                 Err(e) => self.report_error(token, Some(e), "invalid double literal"),
                 _ => self.report_error(token, None::<ParseError>, "invalid double literal"),
             }
@@ -1030,7 +1030,7 @@ impl gen::CELVisitorCompat<'_> for Parser {
         match ctx.tok.as_deref() {
             Some(tok) => self
                 .helper
-                .next_expr(tok, Expr::Literal(LiteralValue::Boolean(true.into()))),
+                .next_expr(tok, Expr::Literal(LiteralValue::Boolean(true))),
             None => self.report_error::<ParseError, _>(&ctx.start(), None, "Incomplete bool!"),
         }
     }
@@ -1039,7 +1039,7 @@ impl gen::CELVisitorCompat<'_> for Parser {
         match ctx.tok.as_deref() {
             Some(token) => self
                 .helper
-                .next_expr(token, Expr::Literal(LiteralValue::Boolean(false.into()))),
+                .next_expr(token, Expr::Literal(LiteralValue::Boolean(false))),
             None => self.report_error::<ParseError, _>(&ctx.start(), None, "Incomplete bool!"),
         }
     }

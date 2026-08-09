@@ -241,7 +241,9 @@ fn bench(out: &mut Vec<Row>, label: String, warmup: u32, iters: u32, mut body: i
     for slot in samples.iter_mut() {
         let meter = Meter::start();
         for _ in 0..iters {
-            black_box(body());
+            // No `black_box`: `body` returns `()`, so there is no value to keep
+            // alive, and what the meter counts is its allocations anyway.
+            body();
         }
         let (local, other) = meter.stop();
         *slot = local;
@@ -1145,8 +1147,8 @@ fn main() {
     }
     println!();
     println!(
-        "{:<44} {:>5} {:>12} {:>12} {:>12} {:>10}  {}",
-        "row", "iters", "allocs/eval", "min", "max", "base", "note"
+        "{:<44} {:>5} {:>12} {:>12} {:>12} {:>10}  note",
+        "row", "iters", "allocs/eval", "min", "max", "base"
     );
 
     let mut unstable: Vec<&str> = Vec::new();

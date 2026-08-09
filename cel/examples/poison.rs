@@ -36,6 +36,10 @@ use cel::majit::bytecode::{clean_batch_sum_f, eval_batch_sum_f, Column};
 use cel::majit::lower::{lower_typed, LoweredF, Schema, ValType};
 use cel::Program;
 
+/// One measured cell: the batch's elapsed time, and the compile, deopt and
+/// abort counts observed over the same window.
+type MeasuredCell = (Duration, usize, usize, usize);
+
 /// Inner trip count of the batch that runs FIRST in the poisoned arm.
 const SHORT: i64 = 2;
 /// Inner trip count of the measured batch.
@@ -281,7 +285,7 @@ fn main() {
 
     // Best (minimum) per (arm, long-round-index) across the outer rounds, with
     // the counters from whichever outer round produced that minimum.
-    let mut best: [[Option<(Duration, usize, usize, usize)>; 3]; 3] = Default::default();
+    let mut best: [[Option<MeasuredCell>; 3]; 3] = Default::default();
     for _ in 0..rounds {
         // Interleaved: a machine that gets busier over the run drifts every arm
         // together instead of penalising whichever ran last.
@@ -297,7 +301,7 @@ fn main() {
             let r = run_arm(&lowered, short, &long_cols, rows, oracle);
             for (i, cell) in r.long.iter().enumerate() {
                 let slot = &mut best[arm][i];
-                if slot.map_or(true, |b| cell.0 < b.0) {
+                if slot.is_none_or(|b| cell.0 < b.0) {
                     *slot = Some(*cell);
                 }
             }
@@ -309,12 +313,12 @@ fn main() {
         "arm", "long#", "ns/row", "compiles", "deopts", "aborts"
     );
     let names = ["cold-long", "short-first", "long-first"];
-    for arm in 0..3 {
-        for i in 0..3 {
-            let (d, c, g, a) = best[arm][i].expect("every cell measured");
+    for (row, name) in best.iter().zip(names) {
+        for (i, cell) in row.iter().enumerate() {
+            let (d, c, g, a) = cell.expect("every cell measured");
             println!(
                 "{:<14}{:>10}{:>12.1}{:>10}{:>10}{:>9}",
-                if i == 0 { names[arm] } else { "" },
+                if i == 0 { name } else { "" },
                 i + 1,
                 ns_per_row(d, rows),
                 c,
@@ -378,11 +382,11 @@ fn main() {
         };
         print!("{label:>10}");
         for (col, mc) in measured_cols.iter().enumerate() {
-            let mut cell: Option<(Duration, usize, usize, usize)> = None;
+            let mut cell: Option<MeasuredCell> = None;
             for _ in 0..rounds {
                 let r = run_arm(&lowered, warm_cols.as_ref(), mc, rows, oracles[col]);
                 let last = r.long[2];
-                if cell.map_or(true, |b| last.0 < b.0) {
+                if cell.is_none_or(|b| last.0 < b.0) {
                     cell = Some(last);
                 }
             }
