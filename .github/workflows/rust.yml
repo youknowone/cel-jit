@@ -39,6 +39,35 @@ jobs:
           cargo test --verbose --features json
           cargo test --verbose --features regex
           cargo test --verbose --features chrono
+      # The tree walker as the caller-facing evaluator. `vm` is a default
+      # feature, so every cargo invocation above — and both `jit` legs below —
+      # builds `Program::execute` as the bytecode VM; `--no-default-features`
+      # is the only way it is the walker.
+      #
+      # Without this step no TEST runs `Program::execute` on the walker.
+      # `tests/oracle.rs` and `tests/vm_walker_sweep.rs` reach the walker under
+      # any feature set, but they call `Value::resolve` /
+      # `Value::resolve_value` directly, so the public door's non-default build
+      # would only be COMPILED (`scripts/feature-matrix.sh`, which is
+      # `-p cel`-scoped) and RUN as a seven-binary smoke pass (the `examples`
+      # job below, whose crate takes `cel` with `default-features = false`) —
+      # never asserted on.
+      #
+      # `regex,chrono` are the other two defaults, so this differs from the
+      # bare `cargo test` above in exactly one feature.
+      #
+      # `-p cel` IS LOAD-BEARING, not tidiness. This is a virtual workspace and
+      # `fuzz/Cargo.toml` takes `[dependencies.cel] path = "../cel"` with
+      # default features ON. `--no-default-features` at the root turns off the
+      # *selected packages'* defaults, not that dependency edge, so feature
+      # unification puts `vm` straight back into the single `cel` build every
+      # test binary links. Measured: without `-p cel` this command reports
+      # `features=regex,chrono,vm` in the `allocs_per_eval` header and compares
+      # against `allocs_per_eval.vm.baseline`; with it, `features=regex,chrono`
+      # and `allocs_per_eval.baseline`. A green leg that ran the VM is exactly
+      # the configuration this step exists to stop going unrun.
+      - name: Run tests (tree walker, vm off)
+        run: cargo test -p cel --verbose --no-default-features --features regex,chrono
   jit:
     name: JIT tier (${{ matrix.backend }})
     runs-on: ubuntu-latest

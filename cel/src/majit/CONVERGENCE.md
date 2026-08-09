@@ -1,16 +1,23 @@
 # Converging cel onto one interpreter
 
-Status: design, not implemented. Written 2026-07-26.
+Status: written 2026-07-26 as design. Step 1 has since landed (see the note
+under it); Steps 2-4 are still design.
 
 Superseded in part, 2026-08-07. Evaluator 1 below is no longer
 `Value::resolve_val` returning `Cow<'a, dyn Val>`: the trait-object universe has
-been deleted and `Program::execute` runs `Value::resolve_value`, which walks the
+been deleted and the tree walker is `Value::resolve_value`, which walks the
 `Value` enum. Everything this document says about `dyn Val`, `Cow` lifetimes and
 `downcast_ref` describes the tree as it stood on 2026-07-26. The two-evaluator
 problem itself is unchanged. One consequence is not merely descriptive: the
 document's argument that Step 1 pays for itself on speed was an argument against
 the deleted walker, and measurement against the new one refutes it. See the note
 under Step 1.
+
+Superseded again, 2026-08-09: `vm` is a default cargo feature, so
+`Program::execute` is the bytecode VM. Wherever this document says
+`Program::execute` is the tree walker, that describes the pre-2026-08-09 default
+and the walker is now reached as `Value::resolve` / `Value::resolve_value`, or
+through `Program::execute` under `--no-default-features`.
 
 ## The problem
 
@@ -103,6 +110,21 @@ subset): lists, maps, strings, bytes, optionals, custom functions, regex.
 A stack VM over `Value` executes it. `Program::execute` becomes that VM and the
 recursive walker is deleted. Nothing about majit is involved. Gate: the entire
 existing cel test suite, unchanged.
+
+> **Landed 2026-08-09, without the deletion.** `cel::vm` is the bytecode
+> compiler and stack VM, and `vm` is a default cargo feature, so
+> `Program::execute` is that VM. The walker is NOT deleted — "What must NOT be
+> done" above is why — and is reached as `Value::resolve` /
+> `Value::resolve_value`, which is what `tests/oracle.rs` and
+> `tests/vm_walker_sweep.rs` call directly, so both evaluators are gated
+> whichever way the feature is set. `--no-default-features --features
+> regex,chrono` is the configuration that hands a *caller* the walker;
+> `.github/workflows/rust.yml` runs a test leg for it, because with `vm` on by
+> default nothing else runs `Program::execute` on the walker.
+>
+> The gate held: `cargo test` and `cargo test --features vm` were run on the
+> same tree before the flip and returned identical results — 127 lib + 2 + 4 +
+> 2 + 2 integration + 15 doc tests, 0 failed in both.
 
 **Step 2 — a merge point on the dispatch loop.**
 Put `jit_merge_point` with `greens = [pc, code]` on the new VM's loop and
@@ -489,7 +511,7 @@ The floor check says the columnar pipeline is worth having in the first place �
 
 | tier | ns per row/eval |
 |---|---|
-| tree-walking `Program::execute` (what cel ships) | 1498.89 |
+| the tree walker (`Program::execute` before `vm` became default) | 1498.89 |
 | clean bytecode VM over the lowered program | 177.97 |
 | **compiled majit trace** | **22.70** |
 

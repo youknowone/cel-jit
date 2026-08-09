@@ -173,7 +173,7 @@ name = "rca111"
 required-features = ["jit"]
 
 [features]
-default = ["regex", "chrono"]
+default = ["regex", "chrono", "vm"]
 structs = []
 bytes = ["dep:bytes"]
 json = ["dep:serde_json", "dep:base64"]
@@ -183,10 +183,16 @@ dhat-heap = [ ] # if you are doing heap profiling
 
 # Route `Program::execute` through the bytecode VM instead of the tree walker.
 #
-# Off by default while the two evaluators coexist. The differential oracle runs
-# BOTH regardless of this flag -- it calls each door directly -- so turning the
-# feature off does not turn the VM's gate off. What the flag decides is which
-# evaluator a *caller* gets.
+# On by default, so the VM is what a caller gets. The tree walker is not
+# deleted and is still the differential oracle: `cel/tests/oracle.rs` and
+# `cel/tests/vm_walker_sweep.rs` call `Value::resolve` / `Value::resolve_value`
+# directly, so both evaluators run under either setting of this flag and
+# turning the flag on did not turn the VM's gate off. What the flag decides is
+# which evaluator a *caller* gets.
+#
+# Turning it OFF -- `--no-default-features --features regex,chrono` -- is now
+# the non-default configuration, and it is the only way `Program::execute`
+# reaches the walker. `.github/workflows/rust.yml` runs a test leg for it.
 vm = []
 
 # PoC: meta-tracing JIT tier built on the in-repo `majit` framework (cell-majit,

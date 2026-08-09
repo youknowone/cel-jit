@@ -51,10 +51,11 @@
 //!   outside the window. That is cometkim's per-call regime
 //!   (`examples/majit_vs_cometkim_percall.rs`), reproduced here so a number
 //!   here can be read beside one there.
-//!   ⚠ The prefix is this row's key, not a claim about which evaluator ran:
-//!   `--features vm` points `Program::execute` at the bytecode VM, and these
-//!   rows then measure that instead. `features` in the header is what tells
-//!   the two apart, which is why it carries `vm`.
+//!   ⚠ The prefix is this row's key, not a claim about which evaluator ran.
+//!   `vm` is a DEFAULT feature and points `Program::execute` at the bytecode
+//!   VM, so these rows measure the VM unless the run passes
+//!   `--no-default-features`. `features` in the header is what tells the two
+//!   apart, which is why it carries `vm`.
 //! * `bind/*` — one `Context::add_variable_from_value(name, Value::List(..))`
 //!   and nothing else. This is task #82's shape.
 //! * `comprehension/*` — one bind PLUS one execute, which is what a caller with
@@ -989,17 +990,26 @@ const BASELINE_HEADER: &str = "\
 # measures. Sharing a file between two of these lets a blessing under one
 # overwrite the other's reference without a word:
 #
-#   allocs_per_eval.baseline         walker, no jit backend -- `cargo test -p cel`
+#   allocs_per_eval.baseline         walker, no jit backend
 #   allocs_per_eval.vm.baseline      bytecode VM, no jit backend
 #   allocs_per_eval.jit.baseline     walker, a jit backend -- adds `regvm/*`
 #   allocs_per_eval.jit.vm.baseline  bytecode VM, a jit backend
 #
-# Bless the one matching your configuration:
+# `vm` IS A DEFAULT FEATURE, so the two `.vm` files are the ones a plain run
+# reads and the two walker files take `--no-default-features`. Bless the one
+# matching your configuration:
 #
 #   CEL_ALLOCS_BLESS=1 cargo test -p cel --test allocs_per_eval
-#   CEL_ALLOCS_BLESS=1 cargo test -p cel --features vm --test allocs_per_eval
+#       -> allocs_per_eval.vm.baseline
+#   CEL_ALLOCS_BLESS=1 cargo test -p cel --no-default-features \\
+#       --features regex,chrono --test allocs_per_eval
+#       -> allocs_per_eval.baseline
 #   CEL_ALLOCS_BLESS=1 cargo test -p cel --features jit-cranelift \\
 #       --test allocs_per_eval
+#       -> allocs_per_eval.jit.vm.baseline
+#   CEL_ALLOCS_BLESS=1 cargo test -p cel --no-default-features \\
+#       --features regex,chrono,jit-cranelift --test allocs_per_eval
+#       -> allocs_per_eval.jit.baseline
 #
 # A run whose `features` differ from the pair recorded below is not comparable
 # and the report says so. `profile` is recorded but does not invalidate a

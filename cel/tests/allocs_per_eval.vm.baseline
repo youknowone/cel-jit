@@ -11,17 +11,26 @@
 # measures. Sharing a file between two of these lets a blessing under one
 # overwrite the other's reference without a word:
 #
-#   allocs_per_eval.baseline         walker, no jit backend -- `cargo test -p cel`
+#   allocs_per_eval.baseline         walker, no jit backend
 #   allocs_per_eval.vm.baseline      bytecode VM, no jit backend
 #   allocs_per_eval.jit.baseline     walker, a jit backend -- adds `regvm/*`
 #   allocs_per_eval.jit.vm.baseline  bytecode VM, a jit backend
 #
-# Bless the one matching your configuration:
+# `vm` IS A DEFAULT FEATURE, so the two `.vm` files are the ones a plain run
+# reads and the two walker files take `--no-default-features`. Bless the one
+# matching your configuration:
 #
 #   CEL_ALLOCS_BLESS=1 cargo test -p cel --test allocs_per_eval
-#   CEL_ALLOCS_BLESS=1 cargo test -p cel --features vm --test allocs_per_eval
+#       -> allocs_per_eval.vm.baseline
+#   CEL_ALLOCS_BLESS=1 cargo test -p cel --no-default-features \
+#       --features regex,chrono --test allocs_per_eval
+#       -> allocs_per_eval.baseline
 #   CEL_ALLOCS_BLESS=1 cargo test -p cel --features jit-cranelift \
 #       --test allocs_per_eval
+#       -> allocs_per_eval.jit.vm.baseline
+#   CEL_ALLOCS_BLESS=1 cargo test -p cel --no-default-features \
+#       --features regex,chrono,jit-cranelift --test allocs_per_eval
+#       -> allocs_per_eval.jit.baseline
 #
 # A run whose `features` differ from the pair recorded below is not comparable
 # and the report says so. `profile` is recorded but does not invalidate a

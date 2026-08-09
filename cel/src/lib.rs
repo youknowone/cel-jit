@@ -219,9 +219,10 @@ impl Program {
 
     /// Evaluate the program.
     ///
-    /// With the `vm` feature this is a thin wrapper over the bytecode VM's
-    /// dispatch loop, and with it off it is the tree walker. The two are held
-    /// to the same answers by the differential corpus in `tests/oracle.rs`.
+    /// With the `vm` feature — which is a DEFAULT feature — this is a thin
+    /// wrapper over the bytecode VM's dispatch loop, and with it off it is the
+    /// tree walker. The two are held to the same answers by the differential
+    /// corpus in `tests/oracle.rs`.
     #[cfg(not(feature = "vm"))]
     pub fn execute(&self, context: &Context) -> ResolveResult {
         Value::resolve(&self.expression, context)
