@@ -284,8 +284,7 @@ fn main() {
     println!(
         "[rca156][window] pre-bridge window is calls 1..{} ({} calls); \
          the floor search is confined to it",
-        prebridge_end,
-        prebridge_end
+        prebridge_end, prebridge_end
     );
 
     if dump_rows {
