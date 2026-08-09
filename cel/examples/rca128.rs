@@ -148,10 +148,29 @@
 //! per-row figures exactly (`F` = an entry ending in `finish`, `G` = an entry
 //! ending in a counted guard failure, `C` = per call):
 //!
+//! ⚠ **The four old `F`/`G` cells each land within 1 of `coefficient + C` (23 vs
+//! 19+4, 65 vs 60+4, 20 vs 17+4, 62 vs 58+4) — i.e. within 1 of a SINGLE-EXIT
+//! PER-CALL cost — so they may be per-call figures mislabelled as per-exit.**
+//!
 //! | | F | G | C |
 //! |---|---|---|---|
 //! | cranelift | 23 | 65 | 4 |
 //! | dynasm | 20 | 62 | 4 |
+//! | **cranelift — PER-EXIT coefficients (`allocs(call) = F·n_finish + G·n_guard + C`), #160, derived at cel-jit `91c5e8828caca571aeb7b523206689c7502c9db0` / majit `ff6360bbe24410c92a23eaaf914fa1d03953a506`, arm64, out-of-sample validated at n=10, residual 0 on 698 of 700** | **19** | **60** | **4** |
+//! | **dynasm — PER-EXIT coefficients, same two trees, same arm64 host, out-of-sample validated at n=10, residual 0 on 698 of 700** | **17** | **58** | **4** |
+//!
+//! ⭐ The two added rows are **additive only**: nothing above them is restated or
+//! corrected, and the old cells are left exactly as published. The cranelift
+//! per-exit row **reproduces #125 rev 5's 19/60/4 at a different tree**, which is
+//! why it is quoted with its own provenance rather than folded into that citation;
+//! the dynasm per-exit row is new and is the first post-drift dynasm measurement,
+//! closing the gap named by the note that begins *"The CL-DYN delta of 3 is
+//! immune to any per-exit constant"* (cited by its words, not its line — this
+//! file's own citations rot from any insertion above them, including this one).
+//! ⛔ `G − F = 41` on **both** backends, so
+//! #125's `GUARD = 42` does not hold at either tree — and because a per-exit
+//! constant cancels in that difference, 41 is the claim least exposed to the
+//! arming inflation discussed above.
 //!
 //! `cost/call = F x finishes + G x guards + C`. So n=5's "anomalous" pre-bridge
 //! 134/128 is just two guard exits, n=2's 27/24 is one finish exit, and the
