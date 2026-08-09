@@ -1,0 +1,188 @@
+# cel — allocations per evaluation. Produced by `tests/allocs_per_eval.rs`.
+#
+# ⚠ THIS FILE IS PER-HOST. It is NOT an absolute contract, and the test does NOT
+#   fail when a row differs from it. Run with `CEL_ALLOCS_GATE=1` to make a drift
+#   fatal — do that in a re-measurement of ONE change on ONE machine, never as a
+#   default CI gate.
+#
+# There is one baseline per (jit, vm) combination, because those are the two
+# features that change what a run MEANS rather than what it costs -- `jit` adds
+# the `regvm/*` rows, and `vm` decides which evaluator every `walker/*` row
+# measures. Sharing a file between two of these lets a blessing under one
+# overwrite the other's reference without a word:
+#
+#   allocs_per_eval.baseline         walker, no jit backend
+#   allocs_per_eval.vm.baseline      bytecode VM, no jit backend
+#   allocs_per_eval.jit.baseline     walker, a jit backend -- adds `regvm/*`
+#   allocs_per_eval.jit.vm.baseline  bytecode VM, a jit backend
+#
+# `vm` IS A DEFAULT FEATURE, so the two `.vm` files are the ones a plain run
+# reads and the two walker files take `--no-default-features`. Bless the one
+# matching your configuration:
+#
+#   CEL_ALLOCS_BLESS=1 cargo test -p cel --test allocs_per_eval
+#       -> allocs_per_eval.vm.baseline
+#   CEL_ALLOCS_BLESS=1 cargo test -p cel --no-default-features \
+#       --features regex,chrono --test allocs_per_eval
+#       -> allocs_per_eval.baseline
+#   CEL_ALLOCS_BLESS=1 cargo test -p cel --features jit-cranelift \
+#       --test allocs_per_eval
+#       -> allocs_per_eval.jit.vm.baseline
+#   CEL_ALLOCS_BLESS=1 cargo test -p cel --no-default-features \
+#       --features regex,chrono,jit-cranelift --test allocs_per_eval
+#       -> allocs_per_eval.jit.baseline
+#
+# A run whose `features` differ from the pair recorded below is not comparable
+# and the report says so. `profile` is recorded but does not invalidate a
+# comparison: dev and release were measured identical on every row.
+#
+# ⚠ EVERY CELL IS COMPARED AGAINST ITS OWN CONFIGURATION'S BASELINE. Nothing is
+#   ever subtracted ACROSS these files. A row present in two of them is two
+#   independent measurements of two different programs, and their difference is
+#   not a quantity -- the `jit` and `vm` legs do not share an evaluator, so a
+#   cross-file delta has no denominator in common. This is written here rather
+#   than in a task record on purpose: a blessing regenerates this header from
+#   the template but never reads a task, and the people who bless are exactly
+#   the people who need it.
+#
+# ⚠ THE JIT BACKEND IS DELIBERATELY NOT IN THE KEY, and the two legs DISAGREE:
+#   the `regvm/jit/*/n=1000` rows read 65/65/67 on cranelift and 63/63/65 on
+#   dynasm. That is not an under-specified key -- it is a finding, and putting
+#   `backend` in the filename would declare it expected and hide it. #116
+#   measured which side of the compile/run boundary it sits on
+#   (`cel/examples/rca116.rs`), and it is RUN-time on both:
+#
+#     * the loop is compiled before the window opens (`loops_compiled` = 1 after
+#       one priming call) and nothing compiles inside it;
+#     * both backends compile the SAME trace -- `trace_ops` 13->25 / 30->55 /
+#       11->21, identical per case;
+#     * allocations per call are invariant over window lengths 1..64, exactly
+#       linear in the call count, so no part of the figure is amortized one-off
+#       work -- a single call already costs the full 65 (or 63);
+#     * the gap is uniform across all three cases, so it is not a property of
+#       any one program's shape.
+#
+#   So: one program, one trace, one guard failure per call, two more
+#   allocations per call on cranelift. Attribution of those two is open.
+#
+#   ⚠ THE GAP WAS 3 AND IS NOW 2, and only one leg moved. #128
+#   (`32f3a1b79f7`, a back-edge FINISH returns from the portal instead of
+#   resuming at `target_pc`) took cranelift 66/66/68 -> 65/65/67 and left
+#   dynasm at 63/63/65 -- measured on the same tree, both legs, at the bless
+#   below. So the divergence is not a fixed constant to be explained once; it
+#   is a quantity that a backend-neutral fix moved on ONE backend. Any future
+#   attribution of the remainder has to account for that asymmetry, and a
+#   re-measurement that reads "3" is reading a tree older than `32f3a1b79f7`.
+#
+#   ⛔ The bullet that used to sit here -- "`float` never compiles a bridge at
+#   all in 6065 calls and still shows the same 3-allocation gap" -- was TRUE
+#   when written and is now FALSE. That was #133: `float`'s bridge trace
+#   aborted because `OP_RETURN_F` reached for the inherent `f64::to_bits`,
+#   which `majit-macros` did not recognise, so the arm degraded to an abort
+#   stub. Fixed in `3b3bb8f15c5`; `float` now compiles its bridge like the
+#   other two cases. It is kept here as a correction rather than deleted
+#   because the sentence was load-bearing for the argument above -- it was the
+#   evidence that the gap is not bridge-related -- and a reader who remembers
+#   it needs to know it was retired by a fix, not by a re-measurement.
+#
+# ⚠ THESE ROWS STILL SAMPLE A PRE-BRIDGE WINDOW, but the cliff they used to
+#   warn about is GONE. The `regvm/jit/*` window covers calls 65..89 and the
+#   first guard bridge lands at call 200, so the figures below remain the
+#   pre-bridge cost and `regvm/jit-steady/*` remains the row that measures the
+#   artifact's steady state. What changed is the size of the step between them.
+#
+#   This block used to read: "after which the same rows cost 23020 (cranelift)
+#   / 20023 (dynasm) allocations per call -- 349x and 317x these numbers -- and
+#   never come back" (#127). That was true and is now FALSE. #128
+#   (`32f3a1b79f7`) found the cause -- the compiled artifact re-entered at
+#   `target_pc` on a back-edge FINISH and re-ran the whole loop, so a call cost
+#   n-1 full compiled runs -- and fixed it. Measured on the same tree as the
+#   bless below:
+#
+#            regvm/jit-steady/*/n=1000     cranelift   dynasm
+#              arith                          24         22
+#              policy                         24         22
+#              float                          26         24
+#
+#   So the post-bridge regime costs ~0.4x the pre-bridge window rather than
+#   349x it, and the steady rows are now BELOW the warm ones. ⛔ Do not restate
+#   the 349x figure from this file's history: it describes a defect that has
+#   been fixed, and the three `jit-steady` rows that carried it are the three
+#   largest deltas in the bless that retired it (-22954, -22954, -42).
+#
+# Format: <label> TAB <allocations per evaluation>
+#! profile = release
+#! features = regex,chrono,vm,jit
+#! host = aarch64-macos
+#! rounds = 3
+
+probe/nothing	0.000
+probe/one-box-per-eval	1.000
+probe/other-thread-allocating	0.000
+walker/simple_arithmetic	1.000
+walker/comparison	2.000
+walker/conditional	1.000
+walker/nested_expression	1.000
+walker/variable_access/hashmap	1.000
+walker/variable_access/resolver	1.000
+walker/member_access	1.000
+walker/list_indexing	1.000
+walker/list_filter	11.000
+walker/list_map	10.000
+walker/all_comprehension	8.000
+walker/exists_comprehension	8.000
+walker/map_list_scaling/1	6.000
+walker/map_list_scaling/10	8.000
+walker/map_list_scaling/100	11.000
+walker/map_list_scaling/1000	14.000
+walker/map_list_scaling/10000	18.000
+walker/filter_list_scaling/1	6.000
+walker/filter_list_scaling/10	7.000
+walker/filter_list_scaling/100	10.000
+walker/filter_list_scaling/1000	13.000
+walker/filter_list_scaling/10000	17.000
+walker/comprehension_scaling/10	12.000
+walker/comprehension_scaling/50	16.000
+walker/comprehension_scaling/100	18.000
+walker/comprehension_scaling/500	22.000
+walker/string_operations	8.000
+walker/member_call_on_variable	11.000
+walker/custom_function	3.000
+walker/real_world_policy	7.000
+walker/map_literal	4.000
+walker/map_literal/nested	7.000
+bind/clone-only/1	0.000
+bind/list-to-context/1	0.000
+bind/clone-only/10	0.000
+bind/list-to-context/10	0.000
+bind/clone-only/100	0.000
+bind/list-to-context/100	0.000
+bind/clone-only/1000	0.000
+bind/list-to-context/1000	0.000
+comprehension/bind+exec/map/10	8.000
+comprehension/bind+exec/filter/10	7.000
+comprehension/bind+exec/chained/10	12.000
+comprehension/bind+exec/all/10	5.000
+comprehension/bind+exec/exists/10	5.000
+comprehension/bind+exec/size/10	9.000
+comprehension/bind+exec/map/100	11.000
+comprehension/bind+exec/filter/100	10.000
+comprehension/bind+exec/chained/100	18.000
+comprehension/bind+exec/all/100	5.000
+comprehension/bind+exec/exists/100	5.000
+comprehension/bind+exec/size/100	12.000
+regvm/clean/arith/n=1	1.000
+regvm/jit/arith/n=1	1.000
+regvm/clean/arith/n=1000	1.000
+regvm/jit/arith/n=1000	61.000
+regvm/jit-steady/arith/n=1000	20.000
+regvm/clean/policy/n=1	1.000
+regvm/jit/policy/n=1	1.000
+regvm/clean/policy/n=1000	1.000
+regvm/jit/policy/n=1000	61.000
+regvm/jit-steady/policy/n=1000	20.000
+regvm/clean/float/n=1	2.000
+regvm/jit/float/n=1	2.000
+regvm/clean/float/n=1000	2.000
+regvm/jit/float/n=1000	63.000
+regvm/jit-steady/float/n=1000	22.000
