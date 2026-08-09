@@ -18,8 +18,18 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Format
         run: cargo fmt --all -- --check
+      # `-p cel` IS LOAD-BEARING, for the reason spelled out at the tree-walker
+      # step below: this is a virtual workspace and `fuzz/Cargo.toml` takes
+      # `cel` with default features ON, so a root `--no-default-features` turns
+      # off only the *selected packages'* defaults and feature unification puts
+      # every one of them straight back. Measured, without `-p cel` this step
+      # compiles cel with `--cfg 'feature="chrono"' --cfg 'feature="default"'
+      # --cfg 'feature="regex"' --cfg 'feature="vm"'` -- i.e. it builds the
+      # DEFAULT feature set, not a minimal one, and has never once built cel
+      # with its features off. With `-p cel` the same line carries no
+      # `--cfg 'feature=...'` at all.
       - name: Build minimal
-        run: cargo build --verbose --no-default-features
+        run: cargo build --verbose -p cel --no-default-features
       - name: Build with default features
         run: cargo build --verbose
       - name: Build with all features
