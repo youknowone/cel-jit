@@ -18,14 +18,20 @@
 //! (`f64` columns for the JIT, a live `Context` for the walker) and are measured
 //! steady-state, with no per-row setup on either side. The baseline is the
 //! tree-walker at its best: ONE reused `Context` whose variables are overwritten
-//! per row, then `Program::execute`.
+//! per row, then `Value::resolve_value` — the walker itself, called directly.
+//! NOT `Program::execute`: that is the bytecode VM whenever the `vm` feature is
+//! on, and `vm` is a DEFAULT feature, so through the public door `stock` would
+//! be a second VM and `stock / clean VM` would compare two bytecode
+//! interpreters. `required-features = ["jit"]` does not imply
+//! `--no-default-features`, so the door would be the VM in every ordinary run.
 //!
 //! Four steady-state measurements over one prebuilt batch program:
 //!   stock    stock tree-walker, reused Context
 //!   clean VM plain Rust bytecode interpreter, no tracing/JIT machinery
 //!   JIT-off  majit tracing interpreter, compilation disabled
 //!   JIT-on   majit compiled trace
-//! This separates the representation/lowering win (`stock / clean VM`) from
+//! This separates the representation/lowering win (`stock / clean VM`, i.e. the
+//! tree-walker against the lowered columnar bytecode) from
 //! the compilation win (`clean VM / JIT-on`). The result is bit-exact (no float
 //! tolerance); a 4-way equality gate enforces it. RELEASE ONLY.
 
@@ -111,7 +117,7 @@ fn main() {
         for i in 0..n {
             ctx.add_variable_from_value("price", price[i]);
             ctx.add_variable_from_value("qty", qty[i]);
-            acc += match program.execute(&ctx).expect("execute") {
+            acc += match Value::resolve_value(program.expression(), &ctx).expect("execute") {
                 Value::Bool(b) => b as i64,
                 Value::Int(v) => v,
                 other => panic!("unexpected {other:?}"),
@@ -205,7 +211,7 @@ fn main() {
         for i in 0..n {
             ctx.add_variable_from_value("price", price[i]);
             ctx.add_variable_from_value("qty", qty[i]);
-            acc += match agg_program.execute(&ctx).expect("execute") {
+            acc += match Value::resolve_value(agg_program.expression(), &ctx).expect("execute") {
                 Value::Float(v) => v,
                 other => panic!("unexpected {other:?}"),
             };

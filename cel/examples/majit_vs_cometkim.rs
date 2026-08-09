@@ -11,10 +11,15 @@
 //!   already support. A declining case still gets a row: it is still ANSWERED,
 //!   by the tree-walker through the library's own fallback, and dropping it
 //!   from the table would read as an expression this crate cannot evaluate.
-//! * **Throughput.** For the ones that lower: stock `Program::execute` per row,
+//! * **Throughput.** For the ones that lower: the stock tree-walker per row,
 //!   the plain Rust bytecode VM, and the compiled trace, over one batch of
 //!   identical data. Only `majit / clean VM` isolates compilation; the ratio to
 //!   stock also contains the data-model change (slot resolution, no boxing).
+//!   `stock` calls `Value::resolve_value` DIRECTLY rather than
+//!   `Program::execute`, because that door is the bytecode VM whenever the `vm`
+//!   feature is on — a DEFAULT feature, and one `required-features = ["jit"]`
+//!   does not turn off — which would leave `stock` naming a walker and running
+//!   a VM, and would put a VM on both sides of the `stock / clean VM` ratio.
 //!
 //! ⚠️ This is NOT a comparison against cometkim's own numbers. His regime is one
 //! `CompiledProgram::execute(&ctx)` per criterion iteration over a FIXED
@@ -496,8 +501,7 @@ fn run_case(case: &Case) -> Row {
     let walked: Vec<Value> = contexts
         .iter()
         .map(|ctx| {
-            program
-                .execute(ctx)
+            Value::resolve_value(program.expression(), ctx)
                 .unwrap_or_else(|e| panic!("{}: stock execute: {e:?}", case.label))
         })
         .collect();
@@ -633,7 +637,7 @@ fn time_one_stock(program: &Program, contexts: &[Context], label: &str) -> f64 {
     time_ns_per_row(|| {
         let mut sink = 0usize;
         for ctx in contexts {
-            let v = black_box(program.execute(black_box(ctx)))
+            let v = black_box(Value::resolve_value(program.expression(), black_box(ctx)))
                 .unwrap_or_else(|e| panic!("{label}: stock execute: {e:?}"));
             sink ^= matches!(v, Value::Bool(true)) as usize;
         }

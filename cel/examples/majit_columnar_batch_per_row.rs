@@ -24,6 +24,12 @@
 //! The four paths — stock, clean bytecode VM, majit with compilation disabled,
 //! compiled majit — are gated on producing identical values for every row.
 //! RELEASE ONLY.
+//!
+//! `stock` is `Value::resolve_value`, the tree-walker called directly — NOT
+//! `Program::execute`, which is the bytecode VM whenever the `vm` feature is
+//! on, and `vm` is a DEFAULT feature. `required-features = ["jit"]` does not
+//! imply `--no-default-features`, so through the public door the panel labelled
+//! `stock tree-walker` would in fact be running the VM.
 
 use std::hint::black_box;
 use std::sync::atomic::Ordering;
@@ -97,7 +103,7 @@ fn main() {
         for i in 0..n {
             ctx.add_variable_from_value("role", role[i].clone());
             ctx.add_variable_from_value("region", region[i].clone());
-            out.push(program.execute(&ctx).expect("execute"));
+            out.push(Value::resolve_value(program.expression(), &ctx).expect("execute"));
         }
         out
     };

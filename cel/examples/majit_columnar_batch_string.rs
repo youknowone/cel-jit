@@ -22,11 +22,17 @@
 //! FAIR comparison = hot vs hot. Both sides receive their data already laid out
 //! (id columns for the JIT, a live `Context` for the walker) and are measured
 //! steady-state, with no per-row setup on either side beyond the walker's
-//! variable overwrite.
+//! variable overwrite. The walker side is `Value::resolve_value`, called
+//! directly — NOT `Program::execute`, which is the bytecode VM whenever the
+//! `vm` feature is on, and `vm` is a DEFAULT feature. Through the public door
+//! `stock` would be a second VM and `stock / clean VM` would compare two
+//! bytecode interpreters; `required-features = ["jit"]` does not imply
+//! `--no-default-features`, so that is what every ordinary run would report.
 //!
 //! The benchmark reports four paths over one prebuilt batch program: stock,
 //! clean bytecode VM, majit with compilation disabled, and compiled majit.
-//! `stock / clean VM` measures the representation/lowering effect, while
+//! `stock / clean VM` measures the representation/lowering effect — the
+//! tree-walker against the lowered columnar bytecode — while
 //! `clean VM / JIT-on` measures the compilation effect. RELEASE ONLY (4-way
 //! equality gate).
 
@@ -108,7 +114,7 @@ fn main() {
         for i in 0..n {
             ctx.add_variable_from_value("role", role[i].clone());
             ctx.add_variable_from_value("region", region[i].clone());
-            acc += match program.execute(&ctx).expect("execute") {
+            acc += match Value::resolve_value(program.expression(), &ctx).expect("execute") {
                 Value::Bool(b) => b as i64,
                 Value::Int(v) => v,
                 other => panic!("unexpected {other:?}"),

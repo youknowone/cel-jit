@@ -17,7 +17,14 @@
 //! (i64 columns for the JIT, a live `Context` for the walker) and are measured
 //! steady-state, with no per-row setup on either side. The baseline is therefore
 //! the tree-walker at its best: ONE reused `Context` whose variables are
-//! overwritten per row, then `Program::execute`. We deliberately do NOT compare
+//! overwritten per row, then `Value::resolve_value` — the walker itself, called
+//! directly. NOT `Program::execute`: that is the bytecode VM whenever the `vm`
+//! feature is on, and `vm` is a DEFAULT feature, so through the public door
+//! `stock` would be a second VM and `stock / clean VM` would compare two
+//! bytecode interpreters rather than a walker against one. This example carries
+//! `required-features = ["jit"]`, which does not imply `--no-default-features`,
+//! so the door would be the VM in every ordinary run of it.
+//! We deliberately do NOT compare
 //! against a fresh-`Context`-per-row walker — that pays a per-row allocation the
 //! JIT never does (cold vs hot), which would flatter the JIT dishonestly.
 //!
@@ -26,7 +33,8 @@
 //!   clean VM plain Rust bytecode interpreter, no tracing/JIT machinery
 //!   JIT-off  majit tracing interpreter, compilation disabled
 //!   JIT-on   majit compiled trace
-//! This separates the representation/lowering win (`stock / clean VM`) from
+//! This separates the representation/lowering win (`stock / clean VM`, i.e. the
+//! tree-walker against the lowered columnar bytecode) from
 //! the compilation win (`clean VM / JIT-on`). RELEASE ONLY (i64 wrap; 4-way
 //! equality gate).
 
@@ -108,7 +116,7 @@ fn main() {
             ctx.add_variable_from_value("balance", balance[i]);
             ctx.add_variable_from_value("amount", amount[i]);
             ctx.add_variable_from_value("frozen", frozen[i]);
-            acc += match program.execute(&ctx).expect("execute") {
+            acc += match Value::resolve_value(program.expression(), &ctx).expect("execute") {
                 Value::Bool(b) => b as i64,
                 Value::Int(v) => v,
                 other => panic!("unexpected {other:?}"),

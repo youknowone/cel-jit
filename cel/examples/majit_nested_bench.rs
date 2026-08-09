@@ -34,8 +34,12 @@
 //! by ordinary least squares over the whole ladder. `steady` is what the
 //! compiled trace actually costs per row; `compile` is the fixed price of
 //! getting there; `break-even` is where the JIT total overtakes the clean VM
-//! total. A fourth tier, the tree-walking `Program::execute` cel actually ships,
-//! is reported per shape as a floor for the columnar pipeline itself.
+//! total. A fourth tier, cel's tree walker, is reported per shape as a floor
+//! for the columnar pipeline itself. It is reached as `Value::resolve_value`,
+//! not through `Program::execute`: that door is the bytecode VM whenever the
+//! `vm` feature is on, and `vm` is a DEFAULT feature that
+//! `required-features = ["jit"]` does not turn off, so the public door would
+//! make the floor a VM measurement under a tree-walker label.
 //!
 //! Two things keep this readable on a shared machine: rounds are interleaved
 //! (clean, interp, jit, clean, interp, jit, …) rather than run in blocks, so a
@@ -58,7 +62,7 @@ use cel::majit::lower::{Schema, ValType};
 use cel::{Context, Program, Value};
 
 /// Reference tier: how many distinct activations to build, and how many
-/// `Program::execute` calls to time over them.
+/// `Value::resolve_value` calls to time over them.
 const TREE_POOL: usize = 512;
 const TREE_EVALS: usize = 20_000;
 
@@ -267,9 +271,11 @@ fn tree_walker_ns_per_eval(
     // must equal the columnar tiers' sum over those rows.
     let matches = contexts
         .iter()
-        .filter(|c| match program.execute(c).expect("tree-walk failed") {
-            Value::Bool(v) => v,
-            other => panic!("expected a boolean result, got {other:?}"),
+        .filter(|c| {
+            match Value::resolve_value(program.expression(), c).expect("tree-walk failed") {
+                Value::Bool(v) => v,
+                other => panic!("expected a boolean result, got {other:?}"),
+            }
         })
         .count();
 
@@ -279,8 +285,7 @@ fn tree_walker_ns_per_eval(
         let mut observed = 0usize;
         for i in 0..TREE_EVALS {
             let context = black_box(&contexts[i % pool]);
-            let v = black_box(program)
-                .execute(context)
+            let v = Value::resolve_value(black_box(program).expression(), context)
                 .expect("tree-walk failed inside the timed region");
             observed ^= matches!(v, Value::Bool(true)) as usize;
         }
@@ -386,7 +391,7 @@ fn main() {
         println!(
             "[{label}]  mean list length {:.2}, mean elements examined {:.2};  \
              tree-walker reference \
-             {tree_ns:.2} ns/eval (cached Program::execute, pool of {pool_rows})",
+             {tree_ns:.2} ns/eval (cached Value::resolve_value, pool of {pool_rows})",
             data.mean_trip(),
             data.examined(max_rows) as f64 / max_rows as f64,
         );

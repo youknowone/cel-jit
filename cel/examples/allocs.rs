@@ -55,6 +55,17 @@ static ALLOC: Counting = Counting;
 
 const ROWS: usize = 50_000;
 
+/// What `Program::execute` resolves to in THIS build, for the panel headers.
+///
+/// `vm` is a default feature, so it is the bytecode VM unless the example was
+/// built with `--no-default-features`. Naming one of the two in a literal would
+/// leave the header disagreeing with what ran.
+const PUBLIC_DOOR: &str = if cfg!(feature = "vm") {
+    "bytecode VM"
+} else {
+    "tree-walker"
+};
+
 fn reset() {
     ALLOCS.store(0, Ordering::Relaxed);
     BYTES.store(0, Ordering::Relaxed);
@@ -187,15 +198,23 @@ fn main() {
 
     record_list();
     string_column();
-    tree_walker();
+    public_door();
 }
 
-/// The door most callers actually use. `cel::Program::execute` is still the
-/// recursive AST tree-walker, which `cel/src/majit/CONVERGENCE.md` prices at
-/// 1498.89 ns/row against the compiled tier's 22.70. The batch tiers are now
-/// at 1.000 allocs/row, so this arm says what the gap costs in allocations
-/// rather than in a timing that this host cannot measure.
-fn tree_walker() {
+/// The door most callers actually use, `cel::Program::execute`.
+///
+/// WHICH evaluator that door runs depends on the feature set: `vm` is a DEFAULT
+/// feature and `required-features = ["jit"]` does not turn it off, so an
+/// ordinary run of this example measures the bytecode VM, and only
+/// `--no-default-features` reaches the recursive AST tree-walker. The panel
+/// headers print whichever one this build resolved to rather than naming one of
+/// them, because the arm is about the door and not about a fixed evaluator.
+///
+/// `cel/src/majit/CONVERGENCE.md` prices the tree-walker at 1498.89 ns/row
+/// against the compiled tier's 22.70. The batch tiers are now at 1.000
+/// allocs/row, so this arm says what the gap costs in allocations rather than
+/// in a timing that this host cannot measure.
+fn public_door() {
     // A scalar expression first, so the per-NODE cost is separated from the
     // per-element cost the comprehension adds.
     walk_scalar();
@@ -255,7 +274,7 @@ fn walk_scalar() {
     let (a_hoisted, b_hoisted) = read();
     assert_ne!(total, 0);
 
-    println!("\n-- tree-walker (Program::execute), scalar `a * 2 + b` --");
+    println!("\n-- {PUBLIC_DOOR} (Program::execute), scalar `a * 2 + b` --");
     for (label, a, b) in [
         ("Context::default() per row", a_fresh, b_fresh),
         ("hoisted Context", a_hoisted, b_hoisted),
@@ -310,7 +329,7 @@ fn walk_list(list_len: i64, source: &str) {
     // `filter(x, x < 0)` keeps nothing; every other source keeps everything.
     assert_eq!(total % list_len as usize, 0);
 
-    println!("\n-- tree-walker (Program::execute), {list_len} elements per row, `{source}` --");
+    println!("\n-- {PUBLIC_DOOR} (Program::execute), {list_len} elements per row, `{source}` --");
     for (label, a, b) in [
         ("build the input Value", a_in, b_in),
         ("bind it to a Context", a_bind, b_bind),

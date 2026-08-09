@@ -11,10 +11,15 @@
 //!
 //! What each column is, and what it is not:
 //!
-//! * **stock** — `Program::execute(&ctx)` on the tree-walker, the same evaluator
-//!   his `interpreted` column measures. His ran against upstream `cel` 0.11.6;
-//!   this one runs against ours, so the two are one measurement of two versions
-//!   of one evaluator.
+//! * **stock** — `Value::resolve_value(program.expression(), &ctx)`, the tree
+//!   walker, the same evaluator his `interpreted` column measures. His ran
+//!   against upstream `cel` 0.11.6; this one runs against ours, so the two are
+//!   one measurement of two versions of one evaluator. The walker is called
+//!   DIRECTLY, not through `Program::execute`, because that door is the bytecode
+//!   VM whenever the `vm` feature is on — a DEFAULT feature, which
+//!   `required-features = ["jit"]` does not turn off. Going through it would
+//!   silently make this column a different evaluator from the one his figures
+//!   were taken on, which is the entire basis of the comparison.
 //! * **majit** — the compiled tier through a ONE-ROW batch: `bind_per_row` once,
 //!   `collect_on(Tier::Jit)` per call. That returns the row's `Value`, which is
 //!   what `execute` returns, so it is the same contract.
@@ -432,8 +437,7 @@ fn run_case(case: &Case) -> Row {
     if case.stock_resolver {
         activation.set_variable_resolver(&RESOLVER);
     }
-    let expected = program
-        .execute(&activation)
+    let expected = Value::resolve_value(program.expression(), &activation)
         .unwrap_or_else(|e| panic!("{}: stock execute: {e:?}", case.label));
 
     // Drift gate: the same walker, over a child scope the LIBRARY's `RowReader`
@@ -442,7 +446,9 @@ fn run_case(case: &Case) -> Row {
     // can disagree and every ratio below silently compares two workloads.
     let mirrored = RowReader::new(&batch).scope(&activation, 0);
     assert_eq!(
-        program.execute(&mirrored).ok().as_ref(),
+        Value::resolve_value(program.expression(), &mirrored)
+            .ok()
+            .as_ref(),
         Some(&expected),
         "{}: the batch columns and the hand-built activation disagree",
         case.label
@@ -456,8 +462,7 @@ fn run_case(case: &Case) -> Row {
     // `UndeclaredReference("@result")`, so all four `comprehension_scaling`
     // rows time a failure and print it as a two-fold speedup.
     let stock = per_call(|| {
-        program
-            .execute(black_box(&activation))
+        Value::resolve_value(program.expression(), black_box(&activation))
             .unwrap_or_else(|e| panic!("{}: stock execute: {e:?}", case.label))
     });
 

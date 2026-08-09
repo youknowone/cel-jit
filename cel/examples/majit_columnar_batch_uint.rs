@@ -17,7 +17,12 @@
 //! (u64 columns for the JIT, a live `Context` for the walker) and are measured
 //! steady-state, with no per-row setup on either side. The baseline is the
 //! tree-walker at its best: ONE reused `Context` whose variables are overwritten
-//! per row, then `Program::execute`.
+//! per row, then `Value::resolve_value` — the walker itself, called directly.
+//! NOT `Program::execute`: that is the bytecode VM whenever the `vm` feature is
+//! on, and `vm` is a DEFAULT feature, so through the public door `stock` would
+//! be a second VM and `stock / clean VM` would compare two bytecode
+//! interpreters. `required-features = ["jit"]` does not imply
+//! `--no-default-features`, so the door would be the VM in every ordinary run.
 //!
 //! The columns are full-range u64 (about half the rows have the high bit set),
 //! so a signed compare would give a different count — the win is not bought by
@@ -25,7 +30,8 @@
 //!
 //! The benchmark reports four paths over one prebuilt batch program: stock,
 //! clean bytecode VM, majit with compilation disabled, and compiled majit.
-//! `stock / clean VM` measures the representation/lowering effect, while
+//! `stock / clean VM` measures the representation/lowering effect — the
+//! tree-walker against the lowered columnar bytecode — while
 //! `clean VM / JIT-on` measures the compilation effect. RELEASE ONLY (4-way
 //! equality gate).
 
@@ -102,7 +108,7 @@ fn main() {
         for i in 0..n {
             ctx.add_variable_from_value("account", account[i]);
             ctx.add_variable_from_value("minimum", minimum[i]);
-            acc += match program.execute(&ctx).expect("execute") {
+            acc += match Value::resolve_value(program.expression(), &ctx).expect("execute") {
                 Value::Bool(b) => b as i64,
                 Value::Int(v) => v,
                 other => panic!("unexpected {other:?}"),
