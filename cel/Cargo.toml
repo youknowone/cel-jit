@@ -31,16 +31,26 @@ pastey = "0.2.1"
 # sibling checkout that made every cargo command — `fmt --check` included —
 # fail on a clean clone. A git revision resolves for anyone.
 #
-# `rev` is https://github.com/youknowone/pyre/pull/960. Bump it deliberately:
-# it is the only thing pinning the JIT tier's behaviour — and a stale pin is
-# silent. The previous rev (`c05bccff72`, PR 834) was 95 majit commits behind,
-# and the first commit past it was the one that made the retrace path work, so
-# every measurement taken against it described machinery that had since been
-# fixed: sweeping `retrace_limit` on a shape-changing batch aborted every
-# retrace at 834 and none at 960.
-majit-ir = { git = "https://github.com/youknowone/pyre.git", rev = "2c86af516883521a476b09c84680e5ed9bbec120", optional = true }
-majit-macros = { git = "https://github.com/youknowone/pyre.git", rev = "2c86af516883521a476b09c84680e5ed9bbec120", optional = true }
-majit-metainterp = { git = "https://github.com/youknowone/pyre.git", rev = "2c86af516883521a476b09c84680e5ed9bbec120", default-features = false, optional = true }
+# `rev` is `main` as of 2026-08-09. Bump it deliberately: it is the only thing
+# pinning the JIT tier's behaviour — and a stale pin is silent. Two measured
+# instances of that silence, both found long after the fact:
+#
+#   - `c05bccff72` (PR 834) sat 95 majit commits behind, and the first commit
+#     past it was the one that made the retrace path work, so every measurement
+#     taken against it described machinery that had since been fixed: sweeping
+#     `retrace_limit` on a shape-changing batch aborted every retrace at 834 and
+#     none at 960.
+#   - `2c86af5168` (PR 960) sat 107 commits behind `main`, 49 of them touching
+#     `majit/`.
+#
+# Neither the distance nor what it covers is observable from inside this repo:
+# a cohabiting checkout carries a `[patch]` in `.cargo/config.toml` that
+# redirects these three crates to the enclosing worktree, which is what every
+# local measurement then runs against. So the pin's own effect is only ever
+# tested where that file is absent — a clean clone, and CI.
+majit-ir = { git = "https://github.com/youknowone/pyre.git", rev = "eba36d13ed90232b08da71c1837877496f982368", optional = true }
+majit-macros = { git = "https://github.com/youknowone/pyre.git", rev = "eba36d13ed90232b08da71c1837877496f982368", optional = true }
+majit-metainterp = { git = "https://github.com/youknowone/pyre.git", rev = "eba36d13ed90232b08da71c1837877496f982368", default-features = false, optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.5.1", features = ["html_reports"] }

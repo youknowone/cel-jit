@@ -884,6 +884,15 @@ pub mod float_bank {
     struct VmStateF {
         regs: Vec<i64>,
         fregs: Vec<f64>,
+        /// What a terminal opcode hands back, as raw i64 bits.
+        ///
+        /// The `; state` merge point leaves the loop through `break` before it
+        /// assigns the walk's resume pc, so after the loop `pc` still names the
+        /// position the walk started from and `program[pc + 1]` — the operand
+        /// saying which register holds the result — cannot be read there. The
+        /// result has to arrive in `state`, and a scalar field is the direct way
+        /// to carry it.
+        ret: i64,
     }
 
     #[majit_macros::jit_interp(
@@ -893,6 +902,7 @@ pub mod float_bank {
         state_fields = {
             regs: [int; virt],
             fregs: [float; virt],
+            ret: int,
         },
         // `opcode_for_binop` has no unsigned spelling and `BindingKind` carries
         // no signedness, so the unsigned multiply-high resop is reached by
@@ -911,10 +921,18 @@ pub mod float_bank {
         let mut state = VmStateF {
             regs: init_regs.to_vec(),
             fregs: vec![0.0; num_fregs],
+            ret: 0,
         };
 
         loop {
-            jit_merge_point!();
+            // `; state` selects the single-pass close: the walk's final state is
+            // transferred into `state` here and the native loop resumes at the
+            // close pc, instead of re-running the circuit the walk already
+            // executed. It also runs `run_pending_abort_blackhole`, which
+            // finishes the opcodes a mid-opcode abort left half-executed — a
+            // consumer on the bare form never reaches that, because the driver
+            // drops the stale stash at the next merge-point entry.
+            jit_merge_point!(driver, program, pc; state);
             let opcode = program[pc];
             match opcode {
                 OP_LOAD_CONST => {
@@ -1424,16 +1442,35 @@ pub mod float_bank {
                     }
                     pc += 4;
                 }
+                // The terminal arms store into `ret` and then leave through an
+                // in-arm `return`, never `{ store; break }`: `classify.rs`
+                // `is_break_expr` requires the arm body to be exactly `break`, so
+                // a composite body classifies `Lowerable` and its tail `break`
+                // reaches `lower_stmt_fallback`, which has a guard for an
+                // enclosed `return` but none for `break` — the statement is inert
+                // and is silently dropped, leaving the lowered arm to fall
+                // through to the dispatch back-edge. `lower_return_stmt` lowers
+                // the `return` spelling in place.
                 OP_RETURN => {
-                    return state.regs[program[pc + 1] as usize];
+                    state.ret = state.regs[program[pc + 1] as usize];
+                    return state.ret;
                 }
                 OP_RETURN_F => {
-                    return state.fregs[program[pc + 1] as usize].to_bits() as i64;
+                    state.ret = majit_f64_to_bits(state.fregs[program[pc + 1] as usize]);
+                    return state.ret;
                 }
-                _ => break,
+                // Was `_ => break` with the panic below the loop. The loop now
+                // has a second way out — the merge point's own `break` on a walk
+                // that reached a terminal return — so falling out of it no longer
+                // identifies a bad opcode, and the panic has to move into the arm
+                // that actually saw one.
+                _ => panic!("fell off end of code"),
             }
         }
-        panic!("fell off end of code");
+        // Reached only when the merge point broke out on a walk that already ran
+        // a terminal opcode, so the result is whatever that opcode parked in
+        // `ret`. The write-back that put it there runs ahead of the `break`.
+        state.ret
     }
 
     /// Reference two-bank interpreter — correctness oracle for the float path.
@@ -1878,6 +1915,7 @@ pub mod float_bank {
         let seed = VmStateF {
             regs: vec![0; num_regs],
             fregs: vec![0.0; num_fregs],
+            ret: 0,
         };
         {
             use majit_metainterp::JitState as _;
