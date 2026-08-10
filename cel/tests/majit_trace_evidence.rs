@@ -20,8 +20,8 @@
 #![cfg(feature = "jit")]
 
 use cel::majit::bytecode::float_bank::{
-    abort_reasons, abort_reasons_since, jit_stats, reset_jit_stats, reset_persistent_state,
-    MAX_PROGRAMS_PER_DRIVER,
+    abort_reasons, abort_reasons_since, guard_census_summary, jit_stats, reset_jit_stats,
+    reset_persistent_state, MAX_PROGRAMS_PER_DRIVER,
 };
 use cel::majit::bytecode::{clean_batch_sum_f, eval_batch_sum_f, Column};
 use cel::majit::lower::{lower_typed, LoweredF, Schema, ValType};
@@ -879,6 +879,14 @@ fn nested_loop_deopts_are_a_warmup_cost_not_a_per_row_cost() {
                 Column::Int(&elems),
             ];
             let (_, deopts, _, _) = measure(&lowered, &columns, rows);
+            // Under MAJIT_GUARD_CENSUS this separates the two shapes a deopt
+            // TOTAL cannot: one guard with no bridge attached versus a spread
+            // of cold guards each below trace_eagerness. Cumulative and with no
+            // reset, so read the increment between consecutive lines.
+            eprintln!(
+                "[warmup-census] {label} rows={rows} deopts={deopts} {}",
+                guard_census_summary(4)
+            );
             counts.push(deopts);
         }
         let (small, large) = (counts[0], counts[1]);

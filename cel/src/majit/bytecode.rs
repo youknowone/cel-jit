@@ -2244,6 +2244,27 @@ pub mod float_bank {
             .join(" ")
     }
 
+    /// Render majit's per-guard deopt census as `distinct=N total=M top=…`.
+    ///
+    /// `guard_failures` is a total, and a total cannot separate the two things
+    /// that produce a large one: ONE guard that keeps returning to the runtime
+    /// because no bridge was ever attached to it, versus a WIDE SPREAD of cold
+    /// guards that each fail below `trace_eagerness`. Those want opposite fixes
+    /// — the first is a bridging defect, the second is a warmup cost that a
+    /// budget mis-sized. `distinct` is what tells them apart.
+    ///
+    /// ⚠ Off unless `MAJIT_GUARD_CENSUS` is set, because the map write sits on
+    /// the deopt path, i.e. exactly the path under study. Returns
+    /// `guard_census=off` when it was never enabled — a third value distinct
+    /// from an empty census, so "no rows" cannot be misread as "no deopts".
+    ///
+    /// ⚠ Cumulative, process-global, and there is no reset. Read the INCREMENT
+    /// across a window rather than the absolute, the way a sweep over several
+    /// shapes has to.
+    pub fn guard_census_summary(top: usize) -> String {
+        majit_metainterp::guard_census_summary(top)
+    }
+
     /// Print one `[jit-stats]` line, tagged with `label`, in the format the pyre
     /// runner uses. `label` names the shape being measured, so a run that sweeps
     /// several of them stays readable.
