@@ -2179,6 +2179,71 @@ pub mod float_bank {
         }
     }
 
+    /// Snapshot majit's abort-reason tallies as `(label, count)` pairs.
+    ///
+    /// [`JitStats::loops_aborted`] counts aborts without saying WHY, and the
+    /// reason is not carried on the `on_trace_abort` hook — it survives only in
+    /// majit's `MC_DIAG` slots, keyed by `Counters::ABORT_*`. Without this a
+    /// test can assert `aborts == 0`, watch it fail, and have no way to learn
+    /// which of seven reasons fired.
+    ///
+    /// `majit-metainterp` is an optional dependency of this crate and is not a
+    /// dependency of the test binaries, so the reader has to come through here.
+    ///
+    /// Selection is by the `abrt_` label prefix, deliberately NOT by the slot
+    /// range those labels currently occupy: a hard-coded range names the wrong
+    /// counters the moment a slot is added, and it does so silently.
+    ///
+    /// ⛔ THIS CENSUS HAS TWO VALUES, NOT SEVEN. `AbortReason` defines only
+    /// `TooLong` and `Generic`, and `Generic.as_int()` is `ABORT_BRIDGE`, so
+    /// every abort that is not a length/tag overflow lands in `abrt_bridge`
+    /// regardless of cause. `abrt_bridge` is the UNCLASSIFIED bucket wearing a
+    /// specific-sounding name; `jitprof.rs` says so outright — "reading it as
+    /// 'a bridge aborted' sends the next reader looking for bridge activity
+    /// that is not there". `stage_abort_reason` would let a caller name a real
+    /// reason and currently has zero callers, which is why nothing is ever
+    /// classified. So [`abort_reasons_since`] relabels that slot in its output
+    /// rather than repeating a name that misdescribes itself.
+    ///
+    /// ⚠ `MC_DIAG` is process-global, cumulative, and has no reset. Diff two
+    /// snapshots with [`abort_reasons_since`] rather than reading one directly.
+    pub fn abort_reasons() -> Vec<(&'static str, u64)> {
+        majit_metainterp::MC_DIAG_LABELS
+            .iter()
+            .enumerate()
+            .filter(|(_, label)| label.starts_with("abrt_"))
+            .map(|(slot, label)| (*label, majit_metainterp::mc_diag(slot)))
+            .collect()
+    }
+
+    /// Render the abort reasons that fired since `before`, as `label=delta`.
+    ///
+    /// `abrt_bridge` is printed as `unclassified(abrt_bridge)` because that is
+    /// what it measures — see [`abort_reasons`]. The original label is kept in
+    /// the parentheses so the output still names the slot it came from.
+    ///
+    /// Empty string when nothing aborted, so a caller can print it
+    /// unconditionally and a quiet window stays quiet.
+    pub fn abort_reasons_since(before: &[(&'static str, u64)]) -> String {
+        abort_reasons()
+            .iter()
+            .zip(before)
+            .filter_map(|((label, now), (_, then))| {
+                let delta = now.saturating_sub(*then);
+                if delta == 0 {
+                    return None;
+                }
+                let name = if *label == "abrt_bridge" {
+                    "unclassified(abrt_bridge)"
+                } else {
+                    label
+                };
+                Some(format!("{name}={delta}"))
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
     /// Print one `[jit-stats]` line, tagged with `label`, in the format the pyre
     /// runner uses. `label` names the shape being measured, so a run that sweeps
     /// several of them stays readable.

@@ -20,7 +20,8 @@
 #![cfg(feature = "jit")]
 
 use cel::majit::bytecode::float_bank::{
-    jit_stats, reset_jit_stats, reset_persistent_state, MAX_PROGRAMS_PER_DRIVER,
+    abort_reasons, abort_reasons_since, jit_stats, reset_jit_stats, reset_persistent_state,
+    MAX_PROGRAMS_PER_DRIVER,
 };
 use cel::majit::bytecode::{clean_batch_sum_f, eval_batch_sum_f, Column};
 use cel::majit::lower::{lower_typed, LoweredF, Schema, ValType};
@@ -689,13 +690,22 @@ fn nested_list_loop_deopt_census() {
             Column::Int(&offsets),
             Column::Int(&elems),
         ];
+        // `aborts` is a bare count; the reason lives only in majit's MC_DIAG
+        // slots. Snapshot across this one shape so a non-zero count arrives
+        // already attributed instead of sending the next reader on a sweep.
+        let reasons_before = abort_reasons();
         let (compiles, deopts, aborts, result) = measure(&lowered, &columns, rows);
+        let reasons = abort_reasons_since(&reasons_before);
         let bridges = jit_stats().bridges_compiled;
         eprintln!(
             "[nested] per_row={per_row} rows={rows} compiles={compiles} \
-             bridges={bridges} guard_fails={deopts} aborts={aborts} result={result:?}"
+             bridges={bridges} guard_fails={deopts} aborts={aborts} result={result:?} \
+             abort_reasons=[{reasons}]"
         );
-        assert_eq!(aborts, 0, "per_row={per_row}: no trace should be refused");
+        assert_eq!(
+            aborts, 0,
+            "per_row={per_row}: no trace should be refused (reasons: [{reasons}])"
+        );
         let budget = warmup_budget(bridges);
         assert!(
             deopts <= budget,
