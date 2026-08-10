@@ -103,8 +103,15 @@ jobs:
       # tracing interpreter is ~200 ns/row in debug), and its cross-tier
       # assertions compare a compiled answer against the tree-walker's, so a
       # debug run would assert on the interpreter tier alone.
+      #
+      # `--no-fail-fast` for the same reason as `fail-fast: false` above, one
+      # scope in: without it `cargo test` stops at the first failing test
+      # TARGET, so the targets after it never run and a red leg reports a
+      # strict subset of what is broken. Measured 2026-08-11 — the first red
+      # target hid a second one on both backends, and the two backends' hidden
+      # failures were not the same test.
       - name: Run JIT tier tests
-        run: cargo test --release --verbose --features jit-${{ matrix.backend }}
+        run: cargo test --release --verbose --features jit-${{ matrix.backend }} --no-fail-fast
   fuzz:
     name: Fuzz
     runs-on: ubuntu-latest
