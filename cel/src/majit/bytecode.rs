@@ -1901,7 +1901,11 @@ pub mod float_bank {
                 driver.set_param("retrace_limit", n);
             }
         }
-        driver.set_on_compile_loop(|_green_key, ops_before, ops_after| {
+        // The fourth parameter is the compiled body's opcode kinds, added
+        // upstream so a gate can ask whether the body actually closes a loop
+        // rather than inferring it from `ops_after`. These counters are totals
+        // and have no use for it; a shape check here would be its own change.
+        driver.set_on_compile_loop(|_green_key, ops_before, ops_after, _opcodes_after| {
             COMPILES.fetch_add(1, Ordering::Relaxed);
             TRACE_OPS_BEFORE.fetch_add(ops_before, Ordering::Relaxed);
             TRACE_OPS_AFTER.fetch_add(ops_after, Ordering::Relaxed);
