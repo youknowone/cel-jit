@@ -1,5 +1,27 @@
 //! #128's closing experiment: does the artifact stop iterating internally?
 //!
+//! ## ⛔ KEY TO THE `majit`/`pyre` SHAS BELOW — every one of them is dead
+//!
+//! This file cites commits in the ENCLOSING repository (`pyre-wasmi`), which
+//! rebases on its own schedule. None of the shas below resolves there any more.
+//! **The subject is the citation; the sha is a dated annotation.** Look one up
+//! with `git -C .. log -1 --fixed-strings --grep='<subject>'` — a rebase
+//! rewrites shas and leaves subjects alone.
+//!
+//! | as written | subject to search for | on the branch 2026-08-11 |
+//! |---|---|---|
+//! | `7c141d84175`, `32f3a1b79f7` — **one change, not two** (identical `git patch-id --stable` `931c9f2bc0d4…`) | majit: return a back-edge FINISH from the portal instead of resuming at the back edge | `64ea1332294`, DOOMED |
+//! | `84155df5133` | majit-macros: recognize f64::to_bits / f64::from_bits as the bitcast intrinsics | `5ede86f1c07`, DOOMED |
+//! | `9a7d0c63ff3` | pyrex: add a trace-shape fixture pinning the flat/peeled trip-count boundary | `331a6d2a55b`, DOOMED |
+//! | `ff6360bbe244` | pyre check.py: record the attached-half pairing decision and re-cite it by symbol | `59c0dc302c3`, DOOMED |
+//!
+//! ⚠ DOOMED means on the branch but not on `origin/main`, so those locators die
+//! at the next rebase too — re-derive from the subject rather than trusting the
+//! right-hand column. ⚠ And two of the citations below are **provenance**, not
+//! attribution: they name the tree a reading was taken on, and substituting a
+//! successor there would relocate a measurement onto a tree it never ran on.
+//! Both are marked at their line.
+//!
 //! #122 established that a compiled cel artifact steps once, permanently, at
 //! `trace_eagerness` calls after its loop compiles — call 200 with the default
 //! 200 — and that the step is a PER-ROW cost even though the guard that bridges
@@ -107,7 +129,9 @@
 //!
 //! ⛔⛔⛔ **`F` AND `G` ARE STALE, AND THIS IS MEASURED, NOT SUSPECTED.** #125 rev 5
 //! re-derived the same model on `rca125p` — which *does* own an allocator — at
-//! tree `9a7d0c63ff3`, cranelift:
+//! tree `9a7d0c63ff3` (⚠ **PROVENANCE — do not re-point.** That sha names the
+//! tree this reading was taken on; a successor is a different tree and the
+//! measurement never ran there. Subject in the key above), cranelift:
 //!
 //!     allocs(call) = 19·n_finish + 60·n_guard + 4      residual 0 on 695 of 698
 //!
@@ -158,6 +182,15 @@
 //! | dynasm | 20 | 62 | 4 |
 //! | **cranelift — PER-EXIT coefficients (`allocs(call) = F·n_finish + G·n_guard + C`), #160, derived at cel-jit `91c5e8828caca571aeb7b523206689c7502c9db0` / majit `ff6360bbe24410c92a23eaaf914fa1d03953a506`, arm64, out-of-sample validated at n=10, residual 0 on 698 of 700** | **19** | **60** | **4** |
 //! | **dynasm — PER-EXIT coefficients, same two trees, same arm64 host, out-of-sample validated at n=10, residual 0 on 698 of 700** | **17** | **58** | **4** |
+//!
+//! ⚠ **The two shas in those rows are PROVENANCE and must stay as written**, even
+//! though neither resolves any more: `91c5e8828cac` is cel-jit's own (this repo,
+//! carried by no remote ref) and `ff6360bbe244` is the enclosing repo's. They
+//! name the pair of trees the coefficients were fitted on. Re-pointing either
+//! would claim the fit was taken on a tree it never ran on, and the two cannot
+//! be re-pointed by one rule anyway — they live in **different repositories**,
+//! so "is this sha still good?" has no single answer here. If the fit is ever
+//! re-taken, replace the numbers and the shas together or not at all.
 //!
 //! ⭐ The two added rows are **additive only**: nothing above them is restated or
 //! corrected, and the old cells are left exactly as published. The cranelift

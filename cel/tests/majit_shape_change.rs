@@ -96,8 +96,11 @@
 //! Reproducing the column needs two edits that are deliberately NOT committed:
 //! flip `cel/Cargo.toml`'s `majit-metainterp/cranelift` to
 //! `majit-metainterp/dynasm`, and `[patch]` the `majit-*` crates at a checkout
-//! carrying pyre `35c51a079a1` ("run the GC rewrite pass whether or not a
-//! collector is installed"), because the pinned revision skips the pass that
+//! carrying pyre "majit: run the GC rewrite pass whether or not a collector is
+//! installed" — `0f78ca9fb5c`, an ancestor of `origin/main`, so unlike most
+//! cross-repo citations here that sha is permanent and safe to use directly.
+//! (It read `35c51a079a1` until 2026-08-11; that tree was rewritten away.)
+//! The pinned revision skips the pass that
 //! lowers `RAW_LOAD_I` and then panics in the dynasm register allocator.
 //!
 //! ## What this test asserts, and what it deliberately does NOT

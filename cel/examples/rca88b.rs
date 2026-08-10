@@ -1,5 +1,20 @@
 //! #88 probes A and B — the two experiments left that need no in-tree instrument.
 //!
+//! ## ⛔ KEY TO THE `majit` SHAS BELOW — both are dead
+//!
+//! These name commits in the ENCLOSING repository (`pyre-wasmi`), which rebases
+//! on its own schedule; neither resolves there now. **The subject is the
+//! citation**, the sha a dated annotation — `git -C .. log -1 --fixed-strings
+//! --grep='<subject>'`, because a rebase rewrites shas and leaves subjects alone.
+//!
+//! | as written | subject to search for | on the branch 2026-08-11 |
+//! |---|---|---|
+//! | `32f3a1b79f7` (#128) | majit: return a back-edge FINISH from the portal instead of resuming at the back edge | `64ea1332294`, DOOMED |
+//! | `68b0d4adbff` | majit-macros: hash green keys with an unrolled fold and defer the GreenKey | `30688ea8eeb`, DOOMED |
+//!
+//! ⚠ DOOMED = on the branch, not on `origin/main`, so the right-hand column dies
+//! at the next rebase too. Re-derive from the subject, not from that sha.
+//!
 //! `cel/examples/rca88.rs` established that the wall is a per-call cost that
 //! survives warmup (25-57x at n=10, both backends), that `gfails/call == 1.00`
 //! is NOT the cause (it reads 0.00 exactly where the wall is), and that

@@ -1,5 +1,25 @@
 # cel — allocations per evaluation. Produced by `tests/allocs_per_eval.rs`.
 #
+# ⛔ KEY TO THE `majit` SHAS IN THIS HEADER — both are dead.
+#   They name commits in the ENCLOSING repository (pyre-wasmi), which rebases on
+#   its own schedule, so neither resolves there now. The SUBJECT is the citation;
+#   the sha is a dated annotation. Look one up with
+#   `git -C .. log -1 --fixed-strings --grep='<subject>'`.
+#
+#     `32f3a1b79f7`  majit: return a back-edge FINISH from the portal instead of
+#                    resuming at the back edge     -> `64ea1332294`, DOOMED
+#     `3b3bb8f15c5`  majit-macros: recognize f64::to_bits / f64::from_bits as the
+#                    bitcast intrinsics            -> `5ede86f1c07`, DOOMED
+#
+#   DOOMED = on the branch but not on origin/main, so those locators die at the
+#   next rebase too; re-derive from the subject. Elsewhere in cel-jit the same
+#   two changes are written `7c141d84175` and `84155df5133` -- rebase twins, ONE
+#   change each, confirmed by identical `git patch-id --stable`, not by subject.
+#
+# ⚠ THIS BLOCK IS GENERATED from `BASELINE_HEADER` in tests/allocs_per_eval.rs.
+#   Editing it in a .baseline file alone is undone by the next
+#   `CEL_ALLOCS_BLESS=1`. Change the const, then re-bless or hand-sync both files.
+#
 # ⚠ THIS FILE IS PER-HOST. It is NOT an absolute contract, and the test does NOT
 #   fail when a row differs from it. Run with `CEL_ALLOCS_GATE=1` to make a drift
 #   fatal — do that in a re-measurement of ONE change on ONE machine, never as a
