@@ -893,11 +893,23 @@ fn nested_loop_deopts_are_a_warmup_cost_not_a_per_row_cost() {
         eprintln!("[warmup] {label} deopts {SMALL}rows={small} {LARGE}rows={large}");
         // 50x the rows may not cost more than 2x the deopts plus a small slack
         // for the extra lengths a bigger batch happens to present first.
+        let allowed = small * 2 + 64;
+        // Report the PER-ROW RATE, not just the counts. Exceeding the budget
+        // does not by itself say which of the two costs this is, and the rate
+        // is what separates them: a rate that holds is a per-row bail, a rate
+        // that falls is warmup that has not finished amortising. Reading a
+        // failure as the former on the strength of the count alone is wrong
+        // whenever the rate fell.
+        let small_rate = small as f64 / SMALL as f64;
+        let large_rate = large as f64 / LARGE as f64;
         assert!(
-            large <= small * 2 + 64,
-            "{label}: {small} deopts over {SMALL} rows but {large} over {LARGE} \
-             — the deopt count scales with the batch, so it is a per-row bail \
-             back to the interpreter and no batch size can amortise it"
+            large <= allowed,
+            "{label}: deopts {small} over {SMALL} rows -> {large} over {LARGE}, \
+             past the {allowed} this gate allows. Per-row rate {small_rate:.4} \
+             -> {large_rate:.4} — a rate that HOLDS is a per-row bail that no \
+             batch size amortises; a rate that FALLS is warmup still amortising, \
+             which has not flattened by {LARGE} rows the way the other shapes \
+             do. The rate says which; the count alone cannot."
         );
     }
 }
