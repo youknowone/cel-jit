@@ -364,17 +364,81 @@
 //!
 //! ### Numbers for the ceiling decision, which is deliberately NOT taken here
 //!
-//! Diagonal cells only, graded readings from both arms pooled:
-//!
-//! | backend | n | per-cell medians | worst | clears 0.10? |
-//! |---|---|---|---|---|
-//! | cranelift | 36 | 0.056 / 0.058 / 0.066 / 0.073 | 0.098 | yes, by 1.02x |
-//! | dynasm | 37 | 0.123 / 0.125 / 0.182 / 0.190 | 0.222 | no |
+//! The pooled per-backend readings live in [`DIAGONAL_CEILING`]'s own doc,
+//! beside the constant they are evidence about, and deliberately in one place
+//! only — a measured table copied to two locations is a pair of independent
+//! assertions that nothing forces to agree.
 //!
 //! [`DIAGONAL_CEILING`] was sized on cranelift-only data under the old
 //! estimator, and both of those facts push it the same way. Changing it is a
 //! separate decision from fixing the instrument that feeds it, and bundling
 //! them would make neither attributable.
+//!
+//! ## ⭐⭐⭐ A margin read through a biased estimator is not a margin
+//!
+//! This is the finding to carry off this file, and it is bigger than the
+//! estimator repair that produced it. The doc here asserted for a long time
+//! that cranelift cleared its ceiling "with 2-8x of room", and that sentence is
+//! why nobody questioned `0.10`. Replacing the `min` with a ratio of medians —
+//! **changing nothing whatsoever about cranelift** — put its worst diagonal
+//! reading at 0.098 against a 0.10 ceiling.
+//!
+//! > **The margin was manufactured by the instrument**, and manufactured in
+//! > exactly the direction that hides a regression. Before citing headroom as
+//! > safety, ask what reduction produced it: a `min`, a best-of-N, or a
+//! > hand-picked quiet run all report optimism as slack.
+//!
+//! The corollary for anyone repairing an estimator here later: **the repair is
+//! never threshold-neutral.** Every constant sized against the old reducer is
+//! calibrated to a quantity that selected for load, so re-sizing is not
+//! optional follow-up work — it is the other half of the change, and it needs
+//! its own measurement rather than an assumption that the old margin survived.
+//!
+//! ## Reproducing the sweep
+//!
+//! ⛔ Recorded because it is the perishable part. Sizing any ceiling here needs
+//! a **Linux x86_64** run (cel-jit's workflow is `ubuntu-latest`; every number
+//! in this file is macOS arm64), and whoever takes it may have none of the
+//! context above. It is two prebuilt binaries and a shell loop:
+//!
+//! ```text
+//! # 1. Build BOTH backends first and lift the binaries out, so that no rebuild
+//! #    ever sits inside the A/B. --release is required: the tier only reaches
+//! #    its compiled trace in release. Never bare `--features jit` -- it names
+//! #    no backend and majit-metainterp turns that into a compile_error!.
+//! for BK in cranelift dynasm; do
+//!   cargo test --locked --release -p cel --features "jit-$BK" \
+//!       --test majit_shape_change --no-run --message-format=json > "build-$BK.json"
+//!   # Take the path from cargo's OWN record. target/release/deps holds stale
+//!   # binaries from earlier feature sets, so a name glob silently mixes builds.
+//!   EXE=$(python3 -c 'import json,sys
+//! for l in open(sys.argv[1]):
+//!     try: m=json.loads(l)
+//!     except Exception: continue
+//!     if m.get("reason")=="compiler-artifact" and m.get("executable") \
+//!        and m.get("target",{}).get("name")=="majit_shape_change": print(m["executable"])
+//! ' "build-$BK.json" | tail -1)
+//!   cp "$EXE" "shape-$BK"
+//! done
+//!
+//! # 2. Alternate them. 7 runs per backend settled every cell here.
+//! for R in 1 2 3 4 5 6 7; do
+//!   for BK in cranelift dynasm; do
+//!     uptime                                    # RECORD THE LOAD. See below.
+//!     "./shape-$BK" --nocapture --test-threads=1
+//!   done
+//! done
+//! ```
+//!
+//! ⛔ **Record the load average and check it before calling the arm quiet.** The
+//! calibration above was taken at load 41.7 on a box whose team routinely runs
+//! seven concurrent builds, and it was written up as "quiet" until the number
+//! was read back. A control arm named for a property nobody measured is an
+//! assertion, not a control.
+//!
+//! ⚠ Two hosts is the minimum useful comparison and this file has one. The
+//! backend gap in particular is a codegen property: dynasm emits machine code
+//! directly, so nothing measured on arm64 predicts x86_64.
 
 #![cfg(feature = "jit")]
 
@@ -424,14 +488,45 @@ const _: () = assert!(ROUNDS % 2 == 1 && ROUNDS >= 5);
 /// this file exists to catch.
 const SETTLE_BATCHES: usize = 2;
 
-/// Cold and diagonal cells measure 0.001-0.064x of the clean VM over 40 runs at
-/// load 50-56.
+/// ⛔ THIS NUMBER WAS SIZED AGAINST A REDUCER SINCE SHOWN TO BE LOAD-SEEKING,
+/// AND IT HAS NOT BEEN RE-SIZED. Do not read it as a value anything has
+/// validated.
 ///
-/// ⚠ That range, and this value, were both taken under the load-seeking
-/// estimator the module doc refutes, so the range is a lower bound on what the
-/// same cells read now. Re-sizing it is deliberately NOT part of the estimator
-/// change: a threshold moved in the same commit as the instrument that feeds it
-/// cannot be attributed to either.
+/// Its original justification was "cold and diagonal cells measure 0.001-0.064x
+/// of the clean VM over 40 runs at load 50-56". Both that range and this
+/// constant come from the `min`-of-ratios estimator the module doc refutes, so
+/// the range is a lower bound on what the same cells read now.
+///
+/// Corrected-estimator readings, pooled across load conditions, graded cells
+/// only:
+///
+/// | backend | n | per-cell medians | worst | vs 0.10 |
+/// |---|---|---|---|---|
+/// | cranelift | 36 | 0.056 / 0.058 / 0.066 / 0.073 | **0.098** | clears by **1.02x** |
+/// | dynasm | 37 | 0.123 / 0.125 / 0.182 / 0.190 | 0.222 | fails |
+///
+/// ⚠ Read the cranelift row as an operational warning, not a pass. 0.098
+/// against 0.10 is not "comfortable headroom" — it is *at* the threshold, one
+/// slow day from a red that would present as a code regression. The file used
+/// to say cranelift had 2-8x of room; that figure was the estimator's bias, and
+/// correcting the instrument is what revealed the true position. Nothing about
+/// cranelift changed.
+///
+/// ⛔⛔ AND THIS GATE HAS EFFECTIVELY NEVER RUN ANYWHERE, so `0.10` is not a
+/// number that has been surviving CI:
+///
+/// * `origin/majit` does not exist — this branch has never been pushed, so
+///   cel-jit's own workflow has never executed on it and there is no historical
+///   green or red to compare a future verdict against;
+/// * `-p cel` in the *parent* pyre-wasmi workspace resolves to
+///   `majit/examples/cel`, a DIFFERENT crate. cel-jit has zero tracked files in
+///   pyre-wasmi, so `pyre-ci.yml` never builds this test at all.
+///
+/// ⇒ PRECONDITION ON ANY CHANGE TO THIS VALUE: a Linux x86_64 sweep, because
+/// cel-jit's workflow runs `ubuntu-latest` and every number above is macOS
+/// arm64. dynasm is an *assembler* backend, so the 2.1-3.7x backend gap is an
+/// arm64 codegen property with no reason to transfer. The module doc's
+/// "Reproducing the sweep" section has the commands.
 const DIAGONAL_CEILING: f64 = 0.10;
 /// Off-diagonal cells measure 0.007-0.567x of the clean VM over the same 40
 /// runs. See the module doc for why this is a widening-detector and not an
