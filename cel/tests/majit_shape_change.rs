@@ -87,12 +87,31 @@
 //! machine, so the two diagonals reading 1.34x/1.42x is noise: the same
 //! comparison under `examples/poison`'s min-of-rounds matrix puts every
 //! diagonal at 1.0x and the off-diagonals at 2.1-4.1x, which is the range to
-//! trust. And cel on dynasm is not yet a sound backend — 5 of 220 `cel` unit
-//! tests miscompile there (a ternary sum, and float/list-valued results
-//! reading back integer bit patterns), so the dynasm column is trustworthy
-//! only because [`measure_cell`] asserts every timed batch against the clean VM and
-//! this particular predicate answers correctly.
+//! trust. And cel on dynasm was not a sound backend when this was written —
+//! 5 of 220 `cel` unit tests miscompiled there (a ternary sum, and
+//! float/list-valued results reading back integer bit patterns), so the dynasm
+//! column was trustworthy only because [`measure_cell`] asserts every timed
+//! batch against the clean VM and that predicate answered correctly.
 //!
+//! ⚠ That soundness caveat is RETIRED as of 2026-08-11: the dynasm unit suite
+//! reads 250 passed / 0 failed at pyre `9970be67cb2`. It is left standing
+//! rather than deleted because the *reason* the column was usable — every
+//! timed batch is checked against the clean VM — is still the reason, and a
+//! reader who remembers "dynasm miscompiles" needs to know it was retired by
+//! fixes rather than by someone lowering the bar.
+//!
+//! ⚠ The first of the two edits below is RETIRED — `cel/Cargo.toml` now carries
+//! `jit-dynasm` and `jit-cranelift` backend selectors, so the column reproduces
+//! with `cargo test --locked -p cel --features jit-dynasm` and no manifest
+//! surgery. A bare `--features jit` is a hard error rather than a silent
+//! no-JIT build, so the flag cannot be forgotten. The SECOND edit still
+//! stands, and is the one to check before trusting any number here: the
+//! `[patch]` lives in `cel-jit/.cargo/config.toml`, which is UNTRACKED. A
+//! clean clone therefore resolves the pinned `majit-metainterp` git rev, not
+//! this worktree's majit — so every figure in this file describes live majit
+//! only for someone who has that untracked file.
+//!
+//! (Historical, describing the state before the selectors existed:)
 //! Reproducing the column needs two edits that are deliberately NOT committed:
 //! flip `cel/Cargo.toml`'s `majit-metainterp/cranelift` to
 //! `majit-metainterp/dynasm`, and `[patch]` the `majit-*` crates at a checkout
@@ -173,6 +192,82 @@
 //! Neither ceiling was widened to get there — the whole change is to the
 //! estimator. If a future red is real, it will be real at the same thresholds
 //! this file has always used.
+//!
+//! ## ⛔ That last sentence is REFUTED, and the estimator is load-seeking
+//!
+//! Measured 2026-08-11 at pyre `9970be67cb2`, 8 cells x 2 backends x 3 runs,
+//! every cell read off the unconditional per-cell `eprintln!` rather than off
+//! a failure message — a gate that prints only when it fails cannot be
+//! compared against the arm that passes. `min` of per-round ratios is minimised by the
+//! round whose DENOMINATOR was largest — that is, by the round where the clean
+//! VM was most starved of CPU. So the estimator does not merely tolerate load,
+//! it **selects for it**, and the gate gets more permissive as the box gets
+//! busier.
+//!
+//! Prediction registered before looking: within each cell, the run with the
+//! largest `clean` has the smallest `fraction`. **15 of 16 cells confirm.** The
+//! 16th is not a counter-example — its `clean` spread is 1.0x (35.4-36.1
+//! ns/row), so there was no denominator variation for the min to seek.
+//!
+//! The consequence is a gate whose verdict is not a function of the code:
+//!
+//! | dynasm cell | run 1 | run 2 | run 3 |
+//! |---|---|---|---|
+//! | `warm=None measured=64` clean | 3324.8 | 473.6 | 891.1 |
+//! | fraction | 0.031 **pass** | 0.226 FAIL | 0.113 FAIL |
+//!
+//! Three of the four diagonal cells flip verdict across three runs. The
+//! numerator over those same runs moves 1.06x; `clean` moves up to 30x
+//! (`warm=Some(2) measured=2`, 30.1-918.1). **The ratio inherits the
+//! denominator's noise, and the min-selection amplifies it in one direction.**
+//!
+//! ⛔ Why the 40/0 table above could not have caught this: every one of those
+//! 40 runs was cranelift, which clears [`DIAGONAL_CEILING`] with 2-8x of room.
+//! An estimator change that makes a comfortable pass more comfortable is
+//! indistinguishable from one that blinds the gate **unless the corpus
+//! contains a subject near the threshold**. dynasm sits at 0.02-0.23 against a
+//! 0.10 ceiling and did not exist in that A/B. A pass-count A/B measures an
+//! estimator's STABILITY; only a near-threshold subject measures its
+//! SENSITIVITY.
+//!
+//! ⚠ What survives all of this: the load-independent reading is the NUMERATOR,
+//! and it is stable. Settled ns/row, median of 3, diagonal cells: cranelift
+//! 35.4 / 35.8 / 1.8 / 1.9, dynasm 104.0 / 102.6 / 6.6 / 4.0 — dynasm is
+//! 2.1-3.7x slower on the matched shape, and that is a real gap, not a
+//! flake. Do NOT re-bless or widen a ceiling to make it green.
+//!
+//! ## ⭐ The two backends are not ranked — the gap INVERTS
+//!
+//! Same run, medians of 3, `dy/cl` of settled ns/row:
+//!
+//! | cell | ceiling | cranelift | dynasm | dy/cl |
+//! |---|---|---|---|---|
+//! | `warm=None measured=64` | 0.10 | 35.4 | 104.0 | 2.94x |
+//! | `warm=Some(64) measured=64` | 0.10 | 35.8 | 102.6 | 2.87x |
+//! | `warm=Some(2) measured=64` | 1.00 | 418.9 | 71.4 | **0.17x** |
+//! | `warm=Some(3) measured=64` | 1.00 | 434.0 | 59.3 | **0.14x** |
+//!
+//! cranelift wins the settled matched shape by ~3x; dynasm wins the
+//! shape-change path by 2.7-7.1x. "dynasm is slower" is false as a general
+//! statement, and the table under "The backend control" above reads the gap as
+//! one-directional because it predates these cells being measured together.
+//!
+//! Only the diagonal has a tight ceiling, so the single tight number can only
+//! ever indict dynasm; [`OFF_DIAGONAL_CEILING`] is a deliberate
+//! widening-detector at 1.00, which cranelift clears comfortably — the worst
+//! off-diagonal reading recorded for it anywhere in this file is 0.567x. No
+//! fraction range is quoted for those cells on purpose: per the section above
+//! the fraction is the unstable half of the measurement, and citing one would
+//! be the error this file now warns about. Compare the settled ns/row column
+//! instead. Neither constant can see the backend the other one misses. Sizing
+//! them is #120 and is deliberately NOT done here — this section records the
+//! measurement, and changing a threshold is a separate decision from
+//! discovering that it grades two populations.
+//!
+//! ⚠ Denominator for everything in these two sections: one host, macOS arm64,
+//! load 21-29, 8 cells x 2 backends x 3 runs. The within-host backend
+//! comparison is sound — same run, same binary shape, stable numerator. The
+//! absolute ns/row figures are NOT portable and must not be quoted as such.
 //!
 //! Re-pricing this is `n` runs of the built test binary counting passes, not
 //! one green: the old estimator produced greens routinely, which is exactly
