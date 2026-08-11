@@ -321,30 +321,66 @@
 //!
 //! ### Calibrating [`CLEAN_SPREAD_CEILING`]
 //!
-//! `q3/q1` of the clean side, 112 baseline cell-runs and 48 with added load:
+//! `q3/q1` of the clean side. Every refusal count is taken against the SHIPPED
+//! ceiling, so the arms are comparable with each other; a count measured against
+//! some other candidate belongs in a different table.
 //!
-//! | arm | load avg | p50 | p90 | max | above 1.50 |
-//! |---|---|---|---|---|---|
-//! | baseline | 41.7 | 1.11 | 1.27 | 2.55 | 2 of 112 (2%) |
-//! | + 9 spinners on 18 cores | 39.4-41.3 | 1.27 | 2.19 | 2.68 | 21 of 48 (44%) |
+//! | arm | load avg (1-min) | p50 | p90 | p98 | max | refused |
+//! |---|---|---|---|---|---|---|
+//! | least contended measured | 11.56 → 11.54 | 1.09 | 1.22 | 1.28 | 1.31 | 0 of 112 (0%) |
+//! | contended | 41.72 | 1.11 | 1.27 | 1.41 | 2.55 | 4 of 112 (4%) |
+//! | + 9 spinners on 18 cores | 39.4-41.3 | 1.27 | 2.19 | 2.68 | 2.68 | 22 of 48 (46%) |
 //!
-//! 1.50 sits at about p98 of the baseline distribution. ⚠ It fired twice there
-//! and NEITHER firing changed a verdict — on this corpus it has not yet
-//! prevented a wrong answer, and it is insurance, not a demonstrated save. What
-//! the loaded arm shows is that it engages when it should: refusal 2% → 44%,
-//! and refused cells carry a median spread of 1.85 against the graded cells'
-//! 1.09.
+//! 0% → 4% → 46% is the mechanism working: it stands down entirely on the
+//! quietest box anyone has measured, engages weakly on a contended one, and
+//! refuses most of a deliberately saturated one. Refused cells on the loaded arm
+//! carry a median spread of 1.85 against the graded cells' 1.09.
 //!
-//! ## ⛔ That baseline arm was NOT a quiet box, and this constant is mis-sized
+//! ⚠ It has still never prevented a wrong answer on this corpus. On the least
+//! contended arm it fired 0 times in 112 cells and every verdict was reached
+//! without it; on the contended arm none of its firings changed a verdict. It is
+//! insurance whose premium is measured and whose payout is not.
 //!
-//! Read the load column: **41.7**. That is a contended box — seven agents build
-//! on this host concurrently and 21-29 is its normal regime. So the sweep above
-//! spans *contended* to *very contended*, and the quiet population is
-//! **unmeasured**. A quiet box has tighter spreads, so a correctly-sized p98 is
-//! LOWER than 1.50 ⇒ [`CLEAN_SPREAD_CEILING`] currently GRADES contended local
-//! runs that a correct bound would refuse. Same permissive direction as the
-//! residual load-dependence above. Re-size it from a quiet arm before trusting
-//! a local verdict.
+//! ⚠ Refusal also correlates with cell DURATION (the `m=64` cells run ~11ms per
+//! round against `m=2`'s ~0.6ms), so a count of refusals is not a reading of box
+//! load.
+//!
+//! ## ⛔ The rule that sized the first ceiling was self-defeating
+//!
+//! 1.50 was set at the refusal rate of a single arm — "refuse the worst ~2%" —
+//! and that rule cannot work, for a reason that has nothing to do with which box
+//! it is derived on: **a quantile of the observed population always refuses that
+//! quantile's share, by construction.** Re-derive it on a quiet box and it
+//! tightens; re-derive it on a burning one and it loosens; either way the gate
+//! refuses 2% and has learned nothing about whether the box was fit to measure
+//! on. A bound whose job is to detect "too noisy to grade" cannot be defined
+//! relative to the noise.
+//!
+//! ⇒ The ceiling is an ABSOLUTE dispersion bound: above it, the middle of the
+//! clean sample is too unsettled for a median ratio to carry meaning.
+//! Measurement cannot supply that number. What measurement supplies is an UPPER
+//! BOUND on it — you cannot set it below what good hardware actually achieves
+//! without refusing everything — so each arm ratchets the constant DOWN and no
+//! arm ever fixes it. The shipped value is the current rung, **tightened
+//! toward** a
+//! correct bound, never *set to* one.
+//!
+//! ⚠ Arm provenance, stated rather than adjectived: measured at loadavg
+//! 11.56 → 11.54 (1-minute, at the start and end of a 10-second sweep; the 5-
+//! and 15-minute averages moved 14.15 → 14.06 and 20.52 → 20.41, and one
+//! competing `rustc` was running at both ends) on a shared box carrying
+//! unrelated load. Start and end agree, so the arm is one population and not two
+//! averaged together. **The dedicated-CI-runner population remains unmeasured**,
+//! and it is quieter than anything here, so the shipped value is still an upper
+//! bound on what
+//! is correct for it.
+//!
+//! ⛔ The predecessor of this section called its baseline arm "quiet" and never
+//! measured it. It ran at 41.72 — printed in every run header — and the constant
+//! derived from it was mis-sized permissive for exactly as long as the adjective
+//! went unchecked. A control named for a property nobody measured is a second
+//! treatment arm with an optimistic name, which is why every arm above is
+//! labelled with a reading instead of a word.
 //!
 //! ⭐ Why the third value is structural rather than a safety valve: this gate
 //! serves TWO populations — a comparatively dedicated CI runner, and a
@@ -543,10 +579,44 @@ const OFF_DIAGONAL_CEILING: f64 = 1.00;
 /// settled, where a `max/min` would be decided by the single worst round and
 /// would refuse to grade a sample the median handles comfortably.
 ///
-/// ⚠ Sized from measurement, not chosen: see the module doc's calibration table.
-/// It is a property of one host's load profile and is the first thing to
-/// re-measure if this gate starts refusing to grade on other hardware.
-const CLEAN_SPREAD_CEILING: f64 = 1.50;
+/// ⚠ This is an UPPER BOUND that has been tightened, not a value that has been
+/// determined. It is the tightest 0.05-granular number that leaves the least
+/// contended arm anyone has measured here entirely graded — that arm's worst
+/// cell spread is 1.31 over 112 readings. A quieter box would justify a lower
+/// one, and the CI runner is quieter than any box these numbers came from. See
+/// the module doc for why a quantile of the observed population is the wrong
+/// rule, and for the arm's measured load.
+///
+/// ⭐ Tightening is the safe direction and that is structural, not a judgement:
+/// too tight and cells go [`Verdict::Unmeasurable`], which the run reports and
+/// which fails loudly if it swallows *every* cell, since a graded count of zero
+/// is an assertion failure rather than a pass. Too loose and a cell is graded
+/// off a denominator that does not mean anything, which is silent. Only one of
+/// those two errors announces itself.
+///
+/// ⚠ Read the following as a consequence, not as the sizing rule — the constant
+/// is derived from the spread distribution alone, because sizing a
+/// noise-detector against the verdicts it protects is how a threshold gets tuned
+/// until it gives the wanted answer. The consequence: on that arm the shipped
+/// ceiling refuses one cell of 112 and it is a `pass`, while every FAIL sits at
+/// or below 1.30, so no demonstrated true positive is converted into a refusal.
+/// A ceiling at the arm's strict p98 of 1.28 *would* have refused one FAIL.
+const CLEAN_SPREAD_CEILING: f64 = 1.35;
+
+/// The worst clean `q3/q1` observed on the arm [`CLEAN_SPREAD_CEILING`] was
+/// derived from, kept as a separate constant so the ceiling cannot drift below
+/// its own justification silently.
+///
+/// Lowering the ceiling past this is not a tuning decision, it is a claim that
+/// a different arm was measured — so it has to move together with the module
+/// doc's calibration table, and this trips if it does not.
+const LEAST_CONTENDED_ARM_WORST_SPREAD: f64 = 1.31;
+const _: () = assert!(
+    CLEAN_SPREAD_CEILING > LEAST_CONTENDED_ARM_WORST_SPREAD,
+    "CLEAN_SPREAD_CEILING is at or below the worst spread of the arm it was \
+     sized on, so it would refuse cells that arm graded. Re-measure and update \
+     the calibration table before lowering it."
+);
 
 struct ListColumns {
     lens: Vec<i64>,
