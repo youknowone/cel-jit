@@ -105,11 +105,26 @@
 //! with `cargo test --locked -p cel --features jit-dynasm` and no manifest
 //! surgery. A bare `--features jit` is a hard error rather than a silent
 //! no-JIT build, so the flag cannot be forgotten. The SECOND edit still
-//! stands, and is the one to check before trusting any number here: the
-//! `[patch]` lives in `cel-jit/.cargo/config.toml`, which is UNTRACKED. A
-//! clean clone therefore resolves the pinned `majit-metainterp` git rev, not
-//! this worktree's majit — so every figure in this file describes live majit
-//! only for someone who has that untracked file.
+//! stands, and is the one to check before trusting any number here. The
+//! `[patch]` lives in `cel-jit/.cargo/config.toml`, which is not merely absent
+//! from the index — it is ACTIVELY IGNORED by this repo's own
+//! `.gitignore:8:/.cargo/`, a decision that file's own header records. A clean
+//! clone therefore resolves the pinned `majit-metainterp` git rev rather than
+//! this worktree's majit, and the two are far apart: measured against parent
+//! commit `aa5bba339d0`, **284 commits touching `majit/`** separate the pin
+//! from it (392 in total), and the pin is NOT an ancestor. So "describes live
+//! majit only for someone who has that untracked file" understates it — for
+//! everyone else this file describes a majit 284 majit-commits behind the one
+//! the figures were measured against.
+//!
+//! ⇒ Every run now stamps which majit it linked: the per-cell and summary lines
+//! carry `majit=` first, from `CEL_MAJIT_PROVENANCE` (see `build.rs`, which
+//! derives it from `Cargo.lock`'s recorded resolution rather than from the
+//! config file's existence).
+//!
+//! ⛔ THE FIGURES RECORDED IN THIS FILE PREDATE THAT STAMP. They were taken by
+//! a rig that printed no token, so the stamp qualifies future readings and
+//! recovers nothing about the ones below.
 //!
 //! (Historical, describing the state before the selectors existed:)
 //! Reproducing the column needs two edits that are deliberately NOT committed:
@@ -881,9 +896,10 @@ fn a_trip_count_change_keeps_the_tier_compiled_and_never_worse_than_no_jit() {
         // against the arm that passes, which is how the previous estimator's
         // defect stayed invisible through 40 green runs.
         eprintln!(
-            "[shape-change] warm={warm:?} measured={measured} settled={jit_ns:.1} \
+            "[shape-change] majit={} warm={warm:?} measured={measured} settled={jit_ns:.1} \
              clean={clean_ns:.1} spread={clean_spread:.2} fraction={fraction:.3} \
              ceiling={ceiling} verdict={} loops_compiled={} bridges={} panics={}",
+            env!("CEL_MAJIT_PROVENANCE"),
             verdict.label(),
             stats.loops_compiled,
             stats.bridges_compiled,
@@ -927,7 +943,10 @@ fn a_trip_count_change_keeps_the_tier_compiled_and_never_worse_than_no_jit() {
     // The denominator for every timing verdict above. Without it a run in which
     // the box was too busy to measure anything is indistinguishable from a run
     // in which the tier was fast in all eight cells.
-    eprintln!("[shape-change] timing cells graded={graded} unmeasurable={unmeasurable}");
+    eprintln!(
+        "[shape-change] majit={} timing cells graded={graded} unmeasurable={unmeasurable}",
+        env!("CEL_MAJIT_PROVENANCE")
+    );
 
     // A run that graded nothing is not a passing run, and it is not a
     // regression either — it is an absent measurement, and it fails under its
