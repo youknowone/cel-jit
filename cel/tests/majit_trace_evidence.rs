@@ -178,6 +178,48 @@ fn warmup_budget(bridges: usize) -> usize {
     TRACE_EAGERNESS * (bridges + WARMING_SLACK) + 1
 }
 
+/// One cumulative row from this thread's OpRef-variant audit, for a run
+/// launched with `MAJIT_OPREF_VARIANT_AUDIT=1`.
+///
+/// Print only. The audit measures a defect nobody has reproduced on a crate
+/// that compiles a non-degenerate trace, so there is no number to pin yet, and
+/// pinning one before measuring certifies whatever state the pin was written
+/// in.
+///
+/// Three properties of the instrument decide the shape of this row.
+///
+/// `notes` is the reached-ness half of any verdict the module reports:
+/// `collisions() == 0` is a result only when `notes() > 0`, because a detector
+/// that never ran reports the same zero as a clean one. So the row leads with
+/// `notes` and never prints a collision count on its own.
+///
+/// `enabled()` is here to force the environment read on THIS thread. The mode
+/// is resolved lazily — only `note_key` and `enabled` ever populate it — so a
+/// thread that never notes never reads `MAJIT_OPREF_VARIANT_AUDIT` at all, and
+/// an absent summary then says "not configured" and "not reached" in the same
+/// breath. Calling it makes the mode a reading instead of an assumption, and it
+/// is the only exercise the environment path gets anywhere: every unit test of
+/// the module arms itself with `set_mode_for_test`, which bypasses it.
+///
+/// [`majit_ir::opref_audit::report_summary`] is called rather than left to the
+/// thread-local destructor, on the module's own advice: teardown is
+/// best-effort, and a caller that needs the summary should ask for it.
+///
+/// ⚠ The counters are per thread and are never reset here, so a row is
+/// cumulative over the test that prints it.
+fn opref_audit_row(label: &str) {
+    let enabled = majit_ir::opref_audit::enabled();
+    eprintln!(
+        "[opref-probe] {label} enabled={enabled} notes={} keys={} \
+         revisits_same_variant={} distinct_collisions={} collision_occurrences={}",
+        majit_ir::opref_audit::notes(),
+        majit_ir::opref_audit::keys_seen(),
+        majit_ir::opref_audit::revisits_same_variant(),
+        majit_ir::opref_audit::distinct_collisions(),
+        majit_ir::opref_audit::collisions(),
+    );
+}
+
 fn lower(src: &str, schema: &Schema) -> LoweredF {
     let program = Program::compile(src).unwrap_or_else(|e| panic!("parse `{src}`: {e:?}"));
     lower_typed(program.expression(), schema).unwrap_or_else(|e| panic!("lower_typed `{src}`: {e}"))
@@ -702,6 +744,7 @@ fn nested_list_loop_deopt_census() {
              bridges={bridges} guard_fails={deopts} aborts={aborts} result={result:?} \
              abort_reasons=[{reasons}]"
         );
+        opref_audit_row(&format!("per_row={per_row}"));
         assert_eq!(
             aborts, 0,
             "per_row={per_row}: no trace should be refused (reasons: [{reasons}])"
@@ -722,6 +765,7 @@ fn nested_list_loop_deopt_census() {
              inner element loop's own back-edge gets hot and compiles too"
         );
     }
+    majit_ir::opref_audit::report_summary();
 }
 
 /// The same nested shape with a trip count that VARIES row to row — the shape
@@ -807,6 +851,7 @@ fn nested_list_loop_varying_trip_count() {
             "[varying] {label} rows={rows} compiles={compiles} bridges={bridges} \
              guard_fails={deopts} aborts={aborts} result={result:?}"
         );
+        opref_audit_row(label);
         assert_eq!(compiles, 2, "{label}: both loops must compile");
         // A shape whose inner trip count varies must still bridge its exit
         // guard, and `bridges_compiled` is the only counter that says whether it
@@ -825,6 +870,7 @@ fn nested_list_loop_varying_trip_count() {
              {WARMING_SLACK} part-warmed + 1 final exit) — that is a per-row bail"
         );
     }
+    majit_ir::opref_audit::report_summary();
 }
 
 /// The property that decides whether the tier is a speedup at all: the deopt
