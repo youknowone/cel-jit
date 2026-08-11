@@ -222,7 +222,9 @@
 //! denominator's noise, and the min-selection amplifies it in one direction.**
 //!
 //! ⛔ Why the 40/0 table above could not have caught this: every one of those
-//! 40 runs was cranelift, which clears [`DIAGONAL_CEILING`] with 2-8x of room.
+//! 40 runs was cranelift, which clears [`DIAGONAL_CEILING`] with 2-8x of room
+//! — a figure that is itself an artefact of the biased estimator, and reads
+//! 1.02x once it is fixed. See the measured table further down.
 //! An estimator change that makes a comfortable pass more comfortable is
 //! indistinguishable from one that blinds the gate **unless the corpus
 //! contains a subject near the threshold**. dynasm sits at 0.02-0.23 against a
@@ -254,8 +256,11 @@
 //!
 //! Only the diagonal has a tight ceiling, so the single tight number can only
 //! ever indict dynasm; [`OFF_DIAGONAL_CEILING`] is a deliberate
-//! widening-detector at 1.00, which cranelift clears comfortably — the worst
-//! off-diagonal reading recorded for it anywhere in this file is 0.567x. No
+//! widening-detector at 1.00, which cranelift clears — the worst off-diagonal
+//! reading recorded for it anywhere in this file is 0.731x, under the median
+//! estimator with 9 spinners running; the quiet worst is 0.697x. (Both figures
+//! were 0.567x while this file used the min estimator, for the reason the
+//! section above gives.) No
 //! fraction range is quoted for those cells on purpose: per the section above
 //! the fraction is the unstable half of the measurement, and citing one would
 //! be the error this file now warns about. Compare the settled ns/row column
@@ -275,6 +280,81 @@
 //! alternate them — this box shares a worktree with other sessions, and a
 //! `cel` source edit between the two builds puts a library difference inside
 //! what looks like an estimator A/B.
+//!
+//! ## ✅ The estimator was replaced, and here is what it measured
+//!
+//! [`measure_cell`] now reports a ratio of per-round medians and refuses to
+//! grade a cell whose clean side was too dispersed. Measured over 7 runs per
+//! backend on one host, alternating the two prebuilt binaries so no rebuild
+//! sits inside the A/B, plus a 3-run-per-backend arm with 9 spinners on 18
+//! cores:
+//!
+//! | | old (min of ratios) | new (ratio of medians) |
+//! |---|---|---|
+//! | diagonal cells holding one verdict | 1 of 4 (dynasm, 3 runs) | **16 of 16** (both backends, 7 runs) |
+//! | verdict flips observed | pass↔FAIL | pass↔UNMEASURABLE only |
+//! | cranelift diagonal headroom | "2-8x" | **1.02x at worst** (0.098 vs 0.10) |
+//!
+//! ⭐ The third row is the one to read twice. The old estimator's headroom was
+//! never real — a `min` over ratios is optimistically biased by construction,
+//! so the 2-8x was the bias, not margin. Reading a threshold's safety off a
+//! biased estimator overstates it in exactly the direction that hides a
+//! regression.
+//!
+//! ### ⛔ A pre-registered prediction of mine was REFUTED
+//!
+//! I predicted the median would make the fraction load-invariant. It does not:
+//! in 8 of 16 backend-cells the clean median ROSE under load while the fraction
+//! FELL. The cause is physical, not statistical — the clean VM does ~16x the
+//! work per row of the compiled tier, so contention costs it more, and the two
+//! sides simply do not degrade at the same rate. **A ratio of any two
+//! differently-load-sensitive timings is load-dependent, and no reduction over
+//! rounds can fix that.**
+//!
+//! What the median did fix is the magnitude and the direction's reach: the
+//! worst fall is now 0.57x where the old estimator's was 7.3x, and across 24
+//! graded diagonal readings under load no cell crossed a ceiling — cranelift
+//! read 0 FAIL / 8 pass / 4 refused, dynasm 9 FAIL / 0 pass / 3 refused. The
+//! residual bias is permissive, so it is still the dangerous direction; it is
+//! now small enough that [`CLEAN_SPREAD_CEILING`] removes the windows where it
+//! is largest before it can reach a verdict.
+//!
+//! ### Calibrating [`CLEAN_SPREAD_CEILING`]
+//!
+//! `q3/q1` of the clean side, 112 quiet cell-runs and 48 loaded:
+//!
+//! | arm | p50 | p90 | max | above 1.50 |
+//! |---|---|---|---|---|
+//! | quiet | 1.11 | 1.27 | 2.55 | 2 of 112 (2%) |
+//! | 9 spinners | 1.27 | 2.19 | 2.68 | 21 of 48 (44%) |
+//!
+//! 1.50 sits at about p98 of the quiet distribution. ⚠ On the quiet arm it
+//! fired twice and NEITHER firing changed a verdict — on this corpus it has not
+//! yet prevented a wrong answer, and it is insurance, not a demonstrated save.
+//! What the loaded arm shows is that it engages when it should: refusal rate
+//! goes 2% → 44%, and the refused cells carry a median spread of 1.85 against
+//! the graded cells' 1.09.
+//!
+//! ⚠ Refusal is correlated with cell DURATION, not purely with box load. The
+//! `measured=64` cells run ~11 ms of clean work per round against the
+//! `measured=2` cells' ~0.6 ms, so they have more opportunity to be descheduled
+//! and they dominate the refused set. That is defensible — a longer round is
+//! genuinely more disturbed — but it means an UNMEASURABLE count is not a
+//! reading of how busy the box was.
+//!
+//! ### Numbers for the ceiling decision, which is deliberately NOT taken here
+//!
+//! Diagonal cells only, graded readings from both arms pooled:
+//!
+//! | backend | n | per-cell medians | worst | clears 0.10? |
+//! |---|---|---|---|---|
+//! | cranelift | 36 | 0.056 / 0.058 / 0.066 / 0.073 | 0.098 | yes, by 1.02x |
+//! | dynasm | 37 | 0.123 / 0.125 / 0.182 / 0.190 | 0.222 | no |
+//!
+//! [`DIAGONAL_CEILING`] was sized on cranelift-only data under the old
+//! estimator, and both of those facts push it the same way. Changing it is a
+//! separate decision from fixing the instrument that feeds it, and bundling
+//! them would make neither attributable.
 
 #![cfg(feature = "jit")]
 
@@ -298,21 +378,27 @@ const ROWS: usize = 20_000;
 const WARM_ROWS: usize = 4_000;
 const THRESHOLD: u32 = 8;
 
-/// Timed rounds per cell; the reported fraction is the min of their ratios.
+/// Timed rounds per cell; the reported fraction is the ratio of their medians.
 ///
-/// Taking a min over `n` rounds only helps if at least one round lands in a
-/// window the box is not contending for, so the count is set by the slowest
-/// cell, not the average one — `warm=Some(2) measured=64`, ~10 ms of compiled
-/// work against ~18 ms of clean work per round.
+/// A median needs a MAJORITY of rounds to land in windows the box is not
+/// contending for — where the old min needed only one. That is a strictly
+/// harder requirement, and it is the point: a reading that survives it is a
+/// reading about the code, and one that does not is refused by
+/// [`CLEAN_SPREAD_CEILING`] rather than reported.
 ///
-/// 5 and 9 were measured against each other, alternated run for run at load
-/// 34-38: **both passed 30 of 30**, with per-cell worst readings within 0.07.
-/// So this corpus does not show 9 buying anything over 5. It is kept because
-/// the cost is ~0.35 s per run and the extra rounds can only widen the window
-/// the min is taken over — but that is a headroom argument, not a measurement,
-/// and lowering it to 5 would not contradict anything measured here. The whole
-/// test runs in about a second.
+/// ⛔ The prior 5-vs-9 result recorded here (30/30 each at load 34-38, per-cell
+/// worst readings within 0.07) was measured under the min estimator and does NOT
+/// transfer: it graded how far the best round could reach, and nine rounds
+/// bought a wider search for that best round. Under a median the same count buys
+/// tolerance of up to four contended rounds instead. 9 is kept — it is the more
+/// robust of the two under the new reduction, at ~0.35 s per run — but no
+/// measurement in this file now compares it against 5. The whole test runs in
+/// about a second.
 const ROUNDS: usize = 9;
+/// The median and the `q3`/`q1` pair below are both nearest-rank on an odd
+/// sample, so every statistic this file reports is a value that was actually
+/// observed rather than an average of two that were not.
+const _: () = assert!(ROUNDS % 2 == 1 && ROUNDS >= 5);
 /// Compiled batches run before timing starts. The first batch after a shape
 /// change legitimately pays to bridge, and a warm-up cost is not the defect
 /// this file exists to catch.
@@ -320,11 +406,32 @@ const SETTLE_BATCHES: usize = 2;
 
 /// Cold and diagonal cells measure 0.001-0.064x of the clean VM over 40 runs at
 /// load 50-56.
+///
+/// ⚠ That range, and this value, were both taken under the load-seeking
+/// estimator the module doc refutes, so the range is a lower bound on what the
+/// same cells read now. Re-sizing it is deliberately NOT part of the estimator
+/// change: a threshold moved in the same commit as the instrument that feeds it
+/// cannot be attributed to either.
 const DIAGONAL_CEILING: f64 = 0.10;
 /// Off-diagonal cells measure 0.007-0.567x of the clean VM over the same 40
 /// runs. See the module doc for why this is a widening-detector and not an
-/// endorsement.
+/// endorsement. The same caveat as [`DIAGONAL_CEILING`] applies to the range.
 const OFF_DIAGONAL_CEILING: f64 = 1.00;
+
+/// The clean side's `q3/q1` across [`ROUNDS`], above which a cell is graded
+/// [`Verdict::Unmeasurable`] instead of pass or fail.
+///
+/// This is a bound on the DENOMINATOR's own dispersion, not on the ratio. The
+/// median resists a minority of contended rounds; what it cannot survive is the
+/// box being contended for most of the window, and `q3/q1` is the statistic that
+/// separates those two — it asks whether the middle of the clean sample is
+/// settled, where a `max/min` would be decided by the single worst round and
+/// would refuse to grade a sample the median handles comfortably.
+///
+/// ⚠ Sized from measurement, not chosen: see the module doc's calibration table.
+/// It is a property of one host's load profile and is the first thing to
+/// re-measure if this gate starts refusing to grade on other hardware.
+const CLEAN_SPREAD_CEILING: f64 = 1.50;
 
 struct ListColumns {
     lens: Vec<i64>,
@@ -377,36 +484,70 @@ fn ns_per_row(d: Duration) -> f64 {
     d.as_secs_f64() * 1e9 / ROWS as f64
 }
 
-/// One cell's fraction-of-the-clean-VM, the ns/row behind it, and the compile
-/// counters for the run that produced them.
+/// What one cell measured, and how much the reading can be trusted.
+struct Cell {
+    /// Median compiled ns/row over [`ROUNDS`] divided by median clean ns/row.
+    fraction: f64,
+    /// Median compiled ns/row — the load-independent half of the reading, and
+    /// the one to quote when comparing backends or hosts.
+    jit_ns: f64,
+    /// Median clean ns/row: the denominator of `fraction`.
+    clean_ns: f64,
+    /// `q3/q1` of the clean side's per-round ns/row. See
+    /// [`CLEAN_SPREAD_CEILING`].
+    clean_spread: f64,
+    stats: JitStats,
+}
+
+/// Nearest-rank median of a sample sorted by [`f64::total_cmp`].
 ///
-/// ## Why the fraction is the min of per-round ratios
+/// [`ROUNDS`] is odd (asserted beside it), so this is the true middle and never
+/// an interpolation between two neighbours.
+fn median_of_sorted(sorted: &[f64]) -> f64 {
+    sorted[sorted.len() / 2]
+}
+
+/// One cell's fraction-of-the-clean-VM, the ns/row behind it, the clean side's
+/// dispersion, and the compile counters for the run that produced them.
 ///
-/// The quantity that cancels machine load is the ratio of two timings taken in
-/// the *same* window, so the round is the unit: time the clean VM and the
-/// compiled tier back to back, divide, and take the min of that ratio over
-/// [`ROUNDS`]. A round whose window was not uniform — a spike landing on one
-/// half and not the other — inflates that round's ratio and the min discards
-/// it. This is what the module doc always claimed the design did.
+/// ## Why the fraction is a ratio of per-round medians
 ///
-/// It did not. The clean side took a **min of 3** batches while the compiled
-/// side ran 3 and kept the **last**, so one descheduled batch landing on the
-/// final iteration went into the numerator undefended, and the two sides were
-/// not in the same window at all — every clean batch ran before the warm-up
-/// did. Over 40 runs at load 50-56 that estimator failed 13 times, reading up
-/// to 3.29x its ceiling on a cell whose worst here is 0.556x.
+/// Three estimators have stood here. The history is kept because each was
+/// replaced for a different reason, and two of the three defects are invisible
+/// in a pass count:
 ///
-/// A ratio of the two independent minima is the other candidate, and it was
-/// measured: 30 runs each at load 68-76, both it and this one passed 30/30. So
-/// the choice between them is not a failure-rate result — it is that a ratio of
-/// minima pairs the best compiled round with the best clean round even when
-/// those are different rounds under different load, where a per-round ratio has
-/// its numerator and denominator in one window by construction.
+/// | # | reduction | why it was replaced |
+/// |---|---|---|
+/// | 1 | clean: min of 3 batches; compiled: last of 3 | the two sides were never in the same window — every clean batch ran before the warm-up. 13 failures in 40 runs at load 50-56, reading up to 3.29x its ceiling |
+/// | 2 | **min** of the per-round ratios | the min is achieved in the round with the LARGEST DENOMINATOR, so it selects for load and the gate loosens as the box gets busier. Three of four diagonal cells flipped verdict across three runs |
+/// | 3 | ratio of the per-round **medians** | current |
 ///
-/// A min over ratios cannot hide a real regression: if the compiled tier is
-/// genuinely slower, every round's ratio rises and so does their minimum. What
-/// it does give up is intermittent regressions — one bad round in nine — which
-/// this file does not claim to catch; its subject is settled steady-state cost.
+/// The round is still the unit, and for the reason estimator 2 got right: the
+/// quantity that cancels machine load is a ratio of two timings taken in the
+/// *same* window, so the clean VM and the compiled tier are timed back to back
+/// and each round yields one pair. What changed is the reduction over those
+/// pairs. Taking the extreme of a noisy sample does not find the quiet round; it
+/// finds the round whose noise happened to fall on the favourable side, and for
+/// a ratio that is the round where the *denominator* was worst. A median asks
+/// the opposite question — what does this cell usually cost — and no single
+/// round, however contended, can move it.
+///
+/// ⚠ Medians of numerator and denominator, not a median of the per-round
+/// ratios. The two differ, and this is the weaker of the pair: it pairs the
+/// typical compiled round with the typical clean round even when those are
+/// different rounds. It is chosen because it makes `jit_ns` and `clean_ns`
+/// reportable as themselves — a median of ratios has no numerator to print, and
+/// the numerator is the half of this measurement that survived the estimator
+/// defect above and the half that is comparable across hosts.
+///
+/// ## What it still cannot do
+///
+/// A median hides intermittent regressions by construction: one slow round in
+/// nine does not move it, and this file does not claim to catch them. Its
+/// subject is settled steady-state cost. It also cannot rescue a window in which
+/// the box was contended for most of the rounds — for that the cell reports
+/// [`Verdict::Unmeasurable`] rather than a number, which is the whole reason
+/// `clean_spread` is computed and returned alongside the fraction.
 ///
 /// The clean VM is a plain-`match` interpreter with no tracing machinery
 /// (`bytecode.rs:1437`), so interleaving it between compiled batches reads the
@@ -414,7 +555,7 @@ fn ns_per_row(d: Duration) -> f64 {
 ///
 /// Every batch on both sides is checked against the oracle answer, so no timing
 /// here is ever taken off a miscompile.
-fn measure_cell(lowered: &LoweredF, warm: Option<i64>, measured: i64) -> (f64, f64, f64, JitStats) {
+fn measure_cell(lowered: &LoweredF, warm: Option<i64>, measured: i64) -> Cell {
     let mc = ListColumns::build(ROWS, measured);
 
     reset_persistent_state();
@@ -437,9 +578,8 @@ fn measure_cell(lowered: &LoweredF, warm: Option<i64>, measured: i64) -> (f64, f
     // structural assertion is about the same state the timings describe.
     let stats = jit_stats();
 
-    let mut best_fraction = f64::INFINITY;
-    let mut jit_at_best = 0.0;
-    let mut clean_at_best = 0.0;
+    let mut jit_samples = Vec::with_capacity(ROUNDS);
+    let mut clean_samples = Vec::with_capacity(ROUNDS);
     for i in 0..ROUNDS {
         let t0 = Instant::now();
         let got_clean = clean_batch_sum_f(lowered, &mc.columns(), ROWS);
@@ -458,17 +598,56 @@ fn measure_cell(lowered: &LoweredF, warm: Option<i64>, measured: i64) -> (f64, f
             "warm={warm:?} measured={measured} round {i}: answer diverged from the clean VM"
         );
 
-        // Report the ns/row from the round that produced the reported ratio, so
-        // the printed numerator and denominator are the pair it came from
-        // rather than two figures from different windows.
-        let fraction = jit_ns / clean_ns;
-        if fraction < best_fraction {
-            best_fraction = fraction;
-            jit_at_best = jit_ns;
-            clean_at_best = clean_ns;
+        jit_samples.push(jit_ns);
+        clean_samples.push(clean_ns);
+    }
+
+    jit_samples.sort_by(f64::total_cmp);
+    clean_samples.sort_by(f64::total_cmp);
+
+    // Middle 50%-ish of the clean sample: with ROUNDS=9 this is v[2] and v[6],
+    // the middle five. A `max/min` here would be a report on the single worst
+    // round, which is exactly the reading the median was adopted to stop
+    // deciding the verdict.
+    let k = ROUNDS / 4;
+    let (q1, q3) = (clean_samples[k], clean_samples[ROUNDS - 1 - k]);
+    // A non-positive q1 cannot happen for a batch of 20_000 rows on any clock
+    // this test can run on, but if the timer ever did return 0 the quotient
+    // must not become a small number that reads as a settled box.
+    let clean_spread = if q1 > 0.0 { q3 / q1 } else { f64::INFINITY };
+
+    let jit_ns = median_of_sorted(&jit_samples);
+    let clean_ns = median_of_sorted(&clean_samples);
+    Cell {
+        fraction: jit_ns / clean_ns,
+        jit_ns,
+        clean_ns,
+        clean_spread,
+        stats,
+    }
+}
+
+/// What a cell's timings support saying about it.
+///
+/// The third value is the point: a two-valued gate must call a window it could
+/// not measure either a pass or a failure, and both are false statements about
+/// the code. See [`CLEAN_SPREAD_CEILING`].
+enum Verdict {
+    Pass,
+    Fail,
+    Unmeasurable,
+}
+
+impl Verdict {
+    /// The printed label is DERIVED from the value the branch below reads, so
+    /// the two cannot drift apart.
+    fn label(&self) -> &'static str {
+        match self {
+            Verdict::Pass => "pass",
+            Verdict::Fail => "FAIL",
+            Verdict::Unmeasurable => "UNMEASURABLE",
         }
     }
-    (best_fraction, jit_at_best, clean_at_best, stats)
 }
 
 #[test]
@@ -489,19 +668,41 @@ fn a_trip_count_change_keeps_the_tier_compiled_and_never_worse_than_no_jit() {
     ];
 
     let mut failures = Vec::new();
+    let mut graded = 0usize;
+    let mut unmeasurable = 0usize;
     for (warm, measured) in cases {
-        let (fraction, jit, clean_ns, stats) = measure_cell(&lowered, warm, measured);
+        let Cell {
+            fraction,
+            jit_ns,
+            clean_ns,
+            clean_spread,
+            stats,
+        } = measure_cell(&lowered, warm, measured);
         let healthy = warm.is_none() || warm == Some(measured);
         let ceiling = if healthy {
             DIAGONAL_CEILING
         } else {
             OFF_DIAGONAL_CEILING
         };
+        let verdict = if clean_spread > CLEAN_SPREAD_CEILING {
+            Verdict::Unmeasurable
+        } else if fraction > ceiling {
+            Verdict::Fail
+        } else {
+            Verdict::Pass
+        };
+        // Printed for every cell whatever the verdict, and printed with its
+        // spread: a gate that prints only when it fails cannot be compared
+        // against the arm that passes, which is how the previous estimator's
+        // defect stayed invisible through 40 green runs.
         eprintln!(
-            "[shape-change] warm={warm:?} measured={measured} settled={jit:.1} \
-             clean={clean_ns:.1} fraction={fraction:.3} ceiling={ceiling} \
-             loops_compiled={} bridges={} panics={}",
-            stats.loops_compiled, stats.bridges_compiled, stats.internal_compile_panics
+            "[shape-change] warm={warm:?} measured={measured} settled={jit_ns:.1} \
+             clean={clean_ns:.1} spread={clean_spread:.2} fraction={fraction:.3} \
+             ceiling={ceiling} verdict={} loops_compiled={} bridges={} panics={}",
+            verdict.label(),
+            stats.loops_compiled,
+            stats.bridges_compiled,
+            stats.internal_compile_panics
         );
 
         // Load-independent floor. "The tier is compiled at all" is a statement
@@ -525,16 +726,37 @@ fn a_trip_count_change_keeps_the_tier_compiled_and_never_worse_than_no_jit() {
             ));
         }
 
-        if fraction > ceiling {
-            failures.push(format!(
-                "warm={warm:?} measured={measured}: {jit:.1} ns/row is {fraction:.2}x the \
-                 clean VM's {clean_ns:.1} (ceiling {ceiling})"
-            ));
+        match verdict {
+            Verdict::Fail => {
+                graded += 1;
+                failures.push(format!(
+                    "warm={warm:?} measured={measured}: {jit_ns:.1} ns/row is {fraction:.2}x the \
+                     clean VM's {clean_ns:.1} (ceiling {ceiling}, clean spread {clean_spread:.2})"
+                ));
+            }
+            Verdict::Pass => graded += 1,
+            Verdict::Unmeasurable => unmeasurable += 1,
         }
     }
+
+    // The denominator for every timing verdict above. Without it a run in which
+    // the box was too busy to measure anything is indistinguishable from a run
+    // in which the tier was fast in all eight cells.
+    eprintln!("[shape-change] timing cells graded={graded} unmeasurable={unmeasurable}");
+
+    // A run that graded nothing is not a passing run, and it is not a
+    // regression either — it is an absent measurement, and it fails under its
+    // own name so that it can never be read as evidence about the tier.
+    assert_ne!(
+        graded, 0,
+        "no timing cell was measurable: the clean VM's per-round spread exceeded \
+         {CLEAN_SPREAD_CEILING} in all {unmeasurable} cells, so this run says nothing \
+         about the compiled tier's cost. Re-run on a quieter box; do NOT read this as a pass"
+    );
     assert!(
         failures.is_empty(),
-        "the tier is not staying ahead of the untraced VM it exists to beat:\n  {}",
+        "the tier is not staying ahead of the untraced VM it exists to beat \
+         ({graded} cells graded, {unmeasurable} unmeasurable):\n  {}",
         failures.join("\n  ")
     );
 }
