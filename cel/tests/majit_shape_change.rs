@@ -321,19 +321,39 @@
 //!
 //! ### Calibrating [`CLEAN_SPREAD_CEILING`]
 //!
-//! `q3/q1` of the clean side, 112 quiet cell-runs and 48 loaded:
+//! `q3/q1` of the clean side, 112 baseline cell-runs and 48 with added load:
 //!
-//! | arm | p50 | p90 | max | above 1.50 |
-//! |---|---|---|---|---|
-//! | quiet | 1.11 | 1.27 | 2.55 | 2 of 112 (2%) |
-//! | 9 spinners | 1.27 | 2.19 | 2.68 | 21 of 48 (44%) |
+//! | arm | load avg | p50 | p90 | max | above 1.50 |
+//! |---|---|---|---|---|---|
+//! | baseline | 41.7 | 1.11 | 1.27 | 2.55 | 2 of 112 (2%) |
+//! | + 9 spinners on 18 cores | 39.4-41.3 | 1.27 | 2.19 | 2.68 | 21 of 48 (44%) |
 //!
-//! 1.50 sits at about p98 of the quiet distribution. ⚠ On the quiet arm it
-//! fired twice and NEITHER firing changed a verdict — on this corpus it has not
-//! yet prevented a wrong answer, and it is insurance, not a demonstrated save.
-//! What the loaded arm shows is that it engages when it should: refusal rate
-//! goes 2% → 44%, and the refused cells carry a median spread of 1.85 against
-//! the graded cells' 1.09.
+//! 1.50 sits at about p98 of the baseline distribution. ⚠ It fired twice there
+//! and NEITHER firing changed a verdict — on this corpus it has not yet
+//! prevented a wrong answer, and it is insurance, not a demonstrated save. What
+//! the loaded arm shows is that it engages when it should: refusal 2% → 44%,
+//! and refused cells carry a median spread of 1.85 against the graded cells'
+//! 1.09.
+//!
+//! ## ⛔ That baseline arm was NOT a quiet box, and this constant is mis-sized
+//!
+//! Read the load column: **41.7**. That is a contended box — seven agents build
+//! on this host concurrently and 21-29 is its normal regime. So the sweep above
+//! spans *contended* to *very contended*, and the quiet population is
+//! **unmeasured**. A quiet box has tighter spreads, so a correctly-sized p98 is
+//! LOWER than 1.50 ⇒ [`CLEAN_SPREAD_CEILING`] currently GRADES contended local
+//! runs that a correct bound would refuse. Same permissive direction as the
+//! residual load-dependence above. Re-size it from a quiet arm before trusting
+//! a local verdict.
+//!
+//! ⭐ Why the third value is structural rather than a safety valve: this gate
+//! serves TWO populations — a comparatively dedicated CI runner, and a
+//! contended developer box whose reference measurement differs from it by an
+//! order of magnitude. No single ceiling is honest in both. The ceiling belongs
+//! to the quiet population; the spread bound decides when the gate is entitled
+//! to use it. If that refuses most local runs, that is the correct answer — "not
+//! measurable here, CI will judge it" is strictly better than a verdict that
+//! inverted because someone else was compiling.
 //!
 //! ⚠ Refusal is correlated with cell DURATION, not purely with box load. The
 //! `measured=64` cells run ~11 ms of clean work per round against the
