@@ -34,6 +34,15 @@ returns `Cow<'a, dyn Val>` and dispatches through trait objects and
 with the only edits to pre-existing cel code being `lib.rs` +3 and
 `Cargo.toml` +44 — and `Program::execute` never reaches it.
 
+> The two line counts are as of 2026-07-26 and are not maintained; `cel/src/majit`
+> is 13561 lines on 2026-08-13. **The clause that matters has not moved:
+> `Program::execute` still never reaches the tier.** Measured the same day: the
+> crate's only `jit_merge_point!` / `can_enter_jit!` are in
+> `cel/src/majit/bytecode.rs`, on `float_bank::run_mainloop_f`, and
+> `cel/src/vm/` — the evaluator `Program::execute` actually runs — mentions
+> majit in 0 of its 6 files. That is Step 2 restated as a census: the JIT traces
+> the mirror, not the interpreter.
+
 That shape is not what a meta-tracing JIT is for. RPython has exactly one
 interpreter; the JIT traces *that* interpreter. Writing a second, traceable
 mirror of the first is the thing meta-tracing exists to make unnecessary. The
@@ -614,18 +623,49 @@ driver just compiled.
 
 ### Still open
 
-- **`cycle 4..12` is the weakest shape** at 5.8x against 29x for a constant trip
-  count. Its deopts are warmup-bounded (the count does not grow with row count),
-  so the residual is the cost of hopping between bridges, not bailing.
-- **The JUMP-into-ptoken half of :3001-3007.** Now that bridges form it is
-  reachable, because the trip count stays in the inner loop's own back-edge
-  instead of being baked into the outer trace. On top of defect 4 it takes trip
-  count 3 from 2101 deopts + 1 abort to 401 deopts and 0 aborts, and removes
-  every abort the selection law used to pick. It is NOT landed; landing it must
-  come with a TIGHTENED census, not a relaxed one.
+- ~~**`cycle 4..12` is the weakest shape** at 5.8x against 29x for a constant
+  trip count.~~ **The ordering no longer holds.** Re-run 2026-08-13 on the same
+  640k ladder, all five shapes in ONE interleaved run — which is what makes the
+  *ordering* readable even though the box was loaded, since a within-run
+  comparison pays the same interference on every arm — `cycle 4..12` is third of
+  five at 6.25x, behind `alternating 8/9` (5.87x) and `constant 8` (5.92x), and
+  ahead of `spread 0..32` (9.41x) and `constant 64` (15.37x). The 29x is not
+  reproducible on this tree either, and that is NOT recorded here as a
+  regression: the box was at load 36-89, three repeats of one panel swung 2.8x,
+  both this crate and majit have moved, and the 177.97 ns/row clean-arm figure
+  the 29x would be checked against comes from a different run than the ratio
+  table it sits in. A quiet box would settle it; nothing short of one will.
+- ~~**The JUMP-into-ptoken half of :3001-3007.** … It is NOT landed~~ —
+  **LANDED**, in the parent repo, as PR #1125 (`majit: extract reusable JIT
+  infrastructure from CEL`). The arm is `already_compiled_here` in
+  `majit-metainterp`'s jitcode dispatch: it resolves the merge point's greens
+  through `merge_point_green_key_hash`, asks `has_compiled_targets_fn`, and on a
+  hit publishes `close_jump_into_key` / `close_greens` / `close_green_pc` for the
+  driver instead of cutting a second copy of that loop. A key whose attempt
+  already declined is latched by `cross_loop_close_declined`, so the optimizer is
+  not re-run over a growing trace for a deterministic decline.
+  The TIGHTENED census this asked for exists and is the way to re-measure it:
+  `xloop_close_decision_reached` / `xloop_close_target_compiled` /
+  `xloop_close_published` (`MC_DIAG` slots 68/69/70, also surfaced by
+  `pyre-wasm-runner`). The first is bumped BEFORE the branch on purpose, so a
+  zero in the other two separates "the walk never reached the decision" from
+  "it reached it and the target was not compiled".
+  ⛔ The deopt figures this item used to quote (trip count 3: 2101 → 401 deopts;
+  `spread 0..32` 959 → 1763) were taken BEFORE the green-key unification and
+  describe jumps into loops filed under keys nothing enters. They do not carry
+  over and must not be cited again without a re-measurement.
 - **Single-activation API.** None of this touches `Program::execute(&Context)`,
   which is how CEL is actually called. The JIT cell in `majit_ab`'s primary panel
-  stays N/A until an `execute_jit(program, activation)` exists.
+  stays N/A until an `execute_jit(program, activation)` exists — and `majit_ab`
+  reports the three real expressions as `lowerable`, so what is absent is the
+  door, not the coverage.
+  **The door would lose if it were built today**, which is why it is not the next
+  step. Same binary, same run, 2026-08-13: stock cached `Program::execute` is
+  183 ns/eval, while the warm persistent-driver tier costs 708 ns for a ONE-row
+  batch (the clean VM does that row in 42 ns). The compiled tier only overtakes
+  the clean VM at 256 rows warm, 262144 on a fresh driver. The per-row rate is
+  not the problem and never was; the fixed per-call cost of entering and leaving
+  a compiled artifact is. That cost is the thing to attack before the API.
 
 ## Two evaluators means the second one must be checked against the first
 
