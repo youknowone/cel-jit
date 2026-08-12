@@ -140,12 +140,80 @@ Put `jit_merge_point` with `greens = [pc, code]` on the new VM's loop and
 `can_enter_jit` on its back-edges, exactly as `run_mainloop_f` does today for
 its subset.
 
+> **Step 2 does not execute in this position, and it splits. Reviewed
+> 2026-08-13.** "Exactly as `run_mainloop_f` does" means *under `#[jit_interp]`*
+> — those two macros are inert on their own (`macro_rules! jit_merge_point`
+> expands to nothing; the proc macro is what turns them into
+> `driver.merge_point` / `driver.back_edge`). So Step 2 as written IS front-end A
+> applied to `cel::vm`, i.e. the thing Step 3 exists to replace, attempted one
+> step early. Worse, the only way to make front-end A digest a `Value`
+> interpreter is to carry the values as `ref(T)`/`opaque(T)` handles with
+> residual calls — a flat mirror state struct, which is **the second evaluator
+> again**, the deviation this document exists to delete.
+>
+> What is genuinely blocking is narrower than "front-end A cannot take cel", and
+> that broader claim is false on its face: front-end A *is* attached and running,
+> on `float_bank::run_mainloop_f`. The blocker is the one this document's own
+> section title already names — front-end A never emits `GuardClass` and has no
+> heap-object model, so a traced `Value` dispatch cannot specialise `Value::Int`
+> from `Value::String` at the merge point, which is the whole point of tracing it.
+>
+> There is also a prerequisite that belongs to **both** front ends and to neither
+> of them exclusively: **the portal shape does not exist yet.** `cel_eval_loop`
+> is a free function but takes no `pc` and does not contain the loop; the loop is
+> `Vm::run` (a method, `pc` a local) and the opcode match is a third function,
+> `Vm::step`. `greens = [pc, code]` is unspellable against any current argument
+> list, and front-end B binds greens/reds **by parameter name**. Reshaping the
+> loop and its dispatch into one free function whose parameters are the greens
+> and reds is cel-only work that touches no majit code.
+>
+> Read the plan as **2a → 3a → 2b → 3b → 4**:
+>
+> | | |
+> |---|---|
+> | **2a** | portal shape (cel only, no majit) |
+> | **3a** | front-end B ANALYSIS over `cel.ullbc` — already wired, corpus stale |
+> | **2b** | the merge point + jitdriver spec — needs 3a's answers |
+> | **3b** | front-end B EXECUTION (guard_class, jitcodes) |
+> | **4** | demote the columnar path |
+>
+> 3a is reachable today: `majit-translate`'s pipeline already runs over
+> `cel-jit/build/llbc/cel.ullbc` in-process from its own cel census test, with
+> empty fnaddr bindings and default host statics. It needs no portal, which is
+> why it can size 2a instead of waiting on it.
+
 **Step 3 — move to front-end B.**
 Extract LLBC for the `cel` crate and drive it through `majit-translate` instead
 of the `#[jit_interp]` macro. `Value`'s dispatch becomes `guard_class` +
 inlined `getfield`, the same treatment pyre's object model gets. This is the
 step that makes the *whole* language traceable rather than a subset, because
 the tracer now sees the real interpreter instead of a hand-written mirror.
+
+> ⚠ **"the same treatment pyre's object model gets" is true of pyre's BEHAVIOUR,
+> not of the route.** Reviewed 2026-08-13: pyre does reach `guard_class`, but
+> through its hand-written tracer, not through `majit-translate`'s codewriter.
+> The codewriter leg — the typeptr rewrite in the getfield/setfield transform,
+> its insn byte, the assembler encoding, the dispatch arm and the blackhole impl
+> — is the one missing piece; everything on either side of it already exists
+> (the metainterp's `guard_class`, the heapcache's known-class tracking, the
+> optimizer's `optimize_guard_class`, and GuardClass codegen in all four
+> backends). So **cel on front-end B would be the first consumer of a route pyre
+> itself does not exercise.** That is a real risk and it is the difference
+> between Step 3 delivering class dispatch and Step 3 delivering residual calls.
+>
+> A second risk this list already gestures at ("cel would be its second client
+> and would expose whatever those adapters paper over") is measurable rather
+> than speculative: run the rtyper's Skip histogram on a cel pipeline run. If
+> cel's graphs mostly fall through to the legacy annotator/resolver, front-end B
+> hands cel the flat legacy walker rather than `guard_class`-quality typing, and
+> most of this step's payoff evaporates. Turn the flag into a number before
+> committing to the step.
+>
+> ⛔ And `build/llbc/cel.ullbc` on this box is STALE — written 2026-08-07,
+> against `cel/src/vm/*` last moved 2026-08-09, so it predates the `vm`-default
+> flip. This list's own risk line ("stale corpora silently mask changes") has
+> already happened once here. Gate on `scripts/extract-llbc.py --check cel`,
+> run bare, before reading it.
 
 **Step 4 — demote the columnar path to what it is.**
 `lower_typed` + the two-bank machine + `eval_batch_sum*` are a **vectorized
@@ -659,13 +727,49 @@ driver just compiled.
   stays N/A until an `execute_jit(program, activation)` exists — and `majit_ab`
   reports the three real expressions as `lowerable`, so what is absent is the
   door, not the coverage.
-  **The door would lose if it were built today**, which is why it is not the next
-  step. Same binary, same run, 2026-08-13: stock cached `Program::execute` is
-  183 ns/eval, while the warm persistent-driver tier costs 708 ns for a ONE-row
-  batch (the clean VM does that row in 42 ns). The compiled tier only overtakes
-  the clean VM at 256 rows warm, 262144 on a fresh driver. The per-row rate is
-  not the problem and never was; the fixed per-call cost of entering and leaving
-  a compiled artifact is. That cost is the thing to attack before the API.
+  **The door is not the next step — but the reason first written here was wrong,
+  and the correction changes what to fix.** The measurement stands: same binary,
+  same run, 2026-08-13, stock cached `Program::execute` is 183 ns/eval while
+  `warm_break_even`'s persistent-driver tier costs 708 ns for a ONE-row batch,
+  against the clean VM's 42 ns. What was wrong is the causal sentence — that the
+  708 ns is the cost of entering and leaving a compiled artifact.
+
+  **At one row of that fixture nothing is compiled and nothing is entered.**
+  Four independent legs, all on this tree:
+
+  1. `LoweredF`'s batch lowering closes the loop as a do-while — `OP_ADD_IMM
+     r_i,1` then `OP_JUMP_IF_ABOVE r_n, r_i, body_pc` — a BOTTOM test. At n=1 the
+     comparison is `1 > 1`, false, so the back edge is not taken.
+  2. The crate's only `can_enter_jit!` sits in `run_mainloop_f`'s
+     `OP_JUMP_IF_ABOVE` arm under `if tgt < pc`, i.e. on that back edge alone.
+  3. `JitDriver::merge_point` opens `if !self.meta.is_tracing() { return; }`, so
+     the merge point cannot enter compiled code on its own; entry is `back_edge`.
+  4. The COLD panel of the same run prints its own `compiles` column, and it
+     reads **0 at rows=1 and rows=8**, first becoming 1 at rows=16.
+
+  `warm_break_even`'s fixture is `engine_program` — `balance >= amount &&
+  !frozen`, straight-line and scalar. ⚠ The reading does NOT generalise to a
+  comprehension shape: a one-row batch of `items.all(i, i.price > 10)` DOES cross
+  `can_enter_jit!`, because `LowerCtxF::emit_back_edge` puts a back edge in the
+  spliced body whose trip count is the per-row `size(L)`, independent of n.
+
+  So the 666 ns above the clean VM is `run_jit_persistent_f` overhead **with the
+  JIT idle** — the `DRIVERS` pool remove/insert pair and its key hashing, the
+  per-program `Arc` insert, `run_mainloop_f`'s two per-call bank allocations
+  (`regs.to_vec()`, `vec![0.0; num_fregs]`), and one `is_tracing()` check per
+  opcode from the expanded mainloop. None of that is the compiled-entry path.
+
+  ⇒ **The door stays closed, but because the target is unmeasured, not because it
+  is known to be expensive.** Two cheap probes separate the two costs, and until
+  they are run nobody knows which to attack: (a) print
+  `size_of::<PooledDriver>()`, on which the pool-churn hypothesis entirely rests;
+  (b) `dispatch` in `batch.rs` already routes `Tier::Interpreter` and `Tier::Jit`
+  through the SAME `run_jit_persistent_f`, differing only in `threshold_for`
+  (`u32::MAX` vs the default) — so timing the Interpreter tier beside the other
+  two splits it exactly: `Interpreter − Clean` is harness overhead with tracing
+  permanently off, `Jit − Interpreter` is tracing plus compiled entry. The
+  genuine entry cost must then be read at the smallest n where `compiles > 0`,
+  never at n=1.
 
 ## Two evaluators means the second one must be checked against the first
 
