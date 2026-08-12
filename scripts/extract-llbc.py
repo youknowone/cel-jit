@@ -177,6 +177,19 @@ SPECS: dict[str, CrateSpec] = {
 # Only the whole-crate artefact by default; `cel-portals` is opt-in.
 DEFAULT_CRATES = ["cel"]
 
+# Required by the shared engine, which hashes it into `source_fingerprint` and
+# writes it as a `STAMP_KEYS` field. It is the channel for a change in THIS
+# driver's extraction behaviour that the automatically-hashed fields -- the
+# per-crate cargo/Charon flags, the layout configuration, the engine's own
+# `FINGERPRINT_SCHEMA` -- do not already represent. Bump it then, and only then.
+#
+# It does not carry this driver's implementation bytes the way it does in
+# pyre's, because `BASE_PATHSPECS` below names `scripts/extract-llbc.py` and so
+# every edit to this file already invalidates the artefact. That cost is
+# deliberate and documented in `AGENTS.md`, which is where tooling notes go to
+# stay outside the fingerprint.
+EXTRACTION_ABI = "1"
+
 # ⛔ `Cargo.lock` is NOT here, and its absence is deliberate rather than an
 # oversight. It is gitignored in this repo (`.gitignore:2`), and the engine
 # builds its input set as `ls_files() | ls_files("--others",
@@ -304,6 +317,7 @@ def main() -> None:
         DEFAULT_CRATES,
         root=ROOT,
         out_dir=ROOT / "build" / "llbc",
+        extraction_abi=EXTRACTION_ABI,
         base_pathspecs=BASE_PATHSPECS,
         charon_root=PYRE_ROOT,
         layout_targets=(),
