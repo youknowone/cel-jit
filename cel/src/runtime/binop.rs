@@ -1,4 +1,4 @@
-//! Arithmetic, dispatched by a narrowing chain on the class word.
+//! Arithmetic and comparison, dispatched by a narrowing chain on the class word.
 //!
 //! Each operator is a chain of **pointer-identity tests on the header word**,
 //! every arm calling a concrete monomorphic function. This is
@@ -25,13 +25,15 @@
 //!
 //! # What is here
 //!
-//! `+ - * / %` and unary negation over the landed leaves, matching the
-//! `Value` operator set arm for arm — `checked_*` with the same overflow,
-//! division-by-zero and remainder-by-zero dispositions, so the frozen oracle
-//! corpus keeps answering the same way when these become the production path.
-//! Equality and ordering are deliberately absent: CEL compares across the
-//! numeric types, which is a semantic question the corpus has to settle rather
-//! than one to infer here.
+//! `+ - * / %`, unary negation, `==`/`!=` and the four orderings over the
+//! landed leaves, matching the `Value` operator set arm for arm — `checked_*`
+//! with the same overflow, division-by-zero and remainder-by-zero dispositions,
+//! and the same cross-type numeric comparisons down to the lossy `i64 as f64`,
+//! so the frozen oracle corpus keeps answering the same way when these become
+//! the production path. The comparison tests are written against that oracle
+//! rather than against a restatement of it: `PartialEq for Value` and
+//! `objects::compare_values` are called on the same operand pairs and the two
+//! answers are required to agree.
 //!
 //! Errors leave through [`super::error`], never a `Result`.
 //!
@@ -55,8 +57,9 @@
 
 use super::error::{raise, CelErrCode, ERROR_SENTINEL};
 use super::object::{
-    new_double, new_duration, new_int, new_timestamp, new_uint, CelClass, CelRef, CEL_DOUBLE_CLASS,
-    CEL_DURATION_CLASS, CEL_INT_CLASS, CEL_TIMESTAMP_CLASS, CEL_UINT_CLASS,
+    new_bool, new_double, new_duration, new_int, new_timestamp, new_uint, CelClass, CelRef,
+    CEL_BOOL_CLASS, CEL_DOUBLE_CLASS, CEL_DURATION_CLASS, CEL_INT_CLASS, CEL_NULL_CLASS,
+    CEL_TIMESTAMP_CLASS, CEL_TYPE_CLASS, CEL_UINT_CLASS,
 };
 
 /// The class word of `w`, as the chains read it.
@@ -84,7 +87,8 @@ macro_rules! payload {
 }
 
 use super::object::{
-    W_DoubleObject, W_DurationObject, W_IntObject, W_TimestampObject, W_UIntObject,
+    W_BoolObject, W_DoubleObject, W_DurationObject, W_IntObject, W_TimestampObject, W_TypeObject,
+    W_UIntObject,
 };
 
 // -- the per-class arms ----------------------------------------------------
@@ -278,6 +282,10 @@ unsafe fn timestamp_shift(ts: CelRef, d: CelRef, add: bool, op: &'static str) ->
 /// Written out rather than folded into a helper taking the arm as a value: an
 /// arm reached through a function pointer is the dynamic shape this module
 /// exists to avoid.
+///
+/// It says nothing about what an arm returns, which is why the three chains
+/// share it: arithmetic answers a [`CelRef`], `==` a `bool`, ordering a
+/// `CMP_*` code.
 macro_rules! same_class_chain {
     ($ta:expr, $a:expr, $b:expr, $( $class:expr => $arm:expr ),+ $(,)?) => {
         $(
@@ -435,7 +443,6 @@ pub unsafe fn cel_rem(a: CelRef, b: CelRef) -> CelRef {
 ///
 /// The operand must be a live value.
 pub unsafe fn cel_negate(a: CelRef) -> CelRef {
-    use super::object::{new_bool, W_BoolObject, CEL_BOOL_CLASS};
     let ta = class_of(a);
     if ta == (&CEL_INT_CLASS as *const CelClass) {
         let v = payload!(a, W_IntObject, intval);
@@ -460,11 +467,473 @@ pub unsafe fn cel_negate(a: CelRef) -> CelRef {
     raise(CelErrCode::NoSuchOverload, "negate", a, ERROR_SENTINEL)
 }
 
+// -- comparison ------------------------------------------------------------
+//
+// Equality and ordering are two different operations here, not one with a
+// projection: `==` is total and never raises, while `<` refuses a pair it has
+// no ordering for. `Value` draws the same line — `OpCode::Equals` pushes
+// `Value::Bool(lhs == rhs)` unconditionally, `OpCode::Less` goes through
+// `objects::compare_values`, which can answer `NoSuchOverload`.
+
+/// [`cel_compare`]'s answer: an ordering, or the refusal.
+///
+/// Plain `i64` codes rather than `Option<Ordering>`, for the reason
+/// [`super::error`] gives for refusing `Result`. `Option<Ordering>` is a
+/// data-carrying enum, and front-end B's only general enum-variant lowering is
+/// anchored to `Result`, so every construction of one would arrive as an
+/// `OpKind::New` plus a discriminant write — a materialized shell per
+/// comparison. An integer is a register.
+pub const CMP_LESS: i64 = -1;
+/// Equal. See [`CMP_LESS`].
+pub const CMP_EQUAL: i64 = 0;
+/// Greater. See [`CMP_LESS`].
+pub const CMP_GREATER: i64 = 1;
+/// The operands have no ordering — `partial_cmp`'s `None`, which the four
+/// operators turn into [`CelErrCode::NoSuchOverload`].
+///
+/// Deliberately not `0`: a caller that forgets the test reads it as some
+/// ordering, never as "equal".
+pub const CMP_INCOMPARABLE: i64 = 2;
+
+/// Three-way compare of two signed words.
+///
+/// Branchless rather than an `if`/`else if` chain because the chain form on an
+/// `Ord` type is what `clippy::comparison_chain` asks to be rewritten as a
+/// `match` on `l.cmp(&r)`, which puts a `core::cmp` call in a graph that two
+/// compares and a subtract keep out of it.
+fn cmp_i64(l: i64, r: i64) -> i64 {
+    (l > r) as i64 - (l < r) as i64
+}
+
+/// Three-way compare of two unsigned words. As [`cmp_i64`].
+fn cmp_u64(l: u64, r: u64) -> i64 {
+    (l > r) as i64 - (l < r) as i64
+}
+
+/// Three-way compare of two doubles, with `partial_cmp`'s `None` as
+/// [`CMP_INCOMPARABLE`].
+///
+/// Written as a chain and not branchlessly: `NaN` answers false to `<`, `>` and
+/// `==` alike, so the subtraction form would report it *equal* to everything.
+/// The trailing arm is exactly the case where one operand is `NaN`.
+fn cmp_f64(l: f64, r: f64) -> i64 {
+    if l < r {
+        CMP_LESS
+    } else if l > r {
+        CMP_GREATER
+    } else if l == r {
+        CMP_EQUAL
+    } else {
+        CMP_INCOMPARABLE
+    }
+}
+
+/// The same comparison with the operands the other way round.
+///
+/// Not a negation: [`CMP_EQUAL`] and [`CMP_INCOMPARABLE`] are their own
+/// reverses, and `-CMP_INCOMPARABLE` is not a code at all.
+fn cmp_reverse(code: i64) -> i64 {
+    if code == CMP_LESS {
+        CMP_GREATER
+    } else if code == CMP_GREATER {
+        CMP_LESS
+    } else {
+        code
+    }
+}
+
+/// Declare the ordering arm of one class, over one payload field.
+macro_rules! ordered_arm {
+    (
+        $(#[$doc:meta])*
+        $name:ident, $leaf:ty, $field:ident, $cmp:ident
+    ) => {
+        $(#[$doc])*
+        ///
+        /// # Safety
+        ///
+        /// Both operands must be live values of this arm's class.
+        pub unsafe fn $name(a: CelRef, b: CelRef) -> i64 {
+            $cmp(payload!(a, $leaf, $field), payload!(b, $leaf, $field))
+        }
+    };
+}
+
+ordered_arm!(w_int_cmp, W_IntObject, intval, cmp_i64);
+ordered_arm!(w_uint_cmp, W_UIntObject, uintval, cmp_u64);
+ordered_arm!(w_double_cmp, W_DoubleObject, floatval, cmp_f64);
+ordered_arm!(w_bool_cmp, W_BoolObject, boolval, cmp_i64);
+ordered_arm!(w_duration_cmp, W_DurationObject, nanos, cmp_i64);
+ordered_arm! {
+    /// `timestamp` against `timestamp`, by instant.
+    ///
+    /// `off_s` is not read, here or in [`w_timestamp_eq`]: it records how the
+    /// value was written, not when it happened, and `DateTime`'s own ordering
+    /// compares instants across offsets.
+    w_timestamp_cmp, W_TimestampObject, nanos, cmp_i64
+}
+
+/// Declare the equality arm of one class, over one payload field.
+macro_rules! eq_arm {
+    (
+        $(#[$doc:meta])*
+        $name:ident, $leaf:ty, $field:ident
+    ) => {
+        $(#[$doc])*
+        ///
+        /// # Safety
+        ///
+        /// Both operands must be live values of this arm's class.
+        pub unsafe fn $name(a: CelRef, b: CelRef) -> bool {
+            payload!(a, $leaf, $field) == payload!(b, $leaf, $field)
+        }
+    };
+}
+
+eq_arm!(w_int_eq, W_IntObject, intval);
+eq_arm!(w_uint_eq, W_UIntObject, uintval);
+eq_arm! {
+    /// `double` against `double`, IEEE-754: `NaN` equals nothing, itself
+    /// included.
+    w_double_eq, W_DoubleObject, floatval
+}
+eq_arm!(w_bool_eq, W_BoolObject, boolval);
+eq_arm!(w_duration_eq, W_DurationObject, nanos);
+eq_arm! {
+    /// `timestamp` against `timestamp`, by instant. See [`w_timestamp_cmp`].
+    w_timestamp_eq, W_TimestampObject, nanos
+}
+eq_arm! {
+    /// Two type values are equal when they denote the same class.
+    ///
+    /// The payload is a `*const CelClass` and the classes are `'static`
+    /// prebuilts, so identity of the denoted class *is* pointer identity of
+    /// the payload.
+    w_type_eq, W_TypeObject, cls
+}
+
+/// `null == null`, the only pair this arm is reached with.
+///
+/// A payloadless leaf has nothing to compare and two `null`s are always equal,
+/// so the arm exists to keep `null` in the chain rather than in the
+/// cross-class tail, where it would answer `false`.
+///
+/// # Safety
+///
+/// Both operands must be live `null` values.
+pub unsafe fn w_null_eq(_a: CelRef, _b: CelRef) -> bool {
+    true
+}
+
+// The cross-type numeric helpers. Three, not six: `==` is symmetric, and each
+// reversed ordering is the forward one under `cmp_reverse`.
+//
+// None of them uses `try_into`, which is how `PartialEq`/`PartialOrd for Value`
+// spell the narrowing conversion, because `TryFrom` yields a `Result` and a
+// `Result` does not lower (see `super::error`). The sign tests below are the
+// same predicates: an `i64` fails to be a `u64` exactly when it is negative,
+// and a `u64` fails to be an `i64` exactly when it exceeds `i64::MAX` — which
+// is what the source's own two comments say its `unwrap_or`s mean.
+//
+// `as f64` on an integer is lossy above 2^53. That is the pinned behaviour of
+// the four int/double arms, reproduced rather than corrected: the oracle corpus
+// answers with it.
+
+/// Whether an `int` and a `uint` denote the same number.
+fn eq_int_uint(l: i64, r: u64) -> bool {
+    l >= 0 && (l as u64) == r
+}
+
+/// Whether an `int` and a `double` denote the same number.
+fn eq_int_double(l: i64, r: f64) -> bool {
+    (l as f64) == r
+}
+
+/// Whether a `uint` and a `double` denote the same number.
+fn eq_uint_double(l: u64, r: f64) -> bool {
+    (l as f64) == r
+}
+
+/// An `int` against a `uint`, in that order.
+fn cmp_int_uint(l: i64, r: u64) -> i64 {
+    if l < 0 {
+        CMP_LESS
+    } else {
+        cmp_u64(l as u64, r)
+    }
+}
+
+/// An `int` against a `double`, in that order.
+fn cmp_int_double(l: i64, r: f64) -> i64 {
+    cmp_f64(l as f64, r)
+}
+
+/// A `uint` against a `double`, in that order.
+fn cmp_uint_double(l: u64, r: f64) -> i64 {
+    cmp_f64(l as f64, r)
+}
+
+/// CEL `==`.
+///
+/// Total: no pair of values refuses, so this never touches [`super::error`] and
+/// its result is always a live `bool`. Values of different classes are unequal
+/// rather than an error — except across `int`, `uint` and `double`, which CEL
+/// compares numerically.
+///
+/// # Safety
+///
+/// Both operands must be live values.
+pub unsafe fn cel_equals(a: CelRef, b: CelRef) -> CelRef {
+    new_bool(values_equal(a, b)) as CelRef
+}
+
+/// CEL `!=`, the negation of [`cel_equals`].
+///
+/// # Safety
+///
+/// As [`cel_equals`].
+pub unsafe fn cel_not_equals(a: CelRef, b: CelRef) -> CelRef {
+    new_bool(!values_equal(a, b)) as CelRef
+}
+
+/// The predicate under [`cel_equals`].
+///
+/// A `bool` rather than a boxed one so `!=` can negate it without allocating a
+/// value to read back.
+///
+/// # Safety
+///
+/// Both operands must be live values.
+pub unsafe fn values_equal(a: CelRef, b: CelRef) -> bool {
+    let ta = class_of(a);
+    let tb = class_of(b);
+    if ta == tb {
+        same_class_chain!(ta, a, b,
+            CEL_INT_CLASS => w_int_eq,
+            CEL_UINT_CLASS => w_uint_eq,
+            CEL_DOUBLE_CLASS => w_double_eq,
+            CEL_BOOL_CLASS => w_bool_eq,
+            CEL_NULL_CLASS => w_null_eq,
+            CEL_DURATION_CLASS => w_duration_eq,
+            CEL_TIMESTAMP_CLASS => w_timestamp_eq,
+            CEL_TYPE_CLASS => w_type_eq,
+        );
+    }
+    values_equal_mixed(a, b, ta, tb)
+}
+
+/// The cross-class arms of `==`: the six numeric pairs, and `false` for
+/// everything else.
+///
+/// # Safety
+///
+/// As [`values_equal`], with `ta`/`tb` their classes.
+unsafe fn values_equal_mixed(
+    a: CelRef,
+    b: CelRef,
+    ta: *const CelClass,
+    tb: *const CelClass,
+) -> bool {
+    let int = &CEL_INT_CLASS as *const CelClass;
+    let uint = &CEL_UINT_CLASS as *const CelClass;
+    let double = &CEL_DOUBLE_CLASS as *const CelClass;
+    if ta == int {
+        if tb == uint {
+            return eq_int_uint(
+                payload!(a, W_IntObject, intval),
+                payload!(b, W_UIntObject, uintval),
+            );
+        }
+        if tb == double {
+            return eq_int_double(
+                payload!(a, W_IntObject, intval),
+                payload!(b, W_DoubleObject, floatval),
+            );
+        }
+    } else if ta == uint {
+        if tb == int {
+            return eq_int_uint(
+                payload!(b, W_IntObject, intval),
+                payload!(a, W_UIntObject, uintval),
+            );
+        }
+        if tb == double {
+            return eq_uint_double(
+                payload!(a, W_UIntObject, uintval),
+                payload!(b, W_DoubleObject, floatval),
+            );
+        }
+    } else if ta == double {
+        if tb == int {
+            return eq_int_double(
+                payload!(b, W_IntObject, intval),
+                payload!(a, W_DoubleObject, floatval),
+            );
+        }
+        if tb == uint {
+            return eq_uint_double(
+                payload!(b, W_UIntObject, uintval),
+                payload!(a, W_DoubleObject, floatval),
+            );
+        }
+    }
+    false
+}
+
+/// Three-way compare of two values, as one of the `CMP_*` codes.
+///
+/// `null` and `type` are absent from the chain on purpose, and the omission is
+/// the behaviour rather than a gap in it. `PartialOrd for Value` does order
+/// `Null` against `Null`, but `objects::compare_values` refuses on
+/// `has_comparer(&lhs)` before it consults the ordering, so `null < null` is
+/// `NoSuchOverload`; leaving both classes out reaches that same answer through
+/// the one exit below, and every other pair those two classes can form has no
+/// ordering either.
+///
+/// # Safety
+///
+/// Both operands must be live values.
+pub unsafe fn cel_compare(a: CelRef, b: CelRef) -> i64 {
+    let ta = class_of(a);
+    let tb = class_of(b);
+    if ta == tb {
+        same_class_chain!(ta, a, b,
+            CEL_INT_CLASS => w_int_cmp,
+            CEL_UINT_CLASS => w_uint_cmp,
+            CEL_DOUBLE_CLASS => w_double_cmp,
+            CEL_BOOL_CLASS => w_bool_cmp,
+            CEL_DURATION_CLASS => w_duration_cmp,
+            CEL_TIMESTAMP_CLASS => w_timestamp_cmp,
+        );
+    }
+    cel_compare_slow(a, b, ta, tb)
+}
+
+/// The cross-class arms of ordering: the six numeric pairs, and
+/// [`CMP_INCOMPARABLE`] for everything else.
+///
+/// The three reversed pairs go through [`cmp_reverse`], which reproduces the
+/// source's arms rather than approximating them. `(uint, int)` is the one worth
+/// checking: the source converts the `uint` to `i64` and answers `Greater` when
+/// it does not fit, and `cmp_reverse(cmp_int_uint(int, uint))` answers the same
+/// in each case — a `uint` above `i64::MAX` exceeds every `int`, a negative
+/// `int` is below every `uint`, and otherwise both fit in `u64` and are
+/// compared there.
+///
+/// # Safety
+///
+/// As [`cel_compare`], with `ta`/`tb` their classes.
+unsafe fn cel_compare_slow(a: CelRef, b: CelRef, ta: *const CelClass, tb: *const CelClass) -> i64 {
+    let int = &CEL_INT_CLASS as *const CelClass;
+    let uint = &CEL_UINT_CLASS as *const CelClass;
+    let double = &CEL_DOUBLE_CLASS as *const CelClass;
+    if ta == int {
+        if tb == uint {
+            return cmp_int_uint(
+                payload!(a, W_IntObject, intval),
+                payload!(b, W_UIntObject, uintval),
+            );
+        }
+        if tb == double {
+            return cmp_int_double(
+                payload!(a, W_IntObject, intval),
+                payload!(b, W_DoubleObject, floatval),
+            );
+        }
+    } else if ta == uint {
+        if tb == int {
+            return cmp_reverse(cmp_int_uint(
+                payload!(b, W_IntObject, intval),
+                payload!(a, W_UIntObject, uintval),
+            ));
+        }
+        if tb == double {
+            return cmp_uint_double(
+                payload!(a, W_UIntObject, uintval),
+                payload!(b, W_DoubleObject, floatval),
+            );
+        }
+    } else if ta == double {
+        if tb == int {
+            return cmp_reverse(cmp_int_double(
+                payload!(b, W_IntObject, intval),
+                payload!(a, W_DoubleObject, floatval),
+            ));
+        }
+        if tb == uint {
+            return cmp_reverse(cmp_uint_double(
+                payload!(b, W_UIntObject, uintval),
+                payload!(a, W_DoubleObject, floatval),
+            ));
+        }
+    }
+    CMP_INCOMPARABLE
+}
+
+/// Declare one ordering operator over the [`cel_compare`] code.
+///
+/// The accept predicate is written into each operator rather than taken as the
+/// `fn(Ordering) -> bool` `objects::compare_values` receives: a predicate
+/// reached through a function pointer is the dynamic shape this module exists
+/// to avoid.
+///
+/// `$op` is diagnostic only. The refusal an ordering produces is
+/// `NoSuchOverload`, which carries neither operator nor operands, so no
+/// spelling here is observable at the boundary — unlike the arithmetic ops,
+/// whose strings are rendered by `UnsupportedBinaryOperator`.
+macro_rules! ordering_op {
+    (
+        $(#[$doc:meta])*
+        $name:ident, $op:literal, |$code:ident| $accept:expr
+    ) => {
+        $(#[$doc])*
+        ///
+        /// # Safety
+        ///
+        /// Both operands must be live values.
+        pub unsafe fn $name(a: CelRef, b: CelRef) -> CelRef {
+            let $code = cel_compare(a, b);
+            if $code == CMP_INCOMPARABLE {
+                return raise(CelErrCode::NoSuchOverload, $op, a, b);
+            }
+            new_bool($accept) as CelRef
+        }
+    };
+}
+
+ordering_op! {
+    /// CEL `<`.
+    cel_less, "less", |code| code == CMP_LESS
+}
+
+ordering_op! {
+    /// CEL `<=`.
+    ///
+    /// Spelled "not greater", the way `OpCode::LessEquals` accepts
+    /// `o != Ordering::Greater`. The two agree because the refusal has already
+    /// been taken above, so only the three ordering codes reach the predicate.
+    cel_less_equals, "less_equals", |code| code != CMP_GREATER
+}
+
+ordering_op! {
+    /// CEL `>`.
+    cel_greater, "greater", |code| code == CMP_GREATER
+}
+
+ordering_op! {
+    /// CEL `>=`. Spelled "not less", as [`cel_less_equals`] is spelled.
+    cel_greater_equals, "greater_equals", |code| code != CMP_LESS
+}
+
 #[cfg(test)]
 mod tests {
+    use std::cmp::Ordering;
+
     use super::*;
+    use crate::objects::compare_values;
     use crate::runtime::error::{clear_error, take_error};
-    use crate::runtime::object::{new_bool, w_type, W_BoolObject, CEL_BOOL_CLASS};
+    use crate::runtime::object::{new_null, new_type, w_type};
+    use crate::{ExecutionError, Value};
 
     /// Every test starts with an empty channel, so a leaked error from an
     /// earlier case cannot be read as this one's.
@@ -660,5 +1129,314 @@ mod tests {
             assert_eq!(cel_negate(new_int(i64::MIN) as CelRef), ERROR_SENTINEL);
             assert_eq!(take_error().unwrap().code, CelErrCode::Overflow);
         }
+    }
+
+    // -- comparison, against the `Value` oracle ----------------------------
+    //
+    // The two comparison tests below do not restate the semantics; they call
+    // the production ones on the same operands. Whatever `PartialEq for Value`
+    // and `objects::compare_values` answer is what the chains have to answer,
+    // including the cases that are arguably wrong (`i64 as f64` above 2^53,
+    // `null < null` refused while `Null.partial_cmp(&Null)` is `Equal`), which
+    // is the point: the corpus is frozen against those answers.
+
+    /// One value of every class the chains dispatch on, with the boundaries
+    /// that separate the cross-type arms: the two conversion failures
+    /// (`int` negative, `uint` above `i64::MAX`), and `NaN`/infinity.
+    fn oracle_values() -> Vec<Value> {
+        let mut values = vec![
+            Value::Int(-1),
+            Value::Int(0),
+            Value::Int(1),
+            Value::Int(i64::MIN),
+            Value::Int(i64::MAX),
+            Value::UInt(0),
+            Value::UInt(1),
+            Value::UInt(i64::MAX as u64),
+            Value::UInt(u64::MAX),
+            Value::Float(-1.0),
+            Value::Float(0.0),
+            Value::Float(1.0),
+            Value::Float(f64::NAN),
+            Value::Float(f64::INFINITY),
+            Value::Bool(false),
+            Value::Bool(true),
+            Value::Null,
+        ];
+        #[cfg(feature = "chrono")]
+        {
+            values.push(Value::Duration(chrono::Duration::nanoseconds(5)));
+            values.push(Value::Duration(chrono::Duration::nanoseconds(-5)));
+            values.push(Value::Timestamp(
+                chrono::DateTime::from_timestamp_nanos(7).fixed_offset(),
+            ));
+        }
+        values
+    }
+
+    /// The class-family value denoting the same thing as `v`.
+    fn boxed(v: &Value) -> CelRef {
+        match v {
+            Value::Int(i) => new_int(*i) as CelRef,
+            Value::UInt(u) => new_uint(*u) as CelRef,
+            Value::Float(f) => new_double(*f) as CelRef,
+            Value::Bool(b) => new_bool(*b) as CelRef,
+            Value::Null => new_null() as CelRef,
+            #[cfg(feature = "chrono")]
+            Value::Duration(d) => new_duration(d.num_nanoseconds().unwrap()) as CelRef,
+            #[cfg(feature = "chrono")]
+            Value::Timestamp(t) => new_timestamp(
+                t.timestamp_nanos_opt().unwrap(),
+                t.offset().local_minus_utc() as i64,
+            ) as CelRef,
+            other => panic!("no leaf for {other:?}"),
+        }
+    }
+
+    /// Every ordered pair of [`oracle_values`] agrees with `PartialEq for
+    /// Value`, in both `==` and `!=`.
+    #[test]
+    fn equality_agrees_with_the_value_operator() {
+        fresh();
+        let values = oracle_values();
+        for lhs in &values {
+            for rhs in &values {
+                let want = lhs == rhs;
+                unsafe {
+                    let (l, r) = (boxed(lhs), boxed(rhs));
+                    let eq = cel_equals(l, r);
+                    assert_eq!(w_type(eq), &CEL_BOOL_CLASS as *const CelClass);
+                    assert_eq!(
+                        payload!(eq, W_BoolObject, boolval) != 0,
+                        want,
+                        "{lhs:?} == {rhs:?}",
+                    );
+                    let ne = cel_not_equals(l, r);
+                    assert_eq!(
+                        payload!(ne, W_BoolObject, boolval) != 0,
+                        !want,
+                        "{lhs:?} != {rhs:?}",
+                    );
+                }
+            }
+        }
+        assert!(
+            !super::super::error::has_error(),
+            "equality is total and must never raise",
+        );
+    }
+
+    /// How [`ordering_agrees_with_compare_values`] divided, so that the test
+    /// cannot pass by never reaching a branch.
+    ///
+    /// A cross-check agrees trivially if the oracle refuses everything: both
+    /// sides would answer "refused" for reasons that have nothing to do with
+    /// each other. The counts below are the coverage claim, asserted at the
+    /// end of the test rather than described in a comment.
+    #[derive(Default)]
+    struct Split {
+        answered: u32,
+        answered_cross_class: u32,
+        refused: u32,
+    }
+
+    /// The answer `objects::compare_values` gives for one operator, required of
+    /// the chain that replaces it.
+    ///
+    /// `got` is computed by the caller so that it lands in the error slot
+    /// immediately before this reads it.
+    unsafe fn agrees_with_compare_values(
+        lhs: &Value,
+        rhs: &Value,
+        name: &str,
+        accept: fn(Ordering) -> bool,
+        got: CelRef,
+        split: &mut Split,
+    ) {
+        match compare_values(lhs.clone(), rhs.clone(), accept) {
+            Ok(Value::Bool(want)) => {
+                split.answered += 1;
+                if std::mem::discriminant(lhs) != std::mem::discriminant(rhs) {
+                    split.answered_cross_class += 1;
+                }
+                assert_ne!(
+                    got, ERROR_SENTINEL,
+                    "{name}: {lhs:?} vs {rhs:?} refused, oracle answered {want}",
+                );
+                assert_eq!(w_type(got), &CEL_BOOL_CLASS as *const CelClass);
+                assert_eq!(
+                    payload!(got, W_BoolObject, boolval) != 0,
+                    want,
+                    "{name}: {lhs:?} vs {rhs:?}",
+                );
+            }
+            Err(ExecutionError::NoSuchOverload) => {
+                split.refused += 1;
+                assert_eq!(
+                    got, ERROR_SENTINEL,
+                    "{name}: {lhs:?} vs {rhs:?} answered, oracle refused",
+                );
+                assert_eq!(take_error().unwrap().code, CelErrCode::NoSuchOverload);
+            }
+            other => panic!("unexpected oracle answer for {name}: {other:?}"),
+        }
+    }
+
+    /// Every ordered pair of [`oracle_values`], through all four operators,
+    /// agrees with `objects::compare_values`.
+    #[test]
+    fn ordering_agrees_with_compare_values() {
+        let values = oracle_values();
+        let mut split = Split::default();
+        for lhs in &values {
+            for rhs in &values {
+                unsafe {
+                    let (l, r) = (boxed(lhs), boxed(rhs));
+                    fresh();
+                    agrees_with_compare_values(
+                        lhs,
+                        rhs,
+                        "less",
+                        |o| o == Ordering::Less,
+                        cel_less(l, r),
+                        &mut split,
+                    );
+                    fresh();
+                    agrees_with_compare_values(
+                        lhs,
+                        rhs,
+                        "less_equals",
+                        |o| o != Ordering::Greater,
+                        cel_less_equals(l, r),
+                        &mut split,
+                    );
+                    fresh();
+                    agrees_with_compare_values(
+                        lhs,
+                        rhs,
+                        "greater",
+                        |o| o == Ordering::Greater,
+                        cel_greater(l, r),
+                        &mut split,
+                    );
+                    fresh();
+                    agrees_with_compare_values(
+                        lhs,
+                        rhs,
+                        "greater_equals",
+                        |o| o != Ordering::Less,
+                        cel_greater_equals(l, r),
+                        &mut split,
+                    );
+                }
+            }
+        }
+        // Measured over the table above: 712 answered (448 of them across two
+        // classes) and 888 refused, of 20 x 20 x 4. The floors are a quarter of
+        // the total rather than those figures, so adding a value to the table
+        // does not have to restate them — but a change that collapses either
+        // branch, or drops the cross-class arms out of reach, still fails here.
+        let total = (values.len() * values.len() * 4) as u32;
+        assert_eq!(
+            split.answered + split.refused,
+            total,
+            "every case classified"
+        );
+        assert!(split.answered > total / 4, "answered {}", split.answered);
+        assert!(split.refused > total / 4, "refused {}", split.refused);
+        assert!(
+            split.answered_cross_class > total / 8,
+            "cross-class answers are the arms this test exists for: {}",
+            split.answered_cross_class,
+        );
+    }
+
+    /// The three codes and the refusal are distinct, and the refusal is not
+    /// reachable by negating an ordering.
+    #[test]
+    fn compare_codes_are_the_four_the_operators_test() {
+        fresh();
+        unsafe {
+            assert_eq!(
+                cel_compare(new_int(1) as CelRef, new_int(2) as CelRef),
+                CMP_LESS,
+            );
+            assert_eq!(
+                cel_compare(new_int(2) as CelRef, new_int(2) as CelRef),
+                CMP_EQUAL,
+            );
+            assert_eq!(
+                cel_compare(new_int(3) as CelRef, new_int(2) as CelRef),
+                CMP_GREATER,
+            );
+            // Two classes with no ordering between them, and one value with no
+            // ordering at all.
+            assert_eq!(
+                cel_compare(new_int(1) as CelRef, new_bool(true) as CelRef),
+                CMP_INCOMPARABLE,
+            );
+            assert_eq!(
+                cel_compare(new_null() as CelRef, new_null() as CelRef),
+                CMP_INCOMPARABLE,
+            );
+            assert_eq!(cmp_reverse(CMP_INCOMPARABLE), CMP_INCOMPARABLE);
+            assert_eq!(cmp_reverse(CMP_EQUAL), CMP_EQUAL);
+            assert_eq!(cmp_reverse(CMP_LESS), CMP_GREATER);
+        }
+        assert!(
+            !super::super::error::has_error(),
+            "cel_compare never raises"
+        );
+    }
+
+    /// `null == null` is true while `null < null` refuses — the asymmetry
+    /// `has_comparer` puts in front of `PartialOrd`, which the missing chain
+    /// arm reproduces.
+    #[test]
+    fn null_compares_equal_and_refuses_to_order() {
+        fresh();
+        unsafe {
+            let eq = cel_equals(new_null() as CelRef, new_null() as CelRef);
+            assert_eq!(payload!(eq, W_BoolObject, boolval), 1);
+            assert_eq!(
+                cel_less(new_null() as CelRef, new_null() as CelRef),
+                ERROR_SENTINEL,
+            );
+        }
+        assert_eq!(take_error().unwrap().code, CelErrCode::NoSuchOverload);
+    }
+
+    /// Type values compare by the class they denote, and carry no ordering.
+    #[test]
+    fn type_values_compare_by_denoted_class() {
+        fresh();
+        unsafe {
+            let int_ty = new_type(&CEL_INT_CLASS) as CelRef;
+            let also_int = new_type(&CEL_INT_CLASS) as CelRef;
+            let uint_ty = new_type(&CEL_UINT_CLASS) as CelRef;
+            assert_ne!(int_ty, also_int, "two allocations, not one interned value");
+            assert!(values_equal(int_ty, also_int));
+            assert!(!values_equal(int_ty, uint_ty));
+            assert_eq!(cel_less(int_ty, uint_ty), ERROR_SENTINEL);
+        }
+        assert_eq!(take_error().unwrap().code, CelErrCode::NoSuchOverload);
+    }
+
+    /// Timestamps compare by instant, so the offset a value was written with
+    /// changes neither equality nor ordering.
+    #[cfg(feature = "chrono")]
+    #[test]
+    fn timestamp_comparison_ignores_the_offset() {
+        fresh();
+        unsafe {
+            let utc = new_timestamp(1_000, 0) as CelRef;
+            let plus_nine = new_timestamp(1_000, 9 * 3_600) as CelRef;
+            assert!(values_equal(utc, plus_nine));
+            assert_eq!(cel_compare(utc, plus_nine), CMP_EQUAL);
+
+            let later = new_timestamp(2_000, 9 * 3_600) as CelRef;
+            assert_eq!(cel_compare(utc, later), CMP_LESS);
+        }
+        assert!(!super::super::error::has_error());
     }
 }
