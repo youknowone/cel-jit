@@ -21,6 +21,10 @@
 //!    `New` allocates through the backend's `malloc` stub and the object never
 //!    enters the traced heap. See [`cel_gc`].
 //!
+//! Besides the twelve fixed-size classes there are the two payload blocks,
+//! registered as **varsize** types from the tokens [`super::object_array`]
+//! carries — see [`varsize_block`].
+//!
 //! # What this does not do yet
 //!
 //! Nothing allocates a cel value through the collector today: [`super::lltype`]
@@ -33,6 +37,8 @@ use majit_gc::collector::{GcConfig, MiniMarkGC};
 use majit_gc::{GcAllocator, TypeInfo};
 use majit_ir::descr::{ArrayFlag, SimpleFieldDescrSpec};
 use majit_ir::Type;
+
+use super::object_array::{ArrayToken, CEL_BYTES_BLOCK_TOKEN, CEL_ITEMS_BLOCK_TOKEN};
 
 use super::object::{
     CelClass, CelObject, W_BoolObject, W_BytesObject, W_DoubleObject, W_DurationObject,
@@ -234,6 +240,17 @@ pub struct CelTypeIds {
     /// "any cel value" has a class to name. It has no instances of its own.
     pub root: u32,
     pub classes: Vec<RegisteredClass>,
+    /// The reference payload block, `CelItemsBlock`.
+    ///
+    /// Not in `classes` and not reachable through [`Self::type_id_of`]: a block
+    /// carries its length word where a leaf carries its class word, so no class
+    /// address maps to it and `get_typeid_from_classptr_if_gcremovetypeptr`
+    /// cannot answer for it. It is named on its own here because the block is
+    /// not the value — the leaf that points at it is.
+    pub items_block: u32,
+    /// The byte payload block, `CelBytesBlock`. As [`Self::items_block`], with
+    /// leaf items.
+    pub bytes_block: u32,
 }
 
 impl CelTypeIds {
@@ -246,12 +263,49 @@ impl CelTypeIds {
     }
 }
 
-/// Register every class with `gc`, then freeze the registry.
+/// The `TypeInfo` for one payload block, from the block's own token.
+///
+/// The three numbers come off the [`ArrayToken`] rather than being spelled
+/// here, which is the whole reason that struct exists: `encode_type_shape`
+/// reads `base_size` as `ofstovar`, `item_size` as `varitemsize` and
+/// `len_offset` as `ofstolength`, and picking them apart per call site is
+/// exactly how pyre registered two array type ids whose blocks were laid out
+/// four bytes apart from what the collector then copied.
+///
+/// `items_have_gc_ptrs` is the only difference between the two blocks and is
+/// not derivable from the token: it says whether the items are managed edges
+/// (`T_IS_GCARRAY_OF_GCPTR`, so a minor collection walks every slot) or plain
+/// bytes. The token carries the item *size*; nothing in it carries the item's
+/// kind.
+///
+/// No `gc_ptr_offsets`. A block's fixed part is the length word alone, which is
+/// an integer — every managed edge a block has is an item.
+fn varsize_block(token: &ArrayToken, items_have_gc_ptrs: bool) -> TypeInfo {
+    TypeInfo::varsize(
+        token.base_size,
+        token.item_size,
+        token.len_offset,
+        items_have_gc_ptrs,
+        Vec::new(),
+    )
+}
+
+/// Register every class and both payload blocks with `gc`, then freeze the
+/// registry.
+///
+/// The blocks come after the classes so that adding them renumbers nothing:
+/// `register_type` hands out ids by position, and [`publish_cel_descrs`] zips
+/// `CEL_CLASS_LAYOUTS` against `classes` by position too. They take no
+/// `register_vtable_for_type` — a block has a length word at offset 0, not a
+/// class word, so an address-to-id lookup over blocks would be reading a
+/// capacity as a class pointer.
 ///
 /// Frozen on the way out, deliberately. `freeze_types` is what assigns
 /// `subclassrange_{min,max}`, and a caller that forgot it would get a family
 /// whose `GuardSubclass` ranges are all `0..0` — which does not fail, it just
-/// answers "no" to every subclass test.
+/// answers "no" to every subclass test. The blocks are unaffected either way:
+/// `assign_inheritance_ids` walks only the types that declare a subclass range,
+/// and a varsize type declares none.
 pub fn register_cel_classes(gc: &mut MiniMarkGC) -> CelTypeIds {
     let root = gc.register_type(TypeInfo::object(size_of::<CelObject>()));
     let mut classes = Vec::with_capacity(CEL_CLASS_LAYOUTS.len());
@@ -274,8 +328,20 @@ pub fn register_cel_classes(gc: &mut MiniMarkGC) -> CelTypeIds {
         GcAllocator::register_vtable_for_type(gc, registered.vtable(), type_id);
         classes.push(registered);
     }
+    // The reference block's items ARE managed edges; the byte block's are
+    // bytes. Two type ids rather than one for two blocks that agree on
+    // `base_size` and `len_offset`, because one id carries one varsize shape
+    // and these two disagree on the item size and on whether the items are
+    // traced at all.
+    let items_block = gc.register_type(varsize_block(&CEL_ITEMS_BLOCK_TOKEN, true));
+    let bytes_block = gc.register_type(varsize_block(&CEL_BYTES_BLOCK_TOKEN, false));
     GcAllocator::freeze_types(gc);
-    CelTypeIds { root, classes }
+    CelTypeIds {
+        root,
+        classes,
+        items_block,
+        bytes_block,
+    }
 }
 
 /// Publish a `SizeDescr` and its `FieldDescr`s for every class, keyed on the
@@ -571,5 +637,103 @@ mod tests {
     fn descrs_publish_under_the_collectors_type_ids() {
         let (_gc, ids) = fresh_gc();
         publish_cel_descrs(&ids);
+    }
+
+    /// The blocks register after the classes, so every class keeps the id it
+    /// had before they existed. That is not cosmetic: `publish_cel_descrs`
+    /// pairs `CEL_CLASS_LAYOUTS` with `ids.classes` by position, and a block
+    /// registered in the middle would shift every class past it onto a
+    /// neighbour's descr.
+    #[test]
+    fn the_blocks_register_past_every_class() {
+        let (_gc, ids) = fresh_gc();
+        let last_class = ids
+            .classes
+            .iter()
+            .map(|r| r.type_id)
+            .max()
+            .expect("the family is not empty");
+        assert!(ids.root < last_class);
+        assert!(ids.items_block > last_class);
+        assert!(ids.bytes_block > ids.items_block);
+    }
+
+    /// A block is not a value: nothing maps a class address to its id, and
+    /// `type_id_of` must not start answering for one.
+    #[test]
+    fn no_class_address_resolves_to_a_block() {
+        let (gc, ids) = fresh_gc();
+        for registered in &ids.classes {
+            let resolved =
+                GcAllocator::get_typeid_from_classptr_if_gcremovetypeptr(&gc, registered.vtable());
+            assert_ne!(resolved, Some(ids.items_block));
+            assert_ne!(resolved, Some(ids.bytes_block));
+        }
+    }
+
+    /// The registration's whole point, end to end: a block allocated at
+    /// [`CelTypeIds::items_block`] has its items walked.
+    ///
+    /// The collector reads the length off the word at `len_offset` and forwards
+    /// `length` slots from `base_size` — which is `CEL_ITEMS_BLOCK_TOKEN`
+    /// verbatim — so a leaf reachable only through a block slot survives the
+    /// collection and the slot carries its new address. Nothing but a real
+    /// collection can check that: a block registered with a wrong shape does
+    /// not fail at registration, it walks the wrong words later.
+    ///
+    /// `alloc_varsize_typed` rather than `super::super::object_array::new_items_block`,
+    /// for the reason `an_object_allocated_at_a_cel_type_id_reports_its_class`
+    /// does not use `malloc_typed`: the two are different heaps, and
+    /// `new_items_block` allocates from `std::alloc`, where the collector owns
+    /// no header to read this type id back out of.
+    #[test]
+    fn a_minor_collection_walks_an_items_blocks_slots() {
+        let (mut gc, ids) = fresh_gc();
+        let int_tid = ids.type_id_of(&CEL_INT_CLASS).expect("int is registered");
+
+        let leaf = gc.alloc_nursery_typed(int_tid, size_of::<W_IntObject>());
+        assert_ne!(leaf.0, 0);
+        unsafe {
+            let w = leaf.0 as CelRef;
+            (*w).ob_type = &CEL_INT_CLASS;
+            crate::runtime::object::payload!(w, W_IntObject, intval) = 7;
+        }
+
+        let block = gc.alloc_varsize_typed(
+            ids.items_block,
+            CEL_ITEMS_BLOCK_TOKEN.base_size,
+            CEL_ITEMS_BLOCK_TOKEN.item_size,
+            1,
+        );
+        assert_ne!(block.0, 0);
+        unsafe {
+            // The length word first, exactly as `alloc_block` writes it: the
+            // walker reads it, so a block is never observable without one.
+            *((block.0 + CEL_ITEMS_BLOCK_TOKEN.len_offset) as *mut usize) = 1;
+            *((block.0 + CEL_ITEMS_BLOCK_TOKEN.base_size) as *mut usize) = leaf.0;
+        }
+        assert_eq!(
+            GcAllocator::get_actual_typeid(&gc, block),
+            Some(ids.items_block)
+        );
+
+        // The block is the only root. The leaf is reachable through its slot
+        // and through nothing else, so it survives only if the slot is walked.
+        let mut root = block;
+        unsafe { GcAllocator::add_root(&mut gc, &mut root) };
+        gc.do_collect_nursery();
+
+        assert_ne!(root.0, block.0, "the collection promoted the block");
+        let moved_leaf = unsafe { *((root.0 + CEL_ITEMS_BLOCK_TOKEN.base_size) as *const usize) };
+        assert_ne!(moved_leaf, 0, "the slot was cleared rather than forwarded");
+        assert_ne!(
+            moved_leaf, leaf.0,
+            "the slot kept the pre-collection address"
+        );
+        unsafe {
+            let w = moved_leaf as CelRef;
+            assert_eq!(crate::runtime::object::payload!(w, W_IntObject, intval), 7);
+        }
+        GcAllocator::remove_root(&mut gc, &mut root);
     }
 }

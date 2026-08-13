@@ -40,12 +40,20 @@
 //! The live length lives on the owning leaf, as `("length", Signed)` does
 //! upstream. A block is never resized in place; growing allocates a fresh one.
 //!
-//! # Nothing traces these yet
+//! # Registered, but nothing is allocated under the registration
 //!
-//! The items are managed edges and no collector walks them, for the same reason
-//! nothing walks `W_OptionalObject`'s: the type ids and the offset lists arrive
-//! with the registration mechanism. [`CEL_ITEMS_BLOCK_TOKEN`] is landed now
-//! because it is precisely the value that registration will consume unchanged.
+//! [`super::registration`] now registers both blocks as varsize types, from
+//! [`CEL_ITEMS_BLOCK_TOKEN`] and [`CEL_BYTES_BLOCK_TOKEN`] unchanged — the
+//! reference block with its items traced, the byte block as a leaf. So the
+//! shape a collector would walk is on record and tested against a real minor
+//! collection.
+//!
+//! What is still absent is any block that carries those type ids: `alloc_block`
+//! allocates from `std::alloc`, where the collector owns no header, and routing
+//! it to the nursery is not a change this module can make alone. The leaf that
+//! points at a block is itself a [`super::lltype`] allocation the collector does
+//! not own, so a GC-allocated block would be reachable from nothing and freed
+//! while live. The blocks move onto the collector when the leaves do.
 
 use super::object::CelRef;
 
@@ -174,11 +182,33 @@ pub fn new_items_block(values: &[CelRef]) -> *mut CelItemsBlock {
     // upstream refuses the shape by name (`jtransform.py`,
     // `raise Exception("setfield_raw_r not supported")`).
     //
-    // So the fix is not a loop spelling. The block has to become a REGISTERED
-    // GC array addressed by `getarrayitem_gc_r` / `setarrayitem_gc_r`, which is
-    // what pyre does for the identical structure and what
-    // [`CEL_ITEMS_BLOCK_TOKEN`] exists to be handed to. Until then this call is
-    // a wall, and it is a wall only for the reference block.
+    // The route out is `setarrayitem_gc_r`, and it is closed to cel BY NAME.
+    // Registering the block as a GC array is necessary and not sufficient:
+    // [`super::registration`] now does that, and this store still does not
+    // lower, because the front end decides whether a `*base.add(i) = v` is an
+    // array store before any descr or type id is consulted. All four of its
+    // reference-array store routes are keyed on pyre identities:
+    //
+    //   - `is_list_items_elem_ptr_add_parts` — the `*base.add(i)` route, this
+    //     one's shape — requires `is_pyobjectref_items_ptr`, whose last test is
+    //     `raw_ptr_pointee_class_root(..) == Some("PyObject")`. [`CelRef`] is a
+    //     `*mut CelObject`, so the pointee root is `"CelObject"`. It also
+    //     requires `base_traces_to_items_block_accessor`, whose
+    //     `regular_call_is_items_block_accessor` is a WHOLE-PATH match against
+    //     `pyre_object::object_array::items_block_items_base`; cel's accessor is
+    //     in crate `cel`, so no rename inside this module reaches it.
+    //   - `is_workspace_index_regular` — `Index` / `IndexMut` — gates on
+    //     `path.starts_with("pyre_")`.
+    //   - `is_object_array_set_ref_call` — whole-path
+    //     `pyre_object::object_array::<Impl>::set_ref`.
+    //   - `is_vec_index_regular` wants a `Vec<T>` receiver, which is the
+    //     encoding this module's header rules out.
+    //
+    // Only brick 1's `graph_is_items_block_base_accessor` is already
+    // crate-agnostic (a `::`-suffix match). So this is a majit-side widening,
+    // not a cel-side spelling: until those gates admit a non-pyre pointee root
+    // and a non-pyre accessor path, this call is a wall — and it is a wall only
+    // for the reference block.
     unsafe {
         let base = items_base(block);
         let mut i = 0;
@@ -208,9 +238,13 @@ pub fn new_bytes_block(bytes: &[u8]) -> *mut CelBytesBlock {
 
 /// Item 0 of a reference block, or null for a null block.
 ///
-/// The shape matters: a byte-offset add on the block pointer is what the
-/// front-end recognises as an array base, lowering an access through it to an
-/// `ArrayRead`/`ArrayWrite` rather than to opaque pointer arithmetic.
+/// ⚠ An earlier revision claimed the byte-offset add is "what the front-end
+/// recognises as an array base". It is not, for this function: the recognition
+/// is `graph_is_items_block_base_accessor`, a match on the ACCESSOR'S OWN
+/// module-qualified name, and the gates downstream of it are keyed on pyre
+/// identities — see [`new_items_block`]. The shape below is the right one to
+/// hold, because it is the one those gates are written around; it is not by
+/// itself what makes an access lower.
 ///
 /// # Safety
 ///
