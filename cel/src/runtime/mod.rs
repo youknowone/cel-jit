@@ -37,9 +37,15 @@
 //!
 //! Read [`object`] before adding a leaf: three separate conditions have to
 //! hold for an allocation to fuse, and all three fail silently.
+//!
+//! Every leaf is allocated from [`heap`], which owns its memory but does not
+//! yet collect it — read that module before assuming a value is reclaimed, and
+//! before wiring the collector, which would otherwise leave two heaps holding
+//! cel objects and no walker able to see both.
 
 pub mod binop;
 pub mod error;
+pub mod heap;
 pub mod lltype;
 pub mod object;
 pub mod object_array;

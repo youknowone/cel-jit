@@ -14,20 +14,23 @@
 //! bare `continue`. See [`super::object`] for the other two silent-decline
 //! conditions and the tripwire tests that pin all three.
 //!
-//! Today the body is a plain `Box` leak. The tracing heap that replaces it is
-//! a later slice: what matters for lowering is the *shape* of the call, which
-//! is fixed now so the class family below it never has to be re-laid.
+//! The body is free to grow, and this one did: it was `Box::into_raw` and now
+//! reaches this thread's [`super::heap::CelHeap`]. What the matcher inspects
+//! is the *call* — the path's last two segments and the argument count — never
+//! the callee's body, and the fuse replaces the call outright when it fires, so
+//! the body is only ever lowered on the paths that declined.
 
-/// Allocate `value` on the heap and return a raw pointer to it.
+use super::heap;
+
+/// Allocate `value` on this thread's heap and return a raw pointer to it.
 ///
 /// # Safety of the returned pointer
 ///
-/// Nothing frees it. Until the tracing heap lands, every value allocated here
-/// leaks; that is deliberate for this slice, because the alternative — a
-/// `Drop`-based owner — reintroduces exactly the owning-place structure the
-/// class family exists to remove.
+/// It is valid until the thread's heap is torn down, and no sooner: nothing
+/// collects yet, because the root set the design enumerates has no walker. See
+/// [`super::heap`] for what that bounds and what it does not.
 pub fn malloc_typed<T>(value: T) -> *mut T {
-    Box::into_raw(Box::new(value))
+    heap::with_heap(|h| h.alloc(value))
 }
 
 /// The managed counterpart, accepted by the same matcher.
@@ -36,5 +39,5 @@ pub fn malloc_typed<T>(value: T) -> *mut T {
 /// heap will eventually route them differently — one to the collector's
 /// managed old-gen, one to an immortal region. They are the same call today.
 pub fn malloc_typed_managed<T>(value: T) -> *mut T {
-    Box::into_raw(Box::new(value))
+    heap::with_heap(|h| h.alloc(value))
 }
