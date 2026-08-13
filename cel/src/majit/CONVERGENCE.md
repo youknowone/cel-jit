@@ -41,13 +41,63 @@ through `Program::execute` under `--no-default-features`.
 > progress toward 2b; it is progress toward knowing the portal is not the problem.
 >
 > **What is actually next is P5** — the `Arc`-free, header-first `W_Root` class
-> family — and it is unlanded: none of `CelObject`, `CelClass`, `W_IntObject` or
-> `malloc_typed` exists under `cel/src`, and `Value` still carries
-> `Arc<String>` / `Arc<Vec<u8>>` / `Arc<dyn Opaque>` / `Arc<CelStruct>`.
-> The B2 number recorded under Step 3 below points at exactly this from a second
-> direction: the largest single rtyper prepass failure across cel's closure is
-> **`sync::Arc::deref`, 16 of 88** — the value universe's `Arc` itself. P5 is the
-> phase that deletes it.
+> family. The B2 number recorded under Step 3 below points at exactly this from a
+> second direction: the largest single rtyper prepass failure across cel's
+> closure is **`sync::Arc::deref`, 16 of 88** — the value universe's `Arc`
+> itself. P5 is the phase that deletes it.
+>
+> **P5's fixed-size half has since landed** (2026-08-13, `cel/src/runtime`):
+> `CelObject`, `CelClass`, `lltype::malloc_typed`, the eight fixed-size leaves
+> (`int uint double bool null duration timestamp type`), the arithmetic chains,
+> and `==`/`!=` plus the four orderings. It is additive — nothing is reachable
+> from `Value`, which still carries `Arc<String>` / `Arc<Vec<u8>>` /
+> `Arc<dyn Opaque>` / `Arc<CelStruct>`. What remains of P5 is blocked, not
+> skipped: the variable-length leaves need **M5** (varsize allocation lowering),
+> and `W_OpaqueObject` needs the heap and the D12 side table.
+>
+> **The premise underneath all of it is now measured, not assumed.** The family
+> is only worth its two header words if `fuse_boxing_alloc` turns each
+> constructor into a `NewWithVtable` the optimizer can delete, and all of that
+> pass's decline paths are a bare `continue`. Seeding the pipeline census at the
+> chains themselves (`majit-translate/tests/test_cel_census.rs`,
+> `cel_census_pipeline_runtime_add` / `_less`, measured at cel-jit `3db70c6`):
+>
+> | portal | `new` | `newwithvtable` |
+> |---|---|---|
+> | `runtime::binop::cel_add` | 1 | **5** |
+> | `runtime::binop::cel_less` | 0 | **1** |
+> | `objects::Value::resolve_value` (control) | 88 | 0 |
+>
+> Five is every constructor in `cel_add`'s closure — `new_int`, `new_uint`,
+> `new_double`, `new_duration`, `new_timestamp` — and one is `new_bool` under
+> `cel_less`. `lltype::malloc_typed` and `pyobject::get_instantiate` drop out of
+> the jitcode list entirely, consumed by the fuse. **The leaves fuse.**
+>
+> ⛔ **Both numbers were unreadable until two harness defects were fixed, and
+> each returned a clean zero rather than an error.**
+>
+> - `run_pipeline_census` passed `HostStaticAddrs::default()`. `pytypes` is the
+>   only channel carrying a class static's address, and `resolve_vtable_addr`
+>   declines without one — so the first run reported `0` about the harness's
+>   configuration, not about any constructor.
+> - `section1_cells` looked up `new_with_vtable` in the opname histogram, which
+>   spells the op `newwithvtable`. That cell read `0` for every portal, fused or
+>   not. It is the same dump-vs-insns-table split the file already prints both
+>   spellings for on `vtablemethodptr` — the second instance of one defect.
+>
+> ⚠ The corrected lookup does **not** overturn the §1 walker row: the walker
+> measures `88 / 0` under both spellings, because it has no allocation of this
+> shape to fuse. The blindness only ever mattered for a portal that fuses.
+>
+> ⛔ **One real wall in the new code, found by the same run.**
+> `runtime::error::RAISED` — the `thread_local!` holding the out-of-band error
+> slot — is not registered in `PyreCallRegistry`, so `raise`'s pyre-side lift
+> fails and it stays residual on every failing arm. `error.rs` already documents
+> the slot as thread-local "for now", belonging to the heap and moving there
+> with it; this measures what the placement costs. The orthodox destination is
+> the one §6.3 names — the slot on an execution context passed as an argument,
+> the shape `OperationError` has upstream — and it needs the context object,
+> so it is P6 work rather than a spelling change here.
 >
 > P5 is SEMVER MAJOR and §8 of the design of record requires M1–M8 to land on
 > one named pyre branch agreed with the user before P5 starts. **M1 itself is
