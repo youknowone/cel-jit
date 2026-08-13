@@ -19,6 +19,40 @@ Superseded again, 2026-08-09: `vm` is a default cargo feature, so
 and the walker is now reached as `Value::resolve` / `Value::resolve_value`, or
 through `Program::execute` under `--no-default-features`.
 
+> ⛔⛔ **THIS DOCUMENT IS NOT THE DESIGN OF RECORD. Read the `cel-unboxed-values`
+> skill first.** Noted 2026-08-13. That document plans the same epic in phases
+> P0–P9 with measured gates, and the two numbering schemes have to be lined up
+> before anything here is executed:
+>
+> | here | there | state |
+> |---|---|---|
+> | Step 1 (replace the walker) | P2 | **landed** |
+> | Step 2 / 2b (merge point, jitdriver spec) | **P8** | gated — see below |
+> | Step 3 / 3a / 3b (front-end B) | P4, P6–P8 | P4 landed; P6–P8 gated |
+> | Step 4 (demote the columnar path) | P9 | gated behind P8 |
+>
+> **The gate: the design of record says STOP AT P5 for the JIT half.** Its
+> economics measurement (task #88) puts a compiled cel artefact's fixed per-call
+> cost at 34–92 µs on both backends against a clean-VM CEL evaluation of
+> 43–130 ns, and sets an explicit re-entry criterion for P6–P8 — *fixed per-call
+> cost under ~1 µs on both backends*. **Steps 2b, 3b and 4 of this document all
+> sit past that stop**, so executing this document's plan in order walks straight
+> through a documented NO-GO. Do not read the 2a/3a work recorded below as
+> progress toward 2b; it is progress toward knowing the portal is not the problem.
+>
+> **What is actually next is P5** — the `Arc`-free, header-first `W_Root` class
+> family — and it is unlanded: none of `CelObject`, `CelClass`, `W_IntObject` or
+> `malloc_typed` exists under `cel/src`, and `Value` still carries
+> `Arc<String>` / `Arc<Vec<u8>>` / `Arc<dyn Opaque>` / `Arc<CelStruct>`.
+> The B2 number recorded under Step 3 below points at exactly this from a second
+> direction: the largest single rtyper prepass failure across cel's closure is
+> **`sync::Arc::deref`, 16 of 88** — the value universe's `Arc` itself. P5 is the
+> phase that deletes it.
+>
+> P5 is SEMVER MAJOR, depends on majit change **M1**, and §8 of the design of
+> record requires M1–M8 to land on one named pyre branch **agreed with the user
+> before P5 starts**. That agreement is a prerequisite, not a formality.
+
 ## The problem
 
 cel-jit currently has **two evaluators**:
