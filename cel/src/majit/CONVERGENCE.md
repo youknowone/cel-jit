@@ -1532,3 +1532,63 @@ Read `stock` first. A run whose `stock` is ~20% above the quiet floor is
 disturbed and its `majit` column describes a slower machine. Repeat until at
 least three runs agree on `stock`, then read the median — a single run is not
 quotable against a threshold this close.
+
+## The header is one word, and the census says the fuse survived it
+
+`CelObject` carried two class pointers — `ob_type` and a `w_class` every
+constructor set to the same address. The second existed for one reason:
+`resolve_vtable_addr` keeps a single vtable address to stand in for both header
+stores the fuse drops, and it verified that substitution by reading the
+`w_class` store back and comparing. A header with no such store resolved to
+`None`, compared unequal, and declined the cluster — every allocation residual,
+in silence.
+
+The word came back by widening the check rather than by re-spelling anything in
+cel. `header_declares_no_class_word` admits a header that *declares* no class
+word, requiring both that no `w_class` `FieldWrite` exists on the root and that
+the header struct's registered layout has no such field. A struct that declares
+the field and omits the store still declines: that shape is a subclass
+constructor taking its class from somewhere else, and re-synthesising it from
+the vtable would answer the base type. CEL has no subclassing — the type object
+of an instance of `T` is `T` — so cel takes the new arm and pays one word per
+value instead of two.
+
+`runtime::pyre_object` went with the field. It carried a name from another
+project so `get_instantiate_arg_addr` would match its three-segment path suffix;
+with no `w_class` store to read there is no caller, and a module kept only to be
+recognised by a check that no longer runs is a shape to remove, not to explain.
+
+### What was measured, and one probe that was not
+
+The four class-family portals, re-censused against a freshly extracted
+`cel.ullbc` (`window writes: 0`, 68 of 68 closure inputs):
+
+| portal | jitcodes | `new / newwithvtable` |
+|---|---|---|
+| `runtime::new_bytes` | 4 | 0 / 1 |
+| `runtime::new_string` | 4 | 0 / 1 |
+| `runtime::new_list` | 1 | 0 / 1 |
+| `runtime::optional` | 5 | 0 / 2 |
+
+Identical to the two-word readings. The fuse fires on the narrow header.
+
+⚠ **The first re-run measured nothing and exited 0.** `cargo test -p
+majit-translate --test test_cel_census` without `--release` reports `0 passed;
+13 ignored` — every probe carries a `debug_assertions` ignore. A green exit over
+an empty denominator is the shape this file keeps warning about; the numbers
+above are from the `--release` run.
+
+⛔ **`cel_census_pipeline_vm_eval` aborts on a stack overflow, and it has no
+baseline.** The census itself completes and prints its 29 jitcodes and its
+43-op vocabulary; the overflow lands afterwards, inside `jitcode.dump()` as
+`section1_cells` walks the results — `section1_cells` has no recursion of its
+own. `RUST_MIN_STACK` at 256 MB does not move it, so it is unbounded recursion
+rather than depth.
+
+It is **not** this change: the only reference to `runtime` from outside
+`cel/src/runtime/` is the `pub mod runtime;` declaration in `lib.rs`, so
+`cel::vm::eval`'s graph closure cannot reach the class family at all. But the
+absence of a baseline is worth stating rather than glossing — every earlier
+census run in this branch filtered to a subset (`7`, `10`, `12` filtered out),
+so this is the first run that executed the whole binary, and "pre-existing" here
+is an argument from reachability, not a measurement of the prior tree.
