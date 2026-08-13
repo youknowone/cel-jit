@@ -99,16 +99,30 @@ through `Program::execute` under `--no-default-features`.
 > measures `88 / 0` under both spellings, because it has no allocation of this
 > shape to fuse. The blindness only ever mattered for a portal that fuses.
 >
-> ⚠ **The optional leaf is landed but UNMEASURED by this table.** `W_OptionalObject`
-> joined the family after these counts were taken, and `CEL_OPTIONAL_CLASS` was
-> added to the census's address table in the same change — but re-running
-> `cel_add` still reports `1 / 5`, because nothing in `+` allocates an optional.
-> The address entry is there so a portal that reaches one resolves rather than
-> declining silently; it is **not** evidence that the optional constructors
-> fuse. That needs a portal whose closure contains `new_optional` /
-> `new_optional_none`, and this file has none yet. It is also the family's first
-> POINTER payload, so it is exactly the case least entitled to be assumed from
-> the five scalar ones.
+> ✅ **The optional leaf is now measured too, and it fuses.** It was landed
+> without a portal that reaches it — `cel_add` reports `1 / 5` either way,
+> because nothing in `+` allocates an optional — so the address-table entry for
+> `CEL_OPTIONAL_CLASS` only meant "a portal that reaches one will resolve rather
+> than decline silently". Measured 2026-08-13 at cel-jit `a67ffaa`, seeding at
+> `runtime::optional::cel_optional_of_non_zero_value`, whose closure holds BOTH
+> constructors (the zero arm allocates through `new_optional_none`, the other
+> through `new_optional`):
+>
+> | portal | jitcodes | `new` | `newwithvtable` | residual : inline |
+> |---|---|---|---|---|
+> | `optional::cel_optional_of_non_zero_value` | 5 | **0** | **2** | **0 : 4** |
+>
+> Two allocation sites, two fusions, nothing left over — and the same run reports
+> **zero residual calls**. The five jitcodes are the portal, `is_zero`, `w_type`
+> and the two constructors; `lltype::malloc_typed` and `pyobject::get_instantiate`
+> drop out exactly as they do under `cel_add`.
+>
+> This was the case least entitled to be assumed from the five scalar
+> constructors, because it is the family's first POINTER payload — and the insn
+> vocabulary shows that half landing as well: `setfield_gc_r/rrd` for the managed
+> write, `constrefnull` for the none case's literal. Both controls reproduce
+> unchanged in the same run (`cel_add` 1 / 5, `cel_less` 0 / 1), so the artefact
+> growing by a module did not move them.
 >
 > ⛔ **One real wall in the new code, found by the same run.**
 > `runtime::error::RAISED` — the `thread_local!` holding the out-of-band error
@@ -1015,6 +1029,55 @@ the call, and the fixed cost that stops it is not in the compiled code. It does
 fixed per-call cost at 34–92 µs, two orders above the ~583 ns floor seen here —
 so the two are agreeing in direction on different quantities, and neither
 number should be quoted for the other.
+
+### Replicated on the other backend, and the compiled tier's intercept
+
+Re-run 2026-08-13 after the rebase onto `origin/main` `c0508da5e32`, same
+harness, **different configuration: `--release --features jit-dynasm`**, where
+the run above is `--profile bench --features jit-cranelift`. Two things come out
+of it.
+
+**The structure replicates.** 12 of 28 compile, the 16 that do not print the
+tracing interpreter under the compiled heading, and the crossover sits between 10
+and 100 elements on all three ladders. ⚠ The count matches; whether it is the
+same 12 is not established, because the run above records only the count. The
+five rows both runs name individually do agree. What moves is the level: the
+non-compiling floor is **653–1471 ns** (median ~741) against cranelift's
+539.8–780.7 (median 583.0), and every compiled row is slower.
+
+| case | cranelift/bench ns | dynasm/release ns |
+|---|---|---|
+| `map_list_scaling/10000` | 11835.0 | 12065.0 |
+| `filter_list_scaling/10000` | 30671.2 | 48938.8 |
+| `comprehension_scaling/500` | 2970.8 | 4394.1 |
+| `map_list_scaling/100` | 1122.8 | 1390.9 |
+| `filter_list_scaling/10` | 1138.6 | 1452.4 |
+
+Backend and profile move together here, so this is not a backend delta — it is
+one configuration against another, and it is recorded that way.
+
+**The intercept is a different quantity from the floor, and it is the one the
+gate is stated in.** The 583 ns floor above is measured on rows that never
+compiled, so it describes the tracing interpreter. Fitting `majit ns` against N
+over the rows that DID compile isolates the compiled tier's own fixed per-call
+cost:
+
+| ladder | fit range | ns/row | intercept |
+|---|---|---|---|
+| `map_list_scaling` | 100–10000 | 1.078 | **1283 ns** |
+| `filter_list_scaling` | 100–1000 / 1000–10000 | 4.92 / 4.73 | **1412 / 1602 ns** |
+| `comprehension_scaling` | 100–500 | 6.105 | **1342 ns** |
+
+The first ladder's fit predicts its own held-out point to 0.5% (N=1000: 2361
+predicted, 2372.8 measured), and the three agree at **~1.3–1.6 µs**.
+
+⚠ **This is NOT a claim that the P6–P8 re-entry criterion is met.** That
+criterion — fixed per-call cost under ~1 µs on both backends — is stated against
+task #88's 34–92 µs, and whether #88 measures this intercept or something that
+also contains compile, publish or first-call cost has not been checked. A 26x
+gap is as easily two different quantities as one improved one; splitting them
+needs #88's harness, not arithmetic on this one. What is established here is the
+intercept itself, under one named configuration.
 
 ## The fixed cost: the driver and the program now outlive a batch
 
