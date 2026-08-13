@@ -1461,3 +1461,74 @@ backend takes it as a no-op.
 purpose**: the compiled tier today runs integer and float columns and constructs
 no cel object, so calling it would change three backend settings that nothing in
 that tier reads — and every per-call number on record was taken without them.
+
+## The gate, measured eight times, and the control that says which readings count
+
+Measured 2026-08-13 at cel-jit `c620b4a` / pyre `1e374f52038`, `--profile bench`,
+one binary per backend invoked directly so no rebuild sits between repeats.
+
+A single run cannot answer the STOP-AT-P5 re-entry criterion — "a compiled cel
+artifact's fixed per-call cost under ~1 µs on both backends" — because the
+threshold is 1 µs and the run-to-run spread on this machine reaches 300 ns. The
+first cranelift set said 1005.6 / 1511.8 / 1131.6 ns and a repeat of the **same
+binary** said 1243.7 / 1203.8 / 1119.8. Neither is wrong; one sample is not a
+measurement at this resolution.
+
+### The harness already prints its own noise control
+
+`stock ns` is `Value::resolve_value` — the tree walker, which no JIT change can
+touch. Across eight cranelift runs of one binary, `map_list_scaling/10`:
+
+| `stock` | `majit fixed` |
+|---|---|
+| 404.3 | 963.3 |
+| 414.9 | 957.1 |
+| 422.2 | 1005.6 |
+| 427.3 | 995.1 |
+| 482.8 | 1256.4 |
+| 493.9 | 1197.1 |
+| 498.9 | 1217.7 |
+| 592.0 | 1243.7 |
+
+The two groups do not overlap on either column, and the disturbance scales both
+by about the same factor (stock ×1.19, majit ×1.24). It is a machine-speed
+factor, not something about the tier — so a run whose `stock` sits well above the
+quiet floor is not a worse reading of the fixed cost, it is a reading of a
+different machine.
+
+⚠ The rule was derived from this data, not registered before it. It is a reading
+with its selection criterion stated, and it wants confirming on a fresh set
+before it is a rule. What makes it more than curve-fitting is that `stock` is
+*independent by construction*: the walker is the one column in the table that no
+change to the compiled tier can move.
+
+### On the quiet runs, both backends
+
+`majit fixed`, ns, every run whose `stock` sits at the quiet floor — four dynasm
+runs and the four quiet cranelift runs of eight:
+
+| ladder | dynasm | cranelift (quiet) |
+|---|---|---|
+| `map_list_scaling` | 912.4 / 905.6 / 990.6 / 917.6 | 963.3 / 995.1 |
+| `filter_list_scaling` | 1030.1 / 941.1 / 1045.5 / 984.4 | 962.1 / 1079.0 |
+| `comprehension_scaling` | 958.0 / 953.0 / 952.2 / 977.7 | 962.3 / 1031.4 |
+
+Eighteen cells, all between **906 and 1079 ns**, fourteen of them under 1 µs.
+`mid err` is 2.0–5.8% on dynasm and 1.8–7.6% on the quiet cranelift runs, and
+`ls fixed` agrees with `majit fixed` to within 3% on dynasm — so on a quiet
+machine the two estimators stop disagreeing, which is itself evidence that their
+earlier 23% gap was the machine and not the model.
+
+**Verdict: the criterion is met to within the measurement's own resolution, and
+not comfortably.** The fixed cost is ~1 µs on both backends, straddling the line
+the gate draws. Saying "under 1 µs" would be picking cells; saying "over" would
+be picking the other four. What is not in doubt is the distance travelled: #88's
+34–92 µs against ~1 µs is 34–70x, a conclusion no 300 ns spread can touch, and
+the break-even moved from thousands of elements to 62–111.
+
+### What to do with a future reading
+
+Read `stock` first. A run whose `stock` is ~20% above the quiet floor is
+disturbed and its `majit` column describes a slower machine. Repeat until at
+least three runs agree on `stock`, then read the median — a single run is not
+quotable against a threshold this close.
