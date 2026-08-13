@@ -849,16 +849,74 @@ compiled tier; 29/29 are answered`, `custom_function` declining with
 and the file's own doc comment saying "18 benchmark expressions", are both
 against a denominator this run does not have.
 
-**The lowering — the landed half of the epic — is the win here.** `clean`
-(the plain bytecode VM over the lowered program, no tracing machinery) against
-`stock` (the tree walker), over the 28 timed cases:
+⛔⛔ **CORRECTION, same day, before anything was built on it: "`clean` is the
+bytecode VM" — written here first and repeated to the user — NAMES THE WRONG
+MACHINE.** There are THREE evaluators in this tree and the documentation
+collapses two of them under "the bytecode VM":
+
+| | what it is | reached by |
+|---|---|---|
+| tree walker | `objects::Value::resolve_value` | `Value::resolve` / `resolve_value` |
+| **cel's VM** | `cel::vm::cel_eval_loop` | **`Program::execute`**, i.e. what a default-features caller gets |
+| **the batch machine** | `majit::bytecode::float_bank::clean_interp_seeded_f` | `BoundBatch::collect_on(Tier::Clean)` |
+
+The harness's `clean` column is the **third** of these — the `Tier::Clean` arm of
+`BoundBatch::collect_on`. It never enters `cel/src/vm/`. So the 22-of-28 result
+below is about the batch machine's interpreter tier, and the harness measures
+**cel's own VM nowhere at all**.
+
+**Measured directly, cel's VM LOSES to the walker at this unit.** Probe under
+the same bench profile, `Program::execute` vs `Value::resolve_value` on the same
+activations, reproduced independently after the first measurement:
+
+| case | walker ns | `Program::execute` ns | |
+|---|---|---|---|
+| `variable_access/hashmap` | 9.4 | 41.1 | **4.4x slower** |
+| `comparison` | 35.0 | 106.7 | 3.0x |
+| `all_comprehension` | 407.2 | 1291.6 | 3.2x |
+| `string_operations` | 177.5 | 373.3 | 2.1x |
+| `conditional` | 41.9 | 90.6 | 2.2x |
+| `simple_arithmetic` | 75.8 | 120.4 | 1.6x |
+
+And it is not a fixed cost that amortises: on a term ladder `cel::vm` fits
+**18.6 ns fixed + 45.6 ns/term**, i.e. the loss is PER-OP and grows with the
+expression. ⚠ So the claim "the landed half of the epic wins on speed" is
+**refuted for the per-call unit** — which is the second time this document has
+had to withdraw a speed argument made for a replacement evaluator (see the
+2026-08-07 note under Step 1). The batch machine wins; `Program::execute` does
+not.
+
+With that subject fixed, the batch machine's column against `stock` (the tree
+walker), over the 28 timed cases:
 
 * faster on **22 of 28**, up to `all_comprehension` 8.01x, `exists_comprehension`
   6.78x, `real_world_policy` 4.78x, `string_operations` 3.75x;
-* slower on 6, and one class is not marginal: `variable_access/hashmap` and
-  `variable_access/resolver` both run **0.11x** — the walker answers them in
-  ~5.4 ns and the VM takes ~50 ns. A bare variable read is where dispatch
-  overhead has nothing to amortise against.
+* slower on 6, of which `variable_access/hashmap` and `/resolver` at **0.11x**
+  looked like a variable-access defect and **is not one**. `clean` bottoms out
+  near ~46 ns for cases of wildly different work — a comprehension costs the
+  same as a bare variable read — because `collect_on` pays a FIXED per-execute
+  cost the walker does not: **three heap allocations**, censused with a counting
+  `#[global_allocator]` at exactly 3.00/call against `collect_raw_on`'s and the
+  bare interpreter's 1.00.
+  1. `clean_interp_seeded_f`'s prologue `init_regs.to_vec()` — it reallocates and
+     copies the WHOLE int register bank per execute (8 B/reg, measured exactly),
+     plus `vec![0.0f64; num_fregs]` when `num_fregs > 0`. `run_mainloop_f` opens
+     the same way, so the interpreter and JIT tiers pay it too.
+  2. `RawOutput::to_values` calls `intern(distinct)` **unconditionally**, in both
+     arms, though `decode` reads the result only in its `ValType::Str` arm and
+     `prepare_batch_reduce` leaves `distinct` empty for every non-string result.
+     An empty `Arc<[_]>` still allocates its 16-byte header — ⛔ **the comment
+     above the List arm's call asserts the opposite** ("an empty `Arc<[_]>` does
+     not allocate"), and it is false on this toolchain.
+  3. the `Vec<Value>` `collect_on` returns, which is its contract —
+     `collect_raw_on` exists to skip it and is printed as the `raw` column.
+
+  ⚠ The floor's magnitude is soft. A row-ladder intercept puts it at 42–46 ns,
+  but the same ladder reports the bare interpreter's intercept ABOVE
+  `collect_raw_on`'s, and the latter strictly contains the former — an ordering
+  violation that bounds systematic error at ≥6 ns. By the per-arm decomposition
+  `variable_access`'s fixed share is ~81%, not the ~100% the plateau suggests.
+  The DIRECTION and the allocation census are solid; the third digit is not.
 
 **The compiled tier does not engage at this unit.** Only **12 of 28** rows
 compiled at all; for the other 16 the `majit` column is the tracing interpreter
