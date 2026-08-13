@@ -38,6 +38,9 @@ pub mod functions;
 mod magic;
 pub mod objects;
 mod resolvers;
+/// The class-based value universe, under construction and not yet reachable
+/// from [`Value`]. See its module documentation before adding to it.
+pub mod runtime;
 pub mod vm;
 
 #[cfg(feature = "chrono")]
