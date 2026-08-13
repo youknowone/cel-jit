@@ -35,6 +35,8 @@
 //! Read [`object`] before adding a leaf: three separate conditions have to
 //! hold for an allocation to fuse, and all three fail silently.
 
+pub mod binop;
+pub mod error;
 pub mod lltype;
 pub mod object;
 pub mod pyre_object;

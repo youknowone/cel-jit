@@ -304,7 +304,10 @@ fn warm_break_even() {
     // at all -- which is why `compiles` is printed on the SAME row rather than
     // in a separate panel. A row with `compiles = 0` and no prior compile for
     // its shape contains no compiled code, whatever its timing says.
-    println!("      pooled driver: {} bytes moved per call, twice (out of DRIVERS and back)", pooled_driver_bytes());
+    println!(
+        "      pooled driver: {} bytes moved per call, twice (out of DRIVERS and back)",
+        pooled_driver_bytes()
+    );
     println!(
         "      rows    clean us      idle us       jit us   idle-clean    jit-idle  \
          jit/clean  gfails/call  cmp"

@@ -445,7 +445,10 @@ mod tests {
         unsafe {
             let int_type = new_type(&CEL_INT_CLASS);
             assert_eq!((*int_type).cls, &CEL_INT_CLASS as *const CelClass);
-            assert_eq!(w_type(int_type as CelRef), &CEL_TYPE_CLASS as *const CelClass);
+            assert_eq!(
+                w_type(int_type as CelRef),
+                &CEL_TYPE_CLASS as *const CelClass
+            );
 
             let string_stand_in = new_type(&CEL_BOOL_CLASS);
             assert_eq!(
