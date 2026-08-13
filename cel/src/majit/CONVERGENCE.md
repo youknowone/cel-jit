@@ -1079,6 +1079,66 @@ gap is as easily two different quantities as one improved one; splitting them
 needs #88's harness, not arithmetic on this one. What is established here is the
 intercept itself, under one named configuration.
 
+### RESOLVED, same day: it IS the same quantity, and the harness now says so
+
+The paragraph above was written before the check it asks for was run. It has
+been run. **#88's decomposition is now computed by the harness itself**
+(`majit_vs_cometkim_percall`, `decompose` / `print_decomposition`), reproducing
+#88's estimator — a two-point fit through each ladder's smallest and largest
+COMPILED member — rather than a better one, so the two figures stay comparable.
+Both backends, both under `--profile bench`, so the profile confound in the
+paragraph above is closed as well:
+
+| ladder | `majit fixed` #88, 2026-08-07 | measured 2026-08-13 | |
+|---|---|---|---|
+| dynasm / map | 51 537 ns | **978.4** | 52.7x |
+| dynasm / filter | 91 543 ns | **1 299.3** | 70.5x |
+| cranelift / map | 47 202 ns | **1 027.5** | 45.9x |
+| cranelift / filter | 34 494 ns | **1 007.8** | 34.2x |
+
+**The control that makes this a statement about the machine and not about the
+measurement is `clean /elem`**, in the same rows of the same runs: 15.03 → 14.57,
+21.12 → 22.78, 9.01 → 11.47, 14.42 → 21.01. The untraced interpreter's
+per-element cost is in the same band it was in on 2026-08-07, while the compiled
+tier's fixed term fell 34–70x. A changed instrument moves both.
+
+⚠ `clean fixed` is NOT a control and must not be read as one: it fell 1.5–2.2x
+(152/188/115/119 → 69.1/104.1/89.0/72.3), and that is *expected* — the two
+per-execute allocations removed above are exactly a fixed per-execute cost of
+the clean tier. It is the per-ELEMENT column that neither change could touch.
+
+⛔⛔ **The obvious reading of `gfails/call` is WRONG, and the tree already said
+so.** #88 named `gfails/call == 1.00` its prime suspect; today's runs read 0.00
+everywhere, which invites "the suspect was fixed". `examples/rca88.rs` refutes
+that in its own doc comment, dated the same day #88 was written: `price + qty * 2`
+reports `gfails/call == 0.00` and still has a 25x wall at n=10 on both backends,
+and the counter reads 0.00 at exactly the sizes where the wall is. **A 0.00 is
+the wall's own regime, not its absence** — so today's zeros are evidence for
+neither side. (The counter is live: `set_on_guard_failure` is registered in
+`new_driver_f`, which is what builds the pooled driver `run_jit_persistent_f`
+uses, and `COMPILES` — registered in the same block — reads 1 on the same rows.
+It is also a rate over 1000 settled calls, so a printed 0.00 bounds it at ≤4 per
+1000 calls rather than asserting an exact zero.)
+
+The cause that is actually in the tree is the portal's back-edge return —
+"return a back-edge FINISH from the portal instead of resuming at the back edge"
+— which cut compiled entries per call from 9 to 1, and is an ancestor of the
+benchmarked HEAD.
+
+**Against the re-entry criterion.** Six ladder×backend cells span
+**0.98–1.30 µs** against "under ~1 µs on both backends". That is at the line, not
+comfortably inside it — one cell (dynasm/map) is under. What is no longer true is
+the sentence the gate rests on: a fixed per-call cost "three orders of magnitude
+above a whole CEL evaluation" is now one order above a 24–46 ns predicate. The
+break-even the gate is really about moved from **3 483–5 047 elements to 53–91**.
+
+⚠ Read `mid err` before quoting any of these to four digits. The two-point fit
+passes through its endpoints by construction, and its worst error at an
+untouched ladder point is 1.7–9.7% on dynasm but **14.2–35.5% on cranelift** —
+the cranelift cost model is not linear over this range, so its `fixed` term is an
+extrapolation with a wide model error. The 34–70x conclusion survives that
+easily; a third significant figure does not.
+
 ## The fixed cost: the driver and the program now outlive a batch
 
 The break-even above was set entirely by trace + compile, and the arithmetic said
