@@ -1592,3 +1592,71 @@ absence of a baseline is worth stating rather than glossing — every earlier
 census run in this branch filtered to a subset (`7`, `10`, `12` filtered out),
 so this is the first run that executed the whole binary, and "pre-existing" here
 is an argument from reachability, not a measurement of the prior tree.
+
+## The heap, and the four routes that will not take a non-pyre element store
+
+`lltype::malloc_typed` was `Box::into_raw(Box::new(v))` and nothing freed it.
+It now allocates from `CelHeap` — one per thread, non-moving segments released
+at teardown. Two things are worth stating about that, because both are easy to
+read the wrong way round.
+
+**It is not a collector.** The root set §7 enumerates has no walker, so an
+allocation is reclaimed when its heap is torn down and not before. Against the
+`Arc`-based `Value` that is a loss of promptness; against `Box::into_raw` it is
+the difference between bounded and unbounded. Only the second comparison
+describes anything that runs today, because the class family is not reachable
+from `crate::Value`.
+
+**Two heaps would be two universes.** `install_cel_gc` turns on
+`set_new_via_gc`, after which a compiled `NewWithVtable` allocates from
+`MiniMarkGC`'s nursery while everything the interpreter builds comes from
+`CelHeap`. A collector walking either cannot see the other, and the symptom
+would be a freed live value, not a diagnostic. `install_cel_gc` has no caller,
+so the split is not live — it has to be closed before it gets one.
+
+### The reroute did not move the fuse, and that is measured rather than argued
+
+The claim was that `fuse_boxing_alloc` reads the *call* — the path's last two
+segments and the argument count — and never the callee body, so replacing
+`Box::into_raw` with a thread-local heap access could not matter. Re-censused
+against a freshly extracted `cel.ullbc` (`window writes: 0`, 69 of 69 closure
+inputs):
+
+| portal | jitcodes | `new / newwithvtable` |
+|---|---|---|
+| `runtime::new_list` | 1 | 0 / 1 |
+| `runtime::optional` | 5 | 0 / 2 |
+| `runtime::new_string` | 4 | 0 / 1 |
+| `runtime::new_bytes` | 4 | 0 / 1 |
+
+Every cell identical to the pre-heap reading. `4 passed` — the run had a real
+denominator, unlike the debug-profile run that reports `0 passed; 13 ignored`
+and exits 0.
+
+### M5's lowering half is blocked in majit-translate, not in cel
+
+The reference block cannot become a lowered element store, and the reason is not
+the block encoding. All four of the front end's reference-array-store routes are
+keyed on pyre identities (`majit-translate/src/front/mir.rs`):
+
+- `is_list_items_elem_ptr_add_parts` — cel's exact `*base.add(i) = v` shape, and
+  refused twice over: `is_pyobjectref_items_ptr` requires
+  `raw_ptr_pointee_class_root(..) == Some("PyObject")`, and
+  `regular_call_is_items_block_accessor` whole-path-matches
+  `pyre_object::object_array::items_block_items_base`.
+- `is_workspace_index_regular` — gates on `path.starts_with("pyre_")`.
+- `Lowering::is_object_array_set_ref_call` — whole path
+  `pyre_object::object_array::<Impl>::set_ref`.
+- `is_vec_index_regular` — needs a real `Vec<T>` receiver, which the block
+  encoding rules out.
+
+⚠ `graph_is_items_block_base_accessor` is crate-agnostic — a `::`-suffix match —
+and that makes it a **trap**: cel can pass it by renaming an accessor, and
+nothing changes, because the sibling conditions in the same gate still refuse.
+A change that only satisfies it would read as progress and buy none.
+
+What did land is the half that was self-contained: `register_cel_classes` now
+registers both payload blocks as varsize types from their tokens. The test that
+grades it forwards a leaf reachable only through a block slot during a real
+nursery collection, and flipping the block's has-pointers flag to false fails
+that assert — so it is not a vacuous green.
