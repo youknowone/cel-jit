@@ -99,15 +99,55 @@ through `Program::execute` under `--no-default-features`.
 > measures `88 / 0` under both spellings, because it has no allocation of this
 > shape to fuse. The blindness only ever mattered for a portal that fuses.
 >
+> ⚠ **The optional leaf is landed but UNMEASURED by this table.** `W_OptionalObject`
+> joined the family after these counts were taken, and `CEL_OPTIONAL_CLASS` was
+> added to the census's address table in the same change — but re-running
+> `cel_add` still reports `1 / 5`, because nothing in `+` allocates an optional.
+> The address entry is there so a portal that reaches one resolves rather than
+> declining silently; it is **not** evidence that the optional constructors
+> fuse. That needs a portal whose closure contains `new_optional` /
+> `new_optional_none`, and this file has none yet. It is also the family's first
+> POINTER payload, so it is exactly the case least entitled to be assumed from
+> the five scalar ones.
+>
 > ⛔ **One real wall in the new code, found by the same run.**
 > `runtime::error::RAISED` — the `thread_local!` holding the out-of-band error
 > slot — is not registered in `PyreCallRegistry`, so `raise`'s pyre-side lift
-> fails and it stays residual on every failing arm. `error.rs` already documents
-> the slot as thread-local "for now", belonging to the heap and moving there
-> with it; this measures what the placement costs. The orthodox destination is
-> the one §6.3 names — the slot on an execution context passed as an argument,
-> the shape `OperationError` has upstream — and it needs the context object,
-> so it is P6 work rather than a spelling change here.
+> fails. `error.rs` already documents the slot as thread-local "for now",
+> belonging to the heap and moving there with it; this measures what the
+> placement costs. The orthodox destination is the one §6.3 names — the slot on
+> an execution context passed as an argument, the shape `OperationError` has
+> upstream — and it needs the context object, so it is P6 work rather than a
+> spelling change here.
+>
+> ⛔⛔ **CORRECTION, 2026-08-13. This entry said the lift failure makes `raise`
+> "stay residual on every failing arm". Both halves are wrong, and the truth is
+> worse than the claim.** Re-measured by
+> `cel_census_pipeline_runtime_add` against a freshly extracted `cel.ullbc`
+> (`cargo test --release` — the census self-ignores under `debug_assertions`,
+> so a debug run reports `ok` with `0 passed; 1 ignored`).
+>
+> * **`raise` is NOT residual — it is a jitcode.** It is one of the 14 the
+>   portal emits (`cel::runtime::error::raise`), so it is reached and lowered
+>   like any other graph. Nothing could have made it residual: it carries no
+>   `#[dont_look_inside]`, which is the mechanism that would.
+> * **The failure is not quiet.** It surfaces as a `compute_at_fixpoint failed`
+>   panic out of the annotator, whose text names the cause exactly —
+>   `OpKind::Call::FunctionPath { segments: ["cel","runtime","error","RAISED"] }
+>   not registered in PyreCallRegistry`, recorded as a lazy failure during
+>   `populate_call_registry_from_call_graphs`. The census still completes
+>   afterwards (14 jitcodes, `residual_call* : inline_call*` = **14 : 19**), so
+>   the run is readable — but "a residual call on the cold path" describes
+>   neither the shape nor the severity of what happens.
+> * **It is not confined to a cold path.** `raise` is inlined into the FAST
+>   chain: `checked_int_arm!` puts a `raise(Overflow, …)` in the `None` arm of
+>   every checked op, so `w_int_add`, `w_uint_add` and `w_duration_add` each
+>   carry one, and all three are jitcodes here. The `+` closure reaches `raise`
+>   from five sites — those three, plus `timestamp_shift` and `cel_add_slow`.
+>
+> ⚠ What this run does NOT establish: it prints no rtyper Skip table, so any
+> count of Skips per portal is unmeasured here. Do not quote one from this
+> entry.
 >
 > P5 is SEMVER MAJOR and §8 of the design of record requires M1–M8 to land on
 > one named pyre branch agreed with the user before P5 starts. **M1 itself is
