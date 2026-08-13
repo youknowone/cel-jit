@@ -165,27 +165,40 @@ pub fn new_items_block(values: &[CelRef]) -> *mut CelItemsBlock {
         )
     } as *mut CelItemsBlock;
     // An index loop rather than `values.iter().enumerate()`, which is the
-    // spelling RPython's own array copies use. It is NOT why this function
-    // lowers or does not: the iterator chain was the first hypothesis for the
-    // census result below and re-censusing after this rewrite reports the same
-    // cells, so it is refuted. The loop stays because it is the orthodox
-    // spelling, not because it bought anything.
+    // spelling RPython's own array copies use.
     //
-    // ⛔ **This function does not lower, and the reason is the store, not the
-    // loop.** Seeded at `new_list`, the census emits ONE jitcode — the leaf
-    // constructor — and leaves this one as a residual call, while `new_bytes`
-    // and `new_string` carry `new_bytes_block`, `bytes_base` and `alloc_block`
-    // in as jitcodes. The difference is what the payload write IS: bytes are
-    // integers, references are not, and `base.add(i).write(*v)` is a raw store
-    // of a REFERENCE. There is no `raw_store_r` — `insns.rs` registers
-    // `raw_load_i`, `raw_load_f` and `raw_store_i` and nothing else — and
-    // upstream refuses the shape by name (`jtransform.py`,
-    // `raise Exception("setfield_raw_r not supported")`).
+    // ✅ **The store below lowers. The loop is what keeps this function out of
+    // `new_list`'s closure.** Those are separate facts and conflating them cost
+    // this comment a wrong answer once already. Seeded at `new_list`, the census
+    // emits ONE jitcode and leaves this one a `residual_call_r_r` — which reads
+    // like the store failing, and is not. Seeded AT this function instead
+    // (`cel_census_pipeline_runtime_new_items_block`) it emits three jitcodes
+    // and the vocabulary carries `setarrayitem_gc_r`: one `arraywrite`, one
+    // `arrayread`, two `arraylen`, which is exactly this loop body. The
+    // reference array store works.
     //
-    // The route out is `setarrayitem_gc_r`, through the front end's
+    // What refuses the function is `JitPolicy::look_inside_graph`'s
+    // `contains_loop`: a graph carrying a backedge is not admitted without an
+    // `unroll_safe` hint, so `find_all_graphs_bfs` never puts it in
+    // `candidate_graphs`, `graphs_from` answers `None`, and `guess_call_kind`
+    // returns `Residual`. Measured rather than inferred — in the ULLBC this
+    // function carries a backedge while `new_bytes_block`, `alloc_block`,
+    // `bytes_base` and `new_list` carry none, and those four are exactly the
+    // ones that lower. The portal-seeded census exists because a portal graph is
+    // admitted WITHOUT that check, which is the only way to see this body at
+    // all.
+    //
+    // ⛔ An earlier revision of this comment claimed the opposite — "the reason
+    // is the store, not the loop" — and cited a re-census after rewriting
+    // `values.iter().enumerate()` into this index loop as having refuted the
+    // loop hypothesis. **Both spellings carry a backedge.** That experiment
+    // could only ever compare spellings within the loopy class, so it was
+    // vacuous for the question it was cited as settling. A control that cannot
+    // produce the outcome it is meant to detect is not evidence for its absence.
+    //
+    // The store reaches `setarrayitem_gc_r` through the front end's
     // `is_list_items_elem_ptr_add_parts`. It has FIVE conditions and the store
-    // below is written to satisfy all five, because four of them are invisible
-    // in the diff:
+    // below satisfies all five, because four of them are invisible in the diff:
     //
     // 1. The callee is `<*mut T>::add` — hence `.add(i)` and not an
     //    `items[i]`-style index.
