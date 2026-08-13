@@ -59,7 +59,7 @@ use super::error::{raise, CelErrCode, ERROR_SENTINEL};
 use super::object::{
     new_bool, new_double, new_duration, new_int, new_timestamp, new_uint, CelClass, CelRef,
     CEL_BOOL_CLASS, CEL_DOUBLE_CLASS, CEL_DURATION_CLASS, CEL_INT_CLASS, CEL_NULL_CLASS,
-    CEL_TIMESTAMP_CLASS, CEL_TYPE_CLASS, CEL_UINT_CLASS,
+    CEL_OPTIONAL_CLASS, CEL_TIMESTAMP_CLASS, CEL_TYPE_CLASS, CEL_UINT_CLASS,
 };
 
 /// The class word of `w`, as the chains read it.
@@ -87,8 +87,8 @@ macro_rules! payload {
 }
 
 use super::object::{
-    W_BoolObject, W_DoubleObject, W_DurationObject, W_IntObject, W_TimestampObject, W_TypeObject,
-    W_UIntObject,
+    W_BoolObject, W_DoubleObject, W_DurationObject, W_IntObject, W_OptionalObject,
+    W_TimestampObject, W_TypeObject, W_UIntObject,
 };
 
 // -- the per-class arms ----------------------------------------------------
@@ -625,6 +625,32 @@ pub unsafe fn w_null_eq(_a: CelRef, _b: CelRef) -> bool {
     true
 }
 
+/// `optional == optional`: two absent values are equal, an absent and a present
+/// one are not, and two present ones defer to what they hold.
+///
+/// The absent test is `is_null` on the payload, not a pointer comparison
+/// against a canonical none. A none is *any* optional whose `w_value` is null —
+/// `new_optional_none` allocates a fresh one per call — so identity would
+/// answer `false` for two nones.
+///
+/// The present case recurses through [`values_equal`] rather than comparing the
+/// wrapped pointers, so `optional.of(1) == optional.of(1)` holds for two
+/// separately boxed `1`s, and so the numeric cross-class arms stay reachable
+/// through a wrapper.
+///
+/// # Safety
+///
+/// Both operands must be live `optional` values, and a present payload must be
+/// a live value.
+pub unsafe fn w_optional_eq(a: CelRef, b: CelRef) -> bool {
+    let va = payload!(a, W_OptionalObject, w_value);
+    let vb = payload!(b, W_OptionalObject, w_value);
+    if va.is_null() || vb.is_null() {
+        return va.is_null() && vb.is_null();
+    }
+    unsafe { values_equal(va, vb) }
+}
+
 // The cross-type numeric helpers. Three, not six: `==` is symmetric, and each
 // reversed ordering is the forward one under `cmp_reverse`.
 //
@@ -717,6 +743,7 @@ pub unsafe fn values_equal(a: CelRef, b: CelRef) -> bool {
             CEL_DURATION_CLASS => w_duration_eq,
             CEL_TIMESTAMP_CLASS => w_timestamp_eq,
             CEL_TYPE_CLASS => w_type_eq,
+            CEL_OPTIONAL_CLASS => w_optional_eq,
         );
     }
     values_equal_mixed(a, b, ta, tb)
@@ -932,7 +959,7 @@ mod tests {
     use super::*;
     use crate::objects::compare_values;
     use crate::runtime::error::{clear_error, take_error};
-    use crate::runtime::object::{new_null, new_type, w_type};
+    use crate::runtime::object::{new_null, new_optional, new_optional_none, new_type, w_type};
     use crate::{ExecutionError, Value};
 
     /// Every test starts with an empty channel, so a leaked error from an
@@ -1438,5 +1465,54 @@ mod tests {
             assert_eq!(cel_compare(utc, later), CMP_LESS);
         }
         assert!(!super::super::error::has_error());
+    }
+
+    /// Optionals: absence is a null payload, not an identity.
+    ///
+    /// Graded against stated expectations rather than `compare_values`, which
+    /// cannot reach this case: the walker spells an optional
+    /// `Value::Opaque(Arc<OptionalValue>)`, and `has_comparer` refuses an
+    /// opaque, so the oracle the other equality tests use answers nothing here.
+    #[test]
+    fn optionals_compare_by_presence_and_by_payload() {
+        fresh();
+        unsafe {
+            let none = new_optional_none() as CelRef;
+            let also_none = new_optional_none() as CelRef;
+            assert_ne!(none, also_none, "two allocations, not one interned none");
+            assert!(values_equal(none, also_none));
+
+            let one = new_optional(new_int(1) as CelRef) as CelRef;
+            let also_one = new_optional(new_int(1) as CelRef) as CelRef;
+            let two = new_optional(new_int(2) as CelRef) as CelRef;
+            assert!(
+                values_equal(one, also_one),
+                "equal by payload, not identity"
+            );
+            assert!(!values_equal(one, two));
+
+            // Absent and present are never equal, in either argument order.
+            assert!(!values_equal(none, one));
+            assert!(!values_equal(one, none));
+
+            // The payload recursion reaches the cross-class numeric arms, so a
+            // wrapper does not make `1 == 1u` stop holding.
+            let one_u = new_optional(new_uint(1) as CelRef) as CelRef;
+            assert!(values_equal(one, one_u));
+        }
+        assert!(!super::super::error::has_error());
+    }
+
+    /// An optional carries no ordering, like `null` and `type`: it is absent
+    /// from `cel_compare`'s chain, so the operators take the refusal.
+    #[test]
+    fn optionals_refuse_to_order() {
+        fresh();
+        unsafe {
+            let one = new_optional(new_int(1) as CelRef) as CelRef;
+            let two = new_optional(new_int(2) as CelRef) as CelRef;
+            assert_eq!(cel_less(one, two), ERROR_SENTINEL);
+        }
+        assert_eq!(take_error().unwrap().code, CelErrCode::NoSuchOverload);
     }
 }

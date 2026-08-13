@@ -72,6 +72,7 @@ pub enum CelKind {
     Timestamp = 5,
     Duration = 6,
     Type = 7,
+    Optional = 8,
 }
 
 /// One value class.
@@ -241,6 +242,46 @@ scalar_leaf! {
     /// Box `nanos` as a CEL `duration`.
     new_duration
     _immutable_fields_W_DurationObject
+}
+
+scalar_leaf! {
+    /// A CEL `optional`, holding the value it wraps or nothing.
+    ///
+    /// A NULL `w_value` is the none case. That spelling, rather than a
+    /// discriminant beside the payload, keeps the leaf one header plus one
+    /// word and keeps the none test a null check on a field that is read
+    /// anyway.
+    ///
+    /// The payload is the family's first MANAGED edge — every other leaf holds
+    /// a scalar. Nothing traces it yet, because nothing traces any of them:
+    /// [`CelClass`] carries no collector type id, and the offset list that
+    /// would name this field arrives with the registration mechanism that fills
+    /// it.
+    W_OptionalObject { w_value: CelRef }
+    CEL_OPTIONAL_CLASS = ("optional_type", CelKind::Optional)
+    /// Wrap `value` as a present CEL `optional`.
+    ///
+    /// The none case is [`new_optional_none`], not this function called with a
+    /// null: there the null is a literal inside the allocation body rather than
+    /// a value arriving as an argument.
+    new_optional
+    _immutable_fields_W_OptionalObject
+}
+
+/// Allocate the absent CEL `optional`.
+///
+/// Written out rather than delegating to [`new_optional`] so the null it stores
+/// is spelled at the allocation site. A fresh allocation per call, for the same
+/// reason [`new_null`] is: interning waits for an allocator that can mint
+/// immortal objects.
+pub fn new_optional_none() -> *mut W_OptionalObject {
+    lltype::malloc_typed(W_OptionalObject {
+        ob_header: CelObject {
+            ob_type: &CEL_OPTIONAL_CLASS,
+            w_class: get_instantiate(&CEL_OPTIONAL_CLASS),
+        },
+        w_value: core::ptr::null_mut(),
+    })
 }
 
 /// A CEL `null`.
