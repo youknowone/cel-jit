@@ -162,17 +162,63 @@ its subset.
 > of them exclusively: **the portal shape does not exist yet.** `cel_eval_loop`
 > is a free function but takes no `pc` and does not contain the loop; the loop is
 > `Vm::run` (a method, `pc` a local) and the opcode match is a third function,
-> `Vm::step`. `greens = [pc, code]` is unspellable against any current argument
-> list, and front-end B binds greens/reds **by parameter name**. Reshaping the
-> loop and its dispatch into one free function whose parameters are the greens
-> and reds is cel-only work that touches no majit code.
+> `Vm::step`.
+>
+> ⛔ **The reason given for 2a below was wrong, and 2a is not the refactor it
+> describes. Refuted 2026-08-13.** The claim was that "`greens = [pc, code]` is
+> unspellable against any current argument list, and front-end B binds
+> greens/reds **by parameter name**", so the loop and its dispatch had to be
+> reshaped into one free function whose parameters are the greens and reds.
+> Both clauses are false, and each is refuted by front-end B's own code:
+>
+> - **Binding is positional off the marker call, not by parameter name.**
+>   `jtransform`'s marker handler is a direct port of
+>   `num_green_args = len(jitdriver.greens); greens = args[1:1+num_green_args];
+>   reds = args[1+num_green_args:]` — the `greens: Vec<String>` in
+>   `JitDriverSpec` supplies the *count* (and the dotted `red.field` greenfield
+>   spelling), not a lookup key. `autodetect_jit_markers_redvars` finds the
+>   `jit_merge_point` in *any* block of the portal graph and slices its argument
+>   list; nothing consults the portal's signature.
+> - **The greens need not be parameters of anything.** pyre's own production
+>   portal — the one `generated.rs` configures with
+>   `greens = [next_instr, is_being_profiled, pycode]` — is
+>   `eval_loop_jit(frame: &mut PyFrame) -> LoopResult`. It takes **one**
+>   argument. `pycode` is a local (`let code = …pyframe_get_pycode(frame)`),
+>   `next_instr` is a loop local, and the single parameter is the *red*. cel's
+>   `Vm::run(&mut self)` is already that shape, with `&mut Vm` as the red.
+>
+> So no reshaping of the production evaluator is warranted on this basis, and
+> `Vm::run` can be the portal as it stands: the merge point needs `code` bound to
+> a local beside the existing `pc`, which is 2b's work, not a prerequisite to it.
+>
+> **What is genuinely open under the 2a heading is a different fault**, recorded
+> by `cel_census_pipeline_vm_run`: seeded at `vm::eval`, the closure contains
+> `cel_eval_loop`, `Vm::new` and `Vm::public_error` — everything `cel_eval_loop`
+> calls **except** `Vm::run` — so it holds nothing of the loop or the opcode
+> match, while seeding directly at `Vm::run` yields 95 jitcodes including
+> `Vm::step`. The portal is reachable as a *seed* and unreachable as a *callee*.
+>
+> Two causes were offered for that (the `vm.run()` method edge is not carried
+> across, or the prepass failures truncated discovery before it got there), and
+> `cel_census_vm_walls` separates them. `cel_eval_loop` lowers to 24 blocks
+> carrying **exactly two** method call sites, and it is the only non-test caller
+> of both: `vm.run()` and `vm.public_error(err)`. `public_error` reached the
+> `vm::eval` closure; `run` did not. A method call site therefore *does* carry
+> the closure across — the mechanism works, and the fault is specific to
+> `Vm::run` rather than to receiver calls as a class. **Reshaping the loop into a
+> free function is the wrong remedy for that**, because the remedy's whole
+> content would be to stop using a mechanism just shown to work.
+>
+> `<Impl>::run` and `<Impl>::step` both lower with zero walls in isolation, so
+> the surviving hypothesis is that `Vm::run` is discovered and then dropped by a
+> failure on it. Confirm that before spending anything on 2a.
 >
 > Read the plan as **2a → 3a → 2b → 3b → 4**:
 >
 > | | |
 > |---|---|
-> | **2a** | portal shape (cel only, no majit) |
-> | **3a** | front-end B ANALYSIS over `cel.ullbc` — already wired, corpus stale |
+> | **2a** | ~~portal shape (cel only, no majit)~~ — **dissolved**; see above. The reshape it named is not required, and what remains under the heading is the `Vm::run`-specific discovery fault, which is majit-side |
+> | **3a** | front-end B ANALYSIS over `cel.ullbc` — ~~corpus stale~~ refreshed and run; `cel::vm` lowers with zero walls |
 > | **2b** | the merge point + jitdriver spec — needs 3a's answers |
 > | **3b** | front-end B EXECUTION (guard_class, jitcodes) |
 > | **4** | demote the columnar path |
@@ -180,7 +226,9 @@ its subset.
 > 3a is reachable today: `majit-translate`'s pipeline already runs over
 > `cel-jit/build/llbc/cel.ullbc` in-process from its own cel census test, with
 > empty fnaddr bindings and default host statics. It needs no portal, which is
-> why it can size 2a instead of waiting on it.
+> why it can size 2a instead of waiting on it — and it did: running it first is
+> what produced both the B2 number above and 2a's refutation, at no cost to the
+> production evaluator.
 
 **Step 3 — move to front-end B.**
 Extract LLBC for the `cel` crate and drive it through `majit-translate` instead
@@ -208,6 +256,46 @@ the tracer now sees the real interpreter instead of a hand-written mirror.
 > hands cel the flat legacy walker rather than `guard_class`-quality typing, and
 > most of this step's payoff evaporates. Turn the flag into a number before
 > committing to the step.
+>
+> **The number, measured 2026-08-13 (B2).** `PYRE_RTYPER_VERBOSE=1` over
+> `cel_census_pipeline_vm_run`, i.e. the closure seeded at `vm::interp::Vm::run`:
+> **88 of 95 graphs take the legacy path**; 7 clear the two-phase gate. The
+> partition is exact — every skip carries the single reason
+> `two-phase: subject not annotated/rtyped in prepass`, and the prepass's own
+> `[PREPASS histogram]` reports 85 phase-A + 3 phase-B failures, so
+> 88 + 7 = 95 with nothing unaccounted. **The risk is confirmed as stated: today
+> front-end B would hand cel the flat legacy walker for 93% of its closure.**
+>
+> What the number does *not* say is that this is architectural. The prepass
+> classifies every failure itself; this is its own `[PREPASS histogram]`, summing
+> to 85 + 3:
+>
+> | count | phase | orthodox disposition |
+> |---|---|---|
+> | 64 | A | `FUNCPATH-OTHER` (registry / residual) |
+> | 12 | A | `CLASSDEF-LESS-FOREIGN` (foreign-type getattr) |
+> | 3 | A | `UNION-PAIR-PORT` |
+> | 2 | A | `RESIDUAL-CLOSURE` (`dont_look_inside`) |
+> | 2 | A | `UNCLASSIFIED` |
+> | 1 | A | `BLOCKED-BLOCK` |
+> | 1 | A | `METHOD-RESOLUTION` |
+> | 3 | B | `GETCLSFIELD` |
+>
+> Re-reading the same 85 messages by their *innermost* cause — the last
+> `not registered in PyreCallRegistry` in a nested chain, since an outer frame
+> only re-reports its callee's failure — splits that 64 further: 59 name a
+> specific unregistered host path and 7 are a contained `compute_at_fixpoint`
+> panic. Ranked by symbol, the head is **`sync::Arc::deref` at 16 of 88**, ahead
+> of `BTreeMap::get`, `core::clone::impls::<Impl>::clone`, `Into::into`,
+> `core::slice::<Impl>::get` and `::last_mut` at 3 each. `Arc` is how cel spells
+> every shared `Value` payload, so that one registration is the largest single
+> lever here, and the row as a whole is a registration backlog, not a design wall.
+>
+> The `CLASSDEF-LESS-FOREIGN` row is the opposite kind: a classdef-less
+> `getattr("__pos_0")` is enum/tuple payload access, which is precisely the
+> `Value` dispatch Step 3 exists to type. Those 12 are the ones that would still
+> be legacy-walked after all the registry work, and they are the honest measure of
+> how much of Step 3's payoff needs the codewriter leg rather than a registry entry.
 >
 > ⛔ And `build/llbc/cel.ullbc` on this box is STALE — written 2026-08-07,
 > against `cel/src/vm/*` last moved 2026-08-09, so it predates the `vm`-default
