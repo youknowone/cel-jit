@@ -1388,3 +1388,76 @@ ns/row: it had been calling `run_jit_seeded_f`, which builds a driver per call,
 so the flagship example had never measured the warm driver. `majit_ab` stays on
 the raw entry points on purpose — both of its panels measure the cold path, a
 fresh driver per run, which the API cannot express.
+
+## The value universe: variable-length leaves, and the collector knows the family
+
+Two slices landed 2026-08-13, both against the class family in
+`cel::runtime`. Neither is reachable from `crate::Value` yet — P5 is what moves
+an evaluator onto the family — so what follows is about the shapes, not about a
+number that moved.
+
+### The varsize tail is not available, and three separate things say so
+
+§3 of the design draws `W_BytesObject` and `W_ObjArray` as a header followed by
+a varsize payload. That encoding does not exist today, and the reasons are
+independent, so relaxing any one of them changes nothing:
+
+1. **The fuse cannot see it.** `fuse_boxing_alloc` matches an allocation call
+   taking exactly one argument — the finished value, by value. A type whose size
+   depends on `n` cannot be passed by value, so a varsize leaf would decline the
+   fuse and forfeit the entire reason the class family exists.
+2. **Upstream forbids it.** `lltype.py`'s `Array._note_inlined_into` raises on
+   inlining a GC array into a structure at all. RPython's own varsize list is a
+   `GcStruct` holding `("length", Signed)` and `("items", Ptr(GcArray(ITEM)))` —
+   a fixed wrapper and a separate array.
+3. **The codewriter cannot address it.** `OpKind::ArrayRead` / `ArrayWrite` /
+   `ArrayLen` carry `nolength: bool`, which spells a length offset of either
+   "absent" or "zero" and nothing else. A leaf carrying the class word at offset
+   0 needs its length word elsewhere, and no array op could then read it.
+
+The third is the one that would have been found last, and it is also the only
+one that is a today-limitation rather than a design invariant: everything below
+that layer already generalises — `get_array_descr` takes a `length_offset:
+usize`, and `JitFrame` registers a nonzero one through
+`varsize_with_custom_trace`. It is a wall until that one `bool` widens.
+
+So the three variable-length leaves — `W_BytesObject`, `W_StringObject`,
+`W_ListObject` — are fixed-size structs holding a live length and a pointer to a
+separately allocated block, which is RPython's own shape. The block carries its
+allocated **capacity** at offset 0, not its live length; the live length is on
+the owning leaf, as `("length", Signed)` is upstream.
+
+### The three registrations, and why one of them had no caller anywhere
+
+P6 is three registrations the compiler does not reconcile with each other:
+the collector's type table, the descr cache keyed on the same numeric id, and
+the driver settings that route a compiled `New` into the traced heap.
+
+**The first two are landed and tested with no pyre in the process.**
+`runtime::registration` drives both from one table — instance size, managed-edge
+offsets, payload fields per class — so the two cannot drift apart by editing one.
+The type ids come from `MiniMarkGC::register_type`, and `publish_cel_descrs`
+takes them rather than minting its own, with an equality assert: the two id
+namespaces are independent (`GcCache::alloc_type_id` against the GC's own
+`TypeRegistry`), and a mismatch is not a wrong answer at the store — it is a
+header word that indexes the wrong row of the type registry at collection time.
+
+⚠ **Only `W_OptionalObject::w_value` is registered as a managed edge**, and that
+is not an oversight. The header words and `W_TypeObject::cls` point at `'static`
+classes; the three payload-block pointers address blocks allocated outside the
+traced heap. Listing any of them would hand the collector an address to trace
+that no collection owns.
+
+**The third had a real blocker, and it was not where the design put it.**
+`set_new_via_gc` has existed as an inherent method on all three backends since it
+was added for aheui's nursery-backed nodes — and a repo-wide search finds **zero
+callers**. `MetaInterp::backend_mut` is private, so no consumer of `JitDriver`
+could reach it, while its siblings `set_gc_allocator` and `set_vtable_offset` are
+both forwarded. The fix is a four-line forwarder, now landed. Only dynasm acts on
+the flag; cranelift already routes `New` through an installed GC and the wasm
+backend takes it as a no-op.
+
+`install_cel_gc` does all three against one driver and **has no caller, on
+purpose**: the compiled tier today runs integer and float columns and constructs
+no cel object, so calling it would change three backend settings that nothing in
+that tier reads — and every per-call number on record was taken without them.
