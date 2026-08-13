@@ -39,4 +39,5 @@ pub mod binop;
 pub mod error;
 pub mod lltype;
 pub mod object;
+pub mod optional;
 pub mod pyre_object;

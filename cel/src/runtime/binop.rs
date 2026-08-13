@@ -72,19 +72,7 @@ unsafe fn class_of(w: CelRef) -> *const CelClass {
     (*w).ob_type
 }
 
-/// Read a payload field that follows the header.
-///
-/// The leaves are `#[repr(C)]` with the header first, so a `CelRef` known to
-/// be of class `T` casts to `*mut T` without adjustment.
-///
-/// Expands to a bare dereference, so every use site must already be an unsafe
-/// context — an `unsafe` block of its own would be redundant inside the
-/// `unsafe fn`s below and would warn.
-macro_rules! payload {
-    ($w:expr, $leaf:ty, $field:ident) => {
-        (*($w as *mut $leaf)).$field
-    };
-}
+use super::object::payload;
 
 use super::object::{
     W_BoolObject, W_DoubleObject, W_DurationObject, W_IntObject, W_OptionalObject,

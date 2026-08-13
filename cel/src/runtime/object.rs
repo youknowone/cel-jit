@@ -139,6 +139,22 @@ pub unsafe fn w_kind(w: CelRef) -> CelKind {
     unsafe { (*w_type(w)).kind }
 }
 
+/// Read a payload field that follows the header.
+///
+/// The leaves are `#[repr(C)]` with the header first, so a `CelRef` known to
+/// be of class `T` casts to `*mut T` without adjustment.
+///
+/// Expands to a bare dereference, so every use site must already be an unsafe
+/// context — an `unsafe` block of its own would be redundant inside the
+/// `unsafe fn`s that read a payload and would warn.
+macro_rules! payload {
+    ($w:expr, $leaf:ty, $field:ident) => {
+        (*($w as *mut $leaf)).$field
+    };
+}
+
+pub(crate) use payload;
+
 /// Declare a fixed-size leaf with one payload field.
 ///
 /// One macro rather than eight hand-written copies, because the constructor

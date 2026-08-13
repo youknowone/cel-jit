@@ -56,6 +56,12 @@ pub enum CelErrCode {
     UnsupportedBinaryOperator,
     /// No overload of the operator accepts this type.
     NoSuchOverload,
+    /// `value()` was called on an `optional` holding nothing.
+    ///
+    /// Distinct from [`Self::NoSuchOverload`], which is about the receiver's
+    /// type: here the receiver is the right type and the operation still has no
+    /// answer. The public spelling is `optional.none() dereference`.
+    NoneDereference,
 }
 
 /// A raised error: what happened, in which operator, to which operands.
