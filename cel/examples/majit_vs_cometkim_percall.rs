@@ -146,6 +146,13 @@ struct Case {
     /// Read the variable through [`RESOLVER`] instead of the context map, which
     /// is what his `variable_access/resolver` measures.
     stock_resolver: bool,
+    /// `(ladder, n)` for a size-ladder member, `None` otherwise.
+    ///
+    /// Carried as data rather than parsed back out of `label`: the decomposition
+    /// below is the number the P5 gate is stated in, and deriving its input by
+    /// splitting a display string would make a renamed case silently drop out of
+    /// the fit instead of failing.
+    ladder: Option<(&'static str, i64)>,
 }
 
 impl Case {
@@ -157,7 +164,13 @@ impl Case {
             cols: Vec::new(),
             stock: Box::new(|_| {}),
             stock_resolver: false,
+            ladder: None,
         }
+    }
+
+    fn in_ladder(mut self, ladder: &'static str, n: i64) -> Case {
+        self.ladder = Some((ladder, n));
+        self
     }
 
     fn col(mut self, name: &str, ty: ValType, path_suffix: &str, col: Col) -> Case {
@@ -263,15 +276,17 @@ fn cases() -> Vec<Case> {
         Case::new("exists_comprehension", "[1, 2, 3, 4, 5].exists(x, x == 3)"),
     ];
 
-    let ladder = |label: &str, src: &str, name: &'static str, elems: Vec<i64>| {
+    let ladder = |ladder: &'static str, n: i64, src: &str, name: &'static str, elems: Vec<i64>| {
         let stock = elems.clone();
-        Case::new(label, src)
+        Case::new(&format!("{ladder}/{n}"), src)
             .int_list(name, elems)
             .stock(move |ctx| ctx.add_variable_from_value(name, stock.clone()))
+            .in_ladder(ladder, n)
     };
     for size in [1i64, 10, 100, 1_000, 10_000] {
         cases.push(ladder(
-            &format!("map_list_scaling/{size}"),
+            "map_list_scaling",
+            size,
             "list.map(x, x * 2)",
             "list",
             (0..size).collect(),
@@ -279,7 +294,8 @@ fn cases() -> Vec<Case> {
     }
     for size in [1i64, 10, 100, 1_000, 10_000] {
         cases.push(ladder(
-            &format!("filter_list_scaling/{size}"),
+            "filter_list_scaling",
+            size,
             "list.filter(x, x % 2 == 0)",
             "list",
             (0..size).collect(),
@@ -287,7 +303,8 @@ fn cases() -> Vec<Case> {
     }
     for size in [10i64, 50, 100, 500] {
         cases.push(ladder(
-            &format!("comprehension_scaling/{size}"),
+            "comprehension_scaling",
+            size,
             "items.filter(x, x % 2 == 0).map(x, x * 2)",
             "items",
             (1..=size).collect(),
@@ -413,6 +430,9 @@ struct Compiled {
 
 struct Row {
     label: String,
+    /// `(ladder, n)`, copied from the case so the decomposition below has its
+    /// input as data.
+    ladder: Option<(&'static str, i64)>,
     stock: f64,
     /// `Err` when the expression does not lower: the tree-walker answers it —
     /// through the library's own fallback, not a hand-written one — and there is
@@ -471,6 +491,7 @@ fn run_case(case: &Case) -> Row {
         Err(e) => {
             return Row {
                 label: case.label.clone(),
+                ladder: case.ladder,
                 stock,
                 compiled: Err(format!("declines: {e}")),
             }
@@ -484,6 +505,7 @@ fn run_case(case: &Case) -> Row {
         Err(e) => {
             return Row {
                 label: case.label.clone(),
+                ladder: case.ladder,
                 stock,
                 compiled: Err(format!("cannot bind: {e}")),
             }
@@ -544,6 +566,7 @@ fn run_case(case: &Case) -> Row {
 
     Row {
         label: case.label.clone(),
+        ladder: case.ladder,
         stock,
         compiled: Ok(Compiled {
             clean,
@@ -561,6 +584,196 @@ fn warm(bound: &BoundBatch<'_, '_>) {
     for _ in 0..256 {
         black_box(bound.collect_on(Tier::Jit).expect("warm run"));
     }
+}
+
+/// A cost model `fixed + per_elem * n`, fitted through two points.
+struct Fit {
+    fixed: f64,
+    per_elem: f64,
+}
+
+impl Fit {
+    /// Through `(n_lo, t_lo)` and `(n_hi, t_hi)`.
+    ///
+    /// Two points, not a least-squares line over all of them, because that is
+    /// what task #88's table was computed with and reproducing its METHOD is the
+    /// point — a different estimator would make the two figures incomparable for
+    /// a reason that has nothing to do with the machine. The fit therefore
+    /// passes through its endpoints by construction, so it is not evidence of
+    /// linearity; `worst_mid_err` below is what tests that.
+    fn two_point(lo: (f64, f64), hi: (f64, f64)) -> Fit {
+        let per_elem = (hi.1 - lo.1) / (hi.0 - lo.0);
+        Fit {
+            fixed: lo.1 - lo.0 * per_elem,
+            per_elem,
+        }
+    }
+
+    fn at(&self, n: f64) -> f64 {
+        self.fixed + self.per_elem * n
+    }
+}
+
+/// One ladder's decomposition.
+struct Decomposition {
+    ladder: &'static str,
+    /// The two `n` the fit was taken through, and how many compiled points the
+    /// ladder had in total.
+    n_lo: i64,
+    n_hi: i64,
+    points: usize,
+    /// Ladder members whose loop never compiled, and which are therefore NOT in
+    /// the fit: their `majit` cell is the tracing interpreter, so including one
+    /// would fit a different machine.
+    excluded: usize,
+    majit: Fit,
+    clean: Fit,
+    /// Worst relative error of the majit fit at a point it did NOT pass through,
+    /// or `None` when the ladder has only the two endpoints.
+    worst_mid_err: Option<f64>,
+    /// The largest `gfails/call` over the compiled members. Printed beside the
+    /// fit because a fixed cost and a per-call guard failure are the same
+    /// finding read two ways, and #88's own tripwire is that a compile count
+    /// must never be reported without it.
+    max_gfails: f64,
+}
+
+/// Task #88's two-point decomposition over the size ladders, computed here
+/// rather than by hand off the table above.
+///
+/// The gate this epic is under — "a compiled cel artifact's fixed per-call cost
+/// under ~1 µs on both backends" — is stated in the `majit fixed` column, and
+/// that column has until now been arithmetic somebody did in a notebook. A
+/// number that decides a phase should be produced by the program that measures
+/// it.
+fn decompose(rows: &[Row]) -> Vec<Decomposition> {
+    let mut ladders: Vec<&'static str> = Vec::new();
+    for r in rows {
+        if let Some((name, _)) = r.ladder {
+            if !ladders.contains(&name) {
+                ladders.push(name);
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    for name in ladders {
+        let mut pts: Vec<(f64, &Compiled)> = Vec::new();
+        let mut excluded = 0usize;
+        for r in rows {
+            let Some((ladder, n)) = r.ladder else {
+                continue;
+            };
+            if ladder != name {
+                continue;
+            }
+            match &r.compiled {
+                Ok(c) if c.compiles > 0 => pts.push((n as f64, c)),
+                _ => excluded += 1,
+            }
+        }
+        if pts.len() < 2 {
+            continue;
+        }
+        pts.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let (lo, hi) = (&pts[0], &pts[pts.len() - 1]);
+
+        let majit = Fit::two_point((lo.0, lo.1.majit), (hi.0, hi.1.majit));
+        let clean = Fit::two_point((lo.0, lo.1.clean), (hi.0, hi.1.clean));
+
+        let worst_mid_err = pts[1..pts.len() - 1]
+            .iter()
+            .map(|(n, c)| ((majit.at(*n) - c.majit) / c.majit).abs())
+            .fold(None::<f64>, |acc, e| Some(acc.map_or(e, |a: f64| a.max(e))));
+
+        out.push(Decomposition {
+            ladder: name,
+            n_lo: lo.0 as i64,
+            n_hi: hi.0 as i64,
+            points: pts.len(),
+            excluded,
+            max_gfails: pts.iter().map(|(_, c)| c.guard_fails).fold(0.0, f64::max),
+            majit,
+            clean,
+            worst_mid_err,
+        });
+    }
+    out
+}
+
+/// `n` where the compiled tier's cost model crosses the clean VM's.
+///
+/// `None` when the compiled tier is not cheaper per element, in which case it
+/// never catches up and there is no crossing to report — a state the table has
+/// to be able to print, because #88 measured a NEGATIVE per-element cost once
+/// (`cranelift/map`, −0.32 ns) and a sign flip there is a real outcome.
+fn break_even(d: &Decomposition) -> Option<f64> {
+    let gain = d.clean.per_elem - d.majit.per_elem;
+    (gain > 0.0).then(|| (d.majit.fixed - d.clean.fixed) / gain)
+}
+
+fn print_decomposition(rows: &[Row]) {
+    let table = decompose(rows);
+    if table.is_empty() {
+        return;
+    }
+    println!(
+        "\ntask #88's two-point decomposition, computed here rather than by hand.\n\
+         `majit fixed` is the column the STOP-AT-P5 gate is stated in: its re-entry\n\
+         criterion is a compiled artifact's fixed per-call cost under ~1 us."
+    );
+    println!(
+        "\n{:<22} {:>7} {:>13} {:>12} {:>11} {:>12} {:>11} {:>11} {:>9} {:>12}",
+        "ladder",
+        "points",
+        "fit through n",
+        "majit fixed",
+        "majit/elem",
+        "clean fixed",
+        "clean/elem",
+        "break-even",
+        "mid err",
+        "gfails/call"
+    );
+    for d in &table {
+        let be = match break_even(d) {
+            Some(n) => format!("{n:>11.0}"),
+            // The compiled tier is not cheaper per element on this ladder, so it
+            // never overtakes. Printed rather than left blank.
+            None => format!("{:>11}", "never"),
+        };
+        let mid = match d.worst_mid_err {
+            Some(e) => format!("{:>8.1}%", e * 100.0),
+            None => format!("{:>9}", "-"),
+        };
+        println!(
+            "{:<22} {:>7} {:>6}..{:<6} {:>12.1} {:>11.3} {:>12.1} {:>11.3} {be} {mid} {:>12.2}",
+            d.ladder,
+            d.points,
+            d.n_lo,
+            d.n_hi,
+            d.majit.fixed,
+            d.majit.per_elem,
+            d.clean.fixed,
+            d.clean.per_elem,
+            d.max_gfails,
+        );
+    }
+    let excluded: usize = table.iter().map(|d| d.excluded).sum();
+    println!(
+        "\nRead it with three cautions.\n\
+         * The fit passes through its two endpoints BY CONSTRUCTION, so it cannot\n\
+           disagree with them. `mid err` is the whole test of the model: it is the\n\
+           worst relative error at a ladder point the fit did not touch, and a\n\
+           `-` means the ladder had no such point and the row is unchecked.\n\
+         * {excluded} ladder member(s) are excluded because their loop never\n\
+           compiled. Their `majit` cell is the tracing interpreter, and fitting it\n\
+           would decompose a different machine.\n\
+         * `gfails/call` belongs beside `majit fixed`, not in a separate table:\n\
+           #88 found 1.00 guard failure per call on every compiled case and named\n\
+           it the prime suspect for the fixed cost it measured. A fixed cost read\n\
+           without it is half a finding."
+    );
 }
 
 fn main() {
@@ -588,6 +801,10 @@ fn main() {
     let mut declined = Vec::new();
     let mut lowered = 0usize;
     let mut never_compiled = Vec::new();
+    // Retained, not just printed: the decomposition below needs every ladder
+    // member's cells at once, and re-running a case to get them back would time
+    // a second, differently-warmed process state.
+    let mut rows = Vec::with_capacity(cases.len());
     for case in &cases {
         let r = run_case(case);
         match &r.compiled {
@@ -621,6 +838,7 @@ fn main() {
                 declined.push((r.label.clone(), why.clone()));
             }
         }
+        rows.push(r);
     }
 
     println!(
@@ -657,4 +875,5 @@ fn main() {
          is that encoding timed on its own — it is MORE than name resolution, so adding it back\n\
          is a pessimistic bound on the difference, not an estimate of it."
     );
+    print_decomposition(&rows);
 }
