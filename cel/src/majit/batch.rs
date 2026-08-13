@@ -1086,8 +1086,12 @@ impl RawOutput<'_> {
                 values,
                 distinct,
             } => {
-                let interned = intern(distinct);
-                values.iter().map(|&v| decode(*ty, v, &interned)).collect()
+                // Built only when something will read it: `decode` consults the
+                // table in its `Str` arm alone. See [`intern`] for why building
+                // it unconditionally was not free.
+                let interned = matches!(*ty, ValType::Str).then(|| intern(distinct));
+                let interned = interned.as_deref().unwrap_or(&[]);
+                values.iter().map(|&v| decode(*ty, v, interned)).collect()
             }
             RawOutput::List {
                 lens,
@@ -1096,10 +1100,15 @@ impl RawOutput<'_> {
             } => {
                 let mut at = 0usize;
                 let mut rows = Vec::with_capacity(lens.len());
-                // The distinct strings are interned once for the whole output.
-                // Free when the output has none: an empty `Arc<[_]>` does not
-                // allocate, and no arm below reads it.
-                let interned = intern(distinct);
+                // The distinct strings are interned once for the whole output,
+                // and only when a field will read them — `column_of` consults
+                // the table in its `Str` arm alone. It is NOT free when the
+                // output has none: see [`intern`].
+                let interned = fields
+                    .iter()
+                    .any(|(_, ty, _)| matches!(*ty, ValType::Str))
+                    .then(|| intern(distinct));
+                let interned = interned.as_ref();
                 // The field shape is a property of the output, not of a row or
                 // an element, so it is decided once here. Matching it inside
                 // the element loop re-dispatched it per element.
@@ -1111,7 +1120,7 @@ impl RawOutput<'_> {
                     // write, where boxing cost two allocations plus a 24-byte
                     // `Value` per element.
                     [(None, ty, buf)] => {
-                        let column = Arc::new(ListStorage::Column(column_of(*ty, buf, &interned)));
+                        let column = Arc::new(ListStorage::Column(column_of(*ty, buf, interned)));
                         for &count in *lens {
                             // `ListRef::window` carries the bound check: the
                             // boxed arm sliced the buffer and so failed on a
@@ -1138,7 +1147,7 @@ impl RawOutput<'_> {
                             .collect();
                         let columns = fields
                             .iter()
-                            .map(|(_, ty, buf)| column_of(*ty, buf, &interned))
+                            .map(|(_, ty, buf)| column_of(*ty, buf, interned))
                             .collect();
                         let schema = Arc::new(ListStorage::Record(Arc::new(RecordSchema::new(
                             keys, columns,
@@ -1161,7 +1170,10 @@ impl RawOutput<'_> {
 /// the whole output rather than once per element.
 /// The column a bank becomes. Every [`ValType`] has an unboxed form, so this
 /// is total and a new bank cannot quietly fall back to boxing.
-fn column_of(bank: ValType, words: &[i64], interned: &Arc<[Arc<String>]>) -> ValueColumn {
+/// `interned` is `None` when no field of the output is a `Str`, which is the
+/// only arm that reads it — its caller decides that once for the whole output
+/// rather than building a table every arm but one ignores.
+fn column_of(bank: ValType, words: &[i64], interned: Option<&Arc<[Arc<String>]>>) -> ValueColumn {
     let bank = match bank {
         ValType::Int => ScalarBank::Int,
         ValType::UInt => ScalarBank::UInt,
@@ -1170,10 +1182,13 @@ fn column_of(bank: ValType, words: &[i64], interned: &Arc<[Arc<String>]>) -> Val
         ValType::Timestamp => ScalarBank::Timestamp,
         ValType::Duration => ScalarBank::Duration,
         ValType::Str => {
+            // Reachable only through the predicate that built the table, so a
+            // `None` here is that predicate and this arm having disagreed.
+            let interned = interned.expect("a Str field is what makes the intern table needed");
             return ValueColumn::Str(Arc::new(StrBank::new(
                 Arc::from(words),
                 Arc::clone(interned),
-            )))
+            )));
         }
     };
     ValueColumn::Scalar {
@@ -1185,6 +1200,15 @@ fn column_of(bank: ValType, words: &[i64], interned: &Arc<[Arc<String>]>) -> Val
 /// The batch's distinct strings, interned once per output. A `Value::String`
 /// is then a reference count rather than a fresh `String` and `Arc` per value,
 /// which is what the rank encoding exists to make possible.
+///
+/// Both callers gate this on a `Str` actually being present, because it is NOT
+/// free on an empty `distinct`: collecting into an `Arc<[_]>` allocates the
+/// 16-byte `ArcInner` header whatever the length, and `prepare_batch_reduce`
+/// leaves `distinct` empty for every result that is not a string. Ungated it
+/// was one of three heap allocations on every `collect_on`, spent on output
+/// nothing reads — measured at ~12 ns of a ~46 ns fixed per-call cost. A
+/// comment here previously asserted the opposite, that an empty `Arc<[_]>`
+/// does not allocate; a counting `#[global_allocator]` says it does.
 fn intern(distinct: &[String]) -> Arc<[Arc<String>]> {
     distinct.iter().map(|s| Arc::new(s.clone())).collect()
 }
@@ -1703,6 +1727,39 @@ mod tests {
                 Arc::ptr_eq(&first, &second),
                 "{tier:?}: two equal strings are not the same interned Arc"
             );
+        }
+    }
+
+    /// A SCALAR string result, which is the arm that decides whether the
+    /// interned table gets built at all.
+    ///
+    /// `to_values` builds the table only when the output will read it, and for
+    /// a scalar output that decision is `ty == ValType::Str` alone. If the gate
+    /// and `decode`'s `Str` arm ever disagree, `decode` indexes an empty table
+    /// — so this pins the one shape where skipping the build would be wrong,
+    /// alongside the two list tests that pin the other arm. Distinct strings
+    /// per row, so a row reading the wrong rank cannot pass by coincidence.
+    #[test]
+    fn a_scalar_string_result_still_reads_its_interned_table() {
+        let s = schema(&[("name", ValType::Str)]);
+        let names: Vec<String> = ["ada", "grace", "ada"]
+            .iter()
+            .map(|t| t.to_string())
+            .collect();
+        let expect: Vec<Value> = ["ada!", "grace!", "ada!"]
+            .iter()
+            .map(|t| Value::String(Arc::new(t.to_string())))
+            .collect();
+
+        let program = BatchProgram::compile("name + \"!\"", &s).unwrap();
+        for tier in [Tier::Clean, Tier::Interpreter, Tier::Jit] {
+            let batch = Batch::new(names.len()).column("name", ColumnRef::Str(&names));
+            let rows = program
+                .bind_per_row(&batch)
+                .unwrap()
+                .collect_on(tier)
+                .unwrap();
+            assert_eq!(rows, expect, "{tier:?}");
         }
     }
 
