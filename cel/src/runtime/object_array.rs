@@ -156,12 +156,29 @@ pub fn new_items_block(values: &[CelRef]) -> *mut CelItemsBlock {
             values.len(),
         )
     } as *mut CelItemsBlock;
-    // An index loop, not `values.iter().enumerate()`. The iterator spelling is
-    // what the first census of this function measured, and it cost the whole
-    // graph: `new_bytes_block` next door lowered and became a jitcode while this
-    // one declined and survived as a residual call, the only difference between
-    // them being the adapter chain. RPython has no iterator adapters either —
-    // its own array copies are index loops.
+    // An index loop rather than `values.iter().enumerate()`, which is the
+    // spelling RPython's own array copies use. It is NOT why this function
+    // lowers or does not: the iterator chain was the first hypothesis for the
+    // census result below and re-censusing after this rewrite reports the same
+    // cells, so it is refuted. The loop stays because it is the orthodox
+    // spelling, not because it bought anything.
+    //
+    // ⛔ **This function does not lower, and the reason is the store, not the
+    // loop.** Seeded at `new_list`, the census emits ONE jitcode — the leaf
+    // constructor — and leaves this one as a residual call, while `new_bytes`
+    // and `new_string` carry `new_bytes_block`, `bytes_base` and `alloc_block`
+    // in as jitcodes. The difference is what the payload write IS: bytes are
+    // integers, references are not, and `base.add(i).write(*v)` is a raw store
+    // of a REFERENCE. There is no `raw_store_r` — `insns.rs` registers
+    // `raw_load_i`, `raw_load_f` and `raw_store_i` and nothing else — and
+    // upstream refuses the shape by name (`jtransform.py`,
+    // `raise Exception("setfield_raw_r not supported")`).
+    //
+    // So the fix is not a loop spelling. The block has to become a REGISTERED
+    // GC array addressed by `getarrayitem_gc_r` / `setarrayitem_gc_r`, which is
+    // what pyre does for the identical structure and what
+    // [`CEL_ITEMS_BLOCK_TOKEN`] exists to be handed to. Until then this call is
+    // a wall, and it is a wall only for the reference block.
     unsafe {
         let base = items_base(block);
         let mut i = 0;
