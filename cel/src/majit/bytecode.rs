@@ -409,6 +409,13 @@ pub struct BatchRun<'a> {
     /// own string literals, which live in the lowering, and a decode table that
     /// borrowed from both would tie the run's lifetime to the program's.
     distinct: Vec<String>,
+    /// Scratch register banks, kept here so a batch run repeatedly does not
+    /// re-allocate them. Only the clean tier reads them: the tracing tiers go
+    /// through [`float_bank::run_mainloop_f`], whose banks are built inside the
+    /// traced portal and cannot be handed in without adding a parameter to it —
+    /// and its greens bind by position, so a new parameter is not a local
+    /// change.
+    banks: float_bank::Banks,
     columns: core::marker::PhantomData<&'a ()>,
 }
 
@@ -419,9 +426,13 @@ impl<'a> BatchRun<'a> {
     /// The program reaches `run` as the `Arc` this batch holds, not as a slice:
     /// a tier that files a compiled loop under its address has to be able to
     /// hold the words, and only the owning handle lets it.
+    ///
+    /// The banks come through as a fourth argument rather than being built by
+    /// the tier, so a tier that can take them — the clean one — allocates
+    /// nothing per run. A tier that cannot is free to ignore them.
     pub fn run(
         &mut self,
-        run: impl FnOnce(&std::sync::Arc<Code>, &[i64], usize) -> i64,
+        run: impl FnOnce(&std::sync::Arc<Code>, &[i64], usize, &mut float_bank::Banks) -> i64,
     ) -> Option<i64> {
         // A zero-row batch reduces to the accumulator's initial value without
         // entering the loop, and its column bases point at nothing.
@@ -429,7 +440,12 @@ impl<'a> BatchRun<'a> {
             return Some(0);
         }
         *self.trap = 0;
-        let result = run(&self.code, &self.init_regs, self.num_float_regs);
+        let result = run(
+            &self.code,
+            &self.init_regs,
+            self.num_float_regs,
+            &mut self.banks,
+        );
         if *self.trap != 0 {
             return None;
         }
@@ -660,6 +676,7 @@ pub fn prepare_batch_reduce<'a>(
         out,
         list_out,
         distinct,
+        banks: float_bank::Banks::default(),
         columns: core::marker::PhantomData,
     }
 }
@@ -670,7 +687,7 @@ fn batch_sum_with(
     columns: &[Column],
     n: usize,
     what: &str,
-    run: impl FnOnce(&std::sync::Arc<Code>, &[i64], usize) -> i64,
+    run: impl FnOnce(&std::sync::Arc<Code>, &[i64], usize, &mut float_bank::Banks) -> i64,
 ) -> Option<i64> {
     prepare_batch(lowered, columns, n, what).run(run)
 }
@@ -699,9 +716,13 @@ pub fn eval_batch_sum_f(
     n: usize,
     threshold: u32,
 ) -> Option<i64> {
-    batch_sum_with(lowered, columns, n, "eval_batch_sum_f", |prog, regs, nf| {
-        float_bank::run_jit_persistent_f(prog, regs, nf, threshold)
-    })
+    batch_sum_with(
+        lowered,
+        columns,
+        n,
+        "eval_batch_sum_f",
+        |prog, regs, nf, _| float_bank::run_jit_persistent_f(prog, regs, nf, threshold),
+    )
 }
 
 /// [`eval_batch_sum_f`] on the oracle tier: the same batch program run by the
@@ -720,7 +741,7 @@ pub fn clean_batch_sum_f(
         "clean_batch_sum_f",
         // The oracle tier keys nothing on the address, so it takes the words as
         // a plain slice and the `Arc` is dropped at the boundary.
-        |code, regs, nf| float_bank::clean_interp_seeded_f(code, regs, nf),
+        |code, regs, nf, banks| float_bank::clean_interp_seeded_f_in(code, regs, nf, banks),
     )
 }
 
@@ -1478,12 +1499,48 @@ pub mod float_bank {
         clean_interp_seeded_f(program, &vec![0i64; num_regs], num_fregs)
     }
 
+    /// Register banks owned across executes, so a caller that runs the same
+    /// shape repeatedly stops paying for two heap allocations per run.
+    ///
+    /// A caller-owned pair rather than a `thread_local!` one on purpose. The
+    /// cost being removed is ~8-9 ns of allocation, and a TLS read through
+    /// `_tlv_get_addr` is about that much on its own — a pool behind a
+    /// `thread_local!` would have spent the saving on reaching it.
+    #[derive(Default)]
+    pub struct Banks {
+        regs: Vec<i64>,
+        fregs: Vec<f64>,
+    }
+
     /// [`clean_interp_f`] over a caller-supplied initial int register bank, for
     /// programs whose data (column bases, row count, trap-word address) arrives
     /// in registers instead of as immediates.
+    ///
+    /// Allocates its banks per call. A caller in a loop wants
+    /// [`clean_interp_seeded_f_in`], which is this function over banks it keeps.
     pub fn clean_interp_seeded_f(program: &Code, init_regs: &[i64], num_fregs: usize) -> i64 {
-        let mut regs = init_regs.to_vec();
-        let mut fregs = vec![0.0f64; num_fregs];
+        clean_interp_seeded_f_in(program, init_regs, num_fregs, &mut Banks::default())
+    }
+
+    /// [`clean_interp_seeded_f`] over banks the caller keeps between runs.
+    ///
+    /// The banks arrive in whatever state the previous run left them, so both
+    /// are re-established here rather than assumed: the int bank is resized and
+    /// overwritten from `init_regs`, and the float bank is refilled with zeroes,
+    /// which is the state `vec![0.0; num_fregs]` used to hand over. Only the
+    /// allocation is saved, not the initialization.
+    pub fn clean_interp_seeded_f_in(
+        program: &Code,
+        init_regs: &[i64],
+        num_fregs: usize,
+        banks: &mut Banks,
+    ) -> i64 {
+        let regs = &mut banks.regs;
+        regs.resize(init_regs.len(), 0);
+        regs.copy_from_slice(init_regs);
+        let fregs = &mut banks.fregs;
+        fregs.clear();
+        fregs.resize(num_fregs, 0.0);
         let mut pc = 0usize;
         loop {
             match program[pc] {

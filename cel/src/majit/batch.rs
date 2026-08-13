@@ -768,7 +768,7 @@ impl BoundBatch<'_, '_> {
         );
         let lowered = &self.program.lowered;
         let mut run = self.run.borrow_mut();
-        run.run(|code, regs, nf| dispatch(tier, threshold, code, regs, nf))
+        run.run(|code, regs, nf, banks| dispatch(tier, threshold, code, regs, nf, banks))
             .ok_or(BatchError::Trapped)?;
         // A LIST-valued result stored each row's element COUNT rather than a
         // value, and the elements themselves went to their own flat buffers at
@@ -797,7 +797,7 @@ impl BoundBatch<'_, '_> {
     fn execute(&self, tier: Tier, threshold: u32) -> Option<i64> {
         self.run
             .borrow_mut()
-            .run(|code, regs, nf| dispatch(tier, threshold, code, regs, nf))
+            .run(|code, regs, nf, banks| dispatch(tier, threshold, code, regs, nf, banks))
     }
 }
 
@@ -814,9 +814,12 @@ fn dispatch(
     code: &std::sync::Arc<[i64]>,
     regs: &[i64],
     nf: usize,
+    banks: &mut float_bank::Banks,
 ) -> i64 {
     match tier {
-        Tier::Clean => float_bank::clean_interp_seeded_f(code, regs, nf),
+        Tier::Clean => float_bank::clean_interp_seeded_f_in(code, regs, nf, banks),
+        // No bank hand-off here: these enter through the traced portal, which
+        // builds its own. See the field's doc on `BatchRun`.
         Tier::Interpreter | Tier::Jit => {
             float_bank::run_jit_persistent_f(code, regs, nf, threshold)
         }

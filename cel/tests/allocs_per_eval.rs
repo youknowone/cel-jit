@@ -602,8 +602,8 @@ fn comprehension_group(out: &mut Vec<Row>) {
 #[cfg(feature = "jit")]
 fn regvm_group(out: &mut Vec<Row>) {
     use cel::majit::bytecode::float_bank::{
-        clean_interp_seeded_f, jit_stats, reset_jit_stats, reset_persistent_state,
-        run_jit_persistent_f,
+        clean_interp_seeded_f, clean_interp_seeded_f_in, jit_stats, reset_jit_stats,
+        reset_persistent_state, run_jit_persistent_f, Banks,
     };
     use cel::majit::lower::{lower_typed, Schema, ValType};
 
@@ -695,6 +695,34 @@ fn regvm_group(out: &mut Vec<Row>) {
                 8,
                 || {
                     black_box(clean_interp_seeded_f(&code, &regs, nf));
+                },
+            );
+
+            // The same interpreter over banks the caller keeps, which is how the
+            // batch machine reaches it. The pair is the measurement: the row
+            // above IS the per-execute bank allocation (one for the int bank,
+            // plus one more where `nf > 0`), and this row is what is left when
+            // it is gone. Anything other than 0.000 here means the clean tier
+            // still allocates per execute.
+            //
+            // Primed once outside the window rather than relying on `bench`'s
+            // warm-up, so the row does not depend on how the harness orders
+            // warm-up against arming the counter: the banks reach their
+            // capacity here and never grow again.
+            let mut banks = Banks::default();
+            let banked = clean_interp_seeded_f_in(&code, &regs, nf, &mut banks);
+            assert_eq!(
+                banked, expected,
+                "regvm/{}/n={n}: the banked clean interpreter diverged from the allocating one",
+                case.label
+            );
+            bench(
+                out,
+                format!("regvm/clean-banked/{}/n={n}", case.label),
+                4,
+                8,
+                || {
+                    black_box(clean_interp_seeded_f_in(&code, &regs, nf, &mut banks));
                 },
             );
 
