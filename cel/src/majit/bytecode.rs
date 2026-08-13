@@ -1998,6 +1998,20 @@ pub mod float_bank {
         programs: std::collections::HashMap<usize, std::sync::Arc<Code>>,
     }
 
+    /// Byte width of the value [`run_jit_persistent_f`] moves out of `DRIVERS`
+    /// and back into it on every call.
+    ///
+    /// Exposed because that pair of moves is a candidate for the per-call cost
+    /// of the persistent tier, and the candidate cannot be sized without this
+    /// number. It is a `size_of`, so it counts only what is INLINE: every heavy
+    /// component named in `JitDriver`/`MetaInterp` is a heap handle -- the
+    /// counter's timetable is a `Vec`, the warm-enter state's cells are an
+    /// index map, cranelift's module and builder context are headers -- so a
+    /// small answer here refutes the memcpy reading rather than confirming it.
+    pub fn pooled_driver_bytes() -> usize {
+        core::mem::size_of::<PooledDriver>()
+    }
+
     std::thread_local! {
         /// Drivers kept across calls, keyed by the state shape they were built
         /// for and the threshold they compile at.

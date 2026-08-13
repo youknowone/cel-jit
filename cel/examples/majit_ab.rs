@@ -39,7 +39,8 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use cel::majit::bytecode::float_bank::{
-    clean_interp_seeded_f, run_jit_persistent_f, run_jit_seeded_f, COMPILES, GUARD_FAILS,
+    clean_interp_seeded_f, pooled_driver_bytes, run_jit_persistent_f, run_jit_seeded_f, COMPILES,
+    GUARD_FAILS,
 };
 use cel::majit::lower::{lower_typed, Schema, ValType};
 use cel::{Context, Program, Value};
@@ -289,7 +290,25 @@ fn warm_break_even() {
     let (balance, amount, frozen) = make_engine_columns(max_n);
 
     println!("persistent driver, compile amortized (the tier the batch API runs):");
-    println!("      rows    clean total      JIT total    JIT/clean  guard fails/call");
+    // The `idle` arm is `run_jit_persistent_f` at a threshold it can never
+    // reach, so it walks the SAME entry path -- pool remove/insert, program
+    // Arc insert, `republish_state_field_fvc`, the expanded mainloop's
+    // per-opcode `is_tracing()` check, the two per-call bank allocations --
+    // and never traces or compiles. That splits one number into two:
+    //
+    //   idle - clean  = the harness cost of the persistent tier with the JIT off
+    //   jit  - idle   = tracing plus whatever entering compiled code costs
+    //
+    // Without the split, a row's cost cannot be attributed, and at the small
+    // sizes it is easy to read a cost as compiled-entry when nothing compiled
+    // at all -- which is why `compiles` is printed on the SAME row rather than
+    // in a separate panel. A row with `compiles = 0` and no prior compile for
+    // its shape contains no compiled code, whatever its timing says.
+    println!("      pooled driver: {} bytes moved per call, twice (out of DRIVERS and back)", pooled_driver_bytes());
+    println!(
+        "      rows    clean us      idle us       jit us   idle-clean    jit-idle  \
+         jit/clean  gfails/call  cmp"
+    );
     let mut first_win = None;
     let mut program: Option<std::sync::Arc<[i64]>> = None;
     for &n in SIZES {
@@ -311,14 +330,21 @@ fn warm_break_even() {
         };
         let expected = clean_interp_seeded_f(&code, &regs, nf);
         // Warm: enough calls that the loop is compiled and stays compiled, so
-        // no call in the timed region pays for a trace.
+        // no call in the timed region pays for a trace. Both JIT arms are warmed
+        // -- they key different pooled drivers (the pool key carries the
+        // threshold), so warming only one would leave the other paying a
+        // `new_driver_f` inside the timed region and the delta would be reading
+        // driver construction rather than the entry path.
         for _ in 0..64 {
             assert_eq!(run_jit_persistent_f(&code, &regs, nf, JIT_ON), expected);
+            assert_eq!(run_jit_persistent_f(&code, &regs, nf, JIT_OFF), expected);
         }
 
         let mut clean_times = Vec::with_capacity(COLD_ROUNDS);
+        let mut idle_times = Vec::with_capacity(COLD_ROUNDS);
         let mut jit_times = Vec::with_capacity(COLD_ROUNDS);
         let g0 = GUARD_FAILS.load(Ordering::Relaxed);
+        let c0 = COMPILES.load(Ordering::Relaxed);
         let mut calls = 0usize;
         for _ in 0..COLD_ROUNDS {
             let start = Instant::now();
@@ -326,20 +352,31 @@ fn warm_break_even() {
             clean_times.push(start.elapsed());
 
             let start = Instant::now();
+            black_box(run_jit_persistent_f(&code, &regs, nf, JIT_OFF));
+            idle_times.push(start.elapsed());
+
+            let start = Instant::now();
             black_box(run_jit_persistent_f(&code, &regs, nf, JIT_ON));
             jit_times.push(start.elapsed());
             calls += 1;
         }
         let fails = (GUARD_FAILS.load(Ordering::Relaxed) - g0) as f64 / calls as f64;
+        let compiles = COMPILES.load(Ordering::Relaxed) - c0;
         let clean = median_duration(clean_times);
+        let idle = median_duration(idle_times);
         let jit = median_duration(jit_times);
         if jit <= clean && first_win.is_none() {
             first_win = Some(n);
         }
+        let us = |d: std::time::Duration| d.as_secs_f64() * 1e6;
         println!(
-            "{n:>10}  {:>10.3} us  {:>12.3} us  {:>10.2}x  {fails:>16.2}",
-            clean.as_secs_f64() * 1e6,
-            jit.as_secs_f64() * 1e6,
+            "{n:>10}  {:>8.3} us  {:>8.3} us  {:>8.3} us  {:>9.3} us  {:>8.3} us  {:>8.2}x  \
+             {fails:>10.2}  {compiles:>3}",
+            us(clean),
+            us(idle),
+            us(jit),
+            us(idle) - us(clean),
+            us(jit) - us(idle),
             jit.as_secs_f64() / clean.as_secs_f64(),
         );
     }
