@@ -64,8 +64,8 @@ pub struct ClassLayout {
     /// Byte offsets of the instance's **managed** edges — the fields the
     /// collector walks during a minor collection.
     ///
-    /// Not simply "every pointer field". `ob_type` and `w_class` point at
-    /// `'static` classes, `W_TypeObject::cls` points at a `'static` class, and
+    /// Not simply "every pointer field". `ob_type` points at a `'static`
+    /// class, `W_TypeObject::cls` points at a `'static` class, and
     /// the three payload-block pointers address blocks that
     /// [`super::object_array`] allocates outside the traced heap. Listing any
     /// of them would hand the collector an address to trace that no collection
@@ -317,9 +317,11 @@ pub fn publish_cel_descrs(ids: &CelTypeIds) {
             true,
             false,
             &specs,
-            // No extra GC edge: cel's `w_class` is a `'static` class pointer,
-            // where pyre's is a managed `PyObject`. Adding it here to look like
-            // pyre would hand the collector a static address to trace.
+            // No extra GC edge. pyre's header carries a `w_class` that is a
+            // managed `PyObject` and so has to be traced; cel's header is one
+            // `'static` class pointer and declares no second word. Adding an
+            // edge here to look like pyre would hand the collector a static
+            // address to trace.
             &[],
         );
 
@@ -551,7 +553,6 @@ mod tests {
         unsafe {
             let w = obj.0 as CelRef;
             (*w).ob_type = &CEL_INT_CLASS;
-            (*w).w_class = &CEL_INT_CLASS;
             crate::runtime::object::payload!(w, W_IntObject, intval) = 7;
         }
 

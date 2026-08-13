@@ -44,6 +44,5 @@ pub mod lltype;
 pub mod object;
 pub mod object_array;
 pub mod optional;
-pub mod pyre_object;
 #[cfg(feature = "jit")]
 pub mod registration;

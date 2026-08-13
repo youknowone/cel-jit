@@ -17,42 +17,49 @@
 //! 1. **The allocation call.** Its path must end `lltype::malloc_typed` and it
 //!    must take exactly one argument, the finished value, by value. See
 //!    [`super::lltype`].
-//! 2. **The `w_class` word.** `resolve_vtable_addr` keeps a single vtable
-//!    address to stand in for both header stores, and verifies the
-//!    substitution is sound by reading the `w_class` store back through
-//!    `get_instantiate_arg_addr` and comparing it to the `ob_type` address. A
-//!    header without that store resolves to `None`, which compares unequal,
-//!    and the whole cluster declines. See [`super::pyre_object`].
+//! 2. **The class word.** `resolve_vtable_addr` keeps a single vtable address
+//!    to stand in for every header store the fuse drops, so it has to be sure
+//!    no dropped store carried a *different* class. Where the header declares
+//!    a `w_class` field it reads that store back through
+//!    `get_instantiate_arg_addr` and compares; where the header declares no
+//!    such field there is nothing that could disagree, which is the arm
+//!    `header_declares_no_class_word` admits and the one every leaf here
+//!    takes. Declaring the field and omitting the store still declines, in
+//!    silence.
 //! 3. **The header offset.** `fuse_boxing_alloc` matches the aggregate's
 //!    `ob_header` store by name and the backend reads the class word at a
 //!    fixed offset (`set_vtable_offset(Some(0))` emits
 //!    `cmp [obj + 0], classptr`). Every leaf therefore const-asserts
 //!    `offset_of!(T, ob_header) == 0`.
 //!
-//! # The header is two words, and that is a correction
+//! # The header is one word, and the word was recovered upstream
 //!
-//! An earlier design took one word — `CelObject { ob_type }` — reasoning that
-//! pyre needs `w_class` for user-defined Python classes while CEL's universe
-//! is closed, so the second word carries nothing. The reasoning is sound and
-//! the conclusion does not survive contact with `resolve_vtable_addr`, which
-//! is condition 2 above: with no `w_class` store the fuse returns 0 and
-//! **every** allocation stays residual, in silence. Two words is what the
-//! lowering is actually tested against, in `charon-corpus`.
+//! An earlier revision of this file carried two — `ob_type` and a `w_class`
+//! that was always equal to it — and said so as a correction. It was one at
+//! first, reasoning that pyre needs `w_class` for user-defined Python classes
+//! while CEL's universe is closed; the reasoning was sound and did not survive
+//! contact with `resolve_vtable_addr`, which back then resolved an absent
+//! `w_class` store to `None`, compared it unequal to the `ob_type` address,
+//! and declined the whole cluster. Every allocation stayed residual, silently
+//! — the failure mode this list exists to pin.
 //!
-//! Recovering the word is a majit change, not a cel one: teach
-//! `resolve_vtable_addr` to read an absent `w_class` store as "base-type
-//! instance" rather than as a mismatch. That is sound precisely for a universe
-//! without subclassing, which is CEL's. It is worth doing — the word is paid
-//! on every value — but it is a separate change with its own test, and
-//! nothing here depends on which way it goes: `#[repr(C)]` with `ob_header`
-//! first means narrowing the header changes each leaf's *size* and no leaf's
-//! *source*, and the offset assertions hold either way.
+//! The word came back on the majit side rather than here, by widening that
+//! check rather than by re-spelling anything in cel:
+//! `header_declares_no_class_word` reads a header that *declares* no class
+//! word as a base-type instance, requiring both that no `w_class` store exists
+//! and that the header struct's registered layout has no such field. What that
+//! arm gives up is subclassing, which a CEL value universe does not have: the
+//! type object of an instance of `T` is `T` itself. What it buys is a word on
+//! every value.
+//!
+//! Gone with the field is the `get_instantiate` call the old check read its
+//! argument out of, and with that call the module that carried pyre's name so
+//! the three-segment path suffix would match.
 
 use core::mem::offset_of;
 
 use super::lltype;
 use super::object_array::{self, CelBytesBlock, CelItemsBlock};
-use super::pyre_object::pyobject::get_instantiate;
 
 /// The coarse family a value belongs to.
 ///
@@ -104,12 +111,11 @@ impl CelClass {
 
 /// The object header, first field of every value.
 ///
-/// `w_class` is always `ob_type` for CEL — see the module documentation for
-/// why the redundant word is here anyway.
+/// One word, and declaring no class word beyond it is what admits the fuse's
+/// base-type arm — see the module documentation.
 #[repr(C)]
 pub struct CelObject {
     pub ob_type: *const CelClass,
-    pub w_class: *const CelClass,
 }
 
 /// A pointer to any value.
@@ -200,10 +206,7 @@ macro_rules! scalar_leaf {
         $(#[$ctor_doc])*
         pub fn $ctor(value: $pty) -> *mut $leaf {
             lltype::malloc_typed($leaf {
-                ob_header: CelObject {
-                    ob_type: &$class,
-                    w_class: get_instantiate(&$class),
-                },
+                ob_header: CelObject { ob_type: &$class },
                 $payload: value,
             })
         }
@@ -298,7 +301,6 @@ pub fn new_optional_none() -> *mut W_OptionalObject {
     lltype::malloc_typed(W_OptionalObject {
         ob_header: CelObject {
             ob_type: &CEL_OPTIONAL_CLASS,
-            w_class: get_instantiate(&CEL_OPTIONAL_CLASS),
         },
         w_value: core::ptr::null_mut(),
     })
@@ -334,7 +336,6 @@ pub fn new_null() -> *mut W_NullObject {
     lltype::malloc_typed(W_NullObject {
         ob_header: CelObject {
             ob_type: &CEL_NULL_CLASS,
-            w_class: get_instantiate(&CEL_NULL_CLASS),
         },
     })
 }
@@ -369,7 +370,6 @@ pub fn new_timestamp(nanos: i64, off_s: i64) -> *mut W_TimestampObject {
     lltype::malloc_typed(W_TimestampObject {
         ob_header: CelObject {
             ob_type: &CEL_TIMESTAMP_CLASS,
-            w_class: get_instantiate(&CEL_TIMESTAMP_CLASS),
         },
         nanos,
         off_s,
@@ -423,7 +423,6 @@ pub fn new_bytes(bytes: &[u8]) -> *mut W_BytesObject {
     lltype::malloc_typed(W_BytesObject {
         ob_header: CelObject {
             ob_type: &CEL_BYTES_CLASS,
-            w_class: get_instantiate(&CEL_BYTES_CLASS),
         },
         data,
         length,
@@ -462,7 +461,6 @@ pub fn new_string(s: &str) -> *mut W_StringObject {
     lltype::malloc_typed(W_StringObject {
         ob_header: CelObject {
             ob_type: &CEL_STRING_CLASS,
-            w_class: get_instantiate(&CEL_STRING_CLASS),
         },
         chars,
         byte_len,
@@ -509,7 +507,6 @@ pub fn new_list(values: &[CelRef]) -> *mut W_ListObject {
     lltype::malloc_typed(W_ListObject {
         ob_header: CelObject {
             ob_type: &CEL_LIST_CLASS,
-            w_class: get_instantiate(&CEL_LIST_CLASS),
         },
         items,
         length,
@@ -546,7 +543,6 @@ pub fn new_type(cls: &'static CelClass) -> *mut W_TypeObject {
     lltype::malloc_typed(W_TypeObject {
         ob_header: CelObject {
             ob_type: &CEL_TYPE_CLASS,
-            w_class: get_instantiate(&CEL_TYPE_CLASS),
         },
         cls,
     })
@@ -577,17 +573,22 @@ mod tests {
         assert_eq!(n as usize, n as CelRef as usize);
     }
 
-    /// Condition 2's cel-side half: `w_class` and `ob_type` must be the same
-    /// address, or `resolve_vtable_addr` declines the fuse for that cluster.
-    /// This does not prove the fuse fires — that needs the lowering — but a
-    /// constructor that broke the invariant would fail here rather than
-    /// showing up as an unexplained zero in a census.
+    /// Condition 2's cel-side half: the one header store a constructor makes
+    /// names its own class. The fuse keeps a single vtable address for the
+    /// whole cluster, so a constructor stamping some other class would make
+    /// that address wrong for the values it mints. This does not prove the
+    /// fuse fires — that needs the lowering — but a constructor that broke
+    /// the invariant would fail here rather than showing up as an unexplained
+    /// zero in a census.
+    ///
+    /// The header declares nothing else to check. That is the point of the
+    /// one-word shape, and `header_declares_no_class_word` is the majit-side
+    /// half that reads the absence as a base-type instance.
     #[test]
-    fn every_constructor_agrees_on_ob_type_and_w_class() {
+    fn every_constructor_stamps_its_own_class() {
         fn check(w: CelRef, expected: *const CelClass) {
             unsafe {
                 assert_eq!((*w).ob_type, expected);
-                assert_eq!((*w).w_class, expected, "w_class must equal ob_type");
             }
         }
         check(new_int(1) as CelRef, &CEL_INT_CLASS);
