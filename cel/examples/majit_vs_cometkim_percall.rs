@@ -69,7 +69,7 @@ use std::time::{Duration, Instant};
 use cel::context::VariableResolver;
 use cel::majit::batch::{Batch, BatchProgram, BoundBatch, ColumnRef, RawOutput, RowReader, Tier};
 use cel::majit::bytecode::float_bank::{
-    reset_persistent_state, COMPILES, GUARD_FAILS, TRACE_ABORTS,
+    jit_stats, reset_persistent_state, COMPILES, GUARD_FAILS, TRACE_ABORTS,
 };
 use cel::majit::lower::{Schema, ValType};
 use cel::{Context, Program, Value};
@@ -426,6 +426,15 @@ struct Compiled {
     /// point hot enough to be traced; only this tells the two apart.
     aborts: f64,
     guard_fails: f64,
+    /// Bridges compiled per call over the same warm window as `aborts` and
+    /// `guard_fails`.
+    ///
+    /// ⚠ Unlike those two this is NOT a callback tally. `jit_stats` builds
+    /// `bridges_compiled` by summing the LIVE drivers' own counts and adding the
+    /// ones already absorbed from retired drivers, so it is a population read at
+    /// two instants and differenced. Nothing in the window retires a driver
+    /// without absorbing its count, so the difference is the window's compiles.
+    bridges: f64,
 }
 
 struct Row {
@@ -536,15 +545,22 @@ fn run_case(case: &Case) -> Row {
     let compiles = COMPILES.load(Ordering::Relaxed);
     // What the driver is still doing per call once it is as warm as it will get.
     const SETTLED: usize = 1_000;
-    let (a0, g0) = (
+    let (a0, g0, b0) = (
         TRACE_ABORTS.load(Ordering::Relaxed),
         GUARD_FAILS.load(Ordering::Relaxed),
+        jit_stats().bridges_compiled,
     );
     for _ in 0..SETTLED {
         black_box(bound.collect_on(Tier::Jit).expect("settled run"));
     }
     let aborts = (TRACE_ABORTS.load(Ordering::Relaxed) - a0) as f64 / SETTLED as f64;
     let guard_fails = (GUARD_FAILS.load(Ordering::Relaxed) - g0) as f64 / SETTLED as f64;
+    // `saturating_sub` where the two above subtract plainly, because the two
+    // above are monotonic counters and this one is a population: only
+    // `reset_persistent_state` can drop a live driver's count without absorbing
+    // it, and it is not called inside this window, but a negative difference is
+    // a wrong number where a clamped zero is a visibly uninformative one.
+    let bridges = jit_stats().bridges_compiled.saturating_sub(b0) as f64 / SETTLED as f64;
 
     let collect = |tier| {
         bound
@@ -576,6 +592,7 @@ fn run_case(case: &Case) -> Row {
             compiles,
             aborts,
             guard_fails,
+            bridges,
         }),
     }
 }
@@ -586,7 +603,7 @@ fn warm(bound: &BoundBatch<'_, '_>) {
     }
 }
 
-/// A cost model `fixed + per_elem * n`, fitted through two points.
+/// A cost model `fixed + per_elem * n`.
 struct Fit {
     fixed: f64,
     per_elem: f64,
@@ -609,6 +626,38 @@ impl Fit {
         }
     }
 
+    /// The same model over EVERY point, by least squares.
+    ///
+    /// It does not replace [`Fit::two_point`] and is not offered as the better
+    /// number. It answers the one question the two-point fit structurally
+    /// cannot: that fit passes through its endpoints by construction, so its
+    /// `fixed` is an extrapolation to `n = 0` with no residual of its own, and
+    /// the only thing that can disagree with it is a point it did not touch. A
+    /// least-squares line touches nothing, so every point is a residual, and
+    /// `fixed` is answerable at ladders with no interior point to spare.
+    ///
+    /// Reported as a second estimate, never as an interval: at four or five
+    /// points of one sample each there is nothing to put a confidence interval
+    /// on, and printing one would claim a precision this harness cannot reach.
+    fn least_squares(pts: &[(f64, f64)]) -> Fit {
+        let n = pts.len() as f64;
+        let mean_x = pts.iter().map(|&(x, _)| x).sum::<f64>() / n;
+        let mean_y = pts.iter().map(|&(_, y)| y).sum::<f64>() / n;
+        let sxx = pts
+            .iter()
+            .map(|&(x, _)| (x - mean_x) * (x - mean_x))
+            .sum::<f64>();
+        let sxy = pts
+            .iter()
+            .map(|&(x, y)| (x - mean_x) * (y - mean_y))
+            .sum::<f64>();
+        let per_elem = sxy / sxx;
+        Fit {
+            fixed: mean_y - per_elem * mean_x,
+            per_elem,
+        }
+    }
+
     fn at(&self, n: f64) -> f64 {
         self.fixed + self.per_elem * n
     }
@@ -617,8 +666,8 @@ impl Fit {
 /// One ladder's decomposition.
 struct Decomposition {
     ladder: &'static str,
-    /// The two `n` the fit was taken through, and how many compiled points the
-    /// ladder had in total.
+    /// The two `n` the TWO-POINT fit was taken through, and how many compiled
+    /// points the ladder had in total. The least-squares fit uses all of them.
     n_lo: i64,
     n_hi: i64,
     points: usize,
@@ -626,20 +675,61 @@ struct Decomposition {
     /// the fit: their `majit` cell is the tracing interpreter, so including one
     /// would fit a different machine.
     excluded: usize,
+    /// The RAW `majit ns` at `n_lo` — nothing fitted, the measurement itself.
+    ///
+    /// Printed beside `majit fixed` because it is what that intercept sits on:
+    /// `fixed = t_lo - per_elem * n_lo`, so the correction is `t_lo - fixed` and
+    /// a reader can size it without being told. Where it is a few percent the
+    /// intercept is a measured point lightly adjusted, and its precision is the
+    /// measurement's rather than the model's.
+    ///
+    /// ⚠ `n_lo` is the lowest rung that COMPILED, not the ladder's lowest rung —
+    /// `map_list_scaling` and `filter_list_scaling` both start at n=1, and a run
+    /// where that rung never compiles anchors the intercept at n=10 instead.
+    /// That is why the abscissa is printed next to the ordinate: the anchor can
+    /// move between runs, and it moves silently otherwise.
+    t_lo: f64,
     majit: Fit,
     clean: Fit,
-    /// Worst relative error of the majit fit at a point it did NOT pass through,
-    /// or `None` when the ladder has only the two endpoints.
+    /// The `majit` model again, fitted by least squares over every included
+    /// point. A SECOND estimate of `majit fixed`, printed beside the first
+    /// rather than in place of it — see [`Fit::least_squares`] for why both.
+    majit_ls: Fit,
+    /// Worst relative error of the TWO-POINT majit fit at a point it did NOT
+    /// pass through, or `None` when the ladder has only the two endpoints.
     worst_mid_err: Option<f64>,
+    /// Worst relative residual of [`Decomposition::majit_ls`] over EVERY
+    /// included point, since that fit passes through none of them.
+    ///
+    /// `None` below three points, where least squares is just the line through
+    /// the two and its residual is zero for a reason that says nothing about
+    /// the model. Same rule as `worst_mid_err`, reached from the other side.
+    worst_ls_err: Option<f64>,
     /// The largest `gfails/call` over the compiled members. Printed beside the
     /// fit because a fixed cost and a per-call guard failure are the same
     /// finding read two ways, and #88's own tripwire is that a compile count
     /// must never be reported without it.
     max_gfails: f64,
+    /// The largest `bridges/call` over the compiled members.
+    ///
+    /// It belongs beside `majit fixed` for the same reason `max_gfails` does.
+    /// `majit fixed` is a per-call cost, and the compiled artifacts the driver
+    /// deals with per call are the most direct decomposition of it: a fixed cost
+    /// that scales with the artifact count is an artifact-count cost, one that
+    /// does not is a per-artifact cost, and those two want opposite repairs.
+    ///
+    /// ⚠ Read what this counts. It is artifacts COMPILED in the warm window, not
+    /// artifacts ENTERED — a settled trace tree enters its bridges on every call
+    /// and compiles none of them, so a zero here says the population stopped
+    /// GROWING, not that the call enters nothing. The nonzero reading is the
+    /// strong one: a warm call that is still compiling has compilation itself
+    /// inside the fixed cost, which no per-entry repair can reach.
+    max_bridges: f64,
 }
 
-/// Task #88's two-point decomposition over the size ladders, computed here
-/// rather than by hand off the table above.
+/// Task #88's decomposition over the size ladders, computed here rather than by
+/// hand off the table above, by two estimators: #88's own two-point fit and a
+/// least-squares fit over every included point.
 ///
 /// The gate this epic is under — "a compiled cel artifact's fixed per-call cost
 /// under ~1 µs on both backends" — is stated in the `majit fixed` column, and
@@ -686,6 +776,17 @@ fn decompose(rows: &[Row]) -> Vec<Decomposition> {
             .map(|(n, c)| ((majit.at(*n) - c.majit) / c.majit).abs())
             .fold(None::<f64>, |acc, e| Some(acc.map_or(e, |a: f64| a.max(e))));
 
+        let majit_pts: Vec<(f64, f64)> = pts.iter().map(|(n, c)| (*n, c.majit)).collect();
+        let majit_ls = Fit::least_squares(&majit_pts);
+        // Every point, where `worst_mid_err` takes the interior ones: this fit
+        // passes through none of them, so there is no endpoint to skip.
+        let worst_ls_err = (majit_pts.len() > 2).then(|| {
+            majit_pts
+                .iter()
+                .map(|&(n, t)| ((majit_ls.at(n) - t) / t).abs())
+                .fold(0.0, f64::max)
+        });
+
         out.push(Decomposition {
             ladder: name,
             n_lo: lo.0 as i64,
@@ -693,9 +794,13 @@ fn decompose(rows: &[Row]) -> Vec<Decomposition> {
             points: pts.len(),
             excluded,
             max_gfails: pts.iter().map(|(_, c)| c.guard_fails).fold(0.0, f64::max),
+            max_bridges: pts.iter().map(|(_, c)| c.bridges).fold(0.0, f64::max),
+            t_lo: lo.1.majit,
             majit,
             clean,
+            majit_ls,
             worst_mid_err,
+            worst_ls_err,
         });
     }
     out
@@ -712,28 +817,44 @@ fn break_even(d: &Decomposition) -> Option<f64> {
     (gain > 0.0).then(|| (d.majit.fixed - d.clean.fixed) / gain)
 }
 
+/// One worst-relative-error cell, or `-` where the ladder cannot supply one.
+///
+/// Shared by `mid err` and `ls err` so the two are formatted identically: they
+/// are only readable against each other if they are printed the same way.
+fn err_cell(e: Option<f64>) -> String {
+    match e {
+        Some(e) => format!("{:>8.1}%", e * 100.0),
+        None => format!("{:>9}", "-"),
+    }
+}
+
 fn print_decomposition(rows: &[Row]) {
     let table = decompose(rows);
     if table.is_empty() {
         return;
     }
     println!(
-        "\ntask #88's two-point decomposition, computed here rather than by hand.\n\
-         `majit fixed` is the column the STOP-AT-P5 gate is stated in: its re-entry\n\
-         criterion is a compiled artifact's fixed per-call cost under ~1 us."
+        "\ntask #88's decomposition, computed here rather than by hand. `majit fixed`\n\
+         is the column the STOP-AT-P5 gate is stated in: its re-entry criterion is a\n\
+         compiled artifact's fixed per-call cost under ~1 us. It is reported by TWO\n\
+         estimators, in the second block, because one of them cannot disagree with\n\
+         its own inputs and so cannot report an error against them."
     );
+    // Two blocks rather than one 165-column line. The split is by SUBJECT, not
+    // by what happened to fit: the per-element slopes and the clean-VM control
+    // are one reading, and `majit fixed` under two estimators is the other. No
+    // column was dropped or narrowed to make them fit.
+    println!("\nthe per-element cost, and the clean VM it is measured against:");
     println!(
-        "\n{:<22} {:>7} {:>13} {:>12} {:>11} {:>12} {:>11} {:>11} {:>9} {:>12}",
+        "\n{:<22} {:>7} {:>13} {:>11} {:>11} {:>12} {:>11} {:>11}",
         "ladder",
         "points",
         "fit through n",
-        "majit fixed",
         "majit/elem",
+        "ls/elem",
         "clean fixed",
         "clean/elem",
-        "break-even",
-        "mid err",
-        "gfails/call"
+        "break-even"
     );
     for d in &table {
         let be = match break_even(d) {
@@ -742,37 +863,88 @@ fn print_decomposition(rows: &[Row]) {
             // never overtakes. Printed rather than left blank.
             None => format!("{:>11}", "never"),
         };
-        let mid = match d.worst_mid_err {
-            Some(e) => format!("{:>8.1}%", e * 100.0),
-            None => format!("{:>9}", "-"),
-        };
         println!(
-            "{:<22} {:>7} {:>6}..{:<6} {:>12.1} {:>11.3} {:>12.1} {:>11.3} {be} {mid} {:>12.2}",
+            "{:<22} {:>7} {:>6}..{:<6} {:>11.3} {:>11.3} {:>12.1} {:>11.3} {be}",
             d.ladder,
             d.points,
             d.n_lo,
             d.n_hi,
-            d.majit.fixed,
             d.majit.per_elem,
+            d.majit_ls.per_elem,
             d.clean.fixed,
             d.clean.per_elem,
+        );
+    }
+    println!("\n`majit fixed`, the number the gate is stated in, by both estimators:");
+    // `n_lo` and `t(n_lo)` lead the block rather than sitting at its end: they
+    // are the point the intercept is anchored on, so they are read BEFORE it.
+    println!(
+        "\n{:<22} {:>7} {:>6} {:>10} {:>12} {:>9} {:>12} {:>9} {:>12} {:>13}",
+        "ladder",
+        "points",
+        "n_lo",
+        "t(n_lo)",
+        "majit fixed",
+        "mid err",
+        "ls fixed",
+        "ls err",
+        "gfails/call",
+        "bridges/call"
+    );
+    for d in &table {
+        println!(
+            "{:<22} {:>7} {:>6} {:>10.1} {:>12.1} {} {:>12.1} {} {:>12.2} {:>13.2}",
+            d.ladder,
+            d.points,
+            d.n_lo,
+            d.t_lo,
+            d.majit.fixed,
+            err_cell(d.worst_mid_err),
+            d.majit_ls.fixed,
+            err_cell(d.worst_ls_err),
             d.max_gfails,
+            d.max_bridges,
         );
     }
     let excluded: usize = table.iter().map(|d| d.excluded).sum();
     println!(
-        "\nRead it with three cautions.\n\
-         * The fit passes through its two endpoints BY CONSTRUCTION, so it cannot\n\
-           disagree with them. `mid err` is the whole test of the model: it is the\n\
-           worst relative error at a ladder point the fit did not touch, and a\n\
-           `-` means the ladder had no such point and the row is unchecked.\n\
+        "\nRead it with six cautions.\n\
+         * The two-point fit passes through its two endpoints BY CONSTRUCTION, so\n\
+           it cannot disagree with them: its `majit fixed` is an extrapolation to\n\
+           n=0 carrying no residual of its own. `mid err` is the whole test of that\n\
+           model — the worst relative error at a ladder point the fit did not\n\
+           touch — and a `-` means the ladder had no such point and the row is\n\
+           entirely unchecked.\n\
+         * `ls fixed` is the same model fitted by LEAST SQUARES over every included\n\
+           point. It is the second opinion, not the better number, and it does not\n\
+           replace the two-point figure: reproducing #88's METHOD is what makes a\n\
+           number here comparable to one taken then. Unlike the first it touches no\n\
+           point, so every point is a residual — `ls err` is the worst of them. A\n\
+           `-` means fewer than three points, where least squares is just the line\n\
+           through the two and its zero residual would say nothing. No interval is\n\
+           printed for either: four or five points at one sample each cannot carry\n\
+           one, and printing one would claim a precision this harness has not got.\n\
+         * `majit fixed` is `t(n_lo)` MINUS the slope's contribution at n_lo, and\n\
+           both are printed so that correction can be sized rather than assumed.\n\
+           Where it is a few percent of `t(n_lo)` the intercept inherits the\n\
+           precision of a DIRECTLY MEASURED point, not the model's: `mid err` and\n\
+           `ls err` describe the model BETWEEN the endpoints, so they bound the\n\
+           per-element term and any extrapolation past the ladder's reach, and a\n\
+           large one does not make the intercept uncertain by the same fraction.\n\
+           The reading that does put the intercept in doubt is the opposite one —\n\
+           `per_elem * n_lo` a LARGE fraction of `t(n_lo)`, where `majit fixed` is\n\
+           mostly the subtraction of a modelled quantity from a measured one.\n\
          * {excluded} ladder member(s) are excluded because their loop never\n\
            compiled. Their `majit` cell is the tracing interpreter, and fitting it\n\
            would decompose a different machine.\n\
          * `gfails/call` belongs beside `majit fixed`, not in a separate table:\n\
            #88 found 1.00 guard failure per call on every compiled case and named\n\
            it the prime suspect for the fixed cost it measured. A fixed cost read\n\
-           without it is half a finding."
+           without it is half a finding.\n\
+         * `bridges/call` counts artifacts COMPILED in the warm window, not\n\
+           artifacts entered. A zero says the artifact population stopped\n\
+           growing, NOT that the call enters no bridge; a nonzero one says a warm\n\
+           call is still compiling, which puts compilation inside `majit fixed`."
     );
 }
 
@@ -784,7 +956,7 @@ fn main() {
         MIN_BATCH.as_millis()
     );
     println!(
-        "{:<28} {:>11} {:>11} {:>11} {:>12} {:>10} {:>10} {:>9} {:>12} {:>12}",
+        "{:<28} {:>11} {:>11} {:>11} {:>12} {:>10} {:>10} {:>9} {:>12} {:>12} {:>13}",
         "case",
         "stock ns",
         "clean ns",
@@ -794,7 +966,8 @@ fn main() {
         "bind ns",
         "compiles",
         "aborts/call",
-        "gfails/call"
+        "gfails/call",
+        "bridges/call"
     );
 
     let cases = cases();
@@ -814,7 +987,7 @@ fn main() {
                     never_compiled.push(r.label.clone());
                 }
                 println!(
-                    "{:<28} {:>11.1} {:>11.1} {:>11.1} {:>11.2}x {:>10.1} {:>10.1} {:>9} {:>12.2} {:>12.2}",
+                    "{:<28} {:>11.1} {:>11.1} {:>11.1} {:>11.2}x {:>10.1} {:>10.1} {:>9} {:>12.2} {:>12.2} {:>13.2}",
                     r.label,
                     r.stock,
                     c.clean,
@@ -824,7 +997,8 @@ fn main() {
                     c.bind,
                     c.compiles,
                     c.aborts,
-                    c.guard_fails
+                    c.guard_fails,
+                    c.bridges
                 );
             }
             Err(why) => {
@@ -832,8 +1006,8 @@ fn main() {
                 // through the library's fallback. A row missing from the table
                 // would read as an expression this crate cannot evaluate.
                 println!(
-                    "{:<28} {:>11.1} {:>11} {:>11} {:>12} {:>10} {:>10} {:>9} {:>12} {:>12}",
-                    r.label, r.stock, "-", "walker", "-", "-", "-", "-", "-", "-"
+                    "{:<28} {:>11.1} {:>11} {:>11} {:>12} {:>10} {:>10} {:>9} {:>12} {:>12} {:>13}",
+                    r.label, r.stock, "-", "walker", "-", "-", "-", "-", "-", "-", "-"
                 );
                 declined.push((r.label.clone(), why.clone()));
             }
