@@ -73,6 +73,16 @@ through `Program::execute` under `--no-default-features`.
 > `cel_less`. `lltype::malloc_typed` and `pyobject::get_instantiate` drop out of
 > the jitcode list entirely, consumed by the fuse. **The leaves fuse.**
 >
+> The count is what makes that a statement about *every* constructor rather
+> than about five fusions somewhere. Each constructor body holds exactly one
+> `malloc_typed`, and each is its own graph, so the five constructor graphs
+> contribute exactly five allocation sites; five of them are `newwithvtable`, so
+> none is left over. ⚠ Which means `cel_add`'s residual `new` is in some other
+> graph, and it is **unidentified**. The obvious candidate — `raise`'s
+> `Some(CelError { .. })` enum shell, which §2(d) says materializes — is refuted
+> by `cel_less`: `error::raise` is a jitcode under both portals, and `cel_less`
+> reports `new` 0.
+>
 > ⛔ **Both numbers were unreadable until two harness defects were fixed, and
 > each returned a clean zero rather than an error.**
 >
