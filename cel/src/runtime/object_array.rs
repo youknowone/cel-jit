@@ -156,10 +156,18 @@ pub fn new_items_block(values: &[CelRef]) -> *mut CelItemsBlock {
             values.len(),
         )
     } as *mut CelItemsBlock;
+    // An index loop, not `values.iter().enumerate()`. The iterator spelling is
+    // what the first census of this function measured, and it cost the whole
+    // graph: `new_bytes_block` next door lowered and became a jitcode while this
+    // one declined and survived as a residual call, the only difference between
+    // them being the adapter chain. RPython has no iterator adapters either —
+    // its own array copies are index loops.
     unsafe {
         let base = items_base(block);
-        for (i, v) in values.iter().enumerate() {
-            base.add(i).write(*v);
+        let mut i = 0;
+        while i < values.len() {
+            base.add(i).write(values[i]);
+            i += 1;
         }
     }
     block
