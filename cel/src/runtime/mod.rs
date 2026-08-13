@@ -25,12 +25,15 @@
 //!
 //! # What is in this slice
 //!
-//! The fixed-size scalar leaves only: `int`, `uint`, `double`, `bool`, `null`,
-//! `duration`, `timestamp` and the type value. Those need nothing but the
-//! fixed-size boxing fuse, which is landed and tested. Everything with a
-//! variable-length payload — strings, bytes, lists, maps, structs — needs
-//! varsize allocation lowering, which is not, so it is a later slice rather
-//! than a half-written one here.
+//! The scalar leaves — `int`, `uint`, `double`, `bool`, `null`, `duration`,
+//! `timestamp`, the type value and `optional` — plus `string`, `bytes` and
+//! `list`, whose payloads live in separately allocated blocks ([`object_array`])
+//! rather than as a varsize tail. Every leaf here is fixed-size, which is what
+//! the boxing fuse requires; [`object_array`] records why the tail encoding is
+//! not available and what would have to change for it to be.
+//!
+//! `map` and `struct` are not here. Both want the strategy indirection the
+//! design gives them, and that is a later slice rather than a half-written one.
 //!
 //! Read [`object`] before adding a leaf: three separate conditions have to
 //! hold for an allocation to fuse, and all three fail silently.
@@ -39,5 +42,6 @@ pub mod binop;
 pub mod error;
 pub mod lltype;
 pub mod object;
+pub mod object_array;
 pub mod optional;
 pub mod pyre_object;

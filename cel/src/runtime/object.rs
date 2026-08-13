@@ -51,6 +51,7 @@
 use core::mem::offset_of;
 
 use super::lltype;
+use super::object_array::{self, CelBytesBlock, CelItemsBlock};
 use super::pyre_object::pyobject::get_instantiate;
 
 /// The coarse family a value belongs to.
@@ -73,6 +74,9 @@ pub enum CelKind {
     Duration = 6,
     Type = 7,
     Optional = 8,
+    Bytes = 9,
+    Str = 10,
+    List = 11,
 }
 
 /// One value class.
@@ -372,6 +376,146 @@ pub fn new_timestamp(nanos: i64, off_s: i64) -> *mut W_TimestampObject {
     })
 }
 
+// -- the variable-length leaves ------------------------------------------
+//
+// Each is a FIXED-size leaf holding a pointer to a payload block allocated by
+// [`super::object_array`], which is where the encoding is argued. The short
+// version: a varsize tail cannot be passed by value, so it cannot reach the
+// fuse, and upstream forbids a GC array inlined in a struct anyway.
+//
+// This makes them ordinary members of the family as far as the fuse is
+// concerned — a header plus scalar and pointer fields, exactly the shape
+// `W_OptionalObject` is measured fusing. What they add is a residual call per
+// value for the block, which the fuse never sees and the optimizer cannot
+// delete.
+
+/// A CEL `bytes`.
+#[repr(C)]
+#[allow(non_camel_case_types)]
+pub struct W_BytesObject {
+    pub ob_header: CelObject,
+    /// The payload, or null for a value whose block has not been built. Its
+    /// offset-0 word is the allocated capacity, not this length.
+    pub data: *mut CelBytesBlock,
+    /// Live length in bytes. Upstream's `("length", Signed)` on the wrapper:
+    /// the block's word is a capacity and a shrink must not move it.
+    pub length: i64,
+}
+
+pub static CEL_BYTES_CLASS: CelClass = CelClass::new("bytes", CelKind::Bytes);
+
+const _: () = {
+    assert!(offset_of!(W_BytesObject, ob_header) == 0);
+};
+
+/// Both written once at allocation. A mutation allocates a new value.
+#[allow(non_upper_case_globals)]
+pub const _immutable_fields_W_BytesObject: &str = "data,length";
+
+/// Box `bytes` as a CEL `bytes`.
+///
+/// The block is built BEFORE the allocation call, not inside it: the fuse
+/// matches a call taking exactly one argument, the finished value, so anything
+/// the value needs has to already exist when that call is made.
+pub fn new_bytes(bytes: &[u8]) -> *mut W_BytesObject {
+    let data = object_array::new_bytes_block(bytes);
+    let length = bytes.len() as i64;
+    lltype::malloc_typed(W_BytesObject {
+        ob_header: CelObject {
+            ob_type: &CEL_BYTES_CLASS,
+            w_class: get_instantiate(&CEL_BYTES_CLASS),
+        },
+        data,
+        length,
+    })
+}
+
+/// A CEL `string`.
+///
+/// Its own leaf rather than a `bytes` with a different class word, because the
+/// two are different CEL types with different operations, and a shared leaf
+/// would make the class word the only thing separating them at every use site.
+///
+/// The payload is UTF-8, so `byte_len` is what indexes the block and is not the
+/// character count.
+#[repr(C)]
+#[allow(non_camel_case_types)]
+pub struct W_StringObject {
+    pub ob_header: CelObject,
+    pub chars: *mut CelBytesBlock,
+    pub byte_len: i64,
+}
+
+pub static CEL_STRING_CLASS: CelClass = CelClass::new("string", CelKind::Str);
+
+const _: () = {
+    assert!(offset_of!(W_StringObject, ob_header) == 0);
+};
+
+#[allow(non_upper_case_globals)]
+pub const _immutable_fields_W_StringObject: &str = "chars,byte_len";
+
+/// Box `s` as a CEL `string`.
+pub fn new_string(s: &str) -> *mut W_StringObject {
+    let chars = object_array::new_bytes_block(s.as_bytes());
+    let byte_len = s.len() as i64;
+    lltype::malloc_typed(W_StringObject {
+        ob_header: CelObject {
+            ob_type: &CEL_STRING_CLASS,
+            w_class: get_instantiate(&CEL_STRING_CLASS),
+        },
+        chars,
+        byte_len,
+    })
+}
+
+/// A CEL `list`.
+///
+/// ⚠ §3 of the design gives this leaf a `strategy` tag beside the storage
+/// pointer. It is deliberately absent here: a discriminant is only meaningful
+/// once there is a second strategy to discriminate, and the design schedules
+/// those for the phase that lands the unboxed columns. Adding the field now
+/// would be a shape with one inhabitant and no reader. It is a scalar field, so
+/// adding it later does not change how this leaf fuses.
+#[repr(C)]
+#[allow(non_camel_case_types)]
+pub struct W_ListObject {
+    pub ob_header: CelObject,
+    pub items: *mut CelItemsBlock,
+    /// Live element count.
+    pub length: i64,
+}
+
+pub static CEL_LIST_CLASS: CelClass = CelClass::new("list", CelKind::List);
+
+const _: () = {
+    assert!(offset_of!(W_ListObject, ob_header) == 0);
+};
+
+/// ⚠ Immutable in the sense the JIT means: written once at allocation, so a
+/// read may fold. CEL lists are immutable values, so this is not the bet it
+/// would be for a mutable list — a `.append` here builds a new value.
+#[allow(non_upper_case_globals)]
+pub const _immutable_fields_W_ListObject: &str = "items,length";
+
+/// Box `values` as a CEL `list`.
+///
+/// The elements are the family's first MULTIPLE managed edges from one value,
+/// and they live in the block rather than in the leaf. Nothing traces them yet,
+/// for the same reason nothing traces [`W_OptionalObject`]'s single edge.
+pub fn new_list(values: &[CelRef]) -> *mut W_ListObject {
+    let items = object_array::new_items_block(values);
+    let length = values.len() as i64;
+    lltype::malloc_typed(W_ListObject {
+        ob_header: CelObject {
+            ob_type: &CEL_LIST_CLASS,
+            w_class: get_instantiate(&CEL_LIST_CLASS),
+        },
+        items,
+        length,
+    })
+}
+
 /// A CEL type value — what `type(x)` evaluates to.
 ///
 /// `cls` is the class of the type this value *denotes*, while the header's own
@@ -454,6 +598,60 @@ mod tests {
         check(new_duration(1) as CelRef, &CEL_DURATION_CLASS);
         check(new_timestamp(1, 0) as CelRef, &CEL_TIMESTAMP_CLASS);
         check(new_type(&CEL_INT_CLASS) as CelRef, &CEL_TYPE_CLASS);
+        check(
+            new_optional(new_int(1) as CelRef) as CelRef,
+            &CEL_OPTIONAL_CLASS,
+        );
+        check(new_optional_none() as CelRef, &CEL_OPTIONAL_CLASS);
+        check(new_bytes(b"x") as CelRef, &CEL_BYTES_CLASS);
+        check(new_string("x") as CelRef, &CEL_STRING_CLASS);
+        check(new_list(&[]) as CelRef, &CEL_LIST_CLASS);
+    }
+
+    /// The variable-length leaves keep their live length on the leaf and their
+    /// payload in the block, and the two must agree at construction. A block's
+    /// own word is a CAPACITY, so the pair is the only place the distinction is
+    /// observable while every block is still exact-sized.
+    #[test]
+    fn a_variable_length_leaf_and_its_block_agree_on_length() {
+        use crate::runtime::object_array::{
+            bytes_base, bytes_capacity, items_base, items_capacity,
+        };
+        unsafe {
+            let b = new_bytes(b"hello");
+            assert_eq!((*b).length, 5);
+            assert_eq!(bytes_capacity((*b).data), 5);
+            assert_eq!(
+                core::slice::from_raw_parts(bytes_base((*b).data), 5),
+                b"hello"
+            );
+
+            let s = new_string("hi");
+            assert_eq!((*s).byte_len, 2);
+            assert_eq!(bytes_capacity((*s).chars), 2);
+
+            let elems: Vec<CelRef> = (0..3).map(|i| new_int(i) as CelRef).collect();
+            let l = new_list(&elems);
+            assert_eq!((*l).length, 3);
+            assert_eq!(items_capacity((*l).items), 3);
+            for (i, e) in elems.iter().enumerate() {
+                assert_eq!(*items_base((*l).items).add(i), *e);
+            }
+        }
+    }
+
+    /// A `string` is not a `bytes` with a different header: the two are
+    /// distinct CEL types, and nothing may rely on the class word alone to tell
+    /// them apart at a use site that has already narrowed.
+    #[test]
+    fn string_and_bytes_are_separate_classes() {
+        unsafe {
+            let s = new_string("x") as CelRef;
+            let b = new_bytes(b"x") as CelRef;
+            assert_ne!((*s).ob_type, (*b).ob_type);
+            assert_eq!(w_kind(s), CelKind::Str);
+            assert_eq!(w_kind(b), CelKind::Bytes);
+        }
     }
 
     #[test]
