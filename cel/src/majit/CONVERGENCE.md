@@ -191,33 +191,34 @@ its subset.
 > `Vm::run` can be the portal as it stands: the merge point needs `code` bound to
 > a local beside the existing `pc`, which is 2b's work, not a prerequisite to it.
 >
-> **What is genuinely open under the 2a heading is a different fault**, recorded
-> by `cel_census_pipeline_vm_run`: seeded at `vm::eval`, the closure contains
-> `cel_eval_loop`, `Vm::new` and `Vm::public_error` — everything `cel_eval_loop`
-> calls **except** `Vm::run` — so it holds nothing of the loop or the opcode
-> match, while seeding directly at `Vm::run` yields 95 jitcodes including
-> `Vm::step`. The portal is reachable as a *seed* and unreachable as a *callee*.
+> **Nor is what looked like a second, genuine fault one.** Seeded at `vm::eval`,
+> the closure is 29 jitcodes holding `cel_eval_loop`, `Vm::new` and
+> `Vm::public_error` — everything `cel_eval_loop` calls **except** `Vm::run` —
+> and so nothing of the loop or the opcode match; seeded at `Vm::run` it is 95
+> jitcodes including `Vm::step` and `Vm::unwind`. `Vm::run` is never named in the
+> `vm::eval` run at all: not as a jitcode, not as a rtyper skip, not as a prepass
+> failure. That is `policy.py:48-84` working, not a defect. `look_inside_graph`
+> computes `contains_loop = !find_backedges(graph).is_empty()` and returns
+> `res && !contains_loop` unless the graph is `unroll_safe`, recording the
+> refusal in `unsafe_loopy_graphs`; a refused graph becomes a residual call and
+> never enters the closure. `Vm::run` **is** the dispatch loop, so it is refused
+> by construction. `cel_eval_loop` (`match vm.run() { … }`, no loop) and
+> `public_error` (no loop) are not, which is the whole of the asymmetry — and it
+> is why `Compiler::emit` and the other `&mut self` methods come through fine.
 >
-> Two causes were offered for that (the `vm.run()` method edge is not carried
-> across, or the prepass failures truncated discovery before it got there), and
-> `cel_census_vm_walls` separates them. `cel_eval_loop` lowers to 24 blocks
-> carrying **exactly two** method call sites, and it is the only non-test caller
-> of both: `vm.run()` and `vm.public_error(err)`. `public_error` reached the
-> `vm::eval` closure; `run` did not. A method call site therefore *does* carry
-> the closure across — the mechanism works, and the fault is specific to
-> `Vm::run` rather than to receiver calls as a class. **Reshaping the loop into a
-> free function is the wrong remedy for that**, because the remedy's whole
-> content would be to stop using a mechanism just shown to work.
->
-> `<Impl>::run` and `<Impl>::step` both lower with zero walls in isolation, so
-> the surviving hypothesis is that `Vm::run` is discovered and then dropped by a
-> failure on it. Confirm that before spending anything on 2a.
+> This is exactly why upstream registers an interpreter loop as a **portal** —
+> a seed for `find_all_graphs` — rather than expecting it to be discovered as a
+> callee, and why pyre configures `eval_loop_jit` as one. So the conclusion is
+> the useful one: **2a is dissolved entirely, and 2b's portal is
+> `vm::interp::Vm::run` exactly as it stands.** `cel_census_pipeline_vm_run` is
+> already that configuration, and its 95-jitcode closure is what a cel
+> `JitDriverSpec` would see.
 >
 > Read the plan as **2a → 3a → 2b → 3b → 4**:
 >
 > | | |
 > |---|---|
-> | **2a** | ~~portal shape (cel only, no majit)~~ — **dissolved**; see above. The reshape it named is not required, and what remains under the heading is the `Vm::run`-specific discovery fault, which is majit-side |
+> | **2a** | ~~portal shape (cel only, no majit)~~ — **dissolved**; see above. The reshape is not required and the discovery gap it was to fix is `policy.py`'s loopy-graph refusal working as designed. `Vm::run` is already portal-shaped |
 > | **3a** | front-end B ANALYSIS over `cel.ullbc` — ~~corpus stale~~ refreshed and run; `cel::vm` lowers with zero walls |
 > | **2b** | the merge point + jitdriver spec — needs 3a's answers |
 > | **3b** | front-end B EXECUTION (guard_class, jitcodes) |
