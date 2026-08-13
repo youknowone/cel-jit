@@ -49,9 +49,65 @@ through `Program::execute` under `--no-default-features`.
 > **`sync::Arc::deref`, 16 of 88** — the value universe's `Arc` itself. P5 is the
 > phase that deletes it.
 >
-> P5 is SEMVER MAJOR, depends on majit change **M1**, and §8 of the design of
-> record requires M1–M8 to land on one named pyre branch **agreed with the user
-> before P5 starts**. That agreement is a prerequisite, not a formality.
+> P5 is SEMVER MAJOR and §8 of the design of record requires M1–M8 to land on
+> one named pyre branch agreed with the user before P5 starts. **M1 itself is
+> already landed**: `pytype_static_addr`'s doc records that the bucket carries
+> only the address while the root comes from the static's own declared type at
+> the read site, naming `charon-corpus`'s `CelClass` as the case it serves, and
+> `cel_boxing_cluster_fuses_once_the_class_address_resolves` asserts one
+> `NewWithVtable` carrying the real class pointer. The gate the design called
+> "the sole gate on the boxing fuse" is open.
+>
+> **D12 — decided 2026-08-13: register a full finalizer.** The design of record
+> left the `W_OpaqueObject` host-object lifetime open between a finalizer and
+> the contract *"opaque host objects live as long as the heap"*. Take the
+> finalizer, with the side table owning the `Arc<dyn Opaque>` and `host_index` a
+> slab slot. Three grounds, each checked against code rather than inherited:
+>
+> - **The mechanism is not a majit change.** `MiniMarkGC::register_finalizer`,
+>   `finalizer_next_dead`, `deal_with_objects_with_finalizers` and the
+>   `FINALIZER_REGISTERED` dedup flag are all present and unit-tested in
+>   majit-gc. The light-destructor path (`TypeInfo::destructor`) exists too and
+>   is the *wrong* tool, not a missing one.
+> - **Upstream puts this exact case on the full queue.** `W_CPPInstance`
+>   (`pypy/module/_cppyy/interp_cppyy.py`) wraps a host object whose destruction
+>   runs arbitrary host code and uses `register_finalizer`, registering only
+>   when it owns the object. `finalizer-order.rst` restricts light destructors
+>   to "objects that just need to free an extra block of raw memory" and forbids
+>   calling any external C function from one — dropping an `Arc<dyn Opaque>`
+>   runs a user `Drop`, so it fails that test by the doc's own sentence.
+> - **CEL mints opaques during evaluation, so the contract would leak
+>   unboundedly.** `impl_conversions!` (`macros.rs`) emits an
+>   `IntoResolveResult` impl per row, and one row is `Arc<dyn Opaque>`, so a
+>   user-registered host function may *return* a fresh opaque per call — inside
+>   a comprehension, per element. That is the public extension point and it
+>   survives P5, unlike the two in-repo producers (`optional.none()` /
+>   `optional.of()` in `functions.rs`), which leave the opaque route for their
+>   own leaves. And there is no reset point to clear the table at: §7 forbids a
+>   dropped-at-return arena because `Program::execute` returns an unlifetimed
+>   value and eleven `ExecutionError` variants carry one.
+>
+> **Accepted failure mode:** loss of prompt deterministic release. Today the
+> last `Value` drop frees the host object at once; afterwards release waits for
+> unreachability at a major plus the drain, so an opaque holding a scarce
+> resource on an idle heap is held until the next evaluation or teardown.
+> Document that hosts needing prompt release keep their own `Arc` and treat the
+> binding as a borrow. The floor is benign: because the side table owns the
+> `Arc`, the worst case — majors never firing — degrades exactly to the
+> heap-lifetime contract, so this is a strict improvement over it rather than a
+> competing bet.
+>
+> **Drain placement is part of the decision.** The collector-side trigger only
+> schedules; the `Arc` drops run at the `Program::execute` boundary, *not* at
+> the in-VM dispatch safepoint, because a user `Drop` may re-enter cel. Upstream
+> avoids the same hazard by draining between bytecodes via `UserDelAction`.
+>
+> **Coupled constraint, recorded with D12:** post-P5 `dyn Opaque` must be
+> contracted not to embed a `Value`/`CelRef`. The side table is not in §7's root
+> set, so an entry holding one dangles; adding the table to the root set instead
+> would invert D12 by making every opaque's referents heap-lifetime. Today's
+> trait admits embedding — `OptionalValue` is an `Opaque` holding a `Value` —
+> so this has to be a documented contract, not a compile-time bound.
 
 ## The problem
 
