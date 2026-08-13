@@ -918,6 +918,39 @@ walker), over the 28 timed cases:
   `variable_access`'s fixed share is ~81%, not the ~100% the plateau suggests.
   The DIRECTION and the allocation census are solid; the third digit is not.
 
+  **Both removable ones are now removed, and the removal is measured.** (3) is
+  the contract and stays.
+
+  * (2) landed as "build the interned string table only when an arm will read
+    it": `to_values` builds it in the `Scalar` arm only for `ValType::Str`, and
+    in the `List` arm only when some field is `Str`. The false comment is gone
+    and `intern`'s doc records the measurement instead.
+  * (1) landed as "run the clean interpreter over banks the caller keeps".
+    `BatchRun` owns a `Banks` pair and hands it to the tier through its closure;
+    `clean_interp_seeded_f_in` resizes and overwrites them rather than
+    allocating. `clean_interp_seeded_f` stays as the allocating wrapper, so
+    every existing caller is unchanged.
+
+    allocs_per_eval now carries a `regvm/clean-banked/*` row beside each
+    `regvm/clean/*` one, asserting first that the two agree on the result — the
+    pair IS the measurement, and it was added because no row in the corpus could
+    see this lever at all:
+
+    | row | allocating | banked |
+    |---|---|---|
+    | `arith/n=1`, `arith/n=1000` | 1.000 | **0.000** |
+    | `policy/n=1`, `policy/n=1000` | 1.000 | **0.000** |
+    | `float/n=1`, `float/n=1000` | 2.000 | **0.000** |
+
+    `min == max` on every row, `unstable=0`. The float rows start at 2 because
+    `num_fregs > 0` adds the second bank; both go.
+
+  ⛔ **The tracing tiers still pay (1).** They enter through `run_mainloop_f`,
+  which builds its banks INSIDE the traced portal. Handing them in means adding
+  a parameter to that function, and its greens bind **by position** off the
+  marker call — so it is not a local change, and it was left out of the same
+  commit rather than risked as a drive-by.
+
 **The compiled tier does not engage at this unit.** Only **12 of 28** rows
 compiled at all; for the other 16 the `majit` column is the tracing interpreter
 printed under the compiled tier's heading, at a fixed **539.8–780.7 ns**
