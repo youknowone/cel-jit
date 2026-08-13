@@ -834,6 +834,57 @@ The floor check says the columnar pipeline is worth having in the first place �
 so the lowering alone buys ~8x and the JIT buys ~8x on top of that, ~66x
 end to end. Pre-fix majit ran this at 3276 ns/row — slower than the tree-walker.
 
+## The per-call regime, which is a different unit and answers differently
+
+Measured 2026-08-13 at cel-jit `d60a60c`, `cel/examples/majit_vs_cometkim_percall`
+in its documented regime (`--profile bench --features jit-cranelift`): one
+expression, one FIXED activation, ONE evaluation timed. The ladder above times a
+batch of many rows; this times a single `execute`, which is the unit the design
+of record's stop-at-P5 gate is stated in. **They do not substitute for each
+other, and the tier answers them oppositely.**
+
+⚠ The denominator is **29** — the harness prints it (`28/29 lower to the
+compiled tier; 29/29 are answered`, `custom_function` declining with
+*"unsupported for majit lowering: call `add`"*). Earlier notes quoting `N/28`,
+and the file's own doc comment saying "18 benchmark expressions", are both
+against a denominator this run does not have.
+
+**The lowering — the landed half of the epic — is the win here.** `clean`
+(the plain bytecode VM over the lowered program, no tracing machinery) against
+`stock` (the tree walker), over the 28 timed cases:
+
+* faster on **22 of 28**, up to `all_comprehension` 8.01x, `exists_comprehension`
+  6.78x, `real_world_policy` 4.78x, `string_operations` 3.75x;
+* slower on 6, and one class is not marginal: `variable_access/hashmap` and
+  `variable_access/resolver` both run **0.11x** — the walker answers them in
+  ~5.4 ns and the VM takes ~50 ns. A bare variable read is where dispatch
+  overhead has nothing to amortise against.
+
+**The compiled tier does not engage at this unit.** Only **12 of 28** rows
+compiled at all; for the other 16 the `majit` column is the tracing interpreter
+printed under the compiled tier's heading, at a fixed **539.8–780.7 ns**
+(median 583.0). At one row per call the batch loop has no back edge to get hot
+on. Of the 12 that did compile, the tier wins only above roughly 100 elements:
+
+| case | stock ns | majit ns | ratio |
+|---|---|---|---|
+| `map_list_scaling/10000` | 221084.2 | 11835.0 | **18.68x** |
+| `filter_list_scaling/10000` | 329411.5 | 30671.2 | **10.74x** |
+| `comprehension_scaling/500` | 23679.4 | 2970.8 | **7.97x** |
+| `map_list_scaling/100` | 2639.2 | 1122.8 | **2.35x** |
+| `comprehension_scaling/10` | 807.2 | 1072.6 | 0.75x |
+| `filter_list_scaling/10` | 494.1 | 1138.6 | 0.43x |
+
+Crossover sits between 10 and 100 elements on all three ladders.
+
+⛔ This is a second, independent measurement pointing the same way as the design
+of record's NO-GO: for a single evaluation the compiled tier is not what answers
+the call, and the fixed cost that stops it is not in the compiled code. It does
+**not** reproduce that gate's own figure — task #88 puts a compiled artefact's
+fixed per-call cost at 34–92 µs, two orders above the ~583 ns floor seen here —
+so the two are agreeing in direction on different quantities, and neither
+number should be quoted for the other.
+
 ## The fixed cost: the driver and the program now outlive a batch
 
 The break-even above was set entirely by trace + compile, and the arithmetic said
