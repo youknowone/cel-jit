@@ -182,38 +182,40 @@ pub fn new_items_block(values: &[CelRef]) -> *mut CelItemsBlock {
     // upstream refuses the shape by name (`jtransform.py`,
     // `raise Exception("setfield_raw_r not supported")`).
     //
-    // The route out is `setarrayitem_gc_r`, and it is closed to cel BY NAME.
-    // Registering the block as a GC array is necessary and not sufficient:
-    // [`super::registration`] now does that, and this store still does not
-    // lower, because the front end decides whether a `*base.add(i) = v` is an
-    // array store before any descr or type id is consulted. All four of its
-    // reference-array store routes are keyed on pyre identities:
+    // The route out is `setarrayitem_gc_r`, through the front end's
+    // `is_list_items_elem_ptr_add_parts`. It has FIVE conditions and the store
+    // below is written to satisfy all five, because four of them are invisible
+    // in the diff:
     //
-    //   - `is_list_items_elem_ptr_add_parts` — the `*base.add(i)` route, this
-    //     one's shape — requires `is_pyobjectref_items_ptr`, whose last test is
-    //     `raw_ptr_pointee_class_root(..) == Some("PyObject")`. [`CelRef`] is a
-    //     `*mut CelObject`, so the pointee root is `"CelObject"`. It also
-    //     requires `base_traces_to_items_block_accessor`, whose
-    //     `regular_call_is_items_block_accessor` is a WHOLE-PATH match against
-    //     `pyre_object::object_array::items_block_items_base`; cel's accessor is
-    //     in crate `cel`, so no rename inside this module reaches it.
-    //   - `is_workspace_index_regular` — `Index` / `IndexMut` — gates on
-    //     `path.starts_with("pyre_")`.
-    //   - `is_object_array_set_ref_call` — whole-path
-    //     `pyre_object::object_array::<Impl>::set_ref`.
-    //   - `is_vec_index_regular` wants a `Vec<T>` receiver, which is the
-    //     encoding this module's header rules out.
+    // 1. The callee is `<*mut T>::add` — hence `.add(i)` and not an
+    //    `items[i]`-style index.
+    // 2. The receiver points at a managed reference: `*mut CelRef` is
+    //    `*mut *mut CelObject`, and `is_object_ref_items_ptr` reads the pointee
+    //    class root off the type. It used to compare that root against the
+    //    literal `"PyObject"`, which no non-pyre host could ever answer;
+    //    majit-translate now derives it.
+    // 3. The index is a runtime local, which `i` is.
+    // 4. The base traces to a recognised items-base accessor — which is why
+    //    [`items_block_items_base`] carries that name and not a shorter one.
+    //    See its own doc: the name is the contract, and it is load-bearing at
+    //    BOTH ends.
+    // 5. ⚠ The `.add` result is dereferenced exactly once and never escapes
+    //    (`add_dest_used_only_as_single_deref`). **This is why the store is
+    //    `*base.add(i) = ..` and not `base.add(i).write(..)`.** `.write()` is a
+    //    method call taking the pointer BY VALUE, so the guard counts it as an
+    //    escape — one `other` use is enough to refuse — and the whole route
+    //    declines however the other four conditions land. A place assignment is
+    //    a deref the guard can see. The two spellings are identical Rust and
+    //    are not identical to the front end.
     //
-    // Only brick 1's `graph_is_items_block_base_accessor` is already
-    // crate-agnostic (a `::`-suffix match). So this is a majit-side widening,
-    // not a cel-side spelling: until those gates admit a non-pyre pointee root
-    // and a non-pyre accessor path, this call is a wall — and it is a wall only
-    // for the reference block.
+    // Registration is necessary and not sufficient here, and so is every
+    // condition above: the front end decides whether this is an array store
+    // before any descr or type id is consulted.
     unsafe {
-        let base = items_base(block);
+        let base = items_block_items_base(block);
         let mut i = 0;
         while i < values.len() {
-            base.add(i).write(values[i]);
+            *base.add(i) = values[i];
             i += 1;
         }
     }
@@ -238,19 +240,29 @@ pub fn new_bytes_block(bytes: &[u8]) -> *mut CelBytesBlock {
 
 /// Item 0 of a reference block, or null for a null block.
 ///
-/// ⚠ An earlier revision claimed the byte-offset add is "what the front-end
-/// recognises as an array base". It is not, for this function: the recognition
-/// is `graph_is_items_block_base_accessor`, a match on the ACCESSOR'S OWN
-/// module-qualified name, and the gates downstream of it are keyed on pyre
-/// identities — see [`new_items_block`]. The shape below is the right one to
-/// hold, because it is the one those gates are written around; it is not by
-/// itself what makes an access lower.
+/// ⚠ **The NAME is a contract with the front end, not a style choice, and it
+/// is load-bearing at two ends that must agree.** `graph_is_items_block_base_accessor`
+/// matches this function's own module-qualified name — `object_array::items_block_items_base`,
+/// crate prefix ignored — and rewrites the `.add` below to return the block
+/// HEADER, because the array descr that reads through it re-adds `base_size`.
+/// `is_object_items_block_base_accessor` matches the same name at the other
+/// end, where [`new_items_block`]'s element store is lowered.
+///
+/// If only the first end matched, this would return the header and the element
+/// store would stay a raw `.add` striding from the LENGTH WORD — every item off
+/// by one, silently. So the name is either right for both or wrong for both;
+/// renaming it to something shorter re-opens exactly that gap. An earlier
+/// revision of this function was called `items_base`, which matched neither.
+///
+/// An earlier revision of this doc also claimed the byte-offset add is "what
+/// the front-end recognises as an array base". It is not — the recognition is
+/// the name, and the shape only has to be the one the rewrite expects.
 ///
 /// # Safety
 ///
 /// `block` is null or points at a live block.
 #[inline]
-pub unsafe fn items_base(block: *mut CelItemsBlock) -> *mut CelRef {
+pub unsafe fn items_block_items_base(block: *mut CelItemsBlock) -> *mut CelRef {
     if block.is_null() {
         return core::ptr::null_mut();
     }
@@ -261,7 +273,7 @@ pub unsafe fn items_base(block: *mut CelItemsBlock) -> *mut CelRef {
 ///
 /// # Safety
 ///
-/// As [`items_base`].
+/// As [`items_block_items_base`].
 #[inline]
 pub unsafe fn bytes_base(block: *mut CelBytesBlock) -> *mut u8 {
     if block.is_null() {
@@ -274,7 +286,7 @@ pub unsafe fn bytes_base(block: *mut CelBytesBlock) -> *mut u8 {
 ///
 /// # Safety
 ///
-/// As [`items_base`].
+/// As [`items_block_items_base`].
 #[inline]
 pub unsafe fn items_capacity(block: *mut CelItemsBlock) -> usize {
     if block.is_null() {
@@ -285,7 +297,7 @@ pub unsafe fn items_capacity(block: *mut CelItemsBlock) -> usize {
 
 /// # Safety
 ///
-/// As [`items_base`].
+/// As [`items_block_items_base`].
 #[inline]
 pub unsafe fn bytes_capacity(block: *mut CelBytesBlock) -> usize {
     if block.is_null() {
@@ -318,7 +330,7 @@ mod tests {
             let values: Vec<CelRef> = (0..4).map(|i| new_int(i) as CelRef).collect();
             let block = new_items_block(&values);
             assert_eq!(items_capacity(block), 4);
-            let base = items_base(block);
+            let base = items_block_items_base(block);
             for (i, v) in values.iter().enumerate() {
                 assert_eq!(*base.add(i), *v);
             }
@@ -355,7 +367,7 @@ mod tests {
     #[test]
     fn the_accessors_are_null_safe() {
         unsafe {
-            assert!(items_base(core::ptr::null_mut()).is_null());
+            assert!(items_block_items_base(core::ptr::null_mut()).is_null());
             assert!(bytes_base(core::ptr::null_mut()).is_null());
             assert_eq!(items_capacity(core::ptr::null_mut()), 0);
             assert_eq!(bytes_capacity(core::ptr::null_mut()), 0);

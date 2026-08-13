@@ -616,7 +616,7 @@ mod tests {
     #[test]
     fn a_variable_length_leaf_and_its_block_agree_on_length() {
         use crate::runtime::object_array::{
-            bytes_base, bytes_capacity, items_base, items_capacity,
+            bytes_base, bytes_capacity, items_block_items_base, items_capacity,
         };
         unsafe {
             let b = new_bytes(b"hello");
@@ -636,7 +636,7 @@ mod tests {
             assert_eq!((*l).length, 3);
             assert_eq!(items_capacity((*l).items), 3);
             for (i, e) in elems.iter().enumerate() {
-                assert_eq!(*items_base((*l).items).add(i), *e);
+                assert_eq!(*items_block_items_base((*l).items).add(i), *e);
             }
         }
     }
