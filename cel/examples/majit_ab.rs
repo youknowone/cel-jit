@@ -39,8 +39,8 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use cel::majit::bytecode::float_bank::{
-    clean_interp_seeded_f, pooled_driver_bytes, run_jit_persistent_f, run_jit_seeded_f, COMPILES,
-    GUARD_FAILS,
+    clean_interp_seeded_f, pooled_driver_bytes, pooled_driver_inline_bytes, run_jit_persistent_f,
+    run_jit_seeded_f, COMPILES, GUARD_FAILS,
 };
 use cel::majit::lower::{lower_typed, Schema, ValType};
 use cel::{Context, Program, Value};
@@ -305,8 +305,10 @@ fn warm_break_even() {
     // in a separate panel. A row with `compiles = 0` and no prior compile for
     // its shape contains no compiled code, whatever its timing says.
     println!(
-        "      pooled driver: {} bytes moved per call, twice (out of DRIVERS and back)",
-        pooled_driver_bytes()
+        "      pooled driver: {} bytes moved per call, twice (out of DRIVERS and back); \
+         driver is {} bytes inline",
+        pooled_driver_bytes(),
+        pooled_driver_inline_bytes()
     );
     println!(
         "      rows    clean us      idle us       jit us   idle-clean    jit-idle  \

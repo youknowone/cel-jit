@@ -2065,7 +2065,21 @@ pub mod float_bank {
     /// counter's timetable is a `Vec`, the warm-enter state's cells are an
     /// index map, cranelift's module and builder context are headers -- so a
     /// small answer here refutes the memcpy reading rather than confirming it.
+    ///
+    /// It is now a pointer width, because the map holds the driver behind a
+    /// `Box`. Compare against [`pooled_driver_inline_bytes`], which is what
+    /// this used to report and what the move used to copy.
     pub fn pooled_driver_bytes() -> usize {
+        core::mem::size_of::<Box<PooledDriver>>()
+    }
+
+    /// Inline width of the driver itself -- what the take-and-reinsert pair
+    /// copied per call before the `Box`, twice.
+    ///
+    /// Kept so the diagnostic still reports the cost that was removed rather
+    /// than only the one that remains; a bare "8 bytes moved" reads as though
+    /// there had never been anything to remove.
+    pub fn pooled_driver_inline_bytes() -> usize {
         core::mem::size_of::<PooledDriver>()
     }
 
@@ -2079,8 +2093,15 @@ pub mod float_bank {
         /// `max_age` generations by `memmgr.py:23-69`) and never recompiles per
         /// invocation. The threshold is part of the key so the interpreter tier
         /// (`u32::MAX`) can never pick up the JIT tier's compiled loop.
+        /// Boxed because `run_jit_persistent_f` takes the entry OUT of the map
+        /// for the duration of the run and puts it back after, so the map's
+        /// value type is copied twice per call. Behind a `Box` that pair moves
+        /// a pointer instead of the whole `JitDriver`, which is inline-large
+        /// (`pooled_driver_inline_bytes`) even though its heavy components are
+        /// heap handles. The take-and-reinsert shape is unchanged -- this is
+        /// the same re-entrancy behaviour, not a different one.
         static DRIVERS: core::cell::RefCell<
-            std::collections::HashMap<(usize, usize, u32), PooledDriver>,
+            std::collections::HashMap<(usize, usize, u32), Box<PooledDriver>>,
         > = core::cell::RefCell::new(std::collections::HashMap::new());
     }
 
@@ -2126,9 +2147,11 @@ pub mod float_bank {
         // driver rather than panicking on the `RefCell`.
         let mut pooled = DRIVERS
             .with(|d| d.borrow_mut().remove(&key))
-            .unwrap_or_else(|| PooledDriver {
-                driver: new_driver_f(threshold, init_regs.len(), num_fregs),
-                programs: std::collections::HashMap::new(),
+            .unwrap_or_else(|| {
+                Box::new(PooledDriver {
+                    driver: new_driver_f(threshold, init_regs.len(), num_fregs),
+                    programs: std::collections::HashMap::new(),
+                })
             });
         // Before the run, not after: the loop this call may compile is keyed on
         // the address, so the address has to be pinned by the time it is taken.
