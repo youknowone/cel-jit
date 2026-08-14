@@ -498,6 +498,23 @@ struct Compiled {
     /// exit, and the one row that always runs interpreted before the first back
     /// edge. It is therefore an UPPER bound on call overhead, not the overhead.
     jit_fix: Option<f64>,
+    /// The SAME slope on the tier that cannot compile: the traced portal with
+    /// its trace threshold at `u32::MAX`. This is the per-row cost BEFORE the
+    /// JIT has produced compiled code — and, because a one-row call takes no
+    /// back edge, it is also what a one-row call pays for ever. `jit_row`
+    /// beside it is the same row AFTER compiling, so the pair is what the
+    /// compiled tier actually earned.
+    interp_row: Option<f64>,
+    interp_fix: Option<f64>,
+    /// The same slope with no tracing machinery in the picture at all. It is
+    /// the floor under both of the above; `interp_row - clean_row` is what
+    /// arming the JIT costs a row that never gets compiled code out of it.
+    clean_row: Option<f64>,
+    /// `clean_fix` is the one fixed cost with NO driver behind it —
+    /// `Tier::Clean` dispatches straight to the plain interpreter and never
+    /// touches the pooled-driver path. So `jit_fix - clean_fix` is that path's
+    /// per-call cost, measured rather than itemised.
+    clean_fix: Option<f64>,
 }
 
 struct Row {
@@ -649,7 +666,13 @@ fn run_case(case: &Case) -> Row {
             .unwrap_or_else(|e| panic!("{}: rebind: {e}", case.label))
     });
 
-    let (jit_row, jit_fix) = compiled_row_cost(case, &lowered);
+    // Three legs of one measurement, so they are taken together rather than
+    // wherever each is first needed. Order is free — see `row_cost` on why the
+    // three tiers cannot contaminate one another — so it runs floor-first,
+    // which is also the order the table reads in.
+    let (clean_row, clean_fix) = row_cost(case, &lowered, Tier::Clean);
+    let (interp_row, interp_fix) = row_cost(case, &lowered, Tier::Interpreter);
+    let (jit_row, jit_fix) = row_cost(case, &lowered, Tier::Jit);
 
     Row {
         label: case.label.clone(),
@@ -667,12 +690,24 @@ fn run_case(case: &Case) -> Row {
             entries,
             jit_row,
             jit_fix,
+            interp_row,
+            interp_fix,
+            clean_row,
+            clean_fix,
         }),
     }
 }
 
-/// The compiled tier's marginal cost of ONE more activation, and the fixed cost
-/// of the call that carries it.
+/// `tier`'s marginal cost of ONE more activation, and the fixed cost of the
+/// call that carries it.
+///
+/// Run on all three tiers this is the pre-compile / post-compile split: the
+/// per-row cost BEFORE the JIT has given the loop compiled code
+/// (`Tier::Interpreter`) and AFTER (`Tier::Jit`), in one unit, with
+/// `Tier::Clean` — no tracing machinery at all — as the floor under both.
+/// Without that split the compiled tier has no number of its own: a one-row
+/// call is the pre-compile tier forever (see below), so the head-to-head
+/// column and the compiled tier are two different machines under one heading.
 ///
 /// Why a slope and not a timing of one activation: the row loop is
 /// bottom-tested, so an `n`-row batch takes `n - 1` back edges and a ONE-row
@@ -684,7 +719,14 @@ fn run_case(case: &Case) -> Row {
 ///
 /// So: replicate the SAME activation `k` times, bit for bit, and difference two
 /// batch sizes. What survives the subtraction is the per-activation cost of
-/// compiled code; what it removes is everything a call pays once.
+/// `tier`; what it removes is everything a call pays once.
+///
+/// The three legs do not contaminate each other and do not have to be ordered.
+/// The driver pool is keyed on `(regs, fregs, THRESHOLD)`, so the
+/// `u32::MAX`-threshold driver `Tier::Interpreter` runs on is a different pool
+/// entry from `Tier::Jit`'s and never sees a loop `Tier::Jit` compiled;
+/// `Tier::Clean` takes no driver at all. The entry gate below checks that
+/// rather than assuming it.
 ///
 /// ⚠ The result is NOT the same unit as cometkim's `compiled` column. His
 /// number is one whole `CompiledProgram::execute(&ctx)` including all per-call
@@ -693,8 +735,8 @@ fn run_case(case: &Case) -> Row {
 /// cannot currently make, and must be read as a model.
 ///
 /// Returns `(None, None)` rather than a number whenever the evidence for
-/// "this ran in compiled code" is not complete.
-fn compiled_row_cost(case: &Case, lowered: &BatchProgram) -> (Option<f64>, Option<f64>) {
+/// "this ran on `tier` and on nothing else" is not complete.
+fn row_cost(case: &Case, lowered: &BatchProgram, tier: Tier) -> (Option<f64>, Option<f64>) {
     // Keep the replicated work bounded: a ladder member already carries
     // thousands of elements per row, and replicating THAT a thousand times
     // would measure the machine's memory system rather than its loop.
@@ -739,12 +781,12 @@ fn compiled_row_cost(case: &Case, lowered: &BatchProgram) -> (Option<f64>, Optio
     };
 
     let run_hi = || {
-        bhi.collect_raw_on(Tier::Jit, consume_raw)
-            .unwrap_or_else(|e| panic!("{}: slope hi: {e}", case.label))
+        bhi.collect_raw_on(tier, consume_raw)
+            .unwrap_or_else(|e| panic!("{}: {tier:?} slope hi: {e}", case.label))
     };
     let run_lo = || {
-        blo.collect_raw_on(Tier::Jit, consume_raw)
-            .unwrap_or_else(|e| panic!("{}: slope lo: {e}", case.label))
+        blo.collect_raw_on(tier, consume_raw)
+            .unwrap_or_else(|e| panic!("{}: {tier:?} slope lo: {e}", case.label))
     };
 
     // `k_hi - 1` back edges in the first call alone, so the threshold is crossed
@@ -754,6 +796,20 @@ fn compiled_row_cost(case: &Case, lowered: &BatchProgram) -> (Option<f64>, Optio
         black_box(run_lo());
     }
 
+    // `Tier::Jit` is the only tier whose number is ABOUT compiled code, so it is
+    // the only one required to enter it. For the other two, entering is the
+    // failure: a `Tier::Interpreter` slope that ran compiled code is a
+    // `Tier::Jit` slope with the wrong heading, which is the very confusion this
+    // split exists to end. Both directions are checked against the same counter.
+    let must_enter = matches!(tier, Tier::Jit);
+    let entry_ok = |seen: usize, calls: usize| {
+        if must_enter {
+            seen >= calls
+        } else {
+            seen == 0
+        }
+    };
+
     // GATE 1 — entry, over a FIXED-count window. `per_call_counted` calibrates
     // by invoking its closure an unbounded number of times, so a probe that ran
     // through it could not state its own denominator.
@@ -762,7 +818,7 @@ fn compiled_row_cost(case: &Case, lowered: &BatchProgram) -> (Option<f64>, Optio
     for _ in 0..PROBE {
         black_box(run_hi());
     }
-    if COMPILED_ENTRIES.load(Ordering::Relaxed) - e0 < PROBE {
+    if !entry_ok(COMPILED_ENTRIES.load(Ordering::Relaxed) - e0, PROBE) {
         return (None, None);
     }
 
@@ -774,13 +830,15 @@ fn compiled_row_cost(case: &Case, lowered: &BatchProgram) -> (Option<f64>, Optio
     let (t_hi, calls_hi) = per_call_counted(run_hi);
     let (t_lo, calls_lo) = per_call_counted(run_lo);
 
-    // GATE 2 — every timed call entered, not merely one of them.
+    // GATE 2 — every timed call entered, not merely one of them. Under
+    // `must_enter == false` this is the opposite claim about the same counter:
+    // not one of them did.
     let entered = COMPILED_ENTRIES.load(Ordering::Relaxed) - en0;
     // GATE 3 — steady state: the slope must not be measuring trace/compile
     // churn, and the bigger batch must actually cost more.
     let churned =
         COMPILES.load(Ordering::Relaxed) != c0 || TRACE_ABORTS.load(Ordering::Relaxed) != ab0;
-    if entered < calls_hi + calls_lo || churned || !(t_hi > t_lo) {
+    if !entry_ok(entered, calls_hi + calls_lo) || churned || !(t_hi > t_lo) {
         return (None, None);
     }
 
@@ -1142,6 +1200,87 @@ fn print_decomposition(rows: &[Row]) {
     );
 }
 
+/// The pre-compile / post-compile split, printed on its own.
+///
+/// Separate from the table above because it is a DIFFERENT UNIT: every column
+/// there is one whole call, every column here is one activation with the call's
+/// fixed cost differenced away. Putting a per-call and a per-row number side by
+/// side under adjacent headings is how the two came to be read as one machine.
+///
+/// A `-` is a refusal, not a zero: `row_cost` returns nothing unless its entry
+/// counter agreed with the tier it was asked for, in both directions.
+fn print_row_cost_table(rows: &[Row]) {
+    println!(
+        "\nper-row cost BY TIER — one replicated-batch slope, run on three tiers.\n\
+         `interp` is the traced portal with its trace threshold at `u32::MAX`, so it can\n\
+         never compile: that column is the per-row cost BEFORE compiling and `jit` is the\n\
+         same row AFTER. `clean` is the plain VM, the floor under both."
+    );
+    println!(
+        "{:<28} {:>10} {:>11} {:>9} {:>12} {:>10} {:>11} {:>9} {:>9}",
+        "case",
+        "clean/row",
+        "interp/row",
+        "jit/row",
+        "jit earns",
+        "clean fix",
+        "interp fix",
+        "jit fix",
+        "drv fix",
+    );
+    let opt = |v: Option<f64>| match v {
+        Some(x) => format!("{x:.1}"),
+        None => "-".to_string(),
+    };
+    for r in rows {
+        let c = match &r.compiled {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let earns = match (c.interp_row, c.jit_row) {
+            (Some(i), Some(j)) if j > 0.0 => format!("{:.2}x", i / j),
+            _ => "-".to_string(),
+        };
+        let drv = match (c.jit_fix, c.clean_fix) {
+            (Some(j), Some(cl)) => format!("{:.1}", j - cl),
+            _ => "-".to_string(),
+        };
+        println!(
+            "{:<28} {:>10} {:>11} {:>9} {:>12} {:>10} {:>11} {:>9} {:>9}",
+            r.label,
+            opt(c.clean_row),
+            opt(c.interp_row),
+            opt(c.jit_row),
+            earns,
+            opt(c.clean_fix),
+            opt(c.interp_fix),
+            opt(c.jit_fix),
+            drv,
+        );
+    }
+    println!(
+        "\n`jit earns` is `interp/row / jit/row` — what compiling bought for ONE activation,\n\
+         with the call's fixed cost differenced out of both sides. It is the only ratio in\n\
+         this file that compares two of OUR tiers on one unit, and so the only one that\n\
+         says whether the compiler is doing its job independently of how the call is\n\
+         entered.\n\
+         \n\
+         `drv fix` is `jit fix - clean fix`. `Tier::Clean` dispatches straight to the plain\n\
+         interpreter and takes no driver at all, so this difference is the pooled-driver\n\
+         path's own per-call cost — the pool lookup, the program-table insert, the state\n\
+         republish, the per-call state buffers — measured rather than itemised.\n\
+         \n\
+         ⚠ `interp fix` and `jit fix` both still CONTAIN one interpreted row: the batch\n\
+         loop is bottom-tested, so row 0 runs before the first back edge on every tier.\n\
+         That row's cost scales with the expression, which is why these intercepts differ\n\
+         per case while `drv fix` is the part that does not.\n\
+         \n\
+         ⚠ `jit earns` is not a claim about a single call. Today no one-row call enters\n\
+         compiled code at all, so `interp/row` is what a call in cometkim's regime actually\n\
+         pays and `jit/row` is what it WOULD pay if the entry existed."
+    );
+}
+
 fn main() {
     println!("cometkim's benchmark expressions in his own regime (cel-jit PR #233)");
     println!(
@@ -1254,6 +1393,7 @@ fn main() {
                 hot — at one row per call the batch loop has no back edge to be hot on."
         );
     }
+    print_row_cost_table(&rows);
     println!(
         "\n`clean ns` is the same lowered bytecode on the plain Rust VM, with no tracing\n\
          machinery at all. Where `majit` is far above it the cost is the tracer, not the\n\
