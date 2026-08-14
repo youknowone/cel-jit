@@ -953,6 +953,21 @@ pub mod float_bank {
         }
     }
 
+    /// [`initial_state_f`] over banks the caller keeps between calls.
+    ///
+    /// The banks arrive in whatever state the previous call left them, so all
+    /// three fields are re-established here rather than assumed. Only the
+    /// allocation is saved, not the initialization — and saving it is the
+    /// point, because a one-row call is otherwise two heap allocations of
+    /// prologue for a few nanoseconds of work.
+    fn reseed_state_f(state: &mut VmStateF, init_regs: &[i64], num_fregs: usize) {
+        state.regs.resize(init_regs.len(), 0);
+        state.regs.copy_from_slice(init_regs);
+        state.fregs.clear();
+        state.fregs.resize(num_fregs, 0.0);
+        state.ret = 0;
+    }
+
     #[majit_macros::jit_interp(
         state = VmStateF,
         env = Code,
@@ -970,7 +985,7 @@ pub mod float_bank {
     fn run_mainloop_f(
         mut driver: &mut majit_metainterp::JitDriver<VmStateF>,
         program: &Code,
-        mut state: VmStateF,
+        state: &mut VmStateF,
         mut pc: usize,
     ) -> i64 {
         loop {
@@ -981,7 +996,7 @@ pub mod float_bank {
             // finishes the opcodes a mid-opcode abort left half-executed — a
             // consumer on the bare form never reaches that, because the driver
             // drops the stale stash at the next merge-point entry.
-            jit_merge_point!(driver, program, pc; state);
+            jit_merge_point!(driver, program, pc; *state);
             let opcode = program[pc];
             match opcode {
                 OP_LOAD_CONST => {
@@ -1484,7 +1499,7 @@ pub mod float_bank {
                     let tgt = program[pc + 3] as usize;
                     if state.regs[a] > state.regs[b] {
                         if tgt < pc {
-                            can_enter_jit!(driver, tgt, &mut state, program, || {});
+                            can_enter_jit!(driver, tgt, &mut *state, program, || {});
                         }
                         pc = tgt;
                         continue;
@@ -1534,7 +1549,7 @@ pub mod float_bank {
         run_mainloop_f(
             driver,
             program,
-            initial_state_f(init_regs, num_fregs),
+            &mut initial_state_f(init_regs, num_fregs),
             ENTRY_PC,
         )
     }
@@ -1630,7 +1645,7 @@ pub mod float_bank {
     fn try_function_entry_jit_f(
         driver: &mut majit_metainterp::JitDriver<VmStateF>,
         program: &Code,
-        loop_keys: &[u64],
+        pooled: &PooledProgram,
         state: &mut VmStateF,
         pc: &mut usize,
     ) -> Option<i64> {
@@ -1644,10 +1659,18 @@ pub mod float_bank {
         // same code. The calls this door exists for are the ones the loop's door
         // cannot serve, and those are exactly the calls whose loop never gets
         // hot — a bottom-tested loop at one row takes no back edge at all.
-        if loop_keys.iter().any(|key| driver.has_compiled_loop(*key)) {
+        if pooled
+            .loop_keys
+            .iter()
+            .any(|key| driver.has_compiled_loop(*key))
+        {
             return None;
         }
-        let (hash, values, types) = green_key_at(program, ENTRY_PC);
+        // Read, not recomputed: the key is `green_key_at(program, ENTRY_PC)`,
+        // and both of its inputs are fixed for as long as the pool pins this
+        // address. See [`PooledProgram`].
+        let hash = pooled.entry_hash;
+        let (values, types) = (&pooled.entry_values, &pooled.entry_types);
         if driver.has_compiled_loop(hash) {
             // The same call the row loop's back edge makes, so entry, guard
             // failure, blackhole resume and bridge start are all handled the one
@@ -2218,6 +2241,14 @@ pub mod float_bank {
         // another one. The door is on [`run_jit_persistent_f`], whose driver
         // outlives the call.
         let result = run_mainloop_from_start_f(&mut driver, program, init_regs, num_fregs);
+        // This driver may have published the per-thread state-field store, and
+        // it is about to die. Telling the pool who holds the store now is what
+        // keeps its skip-the-republish stamp honest — see
+        // [`DriverPool::published_epoch`].
+        let epoch = driver.state_field_fvc_epoch();
+        if epoch != 0 {
+            DRIVERS.with(|d| d.borrow_mut().published_epoch = epoch);
+        }
         // The driver dies at the end of this scope, so read the two tallies that
         // have no callback out of it first.
         let stats = driver.get_stats();
@@ -2264,22 +2295,86 @@ pub mod float_bank {
     /// where upstream would hold one per cell.
     struct PooledDriver {
         driver: majit_metainterp::JitDriver<VmStateF>,
-        /// Keyed by address, which is exactly the identity that must not be
-        /// reused. Two binds of one program collapse to one entry.
-        programs: std::collections::HashMap<usize, PooledProgram>,
+        /// In first-sighting order, so a caller that has already resolved one
+        /// reaches it by index. Appended to and never reordered or removed:
+        /// the whole driver is flushed at once ([`MAX_PROGRAMS_PER_DRIVER`]),
+        /// which is what keeps an index from outliving what it names.
+        programs: Vec<PooledProgram>,
+        /// Address to index into `programs`. Keyed by address, which is exactly
+        /// the identity that must not be reused; two binds of one program
+        /// collapse to one entry. Consulted on a first sighting only.
+        by_addr: std::collections::HashMap<usize, usize>,
+        /// The register banks a call runs on, kept between calls so seeding
+        /// them is two memcpys rather than two allocations. See
+        /// [`reseed_state_f`].
+        ///
+        /// Reached only through the checked-out driver, so a re-entrant call —
+        /// which by construction gets a driver of its own — cannot alias it.
+        state: VmStateF,
     }
 
     /// One program the pool holds alive, with what the entry door needs to know
     /// about it.
+    ///
+    /// Every field but `words` is a pure function of the words, and the words
+    /// cannot change under an address the pool is pinning, so all of it is
+    /// computed on the first sighting and read on every call after.
     struct PooledProgram {
         /// The words. Held for exactly as long as a compiled loop can be keyed
         /// on their address — see [`PooledDriver`].
         words: std::sync::Arc<Code>,
-        /// [`loop_header_keys`] for those words. Cached here because the entry
-        /// door consults it on every call and the answer is a property of the
-        /// program, which by construction cannot change under an address the
-        /// pool is pinning.
+        /// [`loop_header_keys`] for those words.
         loop_keys: Vec<u64>,
+        /// [`green_key_at`] at [`ENTRY_PC`] — the key the function-entry door
+        /// files under. The hash folds the program POINTER, so it is a property
+        /// of this pinned address and not of the words alone.
+        entry_hash: u64,
+        entry_values: [i64; 3],
+        entry_types: [majit_ir::GreenType; 3],
+    }
+
+    impl PooledProgram {
+        fn new(program: &std::sync::Arc<Code>) -> Self {
+            let (entry_hash, entry_values, entry_types) = green_key_at(program, ENTRY_PC);
+            PooledProgram {
+                words: std::sync::Arc::clone(program),
+                loop_keys: loop_header_keys(program),
+                entry_hash,
+                entry_values,
+                entry_types,
+            }
+        }
+    }
+
+    impl PooledDriver {
+        fn new(threshold: u32, num_regs: usize, num_fregs: usize) -> Self {
+            PooledDriver {
+                driver: new_driver_f(threshold, num_regs, num_fregs),
+                programs: Vec::new(),
+                by_addr: std::collections::HashMap::new(),
+                state: VmStateF {
+                    regs: vec![0; num_regs],
+                    fregs: vec![0.0; num_fregs],
+                    ret: 0,
+                },
+            }
+        }
+
+        /// The index of `program` in [`PooledDriver::programs`], pinning the
+        /// words on a first sighting.
+        ///
+        /// Pinning has to happen before the run, not after: the loop this call
+        /// may compile is keyed on the address, so the address has to be held
+        /// by the time the key is taken.
+        fn intern(&mut self, program: &std::sync::Arc<Code>, addr: usize) -> usize {
+            if let Some(&index) = self.by_addr.get(&addr) {
+                return index;
+            }
+            self.programs.push(PooledProgram::new(program));
+            let index = self.programs.len() - 1;
+            self.by_addr.insert(addr, index);
+            index
+        }
     }
 
     /// Byte width of the value [`run_jit_persistent_f`] moves out of `DRIVERS`
@@ -2310,6 +2405,57 @@ pub mod float_bank {
         core::mem::size_of::<PooledDriver>()
     }
 
+    /// This thread's pooled drivers, plus what a call needs to reach one
+    /// without hashing anything.
+    #[derive(Default)]
+    struct DriverPool {
+        /// One per `(regs_len, num_fregs, threshold)` ever asked for. Appended
+        /// to and never reordered, so an index names the same shape for as long
+        /// as the pool lives; [`reset_persistent_state`] clears the whole thing
+        /// and the memo with it.
+        entries: Vec<PoolEntry>,
+        /// Where the last call resolved to. Most callers run one expression on
+        /// one tier over and over, and for them this answers the whole lookup:
+        /// a shape scan and an address hash both become four word compares.
+        /// A caller alternating between two expressions misses it every call
+        /// and pays what every call used to pay.
+        last: Option<Resolved>,
+        /// Epoch of the state-field store this thread last published, or `0`
+        /// before anything did.
+        ///
+        /// The store is one slot per thread ([`JitDriver::republish_state_field_fvc`]),
+        /// so a driver has to re-aim it at itself before it can compile against
+        /// another driver's jitcodes. This records whose it is, so the call is
+        /// made only when the answer is "not ours". Sound because every route
+        /// that writes the slot writes it for a driver a run of this pool is
+        /// holding: `register_dispatch_jitcode` at the first trace start,
+        /// `force_start_tracing` and `start_bridge_tracing` after that. Epochs
+        /// come from a process-global `fetch_add` and are never reused, so a
+        /// dropped driver's epoch can never be matched by a later one.
+        published_epoch: u64,
+    }
+
+    /// One shape's slot in [`DriverPool`].
+    struct PoolEntry {
+        key: (usize, usize, u32),
+        /// `None` while a call has the driver checked out, after a flush
+        /// emptied the slot, and before the first call of this shape built one.
+        /// [`DriverPool::check_out`] says why those are one state and not three.
+        driver: Option<Box<PooledDriver>>,
+    }
+
+    /// A resolved `(shape, threshold, program address)`, as the two indices the
+    /// per-call path actually walks.
+    #[derive(Clone, Copy)]
+    struct Resolved {
+        key: (usize, usize, u32),
+        addr: usize,
+        /// Index into [`DriverPool::entries`].
+        entry: usize,
+        /// Index into that driver's [`PooledDriver::programs`].
+        program: usize,
+    }
+
     std::thread_local! {
         /// Drivers kept across calls, keyed by the state shape they were built
         /// for and the threshold they compile at.
@@ -2320,16 +2466,15 @@ pub mod float_bank {
         /// `max_age` generations by `memmgr.py:23-69`) and never recompiles per
         /// invocation. The threshold is part of the key so the interpreter tier
         /// (`u32::MAX`) can never pick up the JIT tier's compiled loop.
-        /// Boxed because `run_jit_persistent_f` takes the entry OUT of the map
-        /// for the duration of the run and puts it back after, so the map's
+        /// Boxed because `run_jit_persistent_f` takes the entry OUT of the pool
+        /// for the duration of the run and puts it back after, so the slot's
         /// value type is copied twice per call. Behind a `Box` that pair moves
         /// a pointer instead of the whole `JitDriver`, which is inline-large
         /// (`pooled_driver_inline_bytes`) even though its heavy components are
         /// heap handles. The take-and-reinsert shape is unchanged -- this is
         /// the same re-entrancy behaviour, not a different one.
-        static DRIVERS: core::cell::RefCell<
-            std::collections::HashMap<(usize, usize, u32), Box<PooledDriver>>,
-        > = core::cell::RefCell::new(std::collections::HashMap::new());
+        static DRIVERS: core::cell::RefCell<DriverPool> =
+            core::cell::RefCell::new(DriverPool::default());
     }
 
     /// Drop this thread's persistent drivers, so the next batch traces and
@@ -2351,7 +2496,15 @@ pub mod float_bank {
     /// expression's question rather than crashing. Anything that frees program
     /// words without dropping the loops keyed on them reopens it.
     pub fn reset_persistent_state() {
-        DRIVERS.with(|d| d.borrow_mut().clear());
+        DRIVERS.with(|d| {
+            let mut pool = d.borrow_mut();
+            pool.entries.clear();
+            // The memo names an entry and a program by index, and both indices
+            // die with the entries. Dropping it is not an optimisation detail:
+            // a surviving memo would name a program slot in a driver that no
+            // longer exists.
+            pool.last = None;
+        });
     }
 
     /// [`run_jit_seeded_f`] on a driver that outlives the call, so a program
@@ -2369,61 +2522,181 @@ pub mod float_bank {
         threshold: u32,
     ) -> i64 {
         let key = (init_regs.len(), num_fregs, threshold);
-        // Take the driver out of the map for the duration of the run instead of
-        // holding the borrow across it: a re-entrant call then builds its own
-        // driver rather than panicking on the `RefCell`.
-        let mut pooled = DRIVERS
-            .with(|d| d.borrow_mut().remove(&key))
-            .unwrap_or_else(|| {
-                Box::new(PooledDriver {
-                    driver: new_driver_f(threshold, init_regs.len(), num_fregs),
-                    programs: std::collections::HashMap::new(),
-                })
-            });
-        // Split so the entry door can read this program's loop keys out of the
-        // map while it drives the driver; the two are separate fields and their
-        // borrows do not overlap.
-        let PooledDriver { driver, programs } = &mut *pooled;
-        // Before the run, not after: the loop this call may compile is keyed on
-        // the address, so the address has to be pinned by the time it is taken.
-        let loop_keys = &programs
-            .entry(program.as_ptr() as usize)
-            .or_insert_with(|| PooledProgram {
-                words: std::sync::Arc::clone(program),
-                loop_keys: loop_header_keys(program),
-            })
-            .loop_keys;
-        // The store majit decodes guard and resume metadata through is one slot
-        // per thread, written when a driver registers its dispatch jitcode. We
-        // keep a driver per shape, so aim it back at this one before it can
-        // compile anything: another shape's store decodes at the same pcs and
-        // returns a mistyped frame count rather than failing.
-        driver.republish_state_field_fvc();
-        // The call-counted door, ahead of the first instruction. It answers the
-        // whole call when the entry key already has compiled code; otherwise it
-        // hands back where interpretation is to pick up.
-        let mut state = initial_state_f(init_regs, num_fregs);
-        let mut pc = ENTRY_PC;
-        let result = match try_function_entry_jit_f(driver, program, loop_keys, &mut state, &mut pc)
-        {
-            Some(value) => value,
-            None => run_mainloop_f(driver, program, state, pc),
-        };
-        if pooled.programs.len() > MAX_PROGRAMS_PER_DRIVER {
-            // Wholesale, and that is the whole point: the loops and the words
-            // they are keyed on go together, so no key can survive the address
-            // it names. Dropping either alone is the defect
+        let addr = program.as_ptr() as usize;
+        // ONE thread-local access for the whole call. The borrow inside it is
+        // taken twice and held across neither run: a re-entrant call has to
+        // find the pool readable rather than panicking on the `RefCell`.
+        DRIVERS.with(|cell| {
+            // ── check out ──────────────────────────────────────────────────
+            let Checkout {
+                pooled,
+                home,
+                mut program_index,
+                published_epoch,
+            } = cell.borrow_mut().check_out(key, program);
+            // Outside the borrow, because building a driver registers a
+            // dispatch jitcode, which writes the per-thread store this pool
+            // also reads. Only a first call of a shape, or one the slot could
+            // not serve, reaches it.
+            let mut pooled = match pooled {
+                Some(pooled) => pooled,
+                None => {
+                    let mut fresh = Box::new(PooledDriver::new(threshold, key.0, key.1));
+                    program_index = fresh.intern(program, addr);
+                    fresh
+                }
+            };
+            // Split so the entry door can read this program's cached keys while
+            // it drives the driver; the three are separate fields and their
+            // borrows do not overlap.
+            let PooledDriver {
+                driver,
+                programs,
+                state,
+                ..
+            } = &mut *pooled;
+            let pooled_program = &programs[program_index];
+            // The store majit decodes guard and resume metadata through is one
+            // slot per thread, written when a driver registers its dispatch
+            // jitcode. We keep a driver per shape, so aim it back at this one
+            // before it can compile anything: another shape's store decodes at
+            // the same pcs and returns a mistyped frame count rather than
+            // failing. Skipped when this driver is the one that wrote it — see
+            // [`DriverPool::published_epoch`] for why that is decidable here.
+            if driver.state_field_fvc_epoch() != published_epoch {
+                driver.republish_state_field_fvc();
+            }
+            reseed_state_f(state, init_regs, num_fregs);
+            // The call-counted door, ahead of the first instruction. It answers
+            // the whole call when the entry key already has compiled code;
+            // otherwise it hands back where interpretation is to pick up.
+            let mut pc = ENTRY_PC;
+            let result =
+                match try_function_entry_jit_f(driver, program, pooled_program, state, &mut pc) {
+                    Some(value) => value,
+                    None => run_mainloop_f(driver, program, state, pc),
+                };
+            // ── check in ───────────────────────────────────────────────────
+            // Wholesale over the bound, and that is the whole point: the loops
+            // and the words they are keyed on go together, so no key can
+            // survive the address it names. Dropping either alone is the defect
             // ([`MAX_PROGRAMS_PER_DRIVER`] says why cel has to bound this at
-            // all). Read the two tallies with no callback out of it first.
-            let stats = pooled.driver.get_stats();
-            ABSORBED_BRIDGES.fetch_add(stats.bridges_compiled, Ordering::Relaxed);
-            ABSORBED_PANICS.fetch_add(stats.internal_compile_panics as usize, Ordering::Relaxed);
-        } else {
-            DRIVERS.with(|d| {
-                d.borrow_mut().insert(key, pooled);
-            });
+            // all).
+            let keep = pooled.programs.len() <= MAX_PROGRAMS_PER_DRIVER;
+            let dropped = cell
+                .borrow_mut()
+                .check_in(key, addr, home, program_index, pooled, keep);
+            if let Some(dropped) = dropped {
+                // Read the two tallies that have no callback out of the driver
+                // before it goes.
+                let stats = dropped.driver.get_stats();
+                ABSORBED_BRIDGES.fetch_add(stats.bridges_compiled, Ordering::Relaxed);
+                ABSORBED_PANICS
+                    .fetch_add(stats.internal_compile_panics as usize, Ordering::Relaxed);
+            }
+            result
+        })
+    }
+
+    /// What [`DriverPool::check_out`] hands one call.
+    struct Checkout {
+        /// The pooled driver, or `None` when the slot held none and the caller
+        /// has to build one.
+        pooled: Option<Box<PooledDriver>>,
+        /// The slot the driver goes back to.
+        home: usize,
+        /// Index into the driver's programs. Meaningless without `pooled`.
+        program_index: usize,
+        /// [`DriverPool::published_epoch`] as of the checkout.
+        published_epoch: u64,
+    }
+
+    impl DriverPool {
+        /// Take this shape's driver out of the pool for the duration of a run.
+        ///
+        /// An empty slot is the only signal there is, and it means two things at
+        /// once: nobody has built a driver of this shape yet, or one is checked
+        /// out. That conflation is deliberate — both answers are "build one" —
+        /// and it is what makes the pool survive a run that panics: an
+        /// unwinding call simply never checks its driver back in, and the next
+        /// call of that shape rebuilds. A busy FLAG would instead survive the
+        /// unwind and mark the slot occupied by a run that no longer exists.
+        fn check_out(
+            &mut self,
+            key: (usize, usize, u32),
+            program: &std::sync::Arc<Code>,
+        ) -> Checkout {
+            let addr = program.as_ptr() as usize;
+            let published_epoch = self.published_epoch;
+            let memo = self
+                .last
+                .filter(|last| last.key == key && last.addr == addr);
+            let home = match memo {
+                Some(last) => last.entry,
+                None => match self.entries.iter().position(|e| e.key == key) {
+                    Some(entry) => entry,
+                    None => {
+                        self.entries.push(PoolEntry { key, driver: None });
+                        self.entries.len() - 1
+                    }
+                },
+            };
+            let mut pooled = self.entries[home].driver.take();
+            // Resolving the program is a hash only on a first sighting; the
+            // memo answers every call after, and holds because `programs` is
+            // append-only for as long as the driver lives.
+            let program_index = match (&memo, pooled.as_mut()) {
+                (Some(last), Some(_)) => last.program,
+                (None, Some(pooled)) => pooled.intern(program, addr),
+                // No driver to index into. The caller builds one and interns
+                // the program itself.
+                _ => usize::MAX,
+            };
+            Checkout {
+                pooled,
+                home,
+                program_index,
+                published_epoch,
+            }
         }
-        result
+
+        /// Put a run's driver back. `Some` means the pool declined it and the
+        /// caller now owns it — and its unreported tallies.
+        fn check_in(
+            &mut self,
+            key: (usize, usize, u32),
+            addr: usize,
+            home: usize,
+            program_index: usize,
+            pooled: Box<PooledDriver>,
+            keep: bool,
+        ) -> Option<Box<PooledDriver>> {
+            // A driver that published the thread's store is the one holding it
+            // now. A driver that never registered published nothing, so the
+            // slot still belongs to whoever wrote it last and the stamp stands.
+            let epoch = pooled.driver.state_field_fvc_epoch();
+            if epoch != 0 {
+                self.published_epoch = epoch;
+            }
+            // Bounds-checked, and the key re-read rather than trusted: a
+            // `reset_persistent_state` from inside a run would have emptied the
+            // pool under this slot, and refilling a slot that now names another
+            // shape is worse than dropping the driver.
+            if !keep || !self.entries.get(home).is_some_and(|slot| slot.key == key) {
+                // Either way the memo names a program index inside a driver
+                // that is about to go.
+                self.last = None;
+                return Some(pooled);
+            }
+            self.entries[home].driver = Some(pooled);
+            self.last = Some(Resolved {
+                key,
+                addr,
+                entry: home,
+                program: program_index,
+            });
+            None
+        }
     }
 
     /// One reading of the tier's trace census, in the same five key names the
@@ -2484,7 +2757,9 @@ pub mod float_bank {
     pub fn jit_stats() -> JitStats {
         let (live_bridges, live_panics) = DRIVERS.with(|d| {
             d.borrow()
-                .values()
+                .entries
+                .iter()
+                .filter_map(|slot| slot.driver.as_ref())
                 .fold((0usize, 0usize), |(b, p), driver| {
                     let s = driver.driver.get_stats();
                     (

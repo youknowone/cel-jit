@@ -811,6 +811,64 @@ fn regvm_group(out: &mut Vec<Row>) {
             );
             reset_persistent_state();
 
+            // The same persistent path at a threshold it can never reach, so
+            // nothing traces, nothing compiles and no call enters compiled
+            // code. What is left is the call machinery around the interpreter:
+            // the pooled-driver lookup, the program lookup, the entry door's
+            // compiled-check and counter, and the register-bank seed. Every one
+            // of those is either resolved on a first sighting and memoised or
+            // done in place, so the whole call is expected to allocate NOTHING.
+            //
+            // Asserted rather than blessed, and that is the point of the row.
+            // A blessed number records what the code did; this records what it
+            // is FOR. Zero allocations is the whole reason the driver location,
+            // the program entry, the entry green key and the two register banks
+            // stopped being per-call work, and a baseline drift can be
+            // re-blessed away while an assertion cannot.
+            //
+            // ONE ROW ONLY, because the claim is about per-CALL cost and one
+            // row is what isolates it. The same measurement over 1000 rows
+            // reports ~3 allocations per ROW — a property of interpreting a row
+            // at this tier, which no amount of work on the call path moves, and
+            // which would swamp the fixed cost this row exists to pin.
+            const JIT_OFF: u32 = u32::MAX;
+            if n == 1 {
+                reset_persistent_state();
+                let idle = run_jit_persistent_f(&code, &regs, nf, JIT_OFF);
+                assert_eq!(
+                    idle, expected,
+                    "regvm/jit-idle/{}/n={n}: the untraced persistent tier diverged from the \
+                     clean VM",
+                    case.label
+                );
+                let first = out.len();
+                bench(
+                    out,
+                    format!("regvm/jit-idle/{}/n={n}", case.label),
+                    WARMUP,
+                    ITERS,
+                    || {
+                        black_box(run_jit_persistent_f(&code, &regs, nf, JIT_OFF));
+                    },
+                );
+                out[first].detail = String::from(
+                    "one-row call, JIT unreachable — the fixed call cost, asserted to be \
+                     allocation-free",
+                );
+                let worst = *out[first].samples.iter().max().unwrap();
+                assert_eq!(
+                    worst, 0,
+                    "regvm/jit-idle/{}/n={n}: the persistent call path allocated {worst} \
+                     time(s) across {ITERS} one-row calls, and it is expected to allocate \
+                     nothing. The pooled driver and the program are resolved once and \
+                     memoised, the register banks are reused across calls, and the entry door \
+                     reads a cached green key — so a non-zero here names a per-call allocation \
+                     that has come back, not a number to re-bless.",
+                    case.label
+                );
+                reset_persistent_state();
+            }
+
             // #127. The row above measures calls 65..89. The artifact leaves
             // that plateau at call 200, when its first guard bridge compiles,
             // and never returns: measured over 750 windows to call 6065
@@ -820,10 +878,11 @@ fn regvm_group(out: &mut Vec<Row>) {
             // artifact occupies for all but its first 400 calls, and a
             // regression there would move nothing.
             //
-            // Only at n = 1000. At n = 1 the tier never compiles at all (the
-            // `regvm/jit/*/n=1` rows equal their `clean` twins and report
-            // `guard_fails=0`), so there is no post-bridge regime to sample and
-            // a second row would duplicate the first.
+            // The n = 1 twin of this row is below and is a different regime,
+            // not a duplicate: at one row the loop takes no back edge, so
+            // nothing there is post-BRIDGE — the artifact is the function-entry
+            // door's, minted off the call counter, and what the row measures is
+            // entering it.
             if n == 1_000 {
                 /// Past both bridges — the second lands in calls 393..401 — and
                 /// inside the measured tail, which runs to at least call 6065.
@@ -874,6 +933,62 @@ fn regvm_group(out: &mut Vec<Row>) {
                         "NO BRIDGE EVER COMPILED — this case has no post-bridge regime"
                     } else {
                         "STEADY: past every bridge"
+                    }
+                );
+                reset_persistent_state();
+            }
+
+            // The WARM one-row call: compile once, then evaluate a record per
+            // call, which is the regime `examples/majit_percall_steady.rs`
+            // times and the one the per-call fixed cost was measured on. The
+            // `regvm/jit/*/n=1` row above cannot report it, because its window
+            // spans the call that compiles and a compile amortized over 88
+            // calls swamps what entering costs.
+            if n == 1 {
+                /// Past the entry artifact, which `regvm/jit/*/n=1` shows being
+                /// minted inside its own 88-call window.
+                const STEADY_WARMUP: u32 = 256;
+
+                reset_persistent_state();
+                let got = run_jit_persistent_f(&code, &regs, nf, JIT_ON);
+                assert_eq!(
+                    got, expected,
+                    "regvm/jit-steady/{}/n={n}: compiled tier diverged from the clean VM",
+                    case.label
+                );
+                reset_jit_stats();
+                for _ in 0..STEADY_WARMUP {
+                    black_box(run_jit_persistent_f(&code, &regs, nf, JIT_ON));
+                }
+                let at_seam = jit_stats();
+                let first = out.len();
+                bench(
+                    out,
+                    format!("regvm/jit-steady/{}/n={n}", case.label),
+                    0,
+                    ITERS,
+                    || {
+                        black_box(run_jit_persistent_f(&code, &regs, nf, JIT_ON));
+                    },
+                );
+                let after = jit_stats();
+                // `entries_in_window` is what makes the row readable: a one-row
+                // call that never enters compiled code costs what the idle row
+                // costs, and only this counter separates "warm and entering"
+                // from "warm and interpreting anyway".
+                let calls = ITERS * ROUNDS as u32;
+                out[first].detail = format!(
+                    "warmed to call {}, then {calls} calls: compiled_before={} \
+                     entries_in_window={} compiled_in_window={} guard_fails={} — {}",
+                    STEADY_WARMUP + 1,
+                    at_seam.loops_compiled,
+                    after.compiled_entries - at_seam.compiled_entries,
+                    after.loops_compiled - at_seam.loops_compiled,
+                    after.guard_failures - at_seam.guard_failures,
+                    if after.compiled_entries > at_seam.compiled_entries {
+                        "STEADY: every call enters compiled code"
+                    } else {
+                        "NEVER ENTERS — this row measures the interpreter, not the artifact"
                     }
                 );
                 reset_persistent_state();
