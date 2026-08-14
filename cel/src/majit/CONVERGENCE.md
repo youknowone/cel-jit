@@ -1315,6 +1315,60 @@ driver just compiled.
   genuine entry cost must then be read at the smallest n where `compiles > 0`,
   never at n=1.
 
+  ### ✅ Both probes run, 2026-08-14 — the entry cost was never the blocker
+
+  **(a) `size_of::<PooledDriver>()` = 5736 bytes.** The accessor's own doc sets
+  the falsification bar — *"a small answer here refutes the memcpy reading
+  rather than confirming it"*, since every heavy component of
+  `JitDriver`/`MetaInterp` is a heap handle. 5736 is not small: the
+  take-and-reinsert pair moved **~11.5 KB per call**. The pool-churn hypothesis
+  survives its own test.
+
+  **(b) The three-tier split says the entry cost is zero at n=1.**
+
+  ```
+    rows   clean us    idle us     jit us   idle-clean   jit-idle   cmp
+       1   0.083 us   0.584 us   0.584 us     0.501 us   0.000 us     0
+  ```
+
+  `Jit − Interpreter = 0.000 us`. **The whole 666 ns was harness with the JIT
+  idle; none of it was entering or leaving a compiled artifact.** `cmp = 0`
+  confirms nothing compiled, so reading that column as entry cost would have
+  been exactly the error this section warns about.
+
+  ⇒ **The causal sentence corrected above was still not corrected far enough.**
+  It said the 708 ns is *not* compiled-entry cost and named `run_jit_persistent_f`
+  overhead as the alternative — right, but it left "which to attack" open and
+  therefore left the door closed. The split answers it: there was no entry cost
+  to attack at all.
+
+  **Acting on it: boxing `DRIVERS`' value type removed ~0.6 us per call**, flat
+  in row count, with an unchanged `clean us` control at 8 and 16 rows:
+
+  | rows | `idle − clean` before | after |
+  |---|---|---|
+  | 1 | 0.501 us | **0.042 us** |
+  | 8 | 0.959 us | **0.375 us** |
+  | 64 | 3.834 us | **3.084 us** |
+
+  `jit/clean` at one row: 7.04x → **1.98x**. The removed quantity being flat in
+  n is what makes it a fixed per-call cost rather than per-row work; ~11.5 KB in
+  ~0.6 us is ~19 GB/s, the right order for an L2-resident copy.
+
+  ⚠ **What this does and does not license.** It does *not* say the door is open:
+  the primary panel is still `N/A` because `execute_jit(program, activation)`
+  does not exist, and that is an API gap, not a cost. What changed is the reason
+  to build it — the fixed cost that would have dominated a single-activation
+  call was **removable**, and most of it is now gone. The residual ~42 ns still
+  holds the other items named above: key hashing, the per-program `Arc` insert,
+  `run_mainloop_f`'s two per-call bank allocations, and one `is_tracing()` check
+  per opcode.
+
+  ⚠ Both break-even points are unmoved (65536 rows cold, 256 warm) — a ~0.6 us
+  fixed saving does not flip 64 rows, where the JIT is still 2.47x behind the
+  clean VM. A fixed-cost win is invisible wherever per-row work already
+  dominates, and quoting the break-even as a summary statistic would hide it.
+
 ## Two evaluators means the second one must be checked against the first
 
 Until the convergence above lands, the tier's correctness claim rests entirely on
