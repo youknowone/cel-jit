@@ -69,7 +69,7 @@ use std::time::{Duration, Instant};
 use cel::context::VariableResolver;
 use cel::majit::batch::{Batch, BatchProgram, BoundBatch, ColumnRef, RawOutput, RowReader, Tier};
 use cel::majit::bytecode::float_bank::{
-    jit_stats, reset_persistent_state, COMPILES, GUARD_FAILS, TRACE_ABORTS,
+    jit_stats, reset_persistent_state, COMPILED_ENTRIES, COMPILES, GUARD_FAILS, TRACE_ABORTS,
 };
 use cel::majit::lower::{Schema, ValType};
 use cel::{Context, Program, Value};
@@ -116,6 +116,30 @@ enum Col {
 }
 
 impl Col {
+    /// The same one-row activation, `k` times.
+    ///
+    /// Every replicated row is BIT-IDENTICAL to the row the other columns
+    /// measure, so a batch built from these asks the compiled tier exactly the
+    /// question his `execute(&ctx)` asks — `k` times over — rather than a
+    /// related one over synthetic data. That is what lets a per-row cost taken
+    /// here be read against his per-call number at all.
+    ///
+    /// `IntList` repeats the length column and concatenates the elements; the
+    /// bind derives each row's `offset(..)` from `lens` itself, so no offset
+    /// column is built here.
+    fn replicate(&self, k: usize) -> Col {
+        match self {
+            Col::Int(c) => Col::Int(c.repeat(k)),
+            Col::Bool(c) => Col::Bool(c.repeat(k)),
+            // `[T]::repeat` needs `T: Copy`, which `String` is not.
+            Col::Str(c) => Col::Str(c.iter().cycle().take(c.len() * k).cloned().collect()),
+            Col::IntList { lens, elems } => Col::IntList {
+                lens: lens.repeat(k),
+                elems: elems.repeat(k),
+            },
+        }
+    }
+
     fn column_ref(&self) -> ColumnRef<'_> {
         match self {
             Col::Int(c) => ColumnRef::Int(c),
@@ -366,7 +390,18 @@ fn cases() -> Vec<Case> {
 
 /// Time ONE call. Grows an iteration count until a timed batch lasts at least
 /// [`MIN_BATCH`], then reports the fastest of [`ROUNDS`] such batches.
-fn per_call<T>(mut run: impl FnMut() -> T) -> f64 {
+fn per_call<T>(run: impl FnMut() -> T) -> f64 {
+    per_call_counted(run).0
+}
+
+/// [`per_call`], also reporting how many times it invoked the closure —
+/// calibration batches included.
+///
+/// The count is what turns an entry check from `> 0` into `>= calls`. A window
+/// in which one call in ten thousand entered compiled code and the rest fell
+/// back to the tracing interpreter passes the first and fails the second, and
+/// the first is exactly the check a silently degraded column survives.
+fn per_call_counted<T>(mut run: impl FnMut() -> T) -> (f64, usize) {
     fn timed<T>(iters: usize, run: &mut impl FnMut() -> T) -> Duration {
         let start = Instant::now();
         for _ in 0..iters {
@@ -375,9 +410,11 @@ fn per_call<T>(mut run: impl FnMut() -> T) -> f64 {
         start.elapsed()
     }
 
+    let mut calls = 0usize;
     let mut iters = 1usize;
     loop {
         let elapsed = timed(iters, &mut run);
+        calls += iters;
         if elapsed >= MIN_BATCH {
             break;
         }
@@ -389,9 +426,14 @@ fn per_call<T>(mut run: impl FnMut() -> T) -> f64 {
         iters = iters.saturating_mul(grow);
     }
 
-    (0..ROUNDS)
-        .map(|_| timed(iters, &mut run).as_nanos() as f64 / iters as f64)
-        .fold(f64::INFINITY, f64::min)
+    let best = (0..ROUNDS)
+        .map(|_| {
+            let d = timed(iters, &mut run);
+            calls += iters;
+            d.as_nanos() as f64 / iters as f64
+        })
+        .fold(f64::INFINITY, f64::min);
+    (best, calls)
 }
 
 /// A columnar consumer. It reads the buffers the run wrote and never builds a
@@ -435,6 +477,27 @@ struct Compiled {
     /// two instants and differenced. Nothing in the window retires a driver
     /// without absorbing its count, so the difference is the window's compiles.
     bridges: f64,
+    /// Calls that ENTERED compiled code, per call, over the same warm window.
+    ///
+    /// This is what decides whether the `majit` cell beside it is the compiled
+    /// tier or the tracing interpreter, and it is a fact rather than an
+    /// inference: `compiles` says an artifact was minted, which is true of
+    /// cases that never run a byte of it. Expect `0.00` wherever the row loop
+    /// is the only loop — it is bottom-tested, so a one-row batch takes zero
+    /// back edges and never reaches the instruction that consults the compiled
+    /// loop — and a positive number wherever the expression has a loop INSIDE
+    /// the row body, which a comprehension does.
+    entries: f64,
+    /// The compiled tier's marginal cost of one more activation, from a
+    /// replicated-batch slope. `None` when the two probe batches did not both
+    /// run in compiled code, which is a refusal to print a number rather than a
+    /// failure of the case.
+    jit_row: Option<f64>,
+    /// `t(K_LO) - K_LO * jit_row`: everything a call pays that is not
+    /// per-activation — the pool lookup, the state republish, the entry and
+    /// exit, and the one row that always runs interpreted before the first back
+    /// edge. It is therefore an UPPER bound on call overhead, not the overhead.
+    jit_fix: Option<f64>,
 }
 
 struct Row {
@@ -545,16 +608,22 @@ fn run_case(case: &Case) -> Row {
     let compiles = COMPILES.load(Ordering::Relaxed);
     // What the driver is still doing per call once it is as warm as it will get.
     const SETTLED: usize = 1_000;
-    let (a0, g0, b0) = (
+    let (a0, g0, b0, e0) = (
         TRACE_ABORTS.load(Ordering::Relaxed),
         GUARD_FAILS.load(Ordering::Relaxed),
         jit_stats().bridges_compiled,
+        COMPILED_ENTRIES.load(Ordering::Relaxed),
     );
     for _ in 0..SETTLED {
         black_box(bound.collect_on(Tier::Jit).expect("settled run"));
     }
     let aborts = (TRACE_ABORTS.load(Ordering::Relaxed) - a0) as f64 / SETTLED as f64;
     let guard_fails = (GUARD_FAILS.load(Ordering::Relaxed) - g0) as f64 / SETTLED as f64;
+    // The fact the `majit` column's heading has always asserted and never
+    // checked. `compiles` above cannot answer it: it counts artifacts minted,
+    // and a loop that is minted and never entered leaves every other counter
+    // here plausible while the interpreter produces the answers.
+    let entries = (COMPILED_ENTRIES.load(Ordering::Relaxed) - e0) as f64 / SETTLED as f64;
     // `saturating_sub` where the two above subtract plainly, because the two
     // above are monotonic counters and this one is a population: only
     // `reset_persistent_state` can drop a live driver's count without absorbing
@@ -580,6 +649,8 @@ fn run_case(case: &Case) -> Row {
             .unwrap_or_else(|e| panic!("{}: rebind: {e}", case.label))
     });
 
+    let (jit_row, jit_fix) = compiled_row_cost(case, &lowered);
+
     Row {
         label: case.label.clone(),
         ladder: case.ladder,
@@ -593,8 +664,131 @@ fn run_case(case: &Case) -> Row {
             aborts,
             guard_fails,
             bridges,
+            entries,
+            jit_row,
+            jit_fix,
         }),
     }
+}
+
+/// The compiled tier's marginal cost of ONE more activation, and the fixed cost
+/// of the call that carries it.
+///
+/// Why a slope and not a timing of one activation: the row loop is
+/// bottom-tested, so an `n`-row batch takes `n - 1` back edges and a ONE-row
+/// batch takes none. It never executes the instruction that consults the
+/// compiled loop, so no amount of warming makes a one-row call run compiled
+/// code — measured, and pinned by `a_warm_driver_and_a_one_row_batch` in
+/// `tests/majit_trace_evidence.rs`. Timing one row and labelling it the
+/// compiled tier is precisely the defect this function exists to avoid.
+///
+/// So: replicate the SAME activation `k` times, bit for bit, and difference two
+/// batch sizes. What survives the subtraction is the per-activation cost of
+/// compiled code; what it removes is everything a call pays once.
+///
+/// ⚠ The result is NOT the same unit as cometkim's `compiled` column. His
+/// number is one whole `CompiledProgram::execute(&ctx)` including all per-call
+/// overhead. `jit/row` differences that away deliberately, which is why
+/// `jit fix` is returned beside it — but their SUM models a call this engine
+/// cannot currently make, and must be read as a model.
+///
+/// Returns `(None, None)` rather than a number whenever the evidence for
+/// "this ran in compiled code" is not complete.
+fn compiled_row_cost(case: &Case, lowered: &BatchProgram) -> (Option<f64>, Option<f64>) {
+    // Keep the replicated work bounded: a ladder member already carries
+    // thousands of elements per row, and replicating THAT a thousand times
+    // would measure the machine's memory system rather than its loop.
+    let per_row_elems = case
+        .cols
+        .iter()
+        .map(|(_, c)| match c {
+            Col::IntList { elems, .. } => elems.len().max(1),
+            _ => 1,
+        })
+        .max()
+        .unwrap_or(1);
+    const ELEM_BUDGET: usize = 1 << 18;
+    let k_hi = (ELEM_BUDGET / per_row_elems).clamp(32, 1024);
+    let k_lo = (k_hi / 8).max(2);
+
+    let build = |k: usize| -> (Vec<(String, Col)>, usize) {
+        (
+            case.cols
+                .iter()
+                .map(|(n, c)| (n.clone(), c.replicate(k)))
+                .collect(),
+            k,
+        )
+    };
+    let (cols_lo, _) = build(k_lo);
+    let (cols_hi, _) = build(k_hi);
+    let mut batch_lo = Batch::new(k_lo);
+    for (name, col) in &cols_lo {
+        batch_lo = batch_lo.column(name.clone(), col.column_ref());
+    }
+    let mut batch_hi = Batch::new(k_hi);
+    for (name, col) in &cols_hi {
+        batch_hi = batch_hi.column(name.clone(), col.column_ref());
+    }
+    let (blo, bhi) = match (
+        lowered.bind_per_row(&batch_lo),
+        lowered.bind_per_row(&batch_hi),
+    ) {
+        (Ok(lo), Ok(hi)) => (lo, hi),
+        _ => return (None, None),
+    };
+
+    let run_hi = || {
+        bhi.collect_raw_on(Tier::Jit, consume_raw)
+            .unwrap_or_else(|e| panic!("{}: slope hi: {e}", case.label))
+    };
+    let run_lo = || {
+        blo.collect_raw_on(Tier::Jit, consume_raw)
+            .unwrap_or_else(|e| panic!("{}: slope lo: {e}", case.label))
+    };
+
+    // `k_hi - 1` back edges in the first call alone, so the threshold is crossed
+    // long before decay or bucket eviction could reach the counter.
+    for _ in 0..32 {
+        black_box(run_hi());
+        black_box(run_lo());
+    }
+
+    // GATE 1 — entry, over a FIXED-count window. `per_call_counted` calibrates
+    // by invoking its closure an unbounded number of times, so a probe that ran
+    // through it could not state its own denominator.
+    const PROBE: usize = 200;
+    let e0 = COMPILED_ENTRIES.load(Ordering::Relaxed);
+    for _ in 0..PROBE {
+        black_box(run_hi());
+    }
+    if COMPILED_ENTRIES.load(Ordering::Relaxed) - e0 < PROBE {
+        return (None, None);
+    }
+
+    let (c0, ab0, en0) = (
+        COMPILES.load(Ordering::Relaxed),
+        TRACE_ABORTS.load(Ordering::Relaxed),
+        COMPILED_ENTRIES.load(Ordering::Relaxed),
+    );
+    let (t_hi, calls_hi) = per_call_counted(run_hi);
+    let (t_lo, calls_lo) = per_call_counted(run_lo);
+
+    // GATE 2 — every timed call entered, not merely one of them.
+    let entered = COMPILED_ENTRIES.load(Ordering::Relaxed) - en0;
+    // GATE 3 — steady state: the slope must not be measuring trace/compile
+    // churn, and the bigger batch must actually cost more.
+    let churned =
+        COMPILES.load(Ordering::Relaxed) != c0 || TRACE_ABORTS.load(Ordering::Relaxed) != ab0;
+    if entered < calls_hi + calls_lo || churned || !(t_hi > t_lo) {
+        return (None, None);
+    }
+
+    let slope = (t_hi - t_lo) / (k_hi - k_lo) as f64;
+    if !(slope > 0.0) {
+        return (None, None);
+    }
+    (Some(slope), Some(t_lo - k_lo as f64 * slope))
 }
 
 fn warm(bound: &BoundBatch<'_, '_>) {
@@ -956,11 +1150,14 @@ fn main() {
         MIN_BATCH.as_millis()
     );
     println!(
-        "{:<28} {:>11} {:>11} {:>11} {:>12} {:>10} {:>10} {:>9} {:>12} {:>12} {:>13}",
+        "{:<28} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11} {:>12} {:>10} {:>10} {:>9} {:>12} {:>12} {:>13}",
         "case",
         "stock ns",
         "clean ns",
         "majit ns",
+        "enter/call",
+        "jit/row ns",
+        "jit fix ns",
         "majit/stock",
         "raw ns",
         "bind ns",
@@ -986,12 +1183,19 @@ fn main() {
                 if c.compiles == 0 {
                     never_compiled.push(r.label.clone());
                 }
+                let opt = |v: Option<f64>| match v {
+                    Some(x) => format!("{x:.1}"),
+                    None => "-".to_string(),
+                };
                 println!(
-                    "{:<28} {:>11.1} {:>11.1} {:>11.1} {:>11.2}x {:>10.1} {:>10.1} {:>9} {:>12.2} {:>12.2} {:>13.2}",
+                    "{:<28} {:>11.1} {:>11.1} {:>11.1} {:>11.2} {:>11} {:>11} {:>11.2}x {:>10.1} {:>10.1} {:>9} {:>12.2} {:>12.2} {:>13.2}",
                     r.label,
                     r.stock,
                     c.clean,
                     c.majit,
+                    c.entries,
+                    opt(c.jit_row),
+                    opt(c.jit_fix),
                     r.stock / c.majit,
                     c.raw,
                     c.bind,
@@ -1006,8 +1210,21 @@ fn main() {
                 // through the library's fallback. A row missing from the table
                 // would read as an expression this crate cannot evaluate.
                 println!(
-                    "{:<28} {:>11.1} {:>11} {:>11} {:>12} {:>10} {:>10} {:>9} {:>12} {:>12} {:>13}",
-                    r.label, r.stock, "-", "walker", "-", "-", "-", "-", "-", "-", "-"
+                    "{:<28} {:>11.1} {:>11} {:>11} {:>11} {:>11} {:>11} {:>12} {:>10} {:>10} {:>9} {:>12} {:>12} {:>13}",
+                    r.label,
+                    r.stock,
+                    "-",
+                    "walker",
+                    "-",
+                    "-",
+                    "-",
+                    "-",
+                    "-",
+                    "-",
+                    "-",
+                    "-",
+                    "-",
+                    "-"
                 );
                 declined.push((r.label.clone(), why.clone()));
             }
@@ -1048,6 +1265,41 @@ fn main() {
          compiled code looks every variable up in the context BY NAME on every call. `bind ns`\n\
          is that encoding timed on its own — it is MORE than name resolution, so adding it back\n\
          is a pessimistic bound on the difference, not an estimate of it."
+    );
+    println!(
+        "\n`enter/call` is calls that ENTERED compiled code, counted at the point the\n\
+         compiled body is about to run — not artifacts minted. It is what says whether the\n\
+         `majit ns` cell beside it is the compiled tier or the tracing interpreter, and\n\
+         until it existed the heading asserted that and nothing checked it. A `0.00` with\n\
+         `compiles` at 1 is a loop that was compiled and never run: the row loop is\n\
+         bottom-tested, so a one-row batch takes zero back edges and never reaches the\n\
+         instruction that consults it. A positive one is an expression whose row BODY\n\
+         contains a loop that gets hot on its own — which is a per-case fact here, not a\n\
+         property of the shape: a comprehension over a 1-element list still reads 0.00."
+    );
+    println!(
+        "\n`jit/row ns` is the compiled tier's MARGINAL cost of one more activation,\n\
+         measured by replicating this case's single activation bit-for-bit into two batch\n\
+         sizes and differencing them. Three counter gates stand in front of it and it\n\
+         prints `-` if any fails: every call in a fixed 200-call probe entered compiled\n\
+         code, every TIMED call entered it, and no compile or trace-abort happened inside\n\
+         the timed windows. A number that merely looks fast does not get printed."
+    );
+    println!(
+        "\n⚠ `jit/row ns` is NOT the unit cometkim's `compiled` column is in. His is one\n\
+         whole `execute(&ctx)` including every per-call cost; this differences those away\n\
+         on purpose. `jit fix ns` is published so they can be added back — but their SUM\n\
+         models a call this engine cannot currently make at one activation, and quoting\n\
+         `jit/row` against his number without it flatters this side.\n\
+         ⚠ A NEGATIVE `jit fix ns` means the two-point model is refuted for that row: cost\n\
+         is superlinear in the replication count there, so extrapolating to zero rows\n\
+         undershoots. Its `jit/row` is still a measured difference quotient between the\n\
+         two sizes, but it is not a constant marginal cost, and neither cell should be\n\
+         read as a per-activation figure.\n\
+         ⚠ Every replicated row is identical, so the compiled loop gets perfect branch\n\
+         prediction and a hot cache. His regime has the same property — he re-evaluates\n\
+         one fixed activation — so the comparison is symmetric, but neither side's number\n\
+         is what varying data would cost."
     );
     print_decomposition(&rows);
 }
