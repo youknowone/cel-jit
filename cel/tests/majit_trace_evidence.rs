@@ -294,14 +294,43 @@ fn flat_row_loop_stays_in_compiled_code() {
     );
 }
 
-/// Whether a ONE-row batch enters an already-compiled loop.
+/// Whether a ONE-row batch reaches compiled code on a driver that has already
+/// compiled the row loop from a big batch.
 ///
 /// This is the question a single-activation benchmark has to answer before it
 /// can print a compiled-tier number, and until `compiled_entries` existed
 /// nothing could answer it: the artifact is minted either way, and the answers
 /// are identical because the interpreter produces them.
+///
+/// The answer is still NO, and it is worth being exact about which of two very
+/// different reasons now gives it.
+///
+/// It used to be structural and unconditional. The row loop's back edge was the
+/// only door; the loop is bottom-tested, so an `n`-row batch takes `n - 1` back
+/// edges and a one-row batch takes none, and nothing a one-row call executed
+/// ever consulted the JIT. There is now a second door, ahead of the first
+/// instruction and counted per CALL
+/// (`float_bank::try_function_entry_jit_f`), and
+/// [`repeated_one_row_calls_reach_the_compiled_tier`] is a one-row workload that
+/// does reach compiled code through it.
+///
+/// What shuts it here is the 50 000-row warm-up, deliberately. The door declines
+/// for any program whose own loop is already compiled, because on such a program
+/// it does not add a way in — it takes one away. Measured on
+/// `items.all(i, i.price > 10)` over repeated 20 000-row calls: with the decline
+/// removed, an entry artifact was minted and from then on every call entered the
+/// ENTRY key exactly once and the loop header not at all, where before it
+/// entered the loop header and ran the batch there. Both answer correctly, and
+/// `majit_shape_change`'s "never worse than the untraced VM" bound fired on the
+/// difference.
+///
+/// So this pins the boundary between the two doors rather than the absence of
+/// one, and a mixed workload — big batches and single rows through one driver —
+/// gets the row loop's door only. Lifting that would need the two artifacts to
+/// coexist without the entry one displacing the loop's, which is a majit-side
+/// question, not one this crate can answer by keying differently.
 #[test]
-fn a_warm_driver_and_a_one_row_batch() {
+fn a_compiled_row_loop_shuts_the_entry_door() {
     let _serial = serial();
     let schema: Schema = [
         ("price".to_string(), ValType::Int),
@@ -326,10 +355,18 @@ fn a_warm_driver_and_a_one_row_batch() {
     );
     assert!(warm.compiled_entries >= 1, "warm-up must enter it");
 
-    // Same driver, same expression, same green key — one row.
-    reset_jit_stats();
+    // Same driver, same expression, one row — for longer than the entry door's
+    // threshold, so a door that were open would be warm several times over.
+    const ONE_ROW_CALLS: usize = 64;
     let one_cols = [Column::Int(&price[..1]), Column::Int(&qty[..1])];
-    let _ = eval_batch_sum_f(&lowered, &one_cols, 1, 8);
+    reset_jit_stats();
+    for _ in 0..ONE_ROW_CALLS {
+        assert_eq!(
+            eval_batch_sum_f(&lowered, &one_cols, 1, 8),
+            clean_batch_sum_f(&lowered, &one_cols, 1),
+            "the one-row batch must answer what the oracle tier answers"
+        );
+    }
     let one = jit_stats();
     eprintln!(
         "[one-row] warm_entries={} one_row_entries={} one_row_compiles={}",
@@ -337,12 +374,80 @@ fn a_warm_driver_and_a_one_row_batch() {
     );
     assert_eq!(
         one.compiled_entries, 0,
-        "a one-row batch entered compiled code {} time(s). The row loop is \
-         bottom-tested, so an n-row batch takes n-1 back edges and one row \
-         takes none — it never reaches the instruction that consults the \
-         compiled loop. If this now fires, the single-activation door opened \
-         and every 'majit is N/A at one activation' claim needs re-deriving",
+        "a one-row batch entered compiled code {} time(s) on a driver whose row \
+         loop is already compiled. The entry door declines exactly there, and \
+         the decline is what keeps a batch workload entering its row loop; if \
+         this fires, the door opened on a program that has a hot loop and the \
+         batch tier's ns/row is the thing to re-measure",
         one.compiled_entries
+    );
+    assert_eq!(
+        one.loops_compiled, 0,
+        "{ONE_ROW_CALLS} one-row calls minted {} more loop(s) on a driver whose \
+         row loop is compiled. Nothing should trace here at all",
+        one.loops_compiled
+    );
+}
+
+/// A program called over and over with ONE row per call — the way an expression
+/// evaluated per record is used — reaches the compiled tier from cold, with no
+/// big batch anywhere in its history.
+///
+/// The row-loop back edge cannot produce this: at one row it is never taken, so
+/// its counter never moves and the workload stays in the interpreter for as many
+/// calls as it is given. The measurement here is the whole point of counting at
+/// the entry door instead.
+///
+/// Each call binds DIFFERENT values, so the answers are not one answer repeated:
+/// a compiled artifact that had specialised on the first call's bindings — baked
+/// them as constants rather than reading them as loop-invariant inputs — would
+/// answer the first call's question for every later one, and the oracle
+/// comparison per call is what catches that.
+#[test]
+fn repeated_one_row_calls_reach_the_compiled_tier() {
+    let _serial = serial();
+    let schema: Schema = [
+        ("price".to_string(), ValType::Int),
+        ("qty".to_string(), ValType::Int),
+    ]
+    .into_iter()
+    .collect();
+    let lowered = lower("price >= 100 && qty < 50", &schema);
+
+    reset_persistent_state();
+    reset_jit_stats();
+
+    const CALLS: usize = 256;
+    for i in 0..CALLS as i64 {
+        let price = [(i * 37) % 200];
+        let qty = [(i * 11) % 100];
+        let columns = [Column::Int(&price), Column::Int(&qty)];
+        let jit = eval_batch_sum_f(&lowered, &columns, 1, 8);
+        assert_eq!(
+            jit,
+            clean_batch_sum_f(&lowered, &columns, 1),
+            "call {i} diverged from the oracle tier"
+        );
+    }
+
+    let stats = jit_stats();
+    eprintln!("[percall] calls={CALLS} {stats}");
+    assert_eq!(
+        stats.internal_compile_panics, 0,
+        "a trace was dropped by a panic inside compilation, so the tier answered \
+         out of the interpreter and the entry count below measures nothing"
+    );
+    assert!(
+        stats.loops_compiled >= 1,
+        "{CALLS} one-row calls must compile something: the entry door counts \
+         calls, and nothing else in this workload counts at all"
+    );
+    assert!(
+        stats.compiled_entries >= 1,
+        "{CALLS} one-row calls compiled {} loop(s) and entered none. An artifact \
+         that exists and is never entered leaves every answer coming out of the \
+         interpreter, which is the state this door was added to end",
+        stats.loops_compiled
     );
 }
 

@@ -931,6 +931,28 @@ pub mod float_bank {
         ret: i64,
     }
 
+    /// The pc a program starts at, and the position green the function-entry
+    /// door keys on.
+    ///
+    /// It is a different key from any the row loop takes: the loop's back edge
+    /// arms at its body header, which sits past the prologue that seeds the
+    /// column bases and the row counter, so the two positions cannot coincide.
+    /// Two keys means two traces — an entry trace covering the whole call and a
+    /// loop trace covering one row — which is the shape a call-counted door has.
+    const ENTRY_PC: usize = 0;
+
+    /// The register banks a call starts from.
+    ///
+    /// Only the int bank is seeded: the column bases, the row count and the
+    /// trap address all live there, and no float ever enters from outside.
+    fn initial_state_f(init_regs: &[i64], num_fregs: usize) -> VmStateF {
+        VmStateF {
+            regs: init_regs.to_vec(),
+            fregs: vec![0.0; num_fregs],
+            ret: 0,
+        }
+    }
+
     #[majit_macros::jit_interp(
         state = VmStateF,
         env = Code,
@@ -948,18 +970,9 @@ pub mod float_bank {
     fn run_mainloop_f(
         mut driver: &mut majit_metainterp::JitDriver<VmStateF>,
         program: &Code,
-        init_regs: &[i64],
-        num_fregs: usize,
+        mut state: VmStateF,
+        mut pc: usize,
     ) -> i64 {
-        let mut pc: usize = 0;
-        // Only the int bank is seeded: the column bases, the row count and the
-        // trap address all live there, and no float ever enters from outside.
-        let mut state = VmStateF {
-            regs: init_regs.to_vec(),
-            fregs: vec![0.0; num_fregs],
-            ret: 0,
-        };
-
         loop {
             // `; state` selects the single-pass close: the walk's final state is
             // transferred into `state` here and the native loop resumes at the
@@ -1509,6 +1522,173 @@ pub mod float_bank {
         state.ret
     }
 
+    /// [`run_mainloop_f`] from the top of `program` with freshly seeded banks —
+    /// the shape every caller had before the entry door, and what a caller with
+    /// no driver to reuse still wants.
+    fn run_mainloop_from_start_f(
+        driver: &mut majit_metainterp::JitDriver<VmStateF>,
+        program: &Code,
+        init_regs: &[i64],
+        num_fregs: usize,
+    ) -> i64 {
+        run_mainloop_f(
+            driver,
+            program,
+            initial_state_f(init_regs, num_fregs),
+            ENTRY_PC,
+        )
+    }
+
+    /// The green key a door arming at `pc` in `program` files under, as
+    /// `(hash, values, types)`.
+    ///
+    /// The three slots are the ones `can_enter_jit!` builds for a `greens = [pc,
+    /// program]` driver: the marker's own position argument, then each declared
+    /// green with the arming position substituted for `pc`. Both have to be
+    /// spelled the same way here as there — the hash is what `has_compiled_loop`
+    /// answers on, and the typed values are what `comparekey` resolves a cell
+    /// collision with — or a door would file under a key nothing else can name.
+    fn green_key_at(program: &Code, pc: usize) -> (u64, [i64; 3], [majit_ir::GreenType; 3]) {
+        use majit_ir::GreenAsI64 as _;
+        let slots = [pc.__green_repr(), pc.__green_repr(), program.__green_repr()];
+        let mut hash = majit_ir::GREEN_UHASH_SEED;
+        for (value, ty) in slots {
+            hash = majit_ir::green_uhash_step(hash, ty, value);
+        }
+        (
+            hash,
+            [slots[0].0, slots[1].0, slots[2].0],
+            [slots[0].1, slots[1].1, slots[2].1],
+        )
+    }
+
+    /// The green keys of `program`'s own loop headers — the target of every
+    /// backward [`OP_JUMP_IF_ABOVE`], which is where the row loop and any inner
+    /// element loop arm their `can_enter_jit!`.
+    ///
+    /// A word-wise scan, not a decode: an operand that happens to hold
+    /// `OP_JUMP_IF_ABOVE`'s value contributes a position that is not an
+    /// instruction. That is sound because the result is only ever asked whether
+    /// a key is COMPILED, and a loop is filed at a real back-edge target or at
+    /// [`ENTRY_PC`] — a spurious position answers no. Decoding instead needs an
+    /// operand-width table this module does not have and would have to keep in
+    /// step with every opcode added.
+    fn loop_header_keys(program: &Code) -> Vec<u64> {
+        let mut targets: Vec<usize> = Vec::new();
+        for pc in 0..program.len().saturating_sub(3) {
+            if program[pc] != OP_JUMP_IF_ABOVE {
+                continue;
+            }
+            let target = program[pc + 3];
+            if target < 0 || target as usize >= pc {
+                continue;
+            }
+            let target = target as usize;
+            if !targets.contains(&target) {
+                targets.push(target);
+            }
+        }
+        targets
+            .into_iter()
+            .map(|target| green_key_at(program, target).0)
+            .collect()
+    }
+
+    /// The function-entry door: consult the JIT once per CALL, before the first
+    /// instruction runs.
+    ///
+    /// The row loop's `can_enter_jit!` is the only other door, and it is a back
+    /// edge on a bottom-tested loop — an `n`-row batch takes `n - 1` of them and
+    /// a ONE-row batch takes none. Warmup counted there counts rows, so a
+    /// program evaluated a million times at one row per call never warms, and a
+    /// program whose loop is already compiled never enters it at one row either.
+    /// That is the ordinary way CEL is used: compile the expression once,
+    /// evaluate it per record with fresh bindings. This door restores the
+    /// counting a call-shaped workload needs, and it is the same driver call the
+    /// back edge makes — only keyed on [`ENTRY_PC`] instead of the loop header.
+    ///
+    /// `Some(value)` means compiled code ran the whole call and FINISHed, so the
+    /// value is this call's result and nothing else runs. `None` means the call
+    /// is to be interpreted, and the state and pc it must start from come back
+    /// through the out-parameters: the door may have already run compiled code
+    /// that deopted, in which case the blackhole has recovered `state` to the
+    /// guard's resume point and interpretation continues from there rather than
+    /// from the top. Re-entering at the top instead would re-run the rows the
+    /// compiled prefix already ran, and would record any bridge the deopt
+    /// started against the wrong live-ins.
+    ///
+    /// The branches are ordered by what each costs, because this runs on EVERY
+    /// call including the overwhelming majority that do nothing. Only the
+    /// compiled-entry branch touches the driver's trace machinery — which builds
+    /// the trace metadata and extracts the live values, two allocations, before
+    /// it ever consults a counter. A call that is nowhere near the threshold
+    /// must not pay for that and throw it away: warming through
+    /// `back_edge_structured` alone cost ~10ns per row on a two-row batch,
+    /// enough for `majit_shape_change`'s "never worse than the untraced VM"
+    /// bound to fire. The counter is what decides here, and it is a hash lookup
+    /// and an add.
+    fn try_function_entry_jit_f(
+        driver: &mut majit_metainterp::JitDriver<VmStateF>,
+        program: &Code,
+        loop_keys: &[u64],
+        state: &mut VmStateF,
+        pc: &mut usize,
+    ) -> Option<i64> {
+        // A program whose own loop is compiled already has a door, at that
+        // loop's back edge, and takes it on the first row. A second door in
+        // front of it does not add a way in — it takes one AWAY. Measured on
+        // `items.all(i, i.price > 10)` over 20 000-row calls: with an entry
+        // artifact minted, every later call entered the ENTRY key once and the
+        // loop header not at all, where before it entered the loop header once
+        // and ran the whole batch there. Both answer correctly; they are not the
+        // same code. The calls this door exists for are the ones the loop's door
+        // cannot serve, and those are exactly the calls whose loop never gets
+        // hot — a bottom-tested loop at one row takes no back edge at all.
+        if loop_keys.iter().any(|key| driver.has_compiled_loop(*key)) {
+            return None;
+        }
+        let (hash, values, types) = green_key_at(program, ENTRY_PC);
+        if driver.has_compiled_loop(hash) {
+            // The same call the row loop's back edge makes, so entry, guard
+            // failure, blackhole resume and bridge start are all handled the one
+            // way. The predicate is `back_edge_structured`'s own, so this branch
+            // is taken exactly when that call will run compiled code.
+            let resume = driver.back_edge_structured(
+                hash,
+                || majit_ir::GreenKey::with_types(values.to_vec(), types.to_vec()),
+                ENTRY_PC,
+                state,
+                program,
+                || {},
+            );
+            // Drained before `resume` is read, and for the same reason the back
+            // edge's expansion drains it first: a run that FINISHed did not stop
+            // at a resume point, and the pc offered alongside the finish is the
+            // door's own arming position, so taking it would run the call a
+            // second time.
+            if let Some(value) = driver.take_back_edge_finish_int() {
+                return Some(value);
+            }
+            *pc = resume.unwrap_or(ENTRY_PC);
+            return None;
+        }
+        // A trace left live by an earlier call is the row loop's, recording from
+        // wherever it started; arming a second one here would abandon it.
+        if driver.is_tracing() {
+            return None;
+        }
+        if driver
+            .meta_interp_mut()
+            .warm_state_mut()
+            .should_trace_function_entry(hash)
+        {
+            // The counter above is the whole threshold decision, so the start
+            // has to be the one that does not consult a counter of its own.
+            driver.force_start_tracing(hash, ENTRY_PC, state, program);
+        }
+        None
+    }
+
     /// Reference two-bank interpreter — correctness oracle for the float path.
     pub fn clean_interp_f(program: &Code, num_regs: usize, num_fregs: usize) -> i64 {
         clean_interp_seeded_f(program, &vec![0i64; num_regs], num_fregs)
@@ -1953,6 +2133,18 @@ pub mod float_bank {
         // the guard, so `new` is now the whole constructor.
         let mut driver: majit_metainterp::JitDriver<VmStateF> =
             majit_metainterp::JitDriver::new(threshold);
+        // `JitDriver::new` sets only the back-edge threshold; the counter the
+        // function-entry door consults is a second one, and it defaults to
+        // upstream's `rlib/jit.py:589 function_threshold = 1619` — over 200x
+        // this tier's own knob, so a door left on the default never opens under
+        // any measurement this crate takes.
+        //
+        // Both are set to `threshold` rather than kept in upstream's 1619:1039
+        // ratio because the tier has ONE knob and every caller spells its
+        // intention with it: `threshold_for(Tier::Interpreter)` is `u32::MAX`,
+        // meaning never, and a scaled value cannot say that. Same number, two
+        // counters, keyed on two different greens.
+        driver.set_param("function_threshold", threshold as i64);
         // Diagnostic override for the JIT's `retrace_limit`, unset by default.
         //
         // `unroll.py:213-220` branches on this limit to decide what a bridge
@@ -2021,7 +2213,11 @@ pub mod float_bank {
         threshold: u32,
     ) -> i64 {
         let mut driver = new_driver_f(threshold, init_regs.len(), num_fregs);
-        let result = run_mainloop_f(&mut driver, program, init_regs, num_fregs);
+        // No entry door here, and the driver is the reason: it dies with the
+        // call, so an entry artifact this call minted could never be entered by
+        // another one. The door is on [`run_jit_persistent_f`], whose driver
+        // outlives the call.
+        let result = run_mainloop_from_start_f(&mut driver, program, init_regs, num_fregs);
         // The driver dies at the end of this scope, so read the two tallies that
         // have no callback out of it first.
         let stats = driver.get_stats();
@@ -2070,7 +2266,20 @@ pub mod float_bank {
         driver: majit_metainterp::JitDriver<VmStateF>,
         /// Keyed by address, which is exactly the identity that must not be
         /// reused. Two binds of one program collapse to one entry.
-        programs: std::collections::HashMap<usize, std::sync::Arc<Code>>,
+        programs: std::collections::HashMap<usize, PooledProgram>,
+    }
+
+    /// One program the pool holds alive, with what the entry door needs to know
+    /// about it.
+    struct PooledProgram {
+        /// The words. Held for exactly as long as a compiled loop can be keyed
+        /// on their address — see [`PooledDriver`].
+        words: std::sync::Arc<Code>,
+        /// [`loop_header_keys`] for those words. Cached here because the entry
+        /// door consults it on every call and the answer is a property of the
+        /// program, which by construction cannot change under an address the
+        /// pool is pinning.
+        loop_keys: Vec<u64>,
     }
 
     /// Byte width of the value [`run_jit_persistent_f`] moves out of `DRIVERS`
@@ -2171,18 +2380,35 @@ pub mod float_bank {
                     programs: std::collections::HashMap::new(),
                 })
             });
+        // Split so the entry door can read this program's loop keys out of the
+        // map while it drives the driver; the two are separate fields and their
+        // borrows do not overlap.
+        let PooledDriver { driver, programs } = &mut *pooled;
         // Before the run, not after: the loop this call may compile is keyed on
         // the address, so the address has to be pinned by the time it is taken.
-        pooled
-            .programs
-            .insert(program.as_ptr() as usize, std::sync::Arc::clone(program));
+        let loop_keys = &programs
+            .entry(program.as_ptr() as usize)
+            .or_insert_with(|| PooledProgram {
+                words: std::sync::Arc::clone(program),
+                loop_keys: loop_header_keys(program),
+            })
+            .loop_keys;
         // The store majit decodes guard and resume metadata through is one slot
         // per thread, written when a driver registers its dispatch jitcode. We
         // keep a driver per shape, so aim it back at this one before it can
         // compile anything: another shape's store decodes at the same pcs and
         // returns a mistyped frame count rather than failing.
-        pooled.driver.republish_state_field_fvc();
-        let result = run_mainloop_f(&mut pooled.driver, program, init_regs, num_fregs);
+        driver.republish_state_field_fvc();
+        // The call-counted door, ahead of the first instruction. It answers the
+        // whole call when the entry key already has compiled code; otherwise it
+        // hands back where interpretation is to pick up.
+        let mut state = initial_state_f(init_regs, num_fregs);
+        let mut pc = ENTRY_PC;
+        let result = match try_function_entry_jit_f(driver, program, loop_keys, &mut state, &mut pc)
+        {
+            Some(value) => value,
+            None => run_mainloop_f(driver, program, state, pc),
+        };
         if pooled.programs.len() > MAX_PROGRAMS_PER_DRIVER {
             // Wholesale, and that is the whole point: the loops and the words
             // they are keyed on go together, so no key can survive the address
