@@ -21,7 +21,7 @@
 
 use cel::majit::bytecode::float_bank::{
     abort_reasons, abort_reasons_since, guard_census_summary, jit_stats, reset_jit_stats,
-    reset_persistent_state, MAX_PROGRAMS_PER_DRIVER,
+    reset_persistent_state, JitStats, MAX_PROGRAMS_PER_DRIVER,
 };
 use cel::majit::bytecode::{clean_batch_sum_f, eval_batch_sum_f, Column};
 use cel::majit::lower::{lower_typed, LoweredF, Schema, ValType};
@@ -70,12 +70,29 @@ fn measure_warm(
         "{} trace(s) were dropped by a panic inside compilation",
         stats.internal_compile_panics
     );
+    LAST_STATS.with(|s| s.set(stats));
     (
         stats.loops_compiled,
         stats.guard_failures,
         stats.loops_aborted,
         jit,
     )
+}
+
+thread_local! {
+    static LAST_STATS: std::cell::Cell<JitStats> = std::cell::Cell::new(JitStats::default());
+}
+
+/// Every counter from the most recent [`measure`] / [`measure_warm`] window.
+///
+/// Those two return a four-tuple that predates `compiled_entries` and is
+/// destructured at fifteen call sites; widening it would edit fourteen tests
+/// that do not care. The whole record is kept here instead, so a test can ask
+/// for a field the tuple does not carry. The window is the callee's — it resets
+/// the counters itself — and the tests are serialized, so the value belongs to
+/// the call that just returned.
+fn last_measured_stats() -> JitStats {
+    LAST_STATS.with(|s| s.get())
 }
 
 /// One swept data shape: a label and the per-row element count it produces.
@@ -254,19 +271,78 @@ fn flat_row_loop_stays_in_compiled_code() {
     // `deopts` is 0, which is under the upper bound. That was the state for the
     // whole window in which the compiled loop was filed under a green key the
     // back edge does not enter by — the tier was off and this test was green.
-    // Entering the loop once and leaving it once at the end of the batch is a
-    // guard failure, so the honest floor for a single-entry batch is 1.
+    //
+    // `guard_failures >= 1` used to stand in for entry, on the reasoning that
+    // leaving the loop at the end of the batch is a side exit. It is unsound in
+    // both directions: once a bridge covers the loop-exit guard the deopt stops
+    // being recorded while entry continues every call, so the proxy reads zero
+    // on a loop that is entered 50 000 times. `compiled_entries` is the fact
+    // itself, counted where the compiled body is about to run.
+    let entries = last_measured_stats().compiled_entries;
+    eprintln!("[flat] compiled_entries={entries}");
     assert!(
-        deopts >= 1,
-        "nothing entered the compiled row loop over {n} rows: {deopts} guard \
-         failures. A loop that compiles and is never entered answers correctly \
-         through the interpreter, so only this bound sees it"
+        entries >= 1,
+        "nothing entered the compiled row loop over {n} rows. A loop that \
+         compiles and is never entered answers correctly through the \
+         interpreter, so every other counter here stays plausible"
     );
     assert!(
         deopts <= 16,
         "the compiled row loop must run the rows itself (a constant number of \
          side exits), got {deopts} deopts over {n} rows — that is a per-row bail \
          back to the interpreter"
+    );
+}
+
+/// Whether a ONE-row batch enters an already-compiled loop.
+///
+/// This is the question a single-activation benchmark has to answer before it
+/// can print a compiled-tier number, and until `compiled_entries` existed
+/// nothing could answer it: the artifact is minted either way, and the answers
+/// are identical because the interpreter produces them.
+#[test]
+fn a_warm_driver_and_a_one_row_batch() {
+    let _serial = serial();
+    let schema: Schema = [
+        ("price".to_string(), ValType::Int),
+        ("qty".to_string(), ValType::Int),
+    ]
+    .into_iter()
+    .collect();
+    let lowered = lower("price >= 100 && qty < 50", &schema);
+    let n = 50_000usize;
+    let price: Vec<i64> = (0..n as i64).map(|i| (i * 37) % 200).collect();
+    let qty: Vec<i64> = (0..n as i64).map(|i| (i * 11) % 100).collect();
+
+    // Warm the pooled driver until the row loop is compiled and entered.
+    reset_persistent_state();
+    reset_jit_stats();
+    let warm_cols = [Column::Int(&price), Column::Int(&qty)];
+    let _ = eval_batch_sum_f(&lowered, &warm_cols, n, 8);
+    let warm = jit_stats();
+    assert!(
+        warm.loops_compiled >= 1,
+        "warm-up must compile the row loop"
+    );
+    assert!(warm.compiled_entries >= 1, "warm-up must enter it");
+
+    // Same driver, same expression, same green key — one row.
+    reset_jit_stats();
+    let one_cols = [Column::Int(&price[..1]), Column::Int(&qty[..1])];
+    let _ = eval_batch_sum_f(&lowered, &one_cols, 1, 8);
+    let one = jit_stats();
+    eprintln!(
+        "[one-row] warm_entries={} one_row_entries={} one_row_compiles={}",
+        warm.compiled_entries, one.compiled_entries, one.loops_compiled
+    );
+    assert_eq!(
+        one.compiled_entries, 0,
+        "a one-row batch entered compiled code {} time(s). The row loop is \
+         bottom-tested, so an n-row batch takes n-1 back edges and one row \
+         takes none — it never reaches the instruction that consults the \
+         compiled loop. If this now fires, the single-activation door opened \
+         and every 'majit is N/A at one activation' claim needs re-deriving",
+        one.compiled_entries
     );
 }
 

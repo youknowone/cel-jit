@@ -784,6 +784,21 @@ pub mod float_bank {
     /// merge point hot enough to be traced at all; the two have different
     /// causes, and only this counter tells them apart.
     pub static TRACE_ABORTS: AtomicUsize = AtomicUsize::new(0);
+    /// Calls that ENTERED compiled code, as opposed to artifacts that exist.
+    ///
+    /// [`COMPILES`] rises when a loop is minted and says nothing about whether
+    /// anything ran it, and the two genuinely come apart here: the row loop is
+    /// bottom-tested, so an `n`-row batch takes `n - 1` back edges and a
+    /// ONE-row batch takes none — it never executes the instruction that
+    /// consults the compiled loop, however warm the driver already is. A
+    /// measurement that reports the compiled tier at one row is reporting the
+    /// tracing interpreter, and before this counter existed nothing in the
+    /// crate could say so.
+    ///
+    /// Not a substitute for [`GUARD_FAILS`] as an entry proxy — that one is
+    /// unsound in both directions: a bridge covering the loop-exit guard stops
+    /// the deopt being recorded while entry continues every call.
+    pub static COMPILED_ENTRIES: AtomicUsize = AtomicUsize::new(0);
     /// Trace length summed over every compiled loop, before and after the
     /// optimizer. `set_on_compile_loop` has always been handed both numbers and
     /// dropped them; the pair is what says whether the boxing the lowerer emits
@@ -1973,6 +1988,9 @@ pub mod float_bank {
         driver.set_on_trace_abort(|_green_key, _permanent| {
             TRACE_ABORTS.fetch_add(1, Ordering::Relaxed);
         });
+        driver.set_on_compiled_entry(|_green_key, _target_pc| {
+            COMPILED_ENTRIES.fetch_add(1, Ordering::Relaxed);
+        });
         let seed = VmStateF {
             regs: vec![0; num_regs],
             fregs: vec![0.0; num_fregs],
@@ -2210,6 +2228,11 @@ pub mod float_bank {
         pub internal_compile_panics: usize,
         pub trace_ops_before: usize,
         pub trace_ops_after: usize,
+        /// Calls that entered compiled code. See [`COMPILED_ENTRIES`]: this is
+        /// the only field here that distinguishes "an artifact exists" from
+        /// "an artifact ran", and it belongs to the callback window, like
+        /// `loops_compiled` and unlike `bridges_compiled`.
+        pub compiled_entries: usize,
     }
 
     impl core::fmt::Display for JitStats {
@@ -2218,7 +2241,7 @@ pub mod float_bank {
                 f,
                 "loops_compiled={} bridges_compiled={} loops_aborted={} \
                  guard_failures={} internal_compile_panics={} \
-                 trace_ops_before={} trace_ops_after={}",
+                 trace_ops_before={} trace_ops_after={} compiled_entries={}",
                 self.loops_compiled,
                 self.bridges_compiled,
                 self.loops_aborted,
@@ -2226,6 +2249,7 @@ pub mod float_bank {
                 self.internal_compile_panics,
                 self.trace_ops_before,
                 self.trace_ops_after,
+                self.compiled_entries,
             )
         }
     }
@@ -2251,6 +2275,7 @@ pub mod float_bank {
             internal_compile_panics: live_panics + ABSORBED_PANICS.load(Ordering::Relaxed),
             trace_ops_before: TRACE_OPS_BEFORE.load(Ordering::Relaxed),
             trace_ops_after: TRACE_OPS_AFTER.load(Ordering::Relaxed),
+            compiled_entries: COMPILED_ENTRIES.load(Ordering::Relaxed),
         }
     }
 
@@ -2264,6 +2289,7 @@ pub mod float_bank {
             &COMPILES,
             &GUARD_FAILS,
             &TRACE_ABORTS,
+            &COMPILED_ENTRIES,
             &TRACE_OPS_BEFORE,
             &TRACE_OPS_AFTER,
             &ABSORBED_BRIDGES,
