@@ -1,6 +1,18 @@
 //! CEL's own regime: compile the expression ONCE, then evaluate it per record,
 //! one activation per call, with DIFFERENT bindings every call.
 //!
+//! ⚠️ What the clock covers is an ALREADY-ENCODED ACTIVATION, not a deployment
+//! end to end. The timed loop calls pre-built `BoundBatch` values: the pool's
+//! rows are materialized into column storage, wrapped in `Batch`es and bound
+//! once, before the clock starts. A deployment handed a fresh record per call
+//! pays all three per call, and none of the three is inside `steady ns`.
+//! `bind ns` is the last of them, timed separately over already-built `Batch`
+//! values, so it prices rebinding and not record materialization or batch
+//! construction. `steady + bind` is therefore a bound on the ENCODED-activation
+//! path, not on a real per-record cost — the record's own encoding is measured
+//! nowhere here. Read every number below as "what one call costs once its
+//! arguments are already in columnar form".
+//!
 //! That is what a policy engine does — K8s admission, Envoy authz, IAM
 //! conditions — and it is not the shape any benchmark in this crate measured
 //! until now. `majit_vs_cometkim_percall` times one FIXED activation, which is
@@ -47,12 +59,13 @@
 //! with no columns to vary reads `1`/`1` there, and its oracle check, while
 //! still true, cannot detect constant-baking at all.
 //!
-//! ⚠️ `bind` is OUTSIDE the timed call. The pool's rows are encoded into columns
-//! once, up front, and the steady-state loop only runs them. A deployment
-//! receiving a fresh record per call pays that encoding per call, so `bind ns`
-//! is measured and printed separately; `steady + bind` is the pessimistic upper
-//! bound on a real per-record cost, and the tables below never add them for the
-//! reader.
+//! ⚠️ `bind` is OUTSIDE the timed call, and it is kept as its own column rather
+//! than folded in. The pool's rows are encoded into columns once, up front, and
+//! the steady-state loop only runs them. A deployment receiving a fresh record
+//! per call pays that encoding per call, so `bind ns` is measured and printed
+//! separately and the tables below never add the two for the reader. What their
+//! sum bounds is stated at the top of this header: the encoded-activation path,
+//! since `bind` starts from a `Batch` that already exists.
 //!
 //! RELEASE ONLY, under the `[profile.bench]` settings the other benchmarks use:
 //!
@@ -477,6 +490,28 @@ fn counters() -> Counters {
     }
 }
 
+impl Counters {
+    /// Whether NOTHING compiled and no trace aborted between `earlier` and
+    /// `self` — the condition "steady state" names.
+    ///
+    /// All three of root loops, BRIDGES and aborts, because a window with a
+    /// bridge compiled inside it is a window with compilation latency in it,
+    /// exactly as a root-loop compile would be. Only root loops and aborts were
+    /// checked before, so a case that guard-failed and bridged its way through
+    /// the timed loop certified as steady and published a number that included
+    /// the backend's work.
+    ///
+    /// `bridges` is compared for EQUALITY rather than for growth, unlike the two
+    /// tallies beside it: it is a population read twice (see [`Counters`]), so a
+    /// decrease is not evidence that nothing compiled, and refusing the window
+    /// is the direction that cannot publish a compile as steady state.
+    fn settled_since(&self, earlier: &Counters) -> bool {
+        self.compiles == earlier.compiles
+            && self.aborts == earlier.aborts
+            && self.bridges == earlier.bridges
+    }
+}
+
 /// What the warm-up phase found out.
 struct Warm {
     /// Calls made. When `reached` is false this is the cap, and the number is a
@@ -505,7 +540,8 @@ struct Warm {
 }
 
 /// Repeated one-row calls until the tier enters compiled code on `cfg.window`
-/// consecutive calls with nothing compiling or aborting between them.
+/// consecutive calls with nothing compiling or aborting between them — root
+/// loops and bridges alike, per [`Counters::settled_since`].
 ///
 /// The window is what makes this steady state rather than first contact. A
 /// single entry says an artifact ran once; it is compatible with a case that
@@ -527,7 +563,7 @@ fn warm_to_steady(pool: &[BoundBatch<'_, '_>], cfg: &Config, label: &str) -> War
         if entered && first_entry.is_none() {
             first_entry = Some(call + 1);
         }
-        let settled = now.compiles == prev.compiles && now.aborts == prev.aborts;
+        let settled = now.settled_since(&prev);
         streak = if entered && settled { streak + 1 } else { 0 };
         prev = now;
         if streak >= cfg.window {
@@ -589,6 +625,19 @@ struct Measured {
     /// Parse and lower, best of [`PREPARE_SAMPLES`].
     prepare: f64,
     entries_per_call: f64,
+    /// Smallest and largest compiled-entry delta over any ONE call of the
+    /// untimed oracle replay, which makes the same `steady` calls in the same
+    /// order as the timed loop.
+    ///
+    /// This is the per-call evidence behind "every call enters"; `entries_per_call`
+    /// beside it is a mean and cannot distinguish a window where every call
+    /// entered once from one where half entered twice and half not at all. A
+    /// minimum of 0 refuses the `steady ns` cell. A flat expression — one whose
+    /// row body holds no loop of its own — reads `1..1`; a maximum above 1 is a
+    /// row body entering an inner loop's artifact more than once per call.
+    ///
+    /// `None` when the run made no replay calls.
+    replay_entries: Option<(usize, usize)>,
     gfails_per_call: f64,
     aborts_per_call: f64,
     bridges_per_call: f64,
@@ -705,11 +754,30 @@ fn run_case(case: &Case, cfg: &Config) -> Row {
     // it: an oracle call in the timed loop would put the interpreter's cost into
     // the compiled tier's number, which is the one thing this file exists to
     // measure.
+    //
+    // It also carries the PER-CALL entry evidence. The gate below can only
+    // compare the window's entry count with its call count, and an aggregate
+    // `entries >= calls` is not the claim "every call entered": one call with a
+    // nested loop can contribute several entries while another contributes
+    // none, and the sum still clears the bound. This loop makes the same N calls
+    // in the same order, so differencing the entry counter across EACH of them
+    // answers the per-call question — and being untimed, it can pay the counter
+    // read the timed loop must not.
+    // `None` while no replay call has been made, so a run configured with no
+    // replay calls at all refuses the gate below instead of clearing it with an
+    // extremum nothing ever wrote to.
+    let mut replay_entries: Option<(usize, usize)> = None;
     for i in 0..cfg.steady {
         let v = i % bounds.len();
+        let before_call = COMPILED_ENTRIES.load(Ordering::Relaxed);
         let got = bounds[v]
             .collect_on(Tier::Jit)
             .unwrap_or_else(|e| panic!("{}: oracle call {i}: {e}", case.label));
+        let delta = COMPILED_ENTRIES.load(Ordering::Relaxed) - before_call;
+        replay_entries = Some(match replay_entries {
+            Some((lo, hi)) => (lo.min(delta), hi.max(delta)),
+            None => (delta, delta),
+        });
         assert_eq!(
             got, answers[v],
             "{}: call {i} (pool row {v}) diverged from the interpreter tier. An \
@@ -749,9 +817,21 @@ fn run_case(case: &Case, cfg: &Config) -> Row {
     // have compiled or aborted inside the window, and the warm-up must have
     // reached steady state in the first place. Any one of those missing and the
     // cell prints `-`.
+    //
+    // "Every timed call entered" is carried by the untimed replay's per-call
+    // minimum, not by the aggregate: `entered >= timed_calls` alone is cleared
+    // by a window in which some calls entered twice and others not at all. The
+    // aggregate is kept beside it because the replay's evidence is about the
+    // same sequence rather than about these calls, and a window that entered
+    // fewer times in total than the sequence it replays is a window that changed
+    // behaviour between the two.
     let entered = after.entries - before.entries;
-    let settled = after.compiles == before.compiles && after.aborts == before.aborts;
-    let jit = (warm.reached && entered >= timed_calls && settled).then_some(jit_ns);
+    let entered_every_replay_call = replay_entries.is_some_and(|(lo, _)| lo >= 1);
+    let jit = (warm.reached
+        && entered_every_replay_call
+        && entered >= timed_calls
+        && after.settled_since(&before))
+    .then_some(jit_ns);
 
     // PHASE 3 — the reference. The same rows, the same cycle, on the plain VM.
     // `Tier::Clean` dispatches straight to the interpreter and takes no driver at
@@ -786,6 +866,7 @@ fn run_case(case: &Case, cfg: &Config) -> Row {
             bind,
             prepare,
             entries_per_call: per_call(entered),
+            replay_entries,
             gfails_per_call: per_call(after.guard_fails - before.guard_fails),
             aborts_per_call: per_call(after.aborts - before.aborts),
             // Saturating where the three above subtract plainly: this one is a
@@ -889,9 +970,9 @@ fn print_steady_table(rows: &[Row], cfg: &Config) {
            program's word buffer: that is memoised behind the first `bind`, so the first\n  \
            call of the warm-up pays it and `warm ms` contains it.\n\
          * `warm calls` is one-row calls until the tier entered compiled code on {} consecutive\n  \
-           calls with nothing compiling or aborting between them. A `>{}` is a case that never\n  \
-           got there in the cap, and its `steady ns` is `-` rather than a number taken from a\n  \
-           tier that was still warming.\n\
+           calls with nothing compiling or aborting between them — no root loop AND no bridge.\n  \
+           A `>{}` is a case that never got there in the cap, and its `steady ns` is `-` rather\n  \
+           than a number taken from a tier that was still warming.\n\
          * `steady ns` is one whole one-row call on the compiled tier — the fastest of {} rounds\n  \
            of {} calls, cycling {} distinct input rows. `bind` is NOT in it; see the evidence\n  \
            table's `bind ns` and the header.\n\
@@ -919,9 +1000,10 @@ fn print_evidence_table(rows: &[Row]) {
          than one input row:\n"
     );
     println!(
-        "{:<28} {:>11} {:>11} {:>9} {:>12} {:>12} {:>13} {:>7} {:>8} {:>10}",
+        "{:<28} {:>11} {:>12} {:>11} {:>9} {:>12} {:>12} {:>13} {:>7} {:>8} {:>10}",
         "case",
         "enter/call",
+        "per-call min",
         "1st entry",
         "compiles",
         "gfails/call",
@@ -940,10 +1022,15 @@ fn print_evidence_table(rows: &[Row]) {
             Some(c) => c.to_string(),
             None => "never".to_string(),
         };
+        let replay = match m.replay_entries {
+            Some((lo, hi)) => format!("{lo}..{hi}"),
+            None => "-".to_string(),
+        };
         println!(
-            "{:<28} {:>11.2} {:>11} {:>9} {:>12.2} {:>12.2} {:>13.2} {:>7} {:>8} {:>10.1}",
+            "{:<28} {:>11.2} {:>12} {:>11} {:>9} {:>12.2} {:>12.2} {:>13.2} {:>7} {:>8} {:>10.1}",
             row.label,
             m.entries_per_call,
+            replay,
             first,
             m.compiles,
             m.gfails_per_call,
@@ -956,9 +1043,16 @@ fn print_evidence_table(rows: &[Row]) {
     }
     println!(
         "\n* `enter/call` counts calls that ENTERED compiled code, at the point the compiled\n  \
-           body is about to run — not artifacts minted. It is what decides whether the\n  \
-           `steady ns` cell beside it is the compiled tier or the tracing interpreter, and the\n  \
-           gate in front of that cell requires it over EVERY timed call, not one of them.\n\
+           body is about to run — not artifacts minted. It is a MEAN over the timed window,\n  \
+           so on its own it cannot tell a window where every call entered once from one where\n  \
+           half entered twice and half not at all.\n\
+         * `per-call min..max` is the compiled-entry delta of a SINGLE call, smallest and\n  \
+           largest, measured over the untimed oracle replay — the same calls in the same order\n  \
+           as the timed loop, with the counter read the timed loop cannot afford. This is the\n  \
+           evidence behind \"every call enters\": a minimum of 0 refuses the `steady ns` cell\n  \
+           beside it. A flat expression reads `1..1`; a maximum above 1 is a row body entering\n  \
+           an inner loop's artifact more than once per call, which is exactly the case the\n  \
+           aggregate would have hidden.\n\
          * `1st entry` is the call on which compiled code first ran, and it says which of the\n  \
            two doors the case came in through. Around {} — the trace threshold — is the\n  \
            function-entry door, which counts CALLS. A 1 or a 2 is a row BODY whose own loop\n  \
@@ -977,12 +1071,14 @@ fn print_evidence_table(rows: &[Row]) {
          * `bridges/call` counts artifacts COMPILED inside the timed window, not artifacts\n  \
            entered. A zero says the population stopped growing, NOT that the call enters no\n  \
            bridge. A nonzero one says a warm call is still compiling, which puts compilation\n  \
-           itself inside `steady ns`.\n\
-         * `bind ns` is one `bind_per_row` of a pool row, timed on its own. The steady-state\n  \
-           loop does NOT pay it — the pool is encoded up front — while a deployment handed a\n  \
-           fresh record per call does. It is the whole per-activation encoding, which is more\n  \
-           than the name resolution an interpreter would do, so `steady + bind` is a\n  \
-           pessimistic bound on a real per-record cost rather than an estimate of one.",
+           itself inside `steady ns` — and now refuses that cell rather than only annotating\n  \
+           it, on the same footing as a root-loop compile.\n\
+         * `bind ns` is one `bind_per_row` of a pool row, timed on its own, over a `Batch` that\n  \
+           ALREADY EXISTS. The steady-state loop does not pay it — the pool is encoded up front\n  \
+           — while a deployment handed a fresh record per call does. `steady + bind` bounds the\n  \
+           already-encoded activation path and nothing wider: materializing a record into\n  \
+           column storage and building the `Batch` over it are outside both numbers, so this is\n  \
+           not a deployment end-to-end figure.",
         cel::majit::batch::DEFAULT_JIT_THRESHOLD,
     );
 }
@@ -1005,7 +1101,8 @@ fn print_machine_readable(rows: &[Row], cfg: &Config) {
                 println!(
                     "#steady case={} status=declined reason={:?} jit_ns=- clean_ns=- speedup=- \
                      breakeven=- warm_calls=- warm_reached=- warm_ns=- prepare_ns=- bind_ns=- \
-                     entries=- gfails=- aborts=- bridges=- compiles=- inputs=- answers=- calls=-",
+                     entries=- replay_entries_min=- replay_entries_max=- gfails=- aborts=- \
+                     bridges=- compiles=- inputs=- answers=- calls=-",
                     row.label, why
                 );
                 continue;
@@ -1019,10 +1116,15 @@ fn print_machine_readable(rows: &[Row], cfg: &Config) {
             (Some(j), Some(c)) if j > 0.0 => format!("{:.4}", c / j),
             _ => "-".to_string(),
         };
+        let (replay_min, replay_max) = match m.replay_entries {
+            Some((lo, hi)) => (lo.to_string(), hi.to_string()),
+            None => ("-".to_string(), "-".to_string()),
+        };
         println!(
             "#steady case={} status={status} jit_ns={} clean_ns={} speedup={speedup} \
              breakeven={} warm_calls={} warm_reached={} warm_ns={:.0} prepare_ns={:.0} \
-             bind_ns={:.1} entries={:.4} gfails={:.4} aborts={:.4} bridges={:.4} \
+             bind_ns={:.1} entries={:.4} replay_entries_min={replay_min} \
+             replay_entries_max={replay_max} gfails={:.4} aborts={:.4} bridges={:.4} \
              compiles={} inputs={} answers={} calls={}",
             row.label,
             cell(m.jit, 2),
@@ -1054,7 +1156,8 @@ fn main() {
     println!(
         "pool={} distinct input rows, {} timed calls per round, best of {} rounds;\n\
          steady state is {} consecutive calls entering compiled code with nothing\n\
-         compiling or aborting, given at most {} calls to get there.",
+         compiling — root loop or bridge — and nothing aborting, given at most {}\n\
+         calls to get there.",
         cfg.pool, cfg.steady, cfg.rounds, cfg.window, cfg.cap
     );
 
@@ -1089,10 +1192,24 @@ fn main() {
                     .map_or("never".to_string(), |c| c.to_string()),
             )
         } else {
-            format!(
-                "warmed, but the timed window entered compiled code on {:.2} of each call",
-                m.entries_per_call
-            )
+            // Which of the three post-warm conditions refused the cell, named
+            // rather than summarised: the per-call minimum and the aggregate
+            // fail on different populations, and a compile inside the window is
+            // a third thing entirely.
+            match m.replay_entries {
+                None => {
+                    "warmed, but no replay call was made to measure per-call entry with".to_string()
+                }
+                Some((0, hi)) => format!(
+                    "warmed, but at least one call of the replay entered no compiled code \
+                     (per-call entries 0..{hi})"
+                ),
+                Some(_) => format!(
+                    "warmed, but the timed window entered compiled code on {:.2} of each call \
+                     and compiled {:.2} bridges per call",
+                    m.entries_per_call, m.bridges_per_call
+                ),
+            }
         };
         println!("  no number {:<28} {why}", row.label);
     }

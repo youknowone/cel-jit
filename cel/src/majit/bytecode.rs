@@ -1560,9 +1560,10 @@ pub mod float_bank {
     /// The three slots are the ones `can_enter_jit!` builds for a `greens = [pc,
     /// program]` driver: the marker's own position argument, then each declared
     /// green with the arming position substituted for `pc`. Both have to be
-    /// spelled the same way here as there — the hash is what `has_compiled_loop`
-    /// answers on, and the typed values are what `comparekey` resolves a cell
-    /// collision with — or a door would file under a key nothing else can name.
+    /// spelled the same way here as there — the hash is what the compiled-loop
+    /// probes answer on, and the typed values are what `comparekey` resolves a
+    /// cell collision with — or a door would file under a key nothing else can
+    /// name.
     fn green_key_at(program: &Code, pc: usize) -> (u64, [i64; 3], [majit_ir::GreenType; 3]) {
         use majit_ir::GreenAsI64 as _;
         let slots = [pc.__green_repr(), pc.__green_repr(), program.__green_repr()];
@@ -1674,23 +1675,53 @@ pub mod float_bank {
         // same code. The calls this door exists for are the ones the loop's door
         // cannot serve, and those are exactly the calls whose loop never gets
         // hot — a bottom-tested loop at one row takes no back edge at all.
+        //
+        // `has_runnable_compiled_loop`, not `has_compiled_loop`, because the
+        // question this asks is whether the OTHER door can serve the call — a
+        // cell carrying only a `compile_tmp_callback` token has a compiled body
+        // and no frontend meta, so the generic entry runner cannot execute it
+        // and the loop's back edge would keep counting rather than run. Yielding
+        // to a door that cannot open would leave the call with no door at all.
+        //
+        // That this rule makes the two doors mutually exclusive for a program at
+        // all is the review's §1-third / §2-first finding (the artifacts do not
+        // coexist); resolving it needs majit-side artifact coexistence and is
+        // not attempted here.
         if pooled
             .loop_keys
             .iter()
-            .any(|key| driver.has_compiled_loop(*key))
+            .any(|key| driver.has_runnable_compiled_loop(*key))
         {
             return None;
         }
         // Read, not recomputed: the key is `green_key_at(program, ENTRY_PC)`,
         // and both of its inputs are fixed for as long as the pool pins this
         // address. See [`PooledProgram`].
+        //
+        // Every decision below keys on the hash alone, because the probes majit
+        // exposes take a `u64` and resolve no collision chain; the typed key is
+        // only supplied afterwards, to `back_edge_structured`. A 64-bit
+        // collision can therefore pick the wrong cell — the review's §1-second
+        // finding. Closing it needs typed-key-aware queries on the majit side.
         let hash = pooled.entry_hash;
         let (values, types) = (&pooled.entry_values, &pooled.entry_types);
-        if driver.has_compiled_loop(hash) {
+        if driver.has_runnable_compiled_loop(hash) {
             // The same call the row loop's back edge makes, so entry, guard
             // failure, blackhole resume and bridge start are all handled the one
-            // way. The predicate is `back_edge_structured`'s own, so this branch
-            // is taken exactly when that call will run compiled code.
+            // way.
+            //
+            // `has_runnable_compiled_loop` is the stronger of the two probes and
+            // the one this branch needs. `has_compiled_loop` is true as soon as
+            // the cell's token has a body, which includes a
+            // `compile_tmp_callback` stub that has NO frontend
+            // `compiled_loops` meta; the dispatch inside `back_edge_structured`
+            // unwraps that meta unconditionally, so entering on the weaker
+            // predicate panics instead of falling through to interpretation.
+            // Upstream's `maybe_compile_and_run` treats a temporary token by
+            // continuing to count, which is what declining here does. cel mints
+            // no CALL_ASSEMBLER token today — tmp callbacks come from recursive
+            // calls this VM has no opcode for — so this is defense, not a live
+            // crash being fixed.
             let resume = driver.back_edge_structured(
                 hash,
                 || majit_ir::GreenKey::with_types(values.to_vec(), types.to_vec()),

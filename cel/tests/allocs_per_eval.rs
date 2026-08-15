@@ -976,20 +976,33 @@ fn regvm_group(out: &mut Vec<Row>) {
                 // call that never enters compiled code costs what the idle row
                 // costs, and only this counter separates "warm and entering"
                 // from "warm and interpreting anyway".
+                //
+                // The verdict is stated against the CALL COUNT, not against
+                // zero. A window whose entry count merely grew is compatible
+                // with one call entering and the rest interpreting, so calling
+                // that "every call enters" claimed more than the counter
+                // proves. This is still an aggregate — one call entering twice
+                // covers for one entering not at all — so the strongest verdict
+                // here says "at least one entry per call on average", and the
+                // per-call form of the evidence lives in
+                // `examples/majit_percall_steady.rs`.
                 let calls = ITERS * ROUNDS as u32;
+                let entered = after.compiled_entries - at_seam.compiled_entries;
+                let verdict = if entered >= calls as usize {
+                    "STEADY: at least one compiled entry per call, on average over the window"
+                } else if entered > 0 {
+                    "PARTIAL — fewer entries than calls: some calls in this window were \
+                     interpreted, so the number mixes two tiers"
+                } else {
+                    "NEVER ENTERS — this row measures the interpreter, not the artifact"
+                };
                 out[first].detail = format!(
                     "warmed to call {}, then {calls} calls: compiled_before={} \
-                     entries_in_window={} compiled_in_window={} guard_fails={} — {}",
+                     entries_in_window={entered} compiled_in_window={} guard_fails={} — {verdict}",
                     STEADY_WARMUP + 1,
                     at_seam.loops_compiled,
-                    after.compiled_entries - at_seam.compiled_entries,
                     after.loops_compiled - at_seam.loops_compiled,
                     after.guard_failures - at_seam.guard_failures,
-                    if after.compiled_entries > at_seam.compiled_entries {
-                        "STEADY: every call enters compiled code"
-                    } else {
-                        "NEVER ENTERS — this row measures the interpreter, not the artifact"
-                    }
                 );
                 reset_persistent_state();
             }

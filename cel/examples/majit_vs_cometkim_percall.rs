@@ -22,7 +22,10 @@
 //!   were taken on, which is the entire basis of the comparison.
 //! * **majit** — the compiled tier through a ONE-ROW batch: `bind_per_row` once,
 //!   `collect_on(Tier::Jit)` per call. That returns the row's `Value`, which is
-//!   what `execute` returns, so it is the same contract.
+//!   what `execute` returns, so it is the same contract. Published only where
+//!   the calls actually ENTERED compiled code — `enter/call` is the gate, and a
+//!   case that did not reads `not entered` rather than a number that would be
+//!   the tracing interpreter's.
 //! * **raw** — the same call through `collect_raw_on`, where a columnar consumer
 //!   takes the machine's own buffers and no `Value` is built. Not comparable to
 //!   `stock`, which necessarily produces one.
@@ -482,12 +485,27 @@ struct Compiled {
     /// This is what decides whether the `majit` cell beside it is the compiled
     /// tier or the tracing interpreter, and it is a fact rather than an
     /// inference: `compiles` says an artifact was minted, which is true of
-    /// cases that never run a byte of it. Expect `0.00` wherever the row loop
-    /// is the only loop — it is bottom-tested, so a one-row batch takes zero
-    /// back edges and never reaches the instruction that consults the compiled
-    /// loop — and a positive number wherever the expression has a loop INSIDE
-    /// the row body, which a comprehension does.
+    /// cases that never run a byte of it.
+    ///
+    /// A one-row call used to read `0.00` here whenever the row loop was the
+    /// only loop: the loop is bottom-tested, so a one-row batch takes zero back
+    /// edges and never reaches the instruction that consults the compiled loop.
+    /// The function-entry door in `float_bank::try_function_entry_jit_f` counts
+    /// CALLS instead of rows, so such a case can now enter — which is what makes
+    /// gating the `majit` cell on this statistic worth doing rather than merely
+    /// correct.
     entries: f64,
+    /// Whether the settled window entered compiled code on EVERY one of its
+    /// calls, from the integer counter delta rather than from `entries` above.
+    ///
+    /// The gate in front of the `majit ns` cell. It is measured over the settled
+    /// window and not over the timed one, which is the strongest evidence this
+    /// harness collects: the timed loop is `per_call`, which cannot afford a
+    /// counter read per iteration. A window that enters on all 1 000 settled
+    /// calls and then stops entering inside the timed loop would still publish a
+    /// number here — for the per-call-evidenced version of this measurement see
+    /// `majit_percall_steady`.
+    entered_every_settled_call: bool,
     /// The compiled tier's marginal cost of one more activation, from a
     /// replicated-batch slope. `None` when the two probe batches did not both
     /// run in compiled code, which is a refusal to print a number rather than a
@@ -500,10 +518,15 @@ struct Compiled {
     jit_fix: Option<f64>,
     /// The SAME slope on the tier that cannot compile: the traced portal with
     /// its trace threshold at `u32::MAX`. This is the per-row cost BEFORE the
-    /// JIT has produced compiled code — and, because a one-row call takes no
-    /// back edge, it is also what a one-row call pays for ever. `jit_row`
-    /// beside it is the same row AFTER compiling, so the pair is what the
-    /// compiled tier actually earned.
+    /// JIT has produced compiled code; `jit_row` beside it is the same row AFTER
+    /// compiling, so the pair is what the compiled tier actually earned.
+    ///
+    /// It used to be a second thing as well — what a one-row call pays for ever,
+    /// since such a call takes no back edge and so never reached the compiled
+    /// loop. The function-entry door counts CALLS rather than rows, so that no
+    /// longer follows: `entries` says per case whether the one-row calls beside
+    /// this column entered compiled code, and where it says they did, this
+    /// column is the pre-compile cost only.
     interp_row: Option<f64>,
     interp_fix: Option<f64>,
     /// The same slope with no tracing machinery in the picture at all. It is
@@ -640,7 +663,9 @@ fn run_case(case: &Case) -> Row {
     // checked. `compiles` above cannot answer it: it counts artifacts minted,
     // and a loop that is minted and never entered leaves every other counter
     // here plausible while the interpreter produces the answers.
-    let entries = (COMPILED_ENTRIES.load(Ordering::Relaxed) - e0) as f64 / SETTLED as f64;
+    let entries_delta = COMPILED_ENTRIES.load(Ordering::Relaxed) - e0;
+    let entries = entries_delta as f64 / SETTLED as f64;
+    let entered_every_settled_call = entries_delta >= SETTLED;
     // `saturating_sub` where the two above subtract plainly, because the two
     // above are monotonic counters and this one is a population: only
     // `reset_persistent_state` can drop a live driver's count without absorbing
@@ -688,6 +713,7 @@ fn run_case(case: &Case) -> Row {
             guard_fails,
             bridges,
             entries,
+            entered_every_settled_call,
             jit_row,
             jit_fix,
             interp_row,
@@ -705,17 +731,24 @@ fn run_case(case: &Case) -> Row {
 /// per-row cost BEFORE the JIT has given the loop compiled code
 /// (`Tier::Interpreter`) and AFTER (`Tier::Jit`), in one unit, with
 /// `Tier::Clean` — no tracing machinery at all — as the floor under both.
-/// Without that split the compiled tier has no number of its own: a one-row
-/// call is the pre-compile tier forever (see below), so the head-to-head
-/// column and the compiled tier are two different machines under one heading.
+/// Without that split the compiled tier had no number of its own, because the
+/// head-to-head column and the compiled tier could be two different machines
+/// under one heading.
 ///
 /// Why a slope and not a timing of one activation: the row loop is
 /// bottom-tested, so an `n`-row batch takes `n - 1` back edges and a ONE-row
-/// batch takes none. It never executes the instruction that consults the
-/// compiled loop, so no amount of warming makes a one-row call run compiled
-/// code — measured, and pinned by `a_warm_driver_and_a_one_row_batch` in
-/// `tests/majit_trace_evidence.rs`. Timing one row and labelling it the
-/// compiled tier is precisely the defect this function exists to avoid.
+/// batch takes none, and until the function-entry door existed nothing a
+/// one-row call executed ever consulted the compiled loop — no amount of warming
+/// made such a call run compiled code. That is no longer unconditional: the door
+/// in `float_bank::try_function_entry_jit_f` counts CALLS, and
+/// `repeated_one_row_calls_reach_the_compiled_tier` in
+/// `tests/majit_trace_evidence.rs` is a cold one-row workload that reaches
+/// compiled code through it. What still holds is the boundary the door draws —
+/// it declines for a program whose own loop is already compiled, pinned by
+/// `a_compiled_row_loop_shuts_the_entry_door` — so a one-row call after a big
+/// batch is still the pre-compile tier. The slope keeps the two apart without
+/// depending on which of those a case is: `enter/call` reports the entry as a
+/// fact, and this function's own gates require it over every probe call.
 ///
 /// So: replicate the SAME activation `k` times, bit for bit, and difference two
 /// batch sizes. What survives the subtraction is the per-activation cost of
@@ -1275,9 +1308,11 @@ fn print_row_cost_table(rows: &[Row]) {
          That row's cost scales with the expression, which is why these intercepts differ\n\
          per case while `drv fix` is the part that does not.\n\
          \n\
-         ⚠ `jit earns` is not a claim about a single call. Today no one-row call enters\n\
-         compiled code at all, so `interp/row` is what a call in cometkim's regime actually\n\
-         pays and `jit/row` is what it WOULD pay if the entry existed."
+         ⚠ `jit earns` is not a claim about a single call. It compares two per-ROW slopes,\n\
+         and a call in cometkim's regime carries one row: whether that call is on the\n\
+         `interp/row` side or the `jit/row` side is what `enter/call` reports per case, and\n\
+         it is not the same answer for every case any more. A case whose `enter/call` is 0\n\
+         pays `interp/row`; one that enters through the function-entry door does not."
     );
 }
 
@@ -1326,16 +1361,30 @@ fn main() {
                     Some(x) => format!("{x:.1}"),
                     None => "-".to_string(),
                 };
+                // The timed `majit` number is published only where the settled
+                // window entered compiled code on every call. Where it did not,
+                // the number is the tracing interpreter's under the compiled
+                // tier's heading, and so is the ratio derived from it — both are
+                // annotated rather than printed, and `enter/call` beside them
+                // says how far short the evidence fell.
+                let (majit_cell, ratio_cell) = if c.entered_every_settled_call {
+                    (
+                        format!("{:.1}", c.majit),
+                        format!("{:.2}x", r.stock / c.majit),
+                    )
+                } else {
+                    ("not entered".to_string(), "-".to_string())
+                };
                 println!(
-                    "{:<28} {:>11.1} {:>11.1} {:>11.1} {:>11.2} {:>11} {:>11} {:>11.2}x {:>10.1} {:>10.1} {:>9} {:>12.2} {:>12.2} {:>13.2}",
+                    "{:<28} {:>11.1} {:>11.1} {:>11} {:>11.2} {:>11} {:>11} {:>12} {:>10.1} {:>10.1} {:>9} {:>12.2} {:>12.2} {:>13.2}",
                     r.label,
                     r.stock,
                     c.clean,
-                    c.majit,
+                    majit_cell,
                     c.entries,
                     opt(c.jit_row),
                     opt(c.jit_fix),
-                    r.stock / c.majit,
+                    ratio_cell,
                     c.raw,
                     c.bind,
                     c.compiles,
@@ -1387,10 +1436,12 @@ fn main() {
             never_compiled.join(", ")
         );
         println!(
-            "   their `majit ns` is the TRACING INTERPRETER under the compiled tier's heading.\n\
-                `aborts/call` says which of the two reasons applies: a nonzero count is a loop\n\
-                the tracer keeps trying and throwing away, a zero one is a loop that never gets\n\
-                hot — at one row per call the batch loop has no back edge to be hot on."
+            "   their `majit ns` is the TRACING INTERPRETER under the compiled tier's heading,\n\
+                and is printed as `not entered` for exactly that reason. `aborts/call` says\n\
+                which of two reasons applies: a nonzero count is a loop the tracer keeps trying\n\
+                and throwing away, a zero one is a loop that never gets hot — at one row per\n\
+                call the batch loop has no back edge to be hot on, and the function-entry door\n\
+                is the only counter that can warm such a case."
         );
     }
     print_row_cost_table(&rows);
@@ -1408,14 +1459,21 @@ fn main() {
     );
     println!(
         "\n`enter/call` is calls that ENTERED compiled code, counted at the point the\n\
-         compiled body is about to run — not artifacts minted. It is what says whether the\n\
-         `majit ns` cell beside it is the compiled tier or the tracing interpreter, and\n\
-         until it existed the heading asserted that and nothing checked it. A `0.00` with\n\
-         `compiles` at 1 is a loop that was compiled and never run: the row loop is\n\
-         bottom-tested, so a one-row batch takes zero back edges and never reaches the\n\
-         instruction that consults it. A positive one is an expression whose row BODY\n\
-         contains a loop that gets hot on its own — which is a per-case fact here, not a\n\
-         property of the shape: a comprehension over a 1-element list still reads 0.00."
+         compiled body is about to run — not artifacts minted. It now GATES the `majit ns`\n\
+         cell beside it rather than merely standing next to it: a case that did not enter on\n\
+         every call of the settled window prints `not entered` there and no `majit/stock`\n\
+         ratio, because the number would be the tracing interpreter's under the compiled\n\
+         tier's heading. A `0.00` with `compiles` at 1 is a loop that was compiled and never\n\
+         run. Two ways in can produce a positive number: the row BODY contains a loop that\n\
+         gets hot on its own, or the function-entry door — which counts CALLS, not rows —\n\
+         warmed on the repeated one-row calls this file makes. The door declines for a\n\
+         program whose own loop is already compiled, so which of the two applies is a\n\
+         per-case fact.\n\
+         \n\
+         ⚠ The window this is measured over is the 1 000-call settled window, not the timed\n\
+         loop: the timed loop cannot afford a counter read per call. A case that entered on\n\
+         all 1 000 settled calls and then stopped would still publish a number. For the\n\
+         per-call-evidenced form of the same measurement see `majit_percall_steady`."
     );
     println!(
         "\n`jit/row ns` is the compiled tier's MARGINAL cost of one more activation,\n\
