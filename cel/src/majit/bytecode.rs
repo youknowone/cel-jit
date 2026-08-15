@@ -1584,10 +1584,22 @@ pub mod float_bank {
     /// A word-wise scan, not a decode: an operand that happens to hold
     /// `OP_JUMP_IF_ABOVE`'s value contributes a position that is not an
     /// instruction. That is sound because the result is only ever asked whether
-    /// a key is COMPILED, and a loop is filed at a real back-edge target or at
-    /// [`ENTRY_PC`] — a spurious position answers no. Decoding instead needs an
-    /// operand-width table this module does not have and would have to keep in
-    /// step with every opcode added.
+    /// a key is COMPILED, and a key is only ever filed at a position some door
+    /// armed at — a real back-edge target, or [`ENTRY_PC`]. A spurious position
+    /// answers no. Decoding instead needs an operand-width table this module
+    /// does not have and would have to keep in step with every opcode added.
+    ///
+    /// [`ENTRY_PC`] is excluded, and that exclusion is what makes the paragraph
+    /// above true rather than nearly true. A spurious position CAN be
+    /// [`ENTRY_PC`] — `[1, 2, 3, 4, 5].map(x, x * 2)` unrolls to a body whose
+    /// `OP_MUL_OVF` reads register 16 and traps to register 0, so its `[.., 16,
+    /// 17, 18, 0, ..]` words read as a back edge to 0 — and that position does
+    /// NOT answer no, because it is the key the function-entry door itself
+    /// files under. Left in, the door reads its own artifact as evidence that
+    /// some other door exists and declines from the call after the one that
+    /// minted it, permanently: `compiles=1`, `compiled_entries=0`. Excluding it
+    /// costs nothing a real loop header at 0 would have provided, since a door
+    /// there and this door are one key and the caller is that door.
     fn loop_header_keys(program: &Code) -> Vec<u64> {
         let mut targets: Vec<usize> = Vec::new();
         for pc in 0..program.len().saturating_sub(3) {
@@ -1599,6 +1611,9 @@ pub mod float_bank {
                 continue;
             }
             let target = target as usize;
+            if target == ENTRY_PC {
+                continue;
+            }
             if !targets.contains(&target) {
                 targets.push(target);
             }

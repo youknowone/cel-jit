@@ -451,6 +451,75 @@ fn repeated_one_row_calls_reach_the_compiled_tier() {
     );
 }
 
+/// The entry door must not read its OWN artifact as evidence that another door
+/// exists.
+///
+/// `float_bank::loop_header_keys` finds a program's loop headers by scanning for
+/// `OP_JUMP_IF_ABOVE`'s value word-wise, so an OPERAND holding that value
+/// contributes a position that is not an instruction. That is harmless for every
+/// spurious position but one: `ENTRY_PC`, which is the position the entry door
+/// itself arms at. `[1, 2, 3, 4, 5].map(x, x * 2)` produces exactly that — the
+/// unrolled body's `OP_MUL_OVF` reads register 16 (`OP_JUMP_IF_ABOVE`'s value)
+/// and traps to register 0, so its four words read as a back edge to 0 — and the
+/// door then declines from the call after the one that minted its artifact,
+/// forever. Measured before the exclusion: `loops_compiled=1`,
+/// `compiled_entries=0` over 4096 calls, every answer out of the interpreter.
+///
+/// The expression is load-bearing and not an example: it is one of the few
+/// spellings measured to fail. What selects the defect is a numeric
+/// coincidence in the word stream — an operand holding 16 with a 0 three words
+/// later — and no property of the source decides that. `.map` over a literal
+/// unrolls on a six-register stride from a base of 4, so its THIRD element
+/// takes first operand 16 and its `OP_MUL_OVF` traps to register 0; three
+/// elements already suffice, and `[1, 2].map(x, x * 2)` stops at 10 and is
+/// healthy. Neighbours that look like they should fail do not: `.all` over a
+/// literal does not unroll at all, and `.filter` with the same multiply
+/// allocates on a different stride and lands its 16 three words ahead of an
+/// 18. `examples/rca_listmap.rs` runs that whole census.
+#[test]
+fn a_spurious_back_edge_to_entry_pc_does_not_shut_the_entry_door() {
+    use cel::majit::batch::{Batch, BatchProgram, Tier};
+
+    let _serial = serial();
+    let schema: Schema = Schema::new();
+    let lowered = BatchProgram::compile("[1, 2, 3, 4, 5].map(x, x * 2)", &schema)
+        .expect("a literal-list map lowers");
+    let batch = Batch::new(1);
+    let bound = lowered.bind_per_row(&batch).expect("no columns to bind");
+    let oracle = bound
+        .collect_on(Tier::Clean)
+        .expect("the clean tier answers");
+
+    reset_persistent_state();
+    reset_jit_stats();
+
+    const CALLS: usize = 64;
+    for call in 0..CALLS {
+        let jit = bound.collect_on(Tier::Jit).expect("the jit tier answers");
+        assert_eq!(jit, oracle, "call {call} diverged from the oracle tier");
+    }
+
+    let stats = jit_stats();
+    eprintln!("[entry-pc-alias] calls={CALLS} {stats}");
+    assert_eq!(
+        stats.internal_compile_panics, 0,
+        "a trace was dropped by a panic inside compilation, so the entry count \
+         below measures nothing"
+    );
+    assert!(
+        stats.loops_compiled >= 1,
+        "{CALLS} one-row calls must compile something at the entry door"
+    );
+    assert!(
+        stats.compiled_entries >= 1,
+        "{CALLS} one-row calls compiled {} artifact(s) and entered none. The \
+         entry key is in this program's scanned loop-header keys, so the door's \
+         `has_compiled_loop` decline fires on the artifact the door itself just \
+         minted",
+        stats.loops_compiled
+    );
+}
+
 /// What keeping the driver alive across calls, over a program the lowering
 /// itself owns, buys:
 /// a second batch of the same expression finds its loop already compiled and
