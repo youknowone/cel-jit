@@ -1013,6 +1013,77 @@ fn regvm_group(out: &mut Vec<Row>) {
 #[cfg(not(feature = "jit"))]
 fn regvm_group(_out: &mut Vec<Row>) {}
 
+/// The register banks are a fixed-width register FILE, not an accumulator: their
+/// width is a property of the lowered program, so a steady-state evaluation must
+/// allocate the same number of times whatever the row's element count is.
+///
+/// Asserted directly rather than blessed as rows, because the claim is a
+/// relation between two measurements and not a number. A per-element allocation
+/// would be invisible to a baseline row — the row would simply carry a bigger
+/// figure and keep matching itself — but it shows up here as two sizes
+/// disagreeing.
+///
+/// The shape is the chained one on purpose. It is the widest bank the ladder
+/// builds, so a growth introduced anywhere in the bank path reaches it first.
+#[cfg(feature = "jit")]
+fn bank_growth_probe() {
+    use cel::majit::batch::{Batch, BatchProgram, ColumnRef, Tier};
+    use cel::majit::bytecode::float_bank::reset_persistent_state;
+    use cel::majit::lower::{Schema, ValType};
+
+    /// Enough calls past the entry door that nothing is still compiling.
+    const WARMUP: usize = 600;
+    /// Calls the meter is open over. A per-element allocation at the smaller
+    /// size alone would already exceed the whole measured count here.
+    const CALLS: usize = 200;
+
+    const SRC: &str = "items.filter(x, x % 2 == 0).map(x, x * 2)";
+
+    let measure = |n: i64| -> u64 {
+        let schema: Schema = [("items[]".to_string(), ValType::Int)]
+            .into_iter()
+            .collect();
+        let program = BatchProgram::compile(SRC, &schema).expect("the ladder shape lowers");
+        let elems: Vec<i64> = (1..=n).collect();
+        let lens = vec![n];
+        let batch = Batch::new(1).column(
+            "items".to_string(),
+            ColumnRef::List {
+                lens: &lens,
+                fields: vec![(None, ColumnRef::Int(&elems))],
+            },
+        );
+        let bound = program.bind_per_row(&batch).expect("one int list column binds");
+        reset_persistent_state();
+        for _ in 0..WARMUP {
+            black_box(bound.collect_raw_on(Tier::Jit, |out| { let _ = black_box(&out); }))
+                .expect("the compiled tier answers");
+        }
+        let meter = Meter::start();
+        for _ in 0..CALLS {
+            black_box(bound.collect_raw_on(Tier::Jit, |out| { let _ = black_box(&out); }))
+                .expect("the compiled tier answers");
+        }
+        meter.stop().0
+    };
+
+    let small = measure(100);
+    let large = measure(500);
+    assert_eq!(
+        small, large,
+        "bank-growth probe: {CALLS} steady-state calls allocated {small} time(s) at 100 \
+         elements and {large} at 500. The two are expected to be equal: the banks are \
+         sized from the lowered program, reused across calls, and re-established in \
+         place, so nothing in the call path may allocate per ELEMENT. A difference of \
+         about 400 names a bank that now grows as the row is walked — an exact-length \
+         block reallocates on every growth step, which is a per-element heap allocation \
+         in the hot path rather than a number to re-bless."
+    );
+}
+
+#[cfg(not(feature = "jit"))]
+fn bank_growth_probe() {}
+
 // ---------------------------------------------------------------------------
 // baseline
 // ---------------------------------------------------------------------------
@@ -1281,6 +1352,7 @@ fn main() {
     bind_group(&mut rows);
     comprehension_group(&mut rows);
     regvm_group(&mut rows);
+    bank_growth_probe();
 
     let (base, meta) = read_baseline();
     let bless = std::env::var_os("CEL_ALLOCS_BLESS").is_some();
