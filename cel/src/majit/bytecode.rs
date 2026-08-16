@@ -918,8 +918,8 @@ pub mod float_bank {
     }
 
     struct VmStateF {
-        regs: Vec<i64>,
-        fregs: Vec<f64>,
+        regs: majit_metainterp::virt_array::VirtArray<i64>,
+        fregs: majit_metainterp::virt_array::VirtArray<f64>,
         /// What a terminal opcode hands back, as raw i64 bits.
         ///
         /// The `; state` merge point leaves the loop through `break` before it
@@ -947,8 +947,8 @@ pub mod float_bank {
     /// trap address all live there, and no float ever enters from outside.
     fn initial_state_f(init_regs: &[i64], num_fregs: usize) -> VmStateF {
         VmStateF {
-            regs: init_regs.to_vec(),
-            fregs: vec![0.0; num_fregs],
+            regs: majit_metainterp::virt_array::VirtArray::from_slice(init_regs),
+            fregs: majit_metainterp::virt_array::VirtArray::filled(0.0, num_fregs),
             ret: 0,
         }
     }
@@ -960,11 +960,19 @@ pub mod float_bank {
     /// allocation is saved, not the initialization — and saving it is the
     /// point, because a one-row call is otherwise two heap allocations of
     /// prologue for a few nanoseconds of work.
+    ///
+    /// Each bank is resized to the length this call needs and then overwritten
+    /// whole. The float bank is filled rather than emptied first: `resize`
+    /// initializes only the slots it adds, so a bank that already had the right
+    /// length would keep the previous call's values, and clearing it to force
+    /// the fill would give up the allocation this function exists to keep — a
+    /// bank whose storage is a single exact-length block has no spare capacity
+    /// to shrink into and back out of.
     fn reseed_state_f(state: &mut VmStateF, init_regs: &[i64], num_fregs: usize) {
         state.regs.resize(init_regs.len(), 0);
         state.regs.copy_from_slice(init_regs);
-        state.fregs.clear();
         state.fregs.resize(num_fregs, 0.0);
+        state.fregs.fill(0.0);
         state.ret = 0;
     }
 
@@ -2282,8 +2290,8 @@ pub mod float_bank {
             COMPILED_ENTRIES.fetch_add(1, Ordering::Relaxed);
         });
         let seed = VmStateF {
-            regs: vec![0; num_regs],
-            fregs: vec![0.0; num_fregs],
+            regs: majit_metainterp::virt_array::VirtArray::filled(0, num_regs),
+            fregs: majit_metainterp::virt_array::VirtArray::filled(0.0, num_fregs),
             ret: 0,
         };
         {
@@ -2428,8 +2436,8 @@ pub mod float_bank {
                 programs: Vec::new(),
                 by_addr: std::collections::HashMap::new(),
                 state: VmStateF {
-                    regs: vec![0; num_regs],
-                    fregs: vec![0.0; num_fregs],
+                    regs: majit_metainterp::virt_array::VirtArray::filled(0, num_regs),
+                    fregs: majit_metainterp::virt_array::VirtArray::filled(0.0, num_fregs),
                     ret: 0,
                 },
             }
