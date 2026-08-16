@@ -1687,6 +1687,20 @@ pub mod float_bank {
         // all is the review's §1-third / §2-first finding (the artifacts do not
         // coexist); resolving it needs majit-side artifact coexistence and is
         // not attempted here.
+        //
+        // The predicate and not the token form, unlike the entry decision
+        // below: this probe asks about a cell some OTHER door runs, and the
+        // only outcome here is to decline, so there is no run to hand a token
+        // to. It costs one cell read per key either way — the predicate is that
+        // read with its answer collapsed to a bool.
+        //
+        // Still on bare hashes, and that is the one place in this door where a
+        // chained bucket can still answer for the wrong cell. The greens of a
+        // loop header are derivable (they are `pc` and the program address, the
+        // same shape [`green_key_at`] builds), but the pool stores only the
+        // hash, so resolving here would mean widening what it keeps. Left as
+        // is: the consequence is a yield-or-not decision about a door that is
+        // not this one, not an entry into someone else's code.
         if pooled
             .loop_keys
             .iter()
@@ -1698,33 +1712,43 @@ pub mod float_bank {
         // and both of its inputs are fixed for as long as the pool pins this
         // address. See [`PooledProgram`].
         //
-        // Every decision below keys on the hash alone, because the probes majit
-        // exposes take a `u64` and resolve no collision chain; the typed key is
-        // only supplied afterwards, to `back_edge_structured`. A 64-bit
-        // collision can therefore pick the wrong cell — the review's §1-second
-        // finding. Closing it needs typed-key-aware queries on the majit side.
+        // Resolved once, then carried. `entry_hash` is a bucket hash, and a
+        // bucket can hold more than one cell; the typed key settles which one
+        // this door's greens own, and every step below — the entry decision,
+        // the token it decides on, and the run that token is handed to — uses
+        // that one answer. The door used to ask on the bare hash and then hand
+        // the bare hash on, which was two resolutions per warm call and, on a
+        // chained bucket, a decision about one cell followed by a run keyed
+        // through another.
         let hash = pooled.entry_hash;
         let (values, types) = (&pooled.entry_values, &pooled.entry_types);
-        if driver.has_runnable_compiled_loop(hash) {
-            // The same call the row loop's back edge makes, so entry, guard
+        let entry_key = driver.resolve_cell_key(hash, || {
+            majit_ir::GreenKey::with_types(values.to_vec(), types.to_vec())
+        });
+        // The token IS the decision — `Some` is the runnable-compiled-loop
+        // answer this branch used to ask for as a predicate, and it is the same
+        // object the run below enters, so nothing between the two can make them
+        // disagree.
+        //
+        // It is the runnable form, not the weaker code-present one:
+        // code-present is true as soon as the cell's token has a body, which
+        // includes a `compile_tmp_callback` stub that has NO frontend
+        // `compiled_loops` meta; the dispatch inside the entry path unwraps
+        // that meta unconditionally, so entering on the weaker answer panics
+        // instead of falling through to interpretation. Upstream's
+        // `maybe_compile_and_run` treats a temporary token by continuing to
+        // count, which is what declining here does. cel mints no
+        // CALL_ASSEMBLER token today — tmp callbacks come from recursive calls
+        // this VM has no opcode for — so this is defense, not a live crash
+        // being fixed.
+        if let Some(procedure_token) = driver.runnable_procedure_token(entry_key) {
+            // The same run the row loop's back edge reaches, so entry, guard
             // failure, blackhole resume and bridge start are all handled the one
-            // way.
-            //
-            // `has_runnable_compiled_loop` is the stronger of the two probes and
-            // the one this branch needs. `has_compiled_loop` is true as soon as
-            // the cell's token has a body, which includes a
-            // `compile_tmp_callback` stub that has NO frontend
-            // `compiled_loops` meta; the dispatch inside `back_edge_structured`
-            // unwraps that meta unconditionally, so entering on the weaker
-            // predicate panics instead of falling through to interpretation.
-            // Upstream's `maybe_compile_and_run` treats a temporary token by
-            // continuing to count, which is what declining here does. cel mints
-            // no CALL_ASSEMBLER token today — tmp callbacks come from recursive
-            // calls this VM has no opcode for — so this is defense, not a live
-            // crash being fixed.
-            let resume = driver.back_edge_structured(
-                hash,
-                || majit_ir::GreenKey::with_types(values.to_vec(), types.to_vec()),
+            // way — only reached with the cell and its token already in hand
+            // instead of re-derived from the hash.
+            let resume = driver.back_edge_resolved(
+                entry_key,
+                procedure_token,
                 ENTRY_PC,
                 state,
                 program,
@@ -1746,14 +1770,19 @@ pub mod float_bank {
         if driver.is_tracing() {
             return None;
         }
+        // On the resolved key as well, so the counter that decides to trace, the
+        // trace that starts, and the entry decision above are all about the one
+        // cell this door's greens own. Identical to the raw hash on every bucket
+        // that holds a single cell, which includes every bucket that holds none
+        // — so a cold program's first calls count exactly where they did.
         if driver
             .meta_interp_mut()
             .warm_state_mut()
-            .should_trace_function_entry(hash)
+            .should_trace_function_entry(entry_key)
         {
             // The counter above is the whole threshold decision, so the start
             // has to be the one that does not consult a counter of its own.
-            driver.force_start_tracing(hash, ENTRY_PC, state, program);
+            driver.force_start_tracing(entry_key, ENTRY_PC, state, program);
         }
         None
     }
