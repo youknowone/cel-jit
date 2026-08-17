@@ -48,7 +48,9 @@
 //!   result of any type, so this is the compiled path for the `string`-,
 //!   `timestamp`- and `duration`-valued expressions a sum has nothing to do
 //!   with — and the one that keeps each row's own answer rather than a figure
-//!   they all collapse into.
+//!   they all collapse into. [`BoundBatch::collect_into`] is the same read into
+//!   a buffer the caller owns, for one that evaluates repeatedly and would
+//!   rather keep its output vector than allocate one per run.
 //!
 //! Both compile the same loop over the same red-index column reads; only the
 //! last instruction of an iteration differs.
@@ -819,6 +821,43 @@ impl BoundBatch<'_, '_> {
         self.collect_raw_with(tier, threshold, |out| out.to_values())
     }
 
+    /// [`BoundBatch::collect`] writing into a buffer the CALLER owns, so a
+    /// caller evaluating the same batch repeatedly can hand the same buffer
+    /// back and stop allocating an output vector per call.
+    ///
+    /// Contract: on success `out` holds exactly what the matching
+    /// [`BoundBatch::collect`] would have returned — the buffer is CLEARED
+    /// first, so anything it carried from an earlier call is dropped and never
+    /// mixed into this call's rows, and its capacity is what carries over. On
+    /// an error `out` is left untouched: the run has to produce a result before
+    /// there is anything to decode into it.
+    ///
+    /// Both doors box every row through [`RawOutput::extend_values`], so the
+    /// values they produce cannot drift; the only thing that differs is who
+    /// owns the vector they land in.
+    pub fn collect_into(&self, out: &mut Vec<Value>) -> Result<(), BatchError> {
+        self.collect_into_on(Tier::Auto, out)
+    }
+
+    /// [`BoundBatch::collect_into`] on a chosen tier.
+    pub fn collect_into_on(&self, tier: Tier, out: &mut Vec<Value>) -> Result<(), BatchError> {
+        let tier = self.route(tier);
+        self.collect_into_with(tier, threshold_for(tier), out)
+    }
+
+    /// [`BoundBatch::collect_into_on`] with an explicit trace threshold.
+    pub fn collect_into_with(
+        &self,
+        tier: Tier,
+        threshold: u32,
+        out: &mut Vec<Value>,
+    ) -> Result<(), BatchError> {
+        self.collect_raw_with(tier, threshold, |raw| {
+            out.clear();
+            raw.extend_values(out);
+        })
+    }
+
     /// Evaluate every row and hand the results to `f` in the machine's OWN
     /// columnar encoding, on [`Tier::Jit`] — without boxing a row into a
     /// [`Value`].
@@ -1192,6 +1231,19 @@ impl RawOutput<'_> {
     /// [`BoundBatch::collect`] does with a raw output, and the cost the raw
     /// door exists to let a columnar consumer skip.
     pub fn to_values(&self) -> Vec<Value> {
+        let mut out = Vec::with_capacity(self.rows());
+        self.extend_values(&mut out);
+        out
+    }
+
+    /// [`RawOutput::to_values`] appending into a buffer the caller owns, which
+    /// is what [`BoundBatch::collect_into_on`] hands a reused one to. Boxing a
+    /// row costs the same either way; what the caller keeps is the output
+    /// vector's own allocation, which is not part of evaluating a row.
+    ///
+    /// `to_values` is this function into a fresh vector, so a row is decoded by
+    /// one piece of code whichever door asked for it.
+    pub fn extend_values(&self, out: &mut Vec<Value>) {
         match self {
             RawOutput::Scalar {
                 ty,
@@ -1203,7 +1255,7 @@ impl RawOutput<'_> {
                 // it unconditionally was not free.
                 let interned = matches!(*ty, ValType::Str).then(|| intern(distinct));
                 let interned = interned.as_deref().unwrap_or(&[]);
-                values.iter().map(|&v| decode(*ty, v, interned)).collect()
+                out.extend(values.iter().map(|&v| decode(*ty, v, interned)));
             }
             RawOutput::List {
                 lens,
@@ -1211,7 +1263,7 @@ impl RawOutput<'_> {
                 distinct,
             } => {
                 let mut at = 0usize;
-                let mut rows = Vec::with_capacity(lens.len());
+                out.reserve(lens.len());
                 // The distinct strings are interned once for the whole output,
                 // and only when a field will read them — `column_of` consults
                 // the table in its `Str` arm alone. It is NOT free when the
@@ -1240,7 +1292,7 @@ impl RawOutput<'_> {
                             // out-of-range window would otherwise surface as a
                             // short list.
                             let len = count.max(0) as usize;
-                            rows.push(Value::List(ListRef::window(Arc::clone(&column), at, len)));
+                            out.push(Value::List(ListRef::window(Arc::clone(&column), at, len)));
                             at += len;
                         }
                     }
@@ -1266,12 +1318,11 @@ impl RawOutput<'_> {
                         ))));
                         for &count in *lens {
                             let len = count.max(0) as usize;
-                            rows.push(Value::List(ListRef::window(Arc::clone(&schema), at, len)));
+                            out.push(Value::List(ListRef::window(Arc::clone(&schema), at, len)));
                             at += len;
                         }
                     }
                 }
-                rows
             }
         }
     }
@@ -1385,6 +1436,135 @@ mod tests {
             for tier in [Tier::Auto, Tier::Clean, Tier::Interpreter, Tier::Jit] {
                 assert_eq!(bound.collect_on(tier).unwrap(), want, "{tier:?} at {rows}");
             }
+        }
+    }
+
+    /// The caller-buffer door owes exactly what the vector-returning one
+    /// returns. Both decode through `RawOutput::extend_values`, and this is
+    /// what keeps that true: every bank an output can carry — including a list
+    /// result, whose arm builds a shared column rather than a value per row —
+    /// asked on every tier, through both doors.
+    #[test]
+    fn collect_into_answers_what_collect_answers() {
+        let ints = [7i64, -1, 0, 5];
+        let floats = [1.5f64, -0.25, 0.0, 8.0];
+        let bools = [true, false, false, true];
+        let strs: Vec<String> = ["pear", "fig", "apple", "fig"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let elems = [1i64, 2, 3, 4, 5, 6];
+        let lens = [2i64, 3, 1];
+        let scalars: Vec<(&str, &str, Schema, ColumnRef)> = vec![
+            (
+                "x * 2 + 1",
+                "x",
+                schema(&[("x", ValType::Int)]),
+                ColumnRef::Int(&ints),
+            ),
+            (
+                "f * 2.0",
+                "f",
+                schema(&[("f", ValType::Float)]),
+                ColumnRef::Float(&floats),
+            ),
+            (
+                "!b",
+                "b",
+                schema(&[("b", ValType::Bool)]),
+                ColumnRef::Bool(&bools),
+            ),
+            (
+                "s",
+                "s",
+                schema(&[("s", ValType::Str)]),
+                ColumnRef::Str(&strs),
+            ),
+        ];
+        // One buffer across every case, so a case also inherits whatever the
+        // case before it left behind.
+        let mut buf = Vec::new();
+        for (source, name, s, col) in scalars {
+            let rows = match col {
+                ColumnRef::Str(c) => c.len(),
+                _ => ints.len(),
+            };
+            let batch = Batch::new(rows).column(name, col);
+            let program = BatchProgram::compile(source, &s).unwrap();
+            let bound = program.bind_per_row(&batch).unwrap();
+            for tier in [Tier::Auto, Tier::Clean, Tier::Interpreter, Tier::Jit] {
+                let want = bound.collect_on(tier).unwrap();
+                bound.collect_into_on(tier, &mut buf).unwrap();
+                assert_eq!(buf, want, "{source}: {tier:?}");
+            }
+        }
+
+        let s = schema(&[("list[]", ValType::Int)]);
+        let batch = Batch::new(lens.len()).column(
+            "list",
+            ColumnRef::List {
+                lens: &lens,
+                fields: vec![(None, ColumnRef::Int(&elems))],
+            },
+        );
+        let program = BatchProgram::compile("list.map(x, x * 2)", &s).unwrap();
+        let bound = program.bind_per_row(&batch).unwrap();
+        for tier in [Tier::Auto, Tier::Clean, Tier::Interpreter, Tier::Jit] {
+            let want = bound.collect_on(tier).unwrap();
+            bound.collect_into_on(tier, &mut buf).unwrap();
+            assert_eq!(buf, want, "list output: {tier:?}");
+        }
+    }
+
+    /// A reused buffer holds the LATEST run and nothing else. The door clears
+    /// before it decodes, so a shorter batch after a longer one cannot leave
+    /// the longer one's tail behind — which is the failure a buffer that was
+    /// merely overwritten in place would produce, and the one a caller reusing
+    /// a buffer across differently sized batches would hit first.
+    ///
+    /// Run with a `string` result as well as an `int` one, because clearing a
+    /// string row drops a reference count where clearing an int row drops
+    /// nothing.
+    #[test]
+    fn a_reused_buffer_holds_exactly_the_latest_run() {
+        let long: Vec<i64> = (0..64).collect();
+        let short = [9i64, 4];
+        let words: Vec<String> = ["fig", "pear", "fig"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let int_program =
+            BatchProgram::compile("x * 2 + 1", &schema(&[("x", ValType::Int)])).unwrap();
+        let str_program = BatchProgram::compile("s", &schema(&[("s", ValType::Str)])).unwrap();
+
+        for tier in [Tier::Auto, Tier::Clean, Tier::Interpreter, Tier::Jit] {
+            // Junk from before the first call, which the first call owes the
+            // caller nothing of.
+            let mut buf = vec![Value::Int(-777)];
+            let run = |xs: &[i64], buf: &mut Vec<Value>| {
+                let batch = Batch::new(xs.len()).column("x", ColumnRef::Int(xs));
+                int_program
+                    .bind_per_row(&batch)
+                    .unwrap()
+                    .collect_into_on(tier, buf)
+                    .unwrap();
+            };
+            let want =
+                |xs: &[i64]| -> Vec<Value> { xs.iter().map(|v| Value::Int(v * 2 + 1)).collect() };
+
+            run(&long, &mut buf);
+            assert_eq!(buf, want(&long), "{tier:?}: first run");
+            // Shrinking, then growing back into the capacity the first run
+            // left: neither direction may show the other run's rows.
+            run(&short, &mut buf);
+            assert_eq!(buf, want(&short), "{tier:?}: shorter second run");
+            run(&long, &mut buf);
+            assert_eq!(buf, want(&long), "{tier:?}: back to the taller batch");
+
+            let batch = Batch::new(words.len()).column("s", ColumnRef::Str(&words));
+            let bound = str_program.bind_per_row(&batch).unwrap();
+            bound.collect_into_on(tier, &mut buf).unwrap();
+            assert_eq!(buf, bound.collect_on(tier).unwrap(), "{tier:?}: strings");
         }
     }
 

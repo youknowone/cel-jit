@@ -21,11 +21,21 @@
 //!   silently make this column a different evaluator from the one his figures
 //!   were taken on, which is the entire basis of the comparison.
 //! * **majit** — the compiled tier through a ONE-ROW batch: `bind_per_row` once,
-//!   `collect_on(Tier::Jit)` per call. That returns the row's `Value`, which is
-//!   what `execute` returns, so it is the same contract. Published only where
-//!   the calls actually ENTERED compiled code — `enter/call` is the gate, and a
-//!   case that did not reads `not entered` rather than a number that would be
-//!   the tracing interpreter's.
+//!   `collect_into_on(Tier::Jit, &mut out)` per call. That builds the row's
+//!   `Value`, which is what `execute` returns, so it is the same contract.
+//!   Published only where the calls actually ENTERED compiled code —
+//!   `enter/call` is the gate, and a case that did not reads `not entered`
+//!   rather than a number that would be the tracing interpreter's.
+//!
+//!   ⚠ Why the buffer door and not `collect_on`, which returns a fresh
+//!   `Vec<Value>`: `stock` returns ONE `Value` and allocates no container to
+//!   carry it, so a `Vec` per call is ~11 ns this side pays for the batch
+//!   API's shape and not for evaluating the expression. `collect_into_on`
+//!   removes exactly that and nothing else — every row's `Value` is still
+//!   built, by the same code, and the buffer belongs to the caller, who in any
+//!   real per-call loop owns one already. `clean`, `majit` and `auto` all go
+//!   through it and share ONE buffer, so the tiers stay comparable with each
+//!   other; `stock` and cometkim's columns are untouched.
 //! * **raw** — the same call through `collect_raw_on`, where a columnar consumer
 //!   takes the machine's own buffers and no `Value` is built. Not comparable to
 //!   `stock`, which necessarily produces one.
@@ -463,10 +473,10 @@ struct Compiled {
     /// or the cost of the tracer failing to get out of the way.
     clean: f64,
     majit: f64,
-    /// The DEFAULT door — `collect()`, which asks for `Tier::Auto` and lets the
-    /// bound batch pick between the two columns to its left. This is what a
-    /// caller who names no tier gets, and the only column here that is about
-    /// the library's own choice rather than about a tier.
+    /// The DEFAULT route — `Tier::Auto`, which lets the bound batch pick
+    /// between the two columns to its left. This is what a caller who names no
+    /// tier gets, and the only column here that is about the library's own
+    /// choice rather than about a tier.
     auto: f64,
     /// Which tier `Tier::Auto` resolved to, and the body-word count it decided
     /// on. A `clean` route beside a `majit` cell slower than the `clean` one is
@@ -637,7 +647,13 @@ fn run_case(case: &Case) -> Row {
     // Miscompile gate: all three tiers, and the tree-walker, agree on the one
     // row. `collect` is the per-row door, so this compares the VALUE his
     // `execute` returns, not a batch reduction of it.
+    //
+    // The buffer door is gated here beside it because it is the one the table
+    // TIMES: a gate that checked only `collect_on` would leave the measured
+    // door unchecked, and a measured door that produced nothing would read as
+    // a very fast one.
     COMPILES.store(0, Ordering::Relaxed);
+    let mut gate = Vec::new();
     for tier in [Tier::Clean, Tier::Interpreter, Tier::Jit] {
         let got = bound
             .collect_on(tier)
@@ -646,6 +662,14 @@ fn run_case(case: &Case) -> Row {
             got.as_slice(),
             std::slice::from_ref(&expected),
             "{}: {tier:?} vs stock",
+            case.label
+        );
+        bound
+            .collect_into_on(tier, &mut gate)
+            .unwrap_or_else(|e| panic!("{}: {tier:?} into buffer: {e}", case.label));
+        assert_eq!(
+            gate, got,
+            "{}: {tier:?} buffer door vs collect_on",
             case.label
         );
     }
@@ -683,18 +707,22 @@ fn run_case(case: &Case) -> Row {
     // a wrong number where a clamped zero is a visibly uninformative one.
     let bridges = jit_stats().bridges_compiled.saturating_sub(b0) as f64 / SETTLED as f64;
 
-    let collect = |tier| {
+    // ONE output buffer for all three of our timed columns, reused call after
+    // call. See this file's header on why that is the fair door: the buffer is
+    // the caller's, and evaluating a row is what is being compared.
+    let mut out: Vec<Value> = Vec::new();
+    let collect = |tier, out: &mut Vec<Value>| {
         bound
-            .collect_on(tier)
-            .unwrap_or_else(|e| panic!("{}: {tier:?}: {e}", case.label))
+            .collect_into_on(tier, out)
+            .unwrap_or_else(|e| panic!("{}: {tier:?}: {e}", case.label));
+        // The rows are the result, and nothing downstream reads them, so they
+        // are held against elimination here rather than by a return value:
+        // the door hands them back through the buffer.
+        black_box(out.as_slice());
     };
-    let clean = per_call(|| collect(Tier::Clean));
-    let majit = per_call(|| collect(Tier::Jit));
-    let auto = per_call(|| {
-        bound
-            .collect()
-            .unwrap_or_else(|e| panic!("{}: auto: {e}", case.label))
-    });
+    let clean = per_call(|| collect(Tier::Clean, &mut out));
+    let majit = per_call(|| collect(Tier::Jit, &mut out));
+    let auto = per_call(|| collect(Tier::Auto, &mut out));
     let raw = per_call(|| {
         bound
             .collect_raw_on(Tier::Jit, consume_raw)
