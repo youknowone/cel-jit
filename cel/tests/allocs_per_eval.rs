@@ -1319,6 +1319,45 @@ const BASELINE_HEADER: &str = "\
 #   evidence that the gap is not bridge-related -- and a reader who remembers
 #   it needs to know it was retired by a fix, not by a re-measurement.
 #
+# ✅ A DIFFERENT PART of the same backend disagreement IS attributed: the
+#   compiled-ENTRY allocation, one per call, which dynasm pays and cranelift
+#   does not. It is the DEADFRAME REPRESENTATION, not the frame. `DeadFrame`
+#   (majit-backend/src/lib.rs:1620-1631) is an enum with an inline
+#   `JitFrame(JitFrameDeadFrame)` variant and a `Boxed(Box<dyn Any>)` one:
+#   cranelift returns the inline variant
+#   (majit-backend-cranelift/src/compiler.rs:3168) and allocates nothing for it,
+#   while dynasm returns `DeadFrame::boxed(FrameData::owning(..))`
+#   (majit-backend-dynasm/src/runner.rs:3000) and pays one Box per entry. BOTH
+#   legs allocate the JITFRAME itself visibly -- dynasm via
+#   `alloc_off_gc_jitframe` (runner.rs:2871 -> majit-backend/src/jitframe.rs:230),
+#   cranelift inside `run_compiled_code` (compiler.rs:7729-7775) -- so the frame
+#   is NOT where the legs differ, and an attribution that names it is wrong.
+#
+#   Measured, not inferred. On ONE tree: `CEL_ALLOCS_GATE=1 ... --features
+#   jit-cranelift` reports `rows=82 unstable=0 drifted=0`, where `--features
+#   jit-dynasm` on that same tree reports `drifted=12` -- all 12 being `regvm/jit*`
+#   and `regvm/jit-steady/*` rows, each at exactly +1.000. A per-allocation
+#   backtrace of `regvm/jit-steady/arith/n=1` then shows 1 allocation on
+#   cranelift against 2 on dynasm, the extra one being the Box above. The
+#   backtrace was taken with a throwaway allocator mode, not kept here: a
+#   re-entrancy flag so a capture does not count or capture itself, armed for one
+#   named row on one extra call OUTSIDE the metered rounds.
+#
+#   ⚠ \"CRANELIFT PAYS 1\" IS NOT A FLAT FACT, and a reader who takes it as one
+#   will mis-bless. `run_compiled_code` branches on
+#   `cranelift_jitframe_type_id()`: on the arm where a GC type registry exists
+#   the frame is nursery-allocated and therefore INVISIBLE to a global-allocator
+#   counter, and that configuration reads 0 here rather than 1. The capture above
+#   was taken on the other arm, which falls back to a heap `Vec<i64>`. A
+#   re-measurement that disagrees should establish which arm it is on before
+#   recording the difference as a change.
+#
+#   ⛔ THIS ATTRIBUTES ONLY THE COMPILED-ENTRY ALLOCATION. It does NOT explain
+#   the two-allocation `regvm/jit/*/n=1000` gap above: that one runs the OTHER
+#   way round (cranelift higher, dynasm lower) on different rows, and it remains
+#   open, asymmetry included. Two findings, one file, opposite signs -- do not
+#   collapse them into a single \"backend difference\".
+#
 # ⚠ THESE ROWS STILL SAMPLE A PRE-BRIDGE WINDOW, but the cliff they used to
 #   warn about is GONE. The `regvm/jit/*` window covers calls 65..89 and the
 #   first guard bridge lands at call 200, so the figures below remain the
