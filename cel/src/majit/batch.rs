@@ -75,6 +75,38 @@ use crate::{Context, Program, Value};
 /// many iterations. Matches the threshold the benchmarks and tests use.
 pub const DEFAULT_JIT_THRESHOLD: u32 = 8;
 
+/// Body words at which [`Tier::Auto`] hands the run to the compiled tier.
+///
+/// Entering compiled code costs about the same on every call, whatever the
+/// program: the driver lookup, the program-table insert, the state republish,
+/// the per-call buffers. The plain interpreter pays none of it and instead
+/// spends per WORD. So the two cross where the interpreter's words cost what
+/// the entry costs, and that crossing is what this number is — measured, not
+/// assumed, by `tierprobe`, which times both tiers over a straight-line program
+/// and a comprehension at rising batch heights and reports where they meet.
+///
+/// It is stated in body words rather than in rows so that one number serves
+/// both shapes: a tall batch of a small body and a short batch of a
+/// comprehension over many elements reach it the same way.
+///
+/// The two shapes do not cross at exactly the same word count — `tierprobe`
+/// measures 503 and 359 words for straight-line bodies swept by height, 523 and
+/// 469 for comprehensions swept by element count — because a word inside an
+/// inner loop is not quite the same work as a word in a row body. 460 is the
+/// geometric mean of the four. Between the outermost two a batch can be held on
+/// the interpreter just past its own crossing, or handed to the compiled tier
+/// just short of it; every batch outside that band gets the tier it wants.
+///
+/// That the four agree inside a factor of 1.5 is what makes ONE constant the
+/// right shape of rule, and neither half of that agreement was free. Counting
+/// only the BODY's words — leaving out the row loop's own, which is all a
+/// column read costs — spread the four over 242..846 and made a batch of a
+/// column-read expression cost nothing per row however tall it was. Sweeping
+/// without a driver-pool reset between points, which both gated benches take
+/// before every bind, charged each point for the pool the sweep itself had
+/// grown and pushed the two comprehension crossings out to ~870.
+pub const AUTO_JIT_WORDS: usize = 460;
+
 /// Why a batch could not be answered. Every variant means the same thing to a
 /// caller — evaluate this expression with [`crate::Program::execute`] instead —
 /// but they are distinguished because they say different things about the
@@ -252,8 +284,14 @@ impl<'a> Batch<'a> {
 /// cross-tier tests need to select.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Tier {
-    /// The meta-tracing tier: traces the batch loop and compiles it.
+    /// Let the bound batch choose, by how much work its run has to do — see
+    /// [`BoundBatch::route`]. This is what the no-suffix doors
+    /// ([`BoundBatch::sum`], [`BoundBatch::collect`],
+    /// [`BoundBatch::collect_raw`]) ask for; every `_on` door still names a
+    /// tier outright and gets exactly that one.
     #[default]
+    Auto,
+    /// The meta-tracing tier: traces the batch loop and compiles it.
     Jit,
     /// The meta-tracing interpreter with compilation disabled — the tracing
     /// machinery runs but never produces machine code.
@@ -395,9 +433,22 @@ impl BatchProgram {
             "BatchProgram::bind",
             reduce,
         );
+        // An ELEMENT column is as long as the batch's flattened element count,
+        // which is what a comprehension's inner loop iterates over. The longest
+        // one bounds every loop in the body.
+        let elems = self
+            .lowered
+            .slots
+            .iter()
+            .zip(&columns)
+            .filter(|(slot, _)| slot.kind != SlotKind::Row)
+            .map(|(_, c)| c.len())
+            .max()
+            .unwrap_or(0);
         Ok(BoundBatch {
             program: self,
             reduce,
+            body_words: self.lowered.body_words_for(batch.rows, elems),
             run: std::cell::RefCell::new(run),
             _derived: derived,
         })
@@ -669,25 +720,55 @@ pub struct BoundBatch<'a, 'b> {
     /// The prepared program. `RefCell` because running writes the trap word,
     /// while `sum` takes `&self` so a caller can hold the batch across runs.
     run: std::cell::RefCell<BatchRun<'a>>,
+    /// Body words one run over this batch executes, from
+    /// [`LoweredF::body_words_for`] with the batch's own row and element
+    /// counts. Counted at bind, where both are known, so [`Tier::Auto`] costs a
+    /// comparison per call rather than a walk.
+    body_words: usize,
     /// The columns the encoding materialized. Never read again — the program's
     /// base pointers address their buffers — but they must outlive the runs.
     _derived: Vec<DerivedColumn>,
 }
 
 impl BoundBatch<'_, '_> {
-    /// Evaluate every row and return the running total, on [`Tier::Jit`].
+    /// Body words one run over this batch executes — what
+    /// [`BoundBatch::route`] compares against [`AUTO_JIT_WORDS`].
+    pub fn body_words(&self) -> usize {
+        self.body_words
+    }
+
+    /// Which tier [`Tier::Auto`] resolves to for this batch: [`Tier::Jit`] once
+    /// the run has at least [`AUTO_JIT_WORDS`] body words to execute, and
+    /// [`Tier::Clean`] below that. Any other tier is returned unchanged.
+    ///
+    /// The compiled tier buys a cheaper body and charges a fixed cost to reach
+    /// it, so which one wins is a question about how much body there is to run.
+    /// A batch answers it with two numbers it already has: how many rows, and
+    /// how many list elements those rows carry.
+    pub fn route(&self, tier: Tier) -> Tier {
+        match tier {
+            Tier::Auto if self.body_words >= AUTO_JIT_WORDS => Tier::Jit,
+            Tier::Auto => Tier::Clean,
+            explicit => explicit,
+        }
+    }
+
+    /// Evaluate every row and return the running total, on the tier
+    /// [`BoundBatch::route`] picks.
     pub fn sum(&self) -> Result<Value, BatchError> {
-        self.sum_on(Tier::Jit)
+        self.sum_on(Tier::Auto)
     }
 
     /// [`BoundBatch::sum`] on a chosen tier.
     pub fn sum_on(&self, tier: Tier) -> Result<Value, BatchError> {
+        let tier = self.route(tier);
         self.sum_with(tier, threshold_for(tier))
     }
 
     /// [`BoundBatch::sum_on`] with an explicit trace threshold, for a caller
     /// measuring where the compiled tier starts to pay for itself.
     pub fn sum_with(&self, tier: Tier, threshold: u32) -> Result<Value, BatchError> {
+        let tier = self.route(tier);
         let lowered = &self.program.lowered;
         assert_eq!(
             self.reduce,
@@ -711,11 +792,12 @@ impl BoundBatch<'_, '_> {
     /// Requires the batch to have been bound with
     /// [`BatchProgram::bind_per_row`].
     pub fn collect(&self) -> Result<Vec<Value>, BatchError> {
-        self.collect_on(Tier::Jit)
+        self.collect_on(Tier::Auto)
     }
 
     /// [`BoundBatch::collect`] on a chosen tier.
     pub fn collect_on(&self, tier: Tier) -> Result<Vec<Value>, BatchError> {
+        let tier = self.route(tier);
         self.collect_with(tier, threshold_for(tier))
     }
 
@@ -742,7 +824,7 @@ impl BoundBatch<'_, '_> {
     /// The results are borrowed from the run's own buffers, which the next run
     /// overwrites — hence the callback rather than a returned slice.
     pub fn collect_raw<T>(&self, f: impl FnOnce(RawOutput<'_>) -> T) -> Result<T, BatchError> {
-        self.collect_raw_on(Tier::Jit, f)
+        self.collect_raw_on(Tier::Auto, f)
     }
 
     /// [`BoundBatch::collect_raw`] on a chosen tier.
@@ -751,6 +833,7 @@ impl BoundBatch<'_, '_> {
         tier: Tier,
         f: impl FnOnce(RawOutput<'_>) -> T,
     ) -> Result<T, BatchError> {
+        let tier = self.route(tier);
         self.collect_raw_with(tier, threshold_for(tier), f)
     }
 
@@ -761,6 +844,7 @@ impl BoundBatch<'_, '_> {
         threshold: u32,
         f: impl FnOnce(RawOutput<'_>) -> T,
     ) -> Result<T, BatchError> {
+        let tier = self.route(tier);
         assert_eq!(
             self.reduce,
             BatchReduce::PerRow,
@@ -804,7 +888,9 @@ impl BoundBatch<'_, '_> {
 fn threshold_for(tier: Tier) -> u32 {
     match tier {
         Tier::Jit => DEFAULT_JIT_THRESHOLD,
-        Tier::Interpreter | Tier::Clean => u32::MAX,
+        // `Auto` never reaches here: every door resolves it through
+        // `BoundBatch::route` first, which is where the batch's own size is.
+        Tier::Auto | Tier::Interpreter | Tier::Clean => u32::MAX,
     }
 }
 
@@ -817,7 +903,7 @@ fn dispatch(
     banks: &mut float_bank::Banks,
 ) -> i64 {
     match tier {
-        Tier::Clean => float_bank::clean_interp_seeded_f_in(code, regs, nf, banks),
+        Tier::Auto | Tier::Clean => float_bank::clean_interp_seeded_f_in(code, regs, nf, banks),
         // No bank hand-off here: these enter through the traced portal, which
         // builds its own. See the field's doc on `BatchRun`.
         Tier::Interpreter | Tier::Jit => {
@@ -1257,6 +1343,89 @@ mod tests {
         // Row 0 matches; row 1 fails the compare; row 2 is frozen; row 3 fails.
         for tier in [Tier::Clean, Tier::Interpreter, Tier::Jit] {
             assert_eq!(bound.sum_on(tier).unwrap(), Value::Int(1), "{tier:?}");
+        }
+    }
+
+    /// The route is about which tier runs, never about what comes back. Two
+    /// shapes on both sides of the crossing, each answered through the default
+    /// door and through all three tiers by name.
+    #[test]
+    fn the_auto_route_answers_what_every_named_tier_answers() {
+        let s = schema(&[("x", ValType::Int)]);
+        let program = BatchProgram::compile("x * 2 + 1", &s).unwrap();
+        for rows in [1usize, 4, 1_000] {
+            let x: Vec<i64> = (0..rows as i64).collect();
+            let batch = Batch::new(rows).column("x", ColumnRef::Int(&x));
+            let bound = program.bind_per_row(&batch).unwrap();
+            let want: Vec<Value> = x.iter().map(|v| Value::Int(v * 2 + 1)).collect();
+            assert_eq!(bound.collect().unwrap(), want, "auto at {rows} rows");
+            for tier in [Tier::Auto, Tier::Clean, Tier::Interpreter, Tier::Jit] {
+                assert_eq!(bound.collect_on(tier).unwrap(), want, "{tier:?} at {rows}");
+            }
+        }
+    }
+
+    /// What the route is FOR: a one-row straight-line expression has tens of
+    /// body words and stays on the interpreter, while the same expression over
+    /// a tall batch, and a comprehension over a long list, cross
+    /// [`AUTO_JIT_WORDS`] and are handed to the compiled tier.
+    ///
+    /// Pinned as a routing DECISION rather than as a time, because a time is
+    /// what the machine happens to cost today and the decision is the contract.
+    #[test]
+    fn the_route_follows_how_much_body_a_run_has_to_execute() {
+        let s = schema(&[("x", ValType::Int)]);
+        let program = BatchProgram::compile("x * 2 + 1", &s).unwrap();
+        let lowered = program.lowered();
+        assert!(
+            !lowered.iterates_elements(),
+            "no comprehension in `x * 2 + 1`"
+        );
+
+        let one = vec![7i64];
+        let batch = Batch::new(1).column("x", ColumnRef::Int(&one));
+        let bound = program.bind_per_row(&batch).unwrap();
+        assert!(bound.body_words() < AUTO_JIT_WORDS);
+        assert_eq!(bound.route(Tier::Auto), Tier::Clean);
+
+        let tall: Vec<i64> = (0..1_000).collect();
+        let batch = Batch::new(tall.len()).column("x", ColumnRef::Int(&tall));
+        let bound = program.bind_per_row(&batch).unwrap();
+        assert!(bound.body_words() >= AUTO_JIT_WORDS);
+        assert_eq!(bound.route(Tier::Auto), Tier::Jit);
+
+        // One row, but the row's own list is what the body iterates.
+        let s = schema(&[("list", ValType::Int), ("list[]", ValType::Int)]);
+        let program = BatchProgram::compile("list.map(e, e * 2)", &s).unwrap();
+        assert!(program.lowered().iterates_elements());
+        let lens = vec![256i64];
+        let elems: Vec<i64> = (0..256).collect();
+        let batch = Batch::new(1).column(
+            "list",
+            ColumnRef::List {
+                lens: &lens,
+                fields: vec![(None, ColumnRef::Int(&elems))],
+            },
+        );
+        let bound = program.bind_per_row(&batch).unwrap();
+        assert!(bound.body_words() >= AUTO_JIT_WORDS);
+        assert_eq!(bound.route(Tier::Auto), Tier::Jit);
+    }
+
+    /// Naming a tier still gets that tier. The route is the DEFAULT door's
+    /// choice, and every cross-tier test in this file — and every oracle a
+    /// majit answer is graded against — depends on the `_on` doors meaning
+    /// exactly what they say.
+    #[test]
+    fn naming_a_tier_overrides_the_route() {
+        let s = schema(&[("x", ValType::Int)]);
+        let program = BatchProgram::compile("x * 2 + 1", &s).unwrap();
+        let one = vec![7i64];
+        let batch = Batch::new(1).column("x", ColumnRef::Int(&one));
+        let bound = program.bind_per_row(&batch).unwrap();
+        assert_eq!(bound.route(Tier::Auto), Tier::Clean);
+        for tier in [Tier::Clean, Tier::Interpreter, Tier::Jit] {
+            assert_eq!(bound.route(tier), tier);
         }
     }
 

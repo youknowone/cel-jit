@@ -141,6 +141,16 @@ struct TReg {
     idx: usize,
 }
 
+/// Words one per-row column load costs in the row loop's prologue: the opcode
+/// and its three operands, which [`LoweredF::batch_sum_shape`] emits per
+/// [`SlotKind::Row`] slot.
+const ROW_SLOT_WORDS: usize = 4;
+
+/// Words the row loop spends on a row besides its body and its column loads:
+/// the accumulate or the output store, the induction step, the element-address
+/// step, and the back edge — four four-word instructions.
+const ROW_LOOP_WORDS: usize = 16;
+
 /// Where in the batch program a slot's column is read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SlotKind {
@@ -433,6 +443,21 @@ pub struct LoweredF {
     /// lands. [`LoweredF::batch_sum_shape`] relocates each to an
     /// absolute program address once it does.
     pub jump_fixups: Vec<usize>,
+    /// Program words that run once per ITERATED ELEMENT — those enclosed by a
+    /// comprehension's or a runtime `in`'s back edge. Zero for a program whose
+    /// row body is straight-line, which is the whole of the traceable subset
+    /// apart from those two constructs.
+    pub elem_words: usize,
+    /// Program words that run once per ROW: the rest of the body, plus the row
+    /// loop's own — the prologue's column loads and the bookkeeping
+    /// [`LoweredF::batch_sum_shape`] wraps every body in.
+    ///
+    /// The loop's share is not a detail that rounds away. An expression that
+    /// only READS a column lowers to an empty body, because the read is the
+    /// prologue's; counting the body alone would say such a program costs
+    /// nothing per row however tall the batch, which is exactly the case where
+    /// the per-row cost is all there is.
+    pub row_words: usize,
     /// The batch shapes this program can build, built at most once each and
     /// owned here, indexed by [`shape_slot`].
     ///
@@ -663,6 +688,23 @@ impl BatchSeed {
 }
 
 impl LoweredF {
+    /// Whether the row body iterates elements: a comprehension, a chain of
+    /// them, or a runtime `in` over a list column. False for the straight-line
+    /// shapes — arithmetic, comparison, a ternary, a member read, a constant
+    /// index, a string predicate.
+    pub fn iterates_elements(&self) -> bool {
+        self.elem_words > 0
+    }
+
+    /// How many body words a run over `rows` rows carrying `elems` flattened
+    /// list elements executes, straight-line words and per-element words added
+    /// up. A size, not a time: it is the same count on every tier, which is
+    /// what makes it usable to CHOOSE one.
+    pub fn body_words_for(&self, rows: usize, elems: usize) -> usize {
+        rows.saturating_mul(self.row_words)
+            .saturating_add(elems.saturating_mul(self.elem_words))
+    }
+
     /// Build a **columnar batch** program over the two-bank machine: for each
     /// row `i` in `0..n`, load each slot's `col_k[i]` via a red-index `raw_load`
     /// (`OP_COL_LOAD` for int slots, `OP_COL_LOAD_F` for float slots), run the
@@ -1235,6 +1277,9 @@ struct LowerCtxF<'s> {
     const_pool: HashMap<(ValType, i64), TReg>,
     /// Positions within `body` holding a body-relative jump target.
     jump_fixups: Vec<usize>,
+    /// Body words enclosed by a back edge, accumulated as each element loop is
+    /// closed. See [`LoweredF::elem_words`].
+    elem_words: usize,
     /// Set when the top-level expression is collected as a list.
     list_output: Option<ListOutput>,
     schema: &'s Schema,
@@ -1443,6 +1488,11 @@ impl LowerCtxF<'_> {
         self.body
             .extend_from_slice(&[OP_JUMP_IF_ABOVE, a.idx as i64, b.idx as i64, tgt as i64]);
         self.jump_fixups.push(at);
+        // Everything from the loop's entry to the back edge inclusive runs once
+        // per element rather than once per row. Loops that nest count their
+        // inner span on both levels, which is the direction that overstates the
+        // work rather than the one that hides it.
+        self.elem_words += self.body.len() - tgt;
     }
 }
 
@@ -1472,6 +1522,7 @@ pub fn lower_typed(expr: &IdedExpr, schema: &Schema) -> Result<LoweredF, LowerEr
         list_loop: Vec::new(),
         const_pool: HashMap::new(),
         jump_fixups: Vec::new(),
+        elem_words: 0,
         list_output: None,
         schema,
     };
@@ -1503,7 +1554,12 @@ pub fn lower_typed(expr: &IdedExpr, schema: &Schema) -> Result<LoweredF, LowerEr
             Some(bound)
         }
     };
+    let elem_words = ctx.elem_words.min(ctx.body.len());
+    let row_slots = ctx.slots.iter().filter(|s| s.kind == SlotKind::Row).count();
+    let row_words = ctx.body.len() - elem_words + row_slots * ROW_SLOT_WORDS + ROW_LOOP_WORDS;
     Ok(LoweredF {
+        elem_words,
+        row_words,
         prelude: ctx.prelude,
         body: ctx.body,
         result_bank: result.bank,
@@ -3664,6 +3720,7 @@ fn probe_ctx<'a>(ctx: &LowerCtxF<'a>) -> LowerCtxF<'a> {
         list_loop: Vec::new(),
         const_pool: HashMap::new(),
         jump_fixups: Vec::new(),
+        elem_words: 0,
         list_output: None,
         schema: ctx.schema,
     }

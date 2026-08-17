@@ -463,6 +463,16 @@ struct Compiled {
     /// or the cost of the tracer failing to get out of the way.
     clean: f64,
     majit: f64,
+    /// The DEFAULT door — `collect()`, which asks for `Tier::Auto` and lets the
+    /// bound batch pick between the two columns to its left. This is what a
+    /// caller who names no tier gets, and the only column here that is about
+    /// the library's own choice rather than about a tier.
+    auto: f64,
+    /// Which tier `Tier::Auto` resolved to, and the body-word count it decided
+    /// on. A `clean` route beside a `majit` cell slower than the `clean` one is
+    /// the route working; the reverse would be the route mis-set.
+    route: Tier,
+    words: usize,
     raw: f64,
     bind: f64,
     compiles: usize,
@@ -680,6 +690,11 @@ fn run_case(case: &Case) -> Row {
     };
     let clean = per_call(|| collect(Tier::Clean));
     let majit = per_call(|| collect(Tier::Jit));
+    let auto = per_call(|| {
+        bound
+            .collect()
+            .unwrap_or_else(|e| panic!("{}: auto: {e}", case.label))
+    });
     let raw = per_call(|| {
         bound
             .collect_raw_on(Tier::Jit, consume_raw)
@@ -705,6 +720,9 @@ fn run_case(case: &Case) -> Row {
         stock,
         compiled: Ok(Compiled {
             clean,
+            auto,
+            route: bound.route(Tier::Auto),
+            words: bound.body_words(),
             majit,
             raw,
             bind,
@@ -1324,11 +1342,15 @@ fn main() {
         MIN_BATCH.as_millis()
     );
     println!(
-        "{:<28} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11} {:>12} {:>10} {:>10} {:>9} {:>12} {:>12} {:>13}",
+        "{:<28} {:>11} {:>11} {:>11} {:>10} {:>7} {:>9} {:>11} {:>11} {:>11} {:>11} {:>12} {:>10} {:>10} {:>9} {:>12} {:>12} {:>13}",
         "case",
         "stock ns",
         "clean ns",
         "majit ns",
+        "auto ns",
+        "route",
+        "words",
+        "auto/stock",
         "enter/call",
         "jit/row ns",
         "jit fix ns",
@@ -1376,11 +1398,19 @@ fn main() {
                     ("not entered".to_string(), "-".to_string())
                 };
                 println!(
-                    "{:<28} {:>11.1} {:>11.1} {:>11} {:>11.2} {:>11} {:>11} {:>12} {:>10.1} {:>10.1} {:>9} {:>12.2} {:>12.2} {:>13.2}",
+                    "{:<28} {:>11.1} {:>11.1} {:>11} {:>10.1} {:>7} {:>9} {:>11} {:>11.2} {:>11} {:>11} {:>12} {:>10.1} {:>10.1} {:>9} {:>12.2} {:>12.2} {:>13.2}",
                     r.label,
                     r.stock,
                     c.clean,
                     majit_cell,
+                    c.auto,
+                    match c.route {
+                        Tier::Clean => "clean",
+                        Tier::Jit => "jit",
+                        other => panic!("auto resolved to {other:?}"),
+                    },
+                    c.words,
+                    format!("{:.2}x", r.stock / c.auto),
                     c.entries,
                     opt(c.jit_row),
                     opt(c.jit_fix),
@@ -1398,11 +1428,15 @@ fn main() {
                 // through the library's fallback. A row missing from the table
                 // would read as an expression this crate cannot evaluate.
                 println!(
-                    "{:<28} {:>11.1} {:>11} {:>11} {:>11} {:>11} {:>11} {:>12} {:>10} {:>10} {:>9} {:>12} {:>12} {:>13}",
+                    "{:<28} {:>11.1} {:>11} {:>11} {:>10} {:>7} {:>9} {:>11} {:>11} {:>11} {:>11} {:>12} {:>10} {:>10} {:>9} {:>12} {:>12} {:>13}",
                     r.label,
                     r.stock,
                     "-",
                     "walker",
+                    "-",
+                    "-",
+                    "-",
+                    "-",
                     "-",
                     "-",
                     "-",
@@ -1449,6 +1483,22 @@ fn main() {
         "\n`clean ns` is the same lowered bytecode on the plain Rust VM, with no tracing\n\
          machinery at all. Where `majit` is far above it the cost is the tracer, not the\n\
          machine, and the compiled tier is not what answered the call."
+    );
+    println!(
+        "\n`auto ns` is the DEFAULT door, `collect()`, which names no tier: the bound batch\n\
+         picks between `clean` and `majit` by `words` — the body words one run executes,\n\
+         rows times the straight-line body plus elements times the inner loop's. Below\n\
+         `AUTO_JIT_WORDS` the run has less body to execute than reaching compiled code\n\
+         costs, so it stays on the plain VM. `route` says which side of that each case\n\
+         landed, and `auto ns` should track whichever of the two columns to its left the\n\
+         route named. `majit ns` beside it is still the compiled tier ASKED FOR outright,\n\
+         which is what every tier-explicit test and every column of this table below\n\
+         measures — the route changes the default, not the `_on` doors.\n\
+         \n\
+         ⚠ `auto/stock` is the ratio a caller of this library gets. `majit/stock` is the\n\
+         ratio of a caller who names `Tier::Jit`, and where the two disagree the route is\n\
+         doing something: at one row a straight-line expression has a body of tens of\n\
+         words, and no amount of compiling it pays back the entry."
     );
     println!(
         "\n`majit ns` holds the activation fixed exactly as his `execute(&ctx)` does, but a\n\
