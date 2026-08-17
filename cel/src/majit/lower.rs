@@ -92,7 +92,7 @@ fn resolve_path(e: &IdedExpr) -> Result<String, LowerError> {
 /// shares the int bank (`0`/`1`); `Float` lives in the parallel `fregs` bank.
 /// This is the *shape* a compiled float trace guards on (the caller declares
 /// which context columns are `double` via a [`Schema`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ValType {
     Int,
     /// A `bool`, carried as `0`/`1` in the int register file, so storage, column
@@ -943,28 +943,256 @@ impl LoweredF {
             (BatchReduce::Sum, _) => p.extend_from_slice(&[OP_RETURN, r_acc as i64]),
             (BatchReduce::PerRow, _) => p.extend_from_slice(&[OP_RETURN, r_i as i64]),
         }
+        // Only a per-row run writes elements; a sum never reaches them.
+        let list_out_regs: Vec<usize> = match reduce {
+            BatchReduce::PerRow => self
+                .list_output
+                .as_ref()
+                .map(|o| o.base_regs.clone())
+                .unwrap_or_default(),
+            BatchReduce::Sum => Vec::new(),
+        };
+        let scalar_regs: Vec<usize> = self.scalar_seeds.iter().map(|s| s.reg).collect();
+
+        // Narrow both files now that the program is whole. Every index below is
+        // the packer's answer, not the lowering's: the words are rewritten in
+        // place, so the seed has to be rewritten with them or it would fill
+        // registers the program no longer reads.
+        let seeded: Vec<usize> = [r_n, r_trap]
+            .into_iter()
+            .chain(r_out)
+            .chain(base_regs.iter().copied())
+            .chain(scalar_regs.iter().copied())
+            .chain(list_out_regs.iter().copied())
+            .collect();
+        let ints = pack_file(&mut p, RegFile::Ints, total_int_regs, &seeded);
+        // No float register is seeded: every value the caller supplies — a
+        // count, an address, a broadcast scalar — travels in the int file.
+        let floats = pack_file(&mut p, RegFile::Floats, total_float_regs, &[]);
+
         BatchShape {
             code: p.into(),
-            num_float_regs: total_float_regs,
+            num_float_regs: floats.width,
             seed: BatchSeed {
-                r_n,
-                r_trap,
-                r_out,
-                // Only a per-row run writes elements; a sum never reaches them.
-                list_out_regs: match reduce {
-                    BatchReduce::PerRow => self
-                        .list_output
-                        .as_ref()
-                        .map(|o| o.base_regs.clone())
-                        .unwrap_or_default(),
-                    BatchReduce::Sum => Vec::new(),
-                },
-                base_regs,
-                scalar_regs: self.scalar_seeds.iter().map(|s| s.reg).collect(),
-                num_int_regs: total_int_regs,
+                r_n: ints.of(r_n),
+                r_trap: ints.of(r_trap),
+                r_out: r_out.map(|r| ints.of(r)),
+                list_out_regs: list_out_regs.iter().map(|&r| ints.of(r)).collect(),
+                base_regs: base_regs.iter().map(|&r| ints.of(r)).collect(),
+                scalar_regs: scalar_regs.iter().map(|&r| ints.of(r)).collect(),
+                num_int_regs: ints.width,
             },
         }
     }
+}
+
+/// The two register files [`pack_file`] narrows, one call each.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RegFile {
+    Ints,
+    Floats,
+}
+
+/// What one [`pack_file`] run decided: where each old register went, and how
+/// wide the file ended up.
+struct Packing {
+    /// `old -> new`, indexed by the old register.
+    map: Vec<usize>,
+    /// Registers the packed program addresses — one past the highest it names.
+    width: usize,
+}
+
+impl Packing {
+    fn of(&self, reg: usize) -> usize {
+        self.map[reg]
+    }
+}
+
+/// One decoded instruction: where it starts, and what the words after it mean.
+struct Decoded {
+    at: usize,
+    ops: &'static [Operand],
+}
+
+/// Split a program into instructions. Widths come from [`OPERANDS`], so an
+/// opcode this walk does not anticipate is still stepped over correctly.
+fn decode(p: &[i64]) -> Vec<Decoded> {
+    let mut out = Vec::new();
+    let mut at = 0;
+    while at < p.len() {
+        let ops = OPERANDS[p[at] as usize];
+        out.push(Decoded { at, ops });
+        at += 1 + ops.len();
+    }
+    out
+}
+
+/// Narrow one register file to the width the program's own liveness allows,
+/// rewriting every operand that names it.
+///
+/// A tree-walking lowering hands each sub-expression a private register, so a
+/// program's file is as wide as the number of values it ever names rather than
+/// the number it holds AT ONCE — and once a comprehension body runs a chain of
+/// short-lived temporaries the two differ by a lot. The width is not merely a
+/// memory cost. It is the number of words a compiled trace's entry reloads and
+/// the number of live values its register allocator is handed, so a file wider
+/// than the program needs turns into spill traffic in the innermost loop, where
+/// it is paid per element.
+///
+/// `seeded` names the registers the CALLER fills in before the program starts —
+/// the row count, column bases, broadcast scalars. Those keep a word of their
+/// own, as does anything live before the first instruction runs: the seeding
+/// writes them all at once, and two sharing a word would leave one of the two
+/// values overwritten before a single instruction had run.
+fn pack_file(p: &mut [i64], file: RegFile, width: usize, seeded: &[usize]) -> Packing {
+    let code = decode(p);
+    let n = code.len();
+    let index_at: HashMap<usize, usize> = code.iter().enumerate().map(|(k, d)| (d.at, k)).collect();
+
+    // Per-instruction operand roles in this file, and where control can go
+    // next. A trap operand counts as both a read and a write: only the trapping
+    // path stores through it, so its old value survives every other path.
+    let mut reads: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut writes: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut succ: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (k, d) in code.iter().enumerate() {
+        for (j, role) in d.ops.iter().enumerate() {
+            let w = p[d.at + 1 + j] as usize;
+            match (file, role) {
+                (_, Operand::Target) => succ[k].push(index_at[&w]),
+                (RegFile::Ints, Operand::Int) | (RegFile::Floats, Operand::Float) => {
+                    reads[k].push(w)
+                }
+                (RegFile::Ints, Operand::IntOut) | (RegFile::Floats, Operand::FloatOut) => {
+                    writes[k].push(w)
+                }
+                (RegFile::Ints, Operand::IntTrap) => {
+                    reads[k].push(w);
+                    writes[k].push(w);
+                }
+                _ => {}
+            }
+        }
+        let returns = p[d.at] == OP_RETURN || p[d.at] == OP_RETURN_F;
+        if !returns && k + 1 < n {
+            succ[k].push(k + 1);
+        }
+    }
+
+    // Which registers each instruction may still need. Backwards to a fixpoint,
+    // because the program's loops make one pass insufficient.
+    let mut live_in = vec![vec![false; width]; n];
+    let mut live_out = vec![vec![false; width]; n];
+    let mut settled = false;
+    while !settled {
+        settled = true;
+        for k in (0..n).rev() {
+            let mut out = vec![false; width];
+            for &s in &succ[k] {
+                for (r, &live) in live_in[s].iter().enumerate() {
+                    out[r] |= live;
+                }
+            }
+            let mut inn = out.clone();
+            for &w in &writes[k] {
+                inn[w] = false;
+            }
+            for &r in &reads[k] {
+                inn[r] = true;
+            }
+            if out != live_out[k] || inn != live_in[k] {
+                live_out[k] = out;
+                live_in[k] = inn;
+                settled = false;
+            }
+        }
+    }
+
+    let mut clash = vec![vec![false; width]; width];
+    fn mark(clash: &mut [Vec<bool>], a: usize, b: usize) {
+        if a != b {
+            clash[a][b] = true;
+            clash[b][a] = true;
+        }
+    }
+    for k in 0..n {
+        // Everything still live once the instruction finishes, plus what it
+        // defines: two values that coexist here cannot share a word.
+        let mut together: Vec<usize> = (0..width).filter(|&r| live_out[k][r]).collect();
+        together.extend(writes[k].iter().copied().filter(|&w| !live_out[k][w]));
+        for i in 0..together.len() {
+            for j in (i + 1)..together.len() {
+                mark(&mut clash, together[i], together[j]);
+            }
+        }
+        // A destination must not land on a source's word either. The read
+        // happens first for most of these ops, but not all: a checked add
+        // publishes its trap flag and only then recomputes the wrapped sum from
+        // its operands, so a flag sharing an operand's word would read back the
+        // 1 it just wrote.
+        for &w in &writes[k] {
+            for &r in &reads[k] {
+                mark(&mut clash, w, r);
+            }
+        }
+    }
+
+    // Seeded registers, and anything live before the first instruction, take a
+    // word each. The rest are colored greedily against what is already placed.
+    let mut color = vec![usize::MAX; width];
+    let mut next = 0;
+    let entry: Vec<usize> = seeded
+        .iter()
+        .copied()
+        .chain((0..width).filter(|&r| n > 0 && live_in[0][r]))
+        .collect();
+    for r in entry {
+        if color[r] == usize::MAX {
+            color[r] = next;
+            next += 1;
+        }
+    }
+    let named: Vec<bool> = (0..width)
+        .map(|r| (0..n).any(|k| reads[k].contains(&r) || writes[k].contains(&r)))
+        .collect();
+    for r in 0..width {
+        if color[r] != usize::MAX || !named[r] {
+            continue;
+        }
+        let taken: Vec<usize> = (0..width)
+            .filter(|&q| clash[r][q] && color[q] != usize::MAX)
+            .map(|q| color[q])
+            .collect();
+        let mut c = 0;
+        while taken.contains(&c) {
+            c += 1;
+        }
+        color[r] = c;
+    }
+    // A register the program never names needs no word of its own; parking them
+    // all on the first one keeps the map total without widening the file.
+    for c in color.iter_mut() {
+        if *c == usize::MAX {
+            *c = 0;
+        }
+    }
+
+    for d in &code {
+        for (j, role) in d.ops.iter().enumerate() {
+            let names = matches!(
+                (file, role),
+                (
+                    RegFile::Ints,
+                    Operand::Int | Operand::IntOut | Operand::IntTrap
+                ) | (RegFile::Floats, Operand::Float | Operand::FloatOut)
+            );
+            if names {
+                p[d.at + 1 + j] = color[p[d.at + 1 + j] as usize] as i64;
+            }
+        }
+    }
+    let width = color.iter().copied().max().map_or(0, |c| c + 1);
+    Packing { map: color, width }
 }
 
 struct LowerCtxF<'s> {
@@ -1002,6 +1230,9 @@ struct LowerCtxF<'s> {
     /// need per-element offsets a flat row column cannot express — and that
     /// declines on its own, since such a path is not one the schema declares.
     list_loop: Vec<ListLoop>,
+    /// Registers holding a loop-invariant constant, keyed by the bank and the
+    /// word loaded into it. See [`LowerCtxF::const_reg`].
+    const_pool: HashMap<(ValType, i64), TReg>,
     /// Positions within `body` holding a body-relative jump target.
     jump_fixups: Vec<usize>,
     /// Set when the top-level expression is collected as a list.
@@ -1045,6 +1276,38 @@ impl LowerCtxF<'_> {
             }
         };
         TReg { bank, idx }
+    }
+
+    /// The register holding a loop-invariant constant, minted once per
+    /// `(bank, word)` and shared by every later reference to that value.
+    ///
+    /// The load runs in the prelude, before the row loop, and nothing writes
+    /// the register afterwards — the only ops that name it name it as an
+    /// operand — so one register can serve every occurrence. That is what keeps
+    /// a program's register file proportional to the DISTINCT constants it
+    /// mentions rather than to how often it mentions them, and register
+    /// pressure is what decides whether the backend spills inside a
+    /// comprehension's inner loop: a constant is live across the whole body, so
+    /// a duplicate costs a live range spanning every instruction, not just a
+    /// word of bank.
+    ///
+    /// Keyed on the bank as well as the word because the bank is what operands
+    /// are type-checked against: an `int` 1 and a `bool` true are the same
+    /// machine word and not the same operand. A register the lowering will
+    /// WRITE — a cursor, a loop counter, an accumulator seeded with 0 — is not
+    /// a constant and must keep taking a private register from [`Self::fresh`].
+    fn const_reg(&mut self, bank: ValType, word: i64) -> TReg {
+        if let Some(&r) = self.const_pool.get(&(bank, word)) {
+            return r;
+        }
+        let r = self.fresh(bank);
+        let op = match bank {
+            ValType::Float => OP_LOAD_CONST_F,
+            _ => OP_LOAD_CONST,
+        };
+        self.prelude.extend_from_slice(&[op, word, r.idx as i64]);
+        self.const_pool.insert((bank, word), r);
+        r
     }
 
     /// Resolve a row slot whose type the schema must declare. An UNDECLARED path
@@ -1207,6 +1470,7 @@ pub fn lower_typed(expr: &IdedExpr, schema: &Schema) -> Result<LoweredF, LowerEr
         concats: Vec::new(),
         elem_map: HashMap::new(),
         list_loop: Vec::new(),
+        const_pool: HashMap::new(),
         jump_fixups: Vec::new(),
         list_output: None,
         schema,
@@ -1330,33 +1594,16 @@ fn compile_literal_t(ctx: &mut LowerCtxF, lit: &LiteralValue) -> Result<TReg, Lo
     // Literals are loop invariants: emit their loads into the prelude so the
     // batch builder runs them once, not per row.
     match lit {
-        LiteralValue::Int(i) => {
-            let r = ctx.fresh(ValType::Int);
-            ctx.prelude
-                .extend_from_slice(&[OP_LOAD_CONST, *i, r.idx as i64]);
-            Ok(r)
-        }
-        LiteralValue::Boolean(b) => {
-            let r = ctx.fresh(ValType::Bool);
-            ctx.prelude
-                .extend_from_slice(&[OP_LOAD_CONST, *b as i64, r.idx as i64]);
-            Ok(r)
-        }
-        LiteralValue::Double(f) => {
-            let r = ctx.fresh(ValType::Float);
-            // The f64 travels as its raw i64 bits; the VM reloads with
-            // `f64::from_bits`, so the constant is bit-exact.
-            ctx.prelude
-                .extend_from_slice(&[OP_LOAD_CONST_F, f.to_bits() as i64, r.idx as i64]);
-            Ok(r)
-        }
-        LiteralValue::UInt(u) => {
-            let r = ctx.fresh(ValType::UInt);
-            // The u64 travels as its raw i64 bit pattern in the int register file.
-            ctx.prelude
-                .extend_from_slice(&[OP_LOAD_CONST, *u as i64, r.idx as i64]);
-            Ok(r)
-        }
+        LiteralValue::Int(i) => Ok(ctx.const_reg(ValType::Int, *i)),
+        LiteralValue::Boolean(b) => Ok(ctx.const_reg(ValType::Bool, *b as i64)),
+        // The f64 travels as its raw i64 bits; the VM reloads with
+        // `f64::from_bits`, so the constant is bit-exact. Two literals share a
+        // register when their BIT PATTERNS agree, which is the identity the
+        // reload restores — `0.0` and `-0.0` are two constants, and two `NaN`s
+        // with different payloads are two constants.
+        LiteralValue::Double(f) => Ok(ctx.const_reg(ValType::Float, f.to_bits() as i64)),
+        // The u64 travels as its raw i64 bit pattern in the int register file.
+        LiteralValue::UInt(u) => Ok(ctx.const_reg(ValType::UInt, *u as i64)),
         LiteralValue::String(s) => {
             // A string literal is a loop invariant, but unlike an int or a
             // `double` it is not a program CONSTANT: its `i64` id is whatever
@@ -1379,10 +1626,7 @@ fn compile_literal_t(ctx: &mut LowerCtxF, lit: &LiteralValue) -> Result<TReg, Lo
 
 /// Emit a `double` constant load into the prelude and return its float reg.
 fn emit_float_const(ctx: &mut LowerCtxF, v: f64) -> TReg {
-    let r = ctx.fresh(ValType::Float);
-    ctx.prelude
-        .extend_from_slice(&[OP_LOAD_CONST_F, v.to_bits() as i64, r.idx as i64]);
-    r
+    ctx.const_reg(ValType::Float, v.to_bits() as i64)
 }
 
 /// The stdlib's receiver-only temporal accessors (`common/types/duration.rs`
@@ -1404,10 +1648,7 @@ const TEMPORAL_ACCESSORS: &[&str] = &[
 
 /// Emit a loop-invariant int constant load into the prelude and return its reg.
 fn emit_int_const(ctx: &mut LowerCtxF, v: i64) -> TReg {
-    let r = ctx.fresh(ValType::Int);
-    ctx.prelude
-        .extend_from_slice(&[OP_LOAD_CONST, v, r.idx as i64]);
-    r
+    ctx.const_reg(ValType::Int, v)
 }
 
 /// Emit a three-address int-bank op `dst = a <op> b` into the body.
@@ -1747,18 +1988,12 @@ fn emit_str_const(ctx: &mut LowerCtxF, text: String) -> TReg {
 /// A `bool` the lowering knows without looking at the row, hoisted to the
 /// prelude like any other constant.
 fn emit_bool_const(ctx: &mut LowerCtxF, v: bool) -> TReg {
-    let r = ctx.fresh(ValType::Bool);
-    ctx.prelude
-        .extend_from_slice(&[OP_LOAD_CONST, v as i64, r.idx as i64]);
-    r
+    ctx.const_reg(ValType::Bool, v as i64)
 }
 
 /// A zero in the int file, for the sign tests a mixed int/uint comparison needs.
 fn emit_zero_const(ctx: &mut LowerCtxF) -> TReg {
-    let r = ctx.fresh(ValType::Int);
-    ctx.prelude
-        .extend_from_slice(&[OP_LOAD_CONST, 0, r.idx as i64]);
-    r
+    ctx.const_reg(ValType::Int, 0)
 }
 
 /// Emit `[op, a, b, dst]` into the body and hand back `dst`.
@@ -2094,11 +2329,8 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
         let nanos = dt
             .timestamp_nanos_opt()
             .ok_or_else(|| LowerError::unsupported("timestamp outside i64-nanos range"))?;
-        let r = ctx.fresh(ValType::Timestamp);
-        ctx.prelude
-            .extend_from_slice(&[OP_LOAD_CONST, nanos, r.idx as i64]);
         ctx.temporal_consts.push(nanos);
-        return Ok(r);
+        return Ok(ctx.const_reg(ValType::Timestamp, nanos));
     }
     if name == "duration" && call.args.len() == 1 {
         let s = as_string_literal(&call.args[0])
@@ -2108,11 +2340,8 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
         let nanos = dur
             .num_nanoseconds()
             .ok_or_else(|| LowerError::unsupported("duration outside i64-nanos range"))?;
-        let r = ctx.fresh(ValType::Duration);
-        ctx.prelude
-            .extend_from_slice(&[OP_LOAD_CONST, nanos, r.idx as i64]);
         ctx.temporal_consts.push(nanos);
-        return Ok(r);
+        return Ok(ctx.const_reg(ValType::Duration, nanos));
     }
 
     // `size(x)`. The tree-walker's `String::size` is `str::len()` — the UTF-8
@@ -2285,10 +2514,7 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
         let x = compile_t(ctx, &call.args[0])?;
         if elements.is_empty() {
             // `x in []` is always false (the operand is still evaluated above).
-            let d = ctx.fresh(ValType::Bool);
-            ctx.prelude
-                .extend_from_slice(&[OP_LOAD_CONST, 0, d.idx as i64]);
-            return Ok(d);
+            return Ok(emit_bool_const(ctx, false));
         }
         let eq_op = if x.bank == ValType::Float {
             OP_FEQ
@@ -2904,12 +3130,7 @@ fn emit_constant_value(ctx: &mut LowerCtxF, v: &Value) -> Result<TReg, LowerErro
         Value::Int(i) => (ValType::Int, *i),
         Value::UInt(u) => (ValType::UInt, *u as i64),
         Value::Bool(b) => (ValType::Bool, *b as i64),
-        Value::Float(f) => {
-            let r = ctx.fresh(ValType::Float);
-            ctx.prelude
-                .extend_from_slice(&[OP_LOAD_CONST_F, f.to_bits() as i64, r.idx as i64]);
-            return Ok(r);
-        }
+        Value::Float(f) => return Ok(emit_float_const(ctx, *f)),
         Value::String(s) => return Ok(emit_str_const(ctx, s.to_string())),
         Value::Timestamp(t) => (
             ValType::Timestamp,
@@ -2928,10 +3149,7 @@ fn emit_constant_value(ctx: &mut LowerCtxF, v: &Value) -> Result<TReg, LowerErro
             )))
         }
     };
-    let r = ctx.fresh(bank);
-    ctx.prelude
-        .extend_from_slice(&[OP_LOAD_CONST, word, r.idx as i64]);
-    Ok(r)
+    Ok(ctx.const_reg(bank, word))
 }
 
 /// `a == b` over two DECLARED list columns: equal lengths, and every element
@@ -3444,6 +3662,7 @@ fn probe_ctx<'a>(ctx: &LowerCtxF<'a>) -> LowerCtxF<'a> {
         concats: Vec::new(),
         elem_map: HashMap::new(),
         list_loop: Vec::new(),
+        const_pool: HashMap::new(),
         jump_fixups: Vec::new(),
         list_output: None,
         schema: ctx.schema,
@@ -3773,9 +3992,7 @@ fn lower_const_index(
     let out = ctx.fresh(ty);
     match ty {
         ValType::Float => {
-            let zero = ctx.fresh(ValType::Float);
-            ctx.prelude
-                .extend_from_slice(&[OP_LOAD_CONST_F, 0, zero.idx as i64]);
+            let zero = emit_float_const(ctx, 0.0);
             emit_mov(ctx, zero, out);
         }
         _ => ctx

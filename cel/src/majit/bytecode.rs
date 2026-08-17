@@ -198,6 +198,105 @@ pub const OP_MUL_IMM: i64 = 57; // [a, imm, dst]           regs[dst] = regs[a] *
 /// [`OP_MUL_IMM`] for addition — the loop's `i += 1` step.
 pub const OP_ADD_IMM: i64 = 58; // [a, imm, dst]           regs[dst] = regs[a] + imm
 
+/// What one word after an opcode means, for a consumer that walks a program
+/// without running it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Operand {
+    /// A literal in the word stream — a constant, a byte stride, a scale.
+    Imm,
+    /// An int-bank register the instruction reads.
+    Int,
+    /// An int-bank register the instruction writes.
+    IntOut,
+    /// An int-bank register only the TRAP path writes, leaving it as it was on
+    /// every other path — so its old value survives the instruction and it is
+    /// read and written both.
+    IntTrap,
+    /// A float-bank register the instruction reads.
+    Float,
+    /// A float-bank register the instruction writes.
+    FloatOut,
+    /// A program address, in words from the start of the program.
+    Target,
+}
+
+use Operand::{Float, FloatOut, Imm, Int, IntOut, IntTrap, Target};
+
+/// Every opcode's operand roles, indexed by the opcode itself. An entry's
+/// length is the instruction's width less its opcode word, so this table also
+/// says how far the next instruction is.
+///
+/// One table rather than a walk built into each consumer: a consumer that
+/// pattern-matches the opcodes it happens to know silently mis-decodes the ones
+/// it does not — and mis-decoding a width desynchronizes the whole rest of the
+/// program, not just the instruction that was missed.
+///
+/// The length is written in terms of the last opcode rather than as a literal,
+/// so an opcode added past it without a row here is a compile error on this
+/// array instead of an out-of-bounds index the first time that opcode is
+/// decoded.
+pub const OPERANDS: [&[Operand]; OP_ADD_IMM as usize + 1] = [
+    &[Imm, IntOut],                 // 0  LOAD_CONST
+    &[Int, IntOut],                 // 1  MOV
+    &[Int, Int, IntOut],            // 2  ADD
+    &[Int, Int, IntOut],            // 3  SUB
+    &[Int, Int, IntOut],            // 4  MUL
+    &[Int, IntOut],                 // 5  NEG
+    &[Int, Int, IntOut],            // 6  GE
+    &[Int, Int, IntOut],            // 7  GT
+    &[Int, Int, IntOut],            // 8  LE
+    &[Int, Int, IntOut],            // 9  LT
+    &[Int, Int, IntOut],            // 10 EQ
+    &[Int, Int, IntOut],            // 11 NE
+    &[Int, Int, IntOut],            // 12 AND
+    &[Int, Int, IntOut],            // 13 OR
+    &[Int, IntOut],                 // 14 NOT
+    &[Int, Int, Int, IntOut],       // 15 SELECT
+    &[Int, Int, Target],            // 16 JUMP_IF_ABOVE
+    &[Int],                         // 17 RETURN
+    &[Int, Int, IntOut],            // 18 DIV
+    &[Int, Int, IntOut],            // 19 MOD
+    &[Int, Int, IntOut],            // 20 COL_LOAD
+    &[Int, Int, FloatOut],          // 21 COL_LOAD_F
+    &[Imm, FloatOut],               // 22 LOAD_CONST_F
+    &[Float, FloatOut],             // 23 FMOV
+    &[Float, Float, FloatOut],      // 24 FADD
+    &[Float, Float, FloatOut],      // 25 FSUB
+    &[Float, Float, FloatOut],      // 26 FMUL
+    &[Float, Float, FloatOut],      // 27 FDIV
+    &[Float, FloatOut],             // 28 FNEG
+    &[Float, Float, IntOut],        // 29 FGE
+    &[Float, Float, IntOut],        // 30 FGT
+    &[Float, Float, IntOut],        // 31 FLE
+    &[Float, Float, IntOut],        // 32 FLT
+    &[Float, Float, IntOut],        // 33 FEQ
+    &[Float, Float, IntOut],        // 34 FNE
+    &[Int, FloatOut],               // 35 I2F
+    &[Float],                       // 36 RETURN_F
+    &[Int, Float, Float, FloatOut], // 37 FSELECT
+    &[Int, Int, IntOut],            // 38 ULT
+    &[Int, Int, IntOut],            // 39 ULE
+    &[Int, Int, IntOut, IntTrap],   // 40 ADD_OVF
+    &[Int, Int, IntOut, IntTrap],   // 41 SUB_OVF
+    &[Int, Int, IntOut, IntTrap],   // 42 MUL_OVF
+    &[Int, Int],                    // 43 TRAP_STORE
+    &[Float, IntOut],               // 44 F2I
+    &[Int, Int, IntOut, IntTrap],   // 45 DIV_CHK
+    &[Int, Int, IntOut, IntTrap],   // 46 MOD_CHK
+    &[Int, Int, IntOut, IntTrap],   // 47 UDIV
+    &[Int, Int, IntOut, IntTrap],   // 48 UMOD
+    &[Int, Int, IntOut, IntTrap],   // 49 UADD_OVF
+    &[Int, Int, IntOut, IntTrap],   // 50 USUB_OVF
+    &[Int, Int, IntOut, IntTrap],   // 51 UMUL_OVF
+    &[Int, FloatOut],               // 52 U2F
+    &[Float, IntOut],               // 53 F2U
+    &[Int, Int, Int],               // 54 COL_STORE
+    &[Int, Int, Float],             // 55 COL_STORE_F
+    &[Int, Int, IntOut],            // 56 COL_LOAD_B
+    &[Int, Imm, IntOut],            // 57 MUL_IMM
+    &[Int, Imm, IntOut],            // 58 ADD_IMM
+];
+
 /// Raw native-memory load intrinsic recognized by the `#[jit_interp]` proc
 /// macro (lowered to `raw_load_i`); at the interpreter tier this real fn runs.
 /// `base` is a column buffer's base address, `ea` a byte offset — reading
@@ -1595,8 +1694,9 @@ pub mod float_bank {
     /// instruction. That is sound because the result is only ever asked whether
     /// a key is COMPILED, and a key is only ever filed at a position some door
     /// armed at — a real back-edge target, or [`ENTRY_PC`]. A spurious position
-    /// answers no. Decoding instead needs an operand-width table this module
-    /// does not have and would have to keep in step with every opcode added.
+    /// answers no. [`OPERANDS`] would let this decode instead, and a decode
+    /// would contribute no spurious position; the scan is kept because it is
+    /// the cheaper of two answers this caller cannot tell apart.
     ///
     /// [`ENTRY_PC`] is excluded, and that exclusion is what makes the paragraph
     /// above true rather than nearly true. A spurious position CAN be

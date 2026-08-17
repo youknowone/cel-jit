@@ -1053,16 +1053,22 @@ fn bank_growth_probe() {
                 fields: vec![(None, ColumnRef::Int(&elems))],
             },
         );
-        let bound = program.bind_per_row(&batch).expect("one int list column binds");
+        let bound = program
+            .bind_per_row(&batch)
+            .expect("one int list column binds");
         reset_persistent_state();
         for _ in 0..WARMUP {
-            black_box(bound.collect_raw_on(Tier::Jit, |out| { let _ = black_box(&out); }))
-                .expect("the compiled tier answers");
+            black_box(bound.collect_raw_on(Tier::Jit, |out| {
+                let _ = black_box(&out);
+            }))
+            .expect("the compiled tier answers");
         }
         let meter = Meter::start();
         for _ in 0..CALLS {
-            black_box(bound.collect_raw_on(Tier::Jit, |out| { let _ = black_box(&out); }))
-                .expect("the compiled tier answers");
+            black_box(bound.collect_raw_on(Tier::Jit, |out| {
+                let _ = black_box(&out);
+            }))
+            .expect("the compiled tier answers");
         }
         meter.stop().0
     };
