@@ -1224,6 +1224,8 @@ const BASELINE_HEADER: &str = "\
 #                    resuming at the back edge     -> `64ea1332294`, DOOMED
 #     `3b3bb8f15c5`  majit-macros: recognize f64::to_bits / f64::from_bits as the
 #                    bitcast intrinsics            -> `5ede86f1c07`, DOOMED
+#     `a9c530c95ab`  majit-backend: hold the off-GC jitframe deadframe by value,
+#                    not behind a Box              -> closes the ✅ finding below
 #
 #   DOOMED = on the branch but not on origin/main, so those locators die at the
 #   next rebase too; re-derive from the subject. Elsewhere in cel-jit the same
@@ -1319,29 +1321,48 @@ const BASELINE_HEADER: &str = "\
 #   evidence that the gap is not bridge-related -- and a reader who remembers
 #   it needs to know it was retired by a fix, not by a re-measurement.
 #
-# ✅ A DIFFERENT PART of the same backend disagreement IS attributed: the
-#   compiled-ENTRY allocation, one per call, which dynasm pays and cranelift
-#   does not. It is the DEADFRAME REPRESENTATION, not the frame. `DeadFrame`
-#   (majit-backend/src/lib.rs:1620-1631) is an enum with an inline
-#   `JitFrame(JitFrameDeadFrame)` variant and a `Boxed(Box<dyn Any>)` one:
-#   cranelift returns the inline variant
-#   (majit-backend-cranelift/src/compiler.rs:3168) and allocates nothing for it,
-#   while dynasm returns `DeadFrame::boxed(FrameData::owning(..))`
-#   (majit-backend-dynasm/src/runner.rs:3000) and pays one Box per entry. BOTH
-#   legs allocate the JITFRAME itself visibly -- dynasm via
-#   `alloc_off_gc_jitframe` (runner.rs:2871 -> majit-backend/src/jitframe.rs:230),
-#   cranelift inside `run_compiled_code` (compiler.rs:7729-7775) -- so the frame
-#   is NOT where the legs differ, and an attribution that names it is wrong.
+# ✅ CLOSED BY REMOVAL -- and the distinction matters, because this file keeps
+#   findings that were retired by a fix (see the correction above) separate from
+#   findings that were never real. This one was real and is now gone.
 #
-#   Measured, not inferred. On ONE tree: `CEL_ALLOCS_GATE=1 ... --features
-#   jit-cranelift` reports `rows=82 unstable=0 drifted=0`, where `--features
-#   jit-dynasm` on that same tree reports `drifted=12` -- all 12 being `regvm/jit*`
-#   and `regvm/jit-steady/*` rows, each at exactly +1.000. A per-allocation
-#   backtrace of `regvm/jit-steady/arith/n=1` then shows 1 allocation on
-#   cranelift against 2 on dynasm, the extra one being the Box above. The
-#   backtrace was taken with a throwaway allocator mode, not kept here: a
-#   re-entrancy flag so a capture does not count or capture itself, armed for one
-#   named row on one extra call OUTSIDE the metered rounds.
+#   It was the compiled-ENTRY allocation, one per call, which dynasm paid and
+#   cranelift did not, and it was the DEADFRAME REPRESENTATION rather than the
+#   frame. `DeadFrame` was an enum with an inline `JitFrame(JitFrameDeadFrame)`
+#   variant and a `Boxed(Box<dyn Any>)` one: cranelift returned the inline
+#   variant and allocated nothing for it, while dynasm returned
+#   `DeadFrame::boxed(FrameData::owning(..))` and paid one Box per entry. BOTH
+#   legs allocate the JITFRAME itself visibly -- dynasm via
+#   `alloc_off_gc_jitframe`, cranelift inside `run_compiled_code` -- so the frame
+#   was NOT where the legs differed, and an attribution that names it is wrong.
+#
+#   The Box bought type erasure across a crate boundary and nothing else:
+#   `majit-backend` could not name a type declared in `majit-backend-dynasm`.
+#   That constraint has no upstream counterpart -- `llsupport/jitframe.py` sits
+#   below every machine backend -- so the type moved down and `DeadFrame` grew a
+#   `LibcJitFrame` variant it holds by value.
+#
+#   THE ATTRIBUTION WAS CONFIRMED BY REMOVING THE THING, which is the strongest
+#   form available here: two independent meters moved by exactly the predicted
+#   amount, and nothing else moved.
+#
+#     * this gate's dynasm leg went `drifted=12` -> `rows=82 unstable=0
+#       drifted=0`, UNBLESSED, against the same cranelift-recorded baseline
+#       file. The twelve rows converged ONTO the file; the file was not
+#       rewritten to meet them. The cranelift leg did not move.
+#     * majit's `allocs_per_compiled_entry` went 6.000 -> 5.000 per entry on
+#       dynasm and stayed 4.000 on cranelift, and its per-site table lost the
+#       `DeadFrame::boxed` row SPECIFICALLY -- a site disappearing, not just a
+#       total falling. `alloc_off_gc_jitframe` remains, which is
+#       `llmodel.py:298 malloc_jitframe`, the one allocation upstream makes per
+#       entry, so the surviving difference of one is an ownership difference
+#       (dynasm mallocs its frame off the GC heap; cranelift's is a nursery
+#       object) and not another box to hunt.
+#
+#   The earlier per-allocation backtrace of `regvm/jit-steady/arith/n=1` read 1
+#   allocation on cranelift against 2 on dynasm and named the Box; removal
+#   agreed with it. That backtrace used a throwaway allocator mode, not kept
+#   here: a re-entrancy flag so a capture does not count or capture itself,
+#   armed for one named row on one extra call OUTSIDE the metered rounds.
 #
 #   ⚠ \"CRANELIFT PAYS 1\" IS NOT A FLAT FACT, and a reader who takes it as one
 #   will mis-bless. `run_compiled_code` branches on
@@ -1352,11 +1373,11 @@ const BASELINE_HEADER: &str = "\
 #   re-measurement that disagrees should establish which arm it is on before
 #   recording the difference as a change.
 #
-#   ⛔ THIS ATTRIBUTES ONLY THE COMPILED-ENTRY ALLOCATION. It does NOT explain
-#   the two-allocation `regvm/jit/*/n=1000` gap above: that one runs the OTHER
-#   way round (cranelift higher, dynasm lower) on different rows, and it remains
-#   open, asymmetry included. Two findings, one file, opposite signs -- do not
-#   collapse them into a single \"backend difference\".
+#   ⛔ THIS CLOSED ONLY THE COMPILED-ENTRY ALLOCATION. It does NOT explain the
+#   two-allocation `regvm/jit/*/n=1000` gap above: that one runs the OTHER way
+#   round (cranelift higher, dynasm lower) on different rows, and it remains
+#   OPEN, asymmetry included. Two findings, one file, opposite signs -- do not
+#   read \"the dynasm leg is now clean\" as though both had been settled.
 #
 # ⚠ THESE ROWS STILL SAMPLE A PRE-BRIDGE WINDOW, but the cliff they used to
 #   warn about is GONE. The `regvm/jit/*` window covers calls 65..89 and the
