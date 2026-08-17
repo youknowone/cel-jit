@@ -705,6 +705,32 @@ impl LoweredF {
             .saturating_add(elems.saturating_mul(self.elem_words))
     }
 
+    /// Set when this program is a PROJECTION: an expression that names one row
+    /// column and does nothing to it, so a per-row run stores that column's
+    /// element and nothing else.
+    ///
+    /// Such an expression lowers to an empty body — the read it consists of is
+    /// the prologue's column load — and leaves its result in the very register
+    /// that load writes. What the row loop then does is copy the input column
+    /// into the output buffer, one interpreted row at a time. A tier holding
+    /// the column can produce the same buffer by copying it, so this says when
+    /// that is the same answer: no invariant to hoist, no body, one row slot,
+    /// and the result IS that slot, in its own bank.
+    ///
+    /// The slot count is pinned at one rather than derived: a second slot's
+    /// column would be loaded by the prologue and dropped, and admitting such a
+    /// program would leave a consumer copying the FIRST column as the answer to
+    /// an expression whose result is a different one.
+    pub fn is_row_projection(&self) -> bool {
+        self.prelude.is_empty()
+            && self.body.is_empty()
+            && self.list_output.is_none()
+            && self.slots.len() == 1
+            && self.slots[0].kind == SlotKind::Row
+            && self.slots[0].ty == self.result_bank
+            && self.slots[0].reg == self.result_reg
+    }
+
     /// Build a **columnar batch** program over the two-bank machine: for each
     /// row `i` in `0..n`, load each slot's `col_k[i]` via a red-index `raw_load`
     /// (`OP_COL_LOAD` for int slots, `OP_COL_LOAD_F` for float slots), run the

@@ -449,6 +449,7 @@ impl BatchProgram {
             program: self,
             reduce,
             body_words: self.lowered.body_words_for(batch.rows, elems),
+            projected: reduce == BatchReduce::PerRow && self.lowered.is_row_projection(),
             run: std::cell::RefCell::new(run),
             _derived: derived,
         })
@@ -725,6 +726,10 @@ pub struct BoundBatch<'a, 'b> {
     /// counts. Counted at bind, where both are known, so [`Tier::Auto`] costs a
     /// comparison per call rather than a walk.
     body_words: usize,
+    /// Whether this run is a projection the clean tier answers as a column
+    /// copy. Decided at bind, where the reduction and the program are both
+    /// known, so [`BoundBatch::route`] stays a comparison.
+    projected: bool,
     /// The columns the encoding materialized. Never read again — the program's
     /// base pointers address their buffers — but they must outlive the runs.
     _derived: Vec<DerivedColumn>,
@@ -747,6 +752,14 @@ impl BoundBatch<'_, '_> {
     /// how many list elements those rows carry.
     pub fn route(&self, tier: Tier) -> Tier {
         match tier {
+            // A projection is the one shape with no crossing to find: its clean
+            // tier copies the column rather than running the loop, so more rows
+            // buy the compiled tier nothing to be cheaper at. Measured on a
+            // 10 000-row `x`, the clean tier answers in 643 ns and the compiled
+            // one in 10 965 ns — the body-word rule below would route this to
+            // the slower tier by a factor of seventeen, and it grows with the
+            // batch.
+            Tier::Auto if self.projected => Tier::Clean,
             Tier::Auto if self.body_words >= AUTO_JIT_WORDS => Tier::Jit,
             Tier::Auto => Tier::Clean,
             explicit => explicit,
@@ -852,8 +865,18 @@ impl BoundBatch<'_, '_> {
         );
         let lowered = &self.program.lowered;
         let mut run = self.run.borrow_mut();
-        run.run(|code, regs, nf, banks| dispatch(tier, threshold, code, regs, nf, banks))
-            .ok_or(BatchError::Trapped)?;
+        // A projection's output is its input column, so the clean tier writes
+        // it as a copy instead of interpreting the loop that spells the copy
+        // out. The tracing tiers still run the program: what they are measured
+        // and counted on is what the program costs them.
+        //
+        // The bind-time flag is asked first so that a program which is NOT a
+        // projection — every other case on this door — pays one bool test and
+        // not a call that would answer the same thing.
+        if !(tier == Tier::Clean && self.projected && run.project()) {
+            run.run(|code, regs, nf, banks| dispatch(tier, threshold, code, regs, nf, banks))
+                .ok_or(BatchError::Trapped)?;
+        }
         // A LIST-valued result stored each row's element COUNT rather than a
         // value, and the elements themselves went to their own flat buffers at
         // a cursor running across the batch — the same Arrow layout an input
@@ -1362,6 +1385,106 @@ mod tests {
             for tier in [Tier::Auto, Tier::Clean, Tier::Interpreter, Tier::Jit] {
                 assert_eq!(bound.collect_on(tier).unwrap(), want, "{tier:?} at {rows}");
             }
+        }
+    }
+
+    /// An expression that is a bare variable is a PROJECTION, and the clean
+    /// tier answers one by copying the column instead of interpreting the loop
+    /// that copies it a row at a time. What that shortcut owes is the answer
+    /// the loop gives — in every bank an output can carry, and at a height
+    /// where the copy is the whole run as well as one where it is not.
+    ///
+    /// The tiers are the oracle here rather than a hand-written expectation:
+    /// they still run the program, so a copy that encodes a row differently
+    /// than the loop stores it disagrees with three witnesses at once.
+    #[test]
+    fn a_projection_answers_what_the_loop_it_replaces_answers() {
+        let strs: Vec<String> = ["pear", "fig", "apple", "fig"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let ints = [7i64, -1, 0, i64::MAX];
+        let floats = [1.5f64, -0.25, 0.0, f64::INFINITY];
+        let bools = [true, false, false, true];
+        let cases = [
+            ("i", ValType::Int),
+            ("f", ValType::Float),
+            ("b", ValType::Bool),
+            ("s", ValType::Str),
+            ("t", ValType::Timestamp),
+        ];
+        for (name, ty) in cases {
+            let program = BatchProgram::compile(name, &schema(&[(name, ty)])).unwrap();
+            assert!(
+                program.lowered().is_row_projection(),
+                "`{name}` is a bare variable, so it is a projection"
+            );
+            for rows in [1usize, 4] {
+                let col = match ty {
+                    ValType::Int => ColumnRef::Int(&ints[..rows]),
+                    ValType::Float => ColumnRef::Float(&floats[..rows]),
+                    ValType::Bool => ColumnRef::Bool(&bools[..rows]),
+                    ValType::Str => ColumnRef::Str(&strs[..rows]),
+                    ValType::Timestamp => ColumnRef::Timestamp(&ints[..rows]),
+                    other => unreachable!("no projection case declares {other:?}"),
+                };
+                let batch = Batch::new(rows).column(name, col);
+                let bound = program.bind_per_row(&batch).unwrap();
+                let want = bound.collect_on(Tier::Interpreter).unwrap();
+                assert_eq!(want.len(), rows, "{name} at {rows} rows");
+                for tier in [Tier::Auto, Tier::Clean, Tier::Jit] {
+                    assert_eq!(bound.collect_on(tier).unwrap(), want, "{name}: {tier:?}");
+                }
+            }
+        }
+    }
+
+    /// A projection stays on the clean tier however tall the batch gets, where
+    /// the body-word rule would hand a tall one to the compiled tier.
+    ///
+    /// The rule is about a crossing, and a projection has none: the clean tier
+    /// copies the column, so the work it does per row does not grow into what
+    /// compiling is worth paying for. Pinned as a route rather than a time for
+    /// the reason the word-count route is — the decision is the contract.
+    #[test]
+    fn a_projection_stays_clean_however_tall_the_batch() {
+        let s = schema(&[("x", ValType::Int)]);
+        let projection = BatchProgram::compile("x", &s).unwrap();
+        let computed = BatchProgram::compile("x * 2 + 1", &s).unwrap();
+        let tall: Vec<i64> = (0..10_000).collect();
+        let batch = Batch::new(tall.len()).column("x", ColumnRef::Int(&tall));
+
+        let bound = projection.bind_per_row(&batch).unwrap();
+        assert!(
+            bound.body_words() >= AUTO_JIT_WORDS,
+            "the batch is tall enough for the word rule to fire"
+        );
+        assert_eq!(bound.route(Tier::Auto), Tier::Clean);
+
+        // The same height, one operation away from a projection, still crosses.
+        let bound = computed.bind_per_row(&batch).unwrap();
+        assert_eq!(bound.route(Tier::Auto), Tier::Jit);
+
+        // The shortcut is per-row only, so a summing bind keeps the word rule.
+        let bound = projection.bind(&batch).unwrap();
+        assert_eq!(bound.route(Tier::Auto), Tier::Jit);
+    }
+
+    /// The other side of the predicate: an expression that DOES something to
+    /// the column it reads is not a projection, so the clean tier runs its
+    /// program. Pinned because the shortcut is only sound where the loop it
+    /// stands in for would have stored the column unchanged.
+    #[test]
+    fn an_expression_with_a_body_is_not_a_projection() {
+        let s = schema(&[("x", ValType::Int), ("y", ValType::Int)]);
+        for src in ["x * 2", "x + y", "x == 1", "-x"] {
+            assert!(
+                !BatchProgram::compile(src, &s)
+                    .unwrap()
+                    .lowered()
+                    .is_row_projection(),
+                "`{src}` has a body"
+            );
         }
     }
 
