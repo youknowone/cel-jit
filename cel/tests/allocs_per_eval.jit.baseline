@@ -10,6 +10,8 @@
 #                    resuming at the back edge     -> `64ea1332294`, DOOMED
 #     `3b3bb8f15c5`  majit-macros: recognize f64::to_bits / f64::from_bits as the
 #                    bitcast intrinsics            -> `5ede86f1c07`, DOOMED
+#     `a9c530c95ab`  majit-backend: hold the off-GC jitframe deadframe by value,
+#                    not behind a Box              -> closes the ✅ finding below
 #
 #   DOOMED = on the branch but not on origin/main, so those locators die at the
 #   next rebase too; re-derive from the subject. Elsewhere in cel-jit the same
@@ -142,9 +144,81 @@
 #   frame is nursery-allocated and invisible to a global-allocator counter, and
 #   cranelift would read one fewer than dynasm.
 #
-# ⛔ SEVEN ROWS BELOW ARE STALE-LOOSE BY 13 TO 25, AND NOTHING WAS BLESSED. The
-#   2026-08-18 run named above prints 82 rows and compares 70 of them against
-#   this file. Seven drifted, all downward, by the same amount on each backend:
+# ✅ CLOSED BY REMOVAL -- and the distinction matters, because this file keeps
+#   findings that were retired by a fix (the `float` bridge bullet above) or by
+#   a re-measurement (the gap above it) separate from findings that were never
+#   real. This one was real and is now gone.
+#
+#   It was the compiled-ENTRY allocation, one per call, which dynasm paid and
+#   cranelift did not, and it was the DEADFRAME REPRESENTATION rather than the
+#   frame. `DeadFrame` was an enum with an inline `JitFrame(JitFrameDeadFrame)`
+#   variant and a `Boxed(Box<dyn Any>)` one: cranelift returned the inline
+#   variant and allocated nothing for it, while dynasm returned
+#   `DeadFrame::boxed(FrameData::owning(..))` and paid one Box per entry. BOTH
+#   legs allocate the JITFRAME itself visibly -- dynasm via
+#   `alloc_off_gc_jitframe`, cranelift inside `run_compiled_code` -- so the frame
+#   was NOT where the legs differed, and an attribution that names it is wrong.
+#
+#   The Box bought type erasure across a crate boundary and nothing else:
+#   `majit-backend` could not name a type declared in `majit-backend-dynasm`.
+#   That constraint has no upstream counterpart -- `llsupport/jitframe.py` sits
+#   below every machine backend -- so the type moved down and `DeadFrame` grew a
+#   `LibcJitFrame` variant it holds by value.
+#
+#   THE ATTRIBUTION WAS CONFIRMED BY REMOVING THE THING, which is the strongest
+#   form available here: two independent meters moved by exactly the predicted
+#   amount, and nothing else moved.
+#
+#     * this gate's dynasm leg went `drifted=12` -> `rows=82 unstable=0
+#       drifted=0`, UNBLESSED, against the same cranelift-recorded baseline
+#       file. The twelve rows converged ONTO the file; the file was not
+#       rewritten to meet them. The cranelift leg did not move.
+#     * majit's `allocs_per_compiled_entry` went 6.000 -> 5.000 per entry on
+#       dynasm and stayed 4.000 on cranelift, and its per-site table lost the
+#       `DeadFrame::boxed` row SPECIFICALLY -- a site disappearing, not just a
+#       total falling. `alloc_off_gc_jitframe` remains, which is
+#       `llmodel.py:298 malloc_jitframe`, the one allocation upstream makes per
+#       entry, so the surviving difference of one is an ownership difference
+#       (dynasm mallocs its frame off the GC heap; cranelift's is a nursery
+#       object) and not another box to hunt.
+#
+#   The earlier per-allocation backtrace of `regvm/jit-steady/arith/n=1` read 1
+#   allocation on cranelift against 2 on dynasm and named the Box; removal
+#   agreed with it. That backtrace used a throwaway allocator mode, not kept
+#   here: a re-entrancy flag so a capture does not count or capture itself,
+#   armed for one named row on one extra call OUTSIDE the metered rounds.
+#
+#   ⚠ "CRANELIFT PAYS 1" IS NOT A FLAT FACT, and a reader who takes it as one
+#   will mis-bless. `run_compiled_code` branches on
+#   `cranelift_jitframe_type_id()`: on the arm where a GC type registry exists
+#   the frame is nursery-allocated and therefore INVISIBLE to a global-allocator
+#   counter, and that configuration reads 0 here rather than 1. The capture above
+#   was taken on the other arm, which falls back to a heap `Vec<i64>`. A
+#   re-measurement that disagrees should establish which arm it is on before
+#   recording the difference as a change. THIS CAVEAT STILL HOLDS, and the
+#   2026-08-18 re-measurement that retired the gap above is what it looks like
+#   to satisfy it: that capture named the branch line and showed its own frame
+#   landing inside the fallback arm, instead of assuming which arm it was on.
+#
+#   ⛔ THIS CLOSED ONLY THE COMPILED-ENTRY ALLOCATION, and the other finding it
+#   left OPEN -- the two-allocation `regvm/jit/*/n=1000` gap above, which ran
+#   the OTHER way round, cranelift higher on different rows -- is open no
+#   longer. It went to zero, and by different means: this one was closed by
+#   removing a named site and watching two independent meters move by the
+#   predicted amount, that one was retired by a re-measurement that attributes
+#   nothing. Keep them apart in retrospect too. They are not one backend
+#   difference that got settled once, and the correction above carries the
+#   numbers for the second.
+#
+# ⛔ SEVEN ROWS BELOW ARE STALE-LOOSE BY 13 TO 25, AND THE BISECT WINDOW THIS
+#   BLOCK USED TO BUILD FOR THEM WAS AN ARTEFACT OF COMPARING TWO DIFFERENT
+#   FILES. The rows are loose and the drop is real; the window is VOID. Do not
+#   spend a bisect on it and do not re-quote the seven upstream commits it
+#   named -- they are not in evidence, in either direction.
+#
+#   THE ROWS. The 2026-08-18 walker run (`--no-default-features --features
+#   regex,chrono,jit-*`) measures 82 rows and compares the 70 this file holds.
+#   Seven drift, all downward, by the same amount on each backend:
 #
 #     regvm/jit/arith/n=1000           52.000   recorded 65.000   -13.000
 #     regvm/jit-steady/arith/n=1000     1.000   recorded 24.000   -23.000
@@ -154,77 +228,91 @@
 #     regvm/jit/float/n=1000           52.000   recorded 67.000   -15.000
 #     regvm/jit-steady/float/n=1000     1.000   recorded 26.000   -25.000
 #
+#   ⛔ THE CROSS-FILE MISTAKE, WRITTEN OUT SO NOBODY REPEATS IT. This block
+#   used to call `f84e21f` (2026-08-18 01:38) the other reading of the SAME
+#   quantity and date the drop after it. That run took the DEFAULT feature set,
+#   so `baseline_path()` resolved `allocs_per_eval.jit.vm.baseline` -- a
+#   DIFFERENT FILE, 82 rows to this file's 70. Two readings against two
+#   baselines are not two readings of one quantity. That is the rule at the top
+#   of this header, and this block broke it.
+#
+#   `rows={}` is `rows.len()`: the rows MEASURED, not the rows compared. Both
+#   configurations measure 82, so that figure never identified the file and
+#   cannot be used to. What identifies it is the TWELVE. `f84e21f` records
+#   twelve `regvm/jit*` / `regvm/jit-steady/*` rows converging onto its
+#   baseline unblessed; this file holds NINE such rows in total, so 12 > 9 and
+#   that reading is arithmetically impossible here. The backtrace it cites
+#   names `regvm/jit-steady/arith/n=1`, which is not a row of this file at all.
+#
+#   ATTRIBUTION. The drop is already attributed -- in the OTHER file's history,
+#   and in two steps rather than one:
+#
+#     * `d776682` (2026-08-17 08:36, "pin bank width against element count and
+#       re-bless the jit.vm baseline") moved `jit/arith/n=1000` 61->52,
+#       `jit/policy/n=1000` 61->55, `jit/float/n=1000` 63->55, all three
+#       `jit-steady/*/n=1000` 20/20/22->1, and `jit/float/n=1` 2->1;
+#       `51ab293` (14:53, register packing) then took policy and float 55->52.
+#       The campaign record attributes the steady rows' fall to the vable
+#       sync-hook change -- a generated `sync_virtualizable_before_jit` that
+#       replaced the default per-entry array copy in/out with one
+#       `reset_vable_token` store -- and the n=1000 fall to the compiled-entry
+#       contract change.
+#     * that is -9/-19/-9/-19/-1/-11/-21. This file's deltas are
+#       -13/-23/-13/-23/-1/-15/-25. The residual is +4 on the six n=1000 and
+#       steady rows, 0 on `regvm/jit/float/n=1`, and it is OLDER than the
+#       campaign: already at `df1b8ba` this file recorded 65/24/65/24/67/26
+#       where `allocs_per_eval.jit.vm.baseline` recorded 61/20/61/20/63/22,
+#       every `n=1` row agreeing. Its window is `14ea0e7` (2026-08-08 12:34,
+#       the last bless that touched a DATA row here) .. `c4b112b` (08-09 22:50,
+#       that file's first bless), and exactly one commit in it touches the
+#       module these rows measure: `991e26e`, "convert run_mainloop_f to the
+#       single-executor merge point" (`cel/src/majit/bytecode.rs`, inside `pub
+#       mod float_bank`). A candidate, not a claim: nothing measured it.
+#
+#   So this file is stale across TWO epochs and was re-blessed through neither.
+#   It is also 12 rows SHORT -- `regvm/clean-banked/*` (`45ee63b`) and
+#   `regvm/jit-idle/*/n=1` + `regvm/jit-steady/*/n=1` (`e062ef1`) were minted
+#   after 08-08 and have never been compared in this configuration at all.
+#
 #   The REGIME of each row is unchanged, so these are not rows that started
-#   measuring something else. The `regvm/jit/*/n=1000` rows still report
-#   `compiled=0 bridges=0 aborted=0 guard_fails=88` over 88 calls -- one guard
-#   failure per call, exactly as this header records -- and what fell is the
-#   COST of that call, not the number of them. The `regvm/jit-steady/*/n=1000`
-#   rows still report `bridges_before=1 in_window=0 compiled_in_window=0
-#   guard_fails=0 -- STEADY: past every bridge`, and in that regime, with no
-#   guard failure and no compile in the window, a call now costs ONE allocation.
+#   measuring something else: `regvm/jit/*/n=1000` still reports `compiled=0
+#   bridges=0 aborted=0 guard_fails=88` over 88 calls, and
+#   `regvm/jit-steady/*/n=1000` still reports `bridges_before=1 in_window=0
+#   compiled_in_window=0 guard_fails=0 -- STEADY: past every bridge`. ⚠ That
+#   is PROSE checked by eye. `read_baseline` parses `label TAB value` and
+#   nothing else, so no regime is recorded in any baseline and nothing would
+#   catch this paragraph going stale; and it excludes a RE-ROUTED row and
+#   nothing more. Both changes named above move cost at FIXED routing, so it
+#   cannot separate them from anything else that also leaves routing alone.
 #
-#   ⚠ A REFERENCE 13 ALLOCATIONS LOOSE CANNOT CATCH A 13-ALLOCATION REGRESSION.
-#   Until these rows are re-blessed, `CEL_ALLOCS_GATE=1` in this configuration
-#   passes anything that costs its way back up to the recorded figure, and the
-#   `Δ` column reports a constant -13 that says nothing about the change being
-#   measured. That is a reason to know the file is loose, not a step to take in
-#   passing: a bless rewrites the reference every later measurement is read
-#   against, and no bless was taken here.
+#   ⚠ A REFERENCE 13 ALLOCATIONS LOOSE CANNOT CATCH A 13-ALLOCATION
+#   REGRESSION. That still holds for the seven rows below -- and it is a
+#   statement about THIS FILE, not about the measurement:
+#   `allocs_per_eval.jit.vm.baseline` has been tight on the same rows since
+#   2026-08-17 14:53, and was re-verified GATED on 2026-08-18 on BOTH backends
+#   after the enclosing rebase -- 82 of 82 rows, 0 drifted, on each leg. Until
+#   these seven are re-blessed, `CEL_ALLOCS_GATE=1` in
+#   the walker+jit configuration passes anything that costs its way back up to
+#   the recorded figure, and the `Δ` column reports a constant -13 that says
+#   nothing about the change being measured. A bless is licensed here -- every
+#   drift is DOWNWARD, both backends agree, and the endpoints equal what the
+#   other configuration already records -- but it rewrites the reference every
+#   later measurement is read against, so take it deliberately, not in passing.
 #
-#   ⛔ WHAT MOVED THESE ROWS IS NOT ATTRIBUTED. The window is recorded so that a
-#   bisect has a start; no commit in it is named as the cause.
-#
-#   Its start is exact, and the two readings either side of it are the SAME
-#   quantity. `f84e21f` (2026-08-18 01:38, "allocs_per_eval: close the
-#   compiled-entry finding by removal") records `rows=82 unstable=0 drifted=0`
-#   on the dynasm leg against this file and states that the cranelift leg did
-#   not move -- so both legs read 0 drifted rows then, and both read 7 now. The
-#   two phrasings are one counter and not two: this test prints `drifted.len()`
-#   twice, once as `rows={} unstable={} drifted={}` and once as "N of N
-#   baseline rows compared ... N drifted", and that note quotes the first while
-#   the 2026-08-18 run printed the second.
-#
-#   So the drop is later than 01:38. cel-jit itself has no commit in the window.
-#   `.cargo/config.toml` patches the majit crates to `../majit`, which puts the
-#   ENCLOSING worktree in the window as well, and it was rebased there
-#   (2026-08-18 09:35) from `81e8a2d07ba` onto `1348b0a1edc`, picking up exactly
-#   seven commits:
-#
-#     1348b0a1edc  jit: run the collected postprocess callbacks when a later
-#                  pass removes the op (#1307)
-#     fe221caf12b  jit: record the implicit __context__ for a raise the trace
-#                  catches itself (#1300)
-#     6cac2a9088b  majit: stop inheriting a previous compile's target tokens
-#                  (#1287)
-#     416e434a0dc  tests: move eval.rs's Python-semantics cases to a CI-gated
-#                  snippet subset (#1282)
-#     629e8e355a5  jit(cranelift): test the JITFRAME write-barrier flag inline
-#                  before calling the helper (#1306)
-#     79c174f677c  generator: make delegated close() lookup errors unraisable
-#                  (#1302)
-#     45ae12a6922  majit: route both raw-hash cell readers through lookup_chain
-#                  (#1293)
-#
-#   Two of the seven are excluded by the measurement rather than by reading
-#   them: the drop is identical on both backends, which rules out the
-#   cranelift-only `629e8e355a5`, and `416e434a0dc` changes tests only. The
-#   remaining four are not separated here, and none of them is claimed. As with
-#   the shas at the top of this header, the PR number is the durable citation
-#   and the sha is a dated annotation.
-#
-#   ⛔⛔ THE WINDOW IS NOT THOSE SEVEN COMMITS. It is:
-#
-#     the seven upstream commits `81e8a2d07ba..1348b0a1edc`, PLUS any
-#     uncommitted majit edit that was present in the shared enclosing worktree
-#     at 01:38 and is not present now.
-#
-#   THE SECOND TERM IS UNBOUNDED AND WAS NOT OBSERVED EITHER WAY. Several
-#   agents write into that worktree and `.cargo/config.toml` builds the majit
-#   crates straight out of it, so an uncommitted edit standing there at 01:38
-#   was IN the binary that produced the 01:38 reading. The tree is clean now,
-#   which says nothing about what was in it then. A bisect that walks the seven
-#   commits and finds nothing has not exhausted the window; it has exhausted
-#   the term that happens to be enumerable.
+#   WHAT IS STILL NOT PROVEN. That `991e26e` is the -4: nobody measured it, and
+#   `.cargo/config.toml` points the majit crates at the enclosing worktree, so
+#   a rebuild at that commit today is not the tree that produced the 08-08
+#   figure. That upstream moved these rows by ZERO: the VM leg reads 0 drifted
+#   under the gate on both backends AFTER the 2026-08-18 09:35 rebase, so its
+#   endpoints agree at 52/1 across it, but the only walker-
+#   configuration readings are 08-08 and 08-18, nothing was observed between
+#   them, and the argument runs THROUGH the other file -- licensed by `regvm/*`
+#   carrying no `vm` gate (`src/lib.rs:202,217,240` are the library's only
+#   three, all inside `Program::from_expression` / `Program::execute`, which
+#   `regvm_group` never calls), verified at HEAD and not at each intermediate
+#   commit. And whatever uncommitted majit edit stood in the shared enclosing
+#   worktree at any of these blesses: that term is real, unbounded and
+#   unobserved -- at the 08-08/08-09 boundary exactly as much as at this one.
 #
 # ⚠ THESE ROWS STILL SAMPLE A PRE-BRIDGE WINDOW, but the cliff they used to
 #   warn about is GONE. The `regvm/jit/*` window covers calls 65..89 and the
@@ -318,17 +406,29 @@ comprehension/bind+exec/all/100	4.000
 comprehension/bind+exec/exists/100	4.000
 comprehension/bind+exec/size/100	13.000
 regvm/clean/arith/n=1	1.000
+regvm/clean-banked/arith/n=1	0.000
 regvm/jit/arith/n=1	1.000
+regvm/jit-idle/arith/n=1	0.000
+regvm/jit-steady/arith/n=1	1.000
 regvm/clean/arith/n=1000	1.000
-regvm/jit/arith/n=1000	65.000
-regvm/jit-steady/arith/n=1000	24.000
+regvm/clean-banked/arith/n=1000	0.000
+regvm/jit/arith/n=1000	52.000
+regvm/jit-steady/arith/n=1000	1.000
 regvm/clean/policy/n=1	1.000
+regvm/clean-banked/policy/n=1	0.000
 regvm/jit/policy/n=1	1.000
+regvm/jit-idle/policy/n=1	0.000
+regvm/jit-steady/policy/n=1	1.000
 regvm/clean/policy/n=1000	1.000
-regvm/jit/policy/n=1000	65.000
-regvm/jit-steady/policy/n=1000	24.000
+regvm/clean-banked/policy/n=1000	0.000
+regvm/jit/policy/n=1000	52.000
+regvm/jit-steady/policy/n=1000	1.000
 regvm/clean/float/n=1	2.000
-regvm/jit/float/n=1	2.000
+regvm/clean-banked/float/n=1	0.000
+regvm/jit/float/n=1	1.000
+regvm/jit-idle/float/n=1	0.000
+regvm/jit-steady/float/n=1	1.000
 regvm/clean/float/n=1000	2.000
-regvm/jit/float/n=1000	67.000
-regvm/jit-steady/float/n=1000	26.000
+regvm/clean-banked/float/n=1000	0.000
+regvm/jit/float/n=1000	52.000
+regvm/jit-steady/float/n=1000	1.000
