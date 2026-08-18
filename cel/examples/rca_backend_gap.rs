@@ -17,10 +17,32 @@
 //!   back-edge FINISH from the portal instead of resuming at the back edge"
 //!   took cranelift 66/66/68 -> 65/65/67 and left dynasm at 63/63/65.
 //!
-//! So this probe does not measure the gap again. It reproduces ONE warm call of
-//! the exact fixture behind the `regvm/jit/arith/n=1000` row and records the
-//! STACK of every allocation that call makes, so the two backends' tables can
-//! be differenced site by site.
+//! So this probe does not measure the gap again. It reproduces ONE call of the
+//! exact fixture behind the `regvm/jit/arith/n=1000` row and records the STACK
+//! of every allocation that call makes, so the two backends' tables can be
+//! differenced site by site.
+//!
+//! ## Two regimes over one fixture — `RCAGAP_REGIME`
+//!
+//! The baseline carries two row families over this fixture and they measure
+//! different windows, so a per-site table has to say which one it attributes.
+//!
+//! * `warm` (the default) is the window `regvm/jit/*/n=1000` records: warmed
+//!   past the loop compile and stopped SHORT of the first guard bridge. Its
+//!   invariant is `bridges_compiled == 0` at the seam, and a bridge landing
+//!   inside the warm-up refuses the run.
+//! * `steady` is the window `regvm/jit-steady/*/n=1000` records: warmed until
+//!   nothing is left to compile and no guard is left to fail. Its warm-up is
+//!   SEARCHED, not chosen — calls run in chunks of `RCAGAP_SETTLE_CHUNK` until
+//!   a whole chunk moves none of `loops_compiled`, `bridges_compiled`,
+//!   `loops_aborted`, `guard_failures`, and the length it took is printed — and
+//!   its invariant is that all four stand still across the capture window too,
+//!   with at least one compiled entry per call in that window. Any of them
+//!   moving refuses the run, exactly as the warm assert refuses a bridge.
+//!
+//! Everything else is shared and neither regime weakens it: the same fixture,
+//! the same door, the same re-entrancy guard, the same `captured == allocs`
+//! check, and the same unarmed calls either side of the armed ones.
 //!
 //! ## The fixture is copied, not approximated
 //!
@@ -59,6 +81,8 @@
 //!   --features regex,chrono,jit-cranelift --example rca_backend_gap
 //! cargo run --release --no-default-features \
 //!   --features regex,chrono,jit-dynasm --example rca_backend_gap
+//! RCAGAP_REGIME=steady cargo run --release --no-default-features \
+//!   --features regex,chrono,jit-cranelift --example rca_backend_gap
 //! ```
 //!
 //! ⛔ `--features jit` alone names no backend and `majit-metainterp` refuses it.
@@ -67,10 +91,16 @@
 //! row, so either profile answers the question; release is the one the baseline
 //! was taken in.
 //!
-//! `RCAGAP_CASE` (`arith`/`policy`/`float`), `RCAGAP_N`, `RCAGAP_WARMUP`,
-//! `RCAGAP_CAPTURES` and `RCAGAP_TAIL` override the defaults.
+//! `RCAGAP_REGIME` (`warm`/`steady`), `RCAGAP_CASE` (`arith`/`policy`/`float`),
+//! `RCAGAP_N`, `RCAGAP_WARMUP`, `RCAGAP_CAPTURES`, `RCAGAP_TAIL`,
+//! `RCAGAP_SETTLE_CHUNK` and `RCAGAP_SETTLE_MAX` override the defaults.
+//! `RCAGAP_WARMUP` under `steady` replaces the settle search with a count the
+//! caller vouches for; the window invariant still judges where it landed.
 //!
 //! ## Observed, 2026-08-18, aarch64-macos — THE GAP IS ZERO AND THE BASELINE IS STALE
+//!
+//! In the `warm` regime, which is the default. The `steady` regime's own table
+//! is the section after this one.
 //!
 //! There were no two allocations to attribute. Both legs cost **52.000** per
 //! call on all three cases, against a file that records 65/65/67 (cranelift)
@@ -99,7 +129,8 @@
 //! pre-bridge window — fell 24/24/26 -> 1.000. Its regime notes are unchanged:
 //! `bridges_before=1 in_window=0 compiled_in_window=0 guard_fails=0 — STEADY:
 //! past every bridge`, so in that regime, with no guard failure and no compile
-//! in the window, a call now costs ONE allocation. The `regvm/jit/*/n=1000`
+//! in the window, a call now costs ONE allocation — and `RCAGAP_REGIME=steady`
+//! reproduces that window and says below which one. The `regvm/jit/*/n=1000`
 //! rows still report `compiled=0 bridges=0 aborted=0 guard_fails=88` over 88
 //! calls, one guard failure per call exactly as before, so what fell there is
 //! the COST of that call and not the number of them.
@@ -109,7 +140,11 @@
 //! that corpus on which the backends disagree.
 //!
 //! The per-site tables are the finding, not the totals. 45 sites on each leg,
-//! summing to 52 on each leg. Grouped by innermost majit/cel frame they are
+//! summing to 52 on each leg — ⚠ re-measured on 2026-08-18 the same table reads
+//! 42 sites, still summing to 52, on both legs. The 42 is not this file's doing:
+//! the probe as committed at `7555818`, built and run unmodified on the same
+//! tree, prints the same 42 rows and the same total. Sites merged under majit;
+//! the quantity did not move. Grouped by innermost majit/cel frame they are
 //! **identical, row for row, count for count**, except ONE row — and that row
 //! has count 1 on both sides:
 //!
@@ -136,6 +171,61 @@
 //! 52, and the one differing row above becomes a differing TOTAL. Establish
 //! which arm a re-measurement is on before recording a difference.
 //!
+//! ⚠ The four line numbers in that paragraph are the ones majit carried when it
+//! was written, and majit has moved since: on 2026-08-18 the branch is `:7832`,
+//! the arm runs `:7849`-`:7866`, the `vec![0i64; HEADER_WORDS + jf_total]` is
+//! `:7856`, and `:7856` is what the frame symbolizes to. The FACT — that this
+//! build takes the non-GC arm — is re-confirmed on both regimes; the
+//! coordinates are not stable, so re-check by symbol.
+//!
+//! ⛔⛔ WHICH majit TREE THESE NUMBERS WERE TAKEN ON, because `.cargo/config.toml`
+//! patches the majit crates to `../majit` and that is a worktree several agents
+//! share. At the time of this reading the enclosing worktree was in DETACHED
+//! HEAD on a peer branch with 47 staged files — not this crate's own branch and
+//! not a clean upstream/main. The figures are therefore reproductions across
+//! trees rather than readings of one: the warm total read 52 over 45 sites on
+//! an earlier, different tree and reads 52 over 45 sites here, and the steady
+//! total reads 1 here and matched the gate's 1.000 taken on that earlier tree.
+//! Agreement across two unrelated trees is evidence the numbers are a property
+//! of the code; it is NOT the same as a reading on a clean checkout, and no
+//! reading on a clean checkout has been taken. Do not bless a baseline against
+//! these until one has been.
+//!
+//! ## Observed, 2026-08-18, aarch64-macos — THE STEADY REGIME, MEASURED
+//!
+//! `RCAGAP_REGIME=steady`, `arith`, release, both legs, and the two legs agree
+//! on every line of it except the site itself.
+//!
+//! The warm-up SETTLED after 320 calls — five chunks of 64, the last moving
+//! nothing — at `loops_compiled=1 bridges_compiled=1 guard_failures=200
+//! loops_aborted=0`. The capture window then moved none of those four and
+//! entered compiled code 6 times over its 6 calls, so the window is past every
+//! bridge and every call in it ran the artifact. Every call in the run's steady
+//! stretch, armed or not, cost ONE allocation: `warm(last 3)=[1, 1, 1]
+//! armed=[1, 1, 1] tail=[1, 1, 1]`.
+//!
+//! ⭐ THAT ONE ALLOCATION IS THE JITFRAME, AND THIS IS THE MEASUREMENT, not the
+//! inference from the warm window that preceded it. The whole table is one row:
+//!
+//! ```text
+//! cranelift  1  size=224  majit_backend_cranelift::compiler::run_compiled_code_inner@compiler.rs:7856
+//! dynasm     1  size=320  majit_backend::jitframe::alloc_off_gc_jitframe@jitframe.rs:230
+//! ```
+//!
+//! ⭐ Those are the SAME two rows that are the ONLY difference between the two
+//! legs' warm tables. The steady table is therefore not an arbitrary subset of
+//! the warm one: what survives past every bridge is exactly the row on which the
+//! backends disagree, and the 51 the legs share in the warm window are all
+//! pre-bridge cost that the steady regime does not pay. `stacks passing
+//! through:` reads `backend-cranelift=1 backend=1 metainterp=1 cel=1` (dynasm:
+//! `backend-dynasm=1 ...`) — one stack, and it reaches the backend, against a
+//! warm window where 51 of 52 stacks stop above the backend split.
+//!
+//! ⚠ The arm-dependence above is the whole steady total here, not one row of
+//! it: on a build whose GC type registry answers, cranelift's jitframe is
+//! nursery-allocated and invisible to a global-allocator counter, and this
+//! regime would read 0 against dynasm's 1.
+//!
 //! ⛔ WHICH CHANGE CLOSED THE GAP IS NOT ATTRIBUTED HERE. Separating candidates
 //! needs old trees: `.cargo/config.toml` patches the majit crates to `../majit`,
 //! so pricing an older majit means building an older enclosing worktree with
@@ -155,7 +245,7 @@ use std::collections::BTreeMap;
 use std::hint::black_box;
 
 use cel::majit::bytecode::float_bank::{
-    jit_stats, reset_jit_stats, reset_persistent_state, run_jit_persistent_f,
+    jit_stats, reset_jit_stats, reset_persistent_state, run_jit_persistent_f, JitStats,
 };
 use cel::majit::lower::{lower_typed, Schema, ValType};
 use cel::Program;
@@ -223,14 +313,53 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static ALLOC: Counting = Counting;
 
+fn env_usize_opt(key: &str) -> Option<usize> {
+    std::env::var(key).ok().map(|v| {
+        v.parse()
+            .unwrap_or_else(|_| panic!("{key}={v:?}: expected an integer"))
+    })
+}
+
 fn env_usize(key: &str, default: usize) -> usize {
-    std::env::var(key)
-        .ok()
-        .map(|v| {
-            v.parse()
-                .unwrap_or_else(|_| panic!("{key}={v:?}: expected an integer"))
-        })
-        .unwrap_or(default)
+    env_usize_opt(key).unwrap_or(default)
+}
+
+/// Which window on the fixture the probe measures.
+///
+/// The two are the same program, the same door and the same instrument; they
+/// differ only in where the capture window sits relative to the tier's
+/// compiles, and that placement is what each regime's invariant asserts.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Regime {
+    /// The pre-bridge window `regvm/jit/*/n=1000` records: warmed past the loop
+    /// compile and stopped short of the first guard bridge.
+    Warm,
+    /// The post-bridge window `regvm/jit-steady/*/n=1000` records: warmed until
+    /// nothing is left to compile and no guard is left to fail.
+    Steady,
+}
+
+impl Regime {
+    fn label(self) -> &'static str {
+        match self {
+            Regime::Warm => "WARM",
+            Regime::Steady => "STEADY",
+        }
+    }
+}
+
+/// The counters whose stillness DEFINES the steady regime: a compile, a bridge,
+/// an aborted trace and a deopt are the four events that would put the window on
+/// the other side of a tier transition. `trace_ops_*` and `compiled_entries` are
+/// deliberately absent — they move on every steady call by design, so including
+/// them would make "settled" unreachable.
+fn regime_counters(s: &JitStats) -> (usize, usize, usize, usize) {
+    (
+        s.loops_compiled,
+        s.bridges_compiled,
+        s.loops_aborted,
+        s.guard_failures,
+    )
 }
 
 /// The three cases of `tests/allocs_per_eval.rs:640-657`, verbatim.
@@ -367,6 +496,12 @@ struct Sample {
 }
 
 fn main() {
+    let regime_name = std::env::var("RCAGAP_REGIME").unwrap_or_else(|_| "warm".to_string());
+    let regime = match regime_name.as_str() {
+        "warm" => Regime::Warm,
+        "steady" => Regime::Steady,
+        other => panic!("RCAGAP_REGIME={other:?}: expected warm or steady"),
+    };
     let case_name = std::env::var("RCAGAP_CASE").unwrap_or_else(|_| "arith".to_string());
     let case = CASES
         .iter()
@@ -378,15 +513,42 @@ fn main() {
     // different threshold is a different fixture.
     const JIT_ON: u32 = 8;
     // `WARMUP` in the test. One priming call precedes it there too, so the
-    // first captured call here is the test's call 66.
-    let warmup = env_usize("RCAGAP_WARMUP", 64);
+    // first captured call in the warm regime is the test's call 66.
+    const WARM_WARMUP: usize = 64;
+    // Overrides the regime's own plan in both regimes: in `warm` it is the
+    // window's position, in `steady` it replaces the settle search with a
+    // number the caller vouches for. The steady invariant still refuses the
+    // run if that number lands short of the regime.
+    let warmup_override = env_usize_opt("RCAGAP_WARMUP");
     let captures = env_usize("RCAGAP_CAPTURES", 3);
     let tail = env_usize("RCAGAP_TAIL", 3);
+    // The steady warm-up is MEASURED, not chosen: calls run in chunks until a
+    // whole chunk moves none of the four counters. `RCAGAP_SETTLE_MAX` bounds
+    // the search so a fixture that never settles refuses the run instead of
+    // spinning.
+    let settle_chunk = env_usize("RCAGAP_SETTLE_CHUNK", 64);
+    let settle_max = env_usize("RCAGAP_SETTLE_MAX", 8192);
+    assert!(
+        settle_chunk > 0,
+        "RCAGAP_SETTLE_CHUNK=0: a chunk of no calls can never observe a change"
+    );
 
+    // `None` is the only way to reach the settle search, so the warm regime —
+    // whose window position IS the fixed number — never takes it.
+    let fixed_warmup = match regime {
+        Regime::Warm => Some(warmup_override.unwrap_or(WARM_WARMUP)),
+        Regime::Steady => warmup_override,
+    };
+    let warmup_plan = match fixed_warmup {
+        Some(w) if regime == Regime::Warm => format!("warmup={w}"),
+        Some(w) => format!("warmup={w} (fixed)"),
+        None => format!("warmup=settle(chunk={settle_chunk},max={settle_max})"),
+    };
     println!(
-        "rca_backend_gap — per-site attribution of one WARM call\n\
+        "rca_backend_gap — per-site attribution of one {} call\n\
          backend={} profile={} case={} src={:?} n={n} threshold={JIT_ON} \
-         warmup={warmup} captures={captures} tail={tail}",
+         {warmup_plan} captures={captures} tail={tail}",
+        regime.label(),
         backend(),
         if cfg!(debug_assertions) {
             "dev"
@@ -428,16 +590,55 @@ fn main() {
     // The test's priming call, which is where the correctness assert sits.
     let expected = black_box(run_jit_persistent_f(&code, &regs, nf, JIT_ON));
 
-    let mut warm_counts: Vec<u64> = Vec::new();
-    for _ in 0..warmup {
+    // One metered, unarmed call. Both regimes' warm-ups are made of these, and
+    // both read the totals back out of `warm_counts` for the join check.
+    let metered_call = |counts: &mut Vec<u64>| {
         ALLOCS.with(|c| c.set(0));
         let got = black_box(run_jit_persistent_f(&code, &regs, nf, JIT_ON));
-        warm_counts.push(ALLOCS.with(Cell::get));
+        counts.push(ALLOCS.with(Cell::get));
         assert_eq!(
             got, expected,
             "compiled tier diverged from the priming call"
         );
-    }
+    };
+
+    let mut warm_counts: Vec<u64> = Vec::new();
+    let mut settle_note = String::new();
+    let warmup = match fixed_warmup {
+        Some(warmup) => {
+            for _ in 0..warmup {
+                metered_call(&mut warm_counts);
+            }
+            warmup
+        }
+        // The steady window is defined by what has ALREADY happened, so its
+        // warm-up is a search and not a constant: call in chunks until a whole
+        // chunk moves none of the four counters, and report the length it took
+        // rather than asserting a number chosen by hand.
+        None => loop {
+            let before = regime_counters(&jit_stats());
+            for _ in 0..settle_chunk {
+                metered_call(&mut warm_counts);
+            }
+            let (compiled, bridges, aborted, guard_fails) = regime_counters(&jit_stats());
+            if (compiled, bridges, aborted, guard_fails) == before {
+                settle_note = format!(
+                    "settled after {} calls: the last {settle_chunk} moved none of \
+                     loops_compiled/bridges_compiled/loops_aborted/guard_failures",
+                    warm_counts.len()
+                );
+                break warm_counts.len();
+            }
+            assert!(
+                warm_counts.len() < settle_max,
+                "the tier's counters were still moving after {} warm calls \
+                 (loops_compiled={compiled} bridges_compiled={bridges} loops_aborted={aborted} \
+                 guard_failures={guard_fails}): the steady regime was never reached within \
+                 RCAGAP_SETTLE_MAX={settle_max}, so there is no steady call here to attribute",
+                warm_counts.len(),
+            );
+        },
+    };
 
     let s = jit_stats();
     println!(
@@ -449,15 +650,26 @@ fn main() {
         s.guard_failures,
         s.loops_aborted,
     );
-    // The row this probe attributes is blessed as PRE-BRIDGE. If a bridge has
-    // landed by here the window is a different regime and the table below
-    // attributes a cost the baseline row does not carry.
-    assert_eq!(
-        s.bridges_compiled, 0,
-        "a guard bridge landed inside the warm-up: this is no longer the regime \
-         `regvm/jit/{}/n={n}` records",
-        case.label
-    );
+    match regime {
+        // The row this probe attributes is blessed as PRE-BRIDGE. If a bridge
+        // has landed by here the window is a different regime and the table
+        // below attributes a cost the baseline row does not carry.
+        Regime::Warm => assert_eq!(
+            s.bridges_compiled, 0,
+            "a guard bridge landed inside the warm-up: this is no longer the regime \
+             `regvm/jit/{}/n={n}` records",
+            case.label
+        ),
+        // The steady regime's invariant is over the CAPTURE WINDOW and is
+        // checked once that window has closed, so what belongs here is only
+        // where the warm-up stopped and why. A caller-supplied warm-up leaves
+        // no note; the invariant still judges where it landed.
+        Regime::Steady => {
+            if !settle_note.is_empty() {
+                println!("{settle_note}");
+            }
+        }
+    }
     println!(
         "last 8 unarmed warm calls: {:?}",
         &warm_counts[warm_counts.len().saturating_sub(8)..]
@@ -508,6 +720,51 @@ fn main() {
         tail_counts.push(ALLOCS.with(Cell::get));
     }
     println!("unarmed tail after the captures: {tail_counts:?}");
+
+    // ── The steady invariant: the window crossed no tier transition ────────
+    //
+    // `s` was read at the seam, so these deltas span every armed call and the
+    // whole unarmed tail — the same span the table below is built from.
+    if regime == Regime::Steady {
+        let after = jit_stats();
+        let window_calls = captures + tail;
+        let compiled = after.loops_compiled - s.loops_compiled;
+        let bridges = after.bridges_compiled - s.bridges_compiled;
+        let aborted = after.loops_aborted - s.loops_aborted;
+        let guard_fails = after.guard_failures - s.guard_failures;
+        let entered = after.compiled_entries - s.compiled_entries;
+        println!(
+            "steady window ({captures} armed + {tail} unarmed = {window_calls} calls): \
+             bridges_before={} compiled_in_window={compiled} bridges_in_window={bridges} \
+             aborted_in_window={aborted} guard_fails={guard_fails} entries_in_window={entered} \
+             — {}",
+            s.bridges_compiled,
+            if s.bridges_compiled == 0 {
+                "NO BRIDGE EVER COMPILED — nothing measured here is post-bridge"
+            } else {
+                "STEADY: past every bridge"
+            }
+        );
+        // The steady counterpart of the warm regime's pre-bridge assert, and
+        // just as load-bearing: a compile, a bridge, an aborted trace or a
+        // deopt inside the window puts part of a tier transition into the
+        // table, which is the one thing this regime exists to exclude.
+        assert_eq!(
+            (compiled, bridges, aborted, guard_fails),
+            (0, 0, 0, 0),
+            "(loops_compiled, bridges_compiled, loops_aborted, guard_failures) moved inside the \
+             capture window: this is no longer the regime `regvm/jit-steady/{}/n={n}` records",
+            case.label
+        );
+        // Anti-vacuity. Counters also stand still when nothing is running, and
+        // a window of calls that never entered compiled code would attribute
+        // the interpreter under a steady label.
+        assert!(
+            entered >= window_calls,
+            "{entered} compiled entries over {window_calls} calls in the window: a call did not \
+             enter compiled code, so the table below mixes the tiers"
+        );
+    }
 
     for sample in &samples {
         println!(
