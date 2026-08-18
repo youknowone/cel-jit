@@ -200,6 +200,10 @@ required-features = ["jit"]
 name = "rca111"
 required-features = ["jit"]
 
+[[example]]
+name = "rca_backend_gap"
+required-features = ["jit"]
+
 [features]
 default = ["regex", "chrono", "vm"]
 structs = []
