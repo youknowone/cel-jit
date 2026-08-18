@@ -77,37 +77,131 @@ use crate::{Context, Program, Value};
 /// many iterations. Matches the threshold the benchmarks and tests use.
 pub const DEFAULT_JIT_THRESHOLD: u32 = 8;
 
-/// Body words at which [`Tier::Auto`] hands the run to the compiled tier.
+/// Whether the compiled tier is Cranelift's rather than dynasm's — the one
+/// thing the three routing constants below have to be told, because the two
+/// backends do not compile the batch loop into the same code and do not cross
+/// the interpreter in the same place.
 ///
-/// Entering compiled code costs about the same on every call, whatever the
-/// program: the driver lookup, the program-table insert, the state republish,
-/// the per-call buffers. The plain interpreter pays none of it and instead
-/// spends per WORD. So the two cross where the interpreter's words cost what
-/// the entry costs, and that crossing is what this number is — measured, not
-/// assumed, by `tierprobe`, which times both tiers over a straight-line program
-/// and a comprehension at rising batch heights and reports where they meet.
+/// One set of numbers for both was tried and rejected by measurement:
+/// `routeprobe`'s sixteen shapes cross at a median of ~750 body words under
+/// dynasm and ~535 under Cranelift, and grading dynasm's constants against
+/// Cranelift's own sweep named the losing tier on 13 of 240 points where the
+/// 460-word threshold they replaced named it on 9. Per-backend, each names it
+/// on 5 to 7.
 ///
-/// It is stated in body words rather than in rows so that one number serves
-/// both shapes: a tall batch of a small body and a short batch of a
-/// comprehension over many elements reach it the same way.
+/// Both features on at once is not a configuration to measure from — the
+/// manifest says so where they are declared, and `majit-metainterp` picks —
+/// so Cranelift wins the tie here for the same reason.
+const CRANELIFT: bool = cfg!(feature = "jit-cranelift");
+
+/// Picoseconds the compiled tier saves for each body WORD the plain
+/// interpreter would have dispatched. See [`JIT_ENTRY_PS`] for the rule the
+/// three constants feed and for how all three were measured.
+pub const GAIN_PER_WORD_PS: i64 = if CRANELIFT { 143 } else { 137 };
+
+/// Picoseconds the compiled tier saves per ITERATION — per row of the batch,
+/// and per element a comprehension's inner loop visits — beyond what that
+/// iteration's words account for.
 ///
-/// The two shapes do not cross at exactly the same word count — `tierprobe`
-/// measures 503 and 359 words for straight-line bodies swept by height, 523 and
-/// 469 for comprehensions swept by element count — because a word inside an
-/// inner loop is not quite the same work as a word in a row body. 460 is the
-/// geometric mean of the four. Between the outermost two a batch can be held on
-/// the interpreter just past its own crossing, or handed to the compiled tier
-/// just short of it; every batch outside that band gets the tier it wants.
+/// This term is why one word threshold could not be right. Both tiers charge
+/// per iteration as well as per word, and the interpreter's per-iteration cost
+/// is the larger, so every iteration hands the compiled tier a saving that has
+/// nothing to do with how long the iteration is. A body of few words per
+/// iteration therefore breaks even at FEWER total words than a dense one, and a
+/// rule stated in words alone has nowhere to put that: `routeprobe` measures a
+/// 25-word row body crossing at 535 body words and a 59-word one at 1049, on
+/// the same box in the same run.
+pub const GAIN_PER_ITERATION_PS: i64 = if CRANELIFT { 2_888 } else { 2_622 };
+
+/// Picoseconds a call must expect to SAVE before [`Tier::Auto`] hands it to the
+/// compiled tier — the fixed cost of getting there: the driver lookup, the
+/// program-table insert, the state republish, the per-call buffers. The plain
+/// interpreter pays none of it and instead spends per word and per iteration,
+/// so the two tiers cross where the run's accumulated saving reaches this
+/// number.
 ///
-/// That the four agree inside a factor of 1.5 is what makes ONE constant the
-/// right shape of rule, and neither half of that agreement was free. Counting
-/// only the BODY's words — leaving out the row loop's own, which is all a
-/// column read costs — spread the four over 242..846 and made a batch of a
-/// column-read expression cost nothing per row however tall it was. Sweeping
-/// without a driver-pool reset between points, which both gated benches take
-/// before every bind, charged each point for the pool the sweep itself had
-/// grown and pushed the two comprehension crossings out to ~870.
-pub const AUTO_JIT_WORDS: usize = 460;
+/// # The rule
+///
+/// [`compiled_saving_ps`] estimates a run's saving from the two counts a bind
+/// already has:
+///
+/// ```text
+///   saving = body_words * GAIN_PER_WORD_PS
+///          + (rows + elems) * GAIN_PER_ITERATION_PS
+/// ```
+///
+/// and [`BoundBatch::route`] compares it against this constant. Two terms
+/// rather than one count of words, because the crossing is not at a fixed word
+/// count: it moves with the shape, and `tierprobe` measured it moving over
+/// 607..860 words across four shapes in one run. The per-iteration term is what
+/// carries that movement.
+///
+/// # How the three were measured
+///
+/// By `routeprobe`, over sixteen shapes — eight straight-line bodies swept by
+/// batch height, eight comprehensions swept by element count, 25 to 79 words
+/// per iteration. For each it finds the count at which the two tiers change
+/// hands, by interpolating between the two swept points that BRACKET the
+/// crossing, and regresses `1 / crossing` against the shape's words per
+/// iteration. That line's slope and intercept are these two rates divided by
+/// the entry, so the regression pins them as SHARES of it; the entry itself is
+/// the median over the shapes of `jit_fix - clean_fix`, both intercepts read
+/// from the smallest batches swept. Points where the probe could not evidence
+/// that the `Tier::Jit` cell entered compiled code are dropped before any of
+/// it, since such a point times the tracing interpreter rather than either tier.
+///
+/// Row words and element words were fitted separately as well as pooled, and
+/// pooled is what shipped: over four runs the two estimates of each rate
+/// overlapped, so a rule with one pair of constants per axis would have been
+/// fitting the noise between them. `routeprobe` still prints both fits, and
+/// their separating is the signal to revisit this.
+///
+/// The shipped numbers are the MEDIAN of several such runs, taken on a box
+/// under other load, which is what the spread is for. Four runs under dynasm:
+/// per-word share 0.00073..0.00107 of an entry, per-iteration share
+/// 0.0074..0.0378, entry 134..150 ns. Three under Cranelift: 0.00119..0.00172,
+/// 0.0021..0.0424, 106..110 ns. The rule is a ranking of two tiers rather than
+/// a prediction of either, so it tolerates that spread; what would not tolerate
+/// it is reading any one of the three as a cost.
+///
+/// # What invalidates them
+///
+/// They are times, so anything that changes what a tier costs: a cheaper or
+/// dearer path into compiled code (the entry), a change to the interpreter's
+/// dispatch or to what the compiled loop emits per iteration (the two rates).
+/// They are also per-PROFILE, which [`CRANELIFT`] does not cover and nothing
+/// here does: these were measured under `--release`, the build the scoreboard is
+/// read in. Do not assume they carry across profiles. The constant they replaced
+/// was 460 body words, measured under `--profile bench` with `jit-cranelift`,
+/// and re-running its own probe (`tierprobe`) under `--release` with
+/// `jit-dynasm` puts the same four crossings at 607..860 rather than the
+/// 359..523 it was set from. What does NOT invalidate them is the machine being
+/// uniformly faster or slower, since the decision depends only on the ratios
+/// among the three.
+pub const JIT_ENTRY_PS: i64 = if CRANELIFT { 107_700 } else { 142_550 };
+
+/// Picoseconds the compiled tier is expected to save on a run of `lowered` over
+/// `rows` rows carrying `elems` flattened list elements — the left-hand side of
+/// the rule documented on [`JIT_ENTRY_PS`].
+///
+/// A time, unlike [`LoweredF::body_words_for`]'s count, and therefore only ever
+/// an estimate: it is a model of two tiers fitted over sixteen shapes, not a
+/// measurement of this one. That is all a route needs, and it is why the answer
+/// is spent on a comparison rather than reported.
+///
+/// Saturating throughout because `rows` and `elems` are the caller's numbers: a
+/// batch that claims more of either than a saving can be counted in should route
+/// to the compiled tier, which is what a saturated positive does.
+pub fn compiled_saving_ps(lowered: &LoweredF, rows: usize, elems: usize) -> i64 {
+    let count = |n: usize| i64::try_from(n).unwrap_or(i64::MAX);
+    count(lowered.body_words_for(rows, elems))
+        .saturating_mul(GAIN_PER_WORD_PS)
+        .saturating_add(
+            count(rows)
+                .saturating_add(count(elems))
+                .saturating_mul(GAIN_PER_ITERATION_PS),
+        )
+}
 
 /// Why a batch could not be answered. Every variant means the same thing to a
 /// caller — evaluate this expression with [`crate::Program::execute`] instead —
@@ -451,6 +545,7 @@ impl BatchProgram {
             program: self,
             reduce,
             body_words: self.lowered.body_words_for(batch.rows, elems),
+            compiled_saving_ps: compiled_saving_ps(&self.lowered, batch.rows, elems),
             projected: reduce == BatchReduce::PerRow && self.lowered.is_row_projection(),
             run: std::cell::RefCell::new(run),
             _derived: derived,
@@ -725,9 +820,19 @@ pub struct BoundBatch<'a, 'b> {
     run: std::cell::RefCell<BatchRun<'a>>,
     /// Body words one run over this batch executes, from
     /// [`LoweredF::body_words_for`] with the batch's own row and element
-    /// counts. Counted at bind, where both are known, so [`Tier::Auto`] costs a
-    /// comparison per call rather than a walk.
+    /// counts. Counted at bind, where both are known.
+    ///
+    /// A SIZE, and no longer what the route compares — [`Tier::Auto`] asks
+    /// [`compiled_saving_ps`] instead, which spends the same two counts through
+    /// two rates rather than one. Kept because it is what a caller reading the
+    /// scoreboard's `words` column is reading, and because the size is the one
+    /// number here that is the same on every tier.
     body_words: usize,
+    /// Picoseconds the compiled tier is expected to save on one run over this
+    /// batch, from [`compiled_saving_ps`] with the batch's own row and element
+    /// counts. Evaluated at bind, where both are known, so [`Tier::Auto`] costs
+    /// one comparison per call rather than two multiplies and a walk.
+    compiled_saving_ps: i64,
     /// Whether this run is a projection the clean tier answers as a column
     /// copy. Decided at bind, where the reduction and the program are both
     /// known, so [`BoundBatch::route`] stays a comparison.
@@ -738,31 +843,38 @@ pub struct BoundBatch<'a, 'b> {
 }
 
 impl BoundBatch<'_, '_> {
-    /// Body words one run over this batch executes — what
-    /// [`BoundBatch::route`] compares against [`AUTO_JIT_WORDS`].
+    /// Body words one run over this batch executes — a size, the same count on
+    /// every tier, which is what makes it comparable across them.
     pub fn body_words(&self) -> usize {
         self.body_words
     }
 
+    /// Picoseconds the compiled tier is expected to save on one run over this
+    /// batch — what [`BoundBatch::route`] compares against [`JIT_ENTRY_PS`].
+    pub fn compiled_saving_ps(&self) -> i64 {
+        self.compiled_saving_ps
+    }
+
     /// Which tier [`Tier::Auto`] resolves to for this batch: [`Tier::Jit`] once
-    /// the run has at least [`AUTO_JIT_WORDS`] body words to execute, and
-    /// [`Tier::Clean`] below that. Any other tier is returned unchanged.
+    /// the run is expected to save at least [`JIT_ENTRY_PS`] by being compiled,
+    /// and [`Tier::Clean`] below that. Any other tier is returned unchanged.
     ///
     /// The compiled tier buys a cheaper body and charges a fixed cost to reach
-    /// it, so which one wins is a question about how much body there is to run.
-    /// A batch answers it with two numbers it already has: how many rows, and
-    /// how many list elements those rows carry.
+    /// it, so which one wins is a question about how much the body is worth. A
+    /// batch answers it with two numbers it already has — how many rows, and how
+    /// many list elements those rows carry — spent at bind through the rates on
+    /// [`JIT_ENTRY_PS`], which leaves this a comparison.
     pub fn route(&self, tier: Tier) -> Tier {
         match tier {
-            // A projection is the one shape with no crossing to find: its clean
-            // tier copies the column rather than running the loop, so more rows
-            // buy the compiled tier nothing to be cheaper at. Measured on a
-            // 10 000-row `x`, the clean tier answers in 643 ns and the compiled
-            // one in 10 965 ns — the body-word rule below would route this to
-            // the slower tier by a factor of seventeen, and it grows with the
-            // batch.
+            // A projection is the one shape the estimate cannot speak for: its
+            // clean tier copies the column rather than running the loop it was
+            // fitted on, so more rows buy the compiled tier nothing to be
+            // cheaper at. Measured on a 10 000-row `x`, the clean tier answers
+            // in 643 ns and the compiled one in 10 965 ns — the estimate below
+            // would route this to the slower tier by a factor of seventeen, and
+            // it grows with the batch.
             Tier::Auto if self.projected => Tier::Clean,
-            Tier::Auto if self.body_words >= AUTO_JIT_WORDS => Tier::Jit,
+            Tier::Auto if self.compiled_saving_ps >= JIT_ENTRY_PS => Tier::Jit,
             Tier::Auto => Tier::Clean,
             explicit => explicit,
         }
@@ -1636,8 +1748,8 @@ mod tests {
 
         let bound = projection.bind_per_row(&batch).unwrap();
         assert!(
-            bound.body_words() >= AUTO_JIT_WORDS,
-            "the batch is tall enough for the word rule to fire"
+            bound.compiled_saving_ps() >= JIT_ENTRY_PS,
+            "the batch is tall enough for the estimate to fire"
         );
         assert_eq!(bound.route(Tier::Auto), Tier::Clean);
 
@@ -1668,15 +1780,16 @@ mod tests {
         }
     }
 
-    /// What the route is FOR: a one-row straight-line expression has tens of
-    /// body words and stays on the interpreter, while the same expression over
-    /// a tall batch, and a comprehension over a long list, cross
-    /// [`AUTO_JIT_WORDS`] and are handed to the compiled tier.
+    /// What the route is FOR: a one-row straight-line expression saves too
+    /// little by being compiled to pay for reaching compiled code and stays on
+    /// the interpreter, while the same expression over a tall batch, and a
+    /// comprehension over a long list, save more than [`JIT_ENTRY_PS`] and are
+    /// handed to the compiled tier.
     ///
     /// Pinned as a routing DECISION rather than as a time, because a time is
     /// what the machine happens to cost today and the decision is the contract.
     #[test]
-    fn the_route_follows_how_much_body_a_run_has_to_execute() {
+    fn the_route_follows_what_a_run_saves_by_being_compiled() {
         let s = schema(&[("x", ValType::Int)]);
         let program = BatchProgram::compile("x * 2 + 1", &s).unwrap();
         let lowered = program.lowered();
@@ -1688,13 +1801,13 @@ mod tests {
         let one = vec![7i64];
         let batch = Batch::new(1).column("x", ColumnRef::Int(&one));
         let bound = program.bind_per_row(&batch).unwrap();
-        assert!(bound.body_words() < AUTO_JIT_WORDS);
+        assert!(bound.compiled_saving_ps() < JIT_ENTRY_PS);
         assert_eq!(bound.route(Tier::Auto), Tier::Clean);
 
         let tall: Vec<i64> = (0..1_000).collect();
         let batch = Batch::new(tall.len()).column("x", ColumnRef::Int(&tall));
         let bound = program.bind_per_row(&batch).unwrap();
-        assert!(bound.body_words() >= AUTO_JIT_WORDS);
+        assert!(bound.compiled_saving_ps() >= JIT_ENTRY_PS);
         assert_eq!(bound.route(Tier::Auto), Tier::Jit);
 
         // One row, but the row's own list is what the body iterates.
@@ -1711,8 +1824,122 @@ mod tests {
             },
         );
         let bound = program.bind_per_row(&batch).unwrap();
-        assert!(bound.body_words() >= AUTO_JIT_WORDS);
+        assert!(bound.compiled_saving_ps() >= JIT_ENTRY_PS);
         assert_eq!(bound.route(Tier::Auto), Tier::Jit);
+    }
+
+    /// The smallest count at which `route_at` hands the run to the compiled
+    /// tier — a shape's crossing, as the live constants place it.
+    ///
+    /// Scanned rather than computed, so the tests that use it pin what the rule
+    /// DOES and re-derive nothing about how it is spelled.
+    fn crossing(mut route_at: impl FnMut(usize) -> Tier, limit: usize) -> usize {
+        (1..=limit)
+            .find(|&n| route_at(n) == Tier::Jit)
+            .expect("the shape crosses within the limit")
+    }
+
+    /// The inversion a threshold in body words cannot express, and the reason
+    /// the route is no longer one: a run of NO MORE words is handed to the
+    /// compiled tier while a larger one stays on the interpreter.
+    ///
+    /// What separates them is how those words are spread. `x + 1` spends 25
+    /// words on a row and the six-product body spends 79, and each row costs the
+    /// interpreter something beyond its words that the compiled tier does not
+    /// pay — so the thin body's rows are worth relatively more to compile, and
+    /// it breaks even after fewer of its own words have gone by.
+    ///
+    /// No word count can name this pair the right way round: one at or below the
+    /// thin run's size compiles both, one above the dense run's size compiles
+    /// neither, and there is nothing in between. That is the whole claim, and it
+    /// is made against whatever the constants happen to be — each shape's
+    /// crossing is scanned for, not assumed, so this stays true across backends
+    /// and survives a re-measurement that moves the level.
+    #[test]
+    fn a_thin_row_body_is_compiled_where_a_larger_dense_one_is_not() {
+        let s = schema(&[("x", ValType::Int), ("y", ValType::Int)]);
+        let thin = BatchProgram::compile("x + 1", &s).unwrap();
+        let dense = BatchProgram::compile("x*2 + x*3 + y*4 + y*5 + x*6 + y*7", &s).unwrap();
+        assert!(
+            thin.lowered().row_words < dense.lowered().row_words,
+            "the shapes are named for their words per row"
+        );
+
+        let at = |program: &BatchProgram, rows: usize| {
+            let col: Vec<i64> = (0..rows as i64).collect();
+            let batch = Batch::new(rows)
+                .column("x", ColumnRef::Int(&col))
+                .column("y", ColumnRef::Int(&col));
+            let bound = program.bind_per_row(&batch).unwrap();
+            (bound.route(Tier::Auto), bound.body_words())
+        };
+
+        // Each shape at its own crossing, and the dense one one row below its.
+        let thin_rows = crossing(|n| at(&thin, n).0, 512);
+        let dense_rows = crossing(|n| at(&dense, n).0, 512);
+        assert!(dense_rows > 1, "the dense shape crosses above one row");
+        let (thin_route, thin_words) = at(&thin, thin_rows);
+        let (dense_route, dense_words) = at(&dense, dense_rows - 1);
+
+        assert_eq!(thin_route, Tier::Jit, "{thin_rows} thin rows are compiled");
+        assert_eq!(
+            dense_route,
+            Tier::Clean,
+            "{} dense rows are not",
+            dense_rows - 1
+        );
+        assert!(
+            thin_words <= dense_words,
+            "and the compiled run is the smaller: {thin_words} words compiled, \
+             {dense_words} not"
+        );
+    }
+
+    /// The same inversion on the element loop: two comprehensions, and the one
+    /// whose inner body is thinner is compiled at no more total words than the
+    /// denser one is left on the interpreter with.
+    ///
+    /// Pinned separately from the row loop because the two counts reach the rule
+    /// by different routes — one is `rows`, the other is the batch's flattened
+    /// element count — and a rule that lost the element half would still pass
+    /// the test above.
+    #[test]
+    fn a_thin_element_body_is_compiled_where_a_larger_dense_one_is_not() {
+        let s = schema(&[("list", ValType::Int), ("list[]", ValType::Int)]);
+        let thin = BatchProgram::compile("list.map(e, e + 1)", &s).unwrap();
+        let dense = BatchProgram::compile("list.map(e, (e + 1) * (e + 2) + e * 3)", &s).unwrap();
+        assert!(
+            thin.lowered().elem_words < dense.lowered().elem_words,
+            "the shapes are named for their words per element"
+        );
+
+        let at = |program: &BatchProgram, elems: usize| {
+            let lens = vec![elems as i64];
+            let flat: Vec<i64> = (0..elems as i64).collect();
+            let batch = Batch::new(1).column(
+                "list",
+                ColumnRef::List {
+                    lens: &lens,
+                    fields: vec![(None, ColumnRef::Int(&flat))],
+                },
+            );
+            let bound = program.bind_per_row(&batch).unwrap();
+            (bound.route(Tier::Auto), bound.body_words())
+        };
+
+        let thin_elems = crossing(|n| at(&thin, n).0, 512);
+        let dense_elems = crossing(|n| at(&dense, n).0, 512);
+        assert!(dense_elems > 1, "the dense shape crosses above one element");
+        let (thin_route, thin_words) = at(&thin, thin_elems);
+        let (dense_route, dense_words) = at(&dense, dense_elems - 1);
+
+        assert_eq!(thin_route, Tier::Jit);
+        assert_eq!(dense_route, Tier::Clean);
+        assert!(
+            thin_words <= dense_words,
+            "the compiled run is the smaller: {thin_words} words compiled, \
+             {dense_words} not"
+        );
     }
 
     /// Naming a tier still gets that tier. The route is the DEFAULT door's

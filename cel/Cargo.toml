@@ -108,6 +108,10 @@ name = "tierprobe"
 required-features = ["jit"]
 
 [[example]]
+name = "routeprobe"
+required-features = ["jit"]
+
+[[example]]
 name = "varprobe"
 required-features = ["jit"]
 

@@ -1,23 +1,28 @@
-//! Where the compiled tier starts to beat the plain interpreter, measured in
-//! the unit [`cel::majit::batch::AUTO_JIT_WORDS`] is stated in.
+//! Where the compiled tier starts to beat the plain interpreter, per shape, in
+//! body words.
 //!
-//! [`cel::majit::batch::Tier::Auto`] has one number to set, and setting it by
-//! argument is how a routing rule becomes a rule about the cases someone
-//! happened to look at. This probe sets it by measurement instead: it times the
+//! [`cel::majit::batch::Tier::Auto`] has to decide that without measuring, and
+//! deciding it by argument is how a routing rule becomes a rule about the cases
+//! someone happened to look at. This probe measures it instead: it times the
 //! SAME bound batch on `Tier::Clean` and on `Tier::Jit`, sweeping the batch
 //! until the two cross, and reports the crossing in body words — the count
-//! `BoundBatch::body_words` returns, which is what the route compares.
+//! `BoundBatch::body_words` returns.
 //!
-//! Two shapes are swept, because the route has to serve both with one number:
+//! Two shapes are swept, because the route has to serve both:
 //!
 //! * a straight-line program over a rising number of ROWS, where the body's
 //!   words come from re-running a small body per row, and
 //! * a comprehension over a rising number of ELEMENTS at one row, where they
 //!   come from one row's inner loop.
 //!
-//! If the two shapes cross at similar word counts, one constant is the right
-//! shape of rule. If they cross at very different ones, it is not, and this
-//! probe is where that would show.
+//! If the two shapes cross at similar word counts, one word threshold is the
+//! right shape of rule. If they cross at very different ones, it is not — and
+//! that is what this probe found, four crossings spread over 359..523 words,
+//! which is why the route is now the two-term estimate on
+//! [`cel::majit::batch::JIT_ENTRY_PS`] and `routeprobe` is what measures its
+//! constants. This file stays as the independent check on that rule: the
+//! `route` column is what the live rule decides at each point, beside the tier
+//! that actually won it.
 //!
 //! RELEASE ONLY, under the same profile the scoreboard uses:
 //!
@@ -31,7 +36,7 @@ use std::time::{Duration, Instant};
 
 use std::sync::atomic::Ordering;
 
-use cel::majit::batch::{Batch, BatchProgram, BoundBatch, ColumnRef, Tier, AUTO_JIT_WORDS};
+use cel::majit::batch::{Batch, BatchProgram, BoundBatch, ColumnRef, Tier};
 use cel::majit::bytecode::float_bank::{reset_persistent_state, COMPILED_ENTRIES};
 use cel::majit::lower::{Schema, ValType};
 
@@ -99,6 +104,9 @@ struct Point {
     jit: f64,
     /// Calls per call that entered compiled code, over the probe.
     entries: f64,
+    /// What the live route picks for this batch — the rule under test, not a
+    /// re-derivation of it.
+    route: Tier,
 }
 
 impl Point {
@@ -119,6 +127,7 @@ fn measure(bound: &BoundBatch<'_, '_>, n: usize) -> Point {
         clean,
         jit,
         entries,
+        route: bound.route(Tier::Auto),
     }
 }
 
@@ -145,21 +154,35 @@ fn report(title: &str, sweep: &str, points: &[Point]) {
     println!("\n{title}");
     println!("  sweeping {sweep}");
     println!(
-        "  {:>8} {:>10} {:>12} {:>12} {:>11} {:>10}",
-        "n", "words", "clean ns", "jit ns", "enter/call", "winner"
+        "  {:>8} {:>10} {:>12} {:>12} {:>11} {:>11} {:>7} {:>4}",
+        "n", "words", "clean ns", "jit ns", "enter/call", "winner", "route", "ok"
     );
     for p in points {
+        let winner = match (p.entered(), p.jit < p.clean) {
+            (false, _) => "not entered",
+            (true, true) => "jit",
+            (true, false) => "clean",
+        };
+        let route = match p.route {
+            Tier::Jit => "jit",
+            Tier::Clean => "clean",
+            other => panic!("the route resolved Auto to {other:?}"),
+        };
         println!(
-            "  {:>8} {:>10} {:>12.1} {:>12.1} {:>11.2} {:>10}",
+            "  {:>8} {:>10} {:>12.1} {:>12.1} {:>11.2} {:>11} {:>7} {:>4}",
             p.n,
             p.words,
             p.clean,
             p.jit,
             p.entries,
-            match (p.entered(), p.jit < p.clean) {
-                (false, _) => "not entered",
-                (true, true) => "jit",
-                (true, false) => "clean",
+            winner,
+            route,
+            if !p.entered() {
+                "-"
+            } else if winner == route {
+                "y"
+            } else {
+                "NO"
             }
         );
     }
@@ -215,7 +238,9 @@ fn comprehension(source: &str, elems: &[usize]) -> Vec<Point> {
 
 fn main() {
     println!("where Tier::Auto should hand over, in body words");
-    println!("AUTO_JIT_WORDS is currently {AUTO_JIT_WORDS}");
+    println!(
+        "`route` is what `Tier::Auto` picks today; `ok` is whether that is the tier that won."
+    );
     println!(
         "best of {ROUNDS} batches of >= {} ms per point, both tiers on ONE bound batch.",
         MIN_BATCH.as_millis()

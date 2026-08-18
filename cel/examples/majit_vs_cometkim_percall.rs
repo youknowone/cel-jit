@@ -478,11 +478,14 @@ struct Compiled {
     /// tier gets, and the only column here that is about the library's own
     /// choice rather than about a tier.
     auto: f64,
-    /// Which tier `Tier::Auto` resolved to, and the body-word count it decided
-    /// on. A `clean` route beside a `majit` cell slower than the `clean` one is
-    /// the route working; the reverse would be the route mis-set.
+    /// Which tier `Tier::Auto` resolved to, the body-word count of the run, and
+    /// the saving the route actually decided on — `compiled_saving_ps` in
+    /// nanoseconds, against an entry of `JIT_ENTRY_PS`. A `clean` route beside a
+    /// `majit` cell slower than the `clean` one is the route working; the
+    /// reverse would be the route mis-set.
     route: Tier,
     words: usize,
+    saving: f64,
     raw: f64,
     bind: f64,
     compiles: usize,
@@ -751,6 +754,7 @@ fn run_case(case: &Case) -> Row {
             auto,
             route: bound.route(Tier::Auto),
             words: bound.body_words(),
+            saving: bound.compiled_saving_ps() as f64 / 1000.0,
             majit,
             raw,
             bind,
@@ -1370,7 +1374,7 @@ fn main() {
         MIN_BATCH.as_millis()
     );
     println!(
-        "{:<28} {:>11} {:>11} {:>11} {:>10} {:>7} {:>9} {:>11} {:>11} {:>11} {:>11} {:>12} {:>10} {:>10} {:>9} {:>12} {:>12} {:>13}",
+        "{:<28} {:>11} {:>11} {:>11} {:>10} {:>7} {:>9} {:>9} {:>11} {:>11} {:>11} {:>11} {:>12} {:>10} {:>10} {:>9} {:>12} {:>12} {:>13}",
         "case",
         "stock ns",
         "clean ns",
@@ -1378,6 +1382,7 @@ fn main() {
         "auto ns",
         "route",
         "words",
+        "save ns",
         "auto/stock",
         "enter/call",
         "jit/row ns",
@@ -1426,7 +1431,7 @@ fn main() {
                     ("not entered".to_string(), "-".to_string())
                 };
                 println!(
-                    "{:<28} {:>11.1} {:>11.1} {:>11} {:>10.1} {:>7} {:>9} {:>11} {:>11.2} {:>11} {:>11} {:>12} {:>10.1} {:>10.1} {:>9} {:>12.2} {:>12.2} {:>13.2}",
+                    "{:<28} {:>11.1} {:>11.1} {:>11} {:>10.1} {:>7} {:>9} {:>9.0} {:>11} {:>11.2} {:>11} {:>11} {:>12} {:>10.1} {:>10.1} {:>9} {:>12.2} {:>12.2} {:>13.2}",
                     r.label,
                     r.stock,
                     c.clean,
@@ -1438,6 +1443,7 @@ fn main() {
                         other => panic!("auto resolved to {other:?}"),
                     },
                     c.words,
+                    c.saving,
                     format!("{:.2}x", r.stock / c.auto),
                     c.entries,
                     opt(c.jit_row),
@@ -1514,10 +1520,13 @@ fn main() {
     );
     println!(
         "\n`auto ns` is the DEFAULT door, `collect()`, which names no tier: the bound batch\n\
-         picks between `clean` and `majit` by `words` — the body words one run executes,\n\
-         rows times the straight-line body plus elements times the inner loop's. Below\n\
-         `AUTO_JIT_WORDS` the run has less body to execute than reaching compiled code\n\
-         costs, so it stays on the plain VM. `route` says which side of that each case\n\
+         picks between `clean` and `majit` by `save ns` — how much the compiled tier is\n\
+         ESTIMATED to save on this run: rows times a per-row rate plus elements times a\n\
+         per-element one, each rate set by that loop's word count less a fixed per-unit\n\
+         cost a word count cannot see. Below `JIT_ENTRY_PS` the run does not save what\n\
+         reaching compiled code costs, so it stays on the plain VM. `words` is the same\n\
+         run's size on either tier, printed beside it because the two were once one\n\
+         decision. `route` says which side of that each case\n\
          landed, and `auto ns` should track whichever of the two columns to its left the\n\
          route named. `majit ns` beside it is still the compiled tier ASKED FOR outright,\n\
          which is what every tier-explicit test and every column of this table below\n\
