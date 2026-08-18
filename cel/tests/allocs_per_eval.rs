@@ -1481,7 +1481,17 @@ const BASELINE_HEADER: &str = "\
 #       that file's first bless), and exactly one commit in it touches the
 #       module these rows measure: `991e26e`, \"convert run_mainloop_f to the
 #       single-executor merge point\" (`cel/src/majit/bytecode.rs`, inside `pub
-#       mod float_bank`). A candidate, not a claim: nothing measured it.
+#       mod float_bank`). MEASURED 2026-08-18, and RULED OUT as a clean
+#       -4: in clean clones of both endpoints -- where no
+#       `.cargo/config.toml` redirects the crates, so the manifest pins
+#       apply -- the six rows move +11923 (float +11922), not -4. The
+#       reading cannot attribute anything either way: `991e26e` also
+#       bumps the majit pin `2c86af5168`->`eba36d13ed`, across which 82
+#       majit files differ, among them the `virtualstate.rs` emitting the
+#       `InvalidLoop` abort that leaves that endpoint compiling nothing.
+#       And `991e26e^` itself reads 66/66/68 + 66/66/68 with \"NO BRIDGE
+#       EVER COMPILED\", reproducing neither baseline, so no difference
+#       taken there can be differenced against 65/65/67 or 24/24/26.
 #
 #   So this file is stale across TWO epochs and was re-blessed through neither.
 #   It is also 12 rows SHORT -- `regvm/clean-banked/*` (`45ee63b`) and
@@ -1513,10 +1523,16 @@ const BASELINE_HEADER: &str = "\
 #   other configuration already records -- but it rewrites the reference every
 #   later measurement is read against, so take it deliberately, not in passing.
 #
-#   WHAT IS STILL NOT PROVEN. That `991e26e` is the -4: nobody measured it, and
-#   `.cargo/config.toml` points the majit crates at the enclosing worktree, so
-#   a rebuild at that commit today is not the tree that produced the 08-08
-#   figure. That upstream moved these rows by ZERO: the VM leg reads 0 drifted
+#   WHAT IS STILL NOT PROVEN. That `991e26e` is the -4 -- and it is now
+#   unprovable by rebuild, not merely unproven. `.cargo/config.toml` points
+#   the majit crates at the enclosing worktree, and every bless under
+#   investigation was taken locally through that redirect, so the tree those
+#   figures were produced on is a worktree STATE that no longer exists. A
+#   clean clone is the only rebuild that pins anything, and it measured a
+#   different regime at both endpoints (above). No instrument that survives
+#   reaches the +4; it is closed as unattributable, not as explained.
+#
+#   That upstream moved these rows by ZERO: the VM leg reads 0 drifted
 #   under the gate on both backends AFTER the 2026-08-18 09:35 rebase, so its
 #   endpoints agree at 52/1 across it, but the only walker-
 #   configuration readings are 08-08 and 08-18, nothing was observed between
