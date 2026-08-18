@@ -105,6 +105,127 @@
 #   evidence that the gap is not bridge-related -- and a reader who remembers
 #   it needs to know it was retired by a fix, not by a re-measurement.
 #
+#   ⛔ AND THE GAP ITSELF IS NOW ZERO: this whole block is retired, by a
+#   re-measurement rather than by a fix. Re-measured 2026-08-18 on
+#   aarch64-macos, release, both legs of one tree: all three
+#   `regvm/jit/*/n=1000` rows read 52.000 on BOTH backends, and the two 82-row
+#   reports are byte-identical -- a `diff` of them returns nothing, on every row
+#   of the corpus and not only the `regvm/*` ones. So 65/65/67 against 63/63/65,
+#   the two-allocation difference, the 3 -> 2 sub-block and the four #116
+#   bullets that bounded the search for those two allocations all describe a
+#   quantity that no longer exists.
+#
+#   It is kept rather than deleted because it is the recorded reason the BACKEND
+#   is not in this file's name: a reader who remembers that argument needs to
+#   know the finding under it was retired by a re-measurement that names no
+#   cause. The key is unchanged, and there is currently no disagreement for it
+#   to hide.
+#
+#   A second instrument agrees, on a different call sequence and no `bench`
+#   harness. `cel/examples/rca_backend_gap.rs` captures a backtrace per
+#   allocation of ONE warm call and reports 52 allocations over 45 sites on each
+#   leg. Differencing the two per-site tables leaves exactly ONE row, count 1 on
+#   both sides -- cranelift `size=224` in `run_compiled_code_inner`
+#   (majit-backend-cranelift/src/compiler.rs:7849), dynasm `size=320` in
+#   `alloc_off_gc_jitframe` (majit-backend/src/jitframe.rs:230). That is one
+#   jitframe per compiled entry on each leg and nothing else the other does not
+#   have, and `stacks passing through: backend-cranelift=1 | backend-dynasm=1`
+#   against `metainterp=52` puts the remaining 51 above the backend split, where
+#   they cannot differ by backend at all.
+#
+#   ⚠ THAT EQUALITY IS ARM-DEPENDENT, and the arm was shown rather than
+#   assumed. `run_compiled_code_inner` branches on
+#   `cranelift_jitframe_type_id()` at compiler.rs:7827; the
+#   `use_gc_alloc == false` arm runs :7842-:7859 and allocates
+#   `vec![0i64; HEADER_WORDS + jf_total]` at :7849, and the captured cranelift
+#   frame IS that allocation. Where the GC type registry answers instead, that
+#   frame is nursery-allocated and invisible to a global-allocator counter, and
+#   cranelift would read one fewer than dynasm.
+#
+# ⛔ SEVEN ROWS BELOW ARE STALE-LOOSE BY 13 TO 25, AND NOTHING WAS BLESSED. The
+#   2026-08-18 run named above prints 82 rows and compares 70 of them against
+#   this file. Seven drifted, all downward, by the same amount on each backend:
+#
+#     regvm/jit/arith/n=1000           52.000   recorded 65.000   -13.000
+#     regvm/jit-steady/arith/n=1000     1.000   recorded 24.000   -23.000
+#     regvm/jit/policy/n=1000          52.000   recorded 65.000   -13.000
+#     regvm/jit-steady/policy/n=1000    1.000   recorded 24.000   -23.000
+#     regvm/jit/float/n=1               1.000   recorded  2.000    -1.000
+#     regvm/jit/float/n=1000           52.000   recorded 67.000   -15.000
+#     regvm/jit-steady/float/n=1000     1.000   recorded 26.000   -25.000
+#
+#   The REGIME of each row is unchanged, so these are not rows that started
+#   measuring something else. The `regvm/jit/*/n=1000` rows still report
+#   `compiled=0 bridges=0 aborted=0 guard_fails=88` over 88 calls -- one guard
+#   failure per call, exactly as this header records -- and what fell is the
+#   COST of that call, not the number of them. The `regvm/jit-steady/*/n=1000`
+#   rows still report `bridges_before=1 in_window=0 compiled_in_window=0
+#   guard_fails=0 -- STEADY: past every bridge`, and in that regime, with no
+#   guard failure and no compile in the window, a call now costs ONE allocation.
+#
+#   ⚠ A REFERENCE 13 ALLOCATIONS LOOSE CANNOT CATCH A 13-ALLOCATION REGRESSION.
+#   Until these rows are re-blessed, `CEL_ALLOCS_GATE=1` in this configuration
+#   passes anything that costs its way back up to the recorded figure, and the
+#   `Δ` column reports a constant -13 that says nothing about the change being
+#   measured. That is a reason to know the file is loose, not a step to take in
+#   passing: a bless rewrites the reference every later measurement is read
+#   against, and no bless was taken here.
+#
+#   ⛔ WHAT MOVED THESE ROWS IS NOT ATTRIBUTED. The window is recorded so that a
+#   bisect has a start; no commit in it is named as the cause.
+#
+#   Its start is exact, and the two readings either side of it are the SAME
+#   quantity. `f84e21f` (2026-08-18 01:38, "allocs_per_eval: close the
+#   compiled-entry finding by removal") records `rows=82 unstable=0 drifted=0`
+#   on the dynasm leg against this file and states that the cranelift leg did
+#   not move -- so both legs read 0 drifted rows then, and both read 7 now. The
+#   two phrasings are one counter and not two: this test prints `drifted.len()`
+#   twice, once as `rows={} unstable={} drifted={}` and once as "N of N
+#   baseline rows compared ... N drifted", and that note quotes the first while
+#   the 2026-08-18 run printed the second.
+#
+#   So the drop is later than 01:38. cel-jit itself has no commit in the window.
+#   `.cargo/config.toml` patches the majit crates to `../majit`, which puts the
+#   ENCLOSING worktree in the window as well, and it was rebased there
+#   (2026-08-18 09:35) from `81e8a2d07ba` onto `1348b0a1edc`, picking up exactly
+#   seven commits:
+#
+#     1348b0a1edc  jit: run the collected postprocess callbacks when a later
+#                  pass removes the op (#1307)
+#     fe221caf12b  jit: record the implicit __context__ for a raise the trace
+#                  catches itself (#1300)
+#     6cac2a9088b  majit: stop inheriting a previous compile's target tokens
+#                  (#1287)
+#     416e434a0dc  tests: move eval.rs's Python-semantics cases to a CI-gated
+#                  snippet subset (#1282)
+#     629e8e355a5  jit(cranelift): test the JITFRAME write-barrier flag inline
+#                  before calling the helper (#1306)
+#     79c174f677c  generator: make delegated close() lookup errors unraisable
+#                  (#1302)
+#     45ae12a6922  majit: route both raw-hash cell readers through lookup_chain
+#                  (#1293)
+#
+#   Two of the seven are excluded by the measurement rather than by reading
+#   them: the drop is identical on both backends, which rules out the
+#   cranelift-only `629e8e355a5`, and `416e434a0dc` changes tests only. The
+#   remaining four are not separated here, and none of them is claimed. As with
+#   the shas at the top of this header, the PR number is the durable citation
+#   and the sha is a dated annotation.
+#
+#   ⛔⛔ THE WINDOW IS NOT THOSE SEVEN COMMITS. It is:
+#
+#     the seven upstream commits `81e8a2d07ba..1348b0a1edc`, PLUS any
+#     uncommitted majit edit that was present in the shared enclosing worktree
+#     at 01:38 and is not present now.
+#
+#   THE SECOND TERM IS UNBOUNDED AND WAS NOT OBSERVED EITHER WAY. Several
+#   agents write into that worktree and `.cargo/config.toml` builds the majit
+#   crates straight out of it, so an uncommitted edit standing there at 01:38
+#   was IN the binary that produced the 01:38 reading. The tree is clean now,
+#   which says nothing about what was in it then. A bisect that walks the seven
+#   commits and finds nothing has not exhausted the window; it has exhausted
+#   the term that happens to be enumerable.
+#
 # ⚠ THESE ROWS STILL SAMPLE A PRE-BRIDGE WINDOW, but the cliff they used to
 #   warn about is GONE. The `regvm/jit/*` window covers calls 65..89 and the
 #   first guard bridge lands at call 200, so the figures below remain the
@@ -129,6 +250,11 @@
 #   the 349x figure from this file's history: it describes a defect that has
 #   been fixed, and the three `jit-steady` rows that carried it are the three
 #   largest deltas in the bless that retired it (-22954, -22954, -42).
+#
+#   ⛔ THAT THREE-ROW TABLE IS ITSELF SUPERSEDED. On 2026-08-18 both legs read
+#   1.000 on all three `regvm/jit-steady/*/n=1000` rows -- see the stale-loose
+#   list above. What survives is the shape of the claim, that the steady rows
+#   sit BELOW the warm ones; 24/24/26 and 22/22/24 do not.
 #
 # Format: <label> TAB <allocations per evaluation>
 #! profile = release
