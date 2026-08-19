@@ -360,9 +360,16 @@ pub fn publish_cel_descrs(ids: &CelTypeIds) {
             .iter()
             .enumerate()
             .map(|(index_in_parent, field)| SimpleFieldDescrSpec {
-                // cel's `CelObject` header is `ob_type` only — it has no class
-                // word, so this layout declares none.
-                is_class_word: false,
+                // `Some(false)` DECLARES that this field is not the class
+                // word; it does not decline to answer. cel's `CelObject` header
+                // is `ob_type` alone, and this code is reading the layout, so it
+                // can say so outright. `None` would hand the answer to the
+                // fallback that infers it from the display name built three
+                // lines below — and that name is `"{simple_name}.{field}"`, so a
+                // field ever spelled `w_class` would be inferred TRUE. cel spells
+                // its type-carrying fields `w_type` today, which is naming luck
+                // and not a property a declaration has to depend on.
+                is_class_word: Some(false),
                 index: index_in_parent as u32,
                 field_key: field.name.to_string(),
                 name: format!("{simple_name}.{}", field.name),
