@@ -587,6 +587,20 @@ expr: empty.all(x, 1 / 0 == 1)
 feat: macro_all arith_div_zero error variable
 want: bool(true)
 
+# Zero iterations through the APPENDING lowering, which is a different loop
+# from the one `empty.all` above exercises. It is the boundary where the guard
+# decides before the counter has ever been advanced and before any element has
+# been read, so a loop that advanced or indexed one time too many would answer
+# here rather than anywhere else in this section.
+
+expr: empty.map(x, x * 2)
+feat: macro_map variable
+want: list[]
+
+expr: empty.filter(x, x > 0)
+feat: macro_filter variable
+want: list[]
+
 # A comprehension whose range is a map iterates its KEYS. The order is the
 # map's iteration order, which is unspecified — `m.map(k, k)` is deliberately
 # NOT pinned here, because the two evaluators build their maps separately and

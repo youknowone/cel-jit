@@ -204,8 +204,12 @@ pub enum OpCode {
     /// between them the two accounted for four atomic refcount operations per
     /// element, on one shared count.
     ///
-    /// The index is produced by the compiler's own counter, so it is in range
-    /// by construction rather than by a check.
+    /// The compiler emits no bounds test of its own, because the loop guard
+    /// immediately above this instruction has already compared the index
+    /// against the length. The arm still checks: an instruction stream is
+    /// public data, and the buffer underneath is indexed directly. What the
+    /// arm does not do is reach the element through the general indexing path,
+    /// which would decide the container's kind and the key's kind first.
     IterAt,
 
     // -- control flow -----------------------------------------------------

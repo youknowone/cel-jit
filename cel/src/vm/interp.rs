@@ -789,15 +789,42 @@ impl<'a> Vm<'a> {
                 self.push(Value::Int(len));
             }
             OpCode::IterAt => {
-                // Read in place, as `IterLen` does. The borrows end with the
-                // block, so the error path below can still park on `self`.
+                // Read in place, as `IterLen` does, and indexed as a list
+                // rather than through the general indexing path.
+                //
+                // Three facts are true of every program the compiler emits:
+                // the sequence slot holds a list, because `IterElems` and
+                // `IterKeys` are its only writers and both push one; the index
+                // slot holds an integer, because it is initialised with a zero
+                // and advanced only by the loop's own counter; and that
+                // integer is in range, because the guard immediately above
+                // this instruction compared it against the length. None of the
+                // three is true of the INSTRUCTION STREAM, which is public
+                // data anyone can build, so each is still established here --
+                // but as one variant test, one variant test and one unsigned
+                // comparison, rather than by a helper that matches over every
+                // container the language has, then over every key type, and
+                // answers in the wide public error type on a path that never
+                // fails.
+                //
+                // The bound in particular is load-bearing rather than
+                // defensive: `ListStorage::element_at` indexes its buffer
+                // directly, so an unchecked index past the end is a panic for
+                // a boxed or columnar list and a record pointing past its own
+                // columns for a record one.
                 let element = {
-                    let sequence = self.slots.get(a as usize).ok_or(CelErr::InternalError)?;
-                    let index = self.slots.get(b as usize).ok_or(CelErr::InternalError)?;
-                    value_index(sequence, index)
+                    let Some(Value::List(sequence)) = self.slots.get(a as usize) else {
+                        return Err(CelErr::InternalError);
+                    };
+                    let Some(&Value::Int(index)) = self.slots.get(b as usize) else {
+                        return Err(CelErr::InternalError);
+                    };
+                    // A negative index wraps to a very large `usize` and fails
+                    // the bound, which is the answer the general path gives it
+                    // too.
+                    sequence.get(index as usize)
                 };
-                let value = element.map_err(|e| self.park(e))?;
-                self.push(value);
+                self.push(element.ok_or(CelErr::IndexOutOfBounds)?);
             }
 
             // -- control flow ---------------------------------------------------
@@ -1360,5 +1387,63 @@ mod tests {
         let mut ctx = Context::default();
         ctx.add_variable_from_value("xs", Value::list(vec![Value::Int(7), Value::Int(8)]));
         assert_eq!(cel_eval_loop(&code, &ctx), Ok(Value::Bool(true)));
+    }
+
+    /// `IterAt` trusts nothing in its two slots, because an instruction stream
+    /// is public data and the buffer underneath it is indexed directly.
+    ///
+    /// A compiled program cannot reach any of these: the sequence slot is
+    /// written only by `IterElems`/`IterKeys`, the index slot only by the
+    /// loop's counter, and the guard above the instruction has already
+    /// compared the two. That is exactly why they need a hand-built stream to
+    /// state.
+    #[test]
+    fn iter_at_refuses_a_slot_the_compiler_could_not_have_written() {
+        let ctx = Context::default();
+        let program = |consts: Vec<Value>| CelCode {
+            code: vec![
+                OpCode::LoadConst as u32,
+                0,
+                OpCode::StoreLocal as u32,
+                0,
+                OpCode::LoadConst as u32,
+                1,
+                OpCode::StoreLocal as u32,
+                1,
+                OpCode::IterAt as u32,
+                0,
+                1,
+                OpCode::Return as u32,
+            ],
+            consts,
+            n_slots: 2,
+            max_stack: 1,
+            ..CelCode::default()
+        };
+
+        // A sequence slot that is not a list.
+        assert!(cel_eval_loop(&program(vec![Value::Int(7), Value::Int(0)]), &ctx).is_err());
+        // An index slot that is not an integer.
+        assert!(cel_eval_loop(
+            &program(vec![Value::list(vec![Value::Int(1)]), Value::Bool(true)]),
+            &ctx
+        )
+        .is_err());
+        // An index past the end, and a negative one.
+        for out_of_range in [Value::Int(1), Value::Int(-1)] {
+            assert!(cel_eval_loop(
+                &program(vec![Value::list(vec![Value::Int(1)]), out_of_range]),
+                &ctx
+            )
+            .is_err());
+        }
+        // ... and the in-range case still answers.
+        assert_eq!(
+            cel_eval_loop(
+                &program(vec![Value::list(vec![Value::Int(9)]), Value::Int(0)]),
+                &ctx
+            ),
+            Ok(Value::Int(9))
+        );
     }
 }
