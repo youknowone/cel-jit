@@ -20,6 +20,14 @@
 //!   `required-features = ["jit"]` does not turn off. Going through it would
 //!   silently make this column a different evaluator from the one his figures
 //!   were taken on, which is the entire basis of the comparison.
+//! * **exec** — `Program::execute`, the door a consumer of this library
+//!   actually writes. With the `vm` feature — a DEFAULT feature — that door is
+//!   `cel::vm::cel_eval_loop`, the bytecode VM, so `exec` and `stock` are one
+//!   activation through TWO evaluators rather than one evaluator timed twice.
+//!   It answers what no `stock/..` ratio can: whether the tiers below beat the
+//!   evaluator a caller who names nothing already has. `jit` does not imply
+//!   `vm`, so which of the two this build's `execute` reaches is PRINTED with
+//!   the legend rather than assumed.
 //! * **majit** — the compiled tier through a ONE-ROW batch: `bind_per_row` once,
 //!   `collect_into_on(Tier::Jit, &mut out)` per call. That builds the row's
 //!   `Value`, which is what `execute` returns, so it is the same contract.
@@ -116,6 +124,22 @@ const MIN_BATCH: Duration = Duration::from_millis(20);
 /// figure directly, so there is no second measurement whose load conditions
 /// have to be matched, and the minimum is the estimator that is wanted.
 const ROUNDS: usize = 30;
+
+/// Which evaluator `Program::execute` — the `exec` column — reaches in THIS
+/// build.
+///
+/// `vm` is a default feature, so ordinarily the answer is the bytecode VM. It
+/// is not implied by `jit`, though, and `--no-default-features --features
+/// jit-dynasm` builds this example with `execute` routed to the tree walker.
+/// That build would print `exec ns` as a second `stock ns` and `exec/auto` as
+/// a duplicate of `stock/auto`, which is the kind of silent degradation every
+/// other gate in this file exists to refuse — so the answer is printed with the
+/// legend instead of being inferred from the column's heading.
+const EXEC_EVALUATOR: &str = if cfg!(feature = "vm") {
+    "cel::vm::cel_eval_loop, the bytecode VM"
+} else {
+    "the tree walker: `vm` is OFF here, so `exec` is `stock` measured twice"
+};
 
 /// His `benchmark_variable_access` resolver, verbatim.
 struct Resolver;
@@ -635,6 +659,14 @@ struct Row {
     /// input as data.
     ladder: Option<(&'static str, i64)>,
     stock: f64,
+    /// One whole `Program::execute` on the same fixed activation: the door a
+    /// consumer of this library writes, and the only column here that is about
+    /// what such a consumer gets rather than about a tier this file selects.
+    ///
+    /// It lives on `Row` and not on `Compiled` because it is answerable whether
+    /// or not the expression lowers — `Program::execute` has no batch tier
+    /// behind it — so a declined case still carries this cell.
+    exec: f64,
     /// `Err` when the expression does not lower: the tree-walker answers it —
     /// through the library's own fallback, not a hand-written one — and there is
     /// no compiled tier to put beside it.
@@ -687,6 +719,27 @@ fn run_case(case: &Case) -> Row {
             .unwrap_or_else(|e| panic!("{}: stock execute: {e:?}", case.label))
     });
 
+    // The second evaluator answers the same thing. `expected` is the walker's
+    // answer and `exec` below times `Program::execute`, which under the default
+    // `vm` feature is a DIFFERENT evaluator over the same activation; a column
+    // timing a different answer would be timing a different workload.
+    assert_eq!(
+        program.execute(&activation).ok().as_ref(),
+        Some(&expected),
+        "{}: Program::execute and the tree walker disagree",
+        case.label
+    );
+
+    // The default consumer's door, in the same regime as every other column:
+    // one expression, one fixed activation held outside the timer, one
+    // evaluation timed. Nothing about it depends on the batch machine, so it is
+    // measured before the lowering can decline.
+    let exec = per_call(|| {
+        program
+            .execute(black_box(&activation))
+            .unwrap_or_else(|e| panic!("{}: execute: {e:?}", case.label))
+    });
+
     let lowered = match BatchProgram::from_program(&program, &schema) {
         Ok(bp) => bp,
         Err(e) => {
@@ -694,6 +747,7 @@ fn run_case(case: &Case) -> Row {
                 label: case.label.clone(),
                 ladder: case.ladder,
                 stock,
+                exec,
                 compiled: Err(format!("declines: {e}")),
             }
         }
@@ -708,6 +762,7 @@ fn run_case(case: &Case) -> Row {
                 label: case.label.clone(),
                 ladder: case.ladder,
                 stock,
+                exec,
                 compiled: Err(format!("cannot bind: {e}")),
             }
         }
@@ -815,6 +870,7 @@ fn run_case(case: &Case) -> Row {
         label: case.label.clone(),
         ladder: case.ladder,
         stock,
+        exec,
         compiled: Ok(Compiled {
             clean,
             auto,
@@ -1438,13 +1494,20 @@ fn main() {
         "one expression, one FIXED activation, ONE evaluation timed; \
          best of {ROUNDS} batches of >= {} CPU-ms.\n\
          Every ns figure below is USER CPU on the measuring thread, NOT wall clock:\n\
-         time spent descheduled by other work on the box is not charged to it.\n",
+         time spent descheduled by other work on the box is not charged to it.\n\
+         \n\
+         THREE evaluators are timed, and the table names each of them: `stock` is the\n\
+         tree walker called DIRECTLY, `clean`/`majit`/`auto`/`raw` are the batch machine\n\
+         through a `BoundBatch`, and `exec` is `Program::execute` — the door a caller who\n\
+         names nothing goes through. In THIS build `execute` reaches\n\
+         {EXEC_EVALUATOR}.\n",
         MIN_BATCH.as_millis()
     );
     println!(
-        "{:<28} {:>11} {:>11} {:>11} {:>10} {:>7} {:>9} {:>9} {:>11} {:>11} {:>11} {:>11} {:>12} {:>10} {:>10} {:>9} {:>12} {:>12} {:>13}",
+        "{:<28} {:>11} {:>11} {:>11} {:>11} {:>10} {:>7} {:>9} {:>9} {:>11} {:>11} {:>11} {:>11} {:>11} {:>12} {:>10} {:>10} {:>9} {:>12} {:>12} {:>13}",
         "case",
         "stock ns",
+        "exec ns",
         "clean ns",
         "majit ns",
         "auto ns",
@@ -1452,6 +1515,7 @@ fn main() {
         "words",
         "save ns",
         "stock/auto",
+        "exec/auto",
         "enter/call",
         "jit/row ns",
         "jit fix ns",
@@ -1499,9 +1563,10 @@ fn main() {
                     ("not entered".to_string(), "-".to_string())
                 };
                 println!(
-                    "{:<28} {:>11.1} {:>11.1} {:>11} {:>10.1} {:>7} {:>9} {:>9.0} {:>11} {:>11.2} {:>11} {:>11} {:>12} {:>10.1} {:>10.1} {:>9} {:>12.2} {:>12.2} {:>13.2}",
+                    "{:<28} {:>11.1} {:>11.1} {:>11.1} {:>11} {:>10.1} {:>7} {:>9} {:>9.0} {:>11} {:>11} {:>11.2} {:>11} {:>11} {:>12} {:>10.1} {:>10.1} {:>9} {:>12.2} {:>12.2} {:>13.2}",
                     r.label,
                     r.stock,
+                    r.exec,
                     c.clean,
                     majit_cell,
                     c.auto,
@@ -1513,6 +1578,7 @@ fn main() {
                     c.words,
                     c.saving,
                     format!("{:.2}x", r.stock / c.auto),
+                    format!("{:.2}x", r.exec / c.auto),
                     c.entries,
                     opt(c.jit_row),
                     opt(c.jit_fix),
@@ -1530,11 +1596,14 @@ fn main() {
                 // through the library's fallback. A row missing from the table
                 // would read as an expression this crate cannot evaluate.
                 println!(
-                    "{:<28} {:>11.1} {:>11} {:>11} {:>10} {:>7} {:>9} {:>11} {:>11} {:>11} {:>11} {:>12} {:>10} {:>10} {:>9} {:>12} {:>12} {:>13}",
+                    "{:<28} {:>11.1} {:>11.1} {:>11} {:>11} {:>10} {:>7} {:>9} {:>9} {:>11} {:>11} {:>11} {:>11} {:>11} {:>12} {:>10} {:>10} {:>9} {:>12} {:>12} {:>13}",
                     r.label,
                     r.stock,
+                    r.exec,
                     "-",
                     "walker",
+                    "-",
+                    "-",
                     "-",
                     "-",
                     "-",
@@ -1600,17 +1669,29 @@ fn main() {
          which is what every tier-explicit test and every column of this table below\n\
          measures — the route changes the default, not the `_on` doors.\n\
          \n\
-         ⚠ `stock/auto` measures our route against the TREE WALKER, and `stock/majit` a\n\
-         caller who names `Tier::Jit`. Both are spelled as the division actually\n\
-         performed, so each cell checks against the two ns columns it comes from: ABOVE\n\
-         1.00x we beat the walker, BELOW it the walker beat us.\n\
+         ⚠ `stock/auto` measures our route against the TREE WALKER, `stock/majit` a\n\
+         caller who names `Tier::Jit`, and `exec/auto` our route against\n\
+         `Program::execute`. All three are spelled as the division actually performed, so\n\
+         each cell checks against the two ns columns it comes from: ABOVE 1.00x we beat\n\
+         the evaluator the numerator names, BELOW it that evaluator beat us.\n\
          \n\
-         The walker is NOT what a default caller gets. `Program::execute` is the bytecode\n\
-         VM whenever `vm` is on, and `vm` is a default feature — the head of this file says\n\
-         why the walker is nonetheless the right baseline for comparing against his\n\
-         published figures. But no column here times that door, so NOTHING in this table\n\
-         answers whether we beat the evaluator a default consumer actually runs. Read\n\
-         every ratio in this file as against the walker and against nothing else.\n\
+         The walker is NOT what a default caller gets, and `exec ns` is the column that\n\
+         says so in numbers. `vm` is a default feature, so in this build `Program::execute`\n\
+         reaches {EXEC_EVALUATOR},\n\
+         while the head of this file says why the walker is nonetheless the right baseline\n\
+         for comparing against HIS published figures. So read the two families apart:\n\
+         every `stock/..` ratio is against the walker and against nothing else, and\n\
+         `exec/auto` is the one that answers whether we beat the evaluator a default\n\
+         consumer actually runs.\n\
+         \n\
+         ⚠ `exec ns` is one whole `Program::execute` and the batch columns beside it are\n\
+         not the same setup. `execute` builds its VM state — operand stack, locals, logic\n\
+         slots — on every call and looks every variable up in the `Context` BY NAME; the\n\
+         batch columns hoist both out, the activation having been resolved to slots and\n\
+         encoded into columns at `bind` (timed on its own as `bind ns`) and the run state\n\
+         belonging to the `BoundBatch` and reused call after call. `exec/auto` is\n\
+         therefore a DOOR-to-door ratio — what a caller gains by moving to the batch API,\n\
+         setup and all — and not two evaluators compared on equal footing.\n\
          \n\
          Where the two disagree the route is\n\
          doing something: at one row a straight-line expression has a body of tens of\n\
