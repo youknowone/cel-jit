@@ -102,7 +102,8 @@ use cel::majit::bytecode::float_bank::{
     jit_stats, reset_persistent_state, COMPILED_ENTRIES, COMPILES, GUARD_FAILS, TRACE_ABORTS,
 };
 use cel::majit::lower::{Schema, ValType};
-use cel::{Context, Program, Value};
+use cel::vm::OpCode;
+use cel::{Context, IdedExpr, Program, Value};
 
 /// One timed batch must burn at least this much user CPU, so the clock's own
 /// resolution is not what a 7 ns call is being measured against.
@@ -245,6 +246,16 @@ struct Case {
     /// splitting a display string would make a renamed case silently drop out of
     /// the fit instead of failing.
     ladder: Option<(&'static str, i64)>,
+    /// Elements per row for a rung of the BODY-size ladder — one count, shared
+    /// by every rung of it. `None` for every other case.
+    ///
+    /// Deliberately not carried in `ladder` above. That one names a ladder
+    /// whose members vary `n` at a fixed expression, and `decompose` fits a
+    /// cost against `n` over it; a body rung varies the EXPRESSION at a fixed
+    /// `n`, so such a fit would be regressing four points against a constant.
+    /// The two ladders answer different questions and must not share the field
+    /// that decides which fit a case enters.
+    body_elems: Option<i64>,
 }
 
 impl Case {
@@ -257,11 +268,19 @@ impl Case {
             stock: Box::new(|_| {}),
             stock_resolver: false,
             ladder: None,
+            body_elems: None,
         }
     }
 
     fn in_ladder(mut self, ladder: &'static str, n: i64) -> Case {
         self.ladder = Some((ladder, n));
+        self
+    }
+
+    /// Mark this case a rung of the body-size ladder, at the element count
+    /// every rung of it shares.
+    fn in_body_ladder(mut self, elems: i64) -> Case {
+        self.body_elems = Some(elems);
         self
     }
 
@@ -453,6 +472,28 @@ fn cases() -> Vec<Case> {
             );
         }),
     );
+
+    // A BODY-size ladder: one element count, four bodies.
+    //
+    // Appended at the END, and the three ladders above are left exactly as they
+    // were, so every existing case keeps its position in the run order. Each
+    // case resets the driver, but the process state a case inherits is the one
+    // its predecessors left, and moving a case would change that for every case
+    // after it.
+    const BODY_ELEMS: i64 = 1_000;
+    for body in ["x", "x * 2", "x * 2 + 1", "x * 2 + 1 - 3"] {
+        let elems: Vec<i64> = (0..BODY_ELEMS).collect();
+        let stock = elems.clone();
+        cases.push(
+            Case::new(
+                &format!("map_body/{}", body.replace(' ', "")),
+                &format!("list.map(x, {body})"),
+            )
+            .int_list("list", elems)
+            .stock(move |ctx| ctx.add_variable_from_value("list", stock.clone()))
+            .in_body_ladder(BODY_ELEMS),
+        );
+    }
     cases
 }
 
@@ -680,6 +721,12 @@ struct Row {
     /// `(ladder, n)`, copied from the case so the decomposition below has its
     /// input as data.
     ladder: Option<(&'static str, i64)>,
+    /// The element count, for a rung of the body-size ladder.
+    body_elems: Option<i64>,
+    /// This expression's compiled instruction counts. `None` when it does not
+    /// compile, which is not a case this file has but is not worth a panic in
+    /// a column that only annotates.
+    ops: Option<Ops>,
     stock: f64,
     /// One whole `Program::execute` on the same fixed activation: the door a
     /// consumer of this library writes, and the only column here that is about
@@ -762,12 +809,19 @@ fn run_case(case: &Case) -> Row {
             .unwrap_or_else(|e| panic!("{}: execute: {e:?}", case.label))
     });
 
+    // Taken before the lowering can decline, like `stock` and `exec` above, and
+    // outside every timer: this is an annotation on the expression, not a cost
+    // of running it.
+    let ops = ops_of(program.expression());
+
     let lowered = match BatchProgram::from_program(&program, &schema) {
         Ok(bp) => bp,
         Err(e) => {
             return Row {
                 label: case.label.clone(),
                 ladder: case.ladder,
+                body_elems: case.body_elems,
+                ops,
                 stock,
                 exec,
                 compiled: Err(format!("declines: {e}")),
@@ -783,6 +837,8 @@ fn run_case(case: &Case) -> Row {
             return Row {
                 label: case.label.clone(),
                 ladder: case.ladder,
+                body_elems: case.body_elems,
+                ops,
                 stock,
                 exec,
                 compiled: Err(format!("cannot bind: {e}")),
@@ -923,6 +979,8 @@ fn run_case(case: &Case) -> Row {
     Row {
         label: case.label.clone(),
         ladder: case.ladder,
+        body_elems: case.body_elems,
+        ops,
         stock,
         exec,
         compiled: Ok(Compiled {
@@ -1627,6 +1685,128 @@ fn print_row_cost_table(rows: &[Row]) {
     );
 }
 
+/// The compiled instruction counts of one expression, taken from the COMPILER.
+///
+/// The x-axis of any fit over the body-size ladder has to come from here rather
+/// than from counting operators in a source string. Whether `x * 2 + 1 - 3`
+/// contributes four instructions or two is the compiler's answer, and an
+/// assumed count would bend a slope silently wherever a constant folds or an
+/// operand turns out to be shared with the loop scaffolding.
+///
+/// ⚠ These are read off a RECOMPILATION of the expression through
+/// `cel::vm::compile` — the same entry point, over the same input, that
+/// `Program::compile` itself calls, because the code object a `Program` holds
+/// is a private field. Compiling is a pure function of the expression, so this
+/// is the stream `exec ns` runs; it is reached by compiling again rather than
+/// by reading the program's own copy.
+struct Ops {
+    /// Every instruction in the stream, the loop's included. The comprehension's
+    /// setup and its result are in here too, so this exceeds `loop_body` by an
+    /// amount that does not move between rungs of one ladder.
+    total: usize,
+    /// The instructions that run ONCE PER ELEMENT: from the single backward
+    /// `Jump`'s target through that `Jump` itself, inclusive of both.
+    ///
+    /// `None` unless the stream holds exactly one backward jump. A `map` over a
+    /// variable is one loop and no more, so a second one — or none — means the
+    /// stream is not the shape this span assumes, and naming no span is the
+    /// honest answer rather than measuring the wrong one.
+    loop_body: Option<usize>,
+}
+
+fn ops_of(expression: &IdedExpr) -> Option<Ops> {
+    let code = cel::vm::compile(expression).ok()?;
+    let total = code.instructions().count();
+    // Every jump target is an absolute index — the instruction set is fixed
+    // width precisely so that it can be — so a backward jump is one whose
+    // operand is below its own pc, and no branch's sense has to be decoded.
+    let mut backward = code
+        .instructions()
+        .filter(|(pc, op, operands)| matches!(op, OpCode::Jump) && operands[0] < *pc);
+    let loop_body = match (backward.next(), backward.next()) {
+        (Some((jump_pc, _, operands)), None) => {
+            let top = operands[0];
+            Some(
+                code.instructions()
+                    .filter(|(pc, _, _)| (top..=jump_pc).contains(pc))
+                    .count(),
+            )
+        }
+        _ => None,
+    };
+    Some(Ops { total, loop_body })
+}
+
+/// The body-size ladder: one element count, four bodies, each rung's compiled
+/// instruction count printed beside what the rung cost through both evaluators.
+///
+/// Nothing here is fitted. The block prints the INPUTS a fit needs — an x-axis
+/// taken from the compiler and a per-element cost from each evaluator — and
+/// stops there. The size ladders' fit is `print_decomposition`, and this is
+/// deliberately not that: it varies a different axis, and a slope over one is
+/// not a slope over the other.
+fn print_body_ladder(rows: &[Row]) {
+    let rungs: Vec<&Row> = rows.iter().filter(|r| r.body_elems.is_some()).collect();
+    if rungs.is_empty() {
+        return;
+    }
+    println!(
+        "\nBODY-size ladder: the element count is FIXED and only the body of the `map`\n\
+         varies."
+    );
+    println!(
+        "{:<28} {:>7} {:>6} {:>9} {:>11} {:>11} {:>10} {:>11}",
+        "case", "elems", "ops", "loop ops", "exec ns", "stock ns", "exec/elem", "stock/elem",
+    );
+    for r in rungs {
+        let elems = r.body_elems.expect("filtered on Some");
+        let n = elems as f64;
+        let (total, loop_body) = match &r.ops {
+            Some(o) => (
+                o.total.to_string(),
+                o.loop_body
+                    .map_or_else(|| "-".to_string(), |c| c.to_string()),
+            ),
+            None => ("-".to_string(), "-".to_string()),
+        };
+        println!(
+            "{:<28} {:>7} {:>6} {:>9} {:>11.1} {:>11.1} {:>10.2} {:>11.2}",
+            r.label,
+            elems,
+            total,
+            loop_body,
+            r.exec,
+            r.stock,
+            r.exec / n,
+            r.stock / n,
+        );
+    }
+    println!(
+        "\nThe three size ladders above hold the expression fixed and grow `n`, so they\n\
+         price an ELEMENT and cannot say what inside an element the cost is. These hold\n\
+         `n` fixed and grow the body, so the loop scaffolding every rung runs is\n\
+         identical and the only thing that moves between two rungs is how many\n\
+         instructions the body itself contributes.\n\
+         \n\
+         `ops` is every instruction in the compiled stream. `loop ops` is the span that\n\
+         runs once per element: the instructions from the single backward `Jump`'s\n\
+         target through that `Jump`, inclusive. Both come from the COMPILER, not from\n\
+         counting operators in the source — see `Ops` for why that distinction is the\n\
+         point of the column and for the one caveat, that the counts are read off a\n\
+         recompilation. `loop ops` prints `-` unless the stream holds exactly one\n\
+         backward jump, which is a refusal to name a span rather than a guess at one.\n\
+         \n\
+         `exec/elem` and `stock/elem` are that rung's whole call divided by `elems`. The\n\
+         per-call fixed cost is NOT differenced away — there is no size ladder here to\n\
+         take it out with — so each figure carries its own, spread across every element.\n\
+         \n\
+         `stock/elem` is the CONTROL and not decoration: the same bodies through the\n\
+         other evaluator, against the same x-axis. Where it is flat in body size and\n\
+         `exec/elem` is not, what grows with the body is the VM's cost per instruction\n\
+         and not the expression's own."
+    );
+}
+
 fn main() {
     println!("cometkim's benchmark expressions in his own regime (cel-jit PR #233)");
     println!(
@@ -1896,4 +2076,5 @@ fn main() {
          is what varying data would cost."
     );
     print_decomposition(&rows);
+    print_body_ladder(&rows);
 }
