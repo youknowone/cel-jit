@@ -101,6 +101,67 @@ const _: () = {
     assert!(core::mem::size_of::<Operand>() == 32);
 };
 
+/// The four growable buffers a run needs, kept across runs so that evaluating
+/// a program does not allocate an activation record.
+///
+/// Sizing them per run is what an evaluation of `1 + 1` used to pay: `stack` is
+/// at least one entry for any program that compiles, so a scalar expression
+/// cost one malloc and one free, plus a second for `slots` where the program
+/// has a comprehension and a third for `logic` where it has `&&` or `||`. The
+/// tree walker's floor is zero — its operands are recursion locals — so this
+/// was a cost the evaluator paid for being a loop rather than for doing work.
+///
+/// Only the CAPACITY is worth keeping. Every buffer is emptied when it is
+/// returned, so nothing here holds a [`Value`] between runs; what survives is
+/// the allocation, sized to the largest program this thread has evaluated.
+#[derive(Default)]
+struct Scratch {
+    stack: Vec<Operand>,
+    slots: Vec<Value>,
+    logic: Vec<CelResult<bool>>,
+    cold: Vec<ExecutionError>,
+}
+
+impl Scratch {
+    /// Drop everything held, keeping the allocations.
+    ///
+    /// Called when the buffers go back to the pool rather than when they come
+    /// out, so a run that ended in an error — or in a panic, since this is
+    /// reached from [`Vm`]'s [`Drop`] — cannot leave a large list rooted until
+    /// the next evaluation on this thread happens to overwrite it.
+    fn release(&mut self) {
+        self.stack.clear();
+        self.slots.clear();
+        self.logic.clear();
+        self.cold.clear();
+    }
+}
+
+std::thread_local! {
+    /// This thread's idle buffers, or `None` while a run holds them.
+    ///
+    /// Held by VALUE and moved in and out, which is what makes re-entry
+    /// correct rather than merely unlikely: a host function registered in the
+    /// [`Context`] may call [`crate::Program::execute`] again from inside an
+    /// evaluation, and the nested run finds this slot empty and builds its own
+    /// buffers. Lending a `&mut` to a shared buffer instead would alias, and no
+    /// arrangement of flags recovers from that — the outer run's operand stack
+    /// is live across the call.
+    ///
+    /// Nesting therefore pays one set of allocations, and it is the nesting
+    /// caller that pays. On the way out the innermost run to finish is the
+    /// first to store, so the outermost run's buffers — the widest, and the
+    /// ones a subsequent top-level call wants — are what the slot ends up
+    /// holding.
+    ///
+    /// Reached through `try_with` on both sides, never `with`. `Scratch` has a
+    /// destructor, so this slot can already have been torn down by the time a
+    /// thread-local of the caller's runs an evaluation of its own from its own
+    /// destructor. `with` would panic there, and a panic on the way out of
+    /// [`Vm`] would be a panic in a destructor.
+    static SCRATCH: std::cell::Cell<Option<Scratch>> = const { std::cell::Cell::new(None) };
+}
+
 struct Vm<'a> {
     code: &'a CelCode,
     ctx: &'a Context<'a>,
@@ -132,15 +193,57 @@ struct Vm<'a> {
     pending_args: Option<Vec<Value>>,
 }
 
+/// Return the buffers to this thread's pool.
+///
+/// A [`Drop`] impl rather than a call at the end of [`cel_eval_loop`], because
+/// the buffers have to come back on EVERY way out — the `Ok`, the `Err`, and a
+/// panic from a host function called mid-evaluation. Taking them out and
+/// putting them back is also what keeps re-entry sound: the slot is empty for
+/// exactly as long as a run holds it.
+impl Drop for Vm<'_> {
+    fn drop(&mut self) {
+        // `mem::take` on a `Vec` leaves a dangling-free empty one and allocates
+        // nothing, which is the only way to move fields out of a type that
+        // implements `Drop`.
+        let mut scratch = Scratch {
+            stack: std::mem::take(&mut self.stack),
+            slots: std::mem::take(&mut self.slots),
+            logic: std::mem::take(&mut self.logic),
+            cold: std::mem::take(&mut self.cold),
+        };
+        scratch.release();
+        // Dropped rather than pooled where the slot is already gone; see
+        // `SCRATCH`.
+        let _ = SCRATCH.try_with(|slot| slot.set(Some(scratch)));
+    }
+}
+
 impl<'a> Vm<'a> {
+    /// Borrow this thread's buffers and size them for `code`.
+    ///
+    /// Every buffer arrives empty — [`Scratch::release`] is what put it back —
+    /// so this establishes the lengths the loop indexes into and asks the
+    /// operand stack for the depth the compiler proved it needs. On a thread
+    /// that has evaluated anything before, all four of those are already
+    /// satisfied and none of them allocates.
     fn new(code: &'a CelCode, ctx: &'a Context<'a>) -> Self {
+        let mut scratch = SCRATCH
+            .try_with(std::cell::Cell::take)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        scratch.stack.reserve(code.max_stack as usize);
+        scratch.slots.resize(code.n_slots as usize, Value::Null);
+        scratch
+            .logic
+            .resize(code.n_logic as usize, Err(CelErr::InternalError));
         Vm {
             code,
             ctx,
-            stack: Vec::with_capacity(code.max_stack as usize),
-            slots: vec![Value::Null; code.n_slots as usize],
-            logic: vec![Err(CelErr::InternalError); code.n_logic as usize],
-            cold: Vec::new(),
+            stack: scratch.stack,
+            slots: scratch.slots,
+            logic: scratch.logic,
+            cold: scratch.cold,
             pending_args: None,
         }
     }
