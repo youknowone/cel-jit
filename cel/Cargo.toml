@@ -264,6 +264,17 @@ dhat-heap = [ ] # if you are doing heap profiling
 # allocation witness before any timing runs.
 drop-arm-probe = []
 
+# The second measurement probe, and never a shipping feature either. It makes
+# the function-entry door's yield probe choose its key form at run time --
+# the resolved cell key it uses now, or the bare bucket hash it used before --
+# so what that resolution costs per call is a difference taken inside ONE
+# binary rather than between two builds.
+#
+# Off by default, and nothing but `examples/paired_ab.rs` selects it. Both arms
+# DECIDE the same thing on every bucket holding one cell or none, which is
+# every bucket a program here has produced; see `float_bank::LoopKeyArm`.
+loop-key-arm-probe = []
+
 # Route `Program::execute` through the bytecode VM instead of the tree walker.
 #
 # On by default, so the VM is what a caller gets. The tree walker is not

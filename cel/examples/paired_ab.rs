@@ -970,6 +970,14 @@ fn main() {
     #[cfg(feature = "drop-arm-probe")]
     probe(&cfg);
 
+    // -- THE LOOP-KEY PROBE -------------------------------------------------
+    // Task #31: what the function-entry door's per-call loop-key resolution
+    // costs, behind `--features jit-<backend>,loop-key-arm-probe`. Bracketed by
+    // the same two null controls, and each section sets its own floor for the
+    // same reason the drop probe's do.
+    #[cfg(all(feature = "jit", feature = "loop-key-arm-probe"))]
+    loop_key_probe(&cfg);
+
     // -- THE ARMS UNDER TEST ------------------------------------------------
     // Replace these two closures to measure something else. Nothing above needs
     // to change: the controls, the floor and the verdicts are all machinery.
@@ -1205,7 +1213,12 @@ fn probe_code(src: &str) -> cel::vm::CelCode {
 /// claim a resolution three orders of magnitude finer than the one measured.
 /// An unresolved comparison prints no number at all: below the floor there is
 /// nothing to divide.
-#[cfg(feature = "drop-arm-probe")]
+// Shared by both probes; the cfg names each one exactly so that enabling
+// either alone leaves no unused item behind.
+#[cfg(any(
+    feature = "drop-arm-probe",
+    all(feature = "jit", feature = "loop-key-arm-probe")
+))]
 fn per_unit(label: &str, s: &Stats, floor: f64, units: f64, unit: &str) {
     if verdict(s, floor).resolved() {
         println!(
@@ -1231,7 +1244,12 @@ fn per_unit(label: &str, s: &Stats, floor: f64, units: f64, unit: &str) {
 /// noise scales with the length of the batch it lands in, so grading one
 /// against the other would understate the noise by the ratio of the two. Every
 /// comparison below is graded against a null run on its own arms instead.
-#[cfg(feature = "drop-arm-probe")]
+// Shared by both probes; the cfg names each one exactly so that enabling
+// either alone leaves no unused item behind.
+#[cfg(any(
+    feature = "drop-arm-probe",
+    all(feature = "jit", feature = "loop-key-arm-probe")
+))]
 fn local_floor<F: FnMut()>(title: &str, mut make: impl FnMut() -> F, cfg: &Config) -> Floors {
     let run = {
         let mut a = Arm::new("arm under test", make());
@@ -1573,4 +1591,335 @@ fn probe(cfg: &Config) {
     println!("===========================================================");
     drop_decomposition(cfg);
     iter_at_sweep(cfg);
+}
+
+// ---------------------------------------------------------------------------
+// The loop-key probe (feature `loop-key-arm-probe`, with a JIT backend)
+// ---------------------------------------------------------------------------
+//
+// Task #31. `dc9146c` made the function-entry door's yield probe ask
+// `has_runnable_compiled_loop` on a RESOLVED cell key rather than on the bare
+// bucket hash, which buys one bucket walk per loop key on a path that runs on
+// every call at the JIT tier. This prices that walk.
+//
+// The two arms are one compiled `try_function_entry_jit_f` taking a different
+// branch off `float_bank::LoopKeyArm`, so nothing here compares two builds.
+// Both arms DECIDE the same thing — `resolve` answers a bucket holding one
+// cell or none from the walk alone and returns the raw hash — so the
+// difference is the walk and nothing else.
+
+/// The threshold the tier compiles at, matching `majit_ab`'s board.
+#[cfg(all(feature = "jit", feature = "loop-key-arm-probe"))]
+const LOOP_KEY_JIT_ON: u32 = 8;
+
+/// Rows per call.
+///
+/// ONE, which is the shape the entry door exists for: the row loop is
+/// bottom-tested, so a one-row call takes no back edge and the loop's own door
+/// never counts and never opens. It is also the state in which every loop key
+/// answers NO, so `any` walks the whole list instead of short-circuiting on
+/// its first key — which is what makes the per-key divisor below the number of
+/// walks actually performed.
+#[cfg(all(feature = "jit", feature = "loop-key-arm-probe"))]
+const LOOP_KEY_ROWS: usize = 1;
+
+/// The columns the lowered program reads.
+///
+/// Owned by the caller for as long as the program runs: the words carry their
+/// ADDRESSES as seeded registers, so dropping these while a program naming
+/// them is still callable would leave the run reading freed memory.
+#[cfg(all(feature = "jit", feature = "loop-key-arm-probe"))]
+struct LoopKeyColumns {
+    balance: Vec<i64>,
+    amount: Vec<i64>,
+    frozen: Vec<i64>,
+}
+
+#[cfg(all(feature = "jit", feature = "loop-key-arm-probe"))]
+fn loop_key_columns(n: usize) -> LoopKeyColumns {
+    LoopKeyColumns {
+        balance: (0..n as i64).map(|i| 100 + i).collect(),
+        amount: (0..n as i64).map(|i| 50 + i).collect(),
+        frozen: vec![0; n],
+    }
+}
+
+/// `balance >= amount && !frozen` lowered to a batch program over `cols`, with
+/// `extra` further back edges appended after its `RETURN`.
+///
+/// The appended words are never executed — the program has already returned —
+/// but [`float_bank::loop_key_count`] sees them, because the door's scan for
+/// loop headers is word-wise rather than a decode and is documented to count
+/// positions that are not instructions. That is exactly what makes them usable
+/// here: they cost the door precisely what a real loop header costs it, one
+/// key each, without changing a single instruction the call runs. The ladder
+/// they build is what turns a per-call figure into a per-key one.
+///
+/// Each block is `[JUMP_IF_ABOVE, 0, 0, target]` with a target that is
+/// backward, non-zero and distinct, since a target of `ENTRY_PC` is excluded
+/// by the scan and equal targets collapse to one key. The count is asserted
+/// rather than assumed, because a divisor derived from intent instead of from
+/// the door's own answer is how a per-unit figure goes wrong by a factor.
+#[cfg(all(feature = "jit", feature = "loop-key-arm-probe"))]
+fn loop_key_program(
+    cols: &LoopKeyColumns,
+    extra: usize,
+) -> (std::sync::Arc<cel::majit::bytecode::Code>, Vec<i64>, usize) {
+    use cel::majit::bytecode::OP_JUMP_IF_ABOVE;
+    use cel::majit::lower::{lower_typed, Schema, ValType};
+
+    let program =
+        Program::compile("balance >= amount && !frozen").expect("the probe expression compiles");
+    let schema: Schema = [
+        ("balance".to_string(), ValType::Int),
+        ("amount".to_string(), ValType::Int),
+        ("frozen".to_string(), ValType::Bool),
+    ]
+    .into_iter()
+    .collect();
+    let lowered = lower_typed(program.expression(), &schema).expect("the probe expression lowers");
+    let bases = [
+        cols.balance.as_ptr() as i64,
+        cols.amount.as_ptr() as i64,
+        cols.frozen.as_ptr() as i64,
+    ];
+    let (shape, regs) = lowered.batch_sum_program(&bases, LOOP_KEY_ROWS as i64);
+
+    let mut words = shape.code.to_vec();
+    let base_len = words.len();
+    for block in 0..extra {
+        // Backward by construction: the target names the word just before this
+        // block, which is inside the base program for the first block and
+        // inside the previous block after that.
+        let target = (base_len + 4 * block - 1) as i64;
+        words.extend_from_slice(&[OP_JUMP_IF_ABOVE, 0, 0, target]);
+    }
+    (std::sync::Arc::from(words), regs, shape.num_float_regs)
+}
+
+/// Price one program's loop-key walk, and return the per-key figure it
+/// resolved to.
+///
+/// `keys` is read back out of the door rather than passed in, so the divisor
+/// is the number of walks the door performs and not the number a reader of
+/// this file would expect it to.
+#[cfg(all(feature = "jit", feature = "loop-key-arm-probe"))]
+fn loop_key_section(cols: &LoopKeyColumns, extra: usize, cfg: &Config) {
+    use cel::majit::bytecode::float_bank::{
+        jit_stats, loop_key_count, reset_jit_stats, reset_persistent_state,
+        run_jit_persistent_probe_f, LoopKeyArm,
+    };
+
+    let (code, regs, nf) = loop_key_program(cols, extra);
+    let keys = loop_key_count(&code);
+
+    println!();
+    println!("###########################################################");
+    println!("# ENTRY-DOOR LOOP KEYS: {keys} per call ({extra} appended)");
+    println!("###########################################################");
+
+    // A fresh driver, so the compiled artifact the timed calls run on is the
+    // one this section's warmup minted rather than one an earlier section left
+    // behind under a different program.
+    reset_persistent_state();
+    reset_jit_stats();
+
+    let arm = |which| {
+        let code = &code;
+        let regs = &regs;
+        move || {
+            let out = run_jit_persistent_probe_f(
+                black_box(code),
+                black_box(regs),
+                nf,
+                LOOP_KEY_JIT_ON,
+                which,
+            );
+            black_box(out);
+        }
+    };
+
+    // Both arms must answer the same thing. They decide identically on every
+    // bucket holding one cell or none, and that is every bucket a program here
+    // produces — but "must" is what a check is for.
+    let resolved =
+        run_jit_persistent_probe_f(&code, &regs, nf, LOOP_KEY_JIT_ON, LoopKeyArm::Resolved);
+    let bare = run_jit_persistent_probe_f(&code, &regs, nf, LOOP_KEY_JIT_ON, LoopKeyArm::BareHash);
+    assert_eq!(
+        resolved, bare,
+        "the two loop-key arms disagree on the answer at {keys} keys"
+    );
+
+    // Warm both arms past the threshold, so the timed calls run on a compiled
+    // entry rather than paying for a trace inside the window.
+    for _ in 0..64 {
+        arm(LoopKeyArm::Resolved)();
+        arm(LoopKeyArm::BareHash)();
+    }
+
+    // WHICH TIER THE TIMED CALLS RUN ON, measured rather than assumed. A
+    // section whose `compiled_entries` stayed at zero over a window of calls
+    // priced the door in front of the INTERPRETER, which is a different
+    // question from the one task #31 asks; printing it is what lets the answer
+    // be read for what it is.
+    const CENSUS_CALLS: usize = 64;
+    let before = jit_stats();
+    for _ in 0..CENSUS_CALLS {
+        arm(LoopKeyArm::Resolved)();
+    }
+    let after = jit_stats();
+    println!(
+        "  tier census      {CENSUS_CALLS} calls -> compiled_entries +{}, loops_compiled +{}, \
+         aborted +{}   (answer {resolved})",
+        after.compiled_entries - before.compiled_entries,
+        after.loops_compiled - before.loops_compiled,
+        after.loops_aborted - before.loops_aborted,
+    );
+
+    let floors = local_floor(
+        &format!("LOCAL NULL CONTROL: {keys} loop keys, resolved arm vs an identical copy"),
+        || arm(LoopKeyArm::Resolved),
+        cfg,
+    );
+
+    let run = {
+        let mut a = Arm::new("bare hash (pre-dc9146c)", arm(LoopKeyArm::BareHash));
+        let mut b = Arm::new("resolved key (HEAD)", arm(LoopKeyArm::Resolved));
+        run_pair(&mut a, &mut b, cfg)
+    };
+    let (cpu, _) = report(
+        &format!("LOOP-KEY RESOLUTION at {keys} keys per call"),
+        &run,
+        cfg,
+        Some(floors),
+    );
+    // Per CALL first, because that is the quantity the task asks for: one call
+    // is one iteration of this arm, so the paired median IS the per-call cost
+    // and the floor grades it directly.
+    if verdict(&cpu, floors.cpu).resolved() {
+        println!(
+            "  per call         {:+.4} ns ({:+.2}% of the bare-hash arm)   floor ±{:.4} ns/call",
+            cpu.median_diff,
+            100.0 * cpu.median_diff / cpu.a_median,
+            floors.cpu,
+        );
+    } else {
+        println!(
+            "  per call         UNRESOLVED: |{:+.4}| ns below this section's floor of \
+             ±{:.4} ns/call — the cost is bounded ABOVE by the floor, not shown to be zero",
+            cpu.median_diff, floors.cpu,
+        );
+    }
+    if keys > 0 {
+        per_unit("per loop key", &cpu, floors.cpu, keys as f64, "key");
+    }
+}
+
+/// A program with NO backward jump, which is the case the door is supposed to
+/// charge nothing for.
+///
+/// Straight-line words the interpreter runs to a `RETURN`, and no word in them
+/// is `OP_JUMP_IF_ABOVE`, so `loop_keys` is empty and the walk never begins.
+/// The structural claim is that the two arms cannot differ here; the timing is
+/// what says the harness agrees.
+#[cfg(all(feature = "jit", feature = "loop-key-arm-probe"))]
+fn loop_key_zero_section(cfg: &Config) {
+    use cel::majit::bytecode::float_bank::{
+        loop_key_count, reset_jit_stats, reset_persistent_state, run_jit_persistent_probe_f,
+        LoopKeyArm,
+    };
+    use cel::majit::bytecode::{OP_ADD, OP_LOAD_CONST, OP_RETURN};
+
+    // `LOAD_CONST 7 -> r1`, `ADD r0 r1 -> r2`, `RETURN r2`. No word in it is
+    // `OP_JUMP_IF_ABOVE`, which is what makes the key list empty.
+    let words: Vec<i64> = vec![OP_LOAD_CONST, 7, 1, OP_ADD, 0, 1, 2, OP_RETURN, 2];
+    let code: std::sync::Arc<cel::majit::bytecode::Code> = std::sync::Arc::from(words);
+    let regs = vec![0i64; 3];
+    let keys = loop_key_count(&code);
+    assert_eq!(keys, 0, "the no-back-edge control must have no loop keys");
+
+    println!();
+    println!("###########################################################");
+    println!("# ENTRY-DOOR LOOP KEYS: 0 per call (no backward jump)");
+    println!("###########################################################");
+
+    reset_persistent_state();
+    reset_jit_stats();
+
+    let arm = |which| {
+        let code = &code;
+        let regs = &regs;
+        move || {
+            let out = run_jit_persistent_probe_f(
+                black_box(code),
+                black_box(regs),
+                0,
+                LOOP_KEY_JIT_ON,
+                which,
+            );
+            black_box(out);
+        }
+    };
+    let resolved =
+        run_jit_persistent_probe_f(&code, &regs, 0, LOOP_KEY_JIT_ON, LoopKeyArm::Resolved);
+    let bare = run_jit_persistent_probe_f(&code, &regs, 0, LOOP_KEY_JIT_ON, LoopKeyArm::BareHash);
+    assert_eq!(resolved, bare, "the two arms disagree with no loop keys");
+    for _ in 0..64 {
+        arm(LoopKeyArm::Resolved)();
+        arm(LoopKeyArm::BareHash)();
+    }
+
+    let floors = local_floor(
+        "LOCAL NULL CONTROL: 0 loop keys, resolved arm vs an identical copy",
+        || arm(LoopKeyArm::Resolved),
+        cfg,
+    );
+    let run = {
+        let mut a = Arm::new("bare hash (pre-dc9146c)", arm(LoopKeyArm::BareHash));
+        let mut b = Arm::new("resolved key (HEAD)", arm(LoopKeyArm::Resolved));
+        run_pair(&mut a, &mut b, cfg)
+    };
+    let (cpu, _) = report(
+        "LOOP-KEY RESOLUTION at 0 keys per call (must not resolve)",
+        &run,
+        cfg,
+        Some(floors),
+    );
+    if verdict(&cpu, floors.cpu).resolved() {
+        println!(
+            "  !! a comparison whose two arms run the SAME instructions RESOLVED at \
+             {:+.4} ns/call against a floor of ±{:.4}. That is a statement about the \
+             instrument, not about the door.",
+            cpu.median_diff, floors.cpu,
+        );
+    } else {
+        println!(
+            "  per call         UNRESOLVED, as it must be: the walk never begins, so the \
+             two arms are the same instructions (|{:+.4}| vs floor ±{:.4} ns/call)",
+            cpu.median_diff, floors.cpu,
+        );
+    }
+}
+
+/// Everything behind `loop-key-arm-probe`, run inside the bracket the opening
+/// and closing null controls form.
+#[cfg(all(feature = "jit", feature = "loop-key-arm-probe"))]
+fn loop_key_probe(cfg: &Config) {
+    println!();
+    println!("===========================================================");
+    println!("=  LOOP-KEY PROBE (feature `loop-key-arm-probe`)");
+    println!("=  One call is one iteration here, so the paired median IS");
+    println!("=  a per-call figure. Every section sets its own floor from");
+    println!("=  a null control on its own arms.");
+    println!("===========================================================");
+
+    let cols = loop_key_columns(LOOP_KEY_ROWS);
+    loop_key_zero_section(cfg);
+    // A ladder rather than one point: the walk is one per key, so a cost that
+    // is really the walk has to grow with the key count. A per-key figure that
+    // holds across the rungs is the evidence for that; one taken at a single
+    // rung would be an assumption with a number attached.
+    for extra in [0usize, 3, 15, 63] {
+        loop_key_section(&cols, extra, cfg);
+    }
 }

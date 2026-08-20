@@ -1757,6 +1757,77 @@ pub mod float_bank {
         }
     }
 
+    /// Which key form the yield probe in [`try_function_entry_jit_f`] asks on.
+    ///
+    /// A measurement probe, not a feature. The two variants are the door before
+    /// and after the resolution landed, and they exist as two branches of ONE
+    /// compiled function so that what the resolution costs is a difference
+    /// taken inside a single binary. Two builds cannot answer that: they admit
+    /// compile drift and stale binaries, and neither is visible in the numbers
+    /// they produce.
+    ///
+    /// The two agree on every bucket that holds one cell or none, which is
+    /// every bucket a real program has ever produced here —
+    /// [`PooledGreenKey::resolve`] answers such a bucket from the walk alone
+    /// and returns the raw hash. So this is a cost probe, not a behaviour
+    /// switch: the arms differ in what they DO, not in what they decide.
+    #[cfg(feature = "loop-key-arm-probe")]
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub enum LoopKeyArm {
+        /// The bare bucket hash, which is what the probe asked before the
+        /// resolution landed. No walk, no cell read — the hash is already in
+        /// the pool.
+        BareHash,
+        /// What the door does without the probe: one bucket walk per loop key,
+        /// through [`PooledGreenKey::resolve`].
+        Resolved,
+    }
+
+    #[cfg(feature = "loop-key-arm-probe")]
+    std::thread_local! {
+        /// The arm the next call on this thread takes at the yield probe.
+        ///
+        /// Read once per CALL — not once per loop key — and identically by both
+        /// arms, so it is a constant that cancels out of any difference between
+        /// them. It does mean no arm's ABSOLUTE figure is what the shipping
+        /// door costs; only differences are claims.
+        static LOOP_KEY_ARM: core::cell::Cell<LoopKeyArm> =
+            const { core::cell::Cell::new(LoopKeyArm::Resolved) };
+    }
+
+    /// [`run_jit_persistent_f`] with the yield probe's key form chosen
+    /// explicitly.
+    ///
+    /// Announced through a thread-local rather than threaded down as an
+    /// argument, because the door is reached through the pool's `with` closure
+    /// and a parameter would have to be spelled in the shipping signature too.
+    /// Saved and restored around the one call, so two arms interleaved in one
+    /// process never observe each other's setting.
+    #[cfg(feature = "loop-key-arm-probe")]
+    pub fn run_jit_persistent_probe_f(
+        program: &std::sync::Arc<Code>,
+        init_regs: &[i64],
+        num_fregs: usize,
+        threshold: u32,
+        arm: LoopKeyArm,
+    ) -> i64 {
+        let previous = LOOP_KEY_ARM.with(|slot| slot.replace(arm));
+        let out = run_jit_persistent_f(program, init_regs, num_fregs, threshold);
+        LOOP_KEY_ARM.with(|slot| slot.set(previous));
+        out
+    }
+
+    /// How many loop keys the yield probe walks for `program` on every call.
+    ///
+    /// The divisor a per-key figure needs. Exposed for the probe only: a
+    /// caller quoting a per-key cost has to divide by the count the door
+    /// actually walks, and that count is [`loop_header_keys`]'s answer rather
+    /// than the number of loops a reader would count in the source.
+    #[cfg(feature = "loop-key-arm-probe")]
+    pub fn loop_key_count(program: &Code) -> usize {
+        loop_header_keys(program).len()
+    }
+
     /// The green key a door arming at `pc` in `program` files under.
     ///
     /// The three slots are the ones `can_enter_jit!` builds for a `greens = [pc,
@@ -1912,11 +1983,23 @@ pub mod float_bank {
         // this one, not an entry into someone else's compiled code — but the
         // two probes now decide on the same footing, which is what stops the
         // weaker one from being read as evidence about the stronger.
-        if pooled
-            .loop_keys
-            .iter()
-            .any(|key| driver.has_runnable_compiled_loop(key.resolve(driver)))
-        {
+        //
+        // Under `loop-key-arm-probe` the key form is selected at RUN time, so
+        // this walk and the bare-hash probe that preceded it are two branches
+        // of one compiled door. See [`LoopKeyArm`]; the default build has
+        // neither the branch nor the read.
+        #[cfg(feature = "loop-key-arm-probe")]
+        let arm = LOOP_KEY_ARM.with(core::cell::Cell::get);
+        if pooled.loop_keys.iter().any(|key| {
+            #[cfg(feature = "loop-key-arm-probe")]
+            let probe = match arm {
+                LoopKeyArm::BareHash => key.hash,
+                LoopKeyArm::Resolved => key.resolve(driver),
+            };
+            #[cfg(not(feature = "loop-key-arm-probe"))]
+            let probe = key.resolve(driver);
+            driver.has_runnable_compiled_loop(probe)
+        }) {
             return None;
         }
         // Read, not recomputed: the key is `green_key_at(program, ENTRY_PC)`,
