@@ -98,6 +98,17 @@ harness = false
 name = "allocs_per_eval"
 harness = false
 
+# Declared with no `required-features`, unlike every block below it, because it
+# genuinely needs none: the timing machinery is plain `std`, and the probe arms
+# it can select are behind `#[cfg(feature = "drop-arm-probe")]` inside the file.
+# The block still has to exist. `scripts/feature-matrix.sh` checks the manifest
+# and `examples/` for set equality by NAME, so an undeclared example is a
+# failure there whether or not it compiles -- it would otherwise be built in
+# every configuration the matrix runs, which is exactly how a manifest omission
+# once broke nine rows at once.
+[[example]]
+name = "paired_ab"
+
 [[example]]
 name = "majit_ab"
 required-features = ["jit"]
