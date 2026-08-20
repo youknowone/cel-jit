@@ -182,6 +182,44 @@ enum Col {
         lens: Vec<i64>,
         elems: Vec<i64>,
     },
+    /// A list of RECORDS: the same per-row element count, and one flattened
+    /// buffer per NAMED field.
+    ///
+    /// `IntList` above is this same layout with its single field left unnamed.
+    /// The distinction is the schema path and nothing else — `ColumnRef::List`
+    /// documents it as `None` naming the elements themselves (`list[]`) and
+    /// `Some(f)` naming one record field (`list[].f`) — so a record column is
+    /// something the batch machine already carries, not something added for
+    /// these cases.
+    RecordList {
+        lens: Vec<i64>,
+        fields: Vec<(&'static str, Scalars)>,
+    },
+}
+
+/// One record field's flattened buffer.
+///
+/// Deliberately not a [`Col`]: a `Col` is a whole column and may itself be a
+/// list, and a field of a record may not.
+enum Scalars {
+    Int(Vec<i64>),
+    Str(Vec<String>),
+}
+
+impl Scalars {
+    fn replicate(&self, k: usize) -> Scalars {
+        match self {
+            Scalars::Int(c) => Scalars::Int(c.repeat(k)),
+            Scalars::Str(c) => Scalars::Str(c.iter().cycle().take(c.len() * k).cloned().collect()),
+        }
+    }
+
+    fn column_ref(&self) -> ColumnRef<'_> {
+        match self {
+            Scalars::Int(c) => ColumnRef::Int(c),
+            Scalars::Str(c) => ColumnRef::Str(c),
+        }
+    }
 }
 
 impl Col {
@@ -206,6 +244,13 @@ impl Col {
                 lens: lens.repeat(k),
                 elems: elems.repeat(k),
             },
+            Col::RecordList { lens, fields } => Col::RecordList {
+                lens: lens.repeat(k),
+                fields: fields
+                    .iter()
+                    .map(|(name, values)| (*name, values.replicate(k)))
+                    .collect(),
+            },
         }
     }
 
@@ -217,6 +262,13 @@ impl Col {
             Col::IntList { lens, elems } => ColumnRef::List {
                 lens,
                 fields: vec![(None, ColumnRef::Int(elems))],
+            },
+            Col::RecordList { lens, fields } => ColumnRef::List {
+                lens,
+                fields: fields
+                    .iter()
+                    .map(|(name, values)| (Some(*name), values.column_ref()))
+                    .collect(),
             },
         }
     }
@@ -305,6 +357,34 @@ impl Case {
     fn int_list(self, name: &str, elems: Vec<i64>) -> Case {
         let lens = vec![elems.len() as i64];
         self.col(name, ValType::Int, "[]", Col::IntList { lens, elems })
+    }
+
+    /// A list of records: ONE column, and one schema path PER FIELD.
+    ///
+    /// Not routed through [`Case::col`], which declares exactly one path. The
+    /// batch carries `items` once, but the lowering has to be told
+    /// `items[].price` and `items[].name` separately, so the two counts differ
+    /// and the helper that assumes they do not cannot be reused.
+    fn record_list(
+        mut self,
+        name: &str,
+        len: i64,
+        fields: Vec<(&'static str, ValType, Scalars)>,
+    ) -> Case {
+        for (field, ty, _) in &fields {
+            self.schema.push((format!("{name}[].{field}"), *ty));
+        }
+        self.cols.push((
+            name.to_string(),
+            Col::RecordList {
+                lens: vec![len],
+                fields: fields
+                    .into_iter()
+                    .map(|(field, _, values)| (field, values))
+                    .collect(),
+            },
+        ));
+        self
     }
 
     fn stock(mut self, f: impl Fn(&mut Context<'static>) + 'static) -> Case {
@@ -494,6 +574,123 @@ fn cases() -> Vec<Case> {
             .in_body_ladder(BODY_ELEMS),
         );
     }
+
+    // Container-bodied comprehensions. Every body above is integer arithmetic
+    // over a scalar, which is the one shape whose loop never puts a container
+    // on the operand stack: no body on the board reads a field, an index or a
+    // nested list, and CEL's own canonical use — policy over structured
+    // attributes — is entirely made of those.
+    //
+    // `record_map_scaling/N` runs `map_list_scaling/N`'s element counts through
+    // the same `map` with `x * 2` replaced by `i.price`. It is a SIGN TEST, not
+    // a paired control: the two bodies differ in three ways at once, and the
+    // three do not share a sign.
+    //
+    //     `x * 2`    3 instructions, 2 drops, 0 atomics
+    //     `i.price`  2 instructions, 1 drop,  2 atomics
+    //
+    // `GetField` pops its operand, reads the field through a reference and
+    // drops it at the arm's end, so the element's `Arc` is incremented by the
+    // `LoadLocal` and decremented there. Two fewer of one thing and two more of
+    // another bounds nothing in either direction, so differencing the two
+    // ladders answers exactly one question -- whether the container traffic
+    // outweighs the instruction and the drop it saves -- and nothing more
+    // quantitative than that.
+    //
+    // This is not a fixable rung design. A field read IS an instruction, so no
+    // record body can read a field and still match a scalar body's instruction
+    // count; the matched pair was unachievable here rather than unachieved. The
+    // pair that IS matched is `record_exists_int` against `record_exists_str`.
+    //
+    // ⚠ `record_filter` is NOT the paired control for `filter_list_scaling`.
+    // `i.price > 10` admits 989 of 1 000 elements and `x % 2 == 0` admits half,
+    // so they run a different number of appends per element. The predicate is
+    // the shape a policy actually has, which is why it is kept, but the two are
+    // not differenceable.
+    /// Which fields a record case declares.
+    ///
+    /// Load-bearing twice, so it is a parameter rather than one fixed set.
+    /// `RowReader::scope` rebuilds a record element from the DECLARED fields
+    /// and `run_case`'s drift gate compares that against the hand-built
+    /// activation, so the two field sets have to be the same set. And a field
+    /// the expression never reads is not free: the batch encodes it at `bind`
+    /// and RANKS a string column there, so an unread `name` would inflate
+    /// `bind ns` and `encode ns` for a column the timed expression never
+    /// touches — and `record_map_scaling`'s whole purpose is to be comparable
+    /// to `map_list_scaling`, which binds one int column.
+    #[derive(Clone, Copy)]
+    enum Fields {
+        Price,
+        PriceAndName,
+    }
+
+    fn record_case(label: &str, src: &str, n: i64, fields: Fields) -> Case {
+        let prices: Vec<i64> = (0..n).collect();
+        let names: Vec<String> = (0..n).map(|i| format!("n{i}")).collect();
+        // The walker's activation, built the way every other case builds one:
+        // a list of maps, over exactly the declared fields.
+        let stock: Vec<Value> = (0..n as usize)
+            .map(|i| match fields {
+                Fields::Price => map_of(vec![("price", Value::Int(prices[i]))]),
+                Fields::PriceAndName => map_of(vec![
+                    ("price", Value::Int(prices[i])),
+                    ("name", Value::from(names[i].clone())),
+                ]),
+            })
+            .collect();
+        let declared = match fields {
+            Fields::Price => vec![("price", ValType::Int, Scalars::Int(prices))],
+            Fields::PriceAndName => vec![
+                ("price", ValType::Int, Scalars::Int(prices)),
+                ("name", ValType::Str, Scalars::Str(names)),
+            ],
+        };
+        Case::new(label, src)
+            .record_list("items", n, declared)
+            .stock(move |ctx| ctx.add_variable_from_value("items", Value::list(stock.clone())))
+    }
+
+    for n in [1i64, 10, 100, 1_000, 10_000] {
+        cases.push(
+            record_case(
+                &format!("record_map_scaling/{n}"),
+                "items.map(i, i.price)",
+                n,
+                Fields::Price,
+            )
+            .in_ladder("record_map_scaling", n),
+        );
+    }
+
+    // The element count the three flat record cases share, so they are
+    // comparable with each other and with the ladder's own n = 1 000 rung.
+    const RECORD_ELEMS: i64 = 1_000;
+    cases.push(record_case(
+        "record_filter",
+        "items.filter(i, i.price > 10)",
+        RECORD_ELEMS,
+        Fields::Price,
+    ));
+    // An int-keyed and a string-keyed `exists` over the SAME activation and the
+    // same shape, so the pair isolates the field's type and nothing else. Both
+    // declare BOTH fields for that reason: the pair has to bind identical
+    // columns, or the difference between them would include the binding.
+    //
+    // Neither predicate can match — prices are `0..n` and names are `n0..`, so
+    // both scan every element and answer `false`. A matching predicate would
+    // short-circuit, and the two would then scan different numbers of elements.
+    cases.push(record_case(
+        "record_exists_int",
+        "items.exists(i, i.price == -1)",
+        RECORD_ELEMS,
+        Fields::PriceAndName,
+    ));
+    cases.push(record_case(
+        "record_exists_str",
+        r#"items.exists(i, i.name == "zz")"#,
+        RECORD_ELEMS,
+        Fields::PriceAndName,
+    ));
     cases
 }
 
@@ -1064,6 +1261,9 @@ fn row_cost(case: &Case, lowered: &BatchProgram, tier: Tier) -> (Option<f64>, Op
         .iter()
         .map(|(_, c)| match c {
             Col::IntList { elems, .. } => elems.len().max(1),
+            // Counted the same way, or a record row reads as ONE element and
+            // the budget replicates it a thousandfold.
+            Col::RecordList { lens, .. } => (lens.iter().sum::<i64>().max(1)) as usize,
             _ => 1,
         })
         .max()
@@ -1616,7 +1816,13 @@ fn print_row_cost_table(rows: &[Row]) {
         "\nper-row cost BY TIER — one replicated-batch slope, run on three tiers.\n\
          `interp` is the traced portal with its trace threshold at `u32::MAX`, so it can\n\
          never compile: that column is the per-row cost BEFORE compiling and `jit` is the\n\
-         same row AFTER. `clean` is the plain VM, the floor under both."
+         same row AFTER. `clean` is the same columnar program on the batch machine's\n\
+         UNTRACED interpreter, the floor under both.\n\
+         \n\
+         ⚠ `clean` is NOT `cel::vm`. It is `BoundBatch::collect_on(Tier::Clean)`, a plain\n\
+         `match` interpreter over the LOWERED columnar code — registers and banks over\n\
+         flattened `ColumnRef` buffers. No `Value`, no `Arc`, no stack. The VM column on\n\
+         this board is `exec`, and it is the only one whose cost is about `interp.rs`."
     );
     println!(
         "{:<28} {:>10} {:>11} {:>9} {:>12} {:>10} {:>11} {:>9} {:>9}",
@@ -1990,7 +2196,8 @@ fn main() {
          ESTIMATED to save on this run: rows times a per-row rate plus elements times a\n\
          per-element one, each rate set by that loop's word count less a fixed per-unit\n\
          cost a word count cannot see. Below `JIT_ENTRY_PS` the run does not save what\n\
-         reaching compiled code costs, so it stays on the plain VM. `words` is the same\n\
+         reaching compiled code costs, so it stays on `clean` — the batch machine's\n\
+         untraced interpreter, not `cel::vm`. `words` is the same\n\
          run's size on either tier, printed beside it because the two were once one\n\
          decision. `route` says which side of that each case\n\
          landed, and `auto ns` should track whichever of the two columns to its left the\n\
@@ -2074,6 +2281,74 @@ fn main() {
          prediction and a hot cache. His regime has the same property — he re-evaluates\n\
          one fixed activation — so the comparison is symmetric, but neither side's number\n\
          is what varying data would cost."
+    );
+    println!(
+        "\nThe `record_*` cases are the only ones whose comprehension body carries a\n\
+         CONTAINER. Every other body on this board is integer arithmetic over a scalar,\n\
+         which is the one shape whose loop never puts a container on the operand stack —\n\
+         and structured attributes are what CEL is actually used over.\n\
+         \n\
+         ⚠ `record_map_scaling/N` is a SIGN TEST against `map_list_scaling/N`, not a\n\
+         paired control. Same element counts and the same `map`, but the two differ three\n\
+         ways at once and the three do not share a sign.\n\
+         \n\
+         In the BODY: `x * 2` is 3 instructions, 2 drops, 0 atomics; `i.price` is 2\n\
+         instructions, 1 drop, 2 atomics — `LoadLocal i` clones the element's `Map` and\n\
+         `GetField` pops it, reads through a reference and drops it again.\n\
+         \n\
+         ⚠ But a ladder-vs-ladder difference is NOT body-scoped, and the SCAFFOLDING\n\
+         carries two more atomics that a body table cannot see. `IterAt` is\n\
+         `value_index(sequence, index)`, which returns an OWNED `Value`, so it clones the\n\
+         element every iteration; and `StoreLocal iter_var` drops what the slot held\n\
+         before, which is the PREVIOUS element. Both are `Value::Int` on\n\
+         `map_list_scaling` and `Value::Map` here. So the per-element difference between\n\
+         the two ladders is: −1 instruction, −1 drop, and **+4 atomic RMWs**, not +2.\n\
+         The clone and drop COUNTS are equal across the two; what differs is which arm of\n\
+         `drop_glue::<Value>` each takes — the `Map` arm against the do-nothing one.\n\
+         \n\
+         A difference of terms with mixed signs bounds nothing in either direction, so\n\
+         what the pair answers is whether that container traffic outweighs the\n\
+         instruction and the drop it saves, and nothing more quantitative. It cannot be\n\
+         repaired by a better rung: a field read IS an instruction, so no record body\n\
+         matches a scalar body's instruction count. The matched pair is\n\
+         `record_exists_int` against `record_exists_str` below.\n\
+         \n\
+         ⚠ The column that answers it is `exec`, and ONLY `exec`. The three components\n\
+         are instructions, drops and `Arc` traffic in `cel/src/vm/interp.rs`, and none of\n\
+         them exist on `clean`/`majit`/`auto`, which read `items[].price` as a flattened\n\
+         `i64` column with no `Value` and no refcount anywhere in it. Those columns\n\
+         answer a different and also interesting question — whether the COLUMNAR tier\n\
+         cares about record shape — and must be reported under that heading.\n\
+         \n\
+         `record_exists_int` and `record_exists_str` ARE a matched pair, and the only one\n\
+         here that earns the word: same `exists`, same instruction sequence, same drop\n\
+         count, the same CONTAINER atomics, identical declared columns, and neither\n\
+         predicate matchable so neither short-circuits. They differ in the field's type\n\
+         and in nothing else.\n\
+         \n\
+         ⚠ What that pair isolates is NOT the container's refcount traffic. That is FOUR\n\
+         atomics per element and it is identical on both rungs: `IterAt` clones the\n\
+         element out of the list, `StoreLocal` drops the previous one, `LoadLocal i`\n\
+         clones it again and the field read drops that clone — whichever field is named.\n\
+         \n\
+         What differs is FOUR MORE on the string rung, none of them on the container:\n\
+         `value_field` returns `v.into_owned()`, so a string field CLONES its\n\
+         `Arc<String>` where an int field copies; `LoadConst \"zz\"` clones the constant's\n\
+         `Arc<String>` every iteration; and `Equals` pops both operands by value and\n\
+         drops them. Int rung: none of the four. So the pair prices a string-valued\n\
+         attribute against an int-valued one — a real question for policy evaluation —\n\
+         and it does not price the loop.\n\
+         \n\
+         ⚠ The batch columns on the string rung are not comparable to the walker's.\n\
+         `ValType::Str` carries a string as its order-preserving i64 RANK among the\n\
+         batch's distinct strings, so the compiled tiers pay neither the container atomic\n\
+         nor the answer's. `exec/auto` and `stock/auto` will therefore be wider there than\n\
+         on the int rung for a reason that is about representation and not about the loop.\n\
+         \n\
+         ⚠ `record_filter` is NOT `filter_list_scaling`'s control. `i.price > 10` admits\n\
+         989 of 1 000 elements where `x % 2 == 0` admits half, so the two run a different\n\
+         number of appends per element. It is here because it is the shape a policy has,\n\
+         not because it differences against anything."
     );
     print_decomposition(&rows);
     print_body_ladder(&rows);
