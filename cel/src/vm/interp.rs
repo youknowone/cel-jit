@@ -60,18 +60,23 @@ pub fn cel_eval_loop(code: &CelCode, ctx: &Context) -> Result<Value, ExecutionEr
 enum Operand {
     Value(Value),
     List(Vec<Value>),
-    /// Boxed because an inline [`HashMap`] is 48 bytes and would set the width
-    /// of every entry on the stack, including the [`Operand::Value`] that
-    /// almost all of them are. The box costs one allocation per map literal --
-    /// paid only where a map literal appears -- and takes the entry from 56
-    /// bytes to 32.
+    /// Behind a pointer because an inline [`HashMap`] is 48 bytes and would
+    /// set the width of every entry on the stack, including the
+    /// [`Operand::Value`] that almost all of them are; the indirection takes
+    /// the entry from 56 bytes to 32.
     ///
-    /// `clippy::box_collection` argues the opposite -- that the map is on the
-    /// heap already and the box only adds an allocation. That is the trade
-    /// being made here on purpose, and the width it buys is asserted below, so
-    /// the lint is off for this variant rather than followed.
-    #[allow(clippy::box_collection)]
-    Map(Box<HashMap<Key, Value>>),
+    /// The pointer is the [`Arc`] the finished [`Map`] holds, not a [`Box`],
+    /// so the table is built where it lands. Both are 8 bytes here, but a
+    /// `Box` is a different allocation from the one [`Map::object`] needs:
+    /// closing the literal then had to allocate the `Arc`, move the 48-byte
+    /// table into it and free the box -- one allocation and one move per map
+    /// literal, spent only on handing the table over. `finish` now passes the
+    /// same pointer through.
+    ///
+    /// An in-progress table is never shared -- the operand holds the only
+    /// reference until `finish` gives it away -- so `Arc::get_mut` answers
+    /// every insert; see [`Vm::map_mut`].
+    Map(Arc<HashMap<Key, Value>>),
     /// The `names` index of the message type, and the fields set so far. The
     /// type is checked when the struct is opened, so that a bad type name
     /// fails before the field expressions run, as it does in the walker.
@@ -87,10 +92,11 @@ enum Operand {
 /// The stack entry must stay narrow, because `Vm::new` sizes the operand stack
 /// at `max_stack` entries and almost every one of them holds a bare [`Value`].
 ///
-/// Measured: boxing `Map` alone takes this from 56 to 32. Boxing `Struct` as
-/// well changes nothing -- its payload is 32 bytes and the discriminant fits in
-/// the padding after `NameId` -- so a later variant wider than [`Value`] costs
-/// 8 bytes on every entry and fails here rather than in a benchmark.
+/// Measured: putting `Map` behind a pointer alone takes this from 56 to 32.
+/// Doing the same to `Struct` changes nothing -- its payload is 32 bytes and
+/// the discriminant fits in the padding after `NameId` -- so a later variant
+/// wider than [`Value`] costs 8 bytes on every entry and fails here rather
+/// than in a benchmark.
 const _: () = {
     assert!(core::mem::size_of::<Operand>() == 32);
 };
@@ -109,6 +115,21 @@ struct Vm<'a> {
     /// absorbed, so a comprehension whose body errors on every iteration does
     /// not accumulate a table the size of the sequence.
     cold: Vec<ExecutionError>,
+    /// Arguments a missed [`OpCode::CallQualified`] popped, held for the
+    /// [`OpCode::CallMethod`] the compiler emitted right after it.
+    ///
+    /// The pair is one call. The probe has to pop its arguments to ask
+    /// `find_overload` about them, and the receiver path then wants the same
+    /// values in the same order; re-pushing them for `pop_n` to rebuild is a
+    /// second `Vec` per member call on an identifier receiver, which is an
+    /// allocation the walker never pays -- it resolves its arguments once and
+    /// lends the probe a slice.
+    ///
+    /// Live only across the `LoadVar` that loads the receiver, and cleared on
+    /// both ways out: taken by [`OpCode::CallMethod`], and dropped by
+    /// [`Vm::unwind`], which is where that load's error goes when a `&&`/`||`
+    /// absorbs it and the method call never runs.
+    pending_args: Option<Vec<Value>>,
 }
 
 impl<'a> Vm<'a> {
@@ -120,6 +141,7 @@ impl<'a> Vm<'a> {
             slots: vec![Value::Null; code.n_slots as usize],
             logic: vec![Err(CelErr::InternalError); code.n_logic as usize],
             cold: Vec::new(),
+            pending_args: None,
         }
     }
 
@@ -232,7 +254,7 @@ impl<'a> Vm<'a> {
         match operand {
             Operand::Value(value) => Ok(value),
             Operand::List(items) => Ok(Value::list(items)),
-            Operand::Map(entries) => Ok(Value::Map(Map::object(Arc::new(*entries)))),
+            Operand::Map(entries) => Ok(Value::Map(Map::object(entries))),
             Operand::Struct(name, fields) => self.close_struct(name, fields),
         }
     }
@@ -274,7 +296,46 @@ impl<'a> Vm<'a> {
 
     /// The `n` topmost operands, in the order they were pushed.
     fn pop_n(&mut self, n: usize) -> CelResult<Vec<Value>> {
-        let mut args = Vec::with_capacity(n);
+        self.pop_n_spare(n, 0)
+    }
+
+    /// [`Vm::pop_n`] with room for the receiver [`Vm::call_member`] prepends.
+    ///
+    /// `call_member` builds the receiver-first vector that
+    /// `Env::find_member_overload` matches on by `insert`ing the target at
+    /// index 0. A vector sized to exactly the arity has `len == capacity`, so
+    /// that insert reallocates and copies -- once per member call, at every
+    /// arity from 1 upward.
+    ///
+    /// Arity 0 is excluded, and the guard is what makes this an improvement
+    /// rather than a trade. `Vec::with_capacity(0)` allocates NOTHING;
+    /// `Vec::with_capacity(1)` allocates. So at arity 0 the reservation buys
+    /// nothing even on the member path -- unreserved, `insert` grows the empty
+    /// vector once; reserved, the reservation IS that one allocation. A wash
+    /// there, and a pure loss on the path below.
+    ///
+    /// Both opcodes that can reach `call_member` pop through here.
+    /// `CallMethod` is the obvious one; `CallQualified` is the other, because
+    /// a miss hands its vector on rather than re-pushing it, and the compiler
+    /// only ever emits the probe ahead of a `CallMethod` of the same arity
+    /// (`compile::tests::a_probe_and_its_member_call_agree_on_arity`). The
+    /// probe pops BEFORE it knows hit from miss, and a HIT never fills the
+    /// spare slot -- so above arity 0, where the vector is allocated either
+    /// way, widening it costs nothing, but at arity 0 it turns a call that
+    /// allocated no argument vector at all into one that does. Nullary
+    /// namespaced overloads are ordinary: `optional.none` is one, and so is
+    /// any `ctx.add_function("ns.f", || ..)`.
+    ///
+    /// The spare slot stays a property of these sites rather than of `pop_n`,
+    /// which [`OpCode::CallHost`] also uses and which has no receiver.
+    fn pop_n_for_member(&mut self, n: usize) -> CelResult<Vec<Value>> {
+        self.pop_n_spare(n, usize::from(n > 0))
+    }
+
+    /// The `n` topmost operands, in the order they were pushed, in a vector
+    /// with `spare` further slots of capacity.
+    fn pop_n_spare(&mut self, n: usize, spare: usize) -> CelResult<Vec<Value>> {
+        let mut args = Vec::with_capacity(n + spare);
         for _ in 0..n {
             args.push(self.pop()?);
         }
@@ -289,9 +350,16 @@ impl<'a> Vm<'a> {
         }
     }
 
+    /// The map literal on top of the stack, open for the next insert.
+    ///
+    /// `Arc::get_mut` cannot fail here: the operand is the only holder of that
+    /// pointer until [`Vm::finish`] hands it to [`Map::object`], and nothing
+    /// between [`OpCode::NewMap`] and that point clones it. A `None` would be
+    /// the same internal-consistency failure as a non-map on top of the stack,
+    /// so it takes the same answer.
     fn map_mut(&mut self) -> CelResult<&mut HashMap<Key, Value>> {
         match self.stack.last_mut() {
-            Some(Operand::Map(entries)) => Ok(&mut **entries),
+            Some(Operand::Map(entries)) => Arc::get_mut(entries).ok_or(CelErr::InternalError),
             _ => Err(CelErr::InternalError),
         }
     }
@@ -332,6 +400,11 @@ impl<'a> Vm<'a> {
     /// operand is *recorded* in that operator's logic slot and the right
     /// operand still runs. Nothing else in the language catches.
     fn unwind(&mut self, err: CelErr, pc: u32) -> CelResult<u32> {
+        // Whatever a `CallQualified` miss parked belongs to a `CallMethod`
+        // that this error has just decided will not run -- whether the handler
+        // below absorbs it and lands in the right operand, or nothing catches
+        // and the evaluation ends.
+        self.pending_args = None;
         let Some(&Handler {
             land, logic, depth, ..
         }) = self.code.handler_for(pc)
@@ -418,7 +491,7 @@ impl<'a> Vm<'a> {
                     OptView::Plain => self.list_mut()?.push(value),
                 }
             }
-            OpCode::NewMap => self.stack.push(Operand::Map(Box::default())),
+            OpCode::NewMap => self.stack.push(Operand::Map(Arc::default())),
             OpCode::MapInsert | OpCode::MapInsertOptional => {
                 let value = self.pop()?;
                 let key = self.pop()?;
@@ -521,15 +594,25 @@ impl<'a> Vm<'a> {
                 self.push(value);
             }
             OpCode::CallMethod => {
+                // Taken before anything can fail, so the park cannot outlive
+                // the instruction that owns it.
+                let parked = self.pending_args.take();
                 let target = self.pop()?;
-                let args = self.pop_n(b as usize)?;
+                let args = match parked {
+                    // A `CallQualified` miss already popped them, and only the
+                    // receiver sits above.
+                    Some(args) => args,
+                    None => self.pop_n_for_member(b as usize)?,
+                };
+                debug_assert_eq!(args.len(), b as usize, "arity lost across the probe");
                 let value = self.call_member(NameId(a), target, args)?;
                 self.push(value);
             }
             OpCode::CallQualified => {
-                let args = self.pop_n(b as usize)?;
-                // A miss leaves the stack as it was, because the receiver
-                // path that follows re-pushes the same arguments.
+                let args = self.pop_n_for_member(b as usize)?;
+                // A miss parks the arguments instead of re-pushing them, so
+                // the stack the receiver path falls through to holds the
+                // receiver alone and `CallMethod` reads the park.
                 if let Some(value) = self.call_qualified(NameId(a), args)? {
                     self.push(value);
                     return Ok(Step::Jump(c));
@@ -705,18 +788,17 @@ impl<'a> Vm<'a> {
 
     /// The namespaced probe: `math.max(1, 2)`.
     ///
-    /// `None` is a miss, and a miss must leave no trace -- the receiver has
-    /// not been evaluated yet, because `optional.of(1)` names no variable
-    /// `optional`.
+    /// `None` is a miss, and a miss must leave no *evaluated* trace -- the
+    /// receiver has not run yet, because `optional.of(1)` names no variable
+    /// `optional`. It does leave `args` in [`Vm::pending_args`], which is
+    /// where the `CallMethod` after it takes them from.
     fn call_qualified(&mut self, joined: NameId, args: Vec<Value>) -> CelResult<Option<Value>> {
         let name = self.name(joined.0)?;
         if let Some(op) = self.ctx.env().find_overload(name, &args) {
             return op(args).map(Some).map_err(|e| self.park(e));
         }
         let Some(func) = self.ctx.get_function(name) else {
-            for arg in args {
-                self.push(arg);
-            }
+            self.pending_args = Some(args);
             return Ok(None);
         };
         let mut fctx = crate::FunctionContext::new(name, None, self.ctx, args);
@@ -864,6 +946,166 @@ mod tests {
             vm.cold.len() <= 1,
             "64 absorbed errors left {} parked",
             vm.cold.len()
+        );
+    }
+
+    /// A `CallQualified` miss hands its arguments to the `CallMethod` the
+    /// compiler emitted after it. When the receiver load in between raises and
+    /// a short-circuit absorbs the error, that `CallMethod` never runs, and
+    /// the hand-off must not survive into the other operand's own member call.
+    ///
+    /// `undefined_name` names neither a variable nor the first half of a
+    /// function, so the probe misses and `LoadVar` raises. Both right operands
+    /// have a LITERAL receiver, which is the arm that pops its own arguments
+    /// -- so a surviving hand-off is what they would read instead, and each
+    /// answer below flips: `true` becomes a raised error, `false` does too.
+    #[test]
+    fn an_absorbed_receiver_error_does_not_leave_the_probes_arguments_waiting() {
+        let ctx = Context::default();
+        for (source, want) in [
+            (
+                r#"undefined_name.startsWith("zzz") || "hello world".contains("o w")"#,
+                true,
+            ),
+            (
+                r#"undefined_name.startsWith("o w") && "hello world".contains("zzz")"#,
+                false,
+            ),
+        ] {
+            let code = compile(&parse(source)).expect("compiles");
+            let mut vm = Vm::new(&code, &ctx);
+            let got = vm
+                .run()
+                .unwrap_or_else(|e| panic!("{source}: {:?}", vm.public_error(e)));
+            assert_eq!(got, Value::Bool(want), "{source}");
+            assert!(
+                vm.pending_args.is_none(),
+                "{source}: the probe's arguments outlived the call that popped them"
+            );
+        }
+    }
+
+    /// The argument vector a member call is given has room for the receiver
+    /// [`Vm::call_member`] prepends, so that `insert` never reallocates --
+    /// EXCEPT at arity 0, where it must have no room at all.
+    ///
+    /// A `Vec`'s capacity is not observable through the public door -- the
+    /// allocation it saves is, and `tests/allocs_per_eval.rs` is where that is
+    /// pinned. This asserts the invariant those rows rest on directly, because
+    /// a baseline row drifting up by one is a far colder trail than a name.
+    ///
+    /// The arity-0 leg is the opposite assertion rather than a relaxed one.
+    /// `Vec::with_capacity(0)` allocates nothing, so an empty vector that
+    /// leaves here with spare capacity has already spent the allocation that
+    /// reserving was supposed to save: on the member path `insert` would have
+    /// grown it once anyway, and on [`OpCode::CallQualified`]'s hit path --
+    /// which pops through here before it knows hit from miss, and which nullary
+    /// overloads like `optional.none` take -- nothing is ever inserted, so the
+    /// vector is bought and thrown away. `capacity() > 0` here is one
+    /// allocation per nullary namespaced call, which is what
+    /// `walker/qualified_call/nullary` counts.
+    #[test]
+    fn a_member_calls_argument_vector_has_room_for_its_receiver() {
+        let ctx = Context::default();
+        let code = compile(&parse("1")).expect("compiles");
+        for arity in 0..4usize {
+            let mut vm = Vm::new(&code, &ctx);
+            for i in 0..arity {
+                vm.push(Value::Int(i as i64));
+            }
+            let args = vm.pop_n_for_member(arity).expect("the stack holds them");
+            assert_eq!(args.len(), arity);
+            if arity == 0 {
+                assert_eq!(
+                    args.capacity(),
+                    0,
+                    "arity 0: reserving buys nothing here and costs an allocation"
+                );
+            } else {
+                assert!(
+                    args.capacity() > arity,
+                    "arity {arity}: prepending the receiver would reallocate"
+                );
+            }
+        }
+    }
+
+    /// The table a map literal is built in is the table the finished [`Map`]
+    /// holds, not a copy of it.
+    ///
+    /// [`OpCode::NewMap`] opens the operand in the [`Arc`] [`Map::object`]
+    /// will take, so closing the literal hands the pointer over. A `Box`
+    /// builder is the same 8 bytes on the operand stack but a different
+    /// allocation, so `finish` had to allocate the `Arc` as well and move the
+    /// 48-byte table into it -- one allocation per map literal on top of the
+    /// one that was going to happen anyway. That is `walker/map_literal` in
+    /// `tests/allocs_per_eval.rs`; this is the mechanism under that row, and a
+    /// pointer identity is a much colder trail to follow from a baseline that
+    /// drifted up by one.
+    ///
+    /// Driven through [`Vm::step`] rather than by pushing an operand by hand,
+    /// so the `NewMap`/`MapInsert` pair the compiler emits is what runs. The
+    /// literal is NESTED because that is the only shape that reaches
+    /// [`Vm::map_mut`] with an outer map already open -- the one place a
+    /// builder could come to be shared, which is what would make
+    /// `Arc::get_mut` answer `None`.
+    #[test]
+    fn a_map_literal_is_built_in_the_arc_it_is_handed_over_in() {
+        use crate::objects::MapStorage;
+
+        let ctx = Context::default();
+        let code = compile(&parse(r#"{"x": {"y": 3}}"#)).expect("compiles");
+        let mut vm = Vm::new(&code, &ctx);
+
+        // `Vm::run`'s loop with one line added: each builder is recorded the
+        // first time it is seen on top of the stack. Neither table is freed
+        // before the answer is read -- the inner one moves into the outer --
+        // so no recorded address can be reused by the other.
+        let mut opened: Vec<*const HashMap<Key, Value>> = Vec::new();
+        let mut pc = 0u32;
+        let answer = loop {
+            let (op, operands) = vm.code.decode(pc).expect("the program decodes");
+            let operands: [u32; 3] = [
+                operands.first().copied().unwrap_or(0),
+                operands.get(1).copied().unwrap_or(0),
+                operands.get(2).copied().unwrap_or(0),
+            ];
+            let next = pc + op.width();
+            let step = vm
+                .step(op, operands, pc, next)
+                .expect("the literal evaluates");
+            if let Some(Operand::Map(entries)) = vm.stack.last() {
+                let ptr = Arc::as_ptr(entries);
+                if !opened.contains(&ptr) {
+                    opened.push(ptr);
+                }
+            }
+            match step {
+                Step::Next => pc = next,
+                Step::Jump(target) => pc = target,
+                Step::Return(value) => break value,
+            }
+        };
+
+        let Value::Map(outer) = answer else {
+            panic!("a map literal evaluates to a map")
+        };
+        let MapStorage::Object(outer_entries) = outer.storage() else {
+            panic!("a map LITERAL is an owned table, not a record row")
+        };
+        let inner = match outer_entries.values().next() {
+            Some(Value::Map(inner)) => inner,
+            other => panic!("the outer table holds the inner map, got {other:?}"),
+        };
+        let MapStorage::Object(inner_entries) = inner.storage() else {
+            panic!("a map LITERAL is an owned table, not a record row")
+        };
+
+        assert_eq!(
+            opened,
+            vec![Arc::as_ptr(outer_entries), Arc::as_ptr(inner_entries)],
+            "the two tables this program built are not the two it answered with, \
+             so closing a map literal copied it instead of handing it over"
         );
     }
 

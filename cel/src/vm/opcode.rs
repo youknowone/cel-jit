@@ -129,9 +129,15 @@ pub enum OpCode {
     /// Pop `b` arguments and a receiver, call method `names[a]` on it.
     CallMethod,
     /// Try the namespaced function `names[a]` over `b` arguments: on a hit,
-    /// pop them, push the result and jump to `c`; on a miss, leave the stack
-    /// alone and fall through to the receiver-call path the compiler emitted
-    /// after it.
+    /// pop them, push the result and jump to `c`; on a miss, fall through to
+    /// the receiver-call path the compiler emitted after it.
+    ///
+    /// Either way the `b` arguments come off the stack here. A miss hands them
+    /// straight to that [`OpCode::CallMethod`] rather than pushing them back
+    /// for it to pop again, so the receiver it loads in between is the only
+    /// thing that instruction finds on the stack. The compiler's depth model
+    /// still counts them as pushed, which leaves `max_stack` an upper bound
+    /// and nothing else.
     ///
     /// `names[a]` is the *joined* name, built once at compile time. The
     /// walker asks this question on every member call whose receiver parses

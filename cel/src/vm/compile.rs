@@ -938,6 +938,42 @@ mod tests {
         );
     }
 
+    /// Every `CallQualified` is followed by a `CallMethod` of the SAME arity.
+    ///
+    /// That pairing is what lets `Vm::call_qualified`'s miss hand its popped
+    /// arguments straight to `Vm::call_member`, and it is why the probe pops
+    /// with the receiver's slot already reserved: on a miss that vector is the
+    /// one the receiver gets prepended to, and on a hit the spare slot is not
+    /// an allocation. A probe emitted without its member call would make both
+    /// claims false, so the pairing is asserted rather than assumed.
+    #[test]
+    fn a_probe_and_its_member_call_agree_on_arity() {
+        for source in [
+            "optional.of(1)",
+            "s.startsWith(\"h\")",
+            "s.noArgs()",
+            "s.three(1, 2, 3)",
+        ] {
+            let code = code_of(source);
+            let ops: Vec<_> = code
+                .instructions()
+                .map(|(_, op, args)| (op, args))
+                .collect();
+            let probes: Vec<_> = ops
+                .iter()
+                .filter(|(op, _)| *op == OpCode::CallQualified)
+                .collect();
+            assert_eq!(probes.len(), 1, "{source}: {ops:?}");
+            let members: Vec<_> = ops
+                .iter()
+                .filter(|(op, _)| *op == OpCode::CallMethod)
+                .collect();
+            assert_eq!(members.len(), 1, "{source}: {ops:?}");
+            // Operand 1 is the arity for both opcodes.
+            assert_eq!(probes[0].1[1], members[0].1[1], "{source}: {ops:?}");
+        }
+    }
+
     /// A receiver that cannot name a namespace skips the probe entirely.
     #[test]
     fn a_non_identifier_receiver_is_only_a_method_call() {

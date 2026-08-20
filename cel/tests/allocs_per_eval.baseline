@@ -385,6 +385,8 @@ walker/custom_function	2.000
 walker/real_world_policy	4.000
 walker/map_literal	2.000
 walker/map_literal/nested	4.000
+walker/qualified_call/nullary	1.000
+walker/qualified_call/nullary_then_member	2.000
 bind/clone-only/1	0.000
 bind/list-to-context/1	0.000
 bind/clone-only/10	0.000

@@ -513,6 +513,20 @@ fn cometkim_cases() -> Vec<WalkerCase> {
     // on the stack.
     cases.push(walker_case("map_literal", r#"{"a": 1, "b": 2}.a"#));
     cases.push(walker_case("map_literal/nested", r#"{"x": {"y": 3}}.x.y"#));
+    // A namespaced call of arity ZERO that HITS its overload -- `optional.none`
+    // is registered by `common::types::optional`, and so is any user
+    // `ctx.add_function("ns.f", || ..)`. Every other namespaced row in this
+    // corpus carries at least one argument, and the VM compiles `ns.f(..)` as
+    // an `OpCode::CallQualified` probe that pops its arguments BEFORE it knows
+    // hit from miss -- so arity 0 is the one width at which that pop can be
+    // made to allocate a vector nothing is ever put into, and no row here
+    // could see it (task #131). The second row puts a member call after the
+    // hit, so the probe's answer is consumed rather than returned.
+    cases.push(walker_case("qualified_call/nullary", "optional.none()"));
+    cases.push(walker_case(
+        "qualified_call/nullary_then_member",
+        "optional.none().hasValue()",
+    ));
     cases
 }
 

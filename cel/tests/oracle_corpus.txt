@@ -816,6 +816,25 @@ feat: regex string_fn variable
 cfg: regex
 want: bool(true)
 
+# A member call on an identifier receiver is compiled as a namespaced probe
+# followed by the receiver path, and the probe pops the arguments to ask about
+# them. On a miss they are handed straight to the receiver path rather than
+# pushed back, so what is popped once is never popped twice.
+#
+# These two pin the hand-off against the case where it never arrives: the
+# receiver load itself raises, a short-circuit absorbs it, and the arguments
+# must not still be waiting when the OTHER operand makes its own member call.
+# `"..."` receivers are literals, which is the arm that pops its own arguments,
+# so a surviving hand-off is exactly what they would read instead. Both answers
+# below are the ones the walker gives, which never moves an argument twice.
+expr: undefined_name.startsWith("zzz") || "hello world".contains("o w")
+feat: string_fn logic_or error
+want: bool(true)
+
+expr: undefined_name.startsWith("o w") && "hello world".contains("zzz")
+feat: string_fn logic_and error
+want: bool(false)
+
 # ---------------------------------------------------------------------------
 # Optional
 # ---------------------------------------------------------------------------
