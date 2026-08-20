@@ -1467,7 +1467,13 @@ pub fn eval_per_row(
 }
 
 /// [`eval_per_row`] on a chosen tier — for a harness comparing them, or a
-/// caller that wants the plain VM.
+/// caller that wants one named outright.
+///
+/// Every [`Tier`] here runs the LOWERED columnar code — registers and banks
+/// over flattened columns, with no `Value` on a stack. In particular
+/// [`Tier::Clean`] is the untraced interpreter over that same code, NOT
+/// `cel::vm`. The only door to `Program::execute` is the `Err` arm below,
+/// and only for the two outcomes listed there.
 pub fn eval_per_row_on(
     program: &Program,
     schema: &Schema,
