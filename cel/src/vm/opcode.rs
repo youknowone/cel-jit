@@ -40,6 +40,27 @@ pub enum OpCode {
     LoadLocal,
     /// Pop into activation-record slot `a`.
     StoreLocal,
+    /// Add one to the integer in activation-record slot `a`, in place. Nothing
+    /// is pushed and nothing is popped.
+    ///
+    /// This is a comprehension's loop counter and nothing else emits it.
+    /// Spelled out, the counter was `LoadLocal a ; LoadConst 1 ; Add ;
+    /// StoreLocal a` -- four dispatches, an operand-stack round trip and a
+    /// constant-pool entry, to add one to a number the program already owns.
+    /// The slot is named directly for the reason [`OpCode::IterLen`] gives,
+    /// and the increment is applied where the value already is.
+    ///
+    /// Unlike [`OpCode::Add`] this removes no reference counting: a counter
+    /// and the literal one are both `Value::Int`, which owns nothing. What it
+    /// removes is three instructions per element of every comprehension,
+    /// unconditionally.
+    ///
+    /// A slot holding anything but an integer is a malformed program rather
+    /// than a typing error the language can express -- the compiler writes
+    /// this slot with a zero and then only through this instruction -- so it
+    /// is refused the way [`OpCode::IterLen`] refuses a non-list, and overflow
+    /// still raises what the `Add` it replaces raised.
+    IncLocal,
 
     // -- selection --------------------------------------------------------
     /// Pop an operand, push its `names[a]` field.
@@ -255,6 +276,7 @@ impl OpCode {
             | OpCode::JumpIfTrue
             | OpCode::AndMerge
             | OpCode::OrMerge
+            | OpCode::IncLocal
             | OpCode::IterLen => 1,
 
             OpCode::CallHost | OpCode::CallMethod | OpCode::And | OpCode::Or | OpCode::IterAt => 2,
@@ -312,6 +334,9 @@ impl OpCode {
             OpCode::LoadConst | OpCode::LoadVar | OpCode::LoadLocal => (0, 1),
             // Both name their inputs by slot, so neither pops anything.
             OpCode::IterLen | OpCode::IterAt => (0, 1),
+            // Reads and writes one slot; the operand stack is not involved at
+            // all, which is the whole reason the opcode exists.
+            OpCode::IncLocal => (0, 0),
             OpCode::NewList | OpCode::NewMap | OpCode::NewStruct => (0, 1),
 
             OpCode::StoreLocal | OpCode::Return => (1, 0),
@@ -412,5 +437,14 @@ mod tests {
         assert_eq!(OpCode::CallHost.stack_effect(&[0, 3]), (3, 1));
         assert_eq!(OpCode::CallQualified.stack_effect(&[0, 0]), (0, 1));
         assert_eq!(OpCode::CallMethod.stack_effect(&[0, 2]), (3, 1));
+    }
+
+    /// Advancing a slot in place is what [`OpCode::IncLocal`] is for, so it
+    /// must cost no operand-stack traffic. Declared here rather than inferred
+    /// from an emitted program, because it is a property of the instruction.
+    #[test]
+    fn inc_local_names_a_slot_and_leaves_the_operand_stack_alone() {
+        assert_eq!(OpCode::IncLocal.operands(), 1);
+        assert_eq!(OpCode::IncLocal.stack_effect(&[0]), (0, 0));
     }
 }

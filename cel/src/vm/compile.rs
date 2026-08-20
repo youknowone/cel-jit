@@ -725,11 +725,7 @@ impl Compiler {
         self.expr(&comp.loop_step)?;
         self.emit(OpCode::StoreLocal, &[accu], id)?;
 
-        let one = self.add_const(Value::Int(1), id)?;
-        self.emit(OpCode::LoadLocal, &[index], id)?;
-        self.emit(OpCode::LoadConst, &[one], id)?;
-        self.emit(OpCode::Add, &[], id)?;
-        self.emit(OpCode::StoreLocal, &[index], id)?;
+        self.emit(OpCode::IncLocal, &[index], id)?;
         self.emit(OpCode::Jump, &[top], id)?;
 
         self.patch_to_here(exhausted);
@@ -759,7 +755,7 @@ impl Compiler {
     ///   [<guard> JumpIfFalse skip]
     ///   <element>  ListAppend            ; the push, straight into the builder
     /// skip:
-    ///   LoadLocal index  LoadConst 1  Add  StoreLocal index  Jump top
+    ///   IncLocal index  Jump top
     /// done:
     ///   StoreLocal accu                  ; finishes the builder into a Value
     ///   <result>
@@ -818,11 +814,7 @@ impl Compiler {
             self.patch_to_here(skipped);
         }
 
-        let one = self.add_const(Value::Int(1), id)?;
-        self.emit(OpCode::LoadLocal, &[index], id)?;
-        self.emit(OpCode::LoadConst, &[one], id)?;
-        self.emit(OpCode::Add, &[], id)?;
-        self.emit(OpCode::StoreLocal, &[index], id)?;
+        self.emit(OpCode::IncLocal, &[index], id)?;
         self.emit(OpCode::Jump, &[top], id)?;
 
         self.patch_to_here(exhausted);
@@ -1086,6 +1078,56 @@ mod tests {
         }
     }
 
+    /// The loop counter is advanced in place, without operand-stack traffic.
+    ///
+    /// The counter's slot is named by `IterAt`'s second operand, the way the
+    /// source slot is named by its first, so this asks about the slot the loop
+    /// actually indexes with rather than about a position in an emitted
+    /// sequence. What it pins is that the counter is written once -- before
+    /// the loop, with a zero -- and thereafter advanced by an instruction that
+    /// neither pushes nor pops. A second `StoreLocal` of that slot is the
+    /// load/add/store form coming back.
+    ///
+    /// Stated as a property for the reason
+    /// `the_comprehension_loop_never_loads_its_source_onto_the_stack` is: the
+    /// sequence is what a later change to this loop is entitled to move.
+    #[test]
+    fn the_comprehension_counter_is_advanced_without_operand_stack_traffic() {
+        for source in [
+            "xs.map(x, x * 2)",
+            "xs.filter(x, x > 0)",
+            "xs.all(x, x > 0)",
+            "xs.exists(x, x > 0)",
+        ] {
+            let code = code_of(source);
+            let counter = code
+                .instructions()
+                .find(|(_, op, _)| *op == OpCode::IterAt)
+                .map(|(_, _, operands)| operands[1])
+                .unwrap_or_else(|| panic!("{source} iterates, so it names a counter slot"));
+
+            let stores = code
+                .instructions()
+                .filter(|(_, op, operands)| *op == OpCode::StoreLocal && operands[0] == counter)
+                .count();
+            assert_eq!(
+                stores,
+                1,
+                "{source} writes counter slot {counter} through the operand stack:\n{}",
+                code.disassemble()
+            );
+
+            let advanced = code
+                .instructions()
+                .any(|(_, op, operands)| op == OpCode::IncLocal && operands[0] == counter);
+            assert!(
+                advanced,
+                "{source} must advance counter slot {counter} in place:\n{}",
+                code.disassemble()
+            );
+        }
+    }
+
     /// The handler covers the left operand and stops short of the right one,
     /// which is the whole of CEL's asymmetry: an error on the left is absorbed
     /// and an error on the right is raised.
@@ -1178,8 +1220,11 @@ mod tests {
     /// The property is stated as an opcode census rather than a timing, because
     /// the cost being removed is a *copy* and the shape is what decides whether
     /// it happens. `Add` is the discriminator: the general lowering emits one
-    /// for the step's `@result + [x]` and one for the index increment, so a
-    /// single `Add` is exactly the claim that the concatenation is gone.
+    /// for the step's `@result + [x]`, and the loop counter advances through
+    /// `IncLocal` rather than through an addition, so no `Add` at all is
+    /// exactly the claim that the concatenation is gone. The bodies here are
+    /// chosen not to contain a `+` of their own, which is what keeps the
+    /// census a statement about the accumulator.
     #[test]
     fn map_and_filter_append_rather_than_concatenate() {
         for source in [
@@ -1190,7 +1235,7 @@ mod tests {
             let code = code_of(source);
             assert_eq!(
                 count(&code, OpCode::Add),
-                1,
+                0,
                 "{source} still concatenates:\n{}",
                 code.disassemble()
             );

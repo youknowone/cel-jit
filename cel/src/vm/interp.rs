@@ -553,6 +553,25 @@ impl<'a> Vm<'a> {
                     .get_mut(a as usize)
                     .ok_or(CelErr::InternalError)? = value;
             }
+            OpCode::IncLocal => {
+                // In place, so nothing is copied onto the stack and nothing is
+                // popped back off it. The slot is a comprehension's counter,
+                // written once with a zero and thereafter only here, so a
+                // non-integer in it is a malformed stream -- the same answer
+                // `IterLen` gives a slot that does not hold a list.
+                let slot = self
+                    .slots
+                    .get_mut(a as usize)
+                    .ok_or(CelErr::InternalError)?;
+                let Value::Int(counter) = slot else {
+                    return Err(CelErr::InternalError);
+                };
+                // Named for the operator this replaces, so that the public
+                // error is the one the four-instruction form raised.
+                *counter = counter
+                    .checked_add(1)
+                    .ok_or(CelErr::Overflow(OpCode::Add))?;
+            }
 
             // -- selection ----------------------------------------------
             OpCode::GetField => {
