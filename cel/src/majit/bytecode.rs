@@ -379,21 +379,6 @@ pub enum Column<'a> {
     Str(&'a [String]),
 }
 
-/// A projected column, in the form the row loop would have stored it: the
-/// output buffer is `i64` whatever the bank, so a `double` goes in as its bit
-/// pattern and a `bool` as a widened byte.
-///
-/// A `string` column is named rather than carried, because the values the loop
-/// stores are not the caller's strings but the ids [`prepare_batch_reduce`]
-/// ranked them into, and those live in the run's own `str_ids`.
-#[derive(Debug, Clone, Copy)]
-enum Projected<'a> {
-    Int(&'a [i64]),
-    Float(&'a [f64]),
-    Bool(&'a [bool]),
-    StrIds,
-}
-
 impl Column<'_> {
     /// Number of rows.
     pub fn len(&self) -> usize {
@@ -508,13 +493,13 @@ pub struct BatchRun<'a> {
     /// for as long as the run is. Each is separately heap-allocated, so moving
     /// the `BatchRun` moves the box pointers and not the buffers they address.
     ///
-    /// Read only by [`BatchRun::project`], which needs a `string` column in the
-    /// ids the program would have loaded rather than in the caller's strings.
+    /// Never read after preparation: a `string` projection reads its ids
+    /// there, and nothing else consults them.
     str_ids: Vec<Box<[i64]>>,
-    /// The input column a projection's row loop would copy out, when this run
-    /// is one ([`super::lower::LoweredF::is_row_projection`], bound
-    /// [`BatchReduce::PerRow`]). `None` for every other program.
-    projection: Option<Projected<'a>>,
+    /// Whether this run is a projection ([`super::lower::LoweredF::is_row_projection`],
+    /// bound [`BatchReduce::PerRow`]), whose output buffer
+    /// [`prepare_batch_reduce`] has already filled.
+    projection: bool,
     /// One `i64` per row, under [`BatchReduce::PerRow`]: where the loop stores
     /// each row's result. Boxed for the same reason `trap` is — `init_regs`
     /// holds a raw pointer to it, which must survive the run moving.
@@ -573,51 +558,33 @@ impl<'a> BatchRun<'a> {
         Some(result)
     }
 
-    /// Fill the output buffer of a PROJECTION without running its loop, and
-    /// report whether that applied.
+    /// Whether this run is a PROJECTION, whose output buffer already holds the
+    /// answer.
     ///
     /// A projection's row loop reads one column element and stores it, so the
-    /// buffer it produces is the input column in the output's encoding. Writing
-    /// it as a copy is the same answer arrived at without dispatching the five
-    /// instructions per row that spell the copy out — and, for a batch of any
-    /// height, without dispatching them once per row.
+    /// buffer it produces is the input column in the output's encoding. The
+    /// columns are borrowed for as long as the run is and cannot change under
+    /// it, which makes that buffer a function of data already fixed when the
+    /// batch was prepared -- so [`prepare_batch_reduce`] writes it there, once,
+    /// and a call reads what is already in it rather than copying the column
+    /// again. For a batch of any height that is the same answer without the
+    /// five instructions per row that spell the copy out, and without a pass
+    /// over the column per call.
     ///
-    /// Nothing here can trap: a projection does no arithmetic, so the flag the
-    /// loop's epilogue would have published is the clear one it starts at.
+    /// Nothing here can fail: a projection does no arithmetic, so the trap flag
+    /// a loop's epilogue would publish stays the clear one the run starts at.
+    /// That is also why running the SAME program on a tracing tier leaves the
+    /// buffer intact -- the loop writes the same values back over it.
     ///
     /// `false` means this run is not a projection and the caller must run the
-    /// program. That is the only thing it can mean — a projection cannot fail.
+    /// program. That is the only thing it can mean.
     ///
     /// Not part of the public surface: which runs take the shortcut is the
     /// batch layer's decision, made once in [`super::batch::BoundBatch`], and a
     /// caller reaching past it could take it on a tier whose counters are about
     /// what the program costs.
-    pub(super) fn project(&mut self) -> bool {
-        let Some(projected) = self.projection else {
-            return false;
-        };
-        let rows = self.rows;
-        let out = self
-            .out
-            .as_mut()
-            .expect("a projection is only planned for a per-row run, which owns an output buffer");
-        let out = &mut out[..rows];
-        match projected {
-            Projected::Int(col) => out.copy_from_slice(&col[..rows]),
-            Projected::Float(col) => {
-                for (o, &v) in out.iter_mut().zip(&col[..rows]) {
-                    *o = v.to_bits() as i64;
-                }
-            }
-            Projected::Bool(col) => {
-                for (o, &v) in out.iter_mut().zip(&col[..rows]) {
-                    *o = i64::from(v);
-                }
-            }
-            Projected::StrIds => out.copy_from_slice(&self.str_ids[0][..rows]),
-        }
-        *self.trap = 0;
-        true
+    pub(super) fn project(&self) -> bool {
+        self.projection
     }
 
     /// The per-row results the last [`BatchRun::run`] stored, one `i64` per row
@@ -830,19 +797,35 @@ pub fn prepare_batch_reduce<'a>(
         shape
             .seed
             .regs_list(&bases, &scalars, n as i64, trap_addr, out_addr, &list_addrs);
-    // What a projection's loop would copy out, decided here rather than per
-    // run: it is a property of the program and the columns, both of which are
-    // fixed once the batch is prepared. A `string` column's ids are in
-    // `str_ids`, whose only entry it is — a program with a body is not a
-    // projection, and only a body can ask for a predicate table.
+    // What a projection's loop would have copied out, copied out HERE instead:
+    // it is a property of the program and the columns, both of which are fixed
+    // once the batch is prepared, so no later call has anything to recompute.
+    // The output buffer is `i64` whatever the bank, so a `double` goes in as
+    // its bit pattern and a `bool` as a widened byte. A `string` column goes in
+    // as the ids the loop would have loaded rather than as the caller's
+    // strings, and those are `str_ids`' only entry — a program with a body is
+    // not a projection, and only a body can ask for a predicate table.
     let projection = match (reduce, lowered.is_row_projection()) {
-        (BatchReduce::PerRow, true) => Some(match columns[0] {
-            Column::Int(c) => Projected::Int(c),
-            Column::Float(c) => Projected::Float(c),
-            Column::Bool(c) => Projected::Bool(c),
-            Column::Str(_) => Projected::StrIds,
-        }),
-        _ => None,
+        (BatchReduce::PerRow, true) => {
+            let buf = out.as_mut().expect("a per-row run owns an output buffer");
+            let buf = &mut buf[..n];
+            match columns[0] {
+                Column::Int(c) => buf.copy_from_slice(&c[..n]),
+                Column::Float(c) => {
+                    for (o, &v) in buf.iter_mut().zip(&c[..n]) {
+                        *o = v.to_bits() as i64;
+                    }
+                }
+                Column::Bool(c) => {
+                    for (o, &v) in buf.iter_mut().zip(&c[..n]) {
+                        *o = i64::from(v);
+                    }
+                }
+                Column::Str(_) => buf.copy_from_slice(&str_ids[0][..n]),
+            }
+            true
+        }
+        _ => false,
     };
     // A refcount bump on the words `lowered` owns, not a copy: every batch of
     // this expression runs the same allocation, so the JIT's green key — and

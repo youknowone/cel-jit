@@ -1715,6 +1715,11 @@ mod tests {
     /// The tiers are the oracle here rather than a hand-written expectation:
     /// they still run the program, so a copy that encodes a row differently
     /// than the loop stores it disagrees with three witnesses at once.
+    ///
+    /// The clean tier is asked FIRST, on a batch no loop has run over, because
+    /// the copy is written when the batch is prepared: asking it only after a
+    /// tracing tier had filled the same buffer would let a wrong copy pass on
+    /// the values that tier wrote over it.
     #[test]
     fn a_projection_answers_what_the_loop_it_replaces_answers() {
         let strs: Vec<String> = ["pear", "fig", "apple", "fig"]
@@ -1748,8 +1753,10 @@ mod tests {
                 };
                 let batch = Batch::new(rows).column(name, col);
                 let bound = program.bind_per_row(&batch).unwrap();
+                let cold_clean = bound.collect_on(Tier::Clean).unwrap();
                 let want = bound.collect_on(Tier::Interpreter).unwrap();
                 assert_eq!(want.len(), rows, "{name} at {rows} rows");
+                assert_eq!(cold_clean, want, "{name} at {rows} rows, before any run");
                 for tier in [Tier::Auto, Tier::Clean, Tier::Jit] {
                     assert_eq!(bound.collect_on(tier).unwrap(), want, "{name}: {tier:?}");
                 }
