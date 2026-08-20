@@ -156,9 +156,22 @@ pub enum OpCode {
     /// Distinct from [`OpCode::IterElems`] only for lists, where
     /// `xs.all(i, v, ...)` binds `i` to the index and `v` to the element.
     IterKeys,
-    /// Pop a sequence, push its length as an int.
+    /// Push the length of the list in slot `a`. Nothing is popped.
+    ///
+    /// The sequence is named by SLOT rather than taken from the stack because
+    /// the loop that emits this runs it once per element, and reaching a slot
+    /// through [`OpCode::LoadLocal`] copies what is in it: for a list that is
+    /// a `ListRef` clone, whose `Arc` refcount is an atomic increment matched
+    /// by a decrement when this instruction drops the copy again. Reading the
+    /// slot in place costs neither, and the `LoadLocal` itself stops being
+    /// emitted at all.
     IterLen,
-    /// Pop an index and a sequence, push the element at that index.
+    /// Push the element of the sequence in slot `a` at the index in slot `b`.
+    /// Nothing is popped.
+    ///
+    /// Both inputs are named by slot for the reason [`OpCode::IterLen`] gives;
+    /// between them the two accounted for four atomic refcount operations per
+    /// element, on one shared count.
     ///
     /// The index is produced by the compiler's own counter, so it is in range
     /// by construction rather than by a check.
@@ -231,9 +244,10 @@ impl OpCode {
             | OpCode::JumpIfOptNone
             | OpCode::JumpIfTrue
             | OpCode::AndMerge
-            | OpCode::OrMerge => 1,
+            | OpCode::OrMerge
+            | OpCode::IterLen => 1,
 
-            OpCode::CallHost | OpCode::CallMethod | OpCode::And | OpCode::Or => 2,
+            OpCode::CallHost | OpCode::CallMethod | OpCode::And | OpCode::Or | OpCode::IterAt => 2,
 
             OpCode::CallQualified => 3,
 
@@ -262,8 +276,6 @@ impl OpCode {
             | OpCode::NotStrictlyFalse
             | OpCode::IterElems
             | OpCode::IterKeys
-            | OpCode::IterLen
-            | OpCode::IterAt
             | OpCode::Return => 0,
         }
     }
@@ -288,6 +300,8 @@ impl OpCode {
         let arity = |index: usize| operands.get(index).copied().unwrap_or(0);
         match self {
             OpCode::LoadConst | OpCode::LoadVar | OpCode::LoadLocal => (0, 1),
+            // Both name their inputs by slot, so neither pops anything.
+            OpCode::IterLen | OpCode::IterAt => (0, 1),
             OpCode::NewList | OpCode::NewMap | OpCode::NewStruct => (0, 1),
 
             OpCode::StoreLocal | OpCode::Return => (1, 0),
@@ -298,9 +312,9 @@ impl OpCode {
             OpCode::GetField | OpCode::HasField | OpCode::OptSelect => (1, 1),
             OpCode::AndMerge | OpCode::OrMerge => (1, 1),
             OpCode::Not | OpCode::Negate | OpCode::NotStrictlyFalse => (1, 1),
-            OpCode::IterElems | OpCode::IterKeys | OpCode::IterLen => (1, 1),
+            OpCode::IterElems | OpCode::IterKeys => (1, 1),
 
-            OpCode::Index | OpCode::OptIndex | OpCode::IterAt => (2, 1),
+            OpCode::Index | OpCode::OptIndex => (2, 1),
             OpCode::Add
             | OpCode::Sub
             | OpCode::Mul

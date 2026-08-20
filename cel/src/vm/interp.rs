@@ -548,16 +548,25 @@ impl<'a> Vm<'a> {
                 self.push(Value::list(items));
             }
             OpCode::IterLen => {
-                let value = self.pop()?;
-                match value {
-                    Value::List(list) => self.push(Value::Int(list.len() as i64)),
+                // Read in place. The length is the only thing wanted out of
+                // the slot, and taking it through the stack would clone the
+                // whole `Value` -- an atomic refcount pair for a list -- once
+                // per element of the loop that emits this.
+                let len = match self.slots.get(a as usize).ok_or(CelErr::InternalError)? {
+                    Value::List(list) => list.len() as i64,
                     _ => return Err(CelErr::InternalError),
-                }
+                };
+                self.push(Value::Int(len));
             }
             OpCode::IterAt => {
-                let index = self.pop()?;
-                let sequence = self.pop()?;
-                let value = value_index(&sequence, &index).map_err(|e| self.park(e))?;
+                // Read in place, as `IterLen` does. The borrows end with the
+                // block, so the error path below can still park on `self`.
+                let element = {
+                    let sequence = self.slots.get(a as usize).ok_or(CelErr::InternalError)?;
+                    let index = self.slots.get(b as usize).ok_or(CelErr::InternalError)?;
+                    value_index(sequence, index)
+                };
+                let value = element.map_err(|e| self.park(e))?;
                 self.push(value);
             }
 

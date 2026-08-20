@@ -705,14 +705,11 @@ impl Compiler {
 
         let top = self.here();
         self.emit(OpCode::LoadLocal, &[index], id)?;
-        self.emit(OpCode::LoadLocal, &[source], id)?;
-        self.emit(OpCode::IterLen, &[], id)?;
+        self.emit(OpCode::IterLen, &[source], id)?;
         self.emit(OpCode::Less, &[], id)?;
         let exhausted = self.emit_forward(OpCode::JumpIfFalse, id)?;
 
-        self.emit(OpCode::LoadLocal, &[source], id)?;
-        self.emit(OpCode::LoadLocal, &[index], id)?;
-        self.emit(OpCode::IterAt, &[], id)?;
+        self.emit(OpCode::IterAt, &[source, index], id)?;
         self.emit(OpCode::StoreLocal, &[iter_var], id)?;
 
         if let (Some(range), Some(iter_var2)) = (range, iter_var2) {
@@ -757,8 +754,8 @@ impl Compiler {
     ///   <accu_init>                       ; a list literal: leaves the builder
     ///   LoadConst 0   StoreLocal index
     /// top:
-    ///   LoadLocal index  LoadLocal source  IterLen  Less  JumpIfFalse done
-    ///   LoadLocal source  LoadLocal index  IterAt   StoreLocal iter_var
+    ///   LoadLocal index  IterLen source  Less  JumpIfFalse done
+    ///   IterAt source index  StoreLocal iter_var
     ///   [<guard> JumpIfFalse skip]
     ///   <element>  ListAppend            ; the push, straight into the builder
     /// skip:
@@ -799,14 +796,11 @@ impl Compiler {
 
         let top = self.here();
         self.emit(OpCode::LoadLocal, &[index], id)?;
-        self.emit(OpCode::LoadLocal, &[source], id)?;
-        self.emit(OpCode::IterLen, &[], id)?;
+        self.emit(OpCode::IterLen, &[source], id)?;
         self.emit(OpCode::Less, &[], id)?;
         let exhausted = self.emit_forward(OpCode::JumpIfFalse, id)?;
 
-        self.emit(OpCode::LoadLocal, &[source], id)?;
-        self.emit(OpCode::LoadLocal, &[index], id)?;
-        self.emit(OpCode::IterAt, &[], id)?;
+        self.emit(OpCode::IterAt, &[source, index], id)?;
         self.emit(OpCode::StoreLocal, &[iter_var], id)?;
 
         let skipped = match append.guard {
@@ -1005,6 +999,55 @@ mod tests {
         let ops = opcodes(&code_of("xs.all(x, x > 0)"));
         assert!(ops.contains(&OpCode::IterElems), "{ops:?}");
         assert!(!ops.contains(&OpCode::IterKeys), "{ops:?}");
+    }
+
+    /// The loop reaches its source through slot operands and never puts it on
+    /// the operand stack. What that replaced was two `LoadLocal`s of the
+    /// source per element, and each of those copied the whole `Value` -- for a
+    /// list, a `ListRef` clone whose `Arc` refcount is an atomic increment,
+    /// matched by a decrement when the instruction that consumed it dropped
+    /// the copy again.
+    ///
+    /// Stated as a property rather than as an expected instruction sequence:
+    /// the sequence is what a later change to the loop is entitled to move,
+    /// and the invariant is that the source stays out of the stack traffic.
+    #[test]
+    fn the_comprehension_loop_never_loads_its_source_onto_the_stack() {
+        for source in [
+            "xs.map(x, x * 2)",
+            "xs.filter(x, x > 0)",
+            "xs.all(x, x > 0)",
+        ] {
+            let code = code_of(source);
+            let slot_of = |wanted: OpCode| {
+                code.instructions()
+                    .filter(|(_, op, _)| *op == wanted)
+                    .map(|(_, _, operands)| operands[0])
+                    .next()
+            };
+            let slot = slot_of(OpCode::IterAt)
+                .unwrap_or_else(|| panic!("{source} iterates, so it names a source slot"));
+
+            let loaded: Vec<u32> = code
+                .instructions()
+                .filter(|(_, op, _)| *op == OpCode::LoadLocal)
+                .map(|(_, _, operands)| operands[0])
+                .collect();
+            assert!(
+                !loaded.contains(&slot),
+                "{source} loads its source slot {slot}:\n{}",
+                code.disassemble()
+            );
+            // Both instructions must agree on which slot holds the sequence,
+            // or the bound is being read off something other than what is
+            // being indexed.
+            assert_eq!(
+                slot_of(OpCode::IterLen),
+                Some(slot),
+                "{source}:\n{}",
+                code.disassemble()
+            );
+        }
     }
 
     /// The handler covers the left operand and stops short of the right one,
