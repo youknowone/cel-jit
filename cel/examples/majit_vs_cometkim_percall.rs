@@ -1731,9 +1731,18 @@ fn main() {
                 );
             }
             Err(why) => {
-                // Still measured and still ANSWERED — by the tree-walker,
-                // through the library's fallback. A row missing from the table
-                // would read as an expression this crate cannot evaluate.
+                // Still measured and still ANSWERED, twice over: `stock ns`
+                // and `exec ns` are both real on this row, because neither
+                // door needs the lowering. A row missing from the table would
+                // read as an expression this crate cannot evaluate.
+                //
+                // The `majit ns` cell reads `walker` because that is the
+                // evaluator THIS FILE puts beside it, in `stock`. It is not a
+                // claim about the library's own fallback: `eval_per_row_on`
+                // answers a refused batch with one `Program::execute` per row,
+                // which under the default `vm` feature is the bytecode VM and
+                // not the walker at all. `Answered::RowByRow` is named for that
+                // door for exactly this reason.
                 println!(
                     "{:<28} {:>11.1} {:>11.1} {:>11} {:>11} {:>10} {:>7} {:>9} {:>9} {:>11} {:>11} {:>11} {:>11} {:>11} {:>12} {:>10} {:>10} {:>9} {:>12} {:>12} {:>13}",
                     r.label,

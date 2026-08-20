@@ -247,13 +247,17 @@ pub enum BatchError {
     /// A row's arithmetic trapped — an `int` overflow or a division by zero,
     /// where the tree-walker raises. No sum is the right answer.
     Trapped,
-    /// The tree-walker could not evaluate a row either, on the fallback path.
-    /// A real CEL error, not a limit of the batch model — the expression has no
-    /// value for this row however it is run.
+    /// The fallback path could not evaluate a row either. A real CEL error, not
+    /// a limit of the batch model — the expression has no value for this row
+    /// however it is run.
+    ///
+    /// The fallback is one [`crate::Program::execute`] per row, so this is
+    /// whichever evaluator that door is in this build; see
+    /// [`Answered::RowByRow`].
     Row {
         /// Which row.
         row: usize,
-        /// What the walker said.
+        /// What the failed evaluation said.
         message: String,
     },
 }
@@ -1266,17 +1270,18 @@ fn dispatch(
     }
 }
 
-/// Reads a batch's columns back as the values the tree-walker takes.
+/// Reads a batch's columns back as the values a [`Context`] evaluator takes.
 ///
 /// This is the other half of the batch model's contract. Every [`BatchError`]
 /// means "evaluate this with [`Program::execute`] instead", and without this a
 /// caller has to build that path themselves — including the two parts that are
 /// easy to get wrong:
 ///
-/// * A DOTTED column name is a NESTED MAP to the walker, not a variable with a
-///   dot in its name. `obj.nested.value` must arrive as `obj` → `nested` →
-///   `value`, or the walker raises `NoSuchKey` on an expression the batch
-///   answers.
+/// * A DOTTED column name is a NESTED MAP, not a variable with a dot in its
+///   name. `obj.nested.value` must arrive as `obj` → `nested` → `value`, or
+///   evaluation raises `NoSuchKey` on an expression the batch answers. This is
+///   not the walker's rule in particular: the VM reaches a field through the
+///   same `value_field` the walker does.
 /// * A list column's row starts at the sum of every earlier row's element
 ///   count. Walked per row that is quadratic, so the offsets are computed once
 ///   here.
@@ -1404,23 +1409,47 @@ fn cell(col: &ColumnRef, k: usize) -> Value {
     }
 }
 
-/// Which evaluator answered.
+/// Which door answered.
+///
+/// Named for the DOOR and not for the evaluator behind it, because which
+/// evaluator that is depends on a cargo feature. This enum said `Walker` until
+/// it was found to be reporting the bytecode VM on every default build; see
+/// [`Answered::RowByRow`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Answered {
     /// The lowered bytecode, on the tier that was asked for.
     Batch,
-    /// The tree-walker, row by row: the expression did not lower, or a row
-    /// trapped.
-    Walker,
+    /// One [`crate::Program::execute`] per row: the expression did not lower,
+    /// or a row trapped.
+    ///
+    /// ⚠ This is the tree-walker only where `vm` is OFF. `vm` is a DEFAULT
+    /// feature, and with it on `Program::execute` is `crate::vm::cel_eval_loop`
+    /// — so on an ordinary build this door runs the bytecode VM, row by row,
+    /// and never reaches the walker at all.
+    ///
+    /// Following `Program::execute` is the contract, not an accident: a caller
+    /// whose batch was refused gets exactly what a direct call would have given
+    /// them. What was wrong was the name — this variant was called `Walker`,
+    /// which named an evaluator it does not always run, and the whole point of
+    /// the enum is to say which path ran.
+    ///
+    /// It is not a free choice of evaluator either way. The per-call comparison
+    /// finds `Program::execute` LOSING to the walker on every case measured,
+    /// growing with expression size, so this door pays that difference — see
+    /// the `vm`-default question that measurement opened. Reasoning "the
+    /// fallback takes the walker, which is cheaper here" reads the old name and
+    /// is wrong twice.
+    RowByRow,
 }
 
 /// Every row's value for `program` over `batch` — from the batch tiers where
-/// the expression lowers and no row traps, and from the tree-walker otherwise.
+/// the expression lowers and no row traps, and from one
+/// [`crate::Program::execute`] per row otherwise.
 ///
 /// This is the batch model's whole contract in one call. An expression outside
 /// the subset and a trapped row are not outcomes a caller can act on
-/// differently — both mean "the walker owns this" — so they are taken here
-/// rather than handed back, and [`Answered`] says which path ran.
+/// differently — both mean "the row-by-row door owns this" — so they are taken
+/// here rather than handed back, and [`Answered`] says which path ran.
 ///
 /// What is still handed back is a real error: a column the expression reads and
 /// the batch does not carry, a column whose type or length disagrees, or a row
@@ -1452,7 +1481,7 @@ pub fn eval_per_row_on(
         Ok(v) => Ok((v, Answered::Batch)),
         // Only the two data-independent-of-the-caller outcomes fall back. A
         // missing or mistyped column is the caller's own description of the
-        // batch being wrong, and the walker would fail on it too.
+        // batch being wrong, and the fallback would fail on it too.
         Err(
             BatchError::Lower(_) | BatchError::Trapped | BatchError::TemporalOutOfDomain { .. },
         ) => {
@@ -1467,7 +1496,7 @@ pub fn eval_per_row_on(
                         })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            Ok((values, Answered::Walker))
+            Ok((values, Answered::RowByRow))
         }
         Err(e) => Err(e),
     }
@@ -3048,10 +3077,21 @@ mod tests {
     }
 
     /// The fallback contract: an expression the batch cannot answer is still
-    /// answered, by the tree-walker, over the SAME columns — including the two
-    /// reconstructions a caller would have to get right by hand.
+    /// answered, one [`Program::execute`] per row, over the SAME columns —
+    /// including the two reconstructions a caller would have to get right by
+    /// hand.
+    ///
+    /// ⚠ This test cannot check WHICH evaluator answered, and its green must
+    /// not be read as evidence that [`Answered::RowByRow`] is named correctly.
+    /// It asserts the returned label and the row values; the label is the thing
+    /// a wrong name gets wrong, and the values agree either way because
+    /// `tests/oracle.rs` holds the walker and the VM to the same answers. That
+    /// is how this door went by the name `Walker` while running the bytecode VM
+    /// on every default build — this test passed throughout. What the door runs
+    /// is fixed by `Program::execute`, so it is that function's `#[cfg]` and not
+    /// anything here that decides it.
     #[test]
-    fn the_walker_answers_what_the_batch_refuses() {
+    fn the_row_by_row_door_answers_what_the_batch_refuses() {
         let s = schema(&[
             ("x", ValType::Int),
             ("obj.nested.value", ValType::Int),
@@ -3084,11 +3124,11 @@ mod tests {
         assert_eq!(v[2], Value::Int(33));
 
         // Out of subset (a registered function the lowering cannot see into):
-        // the walker answers, and it needs `obj` as a NESTED MAP and the
-        // caller's own function.
+        // the row-by-row door answers, and it needs `obj` as a NESTED MAP and
+        // the caller's own function.
         let p = Program::compile("triple(obj.nested.value) + x").unwrap();
         let (v, who) = eval_per_row(&p, &s, &batch, &base).unwrap();
-        assert_eq!(who, Answered::Walker);
+        assert_eq!(who, Answered::RowByRow);
         assert_eq!(
             v,
             vec![
@@ -3103,7 +3143,7 @@ mod tests {
         // offset — row 1 is empty and row 3 starts at element 3.
         let p = Program::compile("triple(x) > 0 ? tags : tags").unwrap();
         let (v, who) = eval_per_row(&p, &s, &batch, &base).unwrap();
-        assert_eq!(who, Answered::Walker);
+        assert_eq!(who, Answered::RowByRow);
         let row = |k: usize| match &v[k] {
             Value::List(l) => l
                 .iter()
@@ -3128,8 +3168,9 @@ mod tests {
         let a = vec![10i64, 20, 30, 40, 50, 60, 70, 80, 90, 100];
         let base = Context::default();
 
-        // Division by zero on one row: the batch traps, the walker answers the
-        // rows it can -- and raises on the one it cannot, which is a row error.
+        // Division by zero on one row: the batch traps, the row-by-row door
+        // answers the rows it can -- and raises on the one it cannot, which is
+        // a row error.
         let mut b = vec![2i64; 10];
         b[7] = 0;
         let batch = Batch::new(10)
@@ -3152,7 +3193,7 @@ mod tests {
     }
 
     /// A column the expression reads and the batch does not carry is the
-    /// caller's own mistake, not something the walker can rescue.
+    /// caller's own mistake, not something the fallback can rescue.
     #[test]
     fn a_missing_column_is_not_fallen_back_on() {
         let s = schema(&[("a", ValType::Int)]);
