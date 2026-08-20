@@ -1355,6 +1355,16 @@ impl RawOutput<'_> {
     ///
     /// `to_values` is this function into a fresh vector, so a row is decoded by
     /// one piece of code whichever door asked for it.
+    ///
+    /// `#[inline]` because a caller in another crate is the case this is for:
+    /// a non-generic `pub fn` without the attribute publishes no MIR to inline
+    /// from downstream, so such a call is opaque however small the arm it
+    /// takes. Measured from another crate on a one-row `bool` output, the call
+    /// alone — not the work — was 2.0 ns of a 3.9 ns decode. A caller who
+    /// arrives through [`BoundBatch::collect_into_on`] is already inside this
+    /// crate by then and never paid it; `cel/examples/cleanfixprobe.rs` is
+    /// where the two are told apart.
+    #[inline]
     pub fn extend_values(&self, out: &mut Vec<Value>) {
         match self {
             RawOutput::Scalar {
@@ -1362,12 +1372,42 @@ impl RawOutput<'_> {
                 values,
                 distinct,
             } => {
-                // Built only when something will read it: `decode` consults the
-                // table in its `Str` arm alone. See [`intern`] for why building
-                // it unconditionally was not free.
-                let interned = matches!(*ty, ValType::Str).then(|| intern(distinct));
-                let interned = interned.as_deref().unwrap_or(&[]);
-                out.extend(values.iter().map(|&v| decode(*ty, v, interned)));
+                // The bank is a property of the OUTPUT, not of a row, so it is
+                // decided once here and each arm is then a loop over one known
+                // constructor — the same reason the record shape below is
+                // decided outside its element loop. Matching per row cost a
+                // measured 0.7 ns per row, which a one-row output pays in full.
+                //
+                // The string table is built inside the one arm that reads it,
+                // so an output in any other bank does not pay for it at all.
+                // See [`intern`] for why building it unconditionally was not
+                // free.
+                match *ty {
+                    ValType::Int => out.extend(values.iter().map(|&v| Value::Int(v))),
+                    ValType::UInt => out.extend(values.iter().map(|&v| Value::UInt(v as u64))),
+                    ValType::Bool => out.extend(values.iter().map(|&v| Value::Bool(v != 0))),
+                    ValType::Float => out.extend(
+                        values
+                            .iter()
+                            .map(|&v| Value::Float(f64::from_bits(v as u64))),
+                    ),
+                    ValType::Str => {
+                        let interned = intern(distinct);
+                        out.extend(
+                            values
+                                .iter()
+                                .map(|&v| Value::String(interned[v as usize].clone())),
+                        );
+                    }
+                    ValType::Timestamp => out.extend(values.iter().map(|&v| {
+                        Value::Timestamp(chrono::DateTime::from_timestamp_nanos(v).fixed_offset())
+                    })),
+                    ValType::Duration => out.extend(
+                        values
+                            .iter()
+                            .map(|&v| Value::Duration(chrono::Duration::nanoseconds(v))),
+                    ),
+                }
             }
             RawOutput::List {
                 lens,
@@ -1486,20 +1526,6 @@ fn column_of(bank: ValType, words: &[i64], interned: Option<&Arc<[Arc<String>]>>
 /// does not allocate; a counting `#[global_allocator]` says it does.
 fn intern(distinct: &[String]) -> Arc<[Arc<String>]> {
     distinct.iter().map(|s| Arc::new(s.clone())).collect()
-}
-
-fn decode(bank: ValType, v: i64, interned: &[Arc<String>]) -> Value {
-    match bank {
-        ValType::Int => Value::Int(v),
-        ValType::UInt => Value::UInt(v as u64),
-        ValType::Bool => Value::Bool(v != 0),
-        ValType::Float => Value::Float(f64::from_bits(v as u64)),
-        ValType::Str => Value::String(interned[v as usize].clone()),
-        ValType::Timestamp => {
-            Value::Timestamp(chrono::DateTime::from_timestamp_nanos(v).fixed_offset())
-        }
-        ValType::Duration => Value::Duration(chrono::Duration::nanoseconds(v)),
-    }
 }
 
 #[cfg(test)]

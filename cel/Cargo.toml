@@ -123,6 +123,10 @@ name = "varprobe"
 required-features = ["jit"]
 
 [[example]]
+name = "cleanfixprobe"
+required-features = ["jit"]
+
+[[example]]
 name = "majit_columnar_batch"
 required-features = ["jit"]
 
