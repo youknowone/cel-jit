@@ -56,8 +56,17 @@
 //! fixed outside the timer, exactly as he does, but the work left inside it is
 //! not the same work. `bind` is printed so a reader can put that cost back and
 //! bound the advantage: it is the whole per-activation encoding, which is MORE
-//! than name resolution, so `majit + bind` is a pessimistic upper bound on what
-//! a fair single-shot majit call would cost.
+//! than name resolution, so adding it back is a pessimistic bound on the
+//! DIFFERENCE between the two designs.
+//!
+//! It is NOT an upper bound on what a majit call costs, and reading it that way
+//! turns every case the batch API loses into an artifact of the accounting. A
+//! caller that evaluates once really does pay the encoding, so `majit + bind`
+//! is that caller's actual cost and a case it loses is a case it loses. What
+//! the addition over-corrects is only the COMPARISON against a function that
+//! resolves names and builds no columns. `resolve ns`, in the bind-split block
+//! below, is the half of `bind` that is like-for-like with that work; `encode
+//! ns` is the half that is the price of the columnar representation itself.
 //!
 //! ⚠️ `variable_access/resolver` is his one case whose stock side reads through a
 //! `VariableResolver` rather than the context map; that is reproduced here,
@@ -578,6 +587,19 @@ struct Compiled {
     saving: f64,
     raw: f64,
     bind: f64,
+    /// The FIRST half of `bind`: every declared slot path resolved to the
+    /// caller's buffer that feeds it, and nothing else.
+    ///
+    /// This is the half a per-call evaluator also pays — `Program::execute`
+    /// looks every variable up in the `Context` by name on every call — which
+    /// is what makes `auto + resolve` comparable to `exec` in a way
+    /// `auto + bind` is not. `bind` itself is unchanged and still timed whole.
+    resolve: f64,
+    /// The SECOND half: building the buffers the caller did not supply — a
+    /// `size(...)` length column, a list's `offset(...)` prefix sums, a
+    /// concatenation's characters — and ranking the batch's strings. Work only
+    /// a columnar machine does at all.
+    encode: f64,
     compiles: usize,
     /// Traces started and thrown away, per call, once warm. A loop that never
     /// compiles is either aborting — counted here — or never reaching its merge
@@ -857,6 +879,38 @@ fn run_case(case: &Case) -> Row {
             .bind_per_row(&batch)
             .unwrap_or_else(|e| panic!("{}: rebind: {e}", case.label))
     });
+    // The same `bind`, split. `bind` above is untouched and still the whole of
+    // it; these two are measured beside it, and `split err` in the table below
+    // reports how much of it they fail to account for.
+    let resolve = per_call(|| {
+        lowered
+            .resolve(&batch)
+            .unwrap_or_else(|e| panic!("{}: resolve: {e}", case.label))
+    });
+    // Taken ONCE, outside the timer. That is what the encoding runs against,
+    // and it is what keeps `encode` the second half rather than the whole of
+    // `bind` again — the library takes it by reference for exactly this.
+    let resolved = lowered
+        .resolve(&batch)
+        .unwrap_or_else(|e| panic!("{}: resolve: {e}", case.label));
+    // The door `encode ns` TIMES, gated the way the three tier doors above are.
+    // A two-step bind that produced nothing would read as a very fast one.
+    assert_eq!(
+        lowered
+            .bind_per_row_resolved(&resolved)
+            .unwrap_or_else(|e| panic!("{}: encode: {e}", case.label))
+            .collect_on(Tier::Clean)
+            .unwrap_or_else(|e| panic!("{}: encode collect: {e}", case.label))
+            .as_slice(),
+        std::slice::from_ref(&expected),
+        "{}: the two-step bind and the one-step bind disagree",
+        case.label
+    );
+    let encode = per_call(|| {
+        lowered
+            .bind_per_row_resolved(&resolved)
+            .unwrap_or_else(|e| panic!("{}: encode: {e}", case.label))
+    });
 
     // Three legs of one measurement, so they are taken together rather than
     // wherever each is first needed. Order is free — see `row_cost` on why the
@@ -880,6 +934,8 @@ fn run_case(case: &Case) -> Row {
             majit,
             raw,
             bind,
+            resolve,
+            encode,
             compiles,
             aborts,
             guard_fails,
@@ -1405,6 +1461,89 @@ fn print_decomposition(rows: &[Row]) {
     );
 }
 
+/// `bind` decomposed into the two halves it is made of.
+///
+/// Its own block rather than four more columns on the main table, for the same
+/// reason the per-row costs have one: it is a single SUBJECT, and the main
+/// table is already at the width where a reader loses the row.
+///
+/// Nothing here is amortised over anything. A call in cometkim's regime carries
+/// ONE activation, so `bind ns` is paid in full by the caller `exec ns`
+/// measures against, and the question this block answers is how much of that
+/// payment is work the other evaluator does too.
+fn print_bind_split_table(rows: &[Row]) {
+    println!(
+        "\n`bind ns` split into the two halves it is made of, and what each does to the\n\
+         single-shot comparison. `bind ns` itself is unchanged — it is the same whole\n\
+         `bind_per_row` the main table prints, timed the same way."
+    );
+    println!(
+        "{:<28} {:>10} {:>11} {:>10} {:>9} {:>10} {:>10} {:>12} {:>11}",
+        "case",
+        "bind ns",
+        "resolve ns",
+        "encode ns",
+        "res+enc",
+        "split err",
+        "exec/auto",
+        "exec/a+bind",
+        "exec/a+res",
+    );
+    for r in rows {
+        let c = match &r.compiled {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let sum = c.resolve + c.encode;
+        println!(
+            "{:<28} {:>10.1} {:>11.1} {:>10.1} {:>9.1} {:>9.1}% {:>10} {:>12} {:>11}",
+            r.label,
+            c.bind,
+            c.resolve,
+            c.encode,
+            sum,
+            (sum - c.bind) / c.bind * 100.0,
+            format!("{:.2}x", r.exec / c.auto),
+            format!("{:.2}x", r.exec / (c.auto + c.bind)),
+            format!("{:.2}x", r.exec / (c.auto + c.resolve)),
+        );
+    }
+    println!(
+        "\n`resolve ns` is every declared slot path looked up in the batch\'s columns — one\n\
+         map lookup per path, and nothing else. `encode ns` is what the rest of `bind`\n\
+         does: build the buffers the caller did not supply (a `size(...)` length column, a\n\
+         list\'s `offset(...)` prefix sums, a concatenation\'s characters) and rank the\n\
+         batch\'s strings into ids. The library performs them in that order and `bind` is\n\
+         the two composed, so a caller can hold a resolution and encode against it — which\n\
+         is how `encode ns` is timed without re-resolving inside the timer.\n\
+         \n\
+         `split err` is `(res+enc - bind) / bind`. It is the whole test that this is a\n\
+         SPLIT and not a second measurement of the same thing: near zero, the two halves\n\
+         account for `bind` and the row can be read; large, they do not and it cannot. The\n\
+         answers are gated separately — the two-step bind must produce what the one-step\n\
+         bind produces, checked per case before anything here is timed.\n\
+         \n\
+         The three ratios are all `exec` over one of OUR costs, spelled as the division\n\
+         performed, so ABOVE 1.00x we beat `Program::execute` and BELOW it that door beat\n\
+         us. They answer three different questions and are not interchangeable:\n\
+         * `exec/auto` charges our side for the EVALUATION only. A caller who binds once\n\
+           and evaluates many times approaches it; a single-shot caller never does.\n\
+         * `exec/a+bind` charges our side in full — evaluation plus the whole activation\n\
+           encoding. This is what a caller who evaluates ONCE actually gets, and it is the\n\
+           honest single-shot verdict.\n\
+         * `exec/a+res` charges our side only for the work the other door also does: the\n\
+           by-name lookup per variable that `cel_eval_loop` performs on every call. It is\n\
+           NOT what a single-shot caller pays. It isolates how much of the single-shot\n\
+           verdict is columnar SETUP rather than a difference between evaluators, which is\n\
+           the one thing `exec/a+bind` cannot say on its own.\n\
+         \n\
+         ⚠ Read `exec/a+bind` and `exec/a+res` as a PAIR. Where they agree, the verdict\n\
+         does not depend on how the encoding is charged. Where they straddle 1.00x, it\n\
+         does, and the case is decided by setup rather than by evaluation — which is a\n\
+         finding about the batch API\'s shape, not about either evaluator."
+    );
+}
+
 /// The pre-compile / post-compile split, printed on its own.
 ///
 /// Separate from the table above because it is a DIFFERENT UNIT: every column
@@ -1650,6 +1789,7 @@ fn main() {
         );
     }
     print_row_cost_table(&rows);
+    print_bind_split_table(&rows);
     println!(
         "\n`clean ns` is the same lowered bytecode on the plain Rust VM, with no tracing\n\
          machinery at all. Where `majit` is far above it the cost is the tracer, not the\n\

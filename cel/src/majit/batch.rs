@@ -464,9 +464,60 @@ impl BatchProgram {
         self.bind_reduce(batch, BatchReduce::PerRow)
     }
 
+    /// Resolve `batch`'s columns against this program's slots: the FIRST half
+    /// of [`BatchProgram::bind`], on its own.
+    ///
+    /// The split exists because the two halves are not the same KIND of work,
+    /// and a caller that evaluates a batch once pays them both while a caller
+    /// that evaluates it many times pays this one once. Resolution answers
+    /// "which of the caller's buffers does each slot read" — one map lookup per
+    /// declared path, which is the work a tree-walking or bytecode evaluator
+    /// also does on every call, by name. The encoding that follows builds the
+    /// buffers the caller did not supply and ranks the batch's strings, which is
+    /// work only a columnar machine does at all.
+    ///
+    /// Every error about a NAME or a TYPE is raised here — a missing column, a
+    /// column of a type the schema did not declare, a string column of the
+    /// wrong length. The row-length check over the materialized columns stays
+    /// with the encoding, where it has always been, so that the order two
+    /// different mistakes are reported in does not change.
+    pub fn resolve<'a>(&self, batch: &'a Batch<'a>) -> Result<ResolvedBatch<'a>, BatchError> {
+        let mut sources = Vec::with_capacity(self.lowered.slots.len());
+        for slot in &self.lowered.slots {
+            sources.push(self.resolve_slot(batch, slot.path.as_str(), slot.ty)?);
+        }
+        Ok(ResolvedBatch {
+            sources,
+            rows: batch.rows,
+        })
+    }
+
+    /// [`BatchProgram::bind_per_row`] over a resolution already taken: the
+    /// SECOND half, on its own.
+    ///
+    /// `bind_per_row(batch)` is `resolve(batch)` followed by this, and the two
+    /// routes produce the same [`BoundBatch`]. The resolution is taken by
+    /// reference rather than consumed so that a caller can hold one and run the
+    /// encoding repeatedly against it, which is what makes the halves
+    /// separately measurable.
+    pub fn bind_per_row_resolved<'a, 'b>(
+        &'b self,
+        resolved: &ResolvedBatch<'a>,
+    ) -> Result<BoundBatch<'a, 'b>, BatchError> {
+        self.encode_reduce(resolved, BatchReduce::PerRow)
+    }
+
     fn bind_reduce<'a, 'b>(
         &'b self,
         batch: &'a Batch<'a>,
+        reduce: BatchReduce,
+    ) -> Result<BoundBatch<'a, 'b>, BatchError> {
+        self.encode_reduce(&self.resolve(batch)?, reduce)
+    }
+
+    fn encode_reduce<'a, 'b>(
+        &'b self,
+        resolved: &ResolvedBatch<'a>,
         reduce: BatchReduce,
     ) -> Result<BoundBatch<'a, 'b>, BatchError> {
         // Derived buffers are owned by the BoundBatch; `plan` records, per slot,
@@ -474,8 +525,8 @@ impl BatchProgram {
         // first keeps `derived` from reallocating under a borrow.
         let mut derived: Vec<DerivedColumn> = Vec::new();
         let mut plan: Vec<Plan<'a>> = Vec::new();
-        for slot in &self.lowered.slots {
-            plan.push(self.plan_slot(batch, slot.path.as_str(), slot.ty, &mut derived)?);
+        for source in &resolved.sources {
+            plan.push(materialize_slot(source, resolved.rows, &mut derived));
         }
 
         // Row columns must be as long as the batch says. An ELEMENT column is
@@ -488,11 +539,11 @@ impl BatchProgram {
                 Plan::Borrowed(c) => c.len(),
                 Plan::Derived(k) => derived[*k].len(),
             };
-            if len != batch.rows {
+            if len != resolved.rows {
                 return Err(BatchError::RowCount {
                     name: slot.path.clone(),
                     len,
-                    rows: batch.rows,
+                    rows: resolved.rows,
                 });
             }
         }
@@ -525,7 +576,7 @@ impl BatchProgram {
         let run = prepare_batch_reduce(
             &self.lowered,
             &columns,
-            batch.rows,
+            resolved.rows,
             "BatchProgram::bind",
             reduce,
         );
@@ -544,49 +595,61 @@ impl BatchProgram {
         Ok(BoundBatch {
             program: self,
             reduce,
-            body_words: self.lowered.body_words_for(batch.rows, elems),
-            compiled_saving_ps: compiled_saving_ps(&self.lowered, batch.rows, elems),
+            body_words: self.lowered.body_words_for(resolved.rows, elems),
+            compiled_saving_ps: compiled_saving_ps(&self.lowered, resolved.rows, elems),
             projected: reduce == BatchReduce::PerRow && self.lowered.is_row_projection(),
             run: std::cell::RefCell::new(run),
             _derived: derived,
         })
     }
 
-    /// The strings a string-valued SLOT PATH stands for: a declared `string`
-    /// column, a `string(x)` conversion of some other column, or a `concat#k`.
+    /// Where the characters of a string-valued SLOT PATH come from: a declared
+    /// `string` column, a `string(x)` conversion of some other column, or a
+    /// `concat#k`.
     ///
     /// One resolver for all three is what lets them nest — `size(a + string(i))`
     /// is a length column over a concatenation over a conversion. Recursion
     /// terminates because a `concat#k` only ever references a LOWER index.
-    fn strings_for(
+    ///
+    /// This walks the batch's column map and builds no characters; the
+    /// characters are [`build_strings`]'s. Every failure the walk can reach is
+    /// raised here rather than there — a missing column, a column the schema
+    /// declared `string` and the caller did not, a column `string(...)` has no
+    /// overload for, a column of the wrong length — which is what leaves
+    /// [`build_strings`] infallible.
+    fn resolve_strings<'a>(
         &self,
-        batch: &Batch,
+        batch: &'a Batch<'a>,
         path: &str,
         rows: usize,
-    ) -> Result<Vec<String>, BatchError> {
+    ) -> Result<StrSource<'a>, BatchError> {
         let wrong_type = |name: &str| BatchError::ColumnType {
             name: name.to_string(),
             declared: ValType::Str,
         };
         if let Some(k) = concat_slot_index(path) {
             let spec = &self.lowered.concats[k];
-            let side = |s: &ConcatSide| -> Result<Vec<String>, BatchError> {
+            let side = |s: &ConcatSide| -> Result<StrSource<'a>, BatchError> {
                 Ok(match s {
-                    ConcatSide::Literal(text) => vec![text.clone(); rows],
+                    ConcatSide::Literal(text) => StrSource::Repeat(text.clone()),
                     ConcatSide::Derived(j) => {
-                        self.strings_for(batch, &concat_slot_path(*j), rows)?
+                        self.resolve_strings(batch, &concat_slot_path(*j), rows)?
                     }
-                    ConcatSide::Column(p) => self.strings_for(batch, p, rows)?,
+                    ConcatSide::Column(p) => self.resolve_strings(batch, p, rows)?,
                 })
             };
             let (l, r) = (side(&spec.left)?, side(&spec.right)?);
-            return Ok(l.into_iter().zip(r).map(|(a, b)| a + &b).collect());
+            return Ok(StrSource::Concat(Box::new(l), Box::new(r)));
         }
         if let Some(src) = string_slot_source(path) {
-            return column_to_strings(lookup(batch, src)?).ok_or_else(|| wrong_type(src));
+            let col = lookup(batch, src)?;
+            if !is_string_convertible(col) {
+                return Err(wrong_type(src));
+            }
+            return Ok(StrSource::Convert(col));
         }
         match lookup(batch, path)? {
-            ColumnRef::Str(c) if c.len() == rows => Ok(c.to_vec()),
+            ColumnRef::Str(c) if c.len() == rows => Ok(StrSource::Column(c)),
             ColumnRef::Str(c) => Err(BatchError::RowCount {
                 name: path.to_string(),
                 len: c.len(),
@@ -596,20 +659,24 @@ impl BatchProgram {
         }
     }
 
-    /// Resolve one slot path to the column that feeds it.
-    fn plan_slot<'a>(
+    /// Resolve one slot path to the caller buffer(s) that feed it.
+    ///
+    /// The decision tree is the encoding's; what changes here is that each arm
+    /// stops at the buffer instead of going on to build one.
+    /// [`materialize_slot`] is the other half, arm for arm.
+    fn resolve_slot<'a>(
         &self,
         batch: &'a Batch<'a>,
         path: &str,
         ty: ValType,
-        derived: &mut Vec<DerivedColumn>,
-    ) -> Result<Plan<'a>, BatchError> {
+    ) -> Result<SlotSource<'a>, BatchError> {
         // `size(x)`: the element count of a list, or the byte length of a
         // string — which may itself be a derived one.
         if let Some(src) = size_slot_source(path) {
+            // A miss here is not an error: `size` over a string falls through to
+            // the two arms below, which report it.
             if let Ok(ColumnRef::List { lens, .. }) = lookup(batch, src) {
-                derived.push(DerivedColumn::int(lens.to_vec()));
-                return Ok(Plan::Derived(derived.len() - 1));
+                return Ok(SlotSource::Lens(lens));
             }
             // A list ELEMENT's byte length: one entry per flattened element, so
             // it is read at the same address the element itself is.
@@ -625,41 +692,24 @@ impl BatchProgram {
                         declared: ValType::Str,
                     });
                 };
-                derived.push(DerivedColumn::int(
-                    c.iter().map(|s| s.len() as i64).collect(),
-                ));
-                return Ok(Plan::Derived(derived.len() - 1));
+                return Ok(SlotSource::ElemStrLens(c));
             }
-            let buf = self
-                .strings_for(batch, src, batch.rows)?
-                .iter()
-                .map(|s| s.len() as i64)
-                .collect();
-            derived.push(DerivedColumn::int(buf));
-            return Ok(Plan::Derived(derived.len() - 1));
+            return Ok(SlotSource::BuiltLens(
+                self.resolve_strings(batch, src, batch.rows)?,
+            ));
         }
         // The two string-producing derived columns, which need the characters.
         if string_slot_source(path).is_some() || concat_slot_index(path).is_some() {
-            let buf = self.strings_for(batch, path, batch.rows)?;
-            derived.push(DerivedColumn::str(buf));
-            return Ok(Plan::Derived(derived.len() - 1));
+            return Ok(SlotSource::Strings(
+                self.resolve_strings(batch, path, batch.rows)?,
+            ));
         }
         // `offset(x)`: exclusive prefix sums of a list's element counts.
         if let Some(src) = offset_slot_source(path) {
             let ColumnRef::List { lens, .. } = lookup(batch, src)? else {
                 return Err(BatchError::MissingColumn(src.to_string()));
             };
-            let mut acc = 0i64;
-            let buf = lens
-                .iter()
-                .map(|&l| {
-                    let o = acc;
-                    acc += l;
-                    o
-                })
-                .collect();
-            derived.push(DerivedColumn::int(buf));
-            return Ok(Plan::Derived(derived.len() - 1));
+            return Ok(SlotSource::Offsets(lens));
         }
         // `list[]` / `list[].field`: one of a list column's flattened buffers.
         if let Some((list, field)) = elem_slot_source(path) {
@@ -671,10 +721,83 @@ impl BatchProgram {
                 .find(|(f, _)| *f == field)
                 .map(|(_, c)| c)
                 .ok_or_else(|| BatchError::MissingColumn(path.to_string()))?;
-            return encode(col, ty, path);
+            return Ok(SlotSource::Borrowed(borrow_column(col, ty, path)?));
         }
-        encode(lookup(batch, path)?, ty, path)
+        Ok(SlotSource::Borrowed(borrow_column(
+            lookup(batch, path)?,
+            ty,
+            path,
+        )?))
     }
+}
+
+/// Build what one resolved slot needs, and record where the machine reads it.
+///
+/// The other half of [`BatchProgram::resolve_slot`], arm for arm. Infallible:
+/// every way a slot can be refused was reached while resolving it, so what is
+/// left here is allocation and arithmetic over buffers already in hand.
+fn materialize_slot<'a>(
+    source: &SlotSource<'a>,
+    rows: usize,
+    derived: &mut Vec<DerivedColumn>,
+) -> Plan<'a> {
+    let mut push = |c: DerivedColumn| {
+        derived.push(c);
+        Plan::Derived(derived.len() - 1)
+    };
+    match source {
+        SlotSource::Borrowed(c) => Plan::Borrowed(*c),
+        SlotSource::Lens(lens) => push(DerivedColumn::int(lens.to_vec())),
+        SlotSource::Offsets(lens) => {
+            let mut acc = 0i64;
+            push(DerivedColumn::int(
+                lens.iter()
+                    .map(|&l| {
+                        let o = acc;
+                        acc += l;
+                        o
+                    })
+                    .collect(),
+            ))
+        }
+        SlotSource::ElemStrLens(c) => push(DerivedColumn::int(
+            c.iter().map(|s| s.len() as i64).collect(),
+        )),
+        SlotSource::BuiltLens(src) => push(DerivedColumn::int(
+            build_strings(src, rows)
+                .iter()
+                .map(|s| s.len() as i64)
+                .collect(),
+        )),
+        SlotSource::Strings(src) => push(DerivedColumn::str(build_strings(src, rows))),
+    }
+}
+
+/// The characters a [`StrSource`] stands for.
+///
+/// Resolves nothing and cannot fail — see [`BatchProgram::resolve_strings`],
+/// which is where a string slot's mistakes are reported.
+fn build_strings(source: &StrSource<'_>, rows: usize) -> Vec<String> {
+    match source {
+        StrSource::Repeat(text) => vec![text.clone(); rows],
+        StrSource::Column(c) => c.to_vec(),
+        StrSource::Convert(col) => column_to_strings(col)
+            .expect("resolving rejected the columns `string` has no overload for"),
+        StrSource::Concat(l, r) => build_strings(l, rows)
+            .into_iter()
+            .zip(build_strings(r, rows))
+            .map(|(a, b)| a + &b)
+            .collect(),
+    }
+}
+
+/// Whether `string(col)` has an overload for this column's type.
+///
+/// The complement of [`column_to_strings`]'s `None` arm, written beside it so
+/// the two name the same variants. Resolution asks this so that the conversion
+/// itself can be `expect`ed once a slot has been accepted.
+fn is_string_convertible(col: &ColumnRef) -> bool {
+    !matches!(col, ColumnRef::Bool(_) | ColumnRef::List { .. })
 }
 
 /// `string(col)` per row, or `None` for a column CEL's `string` has no overload
@@ -756,12 +879,71 @@ enum Plan<'a> {
     Derived(usize),
 }
 
+/// Where one string-valued slot's characters come from, with every NAME already
+/// resolved to the caller's buffer.
+///
+/// The string half of the resolve/encode split: building THIS walks the batch's
+/// column map, and building the characters from it does not.
+enum StrSource<'a> {
+    /// A literal, the same on every row.
+    Repeat(String),
+    /// A declared `string` column.
+    Column(&'a [String]),
+    /// `string(col)` over a column of some other type. Held as the column, not
+    /// as the conversion of it, because the conversion is the encoding's work.
+    Convert(&'a ColumnRef<'a>),
+    /// Two operands concatenated per row.
+    Concat(Box<StrSource<'a>>, Box<StrSource<'a>>),
+}
+
+/// One slot's inputs, resolved: which of the caller's buffers feed it, and what
+/// has to be built out of them.
+///
+/// Every variant holds the buffers themselves, so nothing here has a name left
+/// to look up. That is what lets [`BatchProgram::resolve`] and the encoding
+/// that follows it run — and be timed — apart.
+enum SlotSource<'a> {
+    /// The caller's column, read where the caller keeps it.
+    Borrowed(Column<'a>),
+    /// A list's per-row element counts, for `size(x)`.
+    Lens(&'a [i64]),
+    /// A list's per-row element counts, for the exclusive prefix sums
+    /// `offset(x)` is.
+    Offsets(&'a [i64]),
+    /// A flattened list ELEMENT string column, for the byte length of each
+    /// element.
+    ElemStrLens(&'a [String]),
+    /// Characters that have to be built before their byte lengths can be taken.
+    BuiltLens(StrSource<'a>),
+    /// The characters themselves.
+    Strings(StrSource<'a>),
+}
+
+/// One batch's columns resolved against a [`BatchProgram`]'s slots, but not yet
+/// encoded.
+///
+/// Produced by [`BatchProgram::resolve`] and consumed by
+/// [`BatchProgram::bind_per_row_resolved`]; see the first of those for why the
+/// two halves are worth separating.
+pub struct ResolvedBatch<'a> {
+    sources: Vec<SlotSource<'a>>,
+    /// The caller's row count, carried so the encoding does not need the
+    /// [`Batch`] again. It cannot drift: `Batch::column` consumes and returns
+    /// the batch, so a batch a resolution was taken from can no longer change.
+    rows: usize,
+}
+
 /// Hand one caller column to the bank its slot reads, checking that the column
 /// is the type the schema declared.
 ///
 /// Every declared type is now readable where the caller keeps it, so this only
-/// borrows — it materializes nothing and can fail only on a type mismatch.
-fn encode<'a>(col: &'a ColumnRef<'a>, ty: ValType, path: &str) -> Result<Plan<'a>, BatchError> {
+/// borrows — it materializes nothing and can fail only on a type mismatch,
+/// which is why it belongs to the resolve half rather than the encoding.
+fn borrow_column<'a>(
+    col: &'a ColumnRef<'a>,
+    ty: ValType,
+    path: &str,
+) -> Result<Column<'a>, BatchError> {
     if col.val_type() != Some(ty) {
         return Err(BatchError::ColumnType {
             name: path.to_string(),
@@ -774,22 +956,20 @@ fn encode<'a>(col: &'a ColumnRef<'a>, ty: ValType, path: &str) -> Result<Plan<'a
     // where the caller keeps it, ONE BYTE per row, by a load whose descr says
     // one. Only `string` is not readable in place.
     match col {
-        ColumnRef::Int(c) | ColumnRef::Timestamp(c) | ColumnRef::Duration(c) => {
-            Ok(Plan::Borrowed(Column::Int(c)))
-        }
-        ColumnRef::Float(c) => Ok(Plan::Borrowed(Column::Float(c))),
+        ColumnRef::Int(c) | ColumnRef::Timestamp(c) | ColumnRef::Duration(c) => Ok(Column::Int(c)),
+        ColumnRef::Float(c) => Ok(Column::Float(c)),
         ColumnRef::UInt(c) => {
             // SAFETY: `u64` and `i64` have the same size and alignment and every
             // bit pattern is valid for both, and the int register file carries a
             // `uint` as exactly that bit pattern (see `ValType::UInt`), so the
             // column is reinterpreted rather than copied.
             let bits = unsafe { core::slice::from_raw_parts(c.as_ptr().cast::<i64>(), c.len()) };
-            Ok(Plan::Borrowed(Column::Int(bits)))
+            Ok(Column::Int(bits))
         }
-        ColumnRef::Bool(c) => Ok(Plan::Borrowed(Column::Bool(c))),
+        ColumnRef::Bool(c) => Ok(Column::Bool(c)),
         // Strings go to `prepare_batch` as strings: the ids are ranks over the
         // whole batch, which one column cannot compute on its own.
-        ColumnRef::Str(c) => Ok(Plan::Borrowed(Column::Str(c))),
+        ColumnRef::Str(c) => Ok(Column::Str(c)),
         ColumnRef::List { .. } => Err(BatchError::MissingColumn(path.to_string())),
     }
 }
@@ -2002,6 +2182,117 @@ mod tests {
             BatchProgram::compile("!frozen", &s),
             Err(BatchError::Lower(_))
         ));
+    }
+
+    /// Binding in one step and binding in two answer identically.
+    ///
+    /// This is what makes `resolve` + `bind_per_row_resolved` a SPLIT of
+    /// `bind_per_row` rather than a second implementation of it. It sweeps one
+    /// case per [`SlotSource`] arm, because the two halves are paired arm for
+    /// arm and an arm that only one of them handles would otherwise show up as
+    /// a wrong answer in exactly one shape.
+    #[test]
+    fn resolving_first_answers_what_binding_in_one_step_answers() {
+        let ints = [7i64, -1, 0, 5];
+        let strs: Vec<String> = ["pear", "fig", "apple", "fig"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let elems = [1i64, 2, 3, 4, 5, 6];
+        let lens = [2i64, 3, 1];
+        let words: Vec<String> = ["ox", "kestrel", "ant", "emu", "yak", "ibis"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        let int_col = || ColumnRef::Int(&ints);
+        let str_col = || ColumnRef::Str(&strs);
+        let list_col = || ColumnRef::List {
+            lens: &lens,
+            fields: vec![(None, ColumnRef::Int(&elems))],
+        };
+        let record_col = || ColumnRef::List {
+            lens: &lens,
+            fields: vec![(Some("w"), ColumnRef::Str(&words))],
+        };
+
+        // `(source, column name, rows, schema, column)`, one per resolved-slot
+        // shape: a borrowed column, built characters, a `string(...)`
+        // conversion, byte lengths over a column and over a concatenation, a
+        // list's element counts, its offsets, and a flattened element field.
+        let int_schema = || schema(&[("x", ValType::Int)]);
+        let str_schema = || schema(&[("s", ValType::Str)]);
+        let list_schema = || schema(&[("l[]", ValType::Int)]);
+        let cases: Vec<(&str, &str, usize, Schema, ColumnRef)> = vec![
+            ("x * 2 + 1", "x", ints.len(), int_schema(), int_col()),
+            ("s + \"!\"", "s", strs.len(), str_schema(), str_col()),
+            ("string(x)", "x", ints.len(), int_schema(), int_col()),
+            ("size(s)", "s", strs.len(), str_schema(), str_col()),
+            ("size(s + \"!\")", "s", strs.len(), str_schema(), str_col()),
+            ("size(l)", "l", lens.len(), list_schema(), list_col()),
+            (
+                "l.map(x, x * 2)",
+                "l",
+                lens.len(),
+                list_schema(),
+                list_col(),
+            ),
+            (
+                "l.map(x, size(x.w))",
+                "l",
+                lens.len(),
+                schema(&[("l[].w", ValType::Str)]),
+                record_col(),
+            ),
+        ];
+
+        for (source, name, rows, sch, col) in cases {
+            let batch = Batch::new(rows).column(name, col);
+            let program = BatchProgram::compile(source, &sch).unwrap();
+
+            let one_step = program.bind_per_row(&batch).unwrap();
+            let resolved = program.resolve(&batch).unwrap();
+            let two_step = program.bind_per_row_resolved(&resolved).unwrap();
+
+            assert_eq!(
+                two_step.body_words(),
+                one_step.body_words(),
+                "{source}: body words"
+            );
+            assert_eq!(
+                two_step.route(Tier::Auto),
+                one_step.route(Tier::Auto),
+                "{source}: route"
+            );
+            for tier in [Tier::Auto, Tier::Clean, Tier::Interpreter, Tier::Jit] {
+                assert_eq!(
+                    two_step.collect_on(tier).unwrap(),
+                    one_step.collect_on(tier).unwrap(),
+                    "{source}: {tier:?}"
+                );
+            }
+        }
+    }
+
+    /// A resolution can be encoded more than once, and each encoding is a fresh
+    /// bind.
+    ///
+    /// The property the timing split depends on: the harness holds ONE
+    /// resolution outside its timer and runs the encoding against it call after
+    /// call, so an encoding that consumed or mutated what it read would make
+    /// every call after the first measure something else.
+    #[test]
+    fn one_resolution_encodes_the_same_answer_every_time() {
+        let ints = [3i64, 9, -2];
+        let s = schema(&[("x", ValType::Int)]);
+        let batch = Batch::new(ints.len()).column("x", ColumnRef::Int(&ints));
+        let program = BatchProgram::compile("x * 2 + 1", &s).unwrap();
+        let resolved = program.resolve(&batch).unwrap();
+        let want = program.bind_per_row(&batch).unwrap().collect().unwrap();
+        for round in 0..4 {
+            let bound = program.bind_per_row_resolved(&resolved).unwrap();
+            assert_eq!(bound.collect().unwrap(), want, "round {round}");
+        }
     }
 
     #[test]
