@@ -76,6 +76,13 @@ majit-metainterp = { git = "https://github.com/youknowone/pyre.git", rev = "3ccb
 criterion = { version = "0.5.1", features = ["html_reports"] }
 serde_bytes = "0.11.14"
 dhat = { version = "0.3.3" }
+# `majit_vs_cometkim_percall` times its batches in user CPU rather than wall
+# clock, which needs `clock_gettime(CLOCK_THREAD_CPUTIME_ID)`. Taking it from
+# `libc` rather than hand-writing the `extern "C"` block costs nothing: the
+# lockfile already resolves `libc` transitively, so this pulls in no new
+# package and no new fetch, and the clock id is one constant that differs per
+# platform and is exactly what a hand-rolled declaration would get wrong.
+libc = "0.2"
 
 [[bench]]
 name = "runtime"

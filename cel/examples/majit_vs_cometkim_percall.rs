@@ -77,7 +77,7 @@
 use std::collections::HashMap;
 use std::hint::black_box;
 use std::sync::atomic::Ordering;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use cel::context::VariableResolver;
 use cel::majit::batch::{Batch, BatchProgram, BoundBatch, ColumnRef, RawOutput, RowReader, Tier};
@@ -87,13 +87,35 @@ use cel::majit::bytecode::float_bank::{
 use cel::majit::lower::{Schema, ValType};
 use cel::{Context, Program, Value};
 
-/// One timed batch must last at least this long, so the clock's own resolution
-/// is not what a 7 ns call is being measured against.
+/// One timed batch must burn at least this much user CPU, so the clock's own
+/// resolution is not what a 7 ns call is being measured against.
 const MIN_BATCH: Duration = Duration::from_millis(20);
-/// Timed batches per measurement. The MINIMUM is reported: other work on the box
-/// can only ever make a batch slower, so the fastest one ran with the least
-/// interference. A median moves with how loaded the machine happened to be.
-const ROUNDS: usize = 7;
+/// Timed batches per measurement. The MINIMUM is reported.
+///
+/// The metric is user CPU (see `per_call_counted`), which already refuses to
+/// charge a batch for the time it spent descheduled — so the old reason for the
+/// minimum, that a preempted batch reads slow, no longer applies. It survives
+/// for a second one: a co-tenant still costs cycles this thread genuinely
+/// executes. Cache lines it evicts we re-fetch, TLB entries it shoots down we
+/// re-walk, pages it forces out we fault back in, and every one of those is our
+/// own instruction stream and lands on our own clock. Contention is therefore
+/// still one-sided — it can only add — and the fastest batch is the one that
+/// ran with the least of it.
+///
+/// Thirty draws rather than seven because a minimum over a one-sided
+/// distribution can only improve with more of them, and on a box carrying a
+/// load average in the hundreds seven may contain no lightly-disturbed batch at
+/// all. The cost is bounded and known: `ROUNDS * MIN_BATCH` of CPU per figure.
+///
+/// `check.py` reaches the opposite conclusion for its interpreter-startup
+/// estimate — "The estimator is the MEDIAN and not the minimum" — and that
+/// argument does not carry here. Its quantity is SUBTRACTED from a separately
+/// measured bench, so an idle minimum taken away from a loaded run leaves the
+/// run's own inflation behind in the difference, and median-against-median is
+/// what cancels it. This harness subtracts nothing and reports the per-call
+/// figure directly, so there is no second measurement whose load conditions
+/// have to be matched, and the minimum is the estimator that is wanted.
+const ROUNDS: usize = 30;
 
 /// His `benchmark_variable_access` resolver, verbatim.
 struct Resolver;
@@ -401,8 +423,9 @@ fn cases() -> Vec<Case> {
     cases
 }
 
-/// Time ONE call. Grows an iteration count until a timed batch lasts at least
-/// [`MIN_BATCH`], then reports the fastest of [`ROUNDS`] such batches.
+/// Time ONE call. Grows an iteration count until a timed batch costs at least
+/// [`MIN_BATCH`] of user CPU, then reports the cheapest of [`ROUNDS`] such
+/// batches.
 fn per_call<T>(run: impl FnMut() -> T) -> f64 {
     per_call_counted(run).0
 }
@@ -415,12 +438,55 @@ fn per_call<T>(run: impl FnMut() -> T) -> f64 {
 /// back to the tracing interpreter passes the first and fails the second, and
 /// the first is exactly the check a silently degraded column survives.
 fn per_call_counted<T>(mut run: impl FnMut() -> T) -> (f64, usize) {
+    /// User CPU burned by THIS thread so far.
+    ///
+    /// A wall clock does not measure this program on a shared box; it measures
+    /// this program plus whatever else wanted the CPU. A batch that is
+    /// descheduled for 300 ms reports 300 ms it never spent, and nothing in the
+    /// figure distinguishes that from a call that genuinely got slower — which
+    /// is the whole failure mode an A/B here has to survive. Charging only the
+    /// cycles this thread actually ran makes a co-tenant's *preemption* cost the
+    /// measurement nothing, and leaves only its cache and TLB damage, which
+    /// [`ROUNDS`]'s minimum is there to shed.
+    ///
+    /// `CLOCK_THREAD_CPUTIME_ID` and not `getrusage(RUSAGE_SELF)`, which reports
+    /// the same kind of quantity, on two grounds. It is per-THREAD: the batches
+    /// run on one thread, and a process-wide clock would fold in any other
+    /// thread's CPU, which is a property of what the example happens to spawn
+    /// today rather than of what is being timed. And it is finer — measured on
+    /// this machine, back-to-back reads advance by as little as 41 ns and never
+    /// repeat a value, where `ru_utime` is a microsecond field that repeated on
+    /// 916 of 1000 such reads. Neither resolution is a threat to a 20 ms batch;
+    /// the point is that the narrower instrument costs nothing to prefer.
+    fn cpu_now() -> Duration {
+        // SAFETY: the call writes through the pointer and does nothing else,
+        // and the pointer is to a live local of exactly the type it expects.
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        let rc = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
+        // Checked, because the two ways this can fail quietly are both worse
+        // than a panic: a clock stuck at 0 leaves the calibration loop below
+        // growing `iters` forever hunting a batch that never gets long enough,
+        // and one that returns stale values publishes a per-call figure that
+        // looks ordinary and is invented.
+        assert_eq!(
+            rc,
+            0,
+            "clock_gettime(CLOCK_THREAD_CPUTIME_ID): {}",
+            std::io::Error::last_os_error()
+        );
+        Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
+    }
+
     fn timed<T>(iters: usize, run: &mut impl FnMut() -> T) -> Duration {
-        let start = Instant::now();
+        let start = cpu_now();
         for _ in 0..iters {
             black_box(run());
         }
-        start.elapsed()
+        // Thread CPU time never runs backwards, so this cannot underflow.
+        cpu_now() - start
     }
 
     let mut calls = 0usize;
@@ -1370,7 +1436,9 @@ fn main() {
     println!("cometkim's benchmark expressions in his own regime (cel-jit PR #233)");
     println!(
         "one expression, one FIXED activation, ONE evaluation timed; \
-         best of {ROUNDS} batches of >= {} ms.\n",
+         best of {ROUNDS} batches of >= {} CPU-ms.\n\
+         Every ns figure below is USER CPU on the measuring thread, NOT wall clock:\n\
+         time spent descheduled by other work on the box is not charged to it.\n",
         MIN_BATCH.as_millis()
     );
     println!(
@@ -1383,11 +1451,11 @@ fn main() {
         "route",
         "words",
         "save ns",
-        "auto/stock",
+        "stock/auto",
         "enter/call",
         "jit/row ns",
         "jit fix ns",
-        "majit/stock",
+        "stock/majit",
         "raw ns",
         "bind ns",
         "compiles",
@@ -1532,8 +1600,19 @@ fn main() {
          which is what every tier-explicit test and every column of this table below\n\
          measures — the route changes the default, not the `_on` doors.\n\
          \n\
-         ⚠ `auto/stock` is the ratio a caller of this library gets. `majit/stock` is the\n\
-         ratio of a caller who names `Tier::Jit`, and where the two disagree the route is\n\
+         ⚠ `stock/auto` measures our route against the TREE WALKER, and `stock/majit` a\n\
+         caller who names `Tier::Jit`. Both are spelled as the division actually\n\
+         performed, so each cell checks against the two ns columns it comes from: ABOVE\n\
+         1.00x we beat the walker, BELOW it the walker beat us.\n\
+         \n\
+         The walker is NOT what a default caller gets. `Program::execute` is the bytecode\n\
+         VM whenever `vm` is on, and `vm` is a default feature — the head of this file says\n\
+         why the walker is nonetheless the right baseline for comparing against his\n\
+         published figures. But no column here times that door, so NOTHING in this table\n\
+         answers whether we beat the evaluator a default consumer actually runs. Read\n\
+         every ratio in this file as against the walker and against nothing else.\n\
+         \n\
+         Where the two disagree the route is\n\
          doing something: at one row a straight-line expression has a body of tens of\n\
          words, and no amount of compiling it pays back the entry."
     );
@@ -1548,7 +1627,7 @@ fn main() {
         "\n`enter/call` is calls that ENTERED compiled code, counted at the point the\n\
          compiled body is about to run — not artifacts minted. It now GATES the `majit ns`\n\
          cell beside it rather than merely standing next to it: a case that did not enter on\n\
-         every call of the settled window prints `not entered` there and no `majit/stock`\n\
+         every call of the settled window prints `not entered` there and no `stock/majit`\n\
          ratio, because the number would be the tracing interpreter's under the compiled\n\
          tier's heading. A `0.00` with `compiles` at 1 is a loop that was compiled and never\n\
          run. Two ways in can produce a positive number: the row BODY contains a loop that\n\
