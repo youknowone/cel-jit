@@ -538,6 +538,30 @@ feat: comprehension_nested macro_map macro_filter variable
 want: list[int(20), int(30), int(40)]
 
 
+# The body NAMES the iteration source, so the loop is reading a list a live
+# binding also holds. The bytecode VM iterates that list where it stands rather
+# than over a private copy of it (`OpCode::IterElems`), which makes these the
+# cases that would diverge if anything could rewrite a list buffer underneath a
+# comprehension. Both element types are here because a string element is a
+# reference count where an int is a bare word.
+
+expr: xs.map(x, xs)
+feat: macro_map variable
+want: list[list[int(1), int(2), int(3), int(4)], list[int(1), int(2), int(3), int(4)], list[int(1), int(2), int(3), int(4)], list[int(1), int(2), int(3), int(4)]]
+
+expr: xs.all(x, x in xs)
+feat: macro_all in_operator variable
+want: bool(true)
+
+expr: xs.filter(x, xs.exists(y, y == x))
+feat: comprehension_nested macro_filter macro_exists variable
+want: list[int(1), int(2), int(3), int(4)]
+
+expr: strs.map(x, strs.size())
+feat: macro_map size variable
+want: list[int(3), int(3), int(3)]
+
+
 # An error raised in a comprehension body propagates out of the loop, and one
 # the body absorbs does not -- the absorbing case runs the handler once per
 # element, so it is also the only case where catching repeatedly could

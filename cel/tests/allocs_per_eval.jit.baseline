@@ -385,6 +385,8 @@ walker/custom_function	2.000
 walker/real_world_policy	4.000
 walker/map_literal	2.000
 walker/map_literal/nested	4.000
+walker/qualified_call/nullary	1.000
+walker/qualified_call/nullary_then_member	2.000
 bind/clone-only/1	0.000
 bind/list-to-context/1	0.000
 bind/clone-only/10	0.000
@@ -405,6 +407,12 @@ comprehension/bind+exec/chained/100	22.000
 comprehension/bind+exec/all/100	4.000
 comprehension/bind+exec/exists/100	4.000
 comprehension/bind+exec/size/100	13.000
+comprehension/all-idem/int/10	4.000
+comprehension/all-idem/int/100	4.000
+comprehension/all-idem/int/1000	4.000
+comprehension/all-idem/str/10	4.000
+comprehension/all-idem/str/100	4.000
+comprehension/all-idem/str/1000	4.000
 regvm/clean/arith/n=1	1.000
 regvm/clean-banked/arith/n=1	0.000
 regvm/jit/arith/n=1	1.000
@@ -412,7 +420,7 @@ regvm/jit-idle/arith/n=1	0.000
 regvm/jit-steady/arith/n=1	1.000
 regvm/clean/arith/n=1000	1.000
 regvm/clean-banked/arith/n=1000	0.000
-regvm/jit/arith/n=1000	52.000
+regvm/jit/arith/n=1000	48.000
 regvm/jit-steady/arith/n=1000	1.000
 regvm/clean/policy/n=1	1.000
 regvm/clean-banked/policy/n=1	0.000
@@ -421,7 +429,7 @@ regvm/jit-idle/policy/n=1	0.000
 regvm/jit-steady/policy/n=1	1.000
 regvm/clean/policy/n=1000	1.000
 regvm/clean-banked/policy/n=1000	0.000
-regvm/jit/policy/n=1000	52.000
+regvm/jit/policy/n=1000	48.000
 regvm/jit-steady/policy/n=1000	1.000
 regvm/clean/float/n=1	2.000
 regvm/clean-banked/float/n=1	0.000
@@ -430,5 +438,5 @@ regvm/jit-idle/float/n=1	0.000
 regvm/jit-steady/float/n=1	1.000
 regvm/clean/float/n=1000	2.000
 regvm/clean-banked/float/n=1000	0.000
-regvm/jit/float/n=1000	52.000
+regvm/jit/float/n=1000	48.000
 regvm/jit-steady/float/n=1000	1.000

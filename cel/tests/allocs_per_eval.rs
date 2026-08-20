@@ -610,6 +610,68 @@ fn comprehension_group(out: &mut Vec<Row>) {
 }
 
 // ---------------------------------------------------------------------------
+// group: what `IterElems` costs per COMPREHENSION, apart from per ITERATION
+// ---------------------------------------------------------------------------
+
+/// `xs.all(x, x == x)` swept over N, with an INT list and a STRING list.
+///
+/// The question these rows exist to answer is whether the comprehension
+/// prologue's cost is O(1) or O(N). `OpCode::IterElems` used to answer with a
+/// freshly materialized list — one `Vec<Value>` buffer plus one
+/// `Arc<ListStorage>` — so its allocation cost was two per comprehension and
+/// independent of N, while the per-element work it did (N `Value` clones) was
+/// not allocation-visible at all. A `Δ` that is CONSTANT across N is therefore
+/// the prologue; a `Δ` that grows with N is something per-iteration and this
+/// group is not measuring what it claims to.
+///
+/// The int/string split is the control for that reading. A `Value` clone of an
+/// int is a register copy and a clone of a string is a reference-count RMW —
+/// neither allocates, so the two sweeps must move by the SAME amount. They
+/// diverging would mean an element-proportional term is in the number.
+///
+/// `x == x` rather than a constant-valued body so the loop reads its bound
+/// variable twice per iteration; the comparison itself allocates nothing for
+/// either element type.
+fn iter_elems_group(out: &mut Vec<Row>) {
+    let int_list = |n: usize| -> Value { (0..n as i64).collect::<Vec<i64>>().into() };
+    let str_list = |n: usize| -> Value {
+        (0..n)
+            .map(|i| format!("element-{i}"))
+            .collect::<Vec<String>>()
+            .into()
+    };
+
+    let program = Program::compile("list.all(x, x == x)").expect("compiles");
+    for (kind, build) in [
+        ("int", &int_list as &dyn Fn(usize) -> Value),
+        ("str", &str_list as &dyn Fn(usize) -> Value),
+    ] {
+        for n in [10usize, 100, 1_000] {
+            let list = build(n);
+            assert!(matches!(list, Value::List(_)));
+            let mut ctx: Context<'static> = Context::default();
+            ctx.add_variable_from_value("list", list.clone());
+            assert_eq!(
+                program.execute(&ctx).expect("evaluates"),
+                Value::Bool(true),
+                "all-idem/{kind}/{n} must be true — a false or an error would \
+                 measure a short-circuited loop"
+            );
+            bench(
+                out,
+                format!("comprehension/all-idem/{kind}/{n}"),
+                4,
+                8,
+                || {
+                    ctx.add_variable_from_value("list", list.clone());
+                    black_box(program.execute(&ctx)).ok();
+                },
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // group: the register machine's own cases (design §12 item 10)
 // ---------------------------------------------------------------------------
 
@@ -1601,6 +1663,7 @@ fn main() {
     walker_group(&mut rows);
     bind_group(&mut rows);
     comprehension_group(&mut rows);
+    iter_elems_group(&mut rows);
     regvm_group(&mut rows);
     bank_growth_probe();
 

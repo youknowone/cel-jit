@@ -407,3 +407,9 @@ comprehension/bind+exec/chained/100	22.000
 comprehension/bind+exec/all/100	4.000
 comprehension/bind+exec/exists/100	4.000
 comprehension/bind+exec/size/100	13.000
+comprehension/all-idem/int/10	4.000
+comprehension/all-idem/int/100	4.000
+comprehension/all-idem/int/1000	4.000
+comprehension/all-idem/str/10	4.000
+comprehension/all-idem/str/100	4.000
+comprehension/all-idem/str/1000	4.000

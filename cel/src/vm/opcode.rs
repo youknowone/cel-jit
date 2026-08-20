@@ -155,6 +155,10 @@ pub enum OpCode {
     // through `CallHost` would be a residual call inside the loop body.
     /// Pop a value, push the sequence a one-variable comprehension iterates:
     /// a list's elements, or a map's keys.
+    ///
+    /// A list's elements ARE that list, so the popped value is pushed back
+    /// unchanged and the loop reads the caller's buffer rather than a private
+    /// copy of it. What that costs and why it is safe is at the arm itself.
     IterElems,
     /// Pop a value, push the sequence a two-variable comprehension iterates
     /// as its first variable: a list's *indices*, or a map's keys.

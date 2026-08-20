@@ -622,8 +622,33 @@ impl<'a> Vm<'a> {
             // -- iteration ----------------------------------------------------
             OpCode::IterElems => {
                 let value = self.pop()?;
-                let items = value_iter(&value).map_err(|e| self.park(e))?;
-                self.push(Value::list(items));
+                match value {
+                    // A list already IS the sequence this iterates, so the
+                    // popped value is pushed straight back. Materializing it
+                    // again bought a `Vec<Value>` buffer and the
+                    // `Arc<ListStorage>` [`Value::list`] wraps it in -- two
+                    // allocations per comprehension, and nothing else: the two
+                    // instructions that read the slot, [`OpCode::IterLen`] and
+                    // [`OpCode::IterAt`], are both window-relative and neither
+                    // cares which buffer answers them.
+                    //
+                    // The slot now SHARES the caller's buffer instead of owning
+                    // a private snapshot of it, and nothing can change that
+                    // buffer while the loop runs. A `Value` has no interior
+                    // mutability, so the only writes are the two that rewrite a
+                    // list in place -- `ListRef::into_vec` and `ListRef::concat`
+                    // -- and both go through `Arc::get_mut`, which cannot answer
+                    // for as long as this slot holds a reference of its own. The
+                    // accumulator cannot be that other reference either: on the
+                    // appending path it is an `Operand::List(Vec<Value>)` that
+                    // owns its elements outright, and on the general path it is
+                    // whatever `accu_init` produced, built before the loop.
+                    Value::List(_) => self.push(value),
+                    _ => {
+                        let items = value_iter(&value).map_err(|e| self.park(e))?;
+                        self.push(Value::list(items));
+                    }
+                }
             }
             OpCode::IterKeys => {
                 let value = self.pop()?;
@@ -1132,6 +1157,57 @@ mod tests {
         let mut vm = Vm::new(&code, &ctx);
         assert_eq!(vm.run(), Ok(Value::Bool(false)));
         assert!(vm.stack.is_empty(), "the operand stack was left dirty");
+    }
+
+    /// A comprehension over a list that is neither boxed nor whole.
+    ///
+    /// [`OpCode::IterElems`] hands a list straight back instead of copying it
+    /// out, so the loop reads the caller's [`ListRef`] where it stands: an
+    /// unboxed column, seen through a WINDOW that starts past its first element
+    /// and stops before its last. Copying it out used to normalise both of
+    /// those away before the loop ever saw them, which is exactly why the
+    /// corpus -- whose lists are all whole boxed buffers -- cannot reach this.
+    #[test]
+    fn a_comprehension_reads_a_windowed_unboxed_list_through_the_window() {
+        use crate::objects::{ListRef, ListStorage, ScalarBank, ValueColumn};
+
+        let words: Arc<[i64]> = Arc::from([10i64, 20, 30, 40, 50, 60].as_slice());
+        let storage = Arc::new(ListStorage::Column(ValueColumn::Scalar {
+            bank: ScalarBank::Int,
+            words,
+        }));
+        let windowed = Value::List(ListRef::window(storage, 2, 3));
+
+        let mut ctx = Context::default();
+        ctx.add_variable_from_value("xs", windowed.clone());
+
+        assert_eq!(
+            run("xs.map(x, x)", &ctx),
+            Ok(Value::list(vec![
+                Value::Int(30),
+                Value::Int(40),
+                Value::Int(50)
+            ]))
+        );
+        assert_eq!(
+            run("xs.all(x, x >= 30 && x <= 50)", &ctx),
+            Ok(Value::Bool(true))
+        );
+        // The body names the iteration source, so the loop and the binding read
+        // one buffer at once -- and the binding still answers for itself after.
+        assert_eq!(
+            run("xs.map(x, xs)", &ctx),
+            Ok(Value::list(vec![
+                windowed.clone(),
+                windowed.clone(),
+                windowed.clone()
+            ]))
+        );
+        assert_eq!(
+            run("xs.filter(x, x in xs)", &ctx),
+            run("xs.map(x, x)", &ctx)
+        );
+        assert_eq!(run("xs", &ctx), Ok(windowed));
     }
 
     /// The parser never builds a two-variable comprehension and the tree
