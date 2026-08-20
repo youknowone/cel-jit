@@ -1728,8 +1728,36 @@ pub mod float_bank {
         )
     }
 
-    /// The green key a door arming at `pc` in `program` files under, as
-    /// `(hash, values, types)`.
+    /// A green key the pool computed once, in both the forms a probe needs.
+    ///
+    /// The hash names a BUCKET, and a bucket can hold more than one cell, so a
+    /// probe that stops at the hash is asking about whichever cell heads the
+    /// chain rather than about the one its greens own. The typed halves are
+    /// what settles that, through `comparekey`. Carrying both is what lets
+    /// every door in this file decide on the cell it means.
+    struct PooledGreenKey {
+        hash: u64,
+        values: [i64; 3],
+        types: [majit_ir::GreenType; 3],
+    }
+
+    impl PooledGreenKey {
+        /// The key of the cell these greens own.
+        ///
+        /// One bucket walk. The typed key is BUILT only where the bucket is
+        /// chained — `resolve_cell_key` answers an empty or single-cell bucket
+        /// from the walk alone — so the two allocations behind it are paid on
+        /// the shape that needs them and not on every call. On every bucket
+        /// holding one cell or none the answer is the raw hash, which is what
+        /// the probes asked before this existed.
+        fn resolve(&self, driver: &majit_metainterp::JitDriver<VmStateF>) -> u64 {
+            driver.resolve_cell_key(self.hash, || {
+                majit_ir::GreenKey::with_types(self.values.to_vec(), self.types.to_vec())
+            })
+        }
+    }
+
+    /// The green key a door arming at `pc` in `program` files under.
     ///
     /// The three slots are the ones `can_enter_jit!` builds for a `greens = [pc,
     /// program]` driver: the marker's own position argument, then each declared
@@ -1738,18 +1766,18 @@ pub mod float_bank {
     /// probes answer on, and the typed values are what `comparekey` resolves a
     /// cell collision with — or a door would file under a key nothing else can
     /// name.
-    fn green_key_at(program: &Code, pc: usize) -> (u64, [i64; 3], [majit_ir::GreenType; 3]) {
+    fn green_key_at(program: &Code, pc: usize) -> PooledGreenKey {
         use majit_ir::GreenAsI64 as _;
         let slots = [pc.__green_repr(), pc.__green_repr(), program.__green_repr()];
         let mut hash = majit_ir::GREEN_UHASH_SEED;
         for (value, ty) in slots {
             hash = majit_ir::green_uhash_step(hash, ty, value);
         }
-        (
+        PooledGreenKey {
             hash,
-            [slots[0].0, slots[1].0, slots[2].0],
-            [slots[0].1, slots[1].1, slots[2].1],
-        )
+            values: [slots[0].0, slots[1].0, slots[2].0],
+            types: [slots[0].1, slots[1].1, slots[2].1],
+        }
     }
 
     /// The green keys of `program`'s own loop headers — the target of every
@@ -1776,7 +1804,7 @@ pub mod float_bank {
     /// minted it, permanently: `compiles=1`, `compiled_entries=0`. Excluding it
     /// costs nothing a real loop header at 0 would have provided, since a door
     /// there and this door are one key and the caller is that door.
-    fn loop_header_keys(program: &Code) -> Vec<u64> {
+    fn loop_header_keys(program: &Code) -> Vec<PooledGreenKey> {
         let mut targets: Vec<usize> = Vec::new();
         for pc in 0..program.len().saturating_sub(3) {
             if program[pc] != OP_JUMP_IF_ABOVE {
@@ -1796,7 +1824,7 @@ pub mod float_bank {
         }
         targets
             .into_iter()
-            .map(|target| green_key_at(program, target).0)
+            .map(|target| green_key_at(program, target))
             .collect()
     }
 
@@ -1869,17 +1897,25 @@ pub mod float_bank {
         // to. It costs one cell read per key either way — the predicate is that
         // read with its answer collapsed to a bool.
         //
-        // Still on bare hashes, and that is the one place in this door where a
-        // chained bucket can still answer for the wrong cell. The greens of a
-        // loop header are derivable (they are `pc` and the program address, the
-        // same shape [`green_key_at`] builds), but the pool stores only the
-        // hash, so resolving here would mean widening what it keeps. Left as
-        // is: the consequence is a yield-or-not decision about a door that is
-        // not this one, not an entry into someone else's code.
+        // On the RESOLVED key, like the entry decision below. A loop header's
+        // greens are `pc` and the program address, the same shape
+        // [`green_key_at`] builds, and the pool now keeps them
+        // ([`PooledGreenKey`]) rather than the hash alone — so a chained bucket
+        // no longer lets this answer for whichever cell heads the chain.
+        //
+        // It costs one bucket walk per loop key per call, on a path that runs
+        // on every call. Proportionate rather than free: the entry decision
+        // below already pays exactly this walk once per call, so the door was
+        // already built to afford one, and a program with no backward jump has
+        // no loop key to walk for. What it buys is smaller than the entry fix —
+        // the outcome here is a yield-or-not decision about a door that is not
+        // this one, not an entry into someone else's compiled code — but the
+        // two probes now decide on the same footing, which is what stops the
+        // weaker one from being read as evidence about the stronger.
         if pooled
             .loop_keys
             .iter()
-            .any(|key| driver.has_runnable_compiled_loop(*key))
+            .any(|key| driver.has_runnable_compiled_loop(key.resolve(driver)))
         {
             return None;
         }
@@ -1887,7 +1923,7 @@ pub mod float_bank {
         // and both of its inputs are fixed for as long as the pool pins this
         // address. See [`PooledProgram`].
         //
-        // Resolved once, then carried. `entry_hash` is a bucket hash, and a
+        // Resolved once, then carried. `entry_key` holds a bucket hash, and a
         // bucket can hold more than one cell; the typed key settles which one
         // this door's greens own, and every step below — the entry decision,
         // the token it decides on, and the run that token is handed to — uses
@@ -1895,11 +1931,7 @@ pub mod float_bank {
         // the bare hash on, which was two resolutions per warm call and, on a
         // chained bucket, a decision about one cell followed by a run keyed
         // through another.
-        let hash = pooled.entry_hash;
-        let (values, types) = (&pooled.entry_values, &pooled.entry_types);
-        let entry_key = driver.resolve_cell_key(hash, || {
-            majit_ir::GreenKey::with_types(values.to_vec(), types.to_vec())
-        });
+        let entry_key = pooled.entry_key.resolve(driver);
         // The token IS the decision — `Some` is the runnable-compiled-loop
         // answer this branch used to ask for as a predicate, and it is the same
         // object the run below enters, so nothing between the two can make them
@@ -2573,25 +2605,21 @@ pub mod float_bank {
         /// The words. Held for exactly as long as a compiled loop can be keyed
         /// on their address — see [`PooledDriver`].
         words: std::sync::Arc<Code>,
-        /// [`loop_header_keys`] for those words.
-        loop_keys: Vec<u64>,
+        /// [`loop_header_keys`] for those words — the keys of the doors that
+        /// are NOT this one, which the entry door yields to.
+        loop_keys: Vec<PooledGreenKey>,
         /// [`green_key_at`] at [`ENTRY_PC`] — the key the function-entry door
         /// files under. The hash folds the program POINTER, so it is a property
         /// of this pinned address and not of the words alone.
-        entry_hash: u64,
-        entry_values: [i64; 3],
-        entry_types: [majit_ir::GreenType; 3],
+        entry_key: PooledGreenKey,
     }
 
     impl PooledProgram {
         fn new(program: &std::sync::Arc<Code>) -> Self {
-            let (entry_hash, entry_values, entry_types) = green_key_at(program, ENTRY_PC);
             PooledProgram {
                 words: std::sync::Arc::clone(program),
                 loop_keys: loop_header_keys(program),
-                entry_hash,
-                entry_values,
-                entry_types,
+                entry_key: green_key_at(program, ENTRY_PC),
             }
         }
     }
