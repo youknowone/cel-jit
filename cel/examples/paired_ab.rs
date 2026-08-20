@@ -962,6 +962,14 @@ fn main() {
         }
     }
 
+    // -- THE PROBE ----------------------------------------------------------
+    // Task #36's drop decomposition and the `IterAt` arm, behind
+    // `--features drop-arm-probe`. Placed here so that the closing null
+    // control below still brackets them; each section inside sets its own
+    // floor, because the one above was measured on a much shorter arm.
+    #[cfg(feature = "drop-arm-probe")]
+    probe(&cfg);
+
     // -- THE ARMS UNDER TEST ------------------------------------------------
     // Replace these two closures to measure something else. Nothing above needs
     // to change: the controls, the floor and the verdicts are all machinery.
@@ -1122,4 +1130,447 @@ fn main() {
             &real_run.name_b
         )
     );
+}
+
+// ---------------------------------------------------------------------------
+// The probe (feature `drop-arm-probe`)
+// ---------------------------------------------------------------------------
+//
+// Two questions, both answered as a difference taken inside ONE binary:
+//
+//   * task #36 — an operand the interpreter throws away goes through the
+//     out-of-line drop glue for `Value`. Is the cost the CALL, or the work
+//     inside it?
+//   * `IterAt` — the arm was rewritten to index a known list instead of
+//     routing through `value_index`, and landed explicitly unmeasured.
+//
+// Both are selected at run time by `cel::vm::ProbePolicy`, so every arm is the
+// same compiled `Vm::step` taking a different branch. That branch costs one
+// field read and one perfectly-predicted test at each site, present
+// identically in every arm, so it cancels out of any difference between two of
+// them — and it also means no arm's ABSOLUTE figure is what the shipping
+// interpreter costs. Only differences are claims.
+
+/// Elements per comprehension for the drop decomposition.
+///
+/// Large on purpose. The harness's floor is per ITERATION of an arm, and one
+/// iteration is a whole comprehension, so the resolution available per DISCARD
+/// is the floor divided by the discards one iteration performs. A thousand
+/// elements buys three orders of magnitude of that division; the price is that
+/// the figure is an average over a loop, which is what a per-element cost is.
+#[cfg(feature = "drop-arm-probe")]
+const DROP_PROBE_ELEMS: usize = 1000;
+
+/// A context binding `xs` to `n` integers.
+///
+/// From ONE, not from zero. A comprehension whose predicate is false for the
+/// first element short-circuits, and an arm that stops after one element is
+/// still a perfectly well-behaved arm -- it just measures a loop that did not
+/// run. The `assert` on each ladder's answer is what turns that from a thing
+/// to remember into a thing that fails.
+#[cfg(feature = "drop-arm-probe")]
+fn int_list_ctx(n: usize) -> Context<'static> {
+    let mut ctx = Context::default();
+    ctx.add_variable_from_value("xs", (1..=n as i64).collect::<Vec<i64>>());
+    ctx
+}
+
+/// A context binding `xs` to `n` strings, each its own allocation.
+#[cfg(feature = "drop-arm-probe")]
+fn string_list_ctx(n: usize) -> Context<'static> {
+    let mut ctx = Context::default();
+    ctx.add_variable_from_value(
+        "xs",
+        (0..n)
+            .map(|i| format!("element-{i:06}"))
+            .collect::<Vec<String>>(),
+    );
+    ctx
+}
+
+/// Compile `src` to a code object the probe can run under an explicit policy.
+#[cfg(feature = "drop-arm-probe")]
+fn probe_code(src: &str) -> cel::vm::CelCode {
+    let expr = cel::parser::Parser::default()
+        .parse(src)
+        .expect("the probe source parses");
+    cel::vm::compile(&expr).expect("the probe source compiles")
+}
+
+/// Print what a resolved comparison says per unit of whatever it loops over.
+///
+/// The floor is per iteration of an arm and one iteration is a whole
+/// comprehension, so BOTH the delta and the floor are divided by the same
+/// count. Quoting a per-element delta against a per-iteration floor would
+/// claim a resolution three orders of magnitude finer than the one measured.
+/// An unresolved comparison prints no number at all: below the floor there is
+/// nothing to divide.
+#[cfg(feature = "drop-arm-probe")]
+fn per_unit(label: &str, s: &Stats, floor: f64, units: f64, unit: &str) {
+    if verdict(s, floor).resolved() {
+        println!(
+            "  {label:<24} {:+.4} ns per {unit}   ({:+.2}% of arm A)   \
+             floor/{unit} ±{:.4} ns over {units:.0}",
+            s.median_diff / units,
+            100.0 * s.median_diff / s.a_median,
+            floor / units,
+        );
+    } else {
+        println!(
+            "  {label:<24} UNRESOLVED per iteration (|{:+.3}| vs floor ±{floor:.3} ns/iter) — \
+             nothing may be quoted per {unit}",
+            s.median_diff,
+        );
+    }
+}
+
+/// A null control on the arms actually under test, and the floor it sets.
+///
+/// The harness's own floor was measured on an arm costing tens of nanoseconds.
+/// A comprehension over a thousand elements costs tens of microseconds, and
+/// noise scales with the length of the batch it lands in, so grading one
+/// against the other would understate the noise by the ratio of the two. Every
+/// comparison below is graded against a null run on its own arms instead.
+#[cfg(feature = "drop-arm-probe")]
+fn local_floor<F: FnMut()>(title: &str, mut make: impl FnMut() -> F, cfg: &Config) -> Floors {
+    let run = {
+        let mut a = Arm::new("arm under test", make());
+        let mut b = Arm::new("identical copy", make());
+        run_pair(&mut a, &mut b, cfg)
+    };
+    let (cpu, wall) = report(title, &run, cfg, None);
+    let floors = Floors {
+        cpu: floor_from(&cpu),
+        wall: floor_from(&wall),
+    };
+    println!(
+        "  LOCAL RESOLUTION FLOOR ±{:.3} ns/iter (thread CPU) — this section only",
+        floors.cpu
+    );
+    floors
+}
+
+/// Task #36: split the cost of an out-of-line `Value` drop into the call and
+/// the work.
+///
+/// Stated before any run:
+///
+/// * `Baseline − InlineDiscriminant` measures **(A) the call**. Both arms test
+///   the discriminant; only Baseline does it behind a `call`/`ret`, with the
+///   caller-saved clobber and the alias barrier that come with it.
+/// * `InlineDiscriminant − ForgetUnsound` measures **(B) the work**. Neither
+///   arm calls out on the trivial path; only Arm I executes the test.
+/// * `Baseline − ForgetUnsound` is **A + B**, an additivity check and not a
+///   third quantity.
+///
+/// #36's hypothesis — "the cost is the CALL, not the work inside it" —
+/// predicts A > B. B ≥ A with both resolved refutes it.
+///
+/// What this does NOT cover: `compare_values` and `binary_values` take their
+/// operands by value and drop them inside `objects.rs`, which the tree walker
+/// shares. Each ladder below therefore measures a MAJORITY of its per-element
+/// `Value` drops, not all of them.
+#[cfg(feature = "drop-arm-probe")]
+fn drop_decomposition(cfg: &Config) {
+    use cel::vm::{cel_eval_loop_with_probe, DropArm, IterAtArm, ProbePolicy};
+    use cel::Value;
+
+    // Both ladders are integer-only, which is what makes `ForgetUnsound`
+    // sound: every operand it forgets is an `Int` or a `Bool`, and forgetting
+    // one releases nothing because it owns nothing.
+    //
+    // The discard counts are read off the lowering in `vm/compile.rs`, per
+    // element:
+    //
+    //   map:  StoreLocal iter_var (the old element) + JumpIfFalse (the
+    //         exhaustion guard)                                        = 2
+    //   all:  those two, plus JumpIfFalse (the loop condition), And,
+    //         AndMerge, and StoreLocal accu                            = 6
+    //
+    // `map` reaches two of the four site families and `all` reaches all four,
+    // so the two ladders are an independent pair of estimates rather than one
+    // measurement run twice.
+    let ladders: [(&str, f64); 2] = [("xs.map(x, x * 2)", 2.0), ("xs.all(x, x > 0)", 6.0)];
+
+    for (src, discards_per_elem) in ladders {
+        let code = probe_code(src);
+        let ctx = int_list_ctx(DROP_PROBE_ELEMS);
+        let discards = discards_per_elem * DROP_PROBE_ELEMS as f64;
+
+        // The discard count above is per element and assumes the loop reaches
+        // every element. `all` stops at the first false, so this is a
+        // precondition of the arithmetic, not a smoke test: an arm that
+        // short-circuits after one element still runs, still times, and its
+        // per-discard figure is then wrong by three orders of magnitude.
+        let answer = cel_eval_loop_with_probe(&code, &ctx, ProbePolicy::default())
+            .expect("the ladder evaluates");
+        let elements = match &answer {
+            Value::List(list) => list.len(),
+            Value::Bool(true) => DROP_PROBE_ELEMS,
+            other => panic!("`{src}` answered {other:?}, which cannot show a full traversal"),
+        };
+        assert_eq!(
+            elements, DROP_PROBE_ELEMS,
+            "`{src}` traversed {elements} of {DROP_PROBE_ELEMS} elements: the discard count \
+             below is per element and assumes the whole sequence"
+        );
+
+        println!();
+        println!("###########################################################");
+        println!("# DROP DECOMPOSITION on `{src}` over {DROP_PROBE_ELEMS} integers");
+        println!("# {discards:.0} discards inside `Vm::step` per iteration");
+        println!("###########################################################");
+
+        // Guard 1, static: nothing the program can put on the stack owns
+        // anything.
+        assert!(
+            code.consts.iter().all(|c| matches!(
+                c,
+                Value::Int(_) | Value::UInt(_) | Value::Float(_) | Value::Bool(_) | Value::Null
+            )),
+            "the unsound arm needs a program whose constants own nothing: {:?}",
+            code.consts
+        );
+
+        let policy = |drop_arm| ProbePolicy {
+            drop_arm,
+            iter_at: IterAtArm::KnownList,
+        };
+
+        // Two of the three arms are semantics-preserving and the third is
+        // supposed to be, on this ladder, for the reason the guards above
+        // state. All three answering the same thing is what says so.
+        for other in [DropArm::InlineDiscriminant, DropArm::ForgetUnsound] {
+            let out =
+                cel_eval_loop_with_probe(&code, &ctx, policy(other)).expect("the arm evaluates");
+            assert_eq!(
+                out, answer,
+                "`{src}` under {other:?} disagrees with the baseline"
+            );
+        }
+        let arm = |drop_arm| {
+            let code = &code;
+            let ctx = &ctx;
+            let policy = policy(drop_arm);
+            move || {
+                let out = cel_eval_loop_with_probe(black_box(code), black_box(ctx), policy)
+                    .expect("the arm evaluates");
+                black_box(out);
+            }
+        };
+
+        // Warm the thread's buffer pool and the allocator's free lists before
+        // counting, so the witness compares two steady-state evaluations
+        // rather than one cold one against one warm one.
+        for arm_policy in [DropArm::Baseline, DropArm::ForgetUnsound] {
+            for _ in 0..4 {
+                arm(arm_policy)();
+            }
+        }
+
+        // Guard 2, dynamic, and the one that decides. If the arm forgot
+        // anything the allocator handed out, the counts do not balance.
+        // NECESSARY, NOT SUFFICIENT: a forgotten clone of something the
+        // CONTEXT owns leaks a reference count and frees no less memory inside
+        // the window, which is why guard 1 and the fixed sources above are not
+        // redundant with it.
+        let (base_allocs, base_frees) = count_allocs(arm(DropArm::Baseline));
+        let (leak_allocs, leak_frees) = count_allocs(arm(DropArm::ForgetUnsound));
+        assert_eq!(
+            leak_allocs as i64 - leak_frees as i64,
+            base_allocs as i64 - base_frees as i64,
+            "DropArm::ForgetUnsound leaked on `{src}`: {leak_allocs} allocs / {leak_frees} \
+             frees against a baseline of {base_allocs}/{base_frees}. Do not time this arm."
+        );
+        println!(
+            "  leak witness     baseline {base_allocs} alloc / {base_frees} free, \
+             forget {leak_allocs} alloc / {leak_frees} free — balanced"
+        );
+
+        let floors = local_floor(
+            &format!("LOCAL NULL CONTROL: `{src}` Baseline vs an identical copy"),
+            || arm(DropArm::Baseline),
+            cfg,
+        );
+
+        let call_run = {
+            let mut a = Arm::new("Baseline (out-of-line glue)", arm(DropArm::Baseline));
+            let mut b = Arm::new(
+                "Arm I (discriminant inline)",
+                arm(DropArm::InlineDiscriminant),
+            );
+            run_pair(&mut a, &mut b, cfg)
+        };
+        let (call_cpu, _) = report(
+            &format!("(A) the out-of-line drop CALL — Baseline vs Arm I, `{src}`"),
+            &call_run,
+            cfg,
+            Some(floors),
+        );
+        per_unit(
+            "(A) call, per discard",
+            &call_cpu,
+            floors.cpu,
+            discards,
+            "discard",
+        );
+
+        let work_run = {
+            let mut a = Arm::new(
+                "Arm I (discriminant inline)",
+                arm(DropArm::InlineDiscriminant),
+            );
+            let mut b = Arm::new("Arm N (forget — LEAKS)", arm(DropArm::ForgetUnsound));
+            run_pair(&mut a, &mut b, cfg)
+        };
+        let (work_cpu, _) = report(
+            &format!("(B) the discriminant WORK — Arm I vs Arm N, `{src}`"),
+            &work_run,
+            cfg,
+            Some(floors),
+        );
+        per_unit(
+            "(B) work, per discard",
+            &work_cpu,
+            floors.cpu,
+            discards,
+            "discard",
+        );
+
+        let whole_run = {
+            let mut a = Arm::new("Baseline (out-of-line glue)", arm(DropArm::Baseline));
+            let mut b = Arm::new("Arm N (forget — LEAKS)", arm(DropArm::ForgetUnsound));
+            run_pair(&mut a, &mut b, cfg)
+        };
+        let (whole_cpu, _) = report(
+            &format!("(A+B) Baseline vs Arm N — must equal A + B, `{src}`"),
+            &whole_run,
+            cfg,
+            Some(floors),
+        );
+        per_unit(
+            "(A+B) per discard",
+            &whole_cpu,
+            floors.cpu,
+            discards,
+            "discard",
+        );
+
+        // Additivity. Two halves measured separately have to add up to the
+        // whole measured directly; if they do not, the three arms were not one
+        // binary's three branches and both halves are void. Reported against
+        // the whole comparison's own interval rather than asserted, because a
+        // disagreement is a result about the instrument and deserves to be
+        // read, not to abort the run.
+        let halves = -call_cpu.median_diff + -work_cpu.median_diff;
+        let direct = -whole_cpu.median_diff;
+        println!(
+            "  additivity        A+B from the halves {halves:+.3} vs measured directly \
+             {direct:+.3} ns/iter   (whole's 95% CI [{:+.3}, {:+.3}])",
+            -whole_cpu.ci_hi, -whole_cpu.ci_lo
+        );
+    }
+}
+
+/// Price the `IterAt` change that landed in `338e0d6` with its effect
+/// explicitly unmeasured.
+///
+/// The old arm handed both slots to `value_index`, which decides the
+/// container's kind, then the key's kind, then bounds-checks, then answers in
+/// `ExecutionError` — which `Vm::park` records on `&mut self`. The new arm is
+/// two variant tests and one unsigned comparison answering in `CelErr`.
+///
+/// Swept over three lengths so that an O(1) effect — anything paid once per
+/// evaluation — separates from the O(N) one the instruction is, and over two
+/// element types because the boxing on the way out of a list differs between
+/// an unboxed integer column and an interned string.
+#[cfg(feature = "drop-arm-probe")]
+fn iter_at_sweep(cfg: &Config) {
+    use cel::vm::{cel_eval_loop_with_probe, DropArm, IterAtArm, ProbePolicy};
+
+    // The smallest body that still runs the instruction once per element, so
+    // the loop's other work is as small a share of the arm as it gets.
+    const SRC: &str = "xs.map(x, x)";
+    let code = probe_code(SRC);
+
+    for (kind, build) in [
+        ("int", int_list_ctx as fn(usize) -> Context<'static>),
+        ("string", string_list_ctx as fn(usize) -> Context<'static>),
+    ] {
+        for n in [10usize, 100, 1000] {
+            let ctx = build(n);
+
+            println!();
+            println!("###########################################################");
+            println!("# IterAt on `{SRC}` over {n} {kind} elements");
+            println!("###########################################################");
+
+            let arm = |iter_at| {
+                let code = &code;
+                let ctx = &ctx;
+                let policy = ProbePolicy {
+                    drop_arm: DropArm::Baseline,
+                    iter_at,
+                };
+                move || {
+                    let out = cel_eval_loop_with_probe(black_box(code), black_box(ctx), policy)
+                        .expect("the arm evaluates");
+                    black_box(out);
+                }
+            };
+
+            // Both arms must compute the same answer to be comparable, and
+            // here that is a real check rather than a formality: the two
+            // lowerings disagree about which error an out-of-range index
+            // raises, so agreement on the in-range path is what says the
+            // rewrite preserved the value.
+            let old = cel_eval_loop_with_probe(
+                &code,
+                &ctx,
+                ProbePolicy {
+                    drop_arm: DropArm::Baseline,
+                    iter_at: IterAtArm::ViaValueIndex,
+                },
+            )
+            .expect("the old arm evaluates");
+            let new = cel_eval_loop_with_probe(&code, &ctx, ProbePolicy::default())
+                .expect("the new arm evaluates");
+            assert_eq!(old, new, "the two IterAt lowerings must agree");
+
+            let floors = local_floor(
+                &format!("LOCAL NULL CONTROL: `{SRC}`, {n} {kind}, new arm vs an identical copy"),
+                || arm(IterAtArm::KnownList),
+                cfg,
+            );
+
+            let run = {
+                let mut a = Arm::new("old (via value_index)", arm(IterAtArm::ViaValueIndex));
+                let mut b = Arm::new("new (known list)", arm(IterAtArm::KnownList));
+                run_pair(&mut a, &mut b, cfg)
+            };
+            let (cpu, _) = report(
+                &format!("IterAt: value_index vs known-list, {n} {kind} elements"),
+                &run,
+                cfg,
+                Some(floors),
+            );
+            per_unit("IterAt, per element", &cpu, floors.cpu, n as f64, "element");
+        }
+    }
+}
+
+/// Everything behind `drop-arm-probe`, run inside the bracket the opening and
+/// closing null controls form.
+#[cfg(feature = "drop-arm-probe")]
+fn probe(cfg: &Config) {
+    println!();
+    println!("===========================================================");
+    println!("=  PROBE (feature `drop-arm-probe`)");
+    println!("=  Every section below sets its OWN floor from a null");
+    println!("=  control on its own arms. The floor printed above was");
+    println!("=  measured on an arm costing tens of nanoseconds and does");
+    println!("=  not apply to a comprehension costing tens of thousands.");
+    println!("===========================================================");
+    drop_decomposition(cfg);
+    iter_at_sweep(cfg);
 }

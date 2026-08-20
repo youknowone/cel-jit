@@ -49,6 +49,8 @@ pub use code::{CelCode, Handler};
 pub use compile::{compile, CompileError, CompileErrorKind};
 pub use error::{CelErr, CelResult, ColdId, NameId};
 pub use interp::cel_eval_loop;
+#[cfg(feature = "drop-arm-probe")]
+pub use interp::{cel_eval_loop_with_probe, DropArm, IterAtArm, ProbePolicy};
 pub use opcode::{OpCode, OPCODE_COUNT};
 
 use crate::common::ast::IdedExpr;

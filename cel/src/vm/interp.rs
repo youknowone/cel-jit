@@ -47,10 +47,39 @@ use std::cmp::Ordering;
 /// `&&` and `||` absorb errors and so raise them on ordinary control flow.
 pub fn cel_eval_loop(code: &CelCode, ctx: &Context) -> Result<Value, ExecutionError> {
     let mut vm = Vm::new(code, ctx);
+    #[cfg(feature = "drop-arm-probe")]
+    {
+        vm.probe = PROBE.with(std::cell::Cell::get);
+    }
     match vm.run() {
         Ok(value) => Ok(value),
         Err(err) => Err(vm.public_error(err)),
     }
+}
+
+/// Run `code` in `ctx` under an explicit probe policy.
+///
+/// The probe's only door, and it goes through the ordinary one rather than
+/// building a machine of its own: `tests/one_dispatch_loop.rs` pins this file
+/// to exactly one `Vm::new` and one `run`, because a second construction site
+/// is what a nested interpreter looks like. So the policy is announced in
+/// advance instead of passed down, which is what [`PROBE`] is for.
+///
+/// Saved and restored around the one call, so two arms interleaved in one
+/// process never observe each other's setting, and an evaluation a host
+/// function starts from inside this one inherits the enclosing policy rather
+/// than a stale one. A panic escaping the evaluation leaves the policy set;
+/// that is a probe, not a library, and the process is going down anyway.
+#[cfg(feature = "drop-arm-probe")]
+pub fn cel_eval_loop_with_probe(
+    code: &CelCode,
+    ctx: &Context,
+    probe: ProbePolicy,
+) -> Result<Value, ExecutionError> {
+    let previous = PROBE.with(|slot| slot.replace(probe));
+    let out = cel_eval_loop(code, ctx);
+    PROBE.with(|slot| slot.set(previous));
+    out
 }
 
 /// One operand-stack entry.
@@ -100,6 +129,144 @@ enum Operand {
 const _: () = {
     assert!(core::mem::size_of::<Operand>() == 32);
 };
+
+/// Which drop policy [`Vm::discard`] applies to a discarded operand.
+///
+/// A measurement probe, not a feature. It exists to answer one question: an
+/// operand the interpreter throws away is dropped through the out-of-line glue
+/// for [`Value`], which on the integer path executes a handful of instructions
+/// and branches that do nothing -- is the cost the CALL, or the work inside
+/// it? The three policies bracket that. The difference between the first two
+/// is the call; the difference between the second two is the work.
+#[cfg(feature = "drop-arm-probe")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DropArm {
+    /// What the interpreter does without the probe: hand the operand to the
+    /// glue, whatever it holds.
+    Baseline,
+    /// Test the discriminant at the call site and reach the glue only for the
+    /// variants that own something. Keeps the work; removes the call on the
+    /// trivial path.
+    InlineDiscriminant,
+    /// THIS ARM LEAKS. Forget the operand: no discriminant test, no call, and
+    /// no release of anything it owned.
+    ///
+    /// Valid ONLY where nothing owning is ever discarded -- an integer body
+    /// over a list of integers, and nothing else. On a case that carries a
+    /// string, a list, a map, a struct or a record it leaks heap proportional
+    /// to the element count and holds reference counts that decide whether an
+    /// in-place string append is taken, so it corrupts the very timings it is
+    /// there to produce. The caller is responsible for proving the case is
+    /// safe; see the leak witness in `examples/paired_ab.rs`.
+    ForgetUnsound,
+}
+
+/// Which lowering [`OpCode::IterAt`] uses to read one element.
+///
+/// The second half of the same probe, and here for the same reason: two
+/// spellings of one instruction, chosen per run, so both live in one binary
+/// and neither can be a different compilation of the other.
+#[cfg(feature = "drop-arm-probe")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum IterAtArm {
+    /// Hand both slots to `value_index`, which decides the container's kind,
+    /// then the key's kind, then bounds-checks, then answers in the wide
+    /// public error type -- which `Vm::park` has to record on `&mut self`.
+    ViaValueIndex,
+    /// What the interpreter does without the probe: two variant tests and one
+    /// unsigned comparison, answering in [`CelErr`].
+    KnownList,
+}
+
+/// Everything the probe selects, carried on the [`Vm`] and read at the site.
+///
+/// One field read and one perfectly-predicted branch per site, present
+/// identically in every arm because every arm is the same compiled code taking
+/// a different branch. Both cancel exactly out of any difference between two
+/// arms -- which is also why no arm's ABSOLUTE figure is what the shipping
+/// interpreter costs. Only differences are claims.
+#[cfg(feature = "drop-arm-probe")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ProbePolicy {
+    pub drop_arm: DropArm,
+    pub iter_at: IterAtArm,
+}
+
+#[cfg(feature = "drop-arm-probe")]
+impl ProbePolicy {
+    /// What the interpreter does without the probe.
+    ///
+    /// A `const` as well as a [`Default`], because the thread-local below is
+    /// initialised in a `const` block and `Default::default` is not callable
+    /// there.
+    pub const STOCK: ProbePolicy = ProbePolicy {
+        drop_arm: DropArm::Baseline,
+        iter_at: IterAtArm::KnownList,
+    };
+}
+
+#[cfg(feature = "drop-arm-probe")]
+impl Default for ProbePolicy {
+    /// What the interpreter does without the probe, so that a run that names
+    /// only one half leaves the other half alone.
+    fn default() -> ProbePolicy {
+        ProbePolicy::STOCK
+    }
+}
+
+#[cfg(feature = "drop-arm-probe")]
+std::thread_local! {
+    /// The policy the next evaluation on this thread runs under.
+    ///
+    /// Read once per evaluation -- not once per instruction -- and identically
+    /// by every arm, so it is a constant that cancels out of any difference
+    /// between two of them.
+    static PROBE: std::cell::Cell<ProbePolicy> =
+        const { std::cell::Cell::new(ProbePolicy::STOCK) };
+}
+
+/// [`DropArm::InlineDiscriminant`]'s policy: test the discriminant here, and
+/// reach the out-of-line glue only for the variants that own something.
+///
+/// The trivial branch is spelled with [`std::mem::forget`] rather than as an
+/// empty match arm, and the difference is the whole arm. `match value { .. =>
+/// {} }` does not MOVE `value` in an arm whose patterns bind nothing, so the
+/// scrutinee is still live at the end of the match and is dropped there --
+/// through the same glue, with the same call. Verified on the generated code:
+/// the empty-arm spelling compiled to a discriminant test in front of two
+/// paths that BOTH called `drop_glue::<Value>`, which is the baseline plus a
+/// test rather than an alternative to it.
+///
+/// Forgetting is what makes the branch a real one, and it is sound for exactly
+/// the variants listed: each is plain data, and the generated glue returns
+/// immediately for every one of their discriminants. A variant added to
+/// [`Value`] that owns anything falls to the `else`, because the list is
+/// explicit rather than a wildcard.
+#[cfg(feature = "drop-arm-probe")]
+#[inline(always)]
+fn discard_inline(value: Value) {
+    #[cfg(feature = "chrono")]
+    let trivial = matches!(
+        value,
+        Value::Int(_)
+            | Value::UInt(_)
+            | Value::Float(_)
+            | Value::Bool(_)
+            | Value::Null
+            | Value::Duration(_)
+            | Value::Timestamp(_)
+    );
+    #[cfg(not(feature = "chrono"))]
+    let trivial = matches!(
+        value,
+        Value::Int(_) | Value::UInt(_) | Value::Float(_) | Value::Bool(_) | Value::Null
+    );
+    if trivial {
+        std::mem::forget(value);
+    } else {
+        drop(value);
+    }
+}
 
 /// The four growable buffers a run needs, kept across runs so that evaluating
 /// a program does not allocate an activation record.
@@ -191,6 +358,9 @@ struct Vm<'a> {
     /// [`Vm::unwind`], which is where that load's error goes when a `&&`/`||`
     /// absorbs it and the method call never runs.
     pending_args: Option<Vec<Value>>,
+    /// Which lowering the probe's sites take. Probe only; see [`ProbePolicy`].
+    #[cfg(feature = "drop-arm-probe")]
+    probe: ProbePolicy,
 }
 
 /// Return the buffers to this thread's pool.
@@ -245,6 +415,8 @@ impl<'a> Vm<'a> {
             logic: scratch.logic,
             cold: scratch.cold,
             pending_args: None,
+            #[cfg(feature = "drop-arm-probe")]
+            probe: ProbePolicy::default(),
         }
     }
 
@@ -351,6 +523,50 @@ impl<'a> Vm<'a> {
     fn pop(&mut self) -> CelResult<Value> {
         let operand = self.stack.pop().ok_or(CelErr::InternalError)?;
         self.finish(operand)
+    }
+
+    /// Throw a popped operand away.
+    ///
+    /// Written as a call rather than left to end of scope so the discard has
+    /// one name a measurement probe can substitute for. Without the probe this
+    /// is the drop the arm performed anyway, at the same point.
+    #[cfg(not(feature = "drop-arm-probe"))]
+    #[inline(always)]
+    fn discard(&self, value: Value) {
+        drop(value);
+    }
+
+    /// Throw a popped operand away, under whichever policy the probe selected.
+    ///
+    /// One branch on a field, taken identically by every evaluation of a run,
+    /// so its cost is a constant that cancels out of any difference between two
+    /// arms. The absolute figure an arm produces is therefore NOT what the
+    /// shipping interpreter costs; only the differences are claims.
+    #[cfg(feature = "drop-arm-probe")]
+    #[inline(always)]
+    fn discard(&self, value: Value) {
+        match self.probe.drop_arm {
+            DropArm::Baseline => drop(value),
+            DropArm::InlineDiscriminant => discard_inline(value),
+            DropArm::ForgetUnsound => {
+                // Compiled out of the release build the measurement uses, so
+                // this is a development tripwire and not the guard. The guard
+                // is the leak witness the caller runs before any timing.
+                debug_assert!(
+                    matches!(
+                        value,
+                        Value::Int(_)
+                            | Value::UInt(_)
+                            | Value::Float(_)
+                            | Value::Bool(_)
+                            | Value::Null
+                    ),
+                    "DropArm::ForgetUnsound leaked an owning Value: this arm is \
+                     valid only for integer bodies over integer lists"
+                );
+                std::mem::forget(value);
+            }
+        }
     }
 
     fn finish(&mut self, operand: Operand) -> CelResult<Value> {
@@ -548,10 +764,12 @@ impl<'a> Vm<'a> {
             }
             OpCode::StoreLocal => {
                 let value = self.pop()?;
-                *self
+                let slot = self
                     .slots
                     .get_mut(a as usize)
-                    .ok_or(CelErr::InternalError)? = value;
+                    .ok_or(CelErr::InternalError)?;
+                let previous = std::mem::replace(slot, value);
+                self.discard(previous);
             }
             OpCode::IncLocal => {
                 // In place, so nothing is copied onto the stack and nothing is
@@ -812,6 +1030,24 @@ impl<'a> Vm<'a> {
                 // directly, so an unchecked index past the end is a panic for
                 // a boxed or columnar list and a record pointing past its own
                 // columns for a record one.
+                // The probe's other half: the lowering this arm replaced,
+                // reachable at run time so that what the replacement bought is
+                // a difference measured inside one binary rather than between
+                // two builds. `value_index` decides the container's kind, then
+                // the key's kind, then bounds-checks, then answers in
+                // `ExecutionError` -- which `park` has to record on `&mut
+                // self`, per element.
+                #[cfg(feature = "drop-arm-probe")]
+                if self.probe.iter_at == IterAtArm::ViaValueIndex {
+                    let element = {
+                        let sequence = self.slots.get(a as usize).ok_or(CelErr::InternalError)?;
+                        let index = self.slots.get(b as usize).ok_or(CelErr::InternalError)?;
+                        value_index(sequence, index)
+                    };
+                    let value = element.map_err(|e| self.park(e))?;
+                    self.push(value);
+                    return Ok(Step::Next);
+                }
                 let element = {
                     let Some(Value::List(sequence)) = self.slots.get(a as usize) else {
                         return Err(CelErr::InternalError);
@@ -843,6 +1079,7 @@ impl<'a> Vm<'a> {
             OpCode::JumpIfFalse | OpCode::JumpIfTrue => {
                 let value = self.pop()?;
                 let taken = as_bool(&value)? == (op == OpCode::JumpIfTrue);
+                self.discard(value);
                 if taken {
                     return Ok(Step::Jump(a));
                 }
@@ -851,6 +1088,7 @@ impl<'a> Vm<'a> {
                 let value = self.pop()?;
                 let short = op == OpCode::Or;
                 let outcome = as_bool(&value);
+                self.discard(value);
                 *self
                     .logic
                     .get_mut(a as usize)
@@ -864,6 +1102,7 @@ impl<'a> Vm<'a> {
                 let right = self.pop()?;
                 let left = *self.logic.get(a as usize).ok_or(CelErr::InternalError)?;
                 let value = merge(left, &right, op == OpCode::OrMerge)?;
+                self.discard(right);
                 // The left-hand error survived only to be weighed here, and
                 // it has just lost. Nothing can observe it now.
                 if let Err(absorbed) = left {

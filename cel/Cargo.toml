@@ -240,6 +240,19 @@ regex = ["dep:regex"]
 chrono = ["dep:chrono"]
 dhat-heap = [ ] # if you are doing heap profiling
 
+# A measurement probe, never a shipping feature. It adds run-time selectable
+# lowerings at two places in the dispatch loop -- the sites that discard a
+# popped operand, and `IterAt` -- so that what one lowering costs against
+# another is a difference taken inside ONE binary. Two `cargo build`
+# invocations cannot answer that: they admit compile drift and stale binaries,
+# and neither is visible in the numbers they produce.
+#
+# Off by default, and nothing but `examples/paired_ab.rs` selects it. One of
+# the drop policies LEAKS by design; see `DropArm::ForgetUnsound`, which is
+# sound only for an integer body over a list of integers and is guarded by an
+# allocation witness before any timing runs.
+drop-arm-probe = []
+
 # Route `Program::execute` through the bytecode VM instead of the tree walker.
 #
 # On by default, so the VM is what a caller gets. The tree walker is not
