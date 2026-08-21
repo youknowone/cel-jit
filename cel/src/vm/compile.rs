@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use super::code::{CelCode, Handler};
+use super::code::{CelCode, Handler, Insn};
 use super::error::NameId;
 use super::opcode::OpCode;
 use crate::common::ast::{
@@ -69,9 +69,20 @@ pub fn compile(expr: &IdedExpr) -> Result<CelCode, CompileError> {
     compiler.finish()
 }
 
+/// A jump operand whose target is not known yet: the instruction holding it,
+/// and which of that instruction's operands it is. The slot is carried rather
+/// than folded into the index because three different operand positions are
+/// patched -- a plain jump's only operand, a short-circuit operator's second,
+/// and the qualified call's third.
+#[derive(Clone, Copy)]
+struct PatchSite {
+    at: u32,
+    slot: usize,
+}
+
 #[derive(Default)]
 struct Compiler {
-    code: Vec<u32>,
+    insns: Vec<Insn>,
     consts: Vec<Value>,
     names: Vec<Box<str>>,
     name_index: HashMap<Box<str>, u32>,
@@ -95,7 +106,7 @@ struct Compiler {
 impl Compiler {
     fn finish(self) -> Result<CelCode, CompileError> {
         Ok(CelCode {
-            code: self.code,
+            insns: self.insns,
             consts: self.consts,
             names: self.names,
             n_slots: self.n_slots,
@@ -110,8 +121,9 @@ impl Compiler {
     fn emit(&mut self, op: OpCode, operands: &[u32], id: u64) -> Result<u32, CompileError> {
         debug_assert_eq!(op.operands() as usize, operands.len(), "{op:?} arity");
         let at = self.here();
-        self.code.push(op as u32);
-        self.code.extend_from_slice(operands);
+        let mut ops = [0u32; 3];
+        ops[..operands.len()].copy_from_slice(operands);
+        self.insns.push(Insn { op, ops });
 
         let (pops, pushes) = op.stack_effect(operands);
         self.depth -= i64::from(pops);
@@ -127,18 +139,19 @@ impl Compiler {
     }
 
     fn here(&self) -> u32 {
-        self.code.len() as u32
+        self.insns.len() as u32
     }
 
-    /// Emit a jump whose target is not known yet, returning the operand's
-    /// index so it can be patched once the target is.
-    fn emit_forward(&mut self, op: OpCode, id: u64) -> Result<usize, CompileError> {
+    /// Emit a jump whose target is not known yet, returning the site to patch
+    /// once the target is. Every opcode reached this way carries its target in
+    /// its only operand.
+    fn emit_forward(&mut self, op: OpCode, id: u64) -> Result<PatchSite, CompileError> {
         let at = self.emit(op, &[u32::MAX], id)?;
-        Ok(at as usize + 1)
+        Ok(PatchSite { at, slot: 0 })
     }
 
-    fn patch_to_here(&mut self, site: usize) {
-        self.code[site] = self.here();
+    fn patch_to_here(&mut self, site: PatchSite) {
+        self.insns[site.at as usize].ops[site.slot] = self.here();
     }
 
     // -- pools ------------------------------------------------------------
@@ -462,7 +475,7 @@ impl Compiler {
             _ => OpCode::OrMerge,
         };
         self.emit(merge, &[logic], id)?;
-        self.patch_to_here(at as usize + 2);
+        self.patch_to_here(PatchSite { at, slot: 1 });
 
         // The slot is dead once the merge has read it, so a sibling operator
         // reuses it rather than growing the record.
@@ -565,7 +578,7 @@ impl Compiler {
             self.depth, merged,
             "the two call paths must meet at one depth"
         );
-        self.patch_to_here(at as usize + 3);
+        self.patch_to_here(PatchSite { at, slot: 2 });
         Ok(())
     }
 }
@@ -1150,7 +1163,7 @@ mod tests {
 
         assert_eq!(handler.start, 0, "the left operand starts the program");
         assert_eq!(handler.end, and.0, "the handler ends where the left does");
-        assert_eq!(handler.land, and.0 + OpCode::And.width());
+        assert_eq!(handler.land, and.0 + 1, "the right operand is next");
         assert_eq!(handler.depth, 0);
         assert_eq!(handler.logic, and.1[0], "the And writes the slot it covers");
 
@@ -1162,7 +1175,7 @@ mod tests {
         assert!(code.handler_for(merge).is_none());
         // The short-circuit target is past the merge, so both paths arrive at
         // the same depth.
-        assert_eq!(and.1[1], merge + OpCode::AndMerge.width());
+        assert_eq!(and.1[1], merge + 1);
     }
 
     /// Nested operators need distinct slots, because the outer one writes its
@@ -1183,7 +1196,7 @@ mod tests {
         // The inner operator's own left operand is covered by the inner
         // handler, which is the shorter of the two covering it.
         let inner = code.handler_for(0).expect("instruction 0 is covered");
-        assert_eq!(inner.end - inner.start, 2, "{}", code.disassemble());
+        assert_eq!(inner.end - inner.start, 1, "{}", code.disassemble());
     }
 
     /// Two operators that cannot be live at once share a slot, for the same

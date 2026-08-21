@@ -4,6 +4,18 @@ use super::error::NameId;
 use super::opcode::OpCode;
 use crate::Value;
 
+/// One instruction, already decoded.
+///
+/// The operands are a fixed three-wide array because that is what the
+/// dispatch arms take: the widest opcode declares three, and a record that
+/// already holds them hands them over without deciding how many there are.
+/// Words the opcode does not declare are zero and no arm reads them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Insn {
+    pub op: OpCode,
+    pub ops: [u32; 3],
+}
+
 /// A compiled CEL expression.
 ///
 /// Sized entirely at compile time. `n_slots` and `max_stack` are what let the
@@ -12,9 +24,11 @@ use crate::Value;
 /// frame stack and no depth that depends on the input.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct CelCode {
-    /// The instruction stream: an opcode word followed by that opcode's
-    /// operands, repeated. Jump operands are indices into this vector.
-    pub code: Vec<u32>,
+    /// The instructions, one record each. A `pc` -- here, in a jump operand
+    /// and in the handler table -- is an index into this vector, so it counts
+    /// instructions rather than words and advancing costs no arithmetic over
+    /// the opcode's width.
+    pub insns: Vec<Insn>,
     /// Literal values, indexed by a `LoadConst` operand.
     pub consts: Vec<Value>,
     /// Identifiers, field names and function names, indexed by [`NameId`].
@@ -65,35 +79,16 @@ impl CelCode {
         self.consts.get(index as usize)
     }
 
-    /// Decode the instruction at `pc`, returning it with its operands.
+    /// Walk the whole program, yielding `(pc, opcode, operands)`.
     ///
-    /// `None` when `pc` is out of range, when the word is not an opcode, or
-    /// when the stream is too short to hold the operands the opcode declares
-    /// -- a truncated stream is a malformed program, not a shorter one.
-    pub fn decode(&self, pc: u32) -> Option<(OpCode, &[u32])> {
-        let word = *self.code.get(pc as usize)?;
-        let op = OpCode::from_word(word)?;
-        let first = pc as usize + 1;
-        let end = first + op.operands() as usize;
-        if end > self.code.len() {
-            return None;
-        }
-        Some((op, &self.code[first..end]))
-    }
-
-    /// Walk the whole stream, yielding `(pc, opcode, operands)`.
-    ///
-    /// Tooling and tests only. Decoding linearly is valid because every
-    /// instruction has a fixed, opcode-determined width, so no operand can be
-    /// mistaken for an opcode.
+    /// Tooling and tests only. The operands are the words the opcode declares,
+    /// so a caller sees the same slice a variable-width stream would have
+    /// carried after it.
     pub fn instructions(&self) -> impl Iterator<Item = (u32, OpCode, &[u32])> {
-        let mut pc = 0u32;
-        std::iter::from_fn(move || {
-            let (op, operands) = self.decode(pc)?;
-            let here = pc;
-            pc += op.width();
-            Some((here, op, operands))
-        })
+        self.insns
+            .iter()
+            .enumerate()
+            .map(|(pc, insn)| (pc as u32, insn.op, &insn.ops[..insn.op.operands() as usize]))
     }
 
     /// The innermost handler covering `pc`, if any.
@@ -126,21 +121,39 @@ impl CelCode {
 mod tests {
     use super::*;
 
-    /// A hand-built stream decodes back to the instructions it encodes,
-    /// including the two-operand form.
+    // Two malformed-program cases were tested here and are gone: a word that
+    // is not an opcode, and an instruction whose operands the stream ended
+    // before. Neither state can be built out of decoded records -- an `Insn`
+    // holds an `OpCode` and three operand words -- so there is nothing left to
+    // refuse.
+
+    /// A hand-built program walks back as the instructions it holds, with `pc`
+    /// counting instructions and each one carrying only the operands its
+    /// opcode declares.
     #[test]
-    fn a_stream_decodes_to_the_instructions_it_encodes() {
+    fn a_program_walks_back_as_the_instructions_it_holds() {
         let code = CelCode {
-            code: vec![
-                OpCode::LoadConst as u32,
-                0,
-                OpCode::LoadVar as u32,
-                1,
-                OpCode::Add as u32,
-                OpCode::CallHost as u32,
-                2,
-                3,
-                OpCode::Return as u32,
+            insns: vec![
+                Insn {
+                    op: OpCode::LoadConst,
+                    ops: [0, 0, 0],
+                },
+                Insn {
+                    op: OpCode::LoadVar,
+                    ops: [1, 0, 0],
+                },
+                Insn {
+                    op: OpCode::Add,
+                    ops: [0, 0, 0],
+                },
+                Insn {
+                    op: OpCode::CallHost,
+                    ops: [2, 3, 0],
+                },
+                Insn {
+                    op: OpCode::Return,
+                    ops: [0, 0, 0],
+                },
             ],
             consts: vec![Value::Int(1)],
             names: vec!["a".into(), "b".into(), "size".into()],
@@ -148,43 +161,21 @@ mod tests {
             ..CelCode::default()
         };
 
-        let decoded: Vec<_> = code
+        let walked: Vec<_> = code
             .instructions()
             .map(|(pc, op, operands)| (pc, op, operands.to_vec()))
             .collect();
 
         assert_eq!(
-            decoded,
+            walked,
             vec![
                 (0, OpCode::LoadConst, vec![0]),
-                (2, OpCode::LoadVar, vec![1]),
-                (4, OpCode::Add, vec![]),
-                (5, OpCode::CallHost, vec![2, 3]),
-                (8, OpCode::Return, vec![]),
+                (1, OpCode::LoadVar, vec![1]),
+                (2, OpCode::Add, vec![]),
+                (3, OpCode::CallHost, vec![2, 3]),
+                (4, OpCode::Return, vec![]),
             ]
         );
-    }
-
-    /// A stream that ends mid-instruction is malformed, and decoding says so
-    /// rather than reading a shorter instruction.
-    #[test]
-    fn a_truncated_operand_does_not_decode() {
-        let code = CelCode {
-            // `CallHost` declares two operands and only one follows.
-            code: vec![OpCode::CallHost as u32, 0],
-            ..CelCode::default()
-        };
-        assert!(code.decode(0).is_none());
-        assert_eq!(code.instructions().count(), 0);
-    }
-
-    #[test]
-    fn a_word_that_is_not_an_opcode_does_not_decode() {
-        let code = CelCode {
-            code: vec![u32::MAX],
-            ..CelCode::default()
-        };
-        assert!(code.decode(0).is_none());
     }
 
     #[test]

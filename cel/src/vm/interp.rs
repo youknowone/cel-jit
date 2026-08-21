@@ -28,7 +28,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-use super::code::{CelCode, Handler};
+use super::code::{CelCode, Handler, Insn};
 use super::error::{CelErr, CelResult, ColdId, NameId};
 use super::opcode::OpCode;
 use crate::context::Context;
@@ -956,15 +956,16 @@ impl<'a> Vm<'a> {
                 pc = self.fused_element(pc)?;
                 continue;
             }
-            let (op, operands) = self.code.decode(pc).ok_or(CelErr::InternalError)?;
-            let operands: [u32; 3] = [
-                operands.first().copied().unwrap_or(0),
-                operands.get(1).copied().unwrap_or(0),
-                operands.get(2).copied().unwrap_or(0),
-            ];
-            let next = pc + op.width();
+            // Range is the only thing left to check: in a vector of decoded
+            // records a word that is not an opcode, and an instruction the
+            // stream stops short of the operands of, are states that cannot be
+            // built. What a bad jump target can still be is off the end.
+            let Some(&Insn { op, ops }) = self.code.insns.get(pc as usize) else {
+                return Err(CelErr::InternalError);
+            };
+            let next = pc + 1;
 
-            match self.step(op, operands, pc, next) {
+            match self.step(op, ops, pc, next) {
                 Ok(Step::Next) => pc = next,
                 Ok(Step::Jump(target)) => pc = target,
                 Ok(Step::Return(value)) => return Ok(value),
@@ -1863,16 +1864,9 @@ mod tests {
         let mut opened: Vec<*const HashMap<Key, Value>> = Vec::new();
         let mut pc = 0u32;
         let answer = loop {
-            let (op, operands) = vm.code.decode(pc).expect("the program decodes");
-            let operands: [u32; 3] = [
-                operands.first().copied().unwrap_or(0),
-                operands.get(1).copied().unwrap_or(0),
-                operands.get(2).copied().unwrap_or(0),
-            ];
-            let next = pc + op.width();
-            let step = vm
-                .step(op, operands, pc, next)
-                .expect("the literal evaluates");
+            let &Insn { op, ops } = vm.code.insns.get(pc as usize).expect("`pc` is in range");
+            let next = pc + 1;
+            let step = vm.step(op, ops, pc, next).expect("the literal evaluates");
             if let Some(Operand::Map(entries)) = vm.stack.last() {
                 let ptr = Arc::as_ptr(entries);
                 if !opened.contains(&ptr) {
@@ -2025,20 +2019,15 @@ mod tests {
     #[test]
     fn iter_at_refuses_a_slot_the_compiler_could_not_have_written() {
         let ctx = Context::default();
+        let insn = |op, ops| Insn { op, ops };
         let program = |consts: Vec<Value>| CelCode {
-            code: vec![
-                OpCode::LoadConst as u32,
-                0,
-                OpCode::StoreLocal as u32,
-                0,
-                OpCode::LoadConst as u32,
-                1,
-                OpCode::StoreLocal as u32,
-                1,
-                OpCode::IterAt as u32,
-                0,
-                1,
-                OpCode::Return as u32,
+            insns: vec![
+                insn(OpCode::LoadConst, [0, 0, 0]),
+                insn(OpCode::StoreLocal, [0, 0, 0]),
+                insn(OpCode::LoadConst, [1, 0, 0]),
+                insn(OpCode::StoreLocal, [1, 0, 0]),
+                insn(OpCode::IterAt, [0, 1, 0]),
+                insn(OpCode::Return, [0, 0, 0]),
             ],
             consts,
             n_slots: 2,

@@ -45,7 +45,7 @@ pub mod error;
 pub mod interp;
 pub mod opcode;
 
-pub use code::{CelCode, Handler};
+pub use code::{CelCode, Handler, Insn};
 pub use compile::{compile, CompileError, CompileErrorKind};
 pub use error::{CelErr, CelResult, ColdId, NameId};
 pub use interp::cel_eval_loop;

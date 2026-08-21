@@ -96,10 +96,12 @@ fn the_vm_has_exactly_one_dispatch_loop() {
 
     occurs_exactly(
         production,
-        ".decode(",
+        ".insns.get(",
         1,
         "Exactly one site may read an instruction out of the code object. Two \
-         readers means two things claim to be the interpreter.",
+         readers means two things claim to be the interpreter. The program is \
+         pre-decoded, so that read is an index into `insns`; the needle is \
+         updated deliberately when the spelling changes, never widened.",
     );
 }
 
