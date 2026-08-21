@@ -1638,13 +1638,62 @@ fn elem_ctx(n: usize) -> Context<'static> {
     ctx
 }
 
-/// The six instructions the per-element block is made of, so the report can
-/// state what each fusion removed without the reader counting them.
+/// The instructions the per-element block is made of, in order.
 ///
 /// Read off `vm/compile.rs`'s appending-comprehension lowering and pinned by
 /// `assert_element_block` below, which reads the actual instruction stream.
+/// Every count this section reports about what an arm removed is derived from
+/// this array rather than restated beside the arm: a restated count is one a
+/// lowering change can leave behind, and one already had been -- the body
+/// group was still labelled with the four instructions and six stack
+/// operations it had before its operator absorbed the constant load.
 #[cfg(feature = "elem-attr-probe")]
-const ELEM_BLOCK: usize = 6;
+const ELEM_OPS: [cel::vm::OpCode; 6] = {
+    use cel::vm::OpCode;
+    [
+        OpCode::IterGuard,
+        OpCode::IterBind,
+        OpCode::LoadLocal,
+        OpCode::MulConst,
+        OpCode::ListAppend,
+        OpCode::IterAdvance,
+    ]
+};
+
+#[cfg(feature = "elem-attr-probe")]
+const ELEM_BLOCK: usize = ELEM_OPS.len();
+
+/// What fusing `ELEM_OPS[range]` removes, spelled for the report.
+///
+/// The dispatch count is the number of instructions; the stack counts are the
+/// declared effect of each, which is the same table `Compiler::emit` sizes the
+/// operand stack from. Nothing here is a second opinion about the block.
+#[cfg(feature = "elem-attr-probe")]
+fn removed_by(range: std::ops::Range<usize>) -> String {
+    let (mut pushes, mut pops) = (0u32, 0u32);
+    for op in &ELEM_OPS[range.clone()] {
+        // No opcode in this block takes an arity operand, so the effect does
+        // not depend on the operand words.
+        let (popped, pushed) = op.stack_effect(&[]);
+        pops += popped;
+        pushes += pushed;
+    }
+    let counted = |n: u32, one: &str, many: &str| {
+        if n == 1 {
+            format!("1 {one}")
+        } else {
+            format!("{n} {many}")
+        }
+    };
+    let mut parts = vec![counted(range.len() as u32, "dispatch", "dispatches")];
+    if pushes > 0 {
+        parts.push(counted(pushes, "push", "pushes"));
+    }
+    if pops > 0 {
+        parts.push(counted(pops, "pop", "pops"));
+    }
+    parts.join(", ")
+}
 
 /// Refuse to measure a program that is not the block this section is about.
 ///
@@ -1658,16 +1707,8 @@ const ELEM_BLOCK: usize = 6;
 #[cfg(feature = "elem-attr-probe")]
 fn assert_element_block(code: &cel::vm::CelCode) {
     use cel::vm::OpCode;
-    let want = [
-        OpCode::IterGuard,
-        OpCode::IterBind,
-        OpCode::LoadLocal,
-        OpCode::MulConst,
-        OpCode::ListAppend,
-        OpCode::IterAdvance,
-    ];
+    let want = ELEM_OPS;
     let ops: Vec<OpCode> = code.instructions().map(|(_, op, _)| op).collect();
-    assert_eq!(want.len(), ELEM_BLOCK);
     assert!(
         ops.windows(ELEM_BLOCK).any(|w| w == want),
         "`{ELEM_SRC}` no longer lowers to the six-instruction per-element \
@@ -1821,29 +1862,23 @@ fn elem_fusion(cfg: &Config, n: usize) {
     // the guard became one instruction deciding on two `i64`s, because an arm
     // that puts `compare_values` back now ADDS work to the stock arm rather
     // than keeping work the stock arm does; it is taken as a control below.
-    let steps: [(&str, FuseArm, FuseArm, &str); 4] = [
-        (
-            "guard dispatch",
-            FuseArm::None,
-            FuseArm::Guard,
-            "1 dispatch",
-        ),
-        ("bind dispatch", FuseArm::Guard, FuseArm::Bind, "1 dispatch"),
+    // Each rung names the slice of `ELEM_OPS` it fuses, and what it removed is
+    // derived from that slice rather than written out beside it.
+    let steps: [(&str, FuseArm, FuseArm, std::ops::Range<usize>); 4] = [
+        ("guard dispatch", FuseArm::None, FuseArm::Guard, 0..1),
+        ("bind dispatch", FuseArm::Guard, FuseArm::Bind, 1..2),
         (
             "body+append dispatch+stack",
             FuseArm::Bind,
             FuseArm::Body,
-            "4 dispatches, 3 pushes, 3 pops",
+            2..5,
         ),
-        (
-            "advance dispatch",
-            FuseArm::Body,
-            FuseArm::Advance,
-            "1 dispatch",
-        ),
+        ("advance dispatch", FuseArm::Body, FuseArm::Advance, 5..6),
     ];
 
-    for (label, a_arm, b_arm, removed) in steps {
+    for (label, a_arm, b_arm, fused) in steps {
+        let removed = removed_by(fused);
+        let removed = removed.as_str();
         let run = {
             let mut a = Arm::new(format!("{a_arm:?}"), arm(a_arm));
             let mut b = Arm::new(format!("{b_arm:?}"), arm(b_arm));
