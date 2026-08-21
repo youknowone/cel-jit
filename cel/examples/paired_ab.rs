@@ -1507,6 +1507,10 @@ fn drop_decomposition(cfg: &Config) {
 /// `ExecutionError` — which `Vm::park` records on `&mut self`. The new arm is
 /// two variant tests and one unsigned comparison answering in `CelErr`.
 ///
+/// The read is `Vm::element_at`, which is what `IterAt` is and what `IterBind`
+/// does before it stores. A compiled comprehension reaches it through
+/// `IterBind`, so this prices the same element read the loop always ran.
+///
 /// Swept over three lengths so that an O(1) effect — anything paid once per
 /// evaluation — separates from the O(N) one the instruction is, and over two
 /// element types because the boxing on the way out of a list differs between
@@ -1598,11 +1602,17 @@ fn iter_at_sweep(cfg: &Config) {
 //
 // The method is subtractive and stays inside one binary: each arm runs the same
 // program through the same dispatch loop with one named GROUP of the
-// twelve-instruction per-element block fused into a single step. An arm removes
+// seven-instruction per-element block fused into a single step. An arm removes
 // dispatches and operand-stack round trips; it does not remove work the walker
 // also does, and `binary_values` — which both evaluators call — is still called
 // by every arm with the same operands. The one exception, `compare_values`, is
-// isolated by running the guard fusion twice, once with the helper kept.
+// isolated by running the guard fusion twice, once with the helper put back.
+//
+// Three of the four groups became single instructions — `IterGuard`, `IterBind`
+// and `IterAdvance` — so the stock arm already pays no operand-stack round trip
+// for any of them, and what those three rungs price is one dispatch each. The
+// body group is the only one left that is more than one instruction, and it
+// holds every push and every pop the block still has.
 //
 // Every rung's answer is asserted equal to the stock arm's before any timing, so
 // an arm that removed the wrong thing fails rather than prints a better number.
@@ -1619,38 +1629,48 @@ fn elem_ctx(n: usize) -> Context<'static> {
     ctx
 }
 
-/// The twelve instructions the per-element block is made of, so the report can
+/// The seven instructions the per-element block is made of, so the report can
 /// state what each fusion removed without the reader counting them.
 ///
 /// Read off `vm/compile.rs`'s appending-comprehension lowering and pinned by
 /// `assert_element_block` below, which reads the actual instruction stream.
 #[cfg(feature = "elem-attr-probe")]
-const ELEM_BLOCK: usize = 12;
+const ELEM_BLOCK: usize = 7;
 
 /// Refuse to measure a program that is not the block this section is about.
+///
+/// Two questions, and the second is the load-bearing one. The window below
+/// says what the block IS, in a form a reader can check against a disassembly.
+/// `map_loop_is_fusable` asks the recogniser itself whether it can fuse this
+/// program — which is the only thing that decides whether any arm below fuses
+/// anything. A window here that had drifted from the recogniser's would let
+/// every arm quietly run the stock loop and still agree on the answer, so the
+/// recogniser is the authority and this window is the description of it.
 #[cfg(feature = "elem-attr-probe")]
 fn assert_element_block(code: &cel::vm::CelCode) {
     use cel::vm::OpCode;
     let want = [
-        OpCode::LoadLocal,
-        OpCode::IterLen,
-        OpCode::Less,
-        OpCode::JumpIfFalse,
-        OpCode::IterAt,
-        OpCode::StoreLocal,
+        OpCode::IterGuard,
+        OpCode::IterBind,
         OpCode::LoadLocal,
         OpCode::LoadConst,
         OpCode::Mul,
         OpCode::ListAppend,
-        OpCode::IncLocal,
-        OpCode::Jump,
+        OpCode::IterAdvance,
     ];
     let ops: Vec<OpCode> = code.instructions().map(|(_, op, _)| op).collect();
     assert_eq!(want.len(), ELEM_BLOCK);
     assert!(
         ops.windows(ELEM_BLOCK).any(|w| w == want),
-        "`{ELEM_SRC}` no longer lowers to the twelve-instruction per-element \
+        "`{ELEM_SRC}` no longer lowers to the seven-instruction per-element \
          block this section attributes. Disassembly:\n{}",
+        code.disassemble()
+    );
+    assert!(
+        cel::vm::map_loop_is_fusable(code),
+        "the window above matches `{ELEM_SRC}` but the probe's recogniser does \
+         not, so every arm would run the stock dispatch loop and report \
+         agreement. Disassembly:\n{}",
         code.disassemble()
     );
 }
@@ -1786,25 +1806,21 @@ fn elem_fusion(cfg: &Config, n: usize) {
     );
 
     // (label, arm A, arm B, what B removes relative to A)
-    let steps: [(&str, FuseArm, FuseArm, &str); 5] = [
+    //
+    // A chain from the stock arm to the fully fused one, which is what makes
+    // the SUM CHECK below an identity: the marginals telescope.
+    // `GuardKeepingCompare` is not on the chain. It stopped being a rung when
+    // the guard became one instruction deciding on two `i64`s, because an arm
+    // that puts `compare_values` back now ADDS work to the stock arm rather
+    // than keeping work the stock arm does; it is taken as a control below.
+    let steps: [(&str, FuseArm, FuseArm, &str); 4] = [
         (
-            "guard dispatch+stack",
+            "guard dispatch",
             FuseArm::None,
-            FuseArm::GuardKeepingCompare,
-            "4 dispatches, 3 pushes, 3 pops",
-        ),
-        (
-            "compare_values+as_bool",
-            FuseArm::GuardKeepingCompare,
             FuseArm::Guard,
-            "1 compare_values, 1 as_bool, 1 discard",
+            "1 dispatch",
         ),
-        (
-            "bind dispatch+stack",
-            FuseArm::Guard,
-            FuseArm::Bind,
-            "2 dispatches, 1 push, 1 pop",
-        ),
+        ("bind dispatch", FuseArm::Guard, FuseArm::Bind, "1 dispatch"),
         (
             "body+append dispatch+stack",
             FuseArm::Bind,
@@ -1815,7 +1831,7 @@ fn elem_fusion(cfg: &Config, n: usize) {
             "advance dispatch",
             FuseArm::Body,
             FuseArm::Advance,
-            "2 dispatches",
+            "1 dispatch",
         ),
     ];
 
@@ -1854,6 +1870,32 @@ fn elem_fusion(cfg: &Config, n: usize) {
         per_unit("advance, from stock", &cpu, floors.cpu, n as f64, "element");
     }
 
+    // The price of the guard's `i64` comparison, taken from the other side.
+    // `IterGuard` decides on two integers it reads out of their slots; this arm
+    // puts `compare_values`, `as_bool` and the discard of their answer back, so
+    // B is the slower one and the figure is what the four-instruction guard
+    // paid to decide the same thing.
+    {
+        let run = {
+            let mut a = Arm::new("Guard", arm(FuseArm::Guard));
+            let mut b = Arm::new("Guard + compare_values", arm(FuseArm::GuardKeepingCompare));
+            run_pair(&mut a, &mut b, cfg)
+        };
+        let (cpu, _) = report(
+            "CONTROL: compare_values + as_bool + discard put back into the guard (sign must be NEGATIVE: B is slower)",
+            &run,
+            cfg,
+            Some(floors),
+        );
+        per_unit(
+            "compare_values+as_bool",
+            &cpu,
+            floors.cpu,
+            n as f64,
+            "element",
+        );
+    }
+
     // The positive control, and the calibration for hypothesis 1. This arm ADDS
     // one atomic increment and one atomic decrement per element to the fully
     // fused arm; the disassembly check in the report says whether it really
@@ -1878,7 +1920,7 @@ fn elem_fusion(cfg: &Config, n: usize) {
     }
 
     // The additivity check. Not a new term: the end-to-end difference has to
-    // equal the five marginals summed, and where it does not, the marginals
+    // equal the four marginals summed, and where it does not, the marginals
     // are not measuring what their labels say.
     {
         let run = {
@@ -1887,7 +1929,7 @@ fn elem_fusion(cfg: &Config, n: usize) {
             run_pair(&mut a, &mut b, cfg)
         };
         let (cpu, _) = report(
-            "SUM CHECK: stock minus fully fused — must equal the five marginals summed",
+            "SUM CHECK: stock minus fully fused — must equal the four marginals summed",
             &run,
             cfg,
             Some(floors),

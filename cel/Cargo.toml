@@ -263,8 +263,9 @@ dhat-heap = [ ] # if you are doing heap profiling
 
 # A measurement probe, never a shipping feature. It adds run-time selectable
 # lowerings at two places in the dispatch loop -- the sites that discard a
-# popped operand, and `IterAt` -- so that what one lowering costs against
-# another is a difference taken inside ONE binary. Two `cargo build`
+# popped operand, and the element read `Vm::element_at`, which is what `IterAt`
+# is and what `IterBind` does before it stores -- so that what one lowering
+# costs against another is a difference taken inside ONE binary. Two `cargo build`
 # invocations cannot answer that: they admit compile drift and stale binaries,
 # and neither is visible in the numbers they produce.
 #

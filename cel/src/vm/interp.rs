@@ -117,43 +117,55 @@ pub fn cel_eval_loop_with_probe(
 /// rather than folded into a dispatch figure -- the loop guard it serves has no
 /// counterpart in the walker at all, which iterates with a Rust iterator.
 ///
-/// The arms are cumulative: each fuses everything the one before it fused, plus
-/// one more group. Marginal differences are therefore the per-group figures and
-/// the end-to-end difference is their sum, which is an additivity check.
+/// The arms are cumulative, [`FuseArm::GuardKeepingCompare`] excepted: each
+/// fuses everything the one before it fused, plus one more group. Marginal
+/// differences are therefore the per-group figures and the end-to-end
+/// difference is their sum, which is an additivity check.
+///
+/// Three of the four groups have since become single instructions --
+/// [`OpCode::IterGuard`], [`OpCode::IterBind`] and [`OpCode::IterAdvance`] --
+/// so the operand-stack round trips those groups used to carry are gone from
+/// the STOCK arm too, and what each of the three arms below now removes is one
+/// dispatch and nothing else. The body group is the only one left that is more
+/// than one instruction, and it is where the remaining stack traffic is.
 #[cfg(feature = "elem-attr-probe")]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FuseArm {
-    /// What the interpreter does without the probe: twelve dispatches per
-    /// element, seven pushes and seven pops.
+    /// What the interpreter does without the probe: seven dispatches per
+    /// element, three pushes and three pops.
     None,
-    /// Fuse `LoadLocal index; IterLen source; Less; JumpIfFalse done` -- four
-    /// dispatches, three pushes and three pops -- and STILL call
-    /// `compare_values` and `as_bool` on the two `Value::Int`s, then discard
-    /// the answer. Removes the dispatches and the stack traffic and nothing
-    /// else.
+    /// Fuse `IterGuard index source done` -- one dispatch -- and decide the
+    /// guard by calling `compare_values` and `as_bool` on the two
+    /// `Value::Int`s, then discarding the answer, as the four instructions
+    /// `IterGuard` replaced did.
+    ///
+    /// A POSITIVE CONTROL rather than a rung, and it stopped being a rung when
+    /// the guard became one instruction that compares two `i64`s. This arm
+    /// RE-ADDS the helpers, so it can cost MORE than [`FuseArm::None`], and its
+    /// distance from [`FuseArm::None`] is not a fusion figure. Its difference
+    /// from [`FuseArm::Guard`] is what it claims and all it claims, and that
+    /// difference is unchanged: exactly what `compare_values` + `as_bool` + the
+    /// discard cost. That is the price of the guard's `i64` comparison, taken
+    /// from the other side.
     GuardKeepingCompare,
-    /// The same fusion, deciding the guard with an `i64` comparison instead.
-    /// The difference from [`FuseArm::GuardKeepingCompare`] is exactly what
-    /// `compare_values` + `as_bool` + the discard cost.
+    /// Fuse `IterGuard index source done` -- one dispatch. There is no stack
+    /// traffic left in the group to remove; the instruction has none.
     Guard,
-    /// ... plus `IterAt source index; StoreLocal var` -- two dispatches, one
-    /// push and one pop. The element is still read through `ListRef::get` and
-    /// still written into the slot with the same `mem::replace` and discard.
+    /// ... plus `IterBind source index var` -- one dispatch. The element is
+    /// still read through `ListRef::get` and still written into the slot with
+    /// the same `mem::replace` and discard.
     Bind,
     /// ... plus `LoadLocal var; LoadConst k; Mul; ListAppend` -- four
-    /// dispatches, three pushes and three pops. `binary_values` is still
-    /// called, with the same two operands, and the result is still pushed into
-    /// the same builder.
+    /// dispatches, three pushes and three pops, which is every push and every
+    /// pop the per-element block has left. `binary_values` is still called,
+    /// with the same two operands, and the result is still pushed into the same
+    /// builder.
     Body,
-    /// ... plus `IncLocal index; Jump top` -- two dispatches. The whole element
-    /// is one step, and the operand stack is not touched at all. The counter is
-    /// still advanced with the same `checked_add`.
+    /// ... plus `IterAdvance index top` -- one dispatch. The whole element is
+    /// one step, and no dispatch at all is left in it. The counter is still
+    /// advanced with the same `checked_add`.
     Advance,
-    /// [`FuseArm::Advance`] plus one `Arc` round trip per element: the source
-    /// list's reference count is incremented and decremented again, and nothing
-    /// else changes.
-    ///
-    /// `IncLocal index; Jump top` fused and NOTHING ELSE, anchored at the
+    /// `IterAdvance index top` fused and NOTHING ELSE, anchored at the
     /// instruction after the body rather than at the loop header.
     ///
     /// The order control. Every other arm is cumulative, so each group's
@@ -208,10 +220,10 @@ pub fn cel_eval_loop_with_fuse(
 #[cfg(feature = "elem-attr-probe")]
 #[derive(Clone, Copy, Debug)]
 struct MapLoop {
-    /// `LoadLocal index`, the loop header. `u32::MAX` when no block matched,
-    /// which is the value that keeps the fused path unreachable.
+    /// `IterGuard`, the loop header. `u32::MAX` when no block matched, which is
+    /// the value that keeps the fused path unreachable.
     top: u32,
-    /// Where `JumpIfFalse` sends an exhausted loop.
+    /// Where `IterGuard` sends an exhausted loop.
     done: u32,
     /// Slot holding the sequence.
     source: u32,
@@ -221,11 +233,11 @@ struct MapLoop {
     var: u32,
     /// Constant-pool index of the body's right operand.
     konst: u32,
-    /// `IterAt`, where an arm that fused only the guard resumes.
+    /// `IterBind`, where an arm that fused only the guard resumes.
     after_guard: u32,
     /// `LoadLocal var`, where an arm that also fused the bind resumes.
     after_bind: u32,
-    /// `IncLocal`, where an arm that also fused the body resumes.
+    /// `IterAdvance`, where an arm that also fused the body resumes.
     after_body: u32,
 }
 
@@ -242,31 +254,26 @@ const NO_MAP_LOOP: MapLoop = MapLoop {
     after_body: 0,
 };
 
-/// Find the twelve-instruction per-element block, if the program has one.
+/// Find the seven-instruction per-element block, if the program has one.
 ///
 /// Run once per evaluation by EVERY arm, so its cost is a constant that cancels
 /// out of any difference between two of them.
 #[cfg(feature = "elem-attr-probe")]
 fn recognize_map_loop(code: &CelCode) -> MapLoop {
-    const WANT: [OpCode; 12] = [
-        OpCode::LoadLocal,
-        OpCode::IterLen,
-        OpCode::Less,
-        OpCode::JumpIfFalse,
-        OpCode::IterAt,
-        OpCode::StoreLocal,
+    const WANT: [OpCode; 7] = [
+        OpCode::IterGuard,
+        OpCode::IterBind,
         OpCode::LoadLocal,
         OpCode::LoadConst,
         OpCode::Mul,
         OpCode::ListAppend,
-        OpCode::IncLocal,
-        OpCode::Jump,
+        OpCode::IterAdvance,
     ];
     // A shift register rather than a collected stream: this runs once per
     // EVALUATION, and `tests/vm_scratch_pool.rs` pins the evaluator's heap
     // floor at zero allocations. A probe that allocates to decide where to
     // measure has changed the thing it is measuring.
-    let mut window = [(0u32, OpCode::Return, [0u32; 3]); 12];
+    let mut window = [(0u32, OpCode::Return, [0u32; 3]); WANT.len()];
     let mut filled = 0usize;
     for (pc, op, operands) in code.instructions() {
         let mut words = [0u32; 3];
@@ -274,7 +281,7 @@ fn recognize_map_loop(code: &CelCode) -> MapLoop {
             *slot = *word;
         }
         window.rotate_left(1);
-        window[11] = (pc, op, words);
+        window[WANT.len() - 1] = (pc, op, words);
         filled += 1;
         if filled < window.len() {
             continue;
@@ -283,31 +290,48 @@ fn recognize_map_loop(code: &CelCode) -> MapLoop {
             continue;
         }
         let index = window[0].2[0];
-        let source = window[1].2[0];
-        let var = window[5].2[0];
+        let source = window[0].2[1];
+        let var = window[1].2[2];
         // Every slot the block names has to be the slot the fused form would
-        // read, or the fusion is not of THIS loop.
-        let consistent = window[4].2[0] == source
-            && window[4].2[1] == index
-            && window[6].2[0] == var
-            && window[10].2[0] == index
-            && window[11].2[0] == window[0].0;
+        // read, or the fusion is not of THIS loop. The guard now names both the
+        // counter and the sequence itself, so the bind is checked against it
+        // rather than the other way round.
+        let consistent = window[1].2[0] == source
+            && window[1].2[1] == index
+            && window[2].2[0] == var
+            && window[6].2[0] == index
+            && window[6].2[1] == window[0].0;
         if !consistent {
             continue;
         }
         return MapLoop {
             top: window[0].0,
-            done: window[3].2[0],
+            done: window[0].2[2],
             source,
             index,
             var,
-            konst: window[7].2[0],
-            after_guard: window[4].0,
-            after_bind: window[6].0,
-            after_body: window[10].0,
+            konst: window[3].2[0],
+            after_guard: window[1].0,
+            after_bind: window[2].0,
+            after_body: window[6].0,
         };
     }
     NO_MAP_LOOP
+}
+
+/// Whether the probe can fuse `code`'s per-element block.
+///
+/// The recogniser's own answer, exported so that a harness refusing to measure
+/// a program that is not this block asks THE RECOGNISER rather than keeping a
+/// second copy of the opcode window. Two copies in two files is a silent
+/// failure waiting to happen and not a loud one: where they disagree, the
+/// recogniser matches nothing, [`Vm::anchor`] stays out of the instruction
+/// stream's range, EVERY arm runs the stock dispatch loop -- and every arm
+/// still agrees on the answer, because they all compute the same value. The
+/// harness would report a full ladder of zeroes as a measurement.
+#[cfg(feature = "elem-attr-probe")]
+pub fn map_loop_is_fusable(code: &CelCode) -> bool {
+    recognize_map_loop(code).top != u32::MAX
 }
 
 /// One operand-stack entry.
@@ -1006,10 +1030,10 @@ impl<'a> Vm<'a> {
     ///
     /// Every quantity below is computed from the same slot, the same constant
     /// and the same helper the instructions it replaces used. What is gone is
-    /// the dispatch of those instructions and their operand-stack round trips
-    /// -- and, for [`FuseArm::Guard`] and above, `compare_values`, which is the
-    /// one arm that removes a helper and the reason
-    /// [`FuseArm::GuardKeepingCompare`] exists next to it.
+    /// the dispatch of those instructions and whatever operand-stack round
+    /// trips they still had -- which, outside the body group, is none: the
+    /// guard, the bind and the advance are each one instruction that names its
+    /// slots.
     ///
     /// The operand stack is left at the depth the fused instructions would have
     /// left it: every group below is stack-neutral end to end, so the builder
@@ -1025,7 +1049,7 @@ impl<'a> Vm<'a> {
             return self.fused_advance(shape);
         }
 
-        // -- the guard: `LoadLocal index ; IterLen source ; Less ; JumpIfFalse`
+        // -- the guard: `IterGuard index source done`
         let index = match self.slots.get(shape.index as usize) {
             Some(&Value::Int(index)) => index,
             _ => return Err(CelErr::InternalError),
@@ -1046,8 +1070,9 @@ impl<'a> Vm<'a> {
         }
         let more = if arm == FuseArm::GuardKeepingCompare {
             // Spelled as `step`'s `Less` arm spells it, function pointer
-            // included, so this arm removes four dispatches and three
-            // operand-stack round trips and nothing else.
+            // included. `IterGuard` decides with an `i64` comparison, so this
+            // arm RE-ADDS the helpers rather than keeping them; see
+            // [`FuseArm::GuardKeepingCompare`].
             let accept: fn(Ordering) -> bool = |o| o == Ordering::Less;
             let decided = compare_values(Value::Int(index), Value::Int(len), accept)
                 .map_err(|e| self.park(e))?;
@@ -1065,7 +1090,7 @@ impl<'a> Vm<'a> {
         }
         let _ = pc;
 
-        // -- the bind: `IterAt source index ; StoreLocal var`
+        // -- the bind: `IterBind source index var`
         let element = {
             let Some(Value::List(sequence)) = self.slots.get(shape.source as usize) else {
                 return Err(CelErr::InternalError);
@@ -1101,11 +1126,11 @@ impl<'a> Vm<'a> {
             return Ok(shape.after_body);
         }
 
-        // -- the advance: `IncLocal index ; Jump top`
+        // -- the advance: `IterAdvance index top`
         self.fused_advance(shape)
     }
 
-    /// `IncLocal index ; Jump top`, run as one step.
+    /// `IterAdvance index top`, run as one step.
     ///
     /// Its own function only because two arms reach it: the cumulative ladder
     /// falls into it, and [`FuseArm::AdvanceOnly`] enters directly at it.
@@ -1151,32 +1176,9 @@ impl<'a> Vm<'a> {
             }
             OpCode::StoreLocal => {
                 let value = self.pop()?;
-                let slot = self
-                    .slots
-                    .get_mut(a as usize)
-                    .ok_or(CelErr::InternalError)?;
-                let previous = std::mem::replace(slot, value);
-                self.discard(previous);
+                self.store_slot(a, value)?;
             }
-            OpCode::IncLocal => {
-                // In place, so nothing is copied onto the stack and nothing is
-                // popped back off it. The slot is a comprehension's counter,
-                // written once with a zero and thereafter only here, so a
-                // non-integer in it is a malformed stream -- the same answer
-                // `IterLen` gives a slot that does not hold a list.
-                let slot = self
-                    .slots
-                    .get_mut(a as usize)
-                    .ok_or(CelErr::InternalError)?;
-                let Value::Int(counter) = slot else {
-                    return Err(CelErr::InternalError);
-                };
-                // Named for the operator this replaces, so that the public
-                // error is the one the four-instruction form raised.
-                *counter = counter
-                    .checked_add(1)
-                    .ok_or(CelErr::Overflow(OpCode::Add))?;
-            }
+            OpCode::IncLocal => self.advance_counter(a)?,
 
             // -- selection ----------------------------------------------
             OpCode::GetField => {
@@ -1383,71 +1385,49 @@ impl<'a> Vm<'a> {
                 self.push(Value::list(items));
             }
             OpCode::IterLen => {
-                // Read in place. The length is the only thing wanted out of
-                // the slot, and taking it through the stack would clone the
-                // whole `Value` -- an atomic refcount pair for a list -- once
-                // per element of the loop that emits this.
-                let len = match self.slots.get(a as usize).ok_or(CelErr::InternalError)? {
-                    Value::List(list) => list.len() as i64,
-                    _ => return Err(CelErr::InternalError),
-                };
+                let len = self.sequence_len(a)?;
                 self.push(Value::Int(len));
             }
             OpCode::IterAt => {
-                // Read in place, as `IterLen` does, and indexed as a list
-                // rather than through the general indexing path.
+                let element = self.element_at(a, b)?;
+                self.push(element);
+            }
+
+            // -- the fused loop -------------------------------------------
+            //
+            // Each of the three reads the same slots, calls the same helpers
+            // and raises the same errors as the group it replaces. What is
+            // gone is the dispatch of the instructions in between, and -- for
+            // the two groups that had any -- the operand-stack round trips
+            // that carried a value from one of them to the next.
+            OpCode::IterGuard => {
+                // Decided as an `i64` comparison rather than through
+                // `compare_values`, because both sides are integers by
+                // construction: the counter is written once before the loop
+                // with a zero and thereafter only by `IterAdvance`, and the
+                // other side is a list's length. Neither is true of the
+                // INSTRUCTION STREAM, so a counter slot holding anything else
+                // is refused the way `IncLocal` refuses one, and a source slot
+                // holding anything else the way `IterLen` refuses one.
                 //
-                // Three facts are true of every program the compiler emits:
-                // the sequence slot holds a list, because `IterElems` and
-                // `IterKeys` are its only writers and both push one; the index
-                // slot holds an integer, because it is initialised with a zero
-                // and advanced only by the loop's own counter; and that
-                // integer is in range, because the guard immediately above
-                // this instruction compared it against the length. None of the
-                // three is true of the INSTRUCTION STREAM, which is public
-                // data anyone can build, so each is still established here --
-                // but as one variant test, one variant test and one unsigned
-                // comparison, rather than by a helper that matches over every
-                // container the language has, then over every key type, and
-                // answers in the wide public error type on a path that never
-                // fails.
-                //
-                // The bound in particular is load-bearing rather than
-                // defensive: `ListStorage::element_at` indexes its buffer
-                // directly, so an unchecked index past the end is a panic for
-                // a boxed or columnar list and a record pointing past its own
-                // columns for a record one.
-                // The probe's other half: the lowering this arm replaced,
-                // reachable at run time so that what the replacement bought is
-                // a difference measured inside one binary rather than between
-                // two builds. `value_index` decides the container's kind, then
-                // the key's kind, then bounds-checks, then answers in
-                // `ExecutionError` -- which `park` has to record on `&mut
-                // self`, per element.
-                #[cfg(feature = "drop-arm-probe")]
-                if self.probe.iter_at == IterAtArm::ViaValueIndex {
-                    let element = {
-                        let sequence = self.slots.get(a as usize).ok_or(CelErr::InternalError)?;
-                        let index = self.slots.get(b as usize).ok_or(CelErr::InternalError)?;
-                        value_index(sequence, index)
-                    };
-                    let value = element.map_err(|e| self.park(e))?;
-                    self.push(value);
-                    return Ok(Step::Next);
-                }
-                let element = {
-                    let Some(Value::List(sequence)) = self.slots.get(a as usize) else {
-                        return Err(CelErr::InternalError);
-                    };
-                    let Some(&Value::Int(index)) = self.slots.get(b as usize) else {
-                        return Err(CelErr::InternalError);
-                    };
-                    // A negative index wraps to a very large `usize` and fails
-                    // the bound, which is the answer the general path gives it
-                    // too.
-                    sequence.get(index as usize)
+                // Read in the order the four instructions read them, so a
+                // stream that is malformed in both slots raises what it raised
+                // before.
+                let Some(&Value::Int(index)) = self.slots.get(a as usize) else {
+                    return Err(CelErr::InternalError);
                 };
-                self.push(element.ok_or(CelErr::IndexOutOfBounds)?);
+                let len = self.sequence_len(b)?;
+                if index >= len {
+                    return Ok(Step::Jump(c));
+                }
+            }
+            OpCode::IterBind => {
+                let element = self.element_at(a, b)?;
+                self.store_slot(c, element)?;
+            }
+            OpCode::IterAdvance => {
+                self.advance_counter(a)?;
+                return Ok(Step::Jump(b));
             }
 
             // -- control flow ---------------------------------------------------
@@ -1505,6 +1485,121 @@ impl<'a> Vm<'a> {
 
     fn name(&self, id: u32) -> CelResult<&'a str> {
         self.code.name(NameId(id)).ok_or(CelErr::InternalError)
+    }
+
+    // -- the slot reads and writes the loop is made of ----------------------
+    //
+    // Each of these is one instruction's whole work and part of a fused one's,
+    // written once so the two cannot answer differently. All are inlined
+    // unconditionally: a call per element is exactly the cost the fused forms
+    // exist to remove.
+
+    /// The length of the list in `slot`.
+    ///
+    /// Read in place. The length is the only thing wanted out of the slot, and
+    /// taking it through the operand stack would clone the whole `Value` -- an
+    /// atomic refcount pair for a list -- once per element of the loop.
+    #[inline(always)]
+    fn sequence_len(&self, slot: u32) -> CelResult<i64> {
+        match self.slots.get(slot as usize).ok_or(CelErr::InternalError)? {
+            Value::List(list) => Ok(list.len() as i64),
+            _ => Err(CelErr::InternalError),
+        }
+    }
+
+    /// The element of the list in `sequence` at the index in `index`.
+    ///
+    /// Read in place, as [`Vm::sequence_len`] is, and indexed as a list rather
+    /// than through the general indexing path.
+    ///
+    /// Three facts are true of every program the compiler emits: the sequence
+    /// slot holds a list, because [`OpCode::IterElems`] and
+    /// [`OpCode::IterKeys`] are its only writers and both push one; the index
+    /// slot holds an integer, because it is initialised with a zero and
+    /// advanced only by the loop's own counter; and that integer is in range,
+    /// because the guard that runs immediately before compared it against the
+    /// length. None of the three is true of the INSTRUCTION STREAM, which is
+    /// public data anyone can build, so each is still established here -- but
+    /// as one variant test, one variant test and one unsigned comparison,
+    /// rather than by a helper that matches over every container the language
+    /// has, then over every key type, and answers in the wide public error type
+    /// on a path that never fails.
+    ///
+    /// The bound in particular is load-bearing rather than defensive:
+    /// `ListStorage::element_at` indexes its buffer directly, so an unchecked
+    /// index past the end is a panic for a boxed or columnar list and a record
+    /// pointing past its own columns for a record one.
+    #[inline(always)]
+    fn element_at(&mut self, sequence: u32, index: u32) -> CelResult<Value> {
+        // The probe's other half: the lowering this replaced, reachable at run
+        // time so that what the replacement bought is a difference measured
+        // inside one binary rather than between two builds. `value_index`
+        // decides the container's kind, then the key's kind, then
+        // bounds-checks, then answers in `ExecutionError` -- which `park` has
+        // to record on `&mut self`, per element.
+        #[cfg(feature = "drop-arm-probe")]
+        if self.probe.iter_at == IterAtArm::ViaValueIndex {
+            let element = {
+                let sequence = self
+                    .slots
+                    .get(sequence as usize)
+                    .ok_or(CelErr::InternalError)?;
+                let index = self
+                    .slots
+                    .get(index as usize)
+                    .ok_or(CelErr::InternalError)?;
+                value_index(sequence, index)
+            };
+            return element.map_err(|e| self.park(e));
+        }
+        let element = {
+            let Some(Value::List(sequence)) = self.slots.get(sequence as usize) else {
+                return Err(CelErr::InternalError);
+            };
+            let Some(&Value::Int(index)) = self.slots.get(index as usize) else {
+                return Err(CelErr::InternalError);
+            };
+            // A negative index wraps to a very large `usize` and fails the
+            // bound, which is the answer the general path gives it too.
+            sequence.get(index as usize)
+        };
+        element.ok_or(CelErr::IndexOutOfBounds)
+    }
+
+    /// Write `value` into `slot`, dropping what was there.
+    #[inline(always)]
+    fn store_slot(&mut self, slot: u32, value: Value) -> CelResult<()> {
+        let slot = self
+            .slots
+            .get_mut(slot as usize)
+            .ok_or(CelErr::InternalError)?;
+        let previous = std::mem::replace(slot, value);
+        self.discard(previous);
+        Ok(())
+    }
+
+    /// Add one to the integer in `slot`, in place.
+    ///
+    /// Nothing is copied onto the operand stack and nothing is popped back off
+    /// it. The slot is a comprehension's counter, written once with a zero and
+    /// thereafter only here, so a non-integer in it is a malformed stream --
+    /// the same answer [`Vm::sequence_len`] gives a slot that does not hold a
+    /// list.
+    #[inline(always)]
+    fn advance_counter(&mut self, slot: u32) -> CelResult<()> {
+        let slot = self
+            .slots
+            .get_mut(slot as usize)
+            .ok_or(CelErr::InternalError)?;
+        let Value::Int(counter) = slot else {
+            return Err(CelErr::InternalError);
+        };
+        // Named for the operator the increment replaced, so that the public
+        // error is the one the load/add/store form raised.
+        *counter = counter
+            .checked_add(1)
+            .ok_or(CelErr::Overflow(OpCode::Add))?;
+        Ok(())
     }
 
     // -- the arms that are more than one expression -------------------------
@@ -1713,6 +1808,52 @@ mod tests {
     fn run(source: &str, ctx: &Context) -> Result<Value, ExecutionError> {
         let code = compile(&parse(source)).unwrap_or_else(|e| panic!("compile {source}: {e}"));
         cel_eval_loop(&code, ctx)
+    }
+
+    /// The probe's recogniser finds the per-element block, and every arm
+    /// answers what the stock arm answers.
+    ///
+    /// The instrument is otherwise only exercised by a benchmark, which is not
+    /// run by the gate. A recogniser that matched nothing would leave every arm
+    /// running the stock dispatch loop and reporting agreement -- a silent pass
+    /// rather than a failure -- so the match itself is asserted before the
+    /// answers are.
+    #[cfg(feature = "elem-attr-probe")]
+    #[test]
+    fn every_fusion_arm_answers_what_the_stock_arm_answers() {
+        let mut ctx = Context::default();
+        ctx.add_variable_from_value("xs", (0..64i64).collect::<Vec<i64>>());
+        let code = compile(&parse("xs.map(x, x * 2)")).expect("compiles");
+
+        let shape = recognize_map_loop(&code);
+        assert_ne!(
+            shape.top,
+            u32::MAX,
+            "the per-element block must be recognised:\n{}",
+            code.disassemble()
+        );
+
+        let stock = cel_eval_loop_with_fuse(&code, &ctx, FuseArm::None).expect("stock evaluates");
+        assert_eq!(
+            stock,
+            Value::list((0..64i64).map(|i| Value::Int(i * 2)).collect::<Vec<_>>()),
+            "the loop has to actually run 64 times"
+        );
+        for arm in [
+            FuseArm::GuardKeepingCompare,
+            FuseArm::Guard,
+            FuseArm::Bind,
+            FuseArm::Body,
+            FuseArm::Advance,
+            FuseArm::AdvanceOnly,
+            FuseArm::AdvancePlusArcRoundTrip,
+        ] {
+            let got = cel_eval_loop_with_fuse(&code, &ctx, arm).expect("the arm evaluates");
+            assert_eq!(
+                got, stock,
+                "{arm:?} answered differently from the stock arm"
+            );
+        }
     }
 
     /// An error absorbed by `&&` is discarded, not accumulated.
@@ -2059,5 +2200,110 @@ mod tests {
             ),
             Ok(Value::Int(9))
         );
+    }
+
+    /// `IterBind` makes the same three checks, on the instruction a compiled
+    /// comprehension actually runs.
+    ///
+    /// The lowering emits no `IterAt`, so leaving those refusals pinned only on
+    /// it would pin them where nothing reaches them. Both instructions read
+    /// through `Vm::element_at`, and this is what says so from the outside.
+    #[test]
+    fn iter_bind_refuses_a_slot_the_compiler_could_not_have_written() {
+        let ctx = Context::default();
+        let insn = |op, ops| Insn { op, ops };
+        let program = |consts: Vec<Value>| CelCode {
+            insns: vec![
+                insn(OpCode::LoadConst, [0, 0, 0]),
+                insn(OpCode::StoreLocal, [0, 0, 0]),
+                insn(OpCode::LoadConst, [1, 0, 0]),
+                insn(OpCode::StoreLocal, [1, 0, 0]),
+                insn(OpCode::IterBind, [0, 1, 2]),
+                insn(OpCode::LoadLocal, [2, 0, 0]),
+                insn(OpCode::Return, [0, 0, 0]),
+            ],
+            consts,
+            n_slots: 3,
+            max_stack: 1,
+            ..CelCode::default()
+        };
+
+        // A sequence slot that is not a list.
+        assert!(cel_eval_loop(&program(vec![Value::Int(7), Value::Int(0)]), &ctx).is_err());
+        // An index slot that is not an integer.
+        assert!(cel_eval_loop(
+            &program(vec![Value::list(vec![Value::Int(1)]), Value::Bool(true)]),
+            &ctx
+        )
+        .is_err());
+        // An index past the end, and a negative one.
+        for out_of_range in [Value::Int(1), Value::Int(-1)] {
+            assert!(cel_eval_loop(
+                &program(vec![Value::list(vec![Value::Int(1)]), out_of_range]),
+                &ctx
+            )
+            .is_err());
+        }
+        // ... and the in-range case binds the element into the slot.
+        assert_eq!(
+            cel_eval_loop(
+                &program(vec![Value::list(vec![Value::Int(9)]), Value::Int(0)]),
+                &ctx
+            ),
+            Ok(Value::Int(9))
+        );
+    }
+
+    /// `IterGuard` refuses the two slots it reads and computes the third
+    /// question rather than checking it.
+    ///
+    /// The bound is not a check the guard makes -- it is the answer the guard
+    /// exists to produce -- so it is asked for that answer in both directions
+    /// instead. What it does check is the counter's type and the sequence's,
+    /// which is what licenses deciding on two `i64`s.
+    #[test]
+    fn iter_guard_refuses_its_slots_and_decides_the_bound() {
+        let ctx = Context::default();
+        let insn = |op, ops| Insn { op, ops };
+        // `IterGuard counter sequence 7`: falls through to the `true` at 5,
+        // and jumps to the `false` at 7 once the counter reaches the length.
+        let program = |consts: Vec<Value>| CelCode {
+            insns: vec![
+                insn(OpCode::LoadConst, [0, 0, 0]),
+                insn(OpCode::StoreLocal, [0, 0, 0]),
+                insn(OpCode::LoadConst, [1, 0, 0]),
+                insn(OpCode::StoreLocal, [1, 0, 0]),
+                insn(OpCode::IterGuard, [1, 0, 7]),
+                insn(OpCode::LoadConst, [2, 0, 0]),
+                insn(OpCode::Return, [0, 0, 0]),
+                insn(OpCode::LoadConst, [3, 0, 0]),
+                insn(OpCode::Return, [0, 0, 0]),
+            ],
+            consts,
+            n_slots: 2,
+            max_stack: 1,
+            ..CelCode::default()
+        };
+        let one = || Value::list(vec![Value::Int(1)]);
+        let guard = |sequence: Value, counter: Value| {
+            cel_eval_loop(
+                &program(vec![
+                    sequence,
+                    counter,
+                    Value::Bool(true),
+                    Value::Bool(false),
+                ]),
+                &ctx,
+            )
+        };
+
+        // A sequence slot that is not a list, and a counter that is not an
+        // integer: the two the `i64` comparison is licensed by.
+        assert!(guard(Value::Int(7), Value::Int(0)).is_err());
+        assert!(guard(one(), Value::Bool(true)).is_err());
+
+        // The bound itself, both ways.
+        assert_eq!(guard(one(), Value::Int(0)), Ok(Value::Bool(true)));
+        assert_eq!(guard(one(), Value::Int(1)), Ok(Value::Bool(false)));
     }
 }

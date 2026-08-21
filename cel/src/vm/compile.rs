@@ -73,7 +73,7 @@ pub fn compile(expr: &IdedExpr) -> Result<CelCode, CompileError> {
 /// and which of that instruction's operands it is. The slot is carried rather
 /// than folded into the index because three different operand positions are
 /// patched -- a plain jump's only operand, a short-circuit operator's second,
-/// and the qualified call's third.
+/// and the third of both the qualified call and the loop guard.
 #[derive(Clone, Copy)]
 struct PatchSite {
     at: u32,
@@ -146,8 +146,30 @@ impl Compiler {
     /// once the target is. Every opcode reached this way carries its target in
     /// its only operand.
     fn emit_forward(&mut self, op: OpCode, id: u64) -> Result<PatchSite, CompileError> {
-        let at = self.emit(op, &[u32::MAX], id)?;
-        Ok(PatchSite { at, slot: 0 })
+        self.emit_forward_in(op, &[u32::MAX], 0, id)
+    }
+
+    /// The same, for an instruction whose forward target is one operand among
+    /// several: `operands[slot]` is the placeholder and the rest are already
+    /// known.
+    ///
+    /// A sibling of [`Compiler::emit_forward`] rather than a second patching
+    /// device, and `emit_forward` is written in terms of it, so a target's
+    /// position is the only thing that varies between them.
+    fn emit_forward_in(
+        &mut self,
+        op: OpCode,
+        operands: &[u32],
+        slot: usize,
+        id: u64,
+    ) -> Result<PatchSite, CompileError> {
+        debug_assert_eq!(
+            operands[slot],
+            u32::MAX,
+            "{op:?} operand {slot} is a target"
+        );
+        let at = self.emit(op, operands, id)?;
+        Ok(PatchSite { at, slot })
     }
 
     fn patch_to_here(&mut self, site: PatchSite) {
@@ -668,6 +690,23 @@ impl Compiler {
     /// `iter_range` and `accu_init` are evaluated outside the new scope --
     /// neither can refer to the variables the comprehension binds -- and
     /// `result` inside it, because it refers to the accumulator.
+    ///
+    /// # The per-element block is emitted already fused
+    ///
+    /// The guard, the bind and the back edge are three groups that each put a
+    /// value on the operand stack and take it off again before the group ends,
+    /// so each is emitted as the one instruction that names what was
+    /// travelling: [`OpCode::IterGuard`], [`OpCode::IterBind`] and
+    /// [`OpCode::IterAdvance`].
+    ///
+    /// Fused HERE rather than by a peephole pass over the finished `Vec<Insn>`,
+    /// and that is the whole reason nothing else in this file changed. A `pc`
+    /// is an index into that vector, so folding *n* instructions into one after
+    /// the fact renumbers every instruction after the fold -- which means
+    /// rewriting every jump operand that points past it, in both directions,
+    /// and every [`Handler`] bound as well. Emitting the fused form in the
+    /// first place means no index ever moves, and [`Compiler::patch_to_here`]
+    /// is untouched.
     fn comprehension(&mut self, comp: &ComprehensionExpr, id: u64) -> Result<(), CompileError> {
         if let Some(append) = AccuAppend::of(comp) {
             return self.appending_comprehension(comp, &append, id);
@@ -717,13 +756,10 @@ impl Compiler {
         };
 
         let top = self.here();
-        self.emit(OpCode::LoadLocal, &[index], id)?;
-        self.emit(OpCode::IterLen, &[source], id)?;
-        self.emit(OpCode::Less, &[], id)?;
-        let exhausted = self.emit_forward(OpCode::JumpIfFalse, id)?;
+        let exhausted =
+            self.emit_forward_in(OpCode::IterGuard, &[index, source, u32::MAX], 2, id)?;
 
-        self.emit(OpCode::IterAt, &[source, index], id)?;
-        self.emit(OpCode::StoreLocal, &[iter_var], id)?;
+        self.emit(OpCode::IterBind, &[source, index, iter_var], id)?;
 
         if let (Some(range), Some(iter_var2)) = (range, iter_var2) {
             self.emit(OpCode::LoadLocal, &[range], id)?;
@@ -738,8 +774,7 @@ impl Compiler {
         self.expr(&comp.loop_step)?;
         self.emit(OpCode::StoreLocal, &[accu], id)?;
 
-        self.emit(OpCode::IncLocal, &[index], id)?;
-        self.emit(OpCode::Jump, &[top], id)?;
+        self.emit(OpCode::IterAdvance, &[index, top], id)?;
 
         self.patch_to_here(exhausted);
         self.patch_to_here(broke);
@@ -763,12 +798,12 @@ impl Compiler {
     ///   <accu_init>                       ; a list literal: leaves the builder
     ///   LoadConst 0   StoreLocal index
     /// top:
-    ///   LoadLocal index  IterLen source  Less  JumpIfFalse done
-    ///   IterAt source index  StoreLocal iter_var
+    ///   IterGuard index source done
+    ///   IterBind source index iter_var
     ///   [<guard> JumpIfFalse skip]
     ///   <element>  ListAppend            ; the push, straight into the builder
     /// skip:
-    ///   IncLocal index  Jump top
+    ///   IterAdvance index top
     /// done:
     ///   StoreLocal accu                  ; finishes the builder into a Value
     ///   <result>
@@ -804,13 +839,10 @@ impl Compiler {
         let iter_var = self.declare(&comp.iter_var, id)?;
 
         let top = self.here();
-        self.emit(OpCode::LoadLocal, &[index], id)?;
-        self.emit(OpCode::IterLen, &[source], id)?;
-        self.emit(OpCode::Less, &[], id)?;
-        let exhausted = self.emit_forward(OpCode::JumpIfFalse, id)?;
+        let exhausted =
+            self.emit_forward_in(OpCode::IterGuard, &[index, source, u32::MAX], 2, id)?;
 
-        self.emit(OpCode::IterAt, &[source, index], id)?;
-        self.emit(OpCode::StoreLocal, &[iter_var], id)?;
+        self.emit(OpCode::IterBind, &[source, index, iter_var], id)?;
 
         let skipped = match append.guard {
             Some(guard) => {
@@ -827,8 +859,7 @@ impl Compiler {
             self.patch_to_here(skipped);
         }
 
-        self.emit(OpCode::IncLocal, &[index], id)?;
-        self.emit(OpCode::Jump, &[top], id)?;
+        self.emit(OpCode::IterAdvance, &[index, top], id)?;
 
         self.patch_to_here(exhausted);
         let accu = self.declare(&comp.accu_var, id)?;
@@ -1060,13 +1091,13 @@ mod tests {
             "xs.all(x, x > 0)",
         ] {
             let code = code_of(source);
-            let slot_of = |wanted: OpCode| {
+            let slot_of = |wanted: OpCode, operand: usize| {
                 code.instructions()
                     .filter(|(_, op, _)| *op == wanted)
-                    .map(|(_, _, operands)| operands[0])
+                    .map(|(_, _, operands)| operands[operand])
                     .next()
             };
-            let slot = slot_of(OpCode::IterAt)
+            let slot = slot_of(OpCode::IterBind, 0)
                 .unwrap_or_else(|| panic!("{source} iterates, so it names a source slot"));
 
             let loaded: Vec<u32> = code
@@ -1083,7 +1114,7 @@ mod tests {
             // or the bound is being read off something other than what is
             // being indexed.
             assert_eq!(
-                slot_of(OpCode::IterLen),
+                slot_of(OpCode::IterGuard, 1),
                 Some(slot),
                 "{source}:\n{}",
                 code.disassemble()
@@ -1093,13 +1124,18 @@ mod tests {
 
     /// The loop counter is advanced in place, without operand-stack traffic.
     ///
-    /// The counter's slot is named by `IterAt`'s second operand, the way the
+    /// The counter's slot is named by `IterBind`'s second operand, the way the
     /// source slot is named by its first, so this asks about the slot the loop
     /// actually indexes with rather than about a position in an emitted
     /// sequence. What it pins is that the counter is written once -- before
     /// the loop, with a zero -- and thereafter advanced by an instruction that
     /// neither pushes nor pops. A second `StoreLocal` of that slot is the
     /// load/add/store form coming back.
+    ///
+    /// That single write is also what makes the counter an integer for the
+    /// whole loop, which is the precondition `IterGuard` compares on rather
+    /// than going through `compare_values`; so the guard has to be reading the
+    /// same slot, and that is asserted here too.
     ///
     /// Stated as a property for the reason
     /// `the_comprehension_loop_never_loads_its_source_onto_the_stack` is: the
@@ -1115,7 +1151,7 @@ mod tests {
             let code = code_of(source);
             let counter = code
                 .instructions()
-                .find(|(_, op, _)| *op == OpCode::IterAt)
+                .find(|(_, op, _)| *op == OpCode::IterBind)
                 .map(|(_, _, operands)| operands[1])
                 .unwrap_or_else(|| panic!("{source} iterates, so it names a counter slot"));
 
@@ -1132,10 +1168,19 @@ mod tests {
 
             let advanced = code
                 .instructions()
-                .any(|(_, op, operands)| op == OpCode::IncLocal && operands[0] == counter);
+                .any(|(_, op, operands)| op == OpCode::IterAdvance && operands[0] == counter);
             assert!(
                 advanced,
                 "{source} must advance counter slot {counter} in place:\n{}",
+                code.disassemble()
+            );
+
+            let guarded = code
+                .instructions()
+                .any(|(_, op, operands)| op == OpCode::IterGuard && operands[0] == counter);
+            assert!(
+                guarded,
+                "{source} guards on a slot other than counter {counter}:\n{}",
                 code.disassemble()
             );
         }

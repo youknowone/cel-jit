@@ -43,7 +43,12 @@ pub enum OpCode {
     /// Add one to the integer in activation-record slot `a`, in place. Nothing
     /// is pushed and nothing is popped.
     ///
-    /// This is a comprehension's loop counter and nothing else emits it.
+    /// This is a comprehension's loop counter, and the comprehension lowering
+    /// now emits it folded into [`OpCode::IterAdvance`] together with the back
+    /// edge that follows it, so no lowering emits it on its own. It stays the
+    /// unfolded half of that instruction: the arm is what `IterAdvance` does
+    /// to the counter, and both are reachable from a hand-built stream.
+    ///
     /// Spelled out, the counter was `LoadLocal a ; LoadConst 1 ; Add ;
     /// StoreLocal a` -- four dispatches, an operand-stack round trip and a
     /// constant-pool entry, to add one to a number the program already owns.
@@ -190,12 +195,15 @@ pub enum OpCode {
     /// Push the length of the list in slot `a`. Nothing is popped.
     ///
     /// The sequence is named by SLOT rather than taken from the stack because
-    /// the loop that emits this runs it once per element, and reaching a slot
-    /// through [`OpCode::LoadLocal`] copies what is in it: for a list that is
-    /// a `ListRef` clone, whose `Arc` refcount is an atomic increment matched
-    /// by a decrement when this instruction drops the copy again. Reading the
+    /// the loop runs this once per element, and reaching a slot through
+    /// [`OpCode::LoadLocal`] copies what is in it: for a list that is a
+    /// `ListRef` clone, whose `Arc` refcount is an atomic increment matched by
+    /// a decrement when this instruction drops the copy again. Reading the
     /// slot in place costs neither, and the `LoadLocal` itself stops being
     /// emitted at all.
+    ///
+    /// Folded into [`OpCode::IterGuard`], which is the whole comparison this
+    /// length was pushed for, so no lowering emits it on its own.
     IterLen,
     /// Push the element of the sequence in slot `a` at the index in slot `b`.
     /// Nothing is popped.
@@ -204,13 +212,61 @@ pub enum OpCode {
     /// between them the two accounted for four atomic refcount operations per
     /// element, on one shared count.
     ///
+    /// Folded into [`OpCode::IterBind`], which is this read and the store that
+    /// always followed it, so no lowering emits it on its own.
+    ///
     /// The compiler emits no bounds test of its own, because the loop guard
-    /// immediately above this instruction has already compared the index
+    /// that runs immediately before this has already compared the index
     /// against the length. The arm still checks: an instruction stream is
     /// public data, and the buffer underneath is indexed directly. What the
     /// arm does not do is reach the element through the general indexing path,
     /// which would decide the container's kind and the key's kind first.
     IterAt,
+
+    // -- the fused loop -----------------------------------------------------
+    //
+    // The three groups of a comprehension's per-element block that touch the
+    // operand stack without ever needing to: each one puts a value on the
+    // stack and takes it off again inside the same group, so the stack is at
+    // the same depth before and after. What was travelling through it is a
+    // slot's number, a list's length and an element -- all of which the
+    // instruction can name directly.
+    //
+    // The comprehension lowering emits these directly; nothing folds an
+    // emitted stream afterwards, for the reason `Compiler::comprehension`
+    // gives.
+    /// The loop guard: fall through while the counter in slot `a` is below the
+    /// length of the list in slot `b`, and jump to `c` when it is not. Nothing
+    /// is pushed and nothing is popped.
+    ///
+    /// Spelled out, this was `LoadLocal a ; IterLen b ; Less ; JumpIfFalse c`
+    /// -- four dispatches and three operand-stack round trips to compare two
+    /// integers the program already holds.
+    ///
+    /// Both are integers by construction, which is what lets the comparison be
+    /// an `i64` one rather than `compare_values`: the counter slot is written
+    /// once, with a zero, before the loop, and thereafter only by
+    /// [`OpCode::IterAdvance`], and the length is a list's. Neither fact is
+    /// true of the INSTRUCTION STREAM, which is public data anyone can build,
+    /// so a counter slot holding anything else is refused the way
+    /// [`OpCode::IncLocal`] refuses one and a source slot holding anything else
+    /// the way [`OpCode::IterLen`] refuses one.
+    IterGuard,
+    /// Bind one element: write the element of the list in slot `a` at the
+    /// index in slot `b` into slot `c`. Nothing is pushed and nothing is
+    /// popped.
+    ///
+    /// Spelled out, this was `IterAt a b ; StoreLocal c`, which moved the
+    /// element onto the operand stack only to take it off again and put it
+    /// where it was always going.
+    IterBind,
+    /// The back edge: add one to the integer in slot `a`, then jump to `b`.
+    /// Nothing is pushed and nothing is popped.
+    ///
+    /// Spelled out, this was `IncLocal a ; Jump b`. Neither half touched the
+    /// operand stack, so this is the one group of the three whose whole saving
+    /// is a dispatch: one of the two the pair cost.
+    IterAdvance,
 
     // -- control flow -----------------------------------------------------
     /// Jump to `a`.
@@ -283,9 +339,14 @@ impl OpCode {
             | OpCode::IncLocal
             | OpCode::IterLen => 1,
 
-            OpCode::CallHost | OpCode::CallMethod | OpCode::And | OpCode::Or | OpCode::IterAt => 2,
+            OpCode::CallHost
+            | OpCode::CallMethod
+            | OpCode::And
+            | OpCode::Or
+            | OpCode::IterAt
+            | OpCode::IterAdvance => 2,
 
-            OpCode::CallQualified => 3,
+            OpCode::CallQualified | OpCode::IterGuard | OpCode::IterBind => 3,
 
             OpCode::Index
             | OpCode::OptIndex
@@ -338,9 +399,12 @@ impl OpCode {
             OpCode::LoadConst | OpCode::LoadVar | OpCode::LoadLocal => (0, 1),
             // Both name their inputs by slot, so neither pops anything.
             OpCode::IterLen | OpCode::IterAt => (0, 1),
-            // Reads and writes one slot; the operand stack is not involved at
-            // all, which is the whole reason the opcode exists.
-            OpCode::IncLocal => (0, 0),
+            // Reads and writes slots; the operand stack is not involved at
+            // all, which is the whole reason these opcodes exist. Each fused
+            // form is stack-neutral because the group it replaces was: what
+            // travelled through the stack was put there and taken off again
+            // inside the same group.
+            OpCode::IncLocal | OpCode::IterGuard | OpCode::IterBind | OpCode::IterAdvance => (0, 0),
             OpCode::NewList | OpCode::NewMap | OpCode::NewStruct => (0, 1),
 
             OpCode::StoreLocal | OpCode::Return => (1, 0),
@@ -450,5 +514,23 @@ mod tests {
     fn inc_local_names_a_slot_and_leaves_the_operand_stack_alone() {
         assert_eq!(OpCode::IncLocal.operands(), 1);
         assert_eq!(OpCode::IncLocal.stack_effect(&[0]), (0, 0));
+    }
+
+    /// The fused loop instructions name everything they touch, so none of them
+    /// costs an operand-stack round trip. Declared here rather than inferred
+    /// from an emitted program, because it is the property the fusion is for:
+    /// a fused form that still pushed or popped would have removed dispatches
+    /// only, and the stack traffic is what the block was measured to be made
+    /// of.
+    #[test]
+    fn the_fused_loop_instructions_leave_the_operand_stack_alone() {
+        for (op, operands) in [
+            (OpCode::IterGuard, 3),
+            (OpCode::IterBind, 3),
+            (OpCode::IterAdvance, 2),
+        ] {
+            assert_eq!(op.operands(), operands, "{op:?}");
+            assert_eq!(op.stack_effect(&[0, 0, 0]), (0, 0), "{op:?}");
+        }
     }
 }

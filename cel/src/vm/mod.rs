@@ -50,7 +50,7 @@ pub use compile::{compile, CompileError, CompileErrorKind};
 pub use error::{CelErr, CelResult, ColdId, NameId};
 pub use interp::cel_eval_loop;
 #[cfg(feature = "elem-attr-probe")]
-pub use interp::{cel_eval_loop_with_fuse, FuseArm};
+pub use interp::{cel_eval_loop_with_fuse, map_loop_is_fusable, FuseArm};
 #[cfg(feature = "drop-arm-probe")]
 pub use interp::{cel_eval_loop_with_probe, DropArm, IterAtArm, ProbePolicy};
 pub use opcode::{OpCode, OPCODE_COUNT};
