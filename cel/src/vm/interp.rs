@@ -51,6 +51,22 @@ pub fn cel_eval_loop(code: &CelCode, ctx: &Context) -> Result<Value, ExecutionEr
     {
         vm.probe = PROBE.with(std::cell::Cell::get);
     }
+    #[cfg(feature = "elem-attr-probe")]
+    {
+        // The shape was recognised unconditionally in `Vm::new`, so every arm
+        // pays the scan. What the arm decides is only whether the fused path
+        // is REACHABLE: an arm that fuses nothing moves the anchor out of the
+        // instruction stream's range instead of skipping the test, so the test
+        // itself is present and perfectly predicted in every arm.
+        vm.fuse = FUSE.with(std::cell::Cell::get);
+        vm.anchor = if vm.shape.top == u32::MAX || vm.fuse == FuseArm::None {
+            u32::MAX
+        } else if vm.fuse == FuseArm::AdvanceOnly {
+            vm.shape.after_body
+        } else {
+            vm.shape.top
+        };
+    }
     match vm.run() {
         Ok(value) => Ok(value),
         Err(err) => Err(vm.public_error(err)),
@@ -80,6 +96,218 @@ pub fn cel_eval_loop_with_probe(
     let out = cel_eval_loop(code, ctx);
     PROBE.with(|slot| slot.set(previous));
     out
+}
+
+/// Which groups of an appending comprehension's per-element instruction block
+/// the dispatch loop runs as ONE step.
+///
+/// A measurement probe, not a feature, and it exists to answer one question:
+/// the bytecode VM's cost over the tree walker on `list.map(x, x * k)` is a
+/// FLAT per-element excess that does not shrink with the list's length, and
+/// nothing named accounts for it. The excess can only be dispatch, operand
+/// stack traffic, or work the walker does not do -- so each arm here removes
+/// one named group of dispatches and operand-stack round trips from the
+/// per-element block and leaves everything else exactly where it was.
+///
+/// The rule every arm obeys: **an arm may remove a dispatch or an operand-stack
+/// round trip; it may not remove work the tree walker also performs.**
+/// `binary_values` is called by both evaluators, so every arm below still calls
+/// it, with the same operands, at the same point. `compare_values` is the one
+/// exception, and it gets its own arm precisely so that its cost is separated
+/// rather than folded into a dispatch figure -- the loop guard it serves has no
+/// counterpart in the walker at all, which iterates with a Rust iterator.
+///
+/// The arms are cumulative: each fuses everything the one before it fused, plus
+/// one more group. Marginal differences are therefore the per-group figures and
+/// the end-to-end difference is their sum, which is an additivity check.
+#[cfg(feature = "elem-attr-probe")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FuseArm {
+    /// What the interpreter does without the probe: twelve dispatches per
+    /// element, seven pushes and seven pops.
+    None,
+    /// Fuse `LoadLocal index; IterLen source; Less; JumpIfFalse done` -- four
+    /// dispatches, three pushes and three pops -- and STILL call
+    /// `compare_values` and `as_bool` on the two `Value::Int`s, then discard
+    /// the answer. Removes the dispatches and the stack traffic and nothing
+    /// else.
+    GuardKeepingCompare,
+    /// The same fusion, deciding the guard with an `i64` comparison instead.
+    /// The difference from [`FuseArm::GuardKeepingCompare`] is exactly what
+    /// `compare_values` + `as_bool` + the discard cost.
+    Guard,
+    /// ... plus `IterAt source index; StoreLocal var` -- two dispatches, one
+    /// push and one pop. The element is still read through `ListRef::get` and
+    /// still written into the slot with the same `mem::replace` and discard.
+    Bind,
+    /// ... plus `LoadLocal var; LoadConst k; Mul; ListAppend` -- four
+    /// dispatches, three pushes and three pops. `binary_values` is still
+    /// called, with the same two operands, and the result is still pushed into
+    /// the same builder.
+    Body,
+    /// ... plus `IncLocal index; Jump top` -- two dispatches. The whole element
+    /// is one step, and the operand stack is not touched at all. The counter is
+    /// still advanced with the same `checked_add`.
+    Advance,
+    /// [`FuseArm::Advance`] plus one `Arc` round trip per element: the source
+    /// list's reference count is incremented and decremented again, and nothing
+    /// else changes.
+    ///
+    /// `IncLocal index; Jump top` fused and NOTHING ELSE, anchored at the
+    /// instruction after the body rather than at the loop header.
+    ///
+    /// The order control. Every other arm is cumulative, so each group's
+    /// marginal price is taken against an arm that has already had the groups
+    /// before it removed -- and a marginal taken in one order need not equal the
+    /// same marginal taken in another. This measures the advance group from the
+    /// STOCK end, where [`FuseArm::Advance`] measures it from the most-fused
+    /// end. Two figures that agree say the split does not depend on the order;
+    /// two that disagree bound how much it does.
+    AdvanceOnly,
+    /// A POSITIVE CONTROL, and the calibration for the "a per-element `Arc`
+    /// clone" hypothesis. It re-adds one of the four atomic refcount operations
+    /// per element that giving [`OpCode::IterLen`] and [`OpCode::IterAt`] slot
+    /// operands removed, so the difference from [`FuseArm::Advance`] is what one
+    /// such clone-and-release costs on this box. Its arm must be checked in the
+    /// disassembly for an atomic read-modify-write: an arm meant to ADD work
+    /// that the optimizer deleted would report the cost as zero.
+    AdvancePlusArcRoundTrip,
+}
+
+#[cfg(feature = "elem-attr-probe")]
+std::thread_local! {
+    /// Which arm the next evaluation on this thread runs under.
+    static FUSE: std::cell::Cell<FuseArm> = const { std::cell::Cell::new(FuseArm::None) };
+}
+
+/// Run `code` in `ctx` with `arm`'s groups fused.
+///
+/// The probe's only door, announced in advance rather than passed down, for the
+/// reason [`cel_eval_loop_with_probe`]'s documentation gives: `interp.rs` is
+/// pinned to exactly one `Vm::new` and one `run`, so a second entry point that
+/// built its own machine would look like a nested interpreter.
+#[cfg(feature = "elem-attr-probe")]
+pub fn cel_eval_loop_with_fuse(
+    code: &CelCode,
+    ctx: &Context,
+    arm: FuseArm,
+) -> Result<Value, ExecutionError> {
+    let previous = FUSE.with(|slot| slot.replace(arm));
+    let out = cel_eval_loop(code, ctx);
+    FUSE.with(|slot| slot.set(previous));
+    out
+}
+
+/// The per-element instruction block of an appending comprehension whose body
+/// is one binary operator against a constant, located in the instruction
+/// stream.
+///
+/// Every field is read off the stream rather than assumed, so a program that
+/// does not have this exact shape is simply not recognised and every arm runs
+/// the stock dispatch loop over it.
+#[cfg(feature = "elem-attr-probe")]
+#[derive(Clone, Copy, Debug)]
+struct MapLoop {
+    /// `LoadLocal index`, the loop header. `u32::MAX` when no block matched,
+    /// which is the value that keeps the fused path unreachable.
+    top: u32,
+    /// Where `JumpIfFalse` sends an exhausted loop.
+    done: u32,
+    /// Slot holding the sequence.
+    source: u32,
+    /// Slot holding the loop counter.
+    index: u32,
+    /// Slot holding the iteration variable.
+    var: u32,
+    /// Constant-pool index of the body's right operand.
+    konst: u32,
+    /// `IterAt`, where an arm that fused only the guard resumes.
+    after_guard: u32,
+    /// `LoadLocal var`, where an arm that also fused the bind resumes.
+    after_bind: u32,
+    /// `IncLocal`, where an arm that also fused the body resumes.
+    after_body: u32,
+}
+
+#[cfg(feature = "elem-attr-probe")]
+const NO_MAP_LOOP: MapLoop = MapLoop {
+    top: u32::MAX,
+    done: 0,
+    source: 0,
+    index: 0,
+    var: 0,
+    konst: 0,
+    after_guard: 0,
+    after_bind: 0,
+    after_body: 0,
+};
+
+/// Find the twelve-instruction per-element block, if the program has one.
+///
+/// Run once per evaluation by EVERY arm, so its cost is a constant that cancels
+/// out of any difference between two of them.
+#[cfg(feature = "elem-attr-probe")]
+fn recognize_map_loop(code: &CelCode) -> MapLoop {
+    const WANT: [OpCode; 12] = [
+        OpCode::LoadLocal,
+        OpCode::IterLen,
+        OpCode::Less,
+        OpCode::JumpIfFalse,
+        OpCode::IterAt,
+        OpCode::StoreLocal,
+        OpCode::LoadLocal,
+        OpCode::LoadConst,
+        OpCode::Mul,
+        OpCode::ListAppend,
+        OpCode::IncLocal,
+        OpCode::Jump,
+    ];
+    // A shift register rather than a collected stream: this runs once per
+    // EVALUATION, and `tests/vm_scratch_pool.rs` pins the evaluator's heap
+    // floor at zero allocations. A probe that allocates to decide where to
+    // measure has changed the thing it is measuring.
+    let mut window = [(0u32, OpCode::Return, [0u32; 3]); 12];
+    let mut filled = 0usize;
+    for (pc, op, operands) in code.instructions() {
+        let mut words = [0u32; 3];
+        for (slot, word) in words.iter_mut().zip(operands) {
+            *slot = *word;
+        }
+        window.rotate_left(1);
+        window[11] = (pc, op, words);
+        filled += 1;
+        if filled < window.len() {
+            continue;
+        }
+        if !window.iter().zip(WANT).all(|(entry, want)| entry.1 == want) {
+            continue;
+        }
+        let index = window[0].2[0];
+        let source = window[1].2[0];
+        let var = window[5].2[0];
+        // Every slot the block names has to be the slot the fused form would
+        // read, or the fusion is not of THIS loop.
+        let consistent = window[4].2[0] == source
+            && window[4].2[1] == index
+            && window[6].2[0] == var
+            && window[10].2[0] == index
+            && window[11].2[0] == window[0].0;
+        if !consistent {
+            continue;
+        }
+        return MapLoop {
+            top: window[0].0,
+            done: window[3].2[0],
+            source,
+            index,
+            var,
+            konst: window[7].2[0],
+            after_guard: window[4].0,
+            after_bind: window[6].0,
+            after_body: window[10].0,
+        };
+    }
+    NO_MAP_LOOP
 }
 
 /// One operand-stack entry.
@@ -361,6 +589,19 @@ struct Vm<'a> {
     /// Which lowering the probe's sites take. Probe only; see [`ProbePolicy`].
     #[cfg(feature = "drop-arm-probe")]
     probe: ProbePolicy,
+    /// Which groups of the per-element block run as one step. Probe only; see
+    /// [`FuseArm`].
+    #[cfg(feature = "elem-attr-probe")]
+    fuse: FuseArm,
+    /// Where that block is. Probe only; see [`MapLoop`].
+    #[cfg(feature = "elem-attr-probe")]
+    shape: MapLoop,
+    /// The one `pc` at which the fused path is taken, or `u32::MAX` for an arm
+    /// that fuses nothing. A field rather than a second test, so that the
+    /// dispatch loop's per-instruction cost is identical in every arm however
+    /// many anchors the probe grows. Probe only.
+    #[cfg(feature = "elem-attr-probe")]
+    anchor: u32,
 }
 
 /// Return the buffers to this thread's pool.
@@ -417,6 +658,14 @@ impl<'a> Vm<'a> {
             pending_args: None,
             #[cfg(feature = "drop-arm-probe")]
             probe: ProbePolicy::default(),
+            #[cfg(feature = "elem-attr-probe")]
+            fuse: FuseArm::None,
+            // Scanned by every arm, including the one that fuses nothing, so
+            // the scan is a constant rather than a term of any difference.
+            #[cfg(feature = "elem-attr-probe")]
+            shape: recognize_map_loop(code),
+            #[cfg(feature = "elem-attr-probe")]
+            anchor: u32::MAX,
         }
     }
 
@@ -695,6 +944,18 @@ impl<'a> Vm<'a> {
     fn run(&mut self) -> CelResult<Value> {
         let mut pc = 0u32;
         loop {
+            // One comparison against a field, executed by every arm on every
+            // dispatch. An arm that fuses nothing holds `u32::MAX` here and
+            // never takes it; an arm that fuses takes it once per element. The
+            // branch is perfectly predicted either way, and it is the probe's
+            // own overhead: an arm that removes k dispatches also removes k
+            // executions of this test, which inflates that arm's measured
+            // saving by k times the cost of one predicted compare.
+            #[cfg(feature = "elem-attr-probe")]
+            if pc == self.anchor {
+                pc = self.fused_element(pc)?;
+                continue;
+            }
             let (op, operands) = self.code.decode(pc).ok_or(CelErr::InternalError)?;
             let operands: [u32; 3] = [
                 operands.first().copied().unwrap_or(0),
@@ -736,6 +997,131 @@ impl<'a> Vm<'a> {
             .ok_or(CelErr::InternalError)? = Err(err);
         self.stack.truncate(depth as usize);
         Ok(land)
+    }
+
+    /// Run the per-element block from [`MapLoop::top`] as one step, up to the
+    /// group the arm stops at, and return the `pc` the dispatch loop resumes
+    /// at.
+    ///
+    /// Every quantity below is computed from the same slot, the same constant
+    /// and the same helper the instructions it replaces used. What is gone is
+    /// the dispatch of those instructions and their operand-stack round trips
+    /// -- and, for [`FuseArm::Guard`] and above, `compare_values`, which is the
+    /// one arm that removes a helper and the reason
+    /// [`FuseArm::GuardKeepingCompare`] exists next to it.
+    ///
+    /// The operand stack is left at the depth the fused instructions would have
+    /// left it: every group below is stack-neutral end to end, so the builder
+    /// the loop appends into stays exactly where it was.
+    #[cfg(feature = "elem-attr-probe")]
+    fn fused_element(&mut self, pc: u32) -> CelResult<u32> {
+        let shape = self.shape;
+        let arm = self.fuse;
+
+        // The order control enters at `after_body`, so it skips straight to the
+        // advance group; every other arm enters at the loop header.
+        if arm == FuseArm::AdvanceOnly {
+            return self.fused_advance(shape);
+        }
+
+        // -- the guard: `LoadLocal index ; IterLen source ; Less ; JumpIfFalse`
+        let index = match self.slots.get(shape.index as usize) {
+            Some(&Value::Int(index)) => index,
+            _ => return Err(CelErr::InternalError),
+        };
+        let len = match self.slots.get(shape.source as usize) {
+            Some(Value::List(list)) => list.len() as i64,
+            _ => return Err(CelErr::InternalError),
+        };
+        if arm == FuseArm::AdvancePlusArcRoundTrip {
+            // Exactly what `LoadLocal source` used to do to this slot, and
+            // nothing more: one increment on the way in, one decrement on the
+            // way out, on the count the whole loop shares.
+            let Some(Value::List(list)) = self.slots.get(shape.source as usize) else {
+                return Err(CelErr::InternalError);
+            };
+            let duplicate = list.clone();
+            drop(std::hint::black_box(duplicate));
+        }
+        let more = if arm == FuseArm::GuardKeepingCompare {
+            // Spelled as `step`'s `Less` arm spells it, function pointer
+            // included, so this arm removes four dispatches and three
+            // operand-stack round trips and nothing else.
+            let accept: fn(Ordering) -> bool = |o| o == Ordering::Less;
+            let decided = compare_values(Value::Int(index), Value::Int(len), accept)
+                .map_err(|e| self.park(e))?;
+            let taken = as_bool(&decided)?;
+            self.discard(decided);
+            taken
+        } else {
+            index < len
+        };
+        if !more {
+            return Ok(shape.done);
+        }
+        if arm == FuseArm::GuardKeepingCompare || arm == FuseArm::Guard {
+            return Ok(shape.after_guard);
+        }
+        let _ = pc;
+
+        // -- the bind: `IterAt source index ; StoreLocal var`
+        let element = {
+            let Some(Value::List(sequence)) = self.slots.get(shape.source as usize) else {
+                return Err(CelErr::InternalError);
+            };
+            sequence.get(index as usize)
+        };
+        let element = element.ok_or(CelErr::IndexOutOfBounds)?;
+        let slot = self
+            .slots
+            .get_mut(shape.var as usize)
+            .ok_or(CelErr::InternalError)?;
+        let previous = std::mem::replace(slot, element);
+        self.discard(previous);
+        if arm == FuseArm::Bind {
+            return Ok(shape.after_bind);
+        }
+
+        // -- the body and the append:
+        //    `LoadLocal var ; LoadConst k ; Mul ; ListAppend`
+        let lhs = self
+            .slots
+            .get(shape.var as usize)
+            .ok_or(CelErr::InternalError)?
+            .clone();
+        let rhs = self
+            .code
+            .konst(shape.konst)
+            .ok_or(CelErr::InternalError)?
+            .clone();
+        let value = binary_values("mul", lhs, rhs).map_err(|e| self.park(e))?;
+        self.list_mut()?.push(value);
+        if arm == FuseArm::Body {
+            return Ok(shape.after_body);
+        }
+
+        // -- the advance: `IncLocal index ; Jump top`
+        self.fused_advance(shape)
+    }
+
+    /// `IncLocal index ; Jump top`, run as one step.
+    ///
+    /// Its own function only because two arms reach it: the cumulative ladder
+    /// falls into it, and [`FuseArm::AdvanceOnly`] enters directly at it.
+    #[cfg(feature = "elem-attr-probe")]
+    #[inline(always)]
+    fn fused_advance(&mut self, shape: MapLoop) -> CelResult<u32> {
+        let slot = self
+            .slots
+            .get_mut(shape.index as usize)
+            .ok_or(CelErr::InternalError)?;
+        let Value::Int(counter) = slot else {
+            return Err(CelErr::InternalError);
+        };
+        *counter = counter
+            .checked_add(1)
+            .ok_or(CelErr::Overflow(OpCode::Add))?;
+        Ok(shape.top)
     }
 
     fn step(&mut self, op: OpCode, operands: [u32; 3], pc: u32, next: u32) -> CelResult<Step> {

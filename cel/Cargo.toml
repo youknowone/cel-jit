@@ -274,6 +274,19 @@ dhat-heap = [ ] # if you are doing heap profiling
 # allocation witness before any timing runs.
 drop-arm-probe = []
 
+# The third measurement probe, and never a shipping feature either. It lets the
+# dispatch loop FUSE the per-element instruction block of an appending
+# comprehension -- `list.map(x, x * k)` -- into one step, in named groups, so
+# that what the VM's dispatch and operand-stack traffic cost per element is a
+# difference taken inside ONE binary rather than between two builds.
+#
+# Every arm computes the same answer from the same helpers; what an arm removes
+# is dispatches and operand-stack round trips, never work the tree walker also
+# does. The harness asserts each arm's result against the stock arm's before
+# any timing, so an arm that removed work it should not have is a failure and
+# not a faster number. Off by default; only `examples/paired_ab.rs` selects it.
+elem-attr-probe = []
+
 # The second measurement probe, and never a shipping feature either. It makes
 # the function-entry door's yield probe choose its key form at run time --
 # the resolved cell key it uses now, or the bare bucket hash it used before --

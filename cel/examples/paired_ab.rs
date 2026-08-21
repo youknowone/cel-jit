@@ -970,6 +970,13 @@ fn main() {
     #[cfg(feature = "drop-arm-probe")]
     probe(&cfg);
 
+    // -- THE ELEMENT-ATTRIBUTION PROBE --------------------------------------
+    // Task #40: what the bytecode VM's flat per-element excess over the tree
+    // walker on `list.map(x, x * 2)` is MADE OF, behind
+    // `--features elem-attr-probe`. Same bracket, same rule about floors.
+    #[cfg(feature = "elem-attr-probe")]
+    element_attribution(&cfg);
+
     // -- THE LOOP-KEY PROBE -------------------------------------------------
     // Task #31: what the function-entry door's per-call loop-key resolution
     // costs, behind `--features jit-<backend>,loop-key-arm-probe`. Bracketed by
@@ -1197,7 +1204,7 @@ fn string_list_ctx(n: usize) -> Context<'static> {
 }
 
 /// Compile `src` to a code object the probe can run under an explicit policy.
-#[cfg(feature = "drop-arm-probe")]
+#[cfg(any(feature = "drop-arm-probe", feature = "elem-attr-probe"))]
 fn probe_code(src: &str) -> cel::vm::CelCode {
     let expr = cel::parser::Parser::default()
         .parse(src)
@@ -1217,6 +1224,7 @@ fn probe_code(src: &str) -> cel::vm::CelCode {
 // either alone leaves no unused item behind.
 #[cfg(any(
     feature = "drop-arm-probe",
+    feature = "elem-attr-probe",
     all(feature = "jit", feature = "loop-key-arm-probe")
 ))]
 fn per_unit(label: &str, s: &Stats, floor: f64, units: f64, unit: &str) {
@@ -1248,6 +1256,7 @@ fn per_unit(label: &str, s: &Stats, floor: f64, units: f64, unit: &str) {
 // either alone leaves no unused item behind.
 #[cfg(any(
     feature = "drop-arm-probe",
+    feature = "elem-attr-probe",
     all(feature = "jit", feature = "loop-key-arm-probe")
 ))]
 fn local_floor<F: FnMut()>(title: &str, mut make: impl FnMut() -> F, cfg: &Config) -> Floors {
@@ -1574,6 +1583,362 @@ fn iter_at_sweep(cfg: &Config) {
             );
             per_unit("IterAt, per element", &cpu, floors.cpu, n as f64, "element");
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The element-attribution probe (feature `elem-attr-probe`)
+// ---------------------------------------------------------------------------
+//
+// Task #40. On the `map_list_scaling` ladder the bytecode VM's excess over the
+// tree walker is a FLAT ~58-64 ns per element from n=1 to n=10000 — the ratio
+// only climbs because the walker amortises a fixed cost, not because the VM's
+// per-element excess grows. Nothing named accounted for it. This section takes
+// it apart.
+//
+// The method is subtractive and stays inside one binary: each arm runs the same
+// program through the same dispatch loop with one named GROUP of the
+// twelve-instruction per-element block fused into a single step. An arm removes
+// dispatches and operand-stack round trips; it does not remove work the walker
+// also does, and `binary_values` — which both evaluators call — is still called
+// by every arm with the same operands. The one exception, `compare_values`, is
+// isolated by running the guard fusion twice, once with the helper kept.
+//
+// Every rung's answer is asserted equal to the stock arm's before any timing, so
+// an arm that removed the wrong thing fails rather than prints a better number.
+
+/// The ladder's source and its input, verbatim from `map_list_scaling`.
+#[cfg(feature = "elem-attr-probe")]
+const ELEM_SRC: &str = "list.map(x, x * 2)";
+
+/// A context binding `list` to `n` integers, as the ladder binds it.
+#[cfg(feature = "elem-attr-probe")]
+fn elem_ctx(n: usize) -> Context<'static> {
+    let mut ctx = Context::default();
+    ctx.add_variable_from_value("list", (0..n as i64).collect::<Vec<i64>>());
+    ctx
+}
+
+/// The twelve instructions the per-element block is made of, so the report can
+/// state what each fusion removed without the reader counting them.
+///
+/// Read off `vm/compile.rs`'s appending-comprehension lowering and pinned by
+/// `assert_element_block` below, which reads the actual instruction stream.
+#[cfg(feature = "elem-attr-probe")]
+const ELEM_BLOCK: usize = 12;
+
+/// Refuse to measure a program that is not the block this section is about.
+#[cfg(feature = "elem-attr-probe")]
+fn assert_element_block(code: &cel::vm::CelCode) {
+    use cel::vm::OpCode;
+    let want = [
+        OpCode::LoadLocal,
+        OpCode::IterLen,
+        OpCode::Less,
+        OpCode::JumpIfFalse,
+        OpCode::IterAt,
+        OpCode::StoreLocal,
+        OpCode::LoadLocal,
+        OpCode::LoadConst,
+        OpCode::Mul,
+        OpCode::ListAppend,
+        OpCode::IncLocal,
+        OpCode::Jump,
+    ];
+    let ops: Vec<OpCode> = code.instructions().map(|(_, op, _)| op).collect();
+    assert_eq!(want.len(), ELEM_BLOCK);
+    assert!(
+        ops.windows(ELEM_BLOCK).any(|w| w == want),
+        "`{ELEM_SRC}` no longer lowers to the twelve-instruction per-element \
+         block this section attributes. Disassembly:\n{}",
+        code.disassemble()
+    );
+}
+
+/// Walk the whole element ladder on both evaluators and print the excess per
+/// element at each rung.
+///
+/// This is the measurement being attributed, re-taken here rather than quoted,
+/// because everything below is a decomposition OF it and a decomposition of a
+/// number this binary cannot reproduce is a decomposition of nothing.
+#[cfg(feature = "elem-attr-probe")]
+fn elem_ladder(cfg: &Config) {
+    use cel::vm::{cel_eval_loop_with_fuse, FuseArm};
+
+    let expr = cel::parser::Parser::default()
+        .parse(ELEM_SRC)
+        .expect("the ladder source parses");
+    let code = probe_code(ELEM_SRC);
+    assert_element_block(&code);
+
+    println!();
+    println!("###########################################################");
+    println!("# THE LADDER, re-taken: `{ELEM_SRC}`, VM vs tree walker");
+    println!("###########################################################");
+
+    for n in [1usize, 10, 100, 1000, 10_000] {
+        let ctx = elem_ctx(n);
+        let vm = || {
+            let code = &code;
+            let ctx = &ctx;
+            move || {
+                let out = cel_eval_loop_with_fuse(black_box(code), black_box(ctx), FuseArm::None)
+                    .expect("the VM arm evaluates");
+                black_box(out);
+            }
+        };
+        let walker = || {
+            let out = cel::Value::resolve_value(black_box(&expr), black_box(&ctx))
+                .expect("the walker arm evaluates");
+            black_box(out);
+        };
+
+        assert_eq!(
+            cel_eval_loop_with_fuse(&code, &ctx, FuseArm::None).expect("VM"),
+            cel::Value::resolve_value(&expr, &ctx).expect("walker"),
+            "the two evaluators must agree at n={n}"
+        );
+
+        let floors = local_floor(
+            &format!("LOCAL NULL CONTROL: walker vs an identical copy, n={n}"),
+            || walker,
+            cfg,
+        );
+        let run = {
+            let mut a = Arm::new("walker (resolve_value)", walker);
+            let mut b = Arm::new("VM (cel_eval_loop)", vm());
+            run_pair(&mut a, &mut b, cfg)
+        };
+        let (cpu, _) = report(&format!("VM minus walker, n={n}"), &run, cfg, Some(floors));
+        println!(
+            "  ABSOLUTE  walker {:9.1} ns/eval = {:7.3} ns/elem   \
+             VM {:9.1} ns/eval = {:7.3} ns/elem",
+            cpu.a_median,
+            cpu.a_median / n as f64,
+            cpu.b_median,
+            cpu.b_median / n as f64,
+        );
+        per_unit("VM excess", &cpu, floors.cpu, n as f64, "element");
+    }
+}
+
+/// The fusion ladder: what the per-element excess is made of.
+#[cfg(feature = "elem-attr-probe")]
+fn elem_fusion(cfg: &Config, n: usize) {
+    use cel::vm::{cel_eval_loop_with_fuse, FuseArm};
+
+    let expr = cel::parser::Parser::default()
+        .parse(ELEM_SRC)
+        .expect("the ladder source parses");
+    let code = probe_code(ELEM_SRC);
+    assert_element_block(&code);
+    let ctx = elem_ctx(n);
+
+    println!();
+    println!("###########################################################");
+    println!("# FUSION LADDER on `{ELEM_SRC}`, {n} elements");
+    println!("###########################################################");
+
+    // Every arm must answer what the stock arm answers. This is the check that
+    // separates "removed a dispatch" from "removed the work".
+    let stock = cel_eval_loop_with_fuse(&code, &ctx, FuseArm::None).expect("stock evaluates");
+    for arm in [
+        FuseArm::GuardKeepingCompare,
+        FuseArm::Guard,
+        FuseArm::Bind,
+        FuseArm::Body,
+        FuseArm::Advance,
+        FuseArm::AdvanceOnly,
+        FuseArm::AdvancePlusArcRoundTrip,
+    ] {
+        let got = cel_eval_loop_with_fuse(&code, &ctx, arm).expect("the arm evaluates");
+        assert_eq!(
+            got, stock,
+            "{arm:?} answered differently from the stock arm"
+        );
+    }
+    assert_eq!(
+        cel::Value::resolve_value(&expr, &ctx).expect("walker"),
+        stock,
+        "the walker must answer what the VM answers"
+    );
+    println!("  ARMS AGREE: every fusion arm and the walker answer the stock arm's value");
+
+    let arm = |fuse: FuseArm| {
+        let code = &code;
+        let ctx = &ctx;
+        move || {
+            let out = cel_eval_loop_with_fuse(black_box(code), black_box(ctx), fuse)
+                .expect("the arm evaluates");
+            black_box(out);
+        }
+    };
+    let walker = || {
+        let out = cel::Value::resolve_value(black_box(&expr), black_box(&ctx))
+            .expect("the walker arm evaluates");
+        black_box(out);
+    };
+
+    let floors = local_floor(
+        &format!("LOCAL NULL CONTROL: stock VM vs an identical copy, n={n}"),
+        || arm(FuseArm::None),
+        cfg,
+    );
+
+    // (label, arm A, arm B, what B removes relative to A)
+    let steps: [(&str, FuseArm, FuseArm, &str); 5] = [
+        (
+            "guard dispatch+stack",
+            FuseArm::None,
+            FuseArm::GuardKeepingCompare,
+            "4 dispatches, 3 pushes, 3 pops",
+        ),
+        (
+            "compare_values+as_bool",
+            FuseArm::GuardKeepingCompare,
+            FuseArm::Guard,
+            "1 compare_values, 1 as_bool, 1 discard",
+        ),
+        (
+            "bind dispatch+stack",
+            FuseArm::Guard,
+            FuseArm::Bind,
+            "2 dispatches, 1 push, 1 pop",
+        ),
+        (
+            "body+append dispatch+stack",
+            FuseArm::Bind,
+            FuseArm::Body,
+            "4 dispatches, 3 pushes, 3 pops",
+        ),
+        (
+            "advance dispatch",
+            FuseArm::Body,
+            FuseArm::Advance,
+            "2 dispatches",
+        ),
+    ];
+
+    for (label, a_arm, b_arm, removed) in steps {
+        let run = {
+            let mut a = Arm::new(format!("{a_arm:?}"), arm(a_arm));
+            let mut b = Arm::new(format!("{b_arm:?}"), arm(b_arm));
+            run_pair(&mut a, &mut b, cfg)
+        };
+        let (cpu, _) = report(
+            &format!("{label}: {a_arm:?} minus {b_arm:?} — removes {removed}"),
+            &run,
+            cfg,
+            Some(floors),
+        );
+        per_unit(label, &cpu, floors.cpu, n as f64, "element");
+    }
+
+    // The order control. The ladder above is cumulative, so every marginal but
+    // the first is taken against an already-fused arm. This takes the LAST
+    // group's marginal from the stock end instead; agreement with the ladder's
+    // own figure for it is what says the split does not depend on the order the
+    // groups were removed in.
+    {
+        let run = {
+            let mut a = Arm::new("None", arm(FuseArm::None));
+            let mut b = Arm::new("AdvanceOnly", arm(FuseArm::AdvanceOnly));
+            run_pair(&mut a, &mut b, cfg)
+        };
+        let (cpu, _) = report(
+            "ORDER CONTROL: the advance group removed from the STOCK arm — compare with `advance dispatch` above",
+            &run,
+            cfg,
+            Some(floors),
+        );
+        per_unit("advance, from stock", &cpu, floors.cpu, n as f64, "element");
+    }
+
+    // The positive control, and the calibration for hypothesis 1. This arm ADDS
+    // one atomic increment and one atomic decrement per element to the fully
+    // fused arm; the disassembly check in the report says whether it really
+    // did. A resolved, correctly-signed answer here is what says the section's
+    // instrument can see a per-element `Arc` clone at all.
+    {
+        let run = {
+            let mut a = Arm::new("Advance", arm(FuseArm::Advance));
+            let mut b = Arm::new(
+                "Advance + Arc round trip",
+                arm(FuseArm::AdvancePlusArcRoundTrip),
+            );
+            run_pair(&mut a, &mut b, cfg)
+        };
+        let (cpu, _) = report(
+            "POSITIVE CONTROL: one Arc clone-and-release per element (sign must be NEGATIVE: B is slower)",
+            &run,
+            cfg,
+            Some(floors),
+        );
+        per_unit("one Arc round trip", &cpu, floors.cpu, n as f64, "element");
+    }
+
+    // The additivity check. Not a new term: the end-to-end difference has to
+    // equal the five marginals summed, and where it does not, the marginals
+    // are not measuring what their labels say.
+    {
+        let run = {
+            let mut a = Arm::new("None", arm(FuseArm::None));
+            let mut b = Arm::new("Advance", arm(FuseArm::Advance));
+            run_pair(&mut a, &mut b, cfg)
+        };
+        let (cpu, _) = report(
+            "SUM CHECK: stock minus fully fused — must equal the five marginals summed",
+            &run,
+            cfg,
+            Some(floors),
+        );
+        per_unit("SUM CHECK", &cpu, floors.cpu, n as f64, "element");
+    }
+
+    // What is left when every dispatch and every operand-stack round trip is
+    // gone: the fully fused VM against the walker. This is the UNATTRIBUTED
+    // remainder of the excess, measured rather than inferred by subtraction.
+    let run = {
+        let mut a = Arm::new("walker (resolve_value)", walker);
+        let mut b = Arm::new("VM, whole element fused", arm(FuseArm::Advance));
+        run_pair(&mut a, &mut b, cfg)
+    };
+    let (cpu, _) = report(
+        &format!("RESIDUAL: fully fused VM minus walker, n={n}"),
+        &run,
+        cfg,
+        Some(floors),
+    );
+    println!(
+        "  ABSOLUTE  walker {:9.1} ns/eval = {:7.3} ns/elem   \
+         fused VM {:9.1} ns/eval = {:7.3} ns/elem",
+        cpu.a_median,
+        cpu.a_median / n as f64,
+        cpu.b_median,
+        cpu.b_median / n as f64,
+    );
+    per_unit(
+        "RESIDUAL (unattributed)",
+        &cpu,
+        floors.cpu,
+        n as f64,
+        "element",
+    );
+}
+
+/// Everything behind `elem-attr-probe`.
+#[cfg(feature = "elem-attr-probe")]
+fn element_attribution(cfg: &Config) {
+    println!();
+    println!("===========================================================");
+    println!("=  ELEMENT ATTRIBUTION (feature `elem-attr-probe`)");
+    println!("=  Each section sets its OWN floor. Every arm is the same");
+    println!("=  dispatch loop taking a different branch, and every arm's");
+    println!("=  answer is asserted equal to the stock arm's.");
+    println!("===========================================================");
+    elem_ladder(cfg);
+    for n in [1000usize, 10_000] {
+        elem_fusion(cfg, n);
     }
 }
 
