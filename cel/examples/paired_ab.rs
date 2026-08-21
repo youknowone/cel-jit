@@ -1611,7 +1611,7 @@ fn iter_at_sweep(cfg: &Config) {
 //
 // The method is subtractive and stays inside one binary: each arm runs the same
 // program through the same dispatch loop with one named GROUP of the
-// seven-instruction per-element block fused into a single step. An arm removes
+// six-instruction per-element block fused into a single step. An arm removes
 // dispatches and operand-stack round trips; it does not remove work the walker
 // also does, and `binary_values` — which both evaluators call — is still called
 // by every arm with the same operands. The one exception, `compare_values`, is
@@ -1638,13 +1638,13 @@ fn elem_ctx(n: usize) -> Context<'static> {
     ctx
 }
 
-/// The seven instructions the per-element block is made of, so the report can
+/// The six instructions the per-element block is made of, so the report can
 /// state what each fusion removed without the reader counting them.
 ///
 /// Read off `vm/compile.rs`'s appending-comprehension lowering and pinned by
 /// `assert_element_block` below, which reads the actual instruction stream.
 #[cfg(feature = "elem-attr-probe")]
-const ELEM_BLOCK: usize = 7;
+const ELEM_BLOCK: usize = 6;
 
 /// Refuse to measure a program that is not the block this section is about.
 ///
@@ -1662,8 +1662,7 @@ fn assert_element_block(code: &cel::vm::CelCode) {
         OpCode::IterGuard,
         OpCode::IterBind,
         OpCode::LoadLocal,
-        OpCode::LoadConst,
-        OpCode::Mul,
+        OpCode::MulConst,
         OpCode::ListAppend,
         OpCode::IterAdvance,
     ];
@@ -1671,7 +1670,7 @@ fn assert_element_block(code: &cel::vm::CelCode) {
     assert_eq!(want.len(), ELEM_BLOCK);
     assert!(
         ops.windows(ELEM_BLOCK).any(|w| w == want),
-        "`{ELEM_SRC}` no longer lowers to the seven-instruction per-element \
+        "`{ELEM_SRC}` no longer lowers to the six-instruction per-element \
          block this section attributes. Disassembly:\n{}",
         code.disassemble()
     );

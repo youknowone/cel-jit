@@ -231,7 +231,7 @@ struct MapLoop {
     index: u32,
     /// Slot holding the iteration variable.
     var: u32,
-    /// Constant-pool index of the body's right operand.
+    /// Constant-pool index of the body operator's folded right operand.
     konst: u32,
     /// `IterBind`, where an arm that fused only the guard resumes.
     after_guard: u32,
@@ -254,18 +254,17 @@ const NO_MAP_LOOP: MapLoop = MapLoop {
     after_body: 0,
 };
 
-/// Find the seven-instruction per-element block, if the program has one.
+/// Find the six-instruction per-element block, if the program has one.
 ///
 /// Run once per evaluation by EVERY arm, so its cost is a constant that cancels
 /// out of any difference between two of them.
 #[cfg(feature = "elem-attr-probe")]
 fn recognize_map_loop(code: &CelCode) -> MapLoop {
-    const WANT: [OpCode; 7] = [
+    const WANT: [OpCode; 6] = [
         OpCode::IterGuard,
         OpCode::IterBind,
         OpCode::LoadLocal,
-        OpCode::LoadConst,
-        OpCode::Mul,
+        OpCode::MulConst,
         OpCode::ListAppend,
         OpCode::IterAdvance,
     ];
@@ -299,8 +298,8 @@ fn recognize_map_loop(code: &CelCode) -> MapLoop {
         let consistent = window[1].2[0] == source
             && window[1].2[1] == index
             && window[2].2[0] == var
-            && window[6].2[0] == index
-            && window[6].2[1] == window[0].0;
+            && window[5].2[0] == index
+            && window[5].2[1] == window[0].0;
         if !consistent {
             continue;
         }
@@ -313,7 +312,7 @@ fn recognize_map_loop(code: &CelCode) -> MapLoop {
             konst: window[3].2[0],
             after_guard: window[1].0,
             after_bind: window[2].0,
-            after_body: window[6].0,
+            after_body: window[5].0,
         };
     }
     NO_MAP_LOOP
@@ -1109,7 +1108,7 @@ impl<'a> Vm<'a> {
         }
 
         // -- the body and the append:
-        //    `LoadLocal var ; LoadConst k ; Mul ; ListAppend`
+        //    `LoadLocal var ; MulConst k ; ListAppend`
         let lhs = self
             .slots
             .get(shape.var as usize)
@@ -1199,6 +1198,23 @@ impl<'a> Vm<'a> {
                 let value = self.index(operand, key, op == OpCode::OptIndex)?;
                 self.push(value);
             }
+            OpCode::GetFieldLocal | OpCode::HasFieldLocal => {
+                // Read in place; see `Vm::sequence_len` for why the copy the
+                // `LoadLocal` made was the operand-stack round trip and not
+                // work of its own. On this path that copy was also an atomic
+                // pair on the container's `Arc`, per field read.
+                let read = {
+                    let operand = self.slots.get(a as usize).ok_or(CelErr::InternalError)?;
+                    let field = self.name(b)?;
+                    if op == OpCode::HasFieldLocal {
+                        has_field(operand, field)
+                    } else {
+                        value_field(operand, field)
+                    }
+                };
+                let value = read.map_err(|e| self.park(e))?;
+                self.push(value);
+            }
             OpCode::OptSelect => {
                 let operand = self.pop()?;
                 let field = Value::String(Arc::new(self.name(a)?.to_string()));
@@ -1286,6 +1302,47 @@ impl<'a> Vm<'a> {
                     OpCode::Less => |o| o == Ordering::Less,
                     OpCode::LessEquals => |o| o != Ordering::Greater,
                     OpCode::Greater => |o| o == Ordering::Greater,
+                    _ => |o| o != Ordering::Less,
+                };
+                let value = compare_values(lhs, rhs, accept).map_err(|e| self.park(e))?;
+                self.push(value);
+            }
+            // The three groups above with the right operand read out of the
+            // constant pool. Each calls the same helper with the same
+            // operands in the same order, so the error it raises carries the
+            // same operator name the pair's did.
+            OpCode::AddConst | OpCode::MulConst | OpCode::ModConst => {
+                let lhs = self.pop()?;
+                // Still cloned: `binary_values` takes its operands by value,
+                // and giving it a by-reference twin for this path alone would
+                // be a second implementation of an answer the tree walker
+                // shares. What is gone is the dispatch and the round trip.
+                let rhs = self.code.konst(a).ok_or(CelErr::InternalError)?.clone();
+                let name = match op {
+                    OpCode::AddConst => "add",
+                    OpCode::MulConst => "mul",
+                    _ => "rem",
+                };
+                let value = binary_values(name, lhs, rhs).map_err(|e| self.park(e))?;
+                self.push(value);
+            }
+            OpCode::EqualsConst | OpCode::NotEqualsConst => {
+                let lhs = self.pop()?;
+                // Read in place. `PartialEq` takes both sides by reference, so
+                // this is the one fused operator that also removes the
+                // constant's clone-and-release.
+                let equal = {
+                    let rhs = self.code.konst(a).ok_or(CelErr::InternalError)?;
+                    lhs == *rhs
+                };
+                self.push(Value::Bool(equal == (op == OpCode::EqualsConst)));
+            }
+            OpCode::LessConst | OpCode::GreaterConst | OpCode::GreaterEqualsConst => {
+                let lhs = self.pop()?;
+                let rhs = self.code.konst(a).ok_or(CelErr::InternalError)?.clone();
+                let accept: fn(Ordering) -> bool = match op {
+                    OpCode::LessConst => |o| o == Ordering::Less,
+                    OpCode::GreaterConst => |o| o == Ordering::Greater,
                     _ => |o| o != Ordering::Less,
                 };
                 let value = compare_values(lhs, rhs, accept).map_err(|e| self.park(e))?;
@@ -1890,6 +1947,111 @@ mod tests {
             assert_eq!(
                 got, stock,
                 "{arm:?} answered differently from the stock arm"
+            );
+        }
+    }
+
+    /// A fused field read answers what the pair answered, on every operand
+    /// kind the read can fail on.
+    ///
+    /// Held against the tree walker rather than against literals alone,
+    /// because a field read's failures are its whole surface: a missing key, a
+    /// container that has no fields, and `has`, which answers `false` where
+    /// the plain read raises. Each is a different arm of `value_field` and
+    /// `has_field`, and the fused instruction reaches all of them through the
+    /// same two helpers.
+    #[test]
+    fn a_fused_field_read_answers_what_the_pair_answered() {
+        let mut ctx = Context::default();
+        let record = Value::Map(crate::objects::Map::from(
+            [("price", Value::Int(7))]
+                .into_iter()
+                .collect::<HashMap<_, _>>(),
+        ));
+        ctx.add_variable_from_value("items", Value::list(vec![record]));
+        ctx.add_variable_from_value("flats", Value::list(vec![Value::Int(1)]));
+
+        for source in [
+            // Present, missing, and a container with no fields at all.
+            "items.map(i, i.price)",
+            "items.map(i, i.missing)",
+            "flats.map(i, i.price)",
+            // `has` answers rather than raising, on the same three.
+            "items.map(i, has(i.price))",
+            "items.map(i, has(i.missing))",
+            "flats.map(i, has(i.price))",
+        ] {
+            let expr = parse(source);
+            let got = run(source, &ctx);
+            let walked = crate::Value::resolve_value(&expr, &ctx);
+            // Compared whole, errors included: `Vm::public_error` rebuilds
+            // the public error from a compact form, so a fused arm that
+            // parked the wrong thing still fails here rather than merely
+            // failing differently.
+            assert_eq!(got, walked, "{source}");
+        }
+    }
+
+    /// A folded literal operand answers what the pair answered, error
+    /// identity included.
+    ///
+    /// The three fused groups fail in three different ways -- `binary_values`
+    /// raises `Overflow` and `RemainderByZero` under the operator's own name,
+    /// `compare_values` raises `NoSuchOverload` for operands of different
+    /// types, and equality raises nothing at all -- and each carries the
+    /// operands inside the error. A fused arm that passed the wrong operator
+    /// name, or the operands in the wrong order, answers a well-formed error
+    /// of the same shape, so the whole value is compared against the walker's.
+    #[test]
+    fn a_folded_literal_operand_answers_what_the_pair_answered() {
+        let mut ctx = Context::default();
+        ctx.add_variable_from_value("xs", vec![i64::MAX]);
+        ctx.add_variable_from_value(
+            "ss",
+            Value::list(vec![Value::String(std::sync::Arc::new("hi".to_string()))]),
+        );
+
+        for source in [
+            // `binary_values`: the operator's name reaches the error.
+            "xs.map(x, x * 2)",
+            "xs.map(x, x + 1)",
+            "xs.map(x, x % 0)",
+            "ss.map(s, s % 2)",
+            // `compare_values`: operands of different types.
+            "ss.filter(s, s < 3)",
+            "ss.filter(s, s > 3)",
+            "ss.filter(s, s >= 3)",
+            // Equality answers `false` across types rather than raising, and
+            // is the one group that reads the constant in place.
+            "ss.map(s, s == 'hi')",
+            "ss.map(s, s != 'hi')",
+            "ss.map(s, s == 3)",
+            "xs.map(x, x == 1)",
+        ] {
+            let expr = parse(source);
+            let code = compile(&expr).unwrap_or_else(|e| panic!("compile {source}: {e}"));
+            // Asserted before the answers are: every source here has to
+            // reach a fused arm, or the comparison below holds two runs of
+            // the same unfused instructions against each other.
+            assert!(
+                code.instructions().any(|(_, op, _)| matches!(
+                    op,
+                    OpCode::AddConst
+                        | OpCode::MulConst
+                        | OpCode::ModConst
+                        | OpCode::EqualsConst
+                        | OpCode::NotEqualsConst
+                        | OpCode::LessConst
+                        | OpCode::GreaterConst
+                        | OpCode::GreaterEqualsConst
+                )),
+                "{source} folds no literal:\n{}",
+                code.disassemble()
+            );
+            assert_eq!(
+                cel_eval_loop(&code, &ctx),
+                crate::Value::resolve_value(&expr, &ctx),
+                "{source}"
             );
         }
     }

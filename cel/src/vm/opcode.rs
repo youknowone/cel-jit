@@ -87,6 +87,31 @@ pub enum OpCode {
     OptIndex,
     /// Pop an operand, push an optional of its `names[a]` field.
     OptSelect,
+    /// Push field `names[b]` of the value in activation-record slot `a`.
+    /// Nothing is popped.
+    ///
+    /// Spelled out, this was `LoadLocal a ; GetField b`. The container went
+    /// onto the operand stack only to be popped off again by the very next
+    /// instruction, which then read a field through a reference to it.
+    ///
+    /// The container is read in place for the reason [`OpCode::IterLen`]
+    /// gives, and here that reason is worth more than a dispatch: a record or
+    /// a map is an `Arc`, so the copy `LoadLocal` made was an atomic increment
+    /// matched by a decrement when this instruction dropped it -- per field
+    /// read, on the shared count. Nothing between the two ever needed a
+    /// container of its own.
+    ///
+    /// A comprehension variable is a slot, which is what makes this the shape
+    /// of every field read in a loop body.
+    GetFieldLocal,
+    /// [`OpCode::GetFieldLocal`] for `has(x.y)`: push whether the value in
+    /// slot `a` has field `names[b]`.
+    ///
+    /// `has` is a compile-time flag on the same AST node, so it selects
+    /// between these two exactly as it selects between [`OpCode::GetField`]
+    /// and [`OpCode::HasField`]; the operand it reads and the way it reads it
+    /// are the same.
+    HasFieldLocal,
 
     // -- aggregate construction -------------------------------------------
     //
@@ -141,6 +166,45 @@ pub enum OpCode {
     GreaterEquals,
     /// The `@in` operator.
     In,
+
+    // -- binary operators against a literal ---------------------------------
+    //
+    // `<lhs> ; LoadConst k ; <BinOp>` is what a predicate against a constant
+    // compiles to, and the middle instruction exists only to put the constant
+    // where the operator will pop it from. Each of these is that pair, with
+    // the constant named by pool index instead.
+    //
+    // One opcode per operator, and not a single `BinOpConst` carrying a kind
+    // operand, for the reason the operators above give: a kind operand is a
+    // second switch inside the dispatch arm.
+    //
+    // The set is deliberately narrow -- the operators a predicate actually
+    // writes against a literal. Everything else keeps the pair, which is
+    // correct and merely unfused; `compile::const_operator` is the list.
+    /// Pop the left operand, push it plus `consts[a]`.
+    AddConst,
+    /// Pop the left operand, push it times `consts[a]`.
+    MulConst,
+    /// Pop the left operand, push it modulo `consts[a]`.
+    ModConst,
+    /// Pop the left operand, push whether it equals `consts[a]`.
+    ///
+    /// This pair and its twin are the only ones that also remove the
+    /// constant's `Value::clone`: equality is decided through `PartialEq`,
+    /// which reads both sides through references, where the arithmetic and
+    /// ordering forms hand their operands to helpers that take them by value.
+    /// A string constant is an `Arc`, so what that saves is an atomic pair per
+    /// evaluation -- and a string constant is exactly what an equality
+    /// predicate is written against.
+    EqualsConst,
+    /// Pop the left operand, push whether it differs from `consts[a]`.
+    NotEqualsConst,
+    /// Pop the left operand, push whether it orders below `consts[a]`.
+    LessConst,
+    /// Pop the left operand, push whether it orders above `consts[a]`.
+    GreaterConst,
+    /// Pop the left operand, push whether it orders at or above `consts[a]`.
+    GreaterEqualsConst,
 
     // -- unary operators --------------------------------------------------
     Not,
@@ -393,7 +457,15 @@ impl OpCode {
             | OpCode::AndMerge
             | OpCode::OrMerge
             | OpCode::IncLocal
-            | OpCode::IterLen => 1,
+            | OpCode::IterLen
+            | OpCode::AddConst
+            | OpCode::MulConst
+            | OpCode::ModConst
+            | OpCode::EqualsConst
+            | OpCode::NotEqualsConst
+            | OpCode::LessConst
+            | OpCode::GreaterConst
+            | OpCode::GreaterEqualsConst => 1,
 
             OpCode::CallHost
             | OpCode::CallMethod
@@ -402,7 +474,9 @@ impl OpCode {
             | OpCode::IterAt
             | OpCode::IterAdvance
             | OpCode::AccuLoopCond
-            | OpCode::AccuLoopCondNot => 2,
+            | OpCode::AccuLoopCondNot
+            | OpCode::GetFieldLocal
+            | OpCode::HasFieldLocal => 2,
 
             OpCode::CallQualified
             | OpCode::IterGuard
@@ -479,6 +553,9 @@ impl OpCode {
             OpCode::MapInsert | OpCode::MapInsertOptional => (2, 0),
 
             OpCode::GetField | OpCode::HasField | OpCode::OptSelect => (1, 1),
+            // The same read with its operand named by slot instead of taken
+            // off the stack, so the pop is gone and the push is not.
+            OpCode::GetFieldLocal | OpCode::HasFieldLocal => (0, 1),
             OpCode::AndMerge | OpCode::OrMerge => (1, 1),
             OpCode::Not | OpCode::Negate | OpCode::NotStrictlyFalse => (1, 1),
             OpCode::IterElems | OpCode::IterKeys => (1, 1),
@@ -496,6 +573,16 @@ impl OpCode {
             | OpCode::Greater
             | OpCode::GreaterEquals
             | OpCode::In => (2, 1),
+            // The same operators with the right operand named by pool index
+            // instead of taken off the stack, so one of the two pops is gone.
+            OpCode::AddConst
+            | OpCode::MulConst
+            | OpCode::ModConst
+            | OpCode::EqualsConst
+            | OpCode::NotEqualsConst
+            | OpCode::LessConst
+            | OpCode::GreaterConst
+            | OpCode::GreaterEqualsConst => (1, 1),
 
             OpCode::CallHost => (arity(1), 1),
             // The receiver is pushed last, above the arguments, because it is

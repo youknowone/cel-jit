@@ -283,6 +283,27 @@ impl Compiler {
     /// `SelectExpr::test` is set only by the `has` macro expander, so it is a
     /// compile-time constant and picks the opcode rather than a branch.
     fn select(&mut self, select: &SelectExpr, id: u64) -> Result<(), CompileError> {
+        // An operand already in a slot is one `LoadLocal` whose only consumer
+        // is the read below it, so the two are emitted as one instruction.
+        // Decided before the operand is compiled, because the alternative --
+        // folding the pair back out of the emitted stream -- would renumber
+        // every `pc` after it; see `Compiler::comprehension`.
+        //
+        // A comprehension variable is a slot, so this is the shape of every
+        // field read in a loop body.
+        if let Expr::Ident(name) = &select.operand.expr {
+            if let Some(slot) = self.lookup(name) {
+                let field = self.add_name(&select.field, id)?;
+                let op = if select.test {
+                    OpCode::HasFieldLocal
+                } else {
+                    OpCode::GetFieldLocal
+                };
+                self.emit(op, &[slot, field.0], id)?;
+                return Ok(());
+            }
+        }
+
         self.expr(&select.operand)?;
         let field = self.add_name(&select.field, id)?;
         let op = if select.test {
@@ -385,6 +406,29 @@ fn simple_operator(name: &str) -> Option<(OpCode, usize)> {
     Some(entry)
 }
 
+/// The fused form of a binary operator whose right operand is a literal, if
+/// this operator has one.
+///
+/// Deliberately not every operator [`simple_operator`] maps. The ones here are
+/// what a predicate is written against a constant -- an arithmetic step, an
+/// equality, an ordering bound -- and an operator absent from this list keeps
+/// the `LoadConst` and the pair, which is unfused rather than wrong. Adding
+/// one is an opcode and a dispatch arm, both of which the reader can see.
+fn const_operator(op: OpCode) -> Option<OpCode> {
+    let fused = match op {
+        OpCode::Add => OpCode::AddConst,
+        OpCode::Mul => OpCode::MulConst,
+        OpCode::Mod => OpCode::ModConst,
+        OpCode::Equals => OpCode::EqualsConst,
+        OpCode::NotEquals => OpCode::NotEqualsConst,
+        OpCode::Less => OpCode::LessConst,
+        OpCode::Greater => OpCode::GreaterConst,
+        OpCode::GreaterEquals => OpCode::GreaterEqualsConst,
+        _ => return None,
+    };
+    Some(fused)
+}
+
 impl Compiler {
     fn call(&mut self, call: &CallExpr, id: u64) -> Result<(), CompileError> {
         // An operator name can only be an operator: the parser mints these
@@ -392,6 +436,24 @@ impl Compiler {
         if call.target.is_none() {
             if let Some((op, arity)) = simple_operator(&call.func_name) {
                 self.check_arity(call, arity, id)?;
+                // A literal right operand is one `LoadConst` whose only
+                // consumer is the operator below it, so the two are emitted as
+                // one instruction. Decided before the arguments are compiled,
+                // for the reason `Compiler::comprehension` gives.
+                //
+                // Only the RIGHT operand: the fused form keeps the operand
+                // order the helpers are called with, and `1 - x` is not
+                // `x - 1`.
+                if arity == 2 {
+                    if let (Some(fused), Expr::Literal(literal)) =
+                        (const_operator(op), &call.args[1].expr)
+                    {
+                        self.expr(&call.args[0])?;
+                        let konst = self.add_const(literal.to_value(), id)?;
+                        self.emit(fused, &[konst], id)?;
+                        return Ok(());
+                    }
+                }
                 for arg in &call.args {
                     self.expr(arg)?;
                 }
@@ -1016,6 +1078,157 @@ mod tests {
         let plain = opcodes(&code_of("m.x"));
         assert!(plain.contains(&OpCode::GetField));
         assert!(!plain.contains(&OpCode::HasField));
+    }
+
+    /// A field read off a slot is one instruction, and the `LoadLocal` that
+    /// used to carry the container is gone with it.
+    ///
+    /// Stated against the slot rather than against a sequence, for the reason
+    /// `the_comprehension_loop_never_loads_its_source_onto_the_stack` gives:
+    /// what matters is that the container never reaches the operand stack,
+    /// because reaching it is what cost an atomic pair on the container's
+    /// `Arc` per read.
+    #[test]
+    fn a_field_read_off_a_comprehension_variable_never_loads_its_container() {
+        for (source, fused) in [
+            ("items.map(i, i.price)", OpCode::GetFieldLocal),
+            ("items.all(i, has(i.price))", OpCode::HasFieldLocal),
+        ] {
+            let code = code_of(source);
+            let slot = code
+                .instructions()
+                .find(|(_, op, _)| *op == fused)
+                .map(|(_, _, operands)| operands[0])
+                .unwrap_or_else(|| {
+                    panic!("{source} reads a field off a slot:\n{}", code.disassemble())
+                });
+            // The iteration variable's slot is the one `IterBind` writes.
+            assert_eq!(
+                code.instructions()
+                    .find(|(_, op, _)| *op == OpCode::IterBind)
+                    .map(|(_, _, operands)| operands[2]),
+                Some(slot),
+                "{source} reads a field off something other than the element:\n{}",
+                code.disassemble()
+            );
+
+            let loaded: Vec<u32> = code
+                .instructions()
+                .filter(|(_, op, _)| *op == OpCode::LoadLocal)
+                .map(|(_, _, operands)| operands[0])
+                .collect();
+            assert!(
+                !loaded.contains(&slot),
+                "{source} still copies slot {slot} onto the stack:\n{}",
+                code.disassemble()
+            );
+        }
+    }
+
+    /// A field read off a free variable keeps the unfused pair.
+    ///
+    /// The fusion is licensed by the operand being one `LoadLocal` of a slot;
+    /// a free variable is a context lookup, which is a different instruction
+    /// over a different thing and can raise where a slot read cannot.
+    #[test]
+    fn a_field_read_off_a_free_variable_is_not_fused() {
+        for (source, unfused) in [("m.x", OpCode::GetField), ("has(m.x)", OpCode::HasField)] {
+            let code = code_of(source);
+            assert_eq!(
+                count(&code, unfused),
+                1,
+                "{source}:\n{}",
+                code.disassemble()
+            );
+            assert_eq!(
+                count(&code, OpCode::GetFieldLocal) + count(&code, OpCode::HasFieldLocal),
+                0,
+                "{source}:\n{}",
+                code.disassemble()
+            );
+        }
+    }
+
+    /// Only the OUTERMOST read of a chain reaches the stack, because only the
+    /// innermost operand is a slot.
+    ///
+    /// `i.a.b` is a select whose operand is another select, so the inner one
+    /// fuses and the outer one reads what the inner one pushed. This is what
+    /// says the recogniser looks at the operand it actually has rather than at
+    /// the expression it is part of.
+    #[test]
+    fn only_the_innermost_read_of_a_chain_is_fused() {
+        let code = code_of("items.map(i, i.a.b)");
+        assert_eq!(
+            count(&code, OpCode::GetFieldLocal),
+            1,
+            "{}",
+            code.disassemble()
+        );
+        assert_eq!(count(&code, OpCode::GetField), 1, "{}", code.disassemble());
+    }
+
+    /// A literal right operand becomes part of the operator, and the
+    /// `LoadConst` that used to carry it is gone with it.
+    ///
+    /// The operand the fused instruction keeps is the constant's index, so
+    /// the assertion is that it still names the same value the pair pushed.
+    #[test]
+    fn a_literal_right_operand_is_folded_into_the_operator() {
+        let code = code_of("xs.filter(x, x % 2 == 0)");
+        for (fused, want) in [
+            (OpCode::ModConst, Value::Int(2)),
+            (OpCode::EqualsConst, Value::Int(0)),
+        ] {
+            let index = code
+                .instructions()
+                .find(|(_, op, _)| *op == fused)
+                .map(|(_, _, operands)| operands[0])
+                .unwrap_or_else(|| panic!("{fused:?} is missing:\n{}", code.disassemble()));
+            assert_eq!(code.konst(index), Some(&want), "{fused:?}");
+        }
+        for gone in [OpCode::Mod, OpCode::Equals] {
+            assert_eq!(count(&code, gone), 0, "{gone:?}:\n{}", code.disassemble());
+        }
+        // Both literals are gone from the stack, leaving only the one the
+        // scaffolding pushes for the loop counter's seed.
+        assert_eq!(
+            count(&code, OpCode::LoadConst),
+            count(&code_of("xs.filter(x, x)"), OpCode::LoadConst),
+            "{}",
+            code.disassemble()
+        );
+    }
+
+    /// Only the RIGHT operand folds, and only for the operators that have a
+    /// fused twin.
+    ///
+    /// The left operand is evaluated first, so a literal there is not the
+    /// instruction immediately below the operator and folding it would
+    /// reorder the two. `Sub` and `LessEquals` have no fused twin, so they
+    /// keep the pair whichever side the literal is on.
+    #[test]
+    fn a_literal_left_operand_and_an_unfused_operator_keep_the_pair() {
+        for (source, control, kept) in [
+            ("xs.map(x, 1 * x)", "xs.map(x, x)", OpCode::Mul),
+            ("xs.map(x, x - 1)", "xs.map(x, x)", OpCode::Sub),
+            (
+                "xs.filter(x, x <= 3)",
+                "xs.filter(x, x)",
+                OpCode::LessEquals,
+            ),
+        ] {
+            let code = code_of(source);
+            assert_eq!(count(&code, kept), 1, "{source}:\n{}", code.disassemble());
+            // One more than the literal-free body compiles to: the literal
+            // still reaches the stack under its own instruction.
+            assert_eq!(
+                count(&code, OpCode::LoadConst),
+                count(&code_of(control), OpCode::LoadConst) + 1,
+                "{source}:\n{}",
+                code.disassemble()
+            );
+        }
     }
 
     /// The comprehension variable becomes a slot; only the free variable
