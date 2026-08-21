@@ -638,9 +638,10 @@ impl Drop for Vm<'_> {
     fn drop(&mut self) {
         // `mem::take` on a `Vec` leaves a dangling-free empty one and allocates
         // nothing, which is the only way to move fields out of a type that
-        // implements `Drop`.
+        // implements `Drop`. The operand stack goes through its own method
+        // because it is the one buffer whose contents are not all in the `Vec`.
         let mut scratch = Scratch {
-            stack: std::mem::take(&mut self.stack),
+            stack: self.take_stack(),
             slots: std::mem::take(&mut self.slots),
             logic: std::mem::take(&mut self.logic),
             cold: std::mem::take(&mut self.cold),
@@ -786,14 +787,74 @@ impl<'a> Vm<'a> {
     }
 
     // -- the operand stack --------------------------------------------------
+    //
+    // The seven methods below are the whole surface: no other evaluator code
+    // reads `Vm::stack`, so what "the top of the stack" means is answered in
+    // one place rather than at each of the sites that asks. `Scratch::release`
+    // clears the pool's own buffer, which no `Vm` owns by then.
+
+    fn push_operand(&mut self, operand: Operand) {
+        self.stack.push(operand);
+    }
+
+    /// Take the topmost operand, or `None` where there is none.
+    ///
+    /// Distinct from [`Vm::pop`] because an aggregate that is still being
+    /// built is an operand and not yet a [`Value`]; only the caller that wants
+    /// a value pays for closing it.
+    fn pop_operand(&mut self) -> Option<Operand> {
+        self.stack.pop()
+    }
+
+    /// The topmost operand, left where it is.
+    fn top(&self) -> Option<&Operand> {
+        self.stack.last()
+    }
+
+    /// The topmost operand, left where it is, open for mutation.
+    ///
+    /// An aggregate still being built is reached through here and mutated in
+    /// place. Every such caller runs AFTER the value it is about to store has
+    /// been popped, so what this answers is the operand under that one.
+    fn top_mut(&mut self) -> Option<&mut Operand> {
+        self.stack.last_mut()
+    }
+
+    /// How many operands are held.
+    fn depth(&self) -> usize {
+        self.stack.len()
+    }
+
+    /// Drop every operand above `depth`.
+    ///
+    /// Only the unwind path calls this, with a [`Handler::depth`] the compiler
+    /// recorded at the guarded region's first instruction. A region's operands
+    /// are the ones it pushed, so raising inside one cannot leave the stack
+    /// shallower than it was on the way in.
+    fn truncate(&mut self, depth: usize) {
+        debug_assert!(
+            depth <= self.depth(),
+            "unwinding to depth {depth} from {}",
+            self.depth()
+        );
+        self.stack.truncate(depth);
+    }
+
+    /// Hand the operand stack to the scratch pool, leaving none behind.
+    ///
+    /// Reached from [`Vm`]'s [`Drop`], on every way out including a panic, so
+    /// what it returns is every operand this run still held.
+    fn take_stack(&mut self) -> Vec<Operand> {
+        std::mem::take(&mut self.stack)
+    }
 
     fn push(&mut self, value: Value) {
-        self.stack.push(Operand::Value(value));
+        self.push_operand(Operand::Value(value));
     }
 
     /// Pop one operand, finishing an aggregate that was still being built.
     fn pop(&mut self) -> CelResult<Value> {
-        let operand = self.stack.pop().ok_or(CelErr::InternalError)?;
+        let operand = self.pop_operand().ok_or(CelErr::InternalError)?;
         self.finish(operand)
     }
 
@@ -935,7 +996,7 @@ impl<'a> Vm<'a> {
     }
 
     fn list_mut(&mut self) -> CelResult<&mut Vec<Value>> {
-        match self.stack.last_mut() {
+        match self.top_mut() {
             Some(Operand::List(items)) => Ok(items),
             _ => Err(CelErr::InternalError),
         }
@@ -949,14 +1010,14 @@ impl<'a> Vm<'a> {
     /// the same internal-consistency failure as a non-map on top of the stack,
     /// so it takes the same answer.
     fn map_mut(&mut self) -> CelResult<&mut HashMap<Key, Value>> {
-        match self.stack.last_mut() {
+        match self.top_mut() {
             Some(Operand::Map(entries)) => Arc::get_mut(entries).ok_or(CelErr::InternalError),
             _ => Err(CelErr::InternalError),
         }
     }
 
     fn struct_mut(&mut self) -> CelResult<&mut BTreeMap<String, Value>> {
-        match self.stack.last_mut() {
+        match self.top_mut() {
             Some(Operand::Struct(_, fields)) => Ok(fields),
             _ => Err(CelErr::InternalError),
         }
@@ -979,6 +1040,18 @@ impl<'a> Vm<'a> {
                 pc = self.fused_element(pc)?;
                 continue;
             }
+            // `max_stack` is `Compiler::emit`'s sum over `stack_effect`, so
+            // this is the declared effect of every opcode checked against
+            // what the arms below actually push. A fused opcode whose
+            // declared net is short by one drifts past this bound and past
+            // nothing else -- every other check in this file is about WHAT is
+            // on top, not how many.
+            debug_assert!(
+                self.depth() <= self.code.max_stack as usize,
+                "depth {} past the compiler's {} at pc {pc}",
+                self.depth(),
+                self.code.max_stack
+            );
             // Range is the only thing left to check: in a vector of decoded
             // records a word that is not an opcode, and an instruction the
             // stream stops short of the operands of, are states that cannot be
@@ -1019,7 +1092,7 @@ impl<'a> Vm<'a> {
             .logic
             .get_mut(logic as usize)
             .ok_or(CelErr::InternalError)? = Err(err);
-        self.stack.truncate(depth as usize);
+        self.truncate(depth as usize);
         Ok(land)
     }
 
@@ -1223,7 +1296,7 @@ impl<'a> Vm<'a> {
             }
 
             // -- aggregates ----------------------------------------------
-            OpCode::NewList => self.stack.push(Operand::List(Vec::new())),
+            OpCode::NewList => self.push_operand(Operand::List(Vec::new())),
             OpCode::ListAppend => {
                 let value = self.pop()?;
                 self.list_mut()?.push(value);
@@ -1236,7 +1309,7 @@ impl<'a> Vm<'a> {
                     OptView::Plain => self.list_mut()?.push(value),
                 }
             }
-            OpCode::NewMap => self.stack.push(Operand::Map(Arc::default())),
+            OpCode::NewMap => self.push_operand(Operand::Map(Arc::default())),
             OpCode::MapInsert | OpCode::MapInsertOptional => {
                 let value = self.pop()?;
                 let key = self.pop()?;
@@ -1528,7 +1601,7 @@ impl<'a> Vm<'a> {
             // -- control flow ---------------------------------------------------
             OpCode::Jump => return Ok(Step::Jump(a)),
             OpCode::JumpIfOptNone => {
-                let empty = match self.stack.last() {
+                let empty = match self.top() {
                     Some(Operand::Value(value)) => {
                         matches!(optional_inner(value), OptView::Empty)
                     }
@@ -1750,7 +1823,7 @@ impl<'a> Vm<'a> {
             };
             return Err(self.park(err));
         }
-        self.stack.push(Operand::Struct(name, BTreeMap::new()));
+        self.push_operand(Operand::Struct(name, BTreeMap::new()));
         Ok(())
     }
 
@@ -2054,6 +2127,55 @@ mod tests {
                 "{source}"
             );
         }
+    }
+
+    /// `list_mut` finds the builder under the operand that was popped.
+    ///
+    /// The three `*_mut` accessors read the top of the stack, and every one of
+    /// them is called AFTER the value it is about to store has been taken off
+    /// it -- so what they answer is the operand one below the one the
+    /// instruction was handed. Driven by hand because a program only reaches
+    /// that state in the middle of an instruction, where nothing can look.
+    #[test]
+    fn the_mut_accessors_answer_for_the_operand_under_the_popped_one() {
+        let code = CelCode {
+            max_stack: 8,
+            ..CelCode::default()
+        };
+        let ctx = Context::default();
+        let mut vm = Vm::new(&code, &ctx);
+
+        assert_eq!(vm.depth(), 0);
+        assert!(vm.top().is_none());
+        assert!(vm.pop_operand().is_none());
+
+        // `NewList` then the element expression: the builder, then the value
+        // that is about to be appended to it.
+        vm.push_operand(Operand::List(Vec::new()));
+        vm.push(Value::Int(2));
+        assert_eq!(vm.depth(), 2);
+        assert!(matches!(vm.top(), Some(Operand::Value(Value::Int(2)))));
+
+        // `ListAppend`: pop, and only then reach for the builder.
+        assert_eq!(vm.pop(), Ok(Value::Int(2)));
+        assert_eq!(vm.depth(), 1);
+        vm.list_mut()
+            .expect("the builder is under the popped value")
+            .push(Value::Int(2));
+
+        // Truncating away an operand above it leaves an aggregate that still
+        // closes, which is what the unwind path depends on.
+        vm.push(Value::Int(3));
+        vm.truncate(1);
+        assert_eq!(vm.depth(), 1);
+        assert_eq!(vm.pop(), Ok(Value::list(vec![Value::Int(2)])));
+        assert_eq!(vm.depth(), 0);
+
+        // The handover empties the stack into the buffer the pool releases,
+        // so an operand still held at the end is not dropped anywhere else.
+        vm.push(Value::Int(4));
+        assert_eq!(vm.take_stack().len(), 1);
+        assert_eq!(vm.depth(), 0);
     }
 
     /// A fused `&&`/`||` keeps CEL's asymmetry: the left operand short-circuits
