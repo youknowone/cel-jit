@@ -477,11 +477,37 @@ impl Compiler {
         self.n_logic = self.n_logic.max(self.next_logic);
 
         let depth = u32::try_from(self.depth).unwrap_or(0);
-        let start = self.here();
-        self.expr(&call.args[0])?;
-        let end = self.here();
-
-        let at = self.emit(op, &[logic, u32::MAX], id)?;
+        // A left operand that is already in a slot is one `LoadLocal` whose
+        // only consumer is the operator below it, so the two are emitted as
+        // one instruction. That is `all`'s and `exists`'s step on every
+        // element -- their accumulator is a slot -- but nothing here is
+        // special to them: any `&&` or `||` over a comprehension variable has
+        // the same shape and gets the same form.
+        let local = match &call.args[0].expr {
+            Expr::Ident(name) => self.lookup(name),
+            _ => None,
+        };
+        // The handler covers the left operand's instructions, and the fused
+        // form IS the left operand's instruction, so it covers that one. The
+        // range stays one wide either way, which is what keeps a nested
+        // operator's handler the innermost one.
+        let (at, target, start, end) = match local {
+            Some(local) => {
+                let fused = match op {
+                    OpCode::And => OpCode::AndLocal,
+                    _ => OpCode::OrLocal,
+                };
+                let at = self.emit(fused, &[local, logic, u32::MAX], id)?;
+                (at, 2, at, at + 1)
+            }
+            None => {
+                let start = self.here();
+                self.expr(&call.args[0])?;
+                let end = self.here();
+                let at = self.emit(op, &[logic, u32::MAX], id)?;
+                (at, 1, start, end)
+            }
+        };
         let land = self.here();
         self.handlers.push(Handler {
             start,
@@ -497,7 +523,7 @@ impl Compiler {
             _ => OpCode::OrMerge,
         };
         self.emit(merge, &[logic], id)?;
-        self.patch_to_here(PatchSite { at, slot: 1 });
+        self.patch_to_here(PatchSite { at, slot: target });
 
         // The slot is dead once the merge has read it, so a sibling operator
         // reuses it rather than growing the record.
@@ -684,6 +710,68 @@ impl<'a> AccuAppend<'a> {
     }
 }
 
+/// The loop condition a comprehension carries, recognised so that the three
+/// instructions the common ones lower to become one.
+///
+/// `parser::macros` synthesises these: `all` tests the accumulator itself,
+/// `exists` tests its negation, and both wrap the test in
+/// `@not_strictly_false`, which is what makes a non-bool accumulator keep the
+/// loop running rather than end it. `exists_one`'s condition is the literal
+/// `true`, which ends the loop on nothing at all -- a third case here rather
+/// than a fourth instruction.
+///
+/// A device of its own for the reason [`AccuAppend`] is one: the decision is
+/// made by inspecting the comprehension, before anything is emitted, so the
+/// stream never holds the unfused form and no `pc` has to move.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LoopCond {
+    /// The literal `true`. Nothing can end the loop early, so nothing is
+    /// emitted to ask.
+    Always,
+    /// `@not_strictly_false(@result)`, which is `all`'s.
+    Accu,
+    /// `@not_strictly_false(!@result)`, which is `exists`'s.
+    NotAccu,
+    /// Anything else, compiled as the expression it is.
+    General,
+}
+
+impl LoopCond {
+    fn of(comp: &ComprehensionExpr) -> LoopCond {
+        if matches!(
+            &comp.loop_cond.expr,
+            Expr::Literal(LiteralValue::Boolean(true))
+        ) {
+            return LoopCond::Always;
+        }
+        // An operator with a target is a method call to `Compiler::call`, not
+        // an operator at all, so a receiver disqualifies both halves here.
+        let operator = |call: &CallExpr, name: &str, arity: usize| {
+            call.target.is_none() && call.func_name == name && call.args.len() == arity
+        };
+        let Expr::Call(outer) = &comp.loop_cond.expr else {
+            return LoopCond::General;
+        };
+        if !operator(outer, operators::NOT_STRICTLY_FALSE, 1) {
+            return LoopCond::General;
+        }
+
+        let accu_var = comp.accu_var.as_str();
+        let is_accu = |e: &IdedExpr| matches!(&e.expr, Expr::Ident(n) if n == accu_var);
+        if is_accu(&outer.args[0]) {
+            return LoopCond::Accu;
+        }
+        match &outer.args[0].expr {
+            Expr::Call(inner)
+                if operator(inner, operators::LOGICAL_NOT, 1) && is_accu(&inner.args[0]) =>
+            {
+                LoopCond::NotAccu
+            }
+            _ => LoopCond::General,
+        }
+    }
+}
+
 impl Compiler {
     /// A comprehension, which is the only construct that emits a back edge.
     ///
@@ -768,8 +856,25 @@ impl Compiler {
             self.emit(OpCode::StoreLocal, &[iter_var2], id)?;
         }
 
-        self.expr(&comp.loop_cond)?;
-        let broke = self.emit_forward(OpCode::JumpIfFalse, id)?;
+        // A hand-built comprehension can bind the iteration variable to the
+        // accumulator's name, in which case `@result` inside the condition
+        // reaches the iteration variable's slot and not this one. Asking
+        // `lookup` is what `Compiler::ident` would have done, so the fused
+        // form names the slot the three instructions would have read.
+        let names_accu = self.lookup(&comp.accu_var) == Some(accu);
+        let broke = match LoopCond::of(comp) {
+            LoopCond::Always => None,
+            LoopCond::Accu if names_accu => {
+                Some(self.emit_forward_in(OpCode::AccuLoopCond, &[accu, u32::MAX], 1, id)?)
+            }
+            LoopCond::NotAccu if names_accu => {
+                Some(self.emit_forward_in(OpCode::AccuLoopCondNot, &[accu, u32::MAX], 1, id)?)
+            }
+            _ => {
+                self.expr(&comp.loop_cond)?;
+                Some(self.emit_forward(OpCode::JumpIfFalse, id)?)
+            }
+        };
 
         self.expr(&comp.loop_step)?;
         self.emit(OpCode::StoreLocal, &[accu], id)?;
@@ -777,7 +882,9 @@ impl Compiler {
         self.emit(OpCode::IterAdvance, &[index, top], id)?;
 
         self.patch_to_here(exhausted);
-        self.patch_to_here(broke);
+        if let Some(broke) = broke {
+            self.patch_to_here(broke);
+        }
         self.expr(&comp.result)?;
 
         self.close_scope(mark);
@@ -1184,6 +1291,139 @@ mod tests {
                 code.disassemble()
             );
         }
+    }
+
+    /// `all` and `exists` carry their loop condition as ONE instruction, and
+    /// `exists_one` carries none at all.
+    ///
+    /// The three lowerings the macros produce, asserted as an opcode census
+    /// rather than a sequence, for the reason
+    /// `the_comprehension_loop_never_loads_its_source_onto_the_stack` gives.
+    /// `NotStrictlyFalse` is the discriminator: it is emitted by nothing else
+    /// a comprehension contains, so none at all is exactly the claim that the
+    /// condition is fused.
+    #[test]
+    fn the_macro_loop_conditions_are_emitted_fused() {
+        for (source, want) in [
+            ("xs.all(x, x > 0)", Some(OpCode::AccuLoopCond)),
+            ("xs.exists(x, x > 0)", Some(OpCode::AccuLoopCondNot)),
+            // A literal-`true` condition ends the loop on nothing, so there is
+            // nothing to emit and nothing to jump over.
+            ("xs.exists_one(x, x > 0)", None),
+        ] {
+            let code = code_of(source);
+            assert_eq!(
+                count(&code, OpCode::NotStrictlyFalse),
+                0,
+                "{source} still tests its accumulator through the stack:\n{}",
+                code.disassemble()
+            );
+            for fused in [OpCode::AccuLoopCond, OpCode::AccuLoopCondNot] {
+                let expected = usize::from(want == Some(fused));
+                assert_eq!(
+                    count(&code, fused),
+                    expected,
+                    "{source} / {fused:?}:\n{}",
+                    code.disassemble()
+                );
+            }
+        }
+    }
+
+    /// The step's `&&`/`||` is fused too, and its accumulator operand is the
+    /// slot the loop stores back into.
+    ///
+    /// Stated against `StoreLocal`, which is the instruction that closes the
+    /// step, so this asks about the slot the accumulator actually lives in
+    /// rather than about a position in the emitted sequence.
+    #[test]
+    fn the_macro_steps_read_their_accumulator_from_its_slot() {
+        for (source, fused) in [
+            ("xs.all(x, x > 0)", OpCode::AndLocal),
+            ("xs.exists(x, x > 0)", OpCode::OrLocal),
+        ] {
+            let code = code_of(source);
+            let accu = code
+                .instructions()
+                .find(|(_, op, _)| *op == fused)
+                .map(|(_, _, operands)| operands[0])
+                .unwrap_or_else(|| {
+                    panic!("{source} steps through {fused:?}:\n{}", code.disassemble())
+                });
+
+            // The unfused pair began with a `LoadLocal` of that same slot, so
+            // a surviving one is the pair coming back.
+            let loaded: Vec<u32> = code
+                .instructions()
+                .filter(|(_, op, _)| *op == OpCode::LoadLocal)
+                .map(|(_, _, operands)| operands[0])
+                .collect();
+            assert_eq!(
+                loaded.iter().filter(|slot| **slot == accu).count(),
+                1,
+                "{source} reads accumulator slot {accu} through the stack more \
+                 than the one time the result does:\n{}",
+                code.disassemble()
+            );
+        }
+    }
+
+    /// A `&&` whose left operand is not a slot keeps the unfused form.
+    ///
+    /// The fusion is licensed by the left operand being one `LoadLocal`; a
+    /// free variable is a context lookup that can raise, and its handler has
+    /// to cover the instruction that does.
+    #[test]
+    fn a_short_circuit_over_a_free_variable_is_not_fused() {
+        let code = code_of("a && b");
+        assert_eq!(count(&code, OpCode::AndLocal), 0, "{}", code.disassemble());
+        assert_eq!(count(&code, OpCode::And), 1, "{}", code.disassemble());
+    }
+
+    /// The fused operator's handler covers the fused instruction and nothing
+    /// else, at the depth the operand stack had before it.
+    ///
+    /// This is the clause that fails silently. `Vm::unwind` restores the
+    /// operand stack with `truncate(handler.depth)`, and nothing checks that
+    /// the depth an absorbing handler carries is the depth the fused form
+    /// actually leaves. An empty range would be worse still: `handler_for`
+    /// asks `start <= pc && pc < end`, so a handler whose range collapsed
+    /// would absorb nothing and the `&&` would stop being commutative over
+    /// errors.
+    #[test]
+    fn a_fused_short_circuit_handler_covers_the_fused_instruction() {
+        let code = code_of("xs.all(x, x > 0)");
+        let (at, operands) = code
+            .instructions()
+            .find(|(_, op, _)| *op == OpCode::AndLocal)
+            .map(|(pc, _, operands)| (pc, operands.to_vec()))
+            .expect("`all` steps through AndLocal");
+
+        let handler = code.handler_for(at).copied().unwrap_or_else(|| {
+            panic!(
+                "the fused operator must be covered:\n{}",
+                code.disassemble()
+            )
+        });
+        assert_eq!(handler.start, at, "{}", code.disassemble());
+        assert_eq!(handler.end, at + 1, "the range is one instruction wide");
+        assert_eq!(handler.land, at + 1, "the right operand is next");
+        assert_eq!(
+            handler.logic, operands[1],
+            "the operator writes the slot it covers"
+        );
+        // The accumulator lives in a slot and the loop's own scaffolding is
+        // stack-neutral, so the step starts on an empty operand stack.
+        assert_eq!(handler.depth, 0, "{}", code.disassemble());
+        // The short-circuit target is past the merge, so both paths arrive at
+        // the same depth -- the same property `a_short_circuit_handler_covers_\
+        // the_left_operand_only` states for the unfused form.
+        let merge = code
+            .instructions()
+            .find(|(pc, op, _)| *op == OpCode::AndMerge && *pc > at)
+            .map(|(pc, _, _)| pc)
+            .expect("`&&` merges");
+        assert_eq!(operands[2], merge + 1, "{}", code.disassemble());
     }
 
     /// The handler covers the left operand and stops short of the right one,

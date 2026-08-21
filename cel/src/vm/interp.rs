@@ -1430,6 +1430,44 @@ impl<'a> Vm<'a> {
                 return Ok(Step::Jump(b));
             }
 
+            // -- the fused accumulator ------------------------------------
+            OpCode::AccuLoopCond | OpCode::AccuLoopCondNot => {
+                // Read in place; see `Vm::sequence_len` for why the copy the
+                // `LoadLocal` made was the operand-stack round trip rather
+                // than work of its own.
+                let accu = self.slots.get(a as usize).ok_or(CelErr::InternalError)?;
+                let more = if op == OpCode::AccuLoopCondNot {
+                    // The negation is inside the `@not_strictly_false`, so a
+                    // non-bool fails at the `!` and never reaches the test
+                    // that would have answered `true` for it.
+                    !as_bool(accu)?
+                } else {
+                    // Which is what the plain form does answer, and why it
+                    // cannot fail where its twin can.
+                    as_bool(accu).unwrap_or(true)
+                };
+                if !more {
+                    return Ok(Step::Jump(b));
+                }
+            }
+            OpCode::AndLocal | OpCode::OrLocal => {
+                let short = op == OpCode::OrLocal;
+                // Read in place, as above: the `LoadLocal` this replaces
+                // copied the slot only so that the `And` could pop it again.
+                let outcome = {
+                    let accu = self.slots.get(a as usize).ok_or(CelErr::InternalError)?;
+                    as_bool(accu)
+                };
+                *self
+                    .logic
+                    .get_mut(b as usize)
+                    .ok_or(CelErr::InternalError)? = outcome;
+                if outcome == Ok(short) {
+                    self.push(Value::Bool(short));
+                    return Ok(Step::Jump(c));
+                }
+            }
+
             // -- control flow ---------------------------------------------------
             OpCode::Jump => return Ok(Step::Jump(a)),
             OpCode::JumpIfOptNone => {
@@ -1852,6 +1890,105 @@ mod tests {
             assert_eq!(
                 got, stock,
                 "{arm:?} answered differently from the stock arm"
+            );
+        }
+    }
+
+    /// A fused `&&`/`||` keeps CEL's asymmetry: the left operand short-circuits
+    /// without the right one running, and an error in the right one is raised
+    /// rather than absorbed.
+    ///
+    /// `x` is the iteration variable, so it is a slot and the operator is
+    /// emitted fused -- which is the only way to reach `OpCode::AndLocal`'s
+    /// short-circuiting path from a compiled program. Inside `all` and
+    /// `exists` that path is unreachable, because the loop condition breaks on
+    /// exactly the accumulator value that would have taken it.
+    ///
+    /// Every case is asserted against the tree walker as well as against a
+    /// literal, because the asymmetry is the walker's and not this
+    /// evaluator's.
+    #[test]
+    fn a_fused_short_circuit_keeps_the_asymmetry() {
+        for (source, want) in [
+            // The left operand decides: `undefined_name` never runs.
+            ("xs.map(x, x && undefined_name)", Some(false)),
+            ("ys.map(x, x || undefined_name)", Some(true)),
+            // The left operand does not decide, so the right one runs and
+            // raises. The handler covers the left operand alone.
+            ("ys.map(x, x && undefined_name)", None),
+            ("xs.map(x, x || undefined_name)", None),
+        ] {
+            let mut ctx = Context::default();
+            ctx.add_variable_from_value("xs", Value::list(vec![Value::Bool(false)]));
+            ctx.add_variable_from_value("ys", Value::list(vec![Value::Bool(true)]));
+
+            let expr = parse(source);
+            let got = run(source, &ctx);
+            let walked = crate::Value::resolve_value(&expr, &ctx);
+            assert_eq!(
+                got.is_ok(),
+                walked.is_ok(),
+                "{source}: VM {got:?} vs walker {walked:?}"
+            );
+            match want {
+                Some(decided) => assert_eq!(
+                    got.expect("the left operand decides"),
+                    Value::list(vec![Value::Bool(decided)]),
+                    "{source}"
+                ),
+                None => assert!(got.is_err(), "{source}: {got:?}"),
+            }
+        }
+    }
+
+    /// The two loop conditions the macros carry, including the one that can
+    /// fail.
+    ///
+    /// `exists` reads its accumulator NEGATED, and the negation is inside the
+    /// `@not_strictly_false`, so a non-bool accumulator is an overload failure
+    /// there rather than the `true` the test answers for it in `all`. Only a
+    /// hand-built comprehension can put a non-bool in that slot.
+    ///
+    /// The step is replaced by the accumulator itself, because `all`'s and
+    /// `exists`'s own step reads the accumulator too and would record the same
+    /// overload failure in its logic slot -- which its merge then raises. That
+    /// is the same answer for a different reason, and it would let this test
+    /// pass with the condition doing nothing at all.
+    #[test]
+    fn the_negated_loop_condition_raises_where_the_plain_one_answers() {
+        use crate::common::ast::{ComprehensionExpr, LiteralValue};
+
+        let mut ctx = Context::default();
+        ctx.add_variable_from_value("xs", Value::list(vec![Value::Int(1)]));
+
+        for (source, want) in [
+            ("xs.all(x, true)", Ok(Value::Int(7))),
+            ("xs.exists(x, true)", Err(ExecutionError::NoSuchOverload)),
+        ] {
+            let Expr::Comprehension(base) = parse(source).expr else {
+                panic!("the macro expands to a comprehension");
+            };
+            let mut comp: ComprehensionExpr = *base;
+            let accu = comp.accu_var.clone();
+            comp.accu_init = IdedExpr {
+                id: 98,
+                expr: Expr::Literal(LiteralValue::Int(7.into())),
+            };
+            comp.loop_step = IdedExpr {
+                id: 99,
+                expr: Expr::Ident(accu),
+            };
+            let code = compile(&IdedExpr {
+                id: 0,
+                expr: Expr::Comprehension(Box::new(comp)),
+            })
+            .expect("compiles");
+
+            assert_eq!(
+                cel_eval_loop(&code, &ctx),
+                want,
+                "{source} with an integer accumulator:\n{}",
+                code.disassemble()
             );
         }
     }

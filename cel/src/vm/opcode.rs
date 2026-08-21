@@ -268,6 +268,62 @@ pub enum OpCode {
     /// is a dispatch: one of the two the pair cost.
     IterAdvance,
 
+    // -- the fused accumulator ----------------------------------------------
+    //
+    // The scaffolding `all` and `exists` carry, which `parser::macros`
+    // synthesises around their predicate: a loop condition that reads the
+    // accumulator, and a short-circuit operator whose left operand is that
+    // same accumulator. Both put a slot's value on the operand stack and take
+    // it off again without anything else looking at it.
+    //
+    // These are what the tree walker does not pay at all -- it reaches the
+    // same accumulator as a `Context` binding through its own recursion -- so
+    // they are an asymmetry against it rather than shared work.
+    /// The loop condition `all` carries: fall through while the accumulator in
+    /// slot `a` is not strictly false, and jump to `b` when it is. Nothing is
+    /// pushed and nothing is popped.
+    ///
+    /// Spelled out, this was `LoadLocal a ; NotStrictlyFalse ; JumpIfFalse b`.
+    /// The accumulator went onto the operand stack, was replaced there by the
+    /// bool it answers to, and came off again -- three dispatches and two
+    /// round trips to read one slot.
+    ///
+    /// The slot is read in place for the reason [`OpCode::IterLen`] gives: a
+    /// `LoadLocal` copies what is in it, and the copy existed only because the
+    /// value had to travel.
+    ///
+    /// `@not_strictly_false` answers `true` for a non-bool rather than
+    /// failing, so this instruction cannot raise.
+    AccuLoopCond,
+    /// [`OpCode::AccuLoopCond`] over the NEGATED accumulator, which is the
+    /// condition `exists` carries: `LoadLocal a ; Not ; NotStrictlyFalse ;
+    /// JumpIfFalse b`.
+    ///
+    /// Its own opcode rather than a flag operand on [`OpCode::AccuLoopCond`],
+    /// for the reason the binary operators give: a kind operand is a second
+    /// switch inside the dispatch arm.
+    ///
+    /// Unlike its twin this CAN raise. The negation is INSIDE the
+    /// `@not_strictly_false`, so a non-bool accumulator reaches `!` first and
+    /// is an overload failure there rather than a `true` the test would have
+    /// answered.
+    AccuLoopCondNot,
+    /// The left half of a `&&` whose left operand is slot `a`: record that
+    /// slot's bool -- or its overload failure -- in logic slot `b`, and when
+    /// it is exactly `false`, push `false` and jump to `c`.
+    ///
+    /// Spelled out, this was `LoadLocal a ; And b c`. It is the shape `all`'s
+    /// step has on every element, because the accumulator is a slot; nothing
+    /// about it is special to `all`, so the compiler emits it for any `&&`
+    /// whose left operand resolves to a slot.
+    ///
+    /// A non-bool slot is not a short circuit, and is recorded rather than
+    /// raised, for the reason [`OpCode::And`] gives.
+    AndLocal,
+    /// The `||` twin of [`OpCode::AndLocal`], mirroring [`OpCode::Or`]:
+    /// short-circuits on `true`.
+    OrLocal,
+
     // -- control flow -----------------------------------------------------
     /// Jump to `a`.
     Jump,
@@ -344,9 +400,15 @@ impl OpCode {
             | OpCode::And
             | OpCode::Or
             | OpCode::IterAt
-            | OpCode::IterAdvance => 2,
+            | OpCode::IterAdvance
+            | OpCode::AccuLoopCond
+            | OpCode::AccuLoopCondNot => 2,
 
-            OpCode::CallQualified | OpCode::IterGuard | OpCode::IterBind => 3,
+            OpCode::CallQualified
+            | OpCode::IterGuard
+            | OpCode::IterBind
+            | OpCode::AndLocal
+            | OpCode::OrLocal => 3,
 
             OpCode::Index
             | OpCode::OptIndex
@@ -405,6 +467,10 @@ impl OpCode {
             // travelled through the stack was put there and taken off again
             // inside the same group.
             OpCode::IncLocal | OpCode::IterGuard | OpCode::IterBind | OpCode::IterAdvance => (0, 0),
+            // Reads one slot and branches on it; neither path touches the
+            // operand stack, because the value the three instructions moved
+            // through it never left the slot.
+            OpCode::AccuLoopCond | OpCode::AccuLoopCondNot => (0, 0),
             OpCode::NewList | OpCode::NewMap | OpCode::NewStruct => (0, 1),
 
             OpCode::StoreLocal | OpCode::Return => (1, 0),
@@ -448,6 +514,12 @@ impl OpCode {
             // into the logic slot. The short-circuiting path pushes the
             // answer instead, so both paths reach the merge one deep.
             OpCode::JumpIfFalse | OpCode::JumpIfTrue | OpCode::And | OpCode::Or => (1, 0),
+            // The same declaration one instruction earlier: the operand the
+            // falling-through path moved into the logic slot is now read out
+            // of an activation-record slot instead, so the falling-through
+            // path is stack-neutral and the short-circuiting one still pushes
+            // the answer. Both paths reach the merge one deep, as above.
+            OpCode::AndLocal | OpCode::OrLocal => (0, 0),
         }
     }
 }

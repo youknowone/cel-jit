@@ -1307,17 +1307,26 @@ fn drop_decomposition(cfg: &Config) {
     // one releases nothing because it owns nothing.
     //
     // The discard counts are read off the lowering in `vm/compile.rs`, per
-    // element:
+    // element. `Vm::discard` is reached from four places — the conditional
+    // jumps, a short-circuit operator's left half, its merge, and
+    // `Vm::store_slot`:
     //
-    //   map:  StoreLocal iter_var (the old element) + JumpIfFalse (the
-    //         exhaustion guard)                                        = 2
-    //   all:  those two, plus JumpIfFalse (the loop condition), And,
-    //         AndMerge, and StoreLocal accu                            = 6
+    //   map:  IterBind, which stores the element over the previous one  = 1
+    //   all:  that one, plus AndMerge and StoreLocal accu               = 3
     //
-    // `map` reaches two of the four site families and `all` reaches all four,
-    // so the two ladders are an independent pair of estimates rather than one
-    // measurement run twice.
-    let ladders: [(&str, f64); 2] = [("xs.map(x, x * 2)", 2.0), ("xs.all(x, x > 0)", 6.0)];
+    // Both counts fell when the loop scaffolding was fused, because three of
+    // the discards were in instructions that no longer exist: `IterGuard`
+    // replaced a `JumpIfFalse` that discarded the guard's bool,
+    // `AccuLoopCond` replaced another, and `AndLocal` replaced an `And` that
+    // discarded the copy of the accumulator it had just been handed. None of
+    // the fused forms puts a value on the operand stack, so none of them has
+    // one to throw away.
+    //
+    // What that costs this section is independence: the two ladders used to
+    // reach all four site families between them and now reach two, with
+    // `all`'s sites a superset of `map`'s. They are still two lengths and two
+    // programs, but no longer two different mixes of site.
+    let ladders: [(&str, f64); 2] = [("xs.map(x, x * 2)", 1.0), ("xs.all(x, x > 0)", 3.0)];
 
     for (src, discards_per_elem) in ladders {
         let code = probe_code(src);
