@@ -139,6 +139,15 @@ required-features = ["jit"]
 name = "routeprobe"
 required-features = ["jit"]
 
+# `jit` only, like `loopkey_ab` above and for the same reason: the stage arms
+# are behind `#[cfg(feature = "entry-stage-probe")]` inside the file, and the
+# file builds and runs without them -- it reports the entry whole and says which
+# feature the split needs. Requiring the probe feature here would instead force
+# it into every matrix row that builds this example.
+[[example]]
+name = "entryprobe"
+required-features = ["jit"]
+
 [[example]]
 name = "varprobe"
 required-features = ["jit"]
@@ -300,6 +309,34 @@ elem-attr-probe = []
 # bucket holding one cell or none, which is every bucket a program here has
 # produced; see `float_bank::LoopKeyArm`.
 loop-key-arm-probe = []
+
+# The fourth measurement probe, and never a shipping feature either. It gives
+# `float_bank::run_jit_persistent_f` a per-stage repeat count, read once per
+# call out of a thread-local, so what one named stage of the JIT entry costs is
+# a difference taken inside ONE binary -- the same call against itself, once
+# with every count at zero and once with one stage repeated k extra times.
+#
+# Repetition and not a clock: the entry is ~100 ns whole (`batch::JIT_ENTRY_PS`)
+# across five stages, and `Instant::now()` costs 20-25 ns here, so a clock per
+# stage would report itself. Not every stage repeats, either -- `check_out`
+# takes the driver OUT of its slot, so it is amplified together with `check_in`
+# as one round trip, and the run that follows cannot be repeated at all and is
+# reported as a residual rather than measured. See `float_bank::EntryStageRepeats`.
+#
+# The residual that leaves is the compiled entry itself, and it is four fifths
+# of the whole -- so this feature also arms majit's own split of it,
+# `back-edge-stage-probe`, which amplifies three stages inside the warm arm of
+# `JitDriver::back_edge_internal` under the same discipline. A weak dependency
+# feature (`?/`): it must not be what pulls the optional `majit-metainterp` in,
+# since a non-JIT build has no entry to split.
+#
+# Off by default, and selected only by measurement examples under `examples/`.
+# A build carrying it pays one thread-local read and five zero-trip loop tests
+# per JIT call that a default build does not, plus one relaxed atomic load and
+# four more zero-trip tests per compiled entry on the majit side, so an absolute
+# figure taken from such a build is not what the shipping door costs; only
+# differences are claims.
+entry-stage-probe = ["majit-metainterp?/back-edge-stage-probe"]
 
 # Route `Program::execute` through the bytecode VM instead of the tree walker.
 #

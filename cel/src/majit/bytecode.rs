@@ -2868,6 +2868,110 @@ pub mod float_bank {
         });
     }
 
+    /// How many EXTRA times each stage of [`run_jit_persistent_f`] runs before
+    /// the call does its own.
+    ///
+    /// A measurement probe, never a shipping feature, and the third of its kind
+    /// in this file after [`LoopKeyArm`]. What it itemises is the fixed cost of
+    /// arriving in compiled code -- `batch::JIT_ENTRY_PS`, ~100 ns whole --
+    /// across the named stages the call is made of, so the ranking of those
+    /// stages is a difference taken inside ONE binary.
+    ///
+    /// REPETITION and not a clock, because `Instant::now()` costs 20-25 ns on
+    /// the box these were taken on: six of them inside a 100 ns budget would
+    /// report the clock. Time the call with every count at zero, time it again
+    /// with one count at `k`, and the difference over `k` is that stage --
+    /// everything the two arms share cancels out of it.
+    ///
+    /// Read ONCE per call rather than once per stage, so the read is a constant
+    /// both arms pay. It does mean no arm's ABSOLUTE figure is what the
+    /// shipping door costs: a build carrying this feature pays that read and
+    /// five zero-trip loop tests per call that a default build does not have.
+    /// Only differences are claims.
+    #[cfg(feature = "entry-stage-probe")]
+    #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+    pub struct EntryStageRepeats {
+        /// Extra [`DRIVERS`] accesses.
+        ///
+        /// A LOWER bound on that stage rather than a measurement of it: a
+        /// thread-local resolves to the same address on every access in a
+        /// thread, so a compiler may compute it once for the whole loop. What
+        /// repetition cannot elide is the initialization check `with` makes --
+        /// [`DRIVERS`] has a non-const initializer -- nor the reload the
+        /// barrier in each pass forces.
+        pub tls: u32,
+        /// Extra pool ROUND TRIPS: [`DriverPool::check_out`] and
+        /// [`DriverPool::check_in`] as a pair.
+        ///
+        /// A pair, and not two counts, because the halves are not separately
+        /// repeatable. `check_out` TAKES the driver out of its slot, so a
+        /// second one in a row finds the slot empty, answers `pooled: None`,
+        /// and the caller builds a fresh driver -- a cold start with a dispatch
+        /// jitcode registration in it, which is not this stage and is orders
+        /// larger than it. Checking the driver back in before the next take is
+        /// what makes the pair idempotent.
+        pub pool: u32,
+        /// Extra [`reseed_state_f`] calls.
+        pub reseed: u32,
+        /// Extra yield scans -- `has_runnable_compiled_loop` on the resolved
+        /// key of every loop header the program has, which is what the entry
+        /// door opens with.
+        ///
+        /// Always the RESOLVED form, so under `loop-key-arm-probe` this prices
+        /// the shipping scan whichever arm the door itself is taking.
+        pub loop_keys: u32,
+        /// Extra passes of an amplification loop with NO stage in it: the
+        /// counter, and the one optimization barrier every other field's loop
+        /// also carries. Subtracting it is what leaves a stage's own cost
+        /// rather than its cost plus the machinery that made it repeat.
+        pub barrier: u32,
+    }
+
+    #[cfg(feature = "entry-stage-probe")]
+    std::thread_local! {
+        /// The counts the next call on this thread runs with.
+        static ENTRY_STAGE_REPEATS: core::cell::Cell<EntryStageRepeats> = const {
+            core::cell::Cell::new(EntryStageRepeats {
+                tls: 0,
+                pool: 0,
+                reseed: 0,
+                loop_keys: 0,
+                barrier: 0,
+            })
+        };
+    }
+
+    #[cfg(feature = "entry-stage-probe")]
+    std::thread_local! {
+        /// How many loop keys the yield scan last walked.
+        ///
+        /// The divisor a per-key figure needs, published by the door rather
+        /// than recounted outside it, where a caller would have to rediscover
+        /// which backward jumps [`loop_header_keys`] admits. Written only while
+        /// the scan is being amplified, so the arm the difference is taken
+        /// against does not carry the store.
+        static ENTRY_STAGE_LOOP_KEYS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+    }
+
+    /// Set the repeat counts for subsequent calls on this thread, answering
+    /// what they were.
+    ///
+    /// A setter rather than a wrapper around one call, unlike
+    /// [`run_jit_persistent_probe_f`]: the entry's whole-cost figure is read
+    /// through `BoundBatch::collect_into_on`, so the stages have to be read
+    /// through it too, or the parts and the whole are about different doors.
+    #[cfg(feature = "entry-stage-probe")]
+    pub fn set_entry_stage_repeats(repeats: EntryStageRepeats) -> EntryStageRepeats {
+        ENTRY_STAGE_REPEATS.with(|slot| slot.replace(repeats))
+    }
+
+    /// The loop-key count the last amplified scan walked. Zero until one has
+    /// run.
+    #[cfg(feature = "entry-stage-probe")]
+    pub fn entry_stage_loop_keys() -> usize {
+        ENTRY_STAGE_LOOP_KEYS.with(core::cell::Cell::get)
+    }
+
     /// [`run_jit_seeded_f`] on a driver that outlives the call, so a program
     /// already compiled by an earlier call runs compiled from its first row.
     ///
@@ -2884,10 +2988,51 @@ pub mod float_bank {
     ) -> i64 {
         let key = (init_regs.len(), num_fregs, threshold);
         let addr = program.as_ptr() as usize;
+        // Read once per call, ahead of every stage, so no stage's difference
+        // carries it. See [`EntryStageRepeats`]; a default build has neither
+        // this read nor the five loops it feeds.
+        #[cfg(feature = "entry-stage-probe")]
+        let repeats = ENTRY_STAGE_REPEATS.with(core::cell::Cell::get);
+        #[cfg(feature = "entry-stage-probe")]
+        for _ in 0..repeats.tls {
+            DRIVERS.with(|cell| {
+                std::hint::black_box(cell as *const core::cell::RefCell<DriverPool>);
+            });
+        }
         // ONE thread-local access for the whole call. The borrow inside it is
         // taken twice and held across neither run: a re-entrant call has to
         // find the pool readable rather than panicking on the `RefCell`.
         DRIVERS.with(|cell| {
+            // The pool round trip, amplified as a PAIR. See
+            // [`EntryStageRepeats::pool`] for why the halves cannot be repeated
+            // apart -- a bare second `check_out` prices a cold start.
+            #[cfg(feature = "entry-stage-probe")]
+            for _ in 0..repeats.pool {
+                let Checkout {
+                    pooled,
+                    home,
+                    program_index,
+                    ..
+                } = cell.borrow_mut().check_out(key, program);
+                // An empty slot is a first sighting of this shape, and building
+                // a driver here would price that rather than the round trip.
+                // Leave it to the call below, where a first sighting belongs.
+                let Some(pooled) = pooled else { break };
+                let keep = pooled.programs.len() <= MAX_PROGRAMS_PER_DRIVER;
+                if let Some(dropped) =
+                    cell.borrow_mut()
+                        .check_in(key, addr, home, program_index, pooled, keep)
+                {
+                    // The pool declined the driver it had just handed out, so
+                    // the next pass would price a rebuild. Absorb its unreported
+                    // tallies exactly as the shipping path does, and stop.
+                    let stats = dropped.driver.get_stats();
+                    ABSORBED_BRIDGES.fetch_add(stats.bridges_compiled, Ordering::Relaxed);
+                    ABSORBED_PANICS
+                        .fetch_add(stats.internal_compile_panics as usize, Ordering::Relaxed);
+                    break;
+                }
+            }
             // ── check out ──────────────────────────────────────────────────
             let Checkout {
                 pooled,
@@ -2927,7 +3072,40 @@ pub mod float_bank {
             if driver.state_field_fvc_epoch() != published_epoch {
                 driver.republish_state_field_fvc();
             }
+            #[cfg(feature = "entry-stage-probe")]
+            for _ in 0..repeats.reseed {
+                reseed_state_f(state, init_regs, num_fregs);
+                // Every pass writes the same bytes over the same banks, so
+                // without a barrier the passes after the first are dead stores
+                // and the loop prices nothing.
+                std::hint::black_box(&mut *state);
+            }
+            // The same loop and the same barrier with no stage in them, so what
+            // the amplification itself costs is subtracted rather than reported
+            // as a stage.
+            #[cfg(feature = "entry-stage-probe")]
+            for _ in 0..repeats.barrier {
+                std::hint::black_box(&mut *state);
+            }
             reseed_state_f(state, init_regs, num_fregs);
+            // The yield scan the entry door opens with. Amplified here rather
+            // than inside [`try_function_entry_jit_f`] because both of its
+            // inputs are already in hand at this point, which leaves that
+            // door's signature the shipping one.
+            #[cfg(feature = "entry-stage-probe")]
+            if repeats.loop_keys != 0 {
+                ENTRY_STAGE_LOOP_KEYS.with(|slot| slot.set(pooled_program.loop_keys.len()));
+                for _ in 0..repeats.loop_keys {
+                    let yielded = pooled_program.loop_keys.iter().any(|key| {
+                        let probe = key.resolve(driver);
+                        driver.has_runnable_compiled_loop(probe)
+                    });
+                    // Reading the answer is what keeps the walk, and the
+                    // barrier inside that read is what stops the next pass
+                    // reusing this one's bucket loads.
+                    std::hint::black_box(yielded);
+                }
+            }
             // The call-counted door, ahead of the first instruction. It answers
             // the whole call when the entry key already has compiled code;
             // otherwise it hands back where interpretation is to pick up.
