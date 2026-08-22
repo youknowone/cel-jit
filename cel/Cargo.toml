@@ -344,7 +344,10 @@ loop-key-arm-probe = []
 # four more zero-trip tests per compiled entry on the majit side, so an absolute
 # figure taken from such a build is not what the shipping door costs; only
 # differences are claims.
-entry-stage-probe = ["majit-metainterp?/back-edge-stage-probe"]
+entry-stage-probe = [
+    "majit-metainterp?/back-edge-stage-probe",
+    "majit-metainterp?/execute-stage-probe",
+]
 
 # Route `Program::execute` through the bytecode VM instead of the tree walker.
 #

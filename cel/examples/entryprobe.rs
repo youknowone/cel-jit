@@ -125,6 +125,12 @@ use cel::majit::bytecode::float_bank::{
 };
 #[cfg(feature = "entry-stage-probe")]
 use majit_metainterp::{back_edge_stage_passes, set_back_edge_stage_repeats, BackEdgeStageRepeats};
+#[cfg(feature = "entry-stage-probe")]
+use majit_metainterp::{
+    call_shot_totals, execute_stage_clock_floor_ns, execute_stage_passes, frame_build_passes,
+    reset_call_shot_totals, set_execute_stage_repeats, set_frame_build_repeats,
+    ExecuteStageRepeats,
+};
 
 /// One timed batch must last at least this long, so the clock's own resolution
 /// is not what the measurement is against. `routeprobe`'s number, because the
@@ -152,11 +158,17 @@ const SWEEP: [usize; 4] = [1, 2, 3, 4];
 #[cfg(feature = "entry-stage-probe")]
 const REPEAT: u32 = 32;
 
+/// Entries the single-shot call arm clocks. Higher than the amplified arms
+/// need: each entry contributes ONE reading rather than [`REPEAT`] of them, so
+/// the averaging an amplified arm gets for free has to be bought here.
+#[cfg(feature = "entry-stage-probe")]
+const CALL_SHOTS: usize = 20_000;
+
 /// The nine amplified arms, in the order [`Split::raw`] holds them: cel's four
 /// stages and its barrier, then majit's three and its barrier. The two barrier
 /// arms are machinery and not stages, and each side's stages are differenced
 /// against their own — see [`Split::barrier_for`].
-const STAGE_LABELS: [&str; 9] = [
+const STAGE_LABELS: [&str; 13] = [
     "A  DRIVERS.with",
     "BF check_out+check_in",
     "C  reseed_state_f",
@@ -166,10 +178,19 @@ const STAGE_LABELS: [&str; 9] = [
     "E2 marshal in",
     "E4 marshal out",
     "(majit barrier)",
+    "E3a prologue",
+    "E3b frame build",
+    "E3d deadframe decode",
+    "(execute barrier)",
 ];
 
-/// Where majit's arms start in [`STAGE_LABELS`].
+/// Where majit's back-edge arms start in [`STAGE_LABELS`].
 const MAJIT_FIRST: usize = 5;
+
+/// Where the arms INSIDE E3 start. Everything from here down is about
+/// `execute_assembler_at_dispatch_key`, and `E3b` is a part of the call rather
+/// than a sibling of it — see [`Split::e3_residual`].
+const EXEC_FIRST: usize = 9;
 
 /// One arm's repeat counts, on both sides of the door.
 ///
@@ -180,17 +201,27 @@ const MAJIT_FIRST: usize = 5;
 struct Repeats {
     cel: EntryStageRepeats,
     majit: BackEdgeStageRepeats,
+    /// The stages inside `execute_assembler_at_dispatch_key`. `call_shot` here
+    /// is NOT an amplified arm — see [`ExecuteStageRepeats`].
+    exec: ExecuteStageRepeats,
+    /// Extra frame builds, which live one crate further down because the frame
+    /// does. Inside the call, not beside it.
+    frame_build: u32,
 }
 
 #[cfg(feature = "entry-stage-probe")]
 fn set_repeats(repeats: Repeats) {
+    // All four, on every arm, so the setters are a constant every arm pays
+    // rather than a difference between them.
     set_entry_stage_repeats(repeats.cel);
     set_back_edge_stage_repeats(repeats.majit);
+    set_execute_stage_repeats(repeats.exec);
+    set_frame_build_repeats(repeats.frame_build);
 }
 
 /// Which repeat count each arm raises. Index-parallel with [`STAGE_LABELS`].
 #[cfg(feature = "entry-stage-probe")]
-const STAGE_ARMS: [fn(&mut Repeats); 9] = [
+const STAGE_ARMS: [fn(&mut Repeats); 13] = [
     |r| r.cel.tls = REPEAT,
     |r| r.cel.pool = REPEAT,
     |r| r.cel.reseed = REPEAT,
@@ -200,6 +231,10 @@ const STAGE_ARMS: [fn(&mut Repeats); 9] = [
     |r| r.majit.marshal_in = REPEAT as u16,
     |r| r.majit.marshal_out = REPEAT as u16,
     |r| r.majit.barrier = REPEAT as u16,
+    |r| r.exec.prologue = REPEAT as u16,
+    |r| r.frame_build = REPEAT,
+    |r| r.exec.decode = REPEAT as u16,
+    |r| r.exec.barrier = REPEAT as u16,
 ];
 
 fn timed(iters: usize, run: &mut impl FnMut()) -> Duration {
@@ -278,7 +313,7 @@ fn point(bound: &BoundBatch<'_, '_>, n: usize) -> (usize, f64, f64, f64) {
 /// seven stages rather than folded into them, so the report can print what the
 /// amplification itself cost next to what it was used to measure.
 #[cfg(feature = "entry-stage-probe")]
-fn arms(bound: &BoundBatch<'_, '_>) -> ([f64; 9], usize, f64) {
+fn arms(bound: &BoundBatch<'_, '_>) -> ([f64; 13], usize, f64, f64, u64) {
     let mut out: Vec<Value> = Vec::new();
     let entered = warm(bound, &mut out);
     // Every arm computes the same answer, and an amplification that broke that
@@ -307,7 +342,7 @@ fn arms(bound: &BoundBatch<'_, '_>) -> ([f64; 9], usize, f64) {
 
     let mut base_buf = out.clone();
     let mut amp_buf = out;
-    let mut raw = [0.0f64; 9];
+    let mut raw = [0.0f64; 13];
     for (slot, arm) in raw.iter_mut().zip(STAGE_ARMS) {
         let mut amplified = Repeats::default();
         arm(&mut amplified);
@@ -328,16 +363,45 @@ fn arms(bound: &BoundBatch<'_, '_>) -> ([f64; 9], usize, f64) {
         *slot = (amped - base) / f64::from(REPEAT);
     }
     set_repeats(Repeats::default());
-    (raw, entry_stage_loop_keys(), entered)
+
+    // ── the one stage that cannot be amplified ────────────────────────────
+    // SINGLE-SHOT, and reported as one. The call runs the trace, so instead of
+    // repeating it the arm clocks it once per entry and accumulates. The clock
+    // pair's own floor is measured in the same crate and subtracted; what is
+    // left is the call plus whatever of that pair's cost the floor under-reads,
+    // so this is an UPPER bound on the call rather than a two-sided estimate.
+    let (call_ns, call_shots) = {
+        let mut shot = Repeats::default();
+        shot.exec.call_shot = 1;
+        reset_call_shot_totals();
+        set_repeats(shot);
+        let mut shot_buf: Vec<Value> = Vec::new();
+        for _ in 0..CALL_SHOTS {
+            bound
+                .collect_into_on(Tier::Jit, &mut shot_buf)
+                .expect("call-shot run");
+            black_box(shot_buf.as_slice());
+        }
+        set_repeats(Repeats::default());
+        let (ns, shots) = call_shot_totals();
+        let floor = execute_stage_clock_floor_ns();
+        let mean = if shots == 0 {
+            f64::NAN
+        } else {
+            ns as f64 / shots as f64 - floor
+        };
+        (mean, shots)
+    };
+    (raw, entry_stage_loop_keys(), entered, call_ns, call_shots)
 }
 
 /// Without the feature there are no arms to run, and the file reports the entry
 /// whole rather than pretending to split it.
 #[cfg(not(feature = "entry-stage-probe"))]
-fn arms(bound: &BoundBatch<'_, '_>) -> ([f64; 9], usize, f64) {
+fn arms(bound: &BoundBatch<'_, '_>) -> ([f64; 13], usize, f64, f64, u64) {
     let mut out: Vec<Value> = Vec::new();
     let entered = warm(bound, &mut out);
-    ([f64::NAN; 9], 0, entered)
+    ([f64::NAN; 13], 0, entered, f64::NAN, 0)
 }
 
 /// Ordinary least squares of `y` against `x`, as `(intercept, slope)`.
@@ -368,9 +432,16 @@ struct Split {
     jit_fix: f64,
     /// Per-pass cost of each amplified arm, each side's barrier last within its
     /// own run of the array, and NOT yet subtracted.
-    raw: [f64; 9],
+    raw: [f64; 13],
     /// Loop keys the door walks per call for this program.
     loop_keys: usize,
+    /// The compiled call, SINGLE-SHOT: the mean of one clocked reading per
+    /// entry, with the clock pair's own floor already subtracted. NaN when the
+    /// arm did not run. Not comparable with the amplified figures beside it —
+    /// see the header.
+    call_ns: f64,
+    /// How many readings that mean is over.
+    call_shots: u64,
 }
 
 impl Split {
@@ -385,8 +456,10 @@ impl Split {
     fn barrier_for(i: usize) -> usize {
         if i < MAJIT_FIRST {
             4
-        } else {
+        } else if i < EXEC_FIRST {
             8
+        } else {
+            12
         }
     }
     /// One stage, with the amplification's own cost taken off it.
@@ -407,6 +480,21 @@ impl Split {
     fn e_measured(&self) -> f64 {
         (MAJIT_FIRST..8).map(|i| self.stage(i)).sum()
     }
+    /// E3a + E3d — the AMPLIFIED stages inside E3. Deliberately excludes E3b,
+    /// which is a part of the call and not a sibling of it, and excludes the
+    /// call, which is single-shot.
+    fn e3_amplified(&self) -> f64 {
+        self.stage(9) + self.stage(11)
+    }
+    /// What E3 has left once its two amplified stages and its single-shot call
+    /// are taken off: the result construction and the drops. A RESIDUAL, and
+    /// reported as one.
+    ///
+    /// NaN-safe by construction only when the call arm ran; a build that did
+    /// not run it has no business quoting this.
+    fn e3_residual(&self) -> f64 {
+        self.e_residual() - self.e3_amplified() - self.call_ns
+    }
     /// E3, the call. A RESIDUAL inside a residual, for the reason the header
     /// gives: it runs the program, so nothing can make it repeat.
     fn e_residual(&self) -> f64 {
@@ -418,10 +506,12 @@ impl Split {
 fn split(
     label: &'static str,
     points: &[(usize, f64, f64, f64)],
-    raw: [f64; 9],
+    raw: [f64; 13],
     loop_keys: usize,
     stage_n: usize,
     entered: f64,
+    call_ns: f64,
+    call_shots: u64,
 ) -> Split {
     let used: Vec<&(usize, f64, f64, f64)> = points.iter().filter(|p| p.3 >= 1.0).collect();
     let xs: Vec<f64> = used.iter().map(|p| p.0 as f64).collect();
@@ -435,6 +525,8 @@ fn split(
         jit_fix: line(&xs, &js).0,
         raw,
         loop_keys,
+        call_ns,
+        call_shots,
     }
 }
 
@@ -495,8 +587,8 @@ fn split_rows(label: &'static str, source: &'static str) -> Split {
     let batch = bind(n);
     reset_persistent_state();
     let bound = program.bind_per_row(&batch).expect("binds");
-    let (raw, keys, entered) = arms(&bound);
-    split(label, &points, raw, keys, n, entered)
+    let (raw, keys, entered, call_ns, call_shots) = arms(&bound);
+    split(label, &points, raw, keys, n, entered, call_ns, call_shots)
 }
 
 /// A comprehension at ONE row whose list carries a rising number of elements.
@@ -519,8 +611,8 @@ fn split_elems(label: &'static str, source: &'static str) -> Split {
     let batch = bind(n);
     reset_persistent_state();
     let bound = program.bind_per_row(&batch).expect("binds");
-    let (raw, keys, entered) = arms(&bound);
-    split(label, &points, raw, keys, n, entered)
+    let (raw, keys, entered, call_ns, call_shots) = arms(&bound);
+    split(label, &points, raw, keys, n, entered, call_ns, call_shots)
 }
 
 /// Run one call per majit arm and report the pass counters the door published,
@@ -553,11 +645,17 @@ fn armcheck() {
         "armcheck: `x + 1` at n={}, {entered:.2} of the probe's calls entered compiled code",
         SWEEP[0]
     );
-    println!("  passes per arm, as [gate, marshal_in, marshal_out, barrier] on ONE call\n");
+    println!(
+        "  per arm on ONE call: back-edge [gate, in, out, barrier], \
+         exec [prologue, decode, barrier], frames\n"
+    );
     for (i, arm) in STAGE_ARMS.iter().enumerate().skip(MAJIT_FIRST) {
+        // Covers both majit groups: the back-edge arms and the four inside E3.
         let mut amplified = Repeats::default();
         arm(&mut amplified);
         let before = back_edge_stage_passes();
+        let exec_before = execute_stage_passes();
+        let frames_before = frame_build_passes();
         set_repeats(amplified);
         let mut got: Vec<Value> = Vec::new();
         bound
@@ -569,9 +667,17 @@ fn armcheck() {
         assert!(got == want, "arm {} changed the answer", STAGE_LABELS[i]);
         let after = back_edge_stage_passes();
         let delta: Vec<u64> = before.iter().zip(after).map(|(b, a)| a - b).collect();
-        let reached = delta.iter().any(|d| *d > 0);
+        let exec_after = execute_stage_passes();
+        let exec_delta: Vec<u64> = exec_before
+            .iter()
+            .zip(exec_after)
+            .map(|(b, a)| a - b)
+            .collect();
+        let frames = frame_build_passes() - frames_before;
+        let reached =
+            delta.iter().any(|d| *d > 0) || exec_delta.iter().any(|d| *d > 0) || frames > 0;
         println!(
-            "  {:<22} {delta:?}  {}",
+            "  {:<22} back-edge {delta:?} exec {exec_delta:?} frames {frames:<4} {}",
             STAGE_LABELS[i],
             if reached { "REACHED" } else { "NOT REACHED" }
         );
@@ -684,6 +790,29 @@ fn main() {
         .map(Split::entry)
         .fold((f64::MAX, f64::MIN), |(lo, hi), e| (lo.min(e), hi.max(e)));
 
+    println!("\n  ns per call, inside E3 (execute barrier already subtracted from the two)");
+    println!(
+        "  {:<42} {:>8} {:>10} {:>10} {:>8} {:>10}",
+        "shape", "E3a", "E3c call*", "E3b in c*", "E3d", "E3 rest"
+    );
+    for s in &splits {
+        println!(
+            "  {:<42} {:>8.2} {:>10.2} {:>10.2} {:>8.2} {:>10.2}",
+            s.label,
+            s.stage(9),
+            s.call_ns,
+            s.stage(10),
+            s.stage(11),
+            s.e3_residual()
+        );
+    }
+    println!(
+        "  * E3c is SINGLE-SHOT, one clocked reading per entry. E3b is AMPLIFIED and is a PART\n  \
+         \x20 of E3c, not a sibling — it is never added into E3 rest. Median of the two\n  \
+         \x20 amplified stages E3a+E3d: {:.2} ns.",
+        median(splits.iter().map(Split::e3_amplified).collect())
+    );
+
     println!(
         "\n  MEDIAN over {} shapes, and each as a share of the entry",
         splits.len()
@@ -741,6 +870,65 @@ fn main() {
     println!(
         "    {:<28} {e_barrier:8.2} ns   <- what one majit amplification pass costs by itself",
         "(majit barrier)"
+    );
+
+    // ── inside E3 ─────────────────────────────────────────────────────────
+    // ⚠ Two KINDS of number here, and they are labelled because they are not
+    // comparable: E3a and E3d are amplified, the call is a single-shot clock
+    // reading, and E3b is a PART of the call rather than a sibling of it, so it
+    // is printed as "of which" and never added into the sum.
+    let e3a = median(splits.iter().map(|s| s.stage(9)).collect());
+    let e3b = median(splits.iter().map(|s| s.stage(10)).collect());
+    let e3d = median(splits.iter().map(|s| s.stage(11)).collect());
+    let e3_barrier = median(splits.iter().map(|s| s.raw[12]).collect());
+    let call = median(splits.iter().map(|s| s.call_ns).collect());
+    let e3 = e_residual;
+    let e3_rest = e3 - e3a - e3d - call;
+    println!("\n  E3 SPLIT — inside the {e3:.2} ns residual above");
+    println!(
+        "    {:<28} {e3a:8.2} ns   {:5.1}% of E3   AMPLIFIED",
+        STAGE_LABELS[9],
+        100.0 * e3a / e3
+    );
+    println!(
+        "    {:<28} {call:8.2} ns   {:5.1}% of E3   SINGLE-SHOT, {} readings/shape",
+        "E3c the call",
+        100.0 * call / e3,
+        splits.first().map_or(0, |s| s.call_shots)
+    );
+    println!(
+        "    {:<28} {e3b:8.2} ns   {:5.1}% of E3   AMPLIFIED, and INSIDE the call above",
+        "  of which frame build",
+        100.0 * e3b / e3
+    );
+    println!(
+        "    {:<28} {e3d:8.2} ns   {:5.1}% of E3   AMPLIFIED",
+        STAGE_LABELS[11],
+        100.0 * e3d / e3
+    );
+    println!(
+        "    {:<28} {e3_rest:8.2} ns   {:5.1}% of E3   <- RESIDUAL: result construction\n    \
+         {:<28}                             and the drops",
+        "E3 rest",
+        100.0 * e3_rest / e3,
+        ""
+    );
+    println!(
+        "    {:<28} {e3_barrier:8.2} ns   <- what one execute-side amplification pass costs",
+        "(execute barrier)"
+    );
+    if call.is_finite() {
+        println!(
+            "    ⚠ the call is a CLOCKED reading and the two beside it are AMPLIFIED ones.\n    \
+             \x20 An amplified figure is a warm-repeat LOWER bound; the clocked one carries the\n    \
+             \x20 clock pair's residue and is an UPPER bound. Do not read the three as one column."
+        );
+    }
+    #[cfg(feature = "entry-stage-probe")]
+    println!(
+        "    passes reached: exec {:?}, frame builds {}",
+        execute_stage_passes(),
+        frame_build_passes()
     );
     #[cfg(feature = "entry-stage-probe")]
     println!(
