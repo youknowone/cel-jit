@@ -64,6 +64,9 @@ pub fn cel_eval_loop(code: &CelCode, ctx: &Context) -> Result<Value, ExecutionEr
         } else if vm.fuse == FuseArm::AdvanceOnly {
             vm.shape.after_body
         } else {
+            // [`FuseArm::AllButBody`] starts here too and then moves the anchor
+            // itself, because its second entry point is only reachable once the
+            // body has run.
             vm.shape.top
         };
     }
@@ -184,6 +187,35 @@ pub enum FuseArm {
     /// end. Two figures that agree say the split does not depend on the order;
     /// two that disagree bound how much it does.
     AdvanceOnly,
+    /// Every group but the BODY: the guard, the bind and the advance all run
+    /// inline, and the body operator keeps its dispatch.
+    ///
+    /// Measured DIRECTLY against [`FuseArm::None`], as one paired difference,
+    /// rather than assembled from the ladder's marginals. That is the whole
+    /// reason it exists. The cumulative ladder prices each group against an arm
+    /// that has already had the earlier ones removed, and two of its own checks
+    /// say those marginals cannot then be recombined: the order control
+    /// disagrees with the ladder's advance figure in every run taken so far,
+    /// and the four marginals sum to MORE than the measured end-to-end
+    /// difference. Both failures are arithmetic over separately measured arms,
+    /// and this arm has no arithmetic in it.
+    ///
+    /// It is also the shape of a lowering that stays general. Fusing the body
+    /// in as well needs one opcode per body operator, which is the growth
+    /// [`OpCode`]'s own design refuses; leaving it dispatched needs none,
+    /// because the guard, the bind and the advance are the same three
+    /// instructions whatever the body computes.
+    ///
+    /// TWO ENTRY POINTS, ONE ANCHOR. The body sits between the bind and the
+    /// advance, so this cannot be a single straight run: the arm resumes at the
+    /// body and has to be re-entered at [`MapLoop::after_body`]. It MOVES
+    /// `Vm::anchor` between the two rather than adding a second field, which is
+    /// what keeps the dispatch loop at exactly one comparison per instruction
+    /// for every arm -- the property that field's doc comment exists to state.
+    /// The two stores that costs are work no other arm does, so what this arm
+    /// reports is if anything an UNDER-statement of the fusion, never an
+    /// over-statement.
+    AllButBody,
     /// A POSITIVE CONTROL, and the calibration for the "a per-element `Arc`
     /// clone" hypothesis. It re-adds one of the four atomic refcount operations
     /// per element that giving [`OpCode::IterLen`] and [`OpCode::IterAt`] slot
@@ -1127,6 +1159,13 @@ impl<'a> Vm<'a> {
         if arm == FuseArm::AdvanceOnly {
             return self.fused_advance(shape);
         }
+        // [`FuseArm::AllButBody`]'s SECOND entry, taken once the dispatched body
+        // has run. Arming the header again before the advance keeps the next
+        // element entering at the top.
+        if arm == FuseArm::AllButBody && pc == shape.after_body {
+            self.anchor = shape.top;
+            return self.fused_advance(shape);
+        }
 
         // -- the guard: `IterGuard index source done`
         let index = match self.slots.get(shape.index as usize) {
@@ -1184,6 +1223,12 @@ impl<'a> Vm<'a> {
         let previous = std::mem::replace(slot, element);
         self.discard(previous);
         if arm == FuseArm::Bind {
+            return Ok(shape.after_bind);
+        }
+        // [`FuseArm::AllButBody`] hands the body back to the dispatch loop and
+        // re-arms the anchor at the advance, which is where it resumes.
+        if arm == FuseArm::AllButBody {
+            self.anchor = shape.after_body;
             return Ok(shape.after_bind);
         }
 
@@ -2148,6 +2193,7 @@ mod tests {
             FuseArm::Body,
             FuseArm::Advance,
             FuseArm::AdvanceOnly,
+            FuseArm::AllButBody,
             FuseArm::AdvancePlusArcRoundTrip,
         ] {
             let got = cel_eval_loop_with_fuse(&code, &ctx, arm).expect("the arm evaluates");

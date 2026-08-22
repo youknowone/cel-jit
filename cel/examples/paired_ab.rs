@@ -1817,6 +1817,7 @@ fn elem_fusion(cfg: &Config, n: usize) {
         FuseArm::Body,
         FuseArm::Advance,
         FuseArm::AdvanceOnly,
+        FuseArm::AllButBody,
         FuseArm::AdvancePlusArcRoundTrip,
     ] {
         let got = cel_eval_loop_with_fuse(&code, &ctx, arm).expect("the arm evaluates");
@@ -1954,6 +1955,46 @@ fn elem_fusion(cfg: &Config, n: usize) {
             Some(floors),
         );
         per_unit("one Arc round trip", &cpu, floors.cpu, n as f64, "element");
+    }
+
+    // The design candidate, measured as ONE paired difference.
+    //
+    // ⭐ PRE-REGISTERED, written before the number existed. The ladder's own
+    // marginals put this at 7.27..7.71 ns/element, by four spellings that
+    // disagree:
+    //
+    //     SUM CHECK      - body                          7.53
+    //     sum(4)         - body                          7.71
+    //     guard + bind + advance (ladder)                 7.69
+    //     guard + bind + advance (ORDER CONTROL's)        7.27
+    //
+    // The bracket is wide because the marginals are NOT independent: the order
+    // control disagrees with the ladder's advance figure in 3 of 3 runs at
+    // 3.1x-11.6x the floor, and the four marginals sum to MORE than the
+    // measured end-to-end difference by up to 0.66. This arm is the fix for
+    // both, because it is measured directly and recombines nothing.
+    //
+    // ⛔ REFUTES: a figure outside 7.0..8.0, or one that does not resolve.
+    // Below the section floor is UNRESOLVED and is reported as such, never as a
+    // signed number.
+    // ⛔ SUSPICIOUS: anything at or past the SUM CHECK's own magnitude, which
+    // would mean this arm removed the body's dispatch as well -- the one thing
+    // it must not do. The `ARMS AGREE` assertion above cannot catch that, since
+    // an arm that wrongly fused the body would still compute the right answer.
+    {
+        let run = {
+            let mut a = Arm::new("None", arm(FuseArm::None));
+            let mut b = Arm::new("AllButBody", arm(FuseArm::AllButBody));
+            run_pair(&mut a, &mut b, cfg)
+        };
+        let (cpu, _) = report(
+            "DESIGN CANDIDATE: guard+bind+advance fused, BODY still dispatched — \
+             one paired difference, pre-registered at 7.27..7.71 ns/element",
+            &run,
+            cfg,
+            Some(floors),
+        );
+        per_unit("all but body", &cpu, floors.cpu, n as f64, "element");
     }
 
     // The additivity check. Not a new term: the end-to-end difference has to
