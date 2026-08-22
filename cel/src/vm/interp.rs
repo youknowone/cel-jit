@@ -122,17 +122,19 @@ pub fn cel_eval_loop_with_probe(
 /// differences are therefore the per-group figures and the end-to-end
 /// difference is their sum, which is an additivity check.
 ///
-/// Three of the four groups have since become single instructions --
-/// [`OpCode::IterGuard`], [`OpCode::IterBind`] and [`OpCode::IterAdvance`] --
-/// so the operand-stack round trips those groups used to carry are gone from
-/// the STOCK arm too, and what each of the three arms below now removes is one
-/// dispatch and nothing else. The body group is the only one left that is more
-/// than one instruction, and it is where the remaining stack traffic is.
+/// All four groups have since become single instructions --
+/// [`OpCode::IterGuard`], [`OpCode::IterBind`],
+/// [`OpCode::MulLocalConstAppend`] and [`OpCode::IterAdvance`] -- so the
+/// operand-stack round trips those groups used to carry are gone from the
+/// STOCK arm too, and what each of the four arms below now removes is one
+/// dispatch and nothing else. The block holds no push and no pop at all: the
+/// only operand it touches is the builder the append mutates in place, which
+/// was put on the stack before the loop and comes off after it.
 #[cfg(feature = "elem-attr-probe")]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FuseArm {
     /// What the interpreter does without the probe: `IterGuard ; IterBind ;
-    /// MulLocalConst ; ListAppend ; IterAdvance`, stepped one at a time.
+    /// MulLocalConstAppend ; IterAdvance`, stepped one at a time.
     ///
     /// Named rather than counted, and every arm below names what it fuses for
     /// the same reason: `recognize_map_loop`'s `WANT` is that list and will
@@ -160,11 +162,12 @@ pub enum FuseArm {
     /// still read through `ListRef::get` and still written into the slot with
     /// the same `mem::replace` and discard.
     Bind,
-    /// ... plus `MulLocalConst var k ; ListAppend`, which are the only two
-    /// instructions the per-element block has left that touch the operand
-    /// stack at all: the operator pushes its answer and `ListAppend` takes it
-    /// straight off again. `binary_values` is still called, with the same two
-    /// operands, and the result is still pushed into the same builder.
+    /// ... plus `MulLocalConstAppend var k` -- one dispatch. The pair this
+    /// replaced, `MulLocalConst var k ; ListAppend`, was the last group in the
+    /// block that put a value on the operand stack and took it off again;
+    /// what is left is the operator handing its answer to the builder
+    /// directly. `binary_values` is still called, with the same two operands,
+    /// and the result still reaches the same builder.
     Body,
     /// ... plus `IterAdvance index top` -- one dispatch. The whole element is
     /// one step, and no dispatch at all is left in it. The counter is still
@@ -259,17 +262,16 @@ const NO_MAP_LOOP: MapLoop = MapLoop {
     after_body: 0,
 };
 
-/// Find the five-instruction per-element block, if the program has one.
+/// Find the four-instruction per-element block, if the program has one.
 ///
 /// Run once per evaluation by EVERY arm, so its cost is a constant that cancels
 /// out of any difference between two of them.
 #[cfg(feature = "elem-attr-probe")]
 fn recognize_map_loop(code: &CelCode) -> MapLoop {
-    const WANT: [OpCode; 5] = [
+    const WANT: [OpCode; 4] = [
         OpCode::IterGuard,
         OpCode::IterBind,
-        OpCode::MulLocalConst,
-        OpCode::ListAppend,
+        OpCode::MulLocalConstAppend,
         OpCode::IterAdvance,
     ];
     // A shift register rather than a collected stream: this runs once per
@@ -302,8 +304,8 @@ fn recognize_map_loop(code: &CelCode) -> MapLoop {
         let consistent = window[1].2[0] == source
             && window[1].2[1] == index
             && window[2].2[0] == var
-            && window[4].2[0] == index
-            && window[4].2[1] == window[0].0;
+            && window[3].2[0] == index
+            && window[3].2[1] == window[0].0;
         if !consistent {
             continue;
         }
@@ -318,7 +320,7 @@ fn recognize_map_loop(code: &CelCode) -> MapLoop {
             konst: window[2].2[1],
             after_guard: window[1].0,
             after_bind: window[2].0,
-            after_body: window[4].0,
+            after_body: window[3].0,
         };
     }
     NO_MAP_LOOP
@@ -1109,9 +1111,8 @@ impl<'a> Vm<'a> {
     /// Every quantity below is computed from the same slot, the same constant
     /// and the same helper the instructions it replaces used. What is gone is
     /// the dispatch of those instructions and whatever operand-stack round
-    /// trips they still had -- which, outside the body group, is none: the
-    /// guard, the bind and the advance are each one instruction that names its
-    /// slots.
+    /// trips they still had -- which is none: each of the four groups is one
+    /// instruction that names everything it reads.
     ///
     /// The operand stack is left at the depth the fused instructions would have
     /// left it: every group below is stack-neutral end to end, so the builder
@@ -1186,7 +1187,7 @@ impl<'a> Vm<'a> {
             return Ok(shape.after_bind);
         }
 
-        // -- the body and the append: `MulLocalConst var k ; ListAppend`
+        // -- the body and the append: `MulLocalConstAppend var k`
         let lhs = self
             .slots
             .get(shape.var as usize)
@@ -1484,6 +1485,81 @@ impl<'a> Vm<'a> {
                 let lhs = self.pop()?;
                 let value = value_contains(&rhs, &lhs).map_err(|e| self.park(e))?;
                 self.push(Value::Bool(value));
+            }
+
+            // -- producing straight into a list ----------------------------
+            //
+            // Each of these is one of the producers above followed by the
+            // `ListAppend` that took its answer off the stack again. The
+            // answer is computed exactly as the producer computes it -- same
+            // slot, same pool entry, same helper, same operand order, so the
+            // error a failure raises is the pair's -- and handed to the
+            // builder instead of pushed. `list_mut` reads the builder off the
+            // top of the stack without popping it, which is what `ListAppend`
+            // does too.
+            OpCode::LoadLocalAppend => {
+                let value = self
+                    .slots
+                    .get(a as usize)
+                    .ok_or(CelErr::InternalError)?
+                    .clone();
+                self.list_mut()?.push(value);
+            }
+            OpCode::GetFieldLocalAppend | OpCode::HasFieldLocalAppend => {
+                let read = {
+                    let operand = self.slots.get(a as usize).ok_or(CelErr::InternalError)?;
+                    let field = self.name(b)?;
+                    if op == OpCode::HasFieldLocalAppend {
+                        has_field(operand, field)
+                    } else {
+                        value_field(operand, field)
+                    }
+                };
+                let value = read.map_err(|e| self.park(e))?;
+                self.list_mut()?.push(value);
+            }
+            OpCode::AddLocalConstAppend
+            | OpCode::MulLocalConstAppend
+            | OpCode::ModLocalConstAppend => {
+                let lhs = self
+                    .slots
+                    .get(a as usize)
+                    .ok_or(CelErr::InternalError)?
+                    .clone();
+                let rhs = self.code.konst(b).ok_or(CelErr::InternalError)?.clone();
+                let name = match op {
+                    OpCode::AddLocalConstAppend => "add",
+                    OpCode::MulLocalConstAppend => "mul",
+                    _ => "rem",
+                };
+                let value = binary_values(name, lhs, rhs).map_err(|e| self.park(e))?;
+                self.list_mut()?.push(value);
+            }
+            OpCode::EqualsLocalConstAppend | OpCode::NotEqualsLocalConstAppend => {
+                let equal = {
+                    let lhs = self.slots.get(a as usize).ok_or(CelErr::InternalError)?;
+                    let rhs = self.code.konst(b).ok_or(CelErr::InternalError)?;
+                    lhs == rhs
+                };
+                let value = Value::Bool(equal == (op == OpCode::EqualsLocalConstAppend));
+                self.list_mut()?.push(value);
+            }
+            OpCode::LessLocalConstAppend
+            | OpCode::GreaterLocalConstAppend
+            | OpCode::GreaterEqualsLocalConstAppend => {
+                let lhs = self
+                    .slots
+                    .get(a as usize)
+                    .ok_or(CelErr::InternalError)?
+                    .clone();
+                let rhs = self.code.konst(b).ok_or(CelErr::InternalError)?.clone();
+                let accept: fn(Ordering) -> bool = match op {
+                    OpCode::LessLocalConstAppend => |o| o == Ordering::Less,
+                    OpCode::GreaterLocalConstAppend => |o| o == Ordering::Greater,
+                    _ => |o| o != Ordering::Less,
+                };
+                let value = compare_values(lhs, rhs, accept).map_err(|e| self.park(e))?;
+                self.list_mut()?.push(value);
             }
 
             // -- unary operators -------------------------------------------
@@ -2140,6 +2216,11 @@ mod tests {
     /// half-fused shape the slot half exists to exclude -- and would leave the
     /// eight stack-operand arms with no source that runs them at all, because
     /// every left operand below the divider is a slot.
+    ///
+    /// A slot source comes in two forms, and which one it is depends on what
+    /// consumes the answer rather than on the fold: a `map` body IS the
+    /// element, so its operator appends, and a `filter` guard's feeds a jump,
+    /// so its operator pushes. Both are the same fold and both are here.
     #[test]
     fn a_folded_literal_operand_answers_what_the_pair_answered() {
         const SLOT_AND_CONST: [OpCode; 8] = [
@@ -2152,6 +2233,29 @@ mod tests {
             OpCode::GreaterLocalConst,
             OpCode::GreaterEqualsLocalConst,
         ];
+        const SLOT_AND_CONST_APPEND: [OpCode; 8] = [
+            OpCode::AddLocalConstAppend,
+            OpCode::MulLocalConstAppend,
+            OpCode::ModLocalConstAppend,
+            OpCode::EqualsLocalConstAppend,
+            OpCode::NotEqualsLocalConstAppend,
+            OpCode::LessLocalConstAppend,
+            OpCode::GreaterLocalConstAppend,
+            OpCode::GreaterEqualsLocalConstAppend,
+        ];
+        /// Both slot forms, built from the two above rather than written out:
+        /// a free-variable left operand must reach NEITHER, and a third list
+        /// that had to be kept in step with them is a list that would not be.
+        const EITHER_SLOT_FORM: [OpCode; 16] = {
+            let mut both = [OpCode::Return; 16];
+            let mut i = 0;
+            while i < SLOT_AND_CONST.len() {
+                both[i] = SLOT_AND_CONST[i];
+                both[i + SLOT_AND_CONST.len()] = SLOT_AND_CONST_APPEND[i];
+                i += 1;
+            }
+            both
+        };
         const STACK_AND_CONST: [OpCode; 8] = [
             OpCode::AddConst,
             OpCode::MulConst,
@@ -2174,32 +2278,121 @@ mod tests {
         ctx.add_variable_from_value("t", hi());
 
         for (source, want, forbidden) in [
-            // -- a slot left operand: both operands fold --------------------
+            // -- a slot left operand, appending: both operands fold, and the
+            //    answer is the element ------------------------------------
             // `binary_values`: the operator's name reaches the error.
-            ("xs.map(x, x * 2)", SLOT_AND_CONST, STACK_AND_CONST),
-            ("xs.map(x, x + 1)", SLOT_AND_CONST, STACK_AND_CONST),
-            ("xs.map(x, x % 0)", SLOT_AND_CONST, STACK_AND_CONST),
-            ("ss.map(s, s % 2)", SLOT_AND_CONST, STACK_AND_CONST),
-            // `compare_values`: operands of different types.
-            ("ss.filter(s, s < 3)", SLOT_AND_CONST, STACK_AND_CONST),
-            ("ss.filter(s, s > 3)", SLOT_AND_CONST, STACK_AND_CONST),
-            ("ss.filter(s, s >= 3)", SLOT_AND_CONST, STACK_AND_CONST),
+            (
+                "xs.map(x, x * 2)",
+                &SLOT_AND_CONST_APPEND[..],
+                &STACK_AND_CONST[..],
+            ),
+            (
+                "xs.map(x, x + 1)",
+                &SLOT_AND_CONST_APPEND[..],
+                &STACK_AND_CONST[..],
+            ),
+            (
+                "xs.map(x, x % 0)",
+                &SLOT_AND_CONST_APPEND[..],
+                &STACK_AND_CONST[..],
+            ),
+            (
+                "ss.map(s, s % 2)",
+                &SLOT_AND_CONST_APPEND[..],
+                &STACK_AND_CONST[..],
+            ),
             // Equality answers `false` across types rather than raising, and
             // is the one group that reads both operands in place.
-            ("ss.map(s, s == 'hi')", SLOT_AND_CONST, STACK_AND_CONST),
-            ("ss.map(s, s != 'hi')", SLOT_AND_CONST, STACK_AND_CONST),
-            ("ss.map(s, s == 3)", SLOT_AND_CONST, STACK_AND_CONST),
-            ("xs.map(x, x == 1)", SLOT_AND_CONST, STACK_AND_CONST),
+            (
+                "ss.map(s, s == 'hi')",
+                &SLOT_AND_CONST_APPEND[..],
+                &STACK_AND_CONST[..],
+            ),
+            (
+                "ss.map(s, s != 'hi')",
+                &SLOT_AND_CONST_APPEND[..],
+                &STACK_AND_CONST[..],
+            ),
+            (
+                "ss.map(s, s == 3)",
+                &SLOT_AND_CONST_APPEND[..],
+                &STACK_AND_CONST[..],
+            ),
+            (
+                "xs.map(x, x == 1)",
+                &SLOT_AND_CONST_APPEND[..],
+                &STACK_AND_CONST[..],
+            ),
+            // -- a slot left operand, pushing: the same fold in a guard, whose
+            //    answer a jump consumes rather than a list ------------------
+            // `compare_values`: operands of different types.
+            (
+                "ss.filter(s, s < 3)",
+                &SLOT_AND_CONST[..],
+                &STACK_AND_CONST[..],
+            ),
+            (
+                "ss.filter(s, s > 3)",
+                &SLOT_AND_CONST[..],
+                &STACK_AND_CONST[..],
+            ),
+            (
+                "ss.filter(s, s >= 3)",
+                &SLOT_AND_CONST[..],
+                &STACK_AND_CONST[..],
+            ),
+            (
+                "xs.filter(x, x == 1)",
+                &SLOT_AND_CONST[..],
+                &STACK_AND_CONST[..],
+            ),
+            (
+                "xs.filter(x, x != 1)",
+                &SLOT_AND_CONST[..],
+                &STACK_AND_CONST[..],
+            ),
             // -- a free-variable left operand: only the constant folds, so
             //    these are the sources that run the eight arms above ---------
-            ("xs.map(x, n * 2)", STACK_AND_CONST, SLOT_AND_CONST),
-            ("xs.map(x, n + 1)", STACK_AND_CONST, SLOT_AND_CONST),
-            ("xs.map(x, n % 0)", STACK_AND_CONST, SLOT_AND_CONST),
-            ("ss.filter(s, t < 3)", STACK_AND_CONST, SLOT_AND_CONST),
-            ("ss.filter(s, t > 3)", STACK_AND_CONST, SLOT_AND_CONST),
-            ("ss.filter(s, t >= 3)", STACK_AND_CONST, SLOT_AND_CONST),
-            ("ss.map(s, t == 'hi')", STACK_AND_CONST, SLOT_AND_CONST),
-            ("ss.map(s, t != 'hi')", STACK_AND_CONST, SLOT_AND_CONST),
+            (
+                "xs.map(x, n * 2)",
+                &STACK_AND_CONST[..],
+                &EITHER_SLOT_FORM[..],
+            ),
+            (
+                "xs.map(x, n + 1)",
+                &STACK_AND_CONST[..],
+                &EITHER_SLOT_FORM[..],
+            ),
+            (
+                "xs.map(x, n % 0)",
+                &STACK_AND_CONST[..],
+                &EITHER_SLOT_FORM[..],
+            ),
+            (
+                "ss.filter(s, t < 3)",
+                &STACK_AND_CONST[..],
+                &EITHER_SLOT_FORM[..],
+            ),
+            (
+                "ss.filter(s, t > 3)",
+                &STACK_AND_CONST[..],
+                &EITHER_SLOT_FORM[..],
+            ),
+            (
+                "ss.filter(s, t >= 3)",
+                &STACK_AND_CONST[..],
+                &EITHER_SLOT_FORM[..],
+            ),
+            (
+                "ss.map(s, t == 'hi')",
+                &STACK_AND_CONST[..],
+                &EITHER_SLOT_FORM[..],
+            ),
+            (
+                "ss.map(s, t != 'hi')",
+                &STACK_AND_CONST[..],
+                &EITHER_SLOT_FORM[..],
+            ),
         ] {
             let expr = parse(source);
             let code = compile(&expr).unwrap_or_else(|e| panic!("compile {source}: {e}"));
@@ -2215,6 +2408,185 @@ mod tests {
             assert!(
                 !ops.iter().any(|op| forbidden.contains(op)),
                 "{source} reaches one of {forbidden:?}:\n{}",
+                code.disassemble()
+            );
+            assert_eq!(
+                cel_eval_loop(&code, &ctx),
+                crate::Value::resolve_value(&expr, &ctx),
+                "{source}"
+            );
+        }
+    }
+
+    /// An arithmetic fold still pushes where its answer is not the element.
+    ///
+    /// A `map` body IS the element, so its operator appends; five of the eight
+    /// pushing arms are reached by a `filter` guard in the case above. The
+    /// three arithmetic ones cannot be a guard on their own -- a non-bool
+    /// condition is an error rather than a fold -- so they are reached through
+    /// an enclosing comparison. That comparison's own operator is one of the
+    /// forms the case above forbids, which is why these are here and not
+    /// there.
+    #[test]
+    fn an_arithmetic_fold_still_pushes_where_its_answer_is_not_the_element() {
+        let mut ctx = Context::default();
+        ctx.add_variable_from_value("xs", vec![3i64, 4]);
+
+        for (source, want, half_fused) in [
+            (
+                "xs.all(x, x + 1 > 0)",
+                OpCode::AddLocalConst,
+                OpCode::AddConst,
+            ),
+            (
+                "xs.all(x, x * 2 > 0)",
+                OpCode::MulLocalConst,
+                OpCode::MulConst,
+            ),
+            (
+                "xs.all(x, x % 2 > 0)",
+                OpCode::ModLocalConst,
+                OpCode::ModConst,
+            ),
+        ] {
+            let expr = parse(source);
+            let code = compile(&expr).unwrap_or_else(|e| panic!("compile {source}: {e}"));
+            let ops: Vec<OpCode> = code.instructions().map(|(_, op, _)| op).collect();
+            assert!(
+                ops.contains(&want),
+                "{source} reaches no {want:?}:\n{}",
+                code.disassemble()
+            );
+            assert!(
+                !ops.contains(&half_fused),
+                "{source} left its left operand on the stack under {half_fused:?}:\n{}",
+                code.disassemble()
+            );
+            assert_eq!(
+                cel_eval_loop(&code, &ctx),
+                crate::Value::resolve_value(&expr, &ctx),
+                "{source}"
+            );
+        }
+    }
+
+    /// Every producer that appends its own answer agrees with the walker, and
+    /// the pair it replaced is gone from the program.
+    ///
+    /// One source per appending opcode, so an arm that read the wrong slot,
+    /// the wrong pool entry or the wrong side of a comparison answers a
+    /// well-formed value of the same shape and is caught by the walker rather
+    /// than by inspection. The `ListAppend` check is the other half: a source
+    /// that quietly stopped fusing would still agree with the walker, and
+    /// agreeing is not what this is about.
+    #[test]
+    fn every_appending_producer_answers_what_its_pair_answered() {
+        let hi = || Value::String(Arc::new("hi".to_string()));
+        let record = Value::Map(crate::objects::Map::from(
+            [("price", Value::Int(7))]
+                .into_iter()
+                .collect::<HashMap<_, _>>(),
+        ));
+        let mut ctx = Context::default();
+        ctx.add_variable_from_value("xs", vec![1i64, 2, 3]);
+        ctx.add_variable_from_value("ss", Value::list(vec![hi()]));
+        ctx.add_variable_from_value("items", Value::list(vec![record]));
+
+        for (source, want) in [
+            ("xs.map(x, x)", OpCode::LoadLocalAppend),
+            ("items.map(i, i.price)", OpCode::GetFieldLocalAppend),
+            ("items.map(i, has(i.price))", OpCode::HasFieldLocalAppend),
+            ("xs.map(x, x + 1)", OpCode::AddLocalConstAppend),
+            ("xs.map(x, x * 2)", OpCode::MulLocalConstAppend),
+            ("xs.map(x, x % 2)", OpCode::ModLocalConstAppend),
+            ("xs.map(x, x == 2)", OpCode::EqualsLocalConstAppend),
+            ("xs.map(x, x != 2)", OpCode::NotEqualsLocalConstAppend),
+            ("xs.map(x, x < 2)", OpCode::LessLocalConstAppend),
+            ("xs.map(x, x > 2)", OpCode::GreaterLocalConstAppend),
+            ("xs.map(x, x >= 2)", OpCode::GreaterEqualsLocalConstAppend),
+            // The operators reach their failing paths through the same arms:
+            // `binary_values` under the operator's own name, and
+            // `compare_values` across two types.
+            ("xs.map(x, x % 0)", OpCode::ModLocalConstAppend),
+            ("ss.map(s, s < 3)", OpCode::LessLocalConstAppend),
+            ("ss.map(s, s == 'hi')", OpCode::EqualsLocalConstAppend),
+        ] {
+            let expr = parse(source);
+            let code = compile(&expr).unwrap_or_else(|e| panic!("compile {source}: {e}"));
+            let ops: Vec<OpCode> = code.instructions().map(|(_, op, _)| op).collect();
+            assert!(
+                ops.contains(&want),
+                "{source} reaches no {want:?}:\n{}",
+                code.disassemble()
+            );
+            assert!(
+                !ops.contains(&OpCode::ListAppend),
+                "{source} still routes its element through the operand stack:\n{}",
+                code.disassemble()
+            );
+            assert_eq!(
+                cel_eval_loop(&code, &ctx),
+                crate::Value::resolve_value(&expr, &ctx),
+                "{source}"
+            );
+        }
+    }
+
+    /// An element that is not a slot-naming producer keeps the pair.
+    ///
+    /// Each of these declines for its own reason, and each reason is one that
+    /// makes the fusion WRONG rather than merely missed: an operand that has
+    /// to come off the stack, a left operand the fold cannot reorder around, a
+    /// name that is not a slot at all. Naming the instruction that must still
+    /// carry the value is what makes a case fail for its own reason -- a bare
+    /// "a `ListAppend` is present" would be satisfied by any of the others
+    /// declining in its place.
+    ///
+    /// Held against the walker as well, because an unfused program that
+    /// stopped agreeing is the same defect as a fused one that did.
+    #[test]
+    fn an_element_that_is_not_a_slot_producer_keeps_the_pair() {
+        let record = Value::Map(crate::objects::Map::from(
+            [("price", Value::Int(7))]
+                .into_iter()
+                .collect::<HashMap<_, _>>(),
+        ));
+        let mut ctx = Context::default();
+        ctx.add_variable_from_value("xs", vec![1i64, 2, 3]);
+        ctx.add_variable_from_value("lim", Value::Int(4));
+        ctx.add_variable_from_value("items", Value::list(vec![record]));
+
+        for (source, kept) in [
+            // No folded twin, so the constant stays under its own load and
+            // the operator pops two.
+            ("xs.map(x, x - 1)", OpCode::Sub),
+            // The literal is on the LEFT, which the fold cannot reorder
+            // around: `1 - x` is not `x - 1`, so neither half folds.
+            ("xs.map(x, 1 * x)", OpCode::Mul),
+            // A free variable is a context lookup, not a slot; the constant
+            // still folds and the left operand still reaches the stack.
+            ("xs.map(x, lim * 2)", OpCode::MulConst),
+            // The whole element is a context lookup.
+            ("xs.map(x, lim)", OpCode::LoadVar),
+            // A chain: only the innermost read names a slot, and the outer one
+            // pops what it pushed.
+            ("items.map(i, i.price.cents)", OpCode::GetField),
+            // A call's arguments come off the stack, so its answer does too.
+            ("xs.map(x, [x].size())", OpCode::CallMethod),
+        ] {
+            let expr = parse(source);
+            let code = compile(&expr).unwrap_or_else(|e| panic!("compile {source}: {e}"));
+            let ops: Vec<OpCode> = code.instructions().map(|(_, op, _)| op).collect();
+            assert!(
+                ops.contains(&kept),
+                "{source} no longer reaches {kept:?}, so it declines for some \
+                 other reason than the one this case is about:\n{}",
+                code.disassemble()
+            );
+            assert!(
+                ops.contains(&OpCode::ListAppend),
+                "{source} fused an element whose value does not come from a \
+                 named slot:\n{}",
                 code.disassemble()
             );
             assert_eq!(

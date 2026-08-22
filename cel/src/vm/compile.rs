@@ -80,6 +80,40 @@ struct PatchSite {
     slot: usize,
 }
 
+/// An instruction that has been decided but not yet emitted: its opcode and
+/// the operand words it can carry.
+///
+/// A value rather than an emission because two different sites want the same
+/// decision. `x * 2` as an expression pushes its answer; `x * 2` as the
+/// element of a list hands the answer to the builder instead. Which of the two
+/// it is belongs to the *consumer*, and what the instruction is does not, so
+/// the recogniser answers with this and the caller says where the answer goes.
+/// [`Compiler::emit`] is still the only writer.
+#[derive(Clone, Copy)]
+struct Decided {
+    op: OpCode,
+    /// Two words because no producer recognised here declares three; the
+    /// opcode says how many of them are its own.
+    words: [u32; 2],
+}
+
+impl Decided {
+    /// The operand words this opcode declares, which is the slice
+    /// [`Compiler::emit`] checks its arity against.
+    fn operands(&self) -> &[u32] {
+        &self.words[..self.op.operands() as usize]
+    }
+
+    /// The same instruction with its answer appended to the list beneath it
+    /// instead of pushed, if this producer has such a form.
+    fn appending(self) -> Option<Decided> {
+        Some(Decided {
+            op: appending_producer(self.op)?,
+            words: self.words,
+        })
+    }
+}
+
 #[derive(Default)]
 struct Compiler {
     insns: Vec<Insn>,
@@ -136,6 +170,11 @@ impl Compiler {
         self.depth += i64::from(pushes);
         self.max_stack = self.max_stack.max(self.depth);
         Ok(at)
+    }
+
+    /// [`Compiler::emit`] for an instruction a recogniser already decided.
+    fn emit_decided(&mut self, decided: Decided, id: u64) -> Result<u32, CompileError> {
+        self.emit(decided.op, decided.operands(), id)
     }
 
     fn here(&self) -> u32 {
@@ -270,8 +309,8 @@ impl Compiler {
     /// The compile-time split the walker makes at run time: a comprehension
     /// variable is a slot, anything else is a context lookup.
     fn ident(&mut self, name: &str, id: u64) -> Result<(), CompileError> {
-        match self.lookup(name) {
-            Some(slot) => self.emit(OpCode::LoadLocal, &[slot], id)?,
+        match self.local_load(name) {
+            Some(decided) => self.emit_decided(decided, id)?,
             None => {
                 let name = self.add_name(name, id)?;
                 self.emit(OpCode::LoadVar, &[name.0], id)?
@@ -291,17 +330,9 @@ impl Compiler {
         //
         // A comprehension variable is a slot, so this is the shape of every
         // field read in a loop body.
-        if let Expr::Ident(name) = &select.operand.expr {
-            if let Some(slot) = self.lookup(name) {
-                let field = self.add_name(&select.field, id)?;
-                let op = if select.test {
-                    OpCode::HasFieldLocal
-                } else {
-                    OpCode::GetFieldLocal
-                };
-                self.emit(op, &[slot, field.0], id)?;
-                return Ok(());
-            }
+        if let Some(decided) = self.field_local(select, id)? {
+            self.emit_decided(decided, id)?;
+            return Ok(());
         }
 
         self.expr(&select.operand)?;
@@ -318,13 +349,16 @@ impl Compiler {
     fn list(&mut self, list: &ListExpr, id: u64) -> Result<(), CompileError> {
         self.emit(OpCode::NewList, &[], id)?;
         for (index, element) in list.elements.iter().enumerate() {
-            self.expr(element)?;
-            let op = if list.optional_indices.contains(&index) {
-                OpCode::ListAppendOptional
-            } else {
-                OpCode::ListAppend
-            };
-            self.emit(op, &[], element.id)?;
+            // An optional element is not the fused shape and keeps the pair:
+            // whether it contributes at all is only known once its value has
+            // been evaluated, so what the append does with the value is the
+            // instruction's whole job and cannot be folded into producing it.
+            if list.optional_indices.contains(&index) {
+                self.expr(element)?;
+                self.emit(OpCode::ListAppendOptional, &[], element.id)?;
+                continue;
+            }
+            self.append_element(element)?;
         }
         Ok(())
     }
@@ -450,6 +484,184 @@ fn local_const_operator(op: OpCode) -> Option<OpCode> {
     Some(fused)
 }
 
+/// The form of a producer that appends its answer to the list beneath it
+/// rather than pushing it, if this producer has one.
+///
+/// The set is the producers that name a SLOT: [`OpCode::LoadLocal`], the two
+/// field reads over a slot, and the eight operators over a slot and a literal.
+/// Naming a slot is the criterion because it is what makes the answer a
+/// function of the element the loop just bound, which is what an append inside
+/// a comprehension consumes once per iteration. A producer that names no slot
+/// -- a `LoadConst`, a `LoadVar` -- appends the same value on every iteration,
+/// so what such a program wants is a hoist and not an opcode, and it keeps the
+/// pair.
+///
+/// Keyed on the producer's opcode rather than on the AST, so the three
+/// recognisers that decide a producer -- [`Compiler::local_load`],
+/// [`Compiler::field_local`] and [`Compiler::binary_local_const`] -- reach
+/// their appending twin through one table and none of them can grow a shape
+/// the others lack.
+fn appending_producer(op: OpCode) -> Option<OpCode> {
+    let fused = match op {
+        OpCode::LoadLocal => OpCode::LoadLocalAppend,
+        OpCode::GetFieldLocal => OpCode::GetFieldLocalAppend,
+        OpCode::HasFieldLocal => OpCode::HasFieldLocalAppend,
+        OpCode::AddLocalConst => OpCode::AddLocalConstAppend,
+        OpCode::MulLocalConst => OpCode::MulLocalConstAppend,
+        OpCode::ModLocalConst => OpCode::ModLocalConstAppend,
+        OpCode::EqualsLocalConst => OpCode::EqualsLocalConstAppend,
+        OpCode::NotEqualsLocalConst => OpCode::NotEqualsLocalConstAppend,
+        OpCode::LessLocalConst => OpCode::LessLocalConstAppend,
+        OpCode::GreaterLocalConst => OpCode::GreaterLocalConstAppend,
+        OpCode::GreaterEqualsLocalConst => OpCode::GreaterEqualsLocalConstAppend,
+        _ => return None,
+    };
+    Some(fused)
+}
+
+/// The producer recognisers.
+///
+/// Each one is the whole decision for its shape, and both of the sites that
+/// want that decision go through it: the site that pushes the answer, and
+/// [`Compiler::append_element`], which hands the answer to a list builder
+/// instead. A recogniser that DECLINES has added nothing to a pool, so a
+/// caller is free to compile the expression by the ordinary path afterwards.
+impl Compiler {
+    /// A name that resolves to a slot, as the one instruction it lowers to.
+    fn local_load(&self, name: &str) -> Option<Decided> {
+        self.lookup(name).map(|slot| Decided {
+            op: OpCode::LoadLocal,
+            words: [slot, 0],
+        })
+    }
+
+    /// A field read whose operand is a slot, as the one instruction it lowers
+    /// to.
+    ///
+    /// `SelectExpr::test` is set only by the `has` macro expander, so it is a
+    /// compile-time constant and picks the opcode rather than a branch.
+    fn field_local(
+        &mut self,
+        select: &SelectExpr,
+        id: u64,
+    ) -> Result<Option<Decided>, CompileError> {
+        let Expr::Ident(name) = &select.operand.expr else {
+            return Ok(None);
+        };
+        let Some(slot) = self.lookup(name) else {
+            return Ok(None);
+        };
+        let field = self.add_name(&select.field, id)?;
+        let op = if select.test {
+            OpCode::HasFieldLocal
+        } else {
+            OpCode::GetFieldLocal
+        };
+        Ok(Some(Decided {
+            op,
+            words: [slot, field.0],
+        }))
+    }
+
+    /// A binary operator whose left operand is a slot and whose right operand
+    /// is a literal, as the one instruction it lowers to.
+    ///
+    /// Only the RIGHT operand may be the literal: the fused form keeps the
+    /// operand order the helpers are called with, and `1 - x` is not `x - 1`.
+    /// `args` is the operator's two arguments, which the caller has already
+    /// checked the arity of.
+    fn binary_local_const(
+        &mut self,
+        op: OpCode,
+        args: &[IdedExpr],
+        id: u64,
+    ) -> Result<Option<Decided>, CompileError> {
+        // Reached through the folded form rather than from the base operator,
+        // so an operator with no folded twin has no fused-local one either.
+        let Some(fused) = const_operator(op).and_then(local_const_operator) else {
+            return Ok(None);
+        };
+        let Expr::Literal(literal) = &args[1].expr else {
+            return Ok(None);
+        };
+        // A free variable is a `LoadVar` context lookup rather than a slot, so
+        // it keeps the pair.
+        let Expr::Ident(name) = &args[0].expr else {
+            return Ok(None);
+        };
+        let Some(slot) = self.lookup(name) else {
+            return Ok(None);
+        };
+        let konst = self.add_const(literal.to_value(), id)?;
+        Ok(Some(Decided {
+            op: fused,
+            words: [slot, konst],
+        }))
+    }
+
+    /// The one instruction an expression lowers to when it names a slot and
+    /// pushes a finished value, or `None` when it is anything else.
+    ///
+    /// The union of the three recognisers above, over the AST shapes that
+    /// reach them. Anything else -- a computation whose operands come off the
+    /// stack, a load of something that is not a slot -- is not one
+    /// instruction, or is one that does not name what it reads, and either
+    /// way there is nothing here to fuse.
+    fn slot_producer(&mut self, e: &IdedExpr) -> Result<Option<Decided>, CompileError> {
+        match &e.expr {
+            Expr::Ident(name) => Ok(self.local_load(name)),
+            Expr::Select(select) => self.field_local(select, e.id),
+            // An operator name can only be an operator, and a receiver means
+            // a method call rather than one; both are `Compiler::call`'s test.
+            Expr::Call(call) if call.target.is_none() => {
+                let Some((op, 2)) = simple_operator(&call.func_name) else {
+                    return Ok(None);
+                };
+                if call.args.len() != 2 {
+                    return Ok(None);
+                }
+                self.binary_local_const(op, &call.args, e.id)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Emit one element of a list and the append that puts it there.
+    ///
+    /// One instruction when the element is a slot-naming producer, and the
+    /// pair otherwise -- which is unfused rather than wrong, the way an
+    /// operator absent from [`const_operator`] keeps its `LoadConst`.
+    ///
+    /// Decided from the AST before anything is emitted, for the reason
+    /// [`Compiler::comprehension`] gives: folding two emitted instructions
+    /// into one after the fact renumbers every `pc` after the fold, and a `pc`
+    /// is what a jump operand and a [`Handler`] bound both are.
+    fn append_element(&mut self, element: &IdedExpr) -> Result<(), CompileError> {
+        let id = element.id;
+        let Some(decided) = self.slot_producer(element)? else {
+            self.expr(element)?;
+            self.emit(OpCode::ListAppend, &[], id)?;
+            return Ok(());
+        };
+        match decided.appending() {
+            Some(fused) => {
+                self.emit_decided(fused, id)?;
+            }
+            // A recognised producer with no appending twin emits what it
+            // decided rather than falling back to `Compiler::expr`, which
+            // would compile the element a second time and add its name or its
+            // constant to the pool twice. Nothing in `appending_producer`
+            // declines today; this arm is what makes that a property of the
+            // table rather than of this call site.
+            None => {
+                self.emit_decided(decided, id)?;
+                self.emit(OpCode::ListAppend, &[], id)?;
+            }
+        }
+        Ok(())
+    }
+}
+
 impl Compiler {
     fn call(&mut self, call: &CallExpr, id: u64) -> Result<(), CompileError> {
         // An operator name can only be an operator: the parser mints these
@@ -466,22 +678,15 @@ impl Compiler {
                 // order the helpers are called with, and `1 - x` is not
                 // `x - 1`.
                 if arity == 2 {
+                    // The LEFT operand folds in as well when it is a slot,
+                    // leaving the whole binary in one instruction.
+                    if let Some(decided) = self.binary_local_const(op, &call.args, id)? {
+                        self.emit_decided(decided, id)?;
+                        return Ok(());
+                    }
                     if let (Some(fused), Expr::Literal(literal)) =
                         (const_operator(op), &call.args[1].expr)
                     {
-                        // The LEFT operand folds in as well when it is a slot,
-                        // leaving the whole binary in one instruction. A free
-                        // variable is a `LoadVar` context lookup rather than a
-                        // slot, so it keeps the pair.
-                        let local = match &call.args[0].expr {
-                            Expr::Ident(name) => self.lookup(name),
-                            _ => None,
-                        };
-                        if let Some((fused_local, slot)) = local_const_operator(fused).zip(local) {
-                            let konst = self.add_const(literal.to_value(), id)?;
-                            self.emit(fused_local, &[slot, konst], id)?;
-                            return Ok(());
-                        }
                         self.expr(&call.args[0])?;
                         let konst = self.add_const(literal.to_value(), id)?;
                         self.emit(fused, &[konst], id)?;
@@ -1004,7 +1209,7 @@ impl Compiler {
     ///   IterGuard index source done
     ///   IterBind source index iter_var
     ///   [<guard> JumpIfFalse skip]
-    ///   <element>  ListAppend            ; the push, straight into the builder
+    ///   <element+append>                 ; straight into the builder
     /// skip:
     ///   IterAdvance index top
     /// done:
@@ -1055,8 +1260,7 @@ impl Compiler {
             None => None,
         };
 
-        self.expr(append.element)?;
-        self.emit(OpCode::ListAppend, &[], id)?;
+        self.append_element(append.element)?;
 
         if let Some(skipped) = skipped {
             self.patch_to_here(skipped);
@@ -1079,6 +1283,7 @@ mod tests {
     use super::*;
     use crate::common::ast::IdedExpr;
     use crate::parser::Parser;
+    use crate::vm::OPCODE_COUNT;
 
     fn code_of(source: &str) -> CelCode {
         let expr = Parser::default()
@@ -1125,7 +1330,10 @@ mod tests {
     #[test]
     fn a_field_read_off_a_comprehension_variable_never_loads_its_container() {
         for (source, fused) in [
-            ("items.map(i, i.price)", OpCode::GetFieldLocal),
+            // `map`'s body IS the element, so the read appends its answer
+            // rather than pushing it; `all`'s feeds the loop condition.
+            ("items.map(i, i.price)", OpCode::GetFieldLocalAppend),
+            ("items.filter(i, i.price > 10)", OpCode::GetFieldLocal),
             ("items.all(i, has(i.price))", OpCode::HasFieldLocal),
         ] {
             let code = code_of(source);
@@ -1806,6 +2014,25 @@ mod tests {
         opcodes(code).iter().filter(|o| **o == op).count()
     }
 
+    /// Whether `op` puts a value into a list: `ListAppend`, or one of the
+    /// producers that appends its own answer.
+    ///
+    /// Derived from [`appending_producer`] rather than listed, so an appending
+    /// form added to that table is counted here without anyone remembering to
+    /// say so -- and a census that silently stopped seeing one would let a
+    /// program that appends the wrong number of times pass.
+    fn is_append(op: OpCode) -> bool {
+        op == OpCode::ListAppend
+            || (0..OPCODE_COUNT)
+                .filter_map(OpCode::from_word)
+                .any(|producer| appending_producer(producer) == Some(op))
+    }
+
+    /// How many times a program appends to a list, in whatever form.
+    fn appends(code: &CelCode) -> usize {
+        opcodes(code).iter().filter(|op| is_append(**op)).count()
+    }
+
     /// `map` and `filter` push into the accumulator instead of rebuilding it.
     ///
     /// The property is stated as an opcode census rather than a timing, because
@@ -1818,10 +2045,13 @@ mod tests {
     /// census a statement about the accumulator.
     #[test]
     fn map_and_filter_append_rather_than_concatenate() {
-        for source in [
-            "xs.map(x, x * 2)",
-            "xs.filter(x, x > 1)",
-            "xs.map(x, x > 1, x * 10)",
+        // The element decides which append the loop carries, so each source
+        // names the one it must reach: the count alone would be satisfied by
+        // the unfused pair, which appends exactly once too.
+        for (source, appender) in [
+            ("xs.map(x, x * 2)", OpCode::MulLocalConstAppend),
+            ("xs.filter(x, x > 1)", OpCode::LoadLocalAppend),
+            ("xs.map(x, x > 1, x * 10)", OpCode::MulLocalConstAppend),
         ] {
             let code = code_of(source);
             assert_eq!(
@@ -1831,9 +2061,22 @@ mod tests {
                 code.disassemble()
             );
             assert_eq!(
-                count(&code, OpCode::ListAppend),
+                count(&code, appender),
+                1,
+                "{source} should append through {appender:?}:\n{}",
+                code.disassemble()
+            );
+            assert_eq!(
+                appends(&code),
                 1,
                 "{source} should append exactly once per iteration:\n{}",
+                code.disassemble()
+            );
+            // The producer's pushing form is gone with the round trip it fed.
+            assert_eq!(
+                count(&code, OpCode::ListAppend),
+                0,
+                "{source} still routes its element through the operand stack:\n{}",
                 code.disassemble()
             );
             // The accumulator lives on the operand stack, so nothing reads it
@@ -1845,6 +2088,139 @@ mod tests {
                 code.disassemble()
             );
         }
+    }
+
+    /// [`appending_producer`] holds exactly the producers that name a slot.
+    ///
+    /// The criterion is stated here as a predicate over the instruction set
+    /// rather than as a second copy of the table, so it is the TABLE that has
+    /// to satisfy it. Two things make it checkable: a producer that names a
+    /// slot is spelled `*Local*` -- that is what the suffix means throughout
+    /// [`OpCode`] -- and a producer that pushes a finished value declares
+    /// `(0, 1)`. Everything `Local` that is not `(0, 1)` writes a slot, reads
+    /// one without pushing, or branches, and none of those has an answer to
+    /// append.
+    ///
+    /// So an opcode added to the `Local` family without an appending twin
+    /// fails here, and so does a twin whose width or stack effect drifts from
+    /// its producer's.
+    #[test]
+    fn the_appending_forms_are_exactly_the_slot_naming_producers() {
+        let mut twins = 0;
+        for word in 0..OPCODE_COUNT {
+            let op = OpCode::from_word(word).expect("word below the count decodes");
+            let names_a_slot = format!("{op:?}").contains("Local");
+            let pushes_a_value = op.stack_effect(&[0, 0, 0]) == (0, 1);
+            let Some(twin) = appending_producer(op) else {
+                assert!(
+                    !(names_a_slot && pushes_a_value),
+                    "{op:?} names a slot and pushes a value, so an element \
+                     that is one has no reason to reach the operand stack. \
+                     Give it an appending twin, or say here why it is not one."
+                );
+                continue;
+            };
+            twins += 1;
+            assert!(
+                names_a_slot && pushes_a_value,
+                "{op:?} has an appending twin but is not a slot-naming \
+                 producer: it declares {:?}",
+                op.stack_effect(&[0, 0, 0])
+            );
+            assert_eq!(
+                twin.operands(),
+                op.operands(),
+                "{twin:?} must carry exactly {op:?}'s operands: `ListAppend` \
+                 names nothing of its own"
+            );
+            assert_eq!(
+                twin.stack_effect(&[0, 0, 0]),
+                (0, 0),
+                "{twin:?} is {op:?}'s `(0, 1)` composed with `ListAppend`'s \
+                 `(1, 0)`, so it must touch the operand stack not at all"
+            );
+        }
+        // A table that had emptied would satisfy every assertion above by
+        // reaching none of them.
+        assert_eq!(
+            twins, 11,
+            "the appending forms are `LoadLocal`, the two field reads over a \
+             slot, and the eight operators over a slot and a literal"
+        );
+    }
+
+    /// A list literal appends through the same fused forms a comprehension
+    /// does, and an optional element does not.
+    ///
+    /// The elements are inside a comprehension because a slot is what a
+    /// comprehension variable IS -- there is nothing else for a producer to
+    /// name -- but the appends being fused here are the literal's, emitted by
+    /// `Compiler::list` and not by the appending-comprehension lowering.
+    ///
+    /// The optional row is the discriminator: the SAME element `x` fuses at
+    /// one index and keeps the pair at the other, because at the optional
+    /// index the append is the instruction that decides whether the element
+    /// contributes at all, which is only knowable once the value exists.
+    #[test]
+    fn a_list_literal_fuses_its_elements_but_never_an_optional_one() {
+        let code = code_of("xs.map(x, [x, x * 2, 3])");
+        for (want, times) in [
+            (OpCode::LoadLocalAppend, 1),
+            (OpCode::MulLocalConstAppend, 1),
+            // The literal element and the outer element, neither of which
+            // names a slot.
+            (OpCode::ListAppend, 2),
+        ] {
+            assert_eq!(
+                count(&code, want),
+                times,
+                "{want:?}:\n{}",
+                code.disassemble()
+            );
+        }
+
+        // `?` is off by default, so the optional half of this case has to ask
+        // for it; a parse failure here would otherwise read as the shape being
+        // absent from the lowering.
+        let expr = Parser::default()
+            .enable_optional_syntax(true)
+            .parse("xs.map(x, [?x, x])")
+            .expect("optional list elements parse when the syntax is enabled");
+        let code = compile(&expr).expect("compiles");
+        let var = code
+            .instructions()
+            .find(|(_, op, _)| *op == OpCode::IterBind)
+            .map(|(_, _, operands)| operands[2])
+            .expect("the comprehension binds an iteration variable");
+
+        let optional = code
+            .instructions()
+            .find(|(_, op, _)| *op == OpCode::ListAppendOptional)
+            .map(|(pc, _, _)| pc)
+            .unwrap_or_else(|| {
+                panic!(
+                    "the optional element keeps its own append:\n{}",
+                    code.disassemble()
+                )
+            });
+        // The instruction it appends is the one immediately above it, and for
+        // this element that is the slot load the fusion would have absorbed.
+        assert_eq!(
+            (
+                code.insns[optional as usize - 1].op,
+                code.insns[optional as usize - 1].ops[0]
+            ),
+            (OpCode::LoadLocal, var),
+            "the optional element's value still reaches the stack:\n{}",
+            code.disassemble()
+        );
+        // The same element at the plain index absorbs its load instead.
+        assert_eq!(
+            count(&code, OpCode::LoadLocalAppend),
+            1,
+            "the plain element beside it still fuses:\n{}",
+            code.disassemble()
+        );
     }
 
     /// The macros that are NOT this shape keep the general lowering, so the
@@ -1861,7 +2237,7 @@ mod tests {
         ] {
             let code = code_of(source);
             assert_eq!(
-                count(&code, OpCode::ListAppend),
+                appends(&code),
                 0,
                 "{source} is not an appending comprehension:\n{}",
                 code.disassemble()

@@ -239,6 +239,55 @@ pub enum OpCode {
     /// popped.
     GreaterEqualsLocalConst,
 
+    // -- producing straight into a list ------------------------------------
+    //
+    // `<producer> ; ListAppend` is what appending an element compiles to, and
+    // the value travels through the operand stack between them: the producer
+    // pushes it and the append takes it straight off again. Each opcode here
+    // is that pair, with the value handed to the list builder directly.
+    //
+    // The builder is NOT an operand of these. It is the [`Operand::List`] the
+    // enclosing `NewList` left on the stack and it stays there for the whole
+    // aggregate, so every one of these is stack-neutral: it pops nothing,
+    // pushes nothing, and mutates what is already on top. That is the same
+    // arrangement `ListAppend` itself has, minus the pop.
+    //
+    // The set is exactly the `Local` producers -- the instructions that name a
+    // SLOT and push a finished value -- and `compile::appending_producer` is
+    // the list. Naming a slot is what makes a producer worth fusing here: its
+    // answer is a function of the element, which is what an append inside a
+    // comprehension consumes once per iteration. A `LoadConst` or a `LoadVar`
+    // element appends the same value on every iteration, so what such a
+    // program wants is not an opcode but a hoist, and it keeps the pair.
+    //
+    // One opcode per producer rather than a producer operand, for the reason
+    // the binary operators give: a kind operand is a second switch inside the
+    // dispatch arm. Each name is its producer's plus `Append`, so the twin
+    // relation is readable off the two names.
+    /// Append slot `a` to the list beneath. Nothing is pushed or popped.
+    LoadLocalAppend,
+    /// Append field `names[b]` of slot `a` to the list beneath.
+    GetFieldLocalAppend,
+    /// Append whether slot `a` has field `names[b]` to the list beneath.
+    HasFieldLocalAppend,
+    /// Append slot `a` plus `consts[b]` to the list beneath.
+    AddLocalConstAppend,
+    /// Append slot `a` times `consts[b]` to the list beneath.
+    MulLocalConstAppend,
+    /// Append slot `a` modulo `consts[b]` to the list beneath.
+    ModLocalConstAppend,
+    /// Append whether slot `a` equals `consts[b]` to the list beneath.
+    EqualsLocalConstAppend,
+    /// Append whether slot `a` differs from `consts[b]` to the list beneath.
+    NotEqualsLocalConstAppend,
+    /// Append whether slot `a` orders below `consts[b]` to the list beneath.
+    LessLocalConstAppend,
+    /// Append whether slot `a` orders above `consts[b]` to the list beneath.
+    GreaterLocalConstAppend,
+    /// Append whether slot `a` orders at or above `consts[b]` to the list
+    /// beneath.
+    GreaterEqualsLocalConstAppend,
+
     // -- unary operators --------------------------------------------------
     Not,
     Negate,
@@ -498,7 +547,8 @@ impl OpCode {
             | OpCode::NotEqualsConst
             | OpCode::LessConst
             | OpCode::GreaterConst
-            | OpCode::GreaterEqualsConst => 1,
+            | OpCode::GreaterEqualsConst
+            | OpCode::LoadLocalAppend => 1,
 
             OpCode::CallHost
             | OpCode::CallMethod
@@ -517,7 +567,20 @@ impl OpCode {
             | OpCode::NotEqualsLocalConst
             | OpCode::LessLocalConst
             | OpCode::GreaterLocalConst
-            | OpCode::GreaterEqualsLocalConst => 2,
+            | OpCode::GreaterEqualsLocalConst
+            // The appending twins carry exactly what their producers carry,
+            // because `ListAppend` names nothing: the list it appends to is
+            // the operand on top of the stack.
+            | OpCode::GetFieldLocalAppend
+            | OpCode::HasFieldLocalAppend
+            | OpCode::AddLocalConstAppend
+            | OpCode::MulLocalConstAppend
+            | OpCode::ModLocalConstAppend
+            | OpCode::EqualsLocalConstAppend
+            | OpCode::NotEqualsLocalConstAppend
+            | OpCode::LessLocalConstAppend
+            | OpCode::GreaterLocalConstAppend
+            | OpCode::GreaterEqualsLocalConstAppend => 2,
 
             OpCode::CallQualified
             | OpCode::IterGuard
@@ -636,6 +699,22 @@ impl OpCode {
             | OpCode::LessLocalConst
             | OpCode::GreaterLocalConst
             | OpCode::GreaterEqualsLocalConst => (0, 1),
+            // The composition of one of the producers above with
+            // `ListAppend`'s `(1, 0)`: the producer's push and the append's
+            // pop were each other's, so the pair's net is what the one
+            // instruction declares. The list it appends to is the operand
+            // underneath, which it neither pops nor replaces.
+            OpCode::LoadLocalAppend
+            | OpCode::GetFieldLocalAppend
+            | OpCode::HasFieldLocalAppend
+            | OpCode::AddLocalConstAppend
+            | OpCode::MulLocalConstAppend
+            | OpCode::ModLocalConstAppend
+            | OpCode::EqualsLocalConstAppend
+            | OpCode::NotEqualsLocalConstAppend
+            | OpCode::LessLocalConstAppend
+            | OpCode::GreaterLocalConstAppend
+            | OpCode::GreaterEqualsLocalConstAppend => (0, 0),
 
             OpCode::CallHost => (arity(1), 1),
             // The receiver is pushed last, above the arguments, because it is

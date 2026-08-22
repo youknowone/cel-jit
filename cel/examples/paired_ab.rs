@@ -1611,17 +1611,18 @@ fn iter_at_sweep(cfg: &Config) {
 //
 // The method is subtractive and stays inside one binary: each arm runs the same
 // program through the same dispatch loop with one named GROUP of the
-// five-instruction per-element block fused into a single step. An arm removes
+// four-instruction per-element block fused into a single step. An arm removes
 // dispatches and operand-stack round trips; it does not remove work the walker
 // also does, and `binary_values` — which both evaluators call — is still called
 // by every arm with the same operands. The one exception, `compare_values`, is
 // isolated by running the guard fusion twice, once with the helper put back.
 //
-// Three of the four groups became single instructions — `IterGuard`, `IterBind`
-// and `IterAdvance` — so the stock arm already pays no operand-stack round trip
-// for any of them, and what those three rungs price is one dispatch each. The
-// body group is the only one left that is more than one instruction, and it
-// holds every push and every pop the block still has.
+// All four groups became single instructions — `IterGuard`, `IterBind`,
+// `MulLocalConstAppend` and `IterAdvance` — so the stock arm already pays no
+// operand-stack round trip for any of them, and what each of the four rungs
+// prices is one dispatch. The block holds no push and no pop at all: the only
+// operand it touches is the builder the append mutates in place, which is put
+// on the stack before the loop and taken off after it.
 //
 // Every rung's answer is asserted equal to the stock arm's before any timing, so
 // an arm that removed the wrong thing fails rather than prints a better number.
@@ -1648,13 +1649,12 @@ fn elem_ctx(n: usize) -> Context<'static> {
 /// group was still labelled with the four instructions and six stack
 /// operations it had before its operator absorbed the constant load.
 #[cfg(feature = "elem-attr-probe")]
-const ELEM_OPS: [cel::vm::OpCode; 5] = {
+const ELEM_OPS: [cel::vm::OpCode; 4] = {
     use cel::vm::OpCode;
     [
         OpCode::IterGuard,
         OpCode::IterBind,
-        OpCode::MulLocalConst,
-        OpCode::ListAppend,
+        OpCode::MulLocalConstAppend,
         OpCode::IterAdvance,
     ]
 };
@@ -1710,8 +1710,8 @@ fn assert_element_block(code: &cel::vm::CelCode) {
     let ops: Vec<OpCode> = code.instructions().map(|(_, op, _)| op).collect();
     assert!(
         ops.windows(ELEM_BLOCK).any(|w| w == want),
-        "`{ELEM_SRC}` no longer lowers to the five-instruction per-element \
-         block this section attributes. Disassembly:\n{}",
+        "`{ELEM_SRC}` no longer lowers to the {ELEM_BLOCK}-instruction \
+         per-element block this section attributes. Disassembly:\n{}",
         code.disassemble()
     );
     assert!(
@@ -1866,13 +1866,8 @@ fn elem_fusion(cfg: &Config, n: usize) {
     let steps: [(&str, FuseArm, FuseArm, std::ops::Range<usize>); 4] = [
         ("guard dispatch", FuseArm::None, FuseArm::Guard, 0..1),
         ("bind dispatch", FuseArm::Guard, FuseArm::Bind, 1..2),
-        (
-            "body+append dispatch+stack",
-            FuseArm::Bind,
-            FuseArm::Body,
-            2..4,
-        ),
-        ("advance dispatch", FuseArm::Body, FuseArm::Advance, 4..5),
+        ("body+append dispatch", FuseArm::Bind, FuseArm::Body, 2..3),
+        ("advance dispatch", FuseArm::Body, FuseArm::Advance, 3..4),
     ];
 
     for (label, a_arm, b_arm, fused) in steps {
