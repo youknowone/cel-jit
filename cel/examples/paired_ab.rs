@@ -1611,7 +1611,7 @@ fn iter_at_sweep(cfg: &Config) {
 //
 // The method is subtractive and stays inside one binary: each arm runs the same
 // program through the same dispatch loop with one named GROUP of the
-// six-instruction per-element block fused into a single step. An arm removes
+// five-instruction per-element block fused into a single step. An arm removes
 // dispatches and operand-stack round trips; it does not remove work the walker
 // also does, and `binary_values` — which both evaluators call — is still called
 // by every arm with the same operands. The one exception, `compare_values`, is
@@ -1648,13 +1648,12 @@ fn elem_ctx(n: usize) -> Context<'static> {
 /// group was still labelled with the four instructions and six stack
 /// operations it had before its operator absorbed the constant load.
 #[cfg(feature = "elem-attr-probe")]
-const ELEM_OPS: [cel::vm::OpCode; 6] = {
+const ELEM_OPS: [cel::vm::OpCode; 5] = {
     use cel::vm::OpCode;
     [
         OpCode::IterGuard,
         OpCode::IterBind,
-        OpCode::LoadLocal,
-        OpCode::MulConst,
+        OpCode::MulLocalConst,
         OpCode::ListAppend,
         OpCode::IterAdvance,
     ]
@@ -1711,7 +1710,7 @@ fn assert_element_block(code: &cel::vm::CelCode) {
     let ops: Vec<OpCode> = code.instructions().map(|(_, op, _)| op).collect();
     assert!(
         ops.windows(ELEM_BLOCK).any(|w| w == want),
-        "`{ELEM_SRC}` no longer lowers to the six-instruction per-element \
+        "`{ELEM_SRC}` no longer lowers to the five-instruction per-element \
          block this section attributes. Disassembly:\n{}",
         code.disassemble()
     );
@@ -1871,9 +1870,9 @@ fn elem_fusion(cfg: &Config, n: usize) {
             "body+append dispatch+stack",
             FuseArm::Bind,
             FuseArm::Body,
-            2..5,
+            2..4,
         ),
-        ("advance dispatch", FuseArm::Body, FuseArm::Advance, 5..6),
+        ("advance dispatch", FuseArm::Body, FuseArm::Advance, 4..5),
     ];
 
     for (label, a_arm, b_arm, fused) in steps {

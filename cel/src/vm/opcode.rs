@@ -189,13 +189,13 @@ pub enum OpCode {
     ModConst,
     /// Pop the left operand, push whether it equals `consts[a]`.
     ///
-    /// This pair and its twin are the only ones that also remove the
-    /// constant's `Value::clone`: equality is decided through `PartialEq`,
-    /// which reads both sides through references, where the arithmetic and
-    /// ordering forms hand their operands to helpers that take them by value.
-    /// A string constant is an `Arc`, so what that saves is an atomic pair per
-    /// evaluation -- and a string constant is exactly what an equality
-    /// predicate is written against.
+    /// Of the eight forms here, this pair and its twin are the only ones that
+    /// also remove the constant's `Value::clone`: equality is decided through
+    /// `PartialEq`, which reads both sides through references, where the
+    /// arithmetic and ordering forms hand their operands to helpers that take
+    /// them by value. A string constant is an `Arc`, so what that saves is an
+    /// atomic pair per evaluation -- and a string constant is exactly what an
+    /// equality predicate is written against.
     EqualsConst,
     /// Pop the left operand, push whether it differs from `consts[a]`.
     NotEqualsConst,
@@ -205,6 +205,39 @@ pub enum OpCode {
     GreaterConst,
     /// Pop the left operand, push whether it orders at or above `consts[a]`.
     GreaterEqualsConst,
+
+    // -- binary operators over a slot and a literal --------------------------
+    //
+    // The operators above with their LEFT operand named by slot as well, which
+    // is what a predicate over a comprehension variable is: `LoadLocal a ;
+    // <op>Const b` is the whole body of `xs.map(x, x * 2)`. Nothing but the
+    // operator ever looked at the copy the load pushed.
+    //
+    // Both halves are named, so the load's dispatch and the operand-stack round
+    // trip it existed for are gone and the instruction pushes its answer
+    // directly. That is what all eight remove, and all of it: what each one
+    // then does about COPYING its operands is the individual arm's business.
+    //
+    // One per operator rather than a kind operand, for the reason the operators
+    // above give; the set is exactly the one `compile::const_operator` maps,
+    // because a fused form needs the constant folded first.
+    /// Push slot `a` plus `consts[b]`. Nothing is popped.
+    AddLocalConst,
+    /// Push slot `a` times `consts[b]`. Nothing is popped.
+    MulLocalConst,
+    /// Push slot `a` modulo `consts[b]`. Nothing is popped.
+    ModLocalConst,
+    /// Push whether slot `a` equals `consts[b]`. Nothing is popped.
+    EqualsLocalConst,
+    /// Push whether slot `a` differs from `consts[b]`. Nothing is popped.
+    NotEqualsLocalConst,
+    /// Push whether slot `a` orders below `consts[b]`. Nothing is popped.
+    LessLocalConst,
+    /// Push whether slot `a` orders above `consts[b]`. Nothing is popped.
+    GreaterLocalConst,
+    /// Push whether slot `a` orders at or above `consts[b]`. Nothing is
+    /// popped.
+    GreaterEqualsLocalConst,
 
     // -- unary operators --------------------------------------------------
     Not,
@@ -476,7 +509,15 @@ impl OpCode {
             | OpCode::AccuLoopCond
             | OpCode::AccuLoopCondNot
             | OpCode::GetFieldLocal
-            | OpCode::HasFieldLocal => 2,
+            | OpCode::HasFieldLocal
+            | OpCode::AddLocalConst
+            | OpCode::MulLocalConst
+            | OpCode::ModLocalConst
+            | OpCode::EqualsLocalConst
+            | OpCode::NotEqualsLocalConst
+            | OpCode::LessLocalConst
+            | OpCode::GreaterLocalConst
+            | OpCode::GreaterEqualsLocalConst => 2,
 
             OpCode::CallQualified
             | OpCode::IterGuard
@@ -583,6 +624,18 @@ impl OpCode {
             | OpCode::LessConst
             | OpCode::GreaterConst
             | OpCode::GreaterEqualsConst => (1, 1),
+            // Both operands named, so the remaining pop is gone too: this is
+            // the composition of a `LoadLocal`'s `(0, 1)` with the `(1, 1)`
+            // above, and the value that used to travel between them never
+            // reaches the stack.
+            OpCode::AddLocalConst
+            | OpCode::MulLocalConst
+            | OpCode::ModLocalConst
+            | OpCode::EqualsLocalConst
+            | OpCode::NotEqualsLocalConst
+            | OpCode::LessLocalConst
+            | OpCode::GreaterLocalConst
+            | OpCode::GreaterEqualsLocalConst => (0, 1),
 
             OpCode::CallHost => (arity(1), 1),
             // The receiver is pushed last, above the arguments, because it is
@@ -690,6 +743,31 @@ mod tests {
         ] {
             assert_eq!(op.operands(), operands, "{op:?}");
             assert_eq!(op.stack_effect(&[0, 0, 0]), (0, 0), "{op:?}");
+        }
+    }
+
+    /// The slot-and-literal operators name a slot and a pool index, so each
+    /// takes two operand words and pushes its answer onto an operand stack it
+    /// never reads. Declared here rather than inferred from an emitted
+    /// program, for the reason above -- and this is the one of the three where
+    /// a wrong declaration is silent in release: `Vm::new` only `reserve`s
+    /// `max_stack` and both depth guards are `debug_assert`, so a net effect
+    /// declared one low surfaces as `Vm::unwind` truncating below a live
+    /// `Operand::List` accumulator rather than as a failure here.
+    #[test]
+    fn the_slot_and_literal_operators_name_both_operands_and_only_push() {
+        for op in [
+            OpCode::AddLocalConst,
+            OpCode::MulLocalConst,
+            OpCode::ModLocalConst,
+            OpCode::EqualsLocalConst,
+            OpCode::NotEqualsLocalConst,
+            OpCode::LessLocalConst,
+            OpCode::GreaterLocalConst,
+            OpCode::GreaterEqualsLocalConst,
+        ] {
+            assert_eq!(op.operands(), 2, "{op:?}");
+            assert_eq!(op.stack_effect(&[]), (0, 1), "{op:?}");
         }
     }
 }

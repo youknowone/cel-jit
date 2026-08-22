@@ -131,8 +131,13 @@ pub fn cel_eval_loop_with_probe(
 #[cfg(feature = "elem-attr-probe")]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FuseArm {
-    /// What the interpreter does without the probe: seven dispatches per
-    /// element, three pushes and three pops.
+    /// What the interpreter does without the probe: `IterGuard ; IterBind ;
+    /// MulLocalConst ; ListAppend ; IterAdvance`, stepped one at a time.
+    ///
+    /// Named rather than counted, and every arm below names what it fuses for
+    /// the same reason: `recognize_map_loop`'s `WANT` is that list and will
+    /// disagree out loud when the lowering moves, where a restated count is
+    /// checkable against nothing. One already had outlived its lowering here.
     None,
     /// Fuse `IterGuard index source done` -- one dispatch -- and decide the
     /// guard by calling `compare_values` and `as_bool` on the two
@@ -155,11 +160,11 @@ pub enum FuseArm {
     /// still read through `ListRef::get` and still written into the slot with
     /// the same `mem::replace` and discard.
     Bind,
-    /// ... plus `LoadLocal var; LoadConst k; Mul; ListAppend` -- four
-    /// dispatches, three pushes and three pops, which is every push and every
-    /// pop the per-element block has left. `binary_values` is still called,
-    /// with the same two operands, and the result is still pushed into the same
-    /// builder.
+    /// ... plus `MulLocalConst var k ; ListAppend`, which are the only two
+    /// instructions the per-element block has left that touch the operand
+    /// stack at all: the operator pushes its answer and `ListAppend` takes it
+    /// straight off again. `binary_values` is still called, with the same two
+    /// operands, and the result is still pushed into the same builder.
     Body,
     /// ... plus `IterAdvance index top` -- one dispatch. The whole element is
     /// one step, and no dispatch at all is left in it. The counter is still
@@ -235,7 +240,7 @@ struct MapLoop {
     konst: u32,
     /// `IterBind`, where an arm that fused only the guard resumes.
     after_guard: u32,
-    /// `LoadLocal var`, where an arm that also fused the bind resumes.
+    /// The body operator, where an arm that also fused the bind resumes.
     after_bind: u32,
     /// `IterAdvance`, where an arm that also fused the body resumes.
     after_body: u32,
@@ -254,17 +259,16 @@ const NO_MAP_LOOP: MapLoop = MapLoop {
     after_body: 0,
 };
 
-/// Find the six-instruction per-element block, if the program has one.
+/// Find the five-instruction per-element block, if the program has one.
 ///
 /// Run once per evaluation by EVERY arm, so its cost is a constant that cancels
 /// out of any difference between two of them.
 #[cfg(feature = "elem-attr-probe")]
 fn recognize_map_loop(code: &CelCode) -> MapLoop {
-    const WANT: [OpCode; 6] = [
+    const WANT: [OpCode; 5] = [
         OpCode::IterGuard,
         OpCode::IterBind,
-        OpCode::LoadLocal,
-        OpCode::MulConst,
+        OpCode::MulLocalConst,
         OpCode::ListAppend,
         OpCode::IterAdvance,
     ];
@@ -298,8 +302,8 @@ fn recognize_map_loop(code: &CelCode) -> MapLoop {
         let consistent = window[1].2[0] == source
             && window[1].2[1] == index
             && window[2].2[0] == var
-            && window[5].2[0] == index
-            && window[5].2[1] == window[0].0;
+            && window[4].2[0] == index
+            && window[4].2[1] == window[0].0;
         if !consistent {
             continue;
         }
@@ -309,10 +313,12 @@ fn recognize_map_loop(code: &CelCode) -> MapLoop {
             source,
             index,
             var,
-            konst: window[3].2[0],
+            // The body operator names both its operands, so the constant is
+            // its SECOND word, behind the slot checked just above.
+            konst: window[2].2[1],
             after_guard: window[1].0,
             after_bind: window[2].0,
-            after_body: window[5].0,
+            after_body: window[4].0,
         };
     }
     NO_MAP_LOOP
@@ -1180,8 +1186,7 @@ impl<'a> Vm<'a> {
             return Ok(shape.after_bind);
         }
 
-        // -- the body and the append:
-        //    `LoadLocal var ; MulConst k ; ListAppend`
+        // -- the body and the append: `MulLocalConst var k ; ListAppend`
         let lhs = self
             .slots
             .get(shape.var as usize)
@@ -1416,6 +1421,59 @@ impl<'a> Vm<'a> {
                 let accept: fn(Ordering) -> bool = match op {
                     OpCode::LessConst => |o| o == Ordering::Less,
                     OpCode::GreaterConst => |o| o == Ordering::Greater,
+                    _ => |o| o != Ordering::Less,
+                };
+                let value = compare_values(lhs, rhs, accept).map_err(|e| self.park(e))?;
+                self.push(value);
+            }
+            // The same three groups again with the LEFT operand read out of a
+            // slot instead of popped, so no operand reaches the stack at all.
+            // The helpers, their operand order and their operator names are
+            // unchanged, which is what keeps the error identical to the pair's.
+            OpCode::AddLocalConst | OpCode::MulLocalConst | OpCode::ModLocalConst => {
+                // Both still cloned, for the reason the `AddConst` arm gives:
+                // `binary_values` takes its operands by value.
+                let lhs = self
+                    .slots
+                    .get(a as usize)
+                    .ok_or(CelErr::InternalError)?
+                    .clone();
+                let rhs = self.code.konst(b).ok_or(CelErr::InternalError)?.clone();
+                let name = match op {
+                    OpCode::AddLocalConst => "add",
+                    OpCode::MulLocalConst => "mul",
+                    _ => "rem",
+                };
+                let value = binary_values(name, lhs, rhs).map_err(|e| self.park(e))?;
+                self.push(value);
+            }
+            OpCode::EqualsLocalConst | OpCode::NotEqualsLocalConst => {
+                // BOTH sides read in place: `PartialEq` takes them by
+                // reference, so this is the one fused form that copies
+                // nothing. `EqualsConst` already read its constant in place,
+                // so what the pair still spent and this does not is the slot's
+                // clone-and-release -- one atomic pair per evaluation on the
+                // `Arc` variants, and a string is what an equality predicate
+                // is written against.
+                let equal = {
+                    let lhs = self.slots.get(a as usize).ok_or(CelErr::InternalError)?;
+                    let rhs = self.code.konst(b).ok_or(CelErr::InternalError)?;
+                    lhs == rhs
+                };
+                self.push(Value::Bool(equal == (op == OpCode::EqualsLocalConst)));
+            }
+            OpCode::LessLocalConst
+            | OpCode::GreaterLocalConst
+            | OpCode::GreaterEqualsLocalConst => {
+                let lhs = self
+                    .slots
+                    .get(a as usize)
+                    .ok_or(CelErr::InternalError)?
+                    .clone();
+                let rhs = self.code.konst(b).ok_or(CelErr::InternalError)?.clone();
+                let accept: fn(Ordering) -> bool = match op {
+                    OpCode::LessLocalConst => |o| o == Ordering::Less,
+                    OpCode::GreaterLocalConst => |o| o == Ordering::Greater,
                     _ => |o| o != Ordering::Less,
                 };
                 let value = compare_values(lhs, rhs, accept).map_err(|e| self.park(e))?;
@@ -2075,50 +2133,88 @@ mod tests {
     /// operands inside the error. A fused arm that passed the wrong operator
     /// name, or the operands in the wrong order, answers a well-formed error
     /// of the same shape, so the whole value is compared against the walker's.
+    ///
+    /// Split by which half of the fold each source reaches, and each half
+    /// names the arms the other half must NOT reach. A single check for "some
+    /// fused arm" would be satisfied by `LoadLocal ; <op>Const` -- the
+    /// half-fused shape the slot half exists to exclude -- and would leave the
+    /// eight stack-operand arms with no source that runs them at all, because
+    /// every left operand below the divider is a slot.
     #[test]
     fn a_folded_literal_operand_answers_what_the_pair_answered() {
+        const SLOT_AND_CONST: [OpCode; 8] = [
+            OpCode::AddLocalConst,
+            OpCode::MulLocalConst,
+            OpCode::ModLocalConst,
+            OpCode::EqualsLocalConst,
+            OpCode::NotEqualsLocalConst,
+            OpCode::LessLocalConst,
+            OpCode::GreaterLocalConst,
+            OpCode::GreaterEqualsLocalConst,
+        ];
+        const STACK_AND_CONST: [OpCode; 8] = [
+            OpCode::AddConst,
+            OpCode::MulConst,
+            OpCode::ModConst,
+            OpCode::EqualsConst,
+            OpCode::NotEqualsConst,
+            OpCode::LessConst,
+            OpCode::GreaterConst,
+            OpCode::GreaterEqualsConst,
+        ];
+
+        let hi = || Value::String(std::sync::Arc::new("hi".to_string()));
         let mut ctx = Context::default();
         ctx.add_variable_from_value("xs", vec![i64::MAX]);
-        ctx.add_variable_from_value(
-            "ss",
-            Value::list(vec![Value::String(std::sync::Arc::new("hi".to_string()))]),
-        );
+        ctx.add_variable_from_value("ss", Value::list(vec![hi()]));
+        // Free variables, so a left operand naming one of these is a `LoadVar`
+        // and only the constant folds. Bound to the same values the elements
+        // carry, so both halves raise the same errors.
+        ctx.add_variable_from_value("n", i64::MAX);
+        ctx.add_variable_from_value("t", hi());
 
-        for source in [
+        for (source, want, forbidden) in [
+            // -- a slot left operand: both operands fold --------------------
             // `binary_values`: the operator's name reaches the error.
-            "xs.map(x, x * 2)",
-            "xs.map(x, x + 1)",
-            "xs.map(x, x % 0)",
-            "ss.map(s, s % 2)",
+            ("xs.map(x, x * 2)", SLOT_AND_CONST, STACK_AND_CONST),
+            ("xs.map(x, x + 1)", SLOT_AND_CONST, STACK_AND_CONST),
+            ("xs.map(x, x % 0)", SLOT_AND_CONST, STACK_AND_CONST),
+            ("ss.map(s, s % 2)", SLOT_AND_CONST, STACK_AND_CONST),
             // `compare_values`: operands of different types.
-            "ss.filter(s, s < 3)",
-            "ss.filter(s, s > 3)",
-            "ss.filter(s, s >= 3)",
+            ("ss.filter(s, s < 3)", SLOT_AND_CONST, STACK_AND_CONST),
+            ("ss.filter(s, s > 3)", SLOT_AND_CONST, STACK_AND_CONST),
+            ("ss.filter(s, s >= 3)", SLOT_AND_CONST, STACK_AND_CONST),
             // Equality answers `false` across types rather than raising, and
-            // is the one group that reads the constant in place.
-            "ss.map(s, s == 'hi')",
-            "ss.map(s, s != 'hi')",
-            "ss.map(s, s == 3)",
-            "xs.map(x, x == 1)",
+            // is the one group that reads both operands in place.
+            ("ss.map(s, s == 'hi')", SLOT_AND_CONST, STACK_AND_CONST),
+            ("ss.map(s, s != 'hi')", SLOT_AND_CONST, STACK_AND_CONST),
+            ("ss.map(s, s == 3)", SLOT_AND_CONST, STACK_AND_CONST),
+            ("xs.map(x, x == 1)", SLOT_AND_CONST, STACK_AND_CONST),
+            // -- a free-variable left operand: only the constant folds, so
+            //    these are the sources that run the eight arms above ---------
+            ("xs.map(x, n * 2)", STACK_AND_CONST, SLOT_AND_CONST),
+            ("xs.map(x, n + 1)", STACK_AND_CONST, SLOT_AND_CONST),
+            ("xs.map(x, n % 0)", STACK_AND_CONST, SLOT_AND_CONST),
+            ("ss.filter(s, t < 3)", STACK_AND_CONST, SLOT_AND_CONST),
+            ("ss.filter(s, t > 3)", STACK_AND_CONST, SLOT_AND_CONST),
+            ("ss.filter(s, t >= 3)", STACK_AND_CONST, SLOT_AND_CONST),
+            ("ss.map(s, t == 'hi')", STACK_AND_CONST, SLOT_AND_CONST),
+            ("ss.map(s, t != 'hi')", STACK_AND_CONST, SLOT_AND_CONST),
         ] {
             let expr = parse(source);
             let code = compile(&expr).unwrap_or_else(|e| panic!("compile {source}: {e}"));
-            // Asserted before the answers are: every source here has to
-            // reach a fused arm, or the comparison below holds two runs of
-            // the same unfused instructions against each other.
+            // Asserted before the answers are: a source that reached neither
+            // its own arms, or reached the other half's, holds two runs of
+            // instructions this case is not about against each other.
+            let ops: Vec<OpCode> = code.instructions().map(|(_, op, _)| op).collect();
             assert!(
-                code.instructions().any(|(_, op, _)| matches!(
-                    op,
-                    OpCode::AddConst
-                        | OpCode::MulConst
-                        | OpCode::ModConst
-                        | OpCode::EqualsConst
-                        | OpCode::NotEqualsConst
-                        | OpCode::LessConst
-                        | OpCode::GreaterConst
-                        | OpCode::GreaterEqualsConst
-                )),
-                "{source} folds no literal:\n{}",
+                ops.iter().any(|op| want.contains(op)),
+                "{source} reaches none of {want:?}:\n{}",
+                code.disassemble()
+            );
+            assert!(
+                !ops.iter().any(|op| forbidden.contains(op)),
+                "{source} reaches one of {forbidden:?}:\n{}",
                 code.disassemble()
             );
             assert_eq!(

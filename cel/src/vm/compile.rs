@@ -429,6 +429,27 @@ fn const_operator(op: OpCode) -> Option<OpCode> {
     Some(fused)
 }
 
+/// The form of a folded operator that also names its LEFT operand by slot.
+///
+/// Keyed on the folded form rather than the base operator, so it is only
+/// reachable once [`const_operator`] has answered: an operator with no folded
+/// twin has no fused-local one either, and the two lists cannot drift apart
+/// into a shape with a left operand named and a right one still on the stack.
+fn local_const_operator(op: OpCode) -> Option<OpCode> {
+    let fused = match op {
+        OpCode::AddConst => OpCode::AddLocalConst,
+        OpCode::MulConst => OpCode::MulLocalConst,
+        OpCode::ModConst => OpCode::ModLocalConst,
+        OpCode::EqualsConst => OpCode::EqualsLocalConst,
+        OpCode::NotEqualsConst => OpCode::NotEqualsLocalConst,
+        OpCode::LessConst => OpCode::LessLocalConst,
+        OpCode::GreaterConst => OpCode::GreaterLocalConst,
+        OpCode::GreaterEqualsConst => OpCode::GreaterEqualsLocalConst,
+        _ => return None,
+    };
+    Some(fused)
+}
+
 impl Compiler {
     fn call(&mut self, call: &CallExpr, id: u64) -> Result<(), CompileError> {
         // An operator name can only be an operator: the parser mints these
@@ -448,6 +469,19 @@ impl Compiler {
                     if let (Some(fused), Expr::Literal(literal)) =
                         (const_operator(op), &call.args[1].expr)
                     {
+                        // The LEFT operand folds in as well when it is a slot,
+                        // leaving the whole binary in one instruction. A free
+                        // variable is a `LoadVar` context lookup rather than a
+                        // slot, so it keeps the pair.
+                        let local = match &call.args[0].expr {
+                            Expr::Ident(name) => self.lookup(name),
+                            _ => None,
+                        };
+                        if let Some((fused_local, slot)) = local_const_operator(fused).zip(local) {
+                            let konst = self.add_const(literal.to_value(), id)?;
+                            self.emit(fused_local, &[slot, konst], id)?;
+                            return Ok(());
+                        }
                         self.expr(&call.args[0])?;
                         let konst = self.add_const(literal.to_value(), id)?;
                         self.emit(fused, &[konst], id)?;
@@ -1172,22 +1206,28 @@ mod tests {
     /// `LoadConst` that used to carry it is gone with it.
     ///
     /// The operand the fused instruction keeps is the constant's index, so
-    /// the assertion is that it still names the same value the pair pushed.
+    /// the assertion is that it still names the same value the pair pushed --
+    /// and WHICH word holds it says how much the operator absorbed. `x % 2`
+    /// has a slot for its left operand, so that folds in too and the constant
+    /// is the second word; the equality's left operand is the modulo itself,
+    /// which is a computation on the stack, so it keeps only the constant.
     #[test]
     fn a_literal_right_operand_is_folded_into_the_operator() {
         let code = code_of("xs.filter(x, x % 2 == 0)");
-        for (fused, want) in [
-            (OpCode::ModConst, Value::Int(2)),
-            (OpCode::EqualsConst, Value::Int(0)),
+        for (fused, word, want) in [
+            (OpCode::ModLocalConst, 1, Value::Int(2)),
+            (OpCode::EqualsConst, 0, Value::Int(0)),
         ] {
             let index = code
                 .instructions()
                 .find(|(_, op, _)| *op == fused)
-                .map(|(_, _, operands)| operands[0])
+                .map(|(_, _, operands)| operands[word])
                 .unwrap_or_else(|| panic!("{fused:?} is missing:\n{}", code.disassemble()));
             assert_eq!(code.konst(index), Some(&want), "{fused:?}");
         }
-        for gone in [OpCode::Mod, OpCode::Equals] {
+        // `ModConst` among them: a slot left operand takes the fold one step
+        // further, so the half-fused form is gone from this program as well.
+        for gone in [OpCode::Mod, OpCode::ModConst, OpCode::Equals] {
             assert_eq!(count(&code, gone), 0, "{gone:?}:\n{}", code.disassemble());
         }
         // Both literals are gone from the stack, leaving only the one the
@@ -1198,6 +1238,46 @@ mod tests {
             "{}",
             code.disassemble()
         );
+    }
+
+    /// A binary over a free variable folds only the constant.
+    ///
+    /// The left half of the fusion is licensed by the operand being one
+    /// `LoadLocal` of a slot; a free variable is a context lookup over the
+    /// activation record's surroundings, so fusing it would read a slot that
+    /// holds something else entirely. The unfused-operator test below does not
+    /// cover this -- each of its cases declines for a different reason.
+    #[test]
+    fn a_free_variable_left_operand_is_not_fused_into_the_operator() {
+        for (source, folded, fused) in [
+            (
+                "xs.map(x, lim * 2)",
+                OpCode::MulConst,
+                OpCode::MulLocalConst,
+            ),
+            (
+                "xs.filter(x, lim >= 3)",
+                OpCode::GreaterEqualsConst,
+                OpCode::GreaterEqualsLocalConst,
+            ),
+            (
+                "xs.map(x, lim == 'hi')",
+                OpCode::EqualsConst,
+                OpCode::EqualsLocalConst,
+            ),
+        ] {
+            let code = code_of(source);
+            assert_eq!(count(&code, folded), 1, "{source}:\n{}", code.disassemble());
+            assert_eq!(count(&code, fused), 0, "{source}:\n{}", code.disassemble());
+            // The left operand still reaches the stack, under the instruction
+            // that can raise where a slot read cannot.
+            let loaded: Vec<&str> = code
+                .instructions()
+                .filter(|(_, op, _)| *op == OpCode::LoadVar)
+                .map(|(_, _, operands)| code.name(NameId(operands[0])).unwrap())
+                .collect();
+            assert!(loaded.contains(&"lim"), "{source}: {loaded:?}");
+        }
     }
 
     /// Only the RIGHT operand folds, and only for the operators that have a
