@@ -148,6 +148,14 @@ required-features = ["jit"]
 name = "entryprobe"
 required-features = ["jit"]
 
+# `jit` and nothing more. The two allocation arms it selects are run-time
+# selectable inside `majit-backend`, not behind a cargo feature here, so there
+# is no probe feature to require -- which is also what lets a build that carries
+# no probe feature at all price the frame.
+[[example]]
+name = "jfpoolprobe"
+required-features = ["jit"]
+
 [[example]]
 name = "varprobe"
 required-features = ["jit"]
