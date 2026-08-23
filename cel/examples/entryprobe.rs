@@ -174,13 +174,14 @@ const CALL_SHOTS: usize = 20_000;
 /// `D1`/`D2`/`D3` are the parts of `D`, not siblings of it: `D` is the whole
 /// yield scan and the three are what it is made of, so they belong to D's sum
 /// and not to the entry's. Summing all sixteen would count the scan twice.
-const STAGE_LABELS: [&str; 16] = [
+const STAGE_LABELS: [&str; 17] = [
     "A  DRIVERS.with",
     "BF check_out+check_in",
     "C  reseed_state_f",
     "D  loop-key yield scan",
     "D1 walk key.resolve",
     "D2 token has_compiled_loop",
+    "D4 upgrade Weak+drop",
     "D3 meta get_compiled_meta",
     "(cel barrier)",
     "E1 warm-entry gate",
@@ -194,18 +195,18 @@ const STAGE_LABELS: [&str; 16] = [
 ];
 
 /// Where majit's back-edge arms start in [`STAGE_LABELS`].
-const MAJIT_FIRST: usize = 8;
+const MAJIT_FIRST: usize = 9;
 
 /// D's three sub-arms. Parts of `D` rather than entries in the entry's sum —
 /// see the note on [`STAGE_LABELS`]. They are cel-side, so their reachability
 /// is proved by cel's own counters and not by majit's.
 #[cfg(feature = "entry-stage-probe")]
-const D_SUB: std::ops::Range<usize> = 4..7;
+const D_SUB: std::ops::Range<usize> = 4..8;
 
 /// Where the arms INSIDE E3 start. Everything from here down is about
 /// `execute_assembler_at_dispatch_key`, and `E3b` is a part of the call rather
 /// than a sibling of it — see [`Split::e3_residual`].
-const EXEC_FIRST: usize = 12;
+const EXEC_FIRST: usize = 13;
 
 /// One arm's repeat counts, on both sides of the door.
 ///
@@ -236,13 +237,14 @@ fn set_repeats(repeats: Repeats) {
 
 /// Which repeat count each arm raises. Index-parallel with [`STAGE_LABELS`].
 #[cfg(feature = "entry-stage-probe")]
-const STAGE_ARMS: [fn(&mut Repeats); 16] = [
+const STAGE_ARMS: [fn(&mut Repeats); 17] = [
     |r| r.cel.tls = REPEAT,
     |r| r.cel.pool = REPEAT,
     |r| r.cel.reseed = REPEAT,
     |r| r.cel.loop_keys = REPEAT,
     |r| r.cel.loop_walk = REPEAT,
     |r| r.cel.loop_token = REPEAT,
+    |r| r.cel.loop_upgrade = REPEAT,
     |r| r.cel.loop_meta = REPEAT,
     |r| r.cel.barrier = REPEAT,
     |r| r.majit.gate = REPEAT as u16,
@@ -331,7 +333,7 @@ fn point(bound: &BoundBatch<'_, '_>, n: usize) -> (usize, f64, f64, f64) {
 /// seven stages rather than folded into them, so the report can print what the
 /// amplification itself cost next to what it was used to measure.
 #[cfg(feature = "entry-stage-probe")]
-fn arms(bound: &BoundBatch<'_, '_>) -> ([f64; 16], usize, f64, f64, u64) {
+fn arms(bound: &BoundBatch<'_, '_>) -> ([f64; 17], usize, f64, f64, u64) {
     let mut out: Vec<Value> = Vec::new();
     let entered = warm(bound, &mut out);
     // Every arm computes the same answer, and an amplification that broke that
@@ -360,7 +362,7 @@ fn arms(bound: &BoundBatch<'_, '_>) -> ([f64; 16], usize, f64, f64, u64) {
 
     let mut base_buf = out.clone();
     let mut amp_buf = out;
-    let mut raw = [0.0f64; 16];
+    let mut raw = [0.0f64; 17];
     for (slot, arm) in raw.iter_mut().zip(STAGE_ARMS) {
         let mut amplified = Repeats::default();
         arm(&mut amplified);
@@ -416,10 +418,10 @@ fn arms(bound: &BoundBatch<'_, '_>) -> ([f64; 16], usize, f64, f64, u64) {
 /// Without the feature there are no arms to run, and the file reports the entry
 /// whole rather than pretending to split it.
 #[cfg(not(feature = "entry-stage-probe"))]
-fn arms(bound: &BoundBatch<'_, '_>) -> ([f64; 16], usize, f64, f64, u64) {
+fn arms(bound: &BoundBatch<'_, '_>) -> ([f64; 17], usize, f64, f64, u64) {
     let mut out: Vec<Value> = Vec::new();
     let entered = warm(bound, &mut out);
-    ([f64::NAN; 16], 0, entered, f64::NAN, 0)
+    ([f64::NAN; 17], 0, entered, f64::NAN, 0)
 }
 
 /// Ordinary least squares of `y` against `x`, as `(intercept, slope)`.
@@ -450,7 +452,7 @@ struct Split {
     jit_fix: f64,
     /// Per-pass cost of each amplified arm, each side's barrier last within its
     /// own run of the array, and NOT yet subtracted.
-    raw: [f64; 16],
+    raw: [f64; 17],
     /// Loop keys the door walks per call for this program.
     loop_keys: usize,
     /// The compiled call, SINGLE-SHOT: the mean of one clocked reading per
@@ -496,13 +498,13 @@ impl Split {
     }
     /// E1 + E2 + E4 — the measured part of E.
     fn e_measured(&self) -> f64 {
-        (MAJIT_FIRST..11).map(|i| self.stage(i)).sum()
+        (MAJIT_FIRST..12).map(|i| self.stage(i)).sum()
     }
     /// E3a + E3d — the AMPLIFIED stages inside E3. Deliberately excludes E3b,
     /// which is a part of the call and not a sibling of it, and excludes the
     /// call, which is single-shot.
     fn e3_amplified(&self) -> f64 {
-        self.stage(12) + self.stage(14)
+        self.stage(13) + self.stage(15)
     }
     /// What E3 has left once its two amplified stages and its single-shot call
     /// are taken off: the result construction and the drops. A RESIDUAL, and
@@ -524,7 +526,7 @@ impl Split {
 fn split(
     label: &'static str,
     points: &[(usize, f64, f64, f64)],
-    raw: [f64; 16],
+    raw: [f64; 17],
     loop_keys: usize,
     stage_n: usize,
     entered: f64,
@@ -703,7 +705,10 @@ fn armcheck() {
 
     // D's sub-arms are cel-side, so majit's counters cannot see them and the
     // loop above skips them. Their own counter is what proves them reached.
-    println!("\n  per arm on ONE call: cel sub-arms [walk, token, meta]\n");
+    // The fifth slot is not a pass count: it is how many loop keys resolved to
+    // something other than their raw hash. Zero is what licenses D2/D3/D4
+    // asking on the hash instead of paying the walk again.
+    println!("\n  per arm on ONE call: cel sub-arms [walk, token, upgrade, meta, chained]\n");
     for i in D_SUB {
         let mut amplified = Repeats::default();
         STAGE_ARMS[i](&mut amplified);
@@ -881,7 +886,7 @@ fn main() {
         "(cel barrier)"
     );
 
-    let e_stage_med: Vec<f64> = (MAJIT_FIRST..11)
+    let e_stage_med: Vec<f64> = (MAJIT_FIRST..12)
         .map(|i| median(splits.iter().map(|s| s.stage(i)).collect()))
         .collect();
     let e_barrier = median(splits.iter().map(|s| s.raw[8]).collect());
@@ -918,9 +923,9 @@ fn main() {
     // comparable: E3a and E3d are amplified, the call is a single-shot clock
     // reading, and E3b is a PART of the call rather than a sibling of it, so it
     // is printed as "of which" and never added into the sum.
-    let e3a = median(splits.iter().map(|s| s.stage(12)).collect());
-    let e3b = median(splits.iter().map(|s| s.stage(13)).collect());
-    let e3d = median(splits.iter().map(|s| s.stage(14)).collect());
+    let e3a = median(splits.iter().map(|s| s.stage(13)).collect());
+    let e3b = median(splits.iter().map(|s| s.stage(14)).collect());
+    let e3d = median(splits.iter().map(|s| s.stage(15)).collect());
     let e3_barrier = median(splits.iter().map(|s| s.raw[12]).collect());
     let call = median(splits.iter().map(|s| s.call_ns).collect());
     let e3 = e_residual;
@@ -1018,7 +1023,8 @@ fn main() {
     let d = median(splits.iter().map(|s| s.stage(3)).collect());
     let walk = median(splits.iter().map(|s| s.stage(4)).collect());
     let token = median(splits.iter().map(|s| s.stage(5)).collect());
-    let meta = median(splits.iter().map(|s| s.stage(6)).collect());
+    let upgrade = median(splits.iter().map(|s| s.stage(6)).collect());
+    let meta = median(splits.iter().map(|s| s.stage(7)).collect());
     let pct = |v: f64| if d != 0.0 { 100.0 * v / d } else { f64::NAN };
     println!("\n  D split — medians over the shapes above, PARTS of D and not entries beside it");
     println!("    D  loop-key yield scan       {d:7.2} ns");
@@ -1032,9 +1038,30 @@ fn main() {
         pct(token)
     );
     println!(
+        "      D4 upgrade Weak+drop       {upgrade:7.2} ns  {:5.1}% of D   the same lookup, the \
+         Weak::upgrade and the Arc drop, WITHOUT the flag reads",
+        pct(upgrade)
+    );
+    println!(
         "      D3 meta  get_compiled_meta {meta:7.2} ns  {:5.1}% of D   one compiled_loops \
          hash and probe",
         pct(meta)
+    );
+    // The four buckets the design choice is pre-registered against. D4 is a
+    // PART of D2, not a sibling of it, so the sum below uses D2 and reports
+    // the flag loads as the D2 - D4 difference rather than adding D4 in.
+    println!(
+        "\n      the four buckets:  walk {:7.2}   upgrade+drop {:7.2}   flag loads {:7.2}   \
+         compiled_loops {:7.2}",
+        walk,
+        upgrade,
+        token - upgrade,
+        meta
+    );
+    println!(
+        "      ⚠ `flag loads` is D2 - D4, so it carries both arms' error; and D4's answer is \
+         WEAKER\n        than the door's (an invalidated token still upgrades), so it is a cost \
+         probe, never a route."
     );
     let sum = walk + token + meta;
     println!(
@@ -1046,11 +1073,19 @@ fn main() {
         }
     );
     println!(
-        "      ⇒ walk {:.0}% vs lookups {:.0}% of D. The two lookups each carry a celltable\n      \
-         walk of their own, so D2 - D1 = {:.2} ns estimates the upgrade + flag loads +\n      \
-         drop, valid only to the extent the two walks cost the same.",
+        "      ⇒ walk {:.0}% vs lookups {:.0}% of D.",
         pct(walk),
-        pct(token + meta),
-        token - walk
+        pct(token + meta)
+    );
+    // Cumulative over every call this process made, which is the right
+    // denominator: the claim is about the corpus, not about one shape.
+    #[cfg(feature = "entry-stage-probe")]
+    let chained = entry_stage_sub_passes()[4];
+    #[cfg(not(feature = "entry-stage-probe"))]
+    let chained = 0u64;
+    println!(
+        "      chained buckets: {chained}  (resolve(driver) != key.hash).  ZERO is what licenses\n      \
+         asking D2/D3/D4 on the raw hash; any other number and those three arms stopped\n      \
+         being about the cell the door asks about."
     );
 }

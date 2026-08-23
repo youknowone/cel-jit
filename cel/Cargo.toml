@@ -347,6 +347,7 @@ loop-key-arm-probe = []
 entry-stage-probe = [
     "majit-metainterp?/back-edge-stage-probe",
     "majit-metainterp?/execute-stage-probe",
+    "majit-metainterp?/yield-stage-probe",
 ]
 
 # Route `Program::execute` through the bytecode VM instead of the tree walker.

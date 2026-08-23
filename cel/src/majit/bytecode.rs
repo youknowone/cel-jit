@@ -2938,6 +2938,21 @@ pub mod float_bank {
         /// The two agree on every bucket holding one cell or none -- the same
         /// equivalence `LoopKeyArm` is built on.
         pub loop_token: u32,
+        /// Extra passes of the yield scan's UPGRADE half:
+        /// `probe_cell_token_upgrades` -- the celltable lookup, the
+        /// `Weak::upgrade`, and the drop of the `Arc` it produced, with NO
+        /// flag read after it.
+        ///
+        /// The one arm that is not expressible from majit's shipping API:
+        /// `get_procedure_token` performs the refcount pair AND reads
+        /// `invalidated` inside one function, so [`Self::loop_token`] fuses
+        /// two separable costs. Differenced against it, this leaves the two
+        /// flag loads -- and that difference is what decides whether the
+        /// refcount pair or the atomic loads is the thing to attack.
+        ///
+        /// ⚠ Its answer is deliberately WEAKER than the door's: an
+        /// invalidated token still upgrades. A cost probe, never a decision.
+        pub loop_upgrade: u32,
         /// Extra passes of the yield scan's META half: `get_compiled_meta`,
         /// one `compiled_loops` hash and probe. Asked on `key.hash` for the
         /// same reason as [`Self::loop_token`].
@@ -2960,6 +2975,7 @@ pub mod float_bank {
                 loop_keys: 0,
                 loop_walk: 0,
                 loop_token: 0,
+                loop_upgrade: 0,
                 loop_meta: 0,
                 barrier: 0,
             })
@@ -2977,15 +2993,28 @@ pub mod float_bank {
         /// against does not carry the store.
         static ENTRY_STAGE_LOOP_KEYS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
 
-        /// Passes run by the three sub-arms of the yield scan, in the order
-        /// `[walk, token, meta]`.
+        /// Passes run by the sub-arms of the yield scan, in the order
+        /// `[walk, token, upgrade, meta]`, plus a fifth slot that is NOT a
+        /// pass count -- see below.
         ///
-        /// What proves an arm is REACHED rather than merely armed. A sub-arm
-        /// that compiled to nothing would still leave its repeat count set and
-        /// its difference indistinguishable from noise; a counter the arm's own
-        /// loop increments cannot be satisfied that way.
-        static ENTRY_STAGE_SUB_PASSES: core::cell::Cell<[u64; 3]> =
-            const { core::cell::Cell::new([0; 3]) };
+        /// The first four are what prove an arm is REACHED rather than merely
+        /// armed. A sub-arm that compiled to nothing would still leave its
+        /// repeat count set and its difference indistinguishable from noise; a
+        /// counter the arm's own loop increments cannot be satisfied that way.
+        ///
+        /// ⭐ Slot 4 is the CHAINED-BUCKET count: how many times
+        /// `key.resolve(driver)` answered something other than `key.hash`.
+        /// `PooledGreenKey::resolve` answers an empty or single-cell bucket
+        /// from the walk alone and returns the raw hash, so on every bucket a
+        /// real program here has produced this stays ZERO -- which is what
+        /// licenses asking the `token`, `upgrade` and `meta` arms on
+        /// `key.hash` instead of paying the walk again inside each of them.
+        /// That licence is an assertion about this corpus, so it is COUNTED
+        /// rather than asserted in prose: if a bucket ever chains, the number
+        /// says so and the three arms stop being about the same cell the door
+        /// asks about.
+        static ENTRY_STAGE_SUB_PASSES: core::cell::Cell<[u64; 5]> =
+            const { core::cell::Cell::new([0; 5]) };
     }
 
     /// Set the repeat counts for subsequent calls on this thread, answering
@@ -3007,10 +3036,12 @@ pub mod float_bank {
         ENTRY_STAGE_LOOP_KEYS.with(core::cell::Cell::get)
     }
 
-    /// Passes run by the yield scan's `[walk, token, meta]` sub-arms since the
-    /// last [`reset_entry_stage_sub_passes`].
+    /// Passes run by the yield scan's `[walk, token, upgrade, meta]` sub-arms
+    /// since the last [`reset_entry_stage_sub_passes`], and in slot 4 the
+    /// number of loop keys whose `resolve` disagreed with their raw hash --
+    /// zero on every bucket holding one cell or none.
     #[cfg(feature = "entry-stage-probe")]
-    pub fn entry_stage_sub_passes() -> [u64; 3] {
+    pub fn entry_stage_sub_passes() -> [u64; 5] {
         ENTRY_STAGE_SUB_PASSES.with(core::cell::Cell::get)
     }
 
@@ -3018,7 +3049,7 @@ pub mod float_bank {
     /// against the calls made under it and not against every call so far.
     #[cfg(feature = "entry-stage-probe")]
     pub fn reset_entry_stage_sub_passes() {
-        ENTRY_STAGE_SUB_PASSES.with(|slot| slot.set([0; 3]));
+        ENTRY_STAGE_SUB_PASSES.with(|slot| slot.set([0; 5]));
     }
 
     /// [`run_jit_seeded_f`] on a driver that outlives the call, so a program
@@ -3185,8 +3216,20 @@ pub mod float_bank {
                         // only the result would let the walk be computed once
                         // and the same value handed to the barrier every pass --
                         // an arm that counts its passes and prices nothing. All
-                        // three sub-arms carry it, so it cancels between them.
-                        std::hint::black_box(key.resolve(std::hint::black_box(&*driver)));
+                        // four sub-arms carry it, so it cancels between them.
+                        let resolved = key.resolve(std::hint::black_box(&*driver));
+                        // The licence for the other three arms to ask on
+                        // `key.hash`, counted rather than assumed. Inside the
+                        // arm that already pays the walk, so no other arm and
+                        // no barrier arm carries the comparison.
+                        if resolved != key.hash {
+                            ENTRY_STAGE_SUB_PASSES.with(|slot| {
+                                let mut p = slot.get();
+                                p[4] += 1;
+                                slot.set(p);
+                            });
+                        }
+                        std::hint::black_box(resolved);
                     }
                 }
             }
@@ -3207,11 +3250,27 @@ pub mod float_bank {
                 }
             }
             #[cfg(feature = "entry-stage-probe")]
+            if repeats.loop_upgrade != 0 {
+                ENTRY_STAGE_LOOP_KEYS.with(|slot| slot.set(pooled_program.loop_keys.len()));
+                ENTRY_STAGE_SUB_PASSES.with(|slot| {
+                    let mut p = slot.get();
+                    p[2] += u64::from(repeats.loop_upgrade);
+                    slot.set(p);
+                });
+                for _ in 0..repeats.loop_upgrade {
+                    for key in &pooled_program.loop_keys {
+                        std::hint::black_box(
+                            std::hint::black_box(&*driver).probe_cell_token_upgrades(key.hash),
+                        );
+                    }
+                }
+            }
+            #[cfg(feature = "entry-stage-probe")]
             if repeats.loop_meta != 0 {
                 ENTRY_STAGE_LOOP_KEYS.with(|slot| slot.set(pooled_program.loop_keys.len()));
                 ENTRY_STAGE_SUB_PASSES.with(|slot| {
                     let mut p = slot.get();
-                    p[2] += u64::from(repeats.loop_meta);
+                    p[3] += u64::from(repeats.loop_meta);
                     slot.set(p);
                 });
                 for _ in 0..repeats.loop_meta {
