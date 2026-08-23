@@ -78,6 +78,52 @@
 //!   discarding them silently would be the same mistake in the other
 //!   direction — but they are flagged.
 //!
+//! # What an amplified stage measures, and what it does not
+//!
+//! Several probes here do not time a named stage directly. They run it K extra
+//! times per call and divide the difference by K, because the stages worth
+//! splitting are smaller than the clock: `Instant::now()` costs 20-25 ns on
+//! this box, so a clock placed around a 5 ns stage reports itself.
+//!
+//! **An amplified figure is an upper bound on what deleting that stage buys.**
+//! Amplification prices the operation serialized and in isolation: K copies
+//! back to back, each waiting on the one before it. Deleting the stage prices
+//! it at the margin, inside surrounding code that was already overlapping part
+//! of its latency. The two differ by a factor and not by a rounding error. The
+//! only gap measured on this board is one heap allocation: 9.16 ns amplified
+//! against 2.62 ns realised when a single one was removed, or 3.5x.
+//!
+//! This does not contradict the separate fact that an amplified figure is a
+//! WARM repeat, and so a lower bound on what one execution of the stage costs
+//! inside the call. The two bounds constrain different quantities: what the
+//! stage costs when it runs, and what removing it returns. A figure can be
+//! under the first and over the second at once.
+//!
+//! That 3.5x is one measurement of one operation. It is a reason to expect a
+//! shortfall and to quote a bracket; it is not a divisor to apply. Pre-register
+//! what a change should return from the marginal end, before building it — a
+//! band centred on the amplified figure will fail a change that worked.
+//!
+//! Two further requirements, each of which has caught a live defect here:
+//!
+//! * **Barrier the stage's inputs, not only its result.** A stage whose
+//!   operands are loop-invariant can be hoisted out of the repeat loop
+//!   entirely. It then runs once, and `delta / K` reports a per-pass price for
+//!   work that happened once — sitting exactly as far above the floor as a
+//!   genuine stage, so neither a pass counter nor a barrier comparison can see
+//!   it. Reading the disassembly does not settle it either: a visible loop body
+//!   proves the body is there, not that the loads are inside it. Absence from
+//!   the disassembly is sound proof of removal; presence is not proof of
+//!   per-pass work.
+//!
+//! * **Sweep K, and sweep it wide.** Genuine per-pass work is invariant in K;
+//!   hoisted work decays as 1/K. The span is the discriminating power — 16
+//!   against 64 separates a factor of 4 from a factor of 1, where adjacent
+//!   values separate 2 from 1 and settle nothing. Grade the ratio only when
+//!   both readings clear the section's floor. A ratio of two unresolved
+//!   readings is not evidence, and a guard that grades on one of them answers
+//!   differently across runs of a single binary, which is worse than no guard.
+//!
 //! # Adding an arm
 //!
 //! Everything above is machinery. The measurement itself is the block at the
