@@ -55,7 +55,7 @@
 //! `Instant::now()` costs 20-25 ns on this box. Five of them inside a 100 ns
 //! budget would measure the clock. So each stage is timed by REPETITION
 //! instead: the same call, once with every repeat count at zero and once with
-//! one stage repeated [`REPEAT`] extra times, and the difference over `REPEAT`
+//! one stage repeated [`repeat`] extra times, and the difference over that count
 //! is that stage. `cleanfixprobe` splits a call into halves the same way.
 //!
 //! Two things that shape is easy to get wrong, and both are settled in
@@ -67,6 +67,12 @@
 //! * Every amplification loop carries a counter and one optimization barrier,
 //!   without which the repeated stage is dead code. A fifth arm runs that loop
 //!   with NO stage in it, and every stage figure has it subtracted.
+//! * A barrier and a reachability counter together still do not prove the stage
+//!   ran once per PASS. A stage whose inputs are loop-invariant can be hoisted
+//!   out of the amplification loop and run once, which the counter cannot see
+//!   -- and which does NOT collapse the arm onto the barrier, because once is
+//!   not zero. The count is what tells them apart: see [`REPEAT_K`], and sweep
+//!   it.
 //!
 //! # What the numbers are and are not
 //!
@@ -149,18 +155,39 @@ const PROBE_CALLS: usize = 200;
 /// its sweep's points at or below four, and this is that region on its own:
 /// nothing here needs the slopes, so nothing here sweeps for them.
 const SWEEP: [usize; 4] = [1, 2, 3, 4];
-/// Extra passes per amplified stage.
+/// Extra passes per amplified stage, as [`repeat`] reports it.
 ///
 /// Large enough that a one-nanosecond stage moves the call by tens of
 /// nanoseconds -- well clear of what the fastest of [`ROUNDS`] batches varies
 /// by -- and small enough that the amplified arm stays the same order as the
 /// arm it is differenced against, which is what keeps the two comparable under
 /// a load excursion.
+///
+/// SETTABLE at run time with `ENTRYPROBE_REPEAT`, because the count is the only
+/// thing that separates a stage running once per pass from one the compiler
+/// hoisted out of the amplification loop. Hoisting does not make an arm read
+/// zero -- the work still runs ONCE -- so a hoisted arm reads `cost / count`,
+/// which is not small and sits just as far above the barrier as a real stage
+/// does. It is however the one thing that MOVES: per-pass work reads the same
+/// ns/pass at every count, hoisted work HALVES each time the count doubles.
+///
+/// Sweeping it needs no rebuild and changes no machine code in the arms: the
+/// counts reach the amplification loops through a `Cell` inside `cel` itself,
+/// so they are already opaque to the optimizer there. One binary, three runs.
+/// The same sweep prices any other per-ARMING cost that leaked into a stage --
+/// a setup, a cold miss, a first-touch fault -- since all of them decay as
+/// `1/count` while the stage itself does not.
 #[cfg(feature = "entry-stage-probe")]
-const REPEAT: u32 = 32;
+static REPEAT_K: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(32);
+
+/// Extra passes each amplified arm asks for. See [`REPEAT_K`].
+#[cfg(feature = "entry-stage-probe")]
+fn repeat() -> u32 {
+    REPEAT_K.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// Entries the single-shot call arm clocks. Higher than the amplified arms
-/// need: each entry contributes ONE reading rather than [`REPEAT`] of them, so
+/// need: each entry contributes ONE reading rather than [`repeat`] of them, so
 /// the averaging an amplified arm gets for free has to be bought here.
 #[cfg(feature = "entry-stage-probe")]
 const CALL_SHOTS: usize = 20_000;
@@ -251,23 +278,23 @@ fn set_repeats(repeats: Repeats) {
 /// Which repeat count each arm raises. Index-parallel with [`STAGE_LABELS`].
 #[cfg(feature = "entry-stage-probe")]
 const STAGE_ARMS: [fn(&mut Repeats); 17] = [
-    |r| r.cel.tls = REPEAT,
-    |r| r.cel.pool = REPEAT,
-    |r| r.cel.reseed = REPEAT,
-    |r| r.cel.loop_keys = REPEAT,
-    |r| r.cel.loop_walk = REPEAT,
-    |r| r.cel.loop_token = REPEAT,
-    |r| r.cel.loop_upgrade = REPEAT,
-    |r| r.cel.loop_meta = REPEAT,
-    |r| r.cel.barrier = REPEAT,
-    |r| r.majit.gate = REPEAT as u16,
-    |r| r.majit.marshal_in = REPEAT as u16,
-    |r| r.majit.marshal_out = REPEAT as u16,
-    |r| r.majit.barrier = REPEAT as u16,
-    |r| r.exec.prologue = REPEAT as u16,
-    |r| r.frame_build = REPEAT,
-    |r| r.exec.decode = REPEAT as u16,
-    |r| r.exec.barrier = REPEAT as u16,
+    |r| r.cel.tls = repeat(),
+    |r| r.cel.pool = repeat(),
+    |r| r.cel.reseed = repeat(),
+    |r| r.cel.loop_keys = repeat(),
+    |r| r.cel.loop_walk = repeat(),
+    |r| r.cel.loop_token = repeat(),
+    |r| r.cel.loop_upgrade = repeat(),
+    |r| r.cel.loop_meta = repeat(),
+    |r| r.cel.barrier = repeat(),
+    |r| r.majit.gate = repeat() as u16,
+    |r| r.majit.marshal_in = repeat() as u16,
+    |r| r.majit.marshal_out = repeat() as u16,
+    |r| r.majit.barrier = repeat() as u16,
+    |r| r.exec.prologue = repeat() as u16,
+    |r| r.frame_build = repeat(),
+    |r| r.exec.decode = repeat() as u16,
+    |r| r.exec.barrier = repeat() as u16,
 ];
 
 fn timed(iters: usize, run: &mut impl FnMut()) -> Duration {
@@ -393,7 +420,7 @@ fn arms(bound: &BoundBatch<'_, '_>) -> ([f64; 17], usize, f64, f64, u64) {
             || run(Repeats::default(), &mut base_buf),
             || run(amplified, &mut amp_buf),
         );
-        *slot = (amped - base) / f64::from(REPEAT);
+        *slot = (amped - base) / f64::from(repeat());
     }
     set_repeats(Repeats::default());
 
@@ -786,6 +813,22 @@ fn check_barrier_wiring() {
 
 fn main() {
     check_barrier_wiring();
+    #[cfg(feature = "entry-stage-probe")]
+    {
+        if let Ok(raw) = std::env::var("ENTRYPROBE_REPEAT") {
+            let k: u32 = raw
+                .parse()
+                .unwrap_or_else(|_| panic!("ENTRYPROBE_REPEAT is not an integer: {raw:?}"));
+            // The majit-side arms hold their counts in a `u16`, so the cast in
+            // `STAGE_ARMS` has to be lossless or those arms would silently ask
+            // for a different count than the cel-side ones.
+            assert!(
+                k > 0 && k <= u32::from(u16::MAX),
+                "ENTRYPROBE_REPEAT out of range: {k}"
+            );
+            REPEAT_K.store(k, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
     if std::env::args().nth(1).as_deref() == Some("armcheck") {
         armcheck();
         return;
@@ -803,7 +846,10 @@ fn main() {
          \x20 reads NaN. Rebuild with --features jit-cranelift,entry-stage-probe for the split."
     );
     #[cfg(feature = "entry-stage-probe")]
-    println!("each stage repeated {REPEAT} extra times per call; delta / {REPEAT} is the stage.");
+    {
+        let k = repeat();
+        println!("each stage repeated {k} extra times per call; delta / {k} is the stage.");
+    }
 
     let splits = vec![
         split_rows("rows: x + 1", "x + 1"),
