@@ -10,11 +10,86 @@
 //!
 //! The two-bank machine's [`ValType`] has seven variants — `Int`, `Bool`,
 //! `UInt`, `Float`, `Str`, `Timestamp`, `Duration` — and no bank for bytes,
-//! null or optional. A corpus expression reading `by`, `nil`, `opt_some` or
-//! `opt_none` therefore cannot lower under ANY schema anyone could write, so
-//! counting it as a decline measures the corpus's input universe rather than
-//! `lower_typed`'s op coverage. Those records are separated into their own
-//! `DOMAIN` bucket and the census reports TWO fractions:
+//! null or optional.
+//!
+//! The `DOMAIN` bucket holds the records that fail for THAT reason rather than
+//! for a missing operator: a record reading `by`, `nil`, `opt_some` or
+//! `opt_none` cannot lower under ANY schema anyone could write, so counting it
+//! as a decline would measure the corpus's input universe rather than
+//! `lower_typed`'s op coverage. The test is [`collect_out_of_domain`], over the
+//! parsed AST, and it looks at BINDINGS ONLY.
+//!
+//! ## Why bindings and not literals
+//!
+//! `b"hi"` and `null` are values the machine cannot hold either, so the obvious
+//! move is to treat an out-of-domain LITERAL the same way. That was tried and
+//! reverted; the reasons are worth keeping, because each costs a measurement to
+//! rediscover.
+//!
+//! **A binding is fatal on its own; a literal is not.** A binding has to become
+//! a column, the schema is what names a column's bank, and there is no bank to
+//! name — so no schema over any context admits it. A literal can be erased by
+//! constant folding before any bank is chosen: `null == null` carries a null
+//! literal and LOWERS today, to a folded `true`. Treating literals as fatal
+//! moves 7 records into `DOMAIN` and takes that one out of `LOWERED`, which is
+//! a record the machine demonstrably handles.
+//!
+//! **Conditioning on the decline instead splits a single failure class in
+//! two.** The repair for that counterexample is "a literal counts only when the
+//! lowering also declined", and it is worse than the problem. It tests that a
+//! decline happened SOMEWHERE in the record, never that the literal caused it —
+//! so it lands `type(null)` in `DOMAIN` and `type(1)` in `DECLINED`, though
+//! both fail for one reason: `type()` folds to a `Value::Opaque` and no bank
+//! holds it. The only thing telling them apart is an incidental null literal
+//! that is not why either declined.
+//!
+//! That is the objection, and it is not about how many rows move. The bucket
+//! already under-approximates its predicate (next section), and a UNIFORM
+//! under-approximation is honest. One that admits some members of a failure
+//! class and excludes others on an incidental syntactic feature is an artifact:
+//! a reader seeing `type(null)` filed as "no schema can help" beside `type(1)`
+//! filed as a decline will conclude something the data does not support. In
+//! passing it also shrinks `constant of type `opaque`` from 17 to 14, taking
+//! 15% off the census's one actionable finding.
+//!
+//! Attributing by CAUSE would fix that, and cause is not available here: the
+//! only channel carrying it is the `LowerError` text, which is barred because
+//! it goes stale the moment a message is reworded. So the choice is between two
+//! UNIFORM rules — bindings only, or bindings plus literals-with-decline — and
+//! only the first is uniform.
+//!
+//! **The message text is not an alternative channel.** Seven records carry an
+//! out-of-domain literal:
+//!
+//! ```text
+//!   line 89    b"hi"                     line 656   type(null)
+//!   line 93    null                      line 775   type(null) == null_type
+//!   line 97    null == null              line 1152  b"ab" + b"cd"
+//!   line 652   type(b"hi")
+//! ```
+//!
+//! Only two say so in their `LowerError` — line 89 (`bytes literal`) and line
+//! 93 (`null literal`). Line 97 does not decline at all, and the remaining four
+//! decline for a downstream reason, so any rule reading the reason string sees
+//! two of seven and silently misses the rest.
+//!
+//! So `DOMAIN` stays the narrow syntactic test. It is uniform, and it is
+//! decidable without running the thing it exists to explain — neither of which
+//! any wider version manages. The choice costs nothing besides: `raw` reads
+//! 55.1% under either rule (see the invariance note below), so the fraction
+//! worth quoting does not depend on it.
+//!
+//! ## `DOMAIN` under-approximates its own predicate, deliberately
+//!
+//! Stated plainly so the number is not over-read: the bucket is a SUFFICIENT
+//! SYNTACTIC TEST for "cannot lower under any schema", not that predicate
+//! itself. Other declines satisfy the predicate too — a folded constant of an
+//! unrepresentable type, a struct literal — because no schema declaration
+//! changes what a folded constant's type is. Widening the test would move those
+//! records out of `DECLINED` without a single change to `lower_typed`, which is
+//! exactly why the fraction to quote is the one that cannot be moved that way.
+//!
+//! With `DOMAIN` separated, the census reports TWO fractions:
 //!
 //! * **raw** — `LOWERED / (LOWERED + DECLINED + DOMAIN)`, what a caller holding
 //!   this corpus and this machine would actually see;
@@ -22,6 +97,13 @@
 //!   covers once the expressions no schema can name are set aside.
 //!
 //! Neither is reported alone. The gap between them IS a finding.
+//!
+//! And they are not equally solid. Moving a record between `DECLINED` and
+//! `DOMAIN` reclassifies it inside the SAME denominator, so **`raw` is
+//! INVARIANT under where the `DOMAIN` boundary is drawn** and only `in-domain`
+//! responds to it. `raw` is a measurement; `in-domain` is a measurement plus a
+//! judgement about that boundary. **When the two disagree, quote `raw`** — it
+//! is the one a wider definition of `DOMAIN` cannot inflate.
 //!
 //! ## The schema is deliberately maximal
 //!
@@ -47,6 +129,26 @@
 //!
 //! Anything else that differs — a bank name, a type class — stays a distinct
 //! row, because those are different reasons and not different spellings of one.
+//!
+//! Normalising is what makes the histogram countable, and it is also what makes
+//! it unactionable on its own: "26 declines about a constant of some type" is a
+//! size without a name, and nobody can turn it into work. So each bucket also
+//! prints the DISTINCT RAW reasons underneath it with their own counts, which
+//! is where the type names, the function names and the paths survive. Every
+//! bucket gets its sub-rows, with no threshold — a threshold would hide exactly
+//! the long tail that says what is missing. The one exception is a bucket whose
+//! sole raw reason is the bucket string itself (normalisation was a no-op
+//! because the reason carries no backticks and no digits); printing that twice
+//! would be noise.
+//!
+//! Every row also carries `(n err)`: how many of its records the corpus writes
+//! as `want: error(...)`. That column is what tells a coverage GAP apart from
+//! correct behaviour, and a count alone cannot. A row of expressions the corpus
+//! wrote to RAISE is one where refusing to lower may be the right answer rather
+//! than a hole — the tree-walker is going to produce an error for them either
+//! way — whereas a row with no error cases is asking for work. See
+//! [`DeclineCell`]. The whole-population version of the same number is in the
+//! cross-tab below the histogram; this is that number resolved per reason.
 //!
 //! ## The honesty clause — read this before quoting the number
 //!
@@ -204,34 +306,40 @@ fn maximal_schema() -> Schema {
 const OUT_OF_DOMAIN_BINDINGS: &[&str] = &["by", "nil", "opt_some", "opt_none"];
 
 // ---------------------------------------------------------------------------
-// free identifiers
+// out-of-domain reads
 // ---------------------------------------------------------------------------
 
-/// Every `Ident` name reachable from `e`.
+/// Every out-of-domain BINDING `e` reads: a name in [`OUT_OF_DOMAIN_BINDINGS`].
 ///
-/// An OVER-approximation of the free set: a comprehension's bound variables are
-/// collected too, because separating them would need a scope walk this census
-/// does not need. That is sound for its one use — deciding whether a record
-/// reads an out-of-domain binding — provided no name in
-/// [`OUT_OF_DOMAIN_BINDINGS`] is ever a bound variable in the corpus. It is
-/// not: the corpus's macro variables are `x`, `y`, `p`, `k`, `optional` and
-/// `size`, and `assert_no_out_of_domain_name_is_bound` re-checks that claim
-/// against the corpus text rather than leaving it as a comment.
+/// Bindings only, and that narrowness is the point — see the census header's
+/// "why bindings and not literals" for the measurement that settled it. A
+/// binding is decidable from the AST alone and needs nothing from
+/// `lower_typed`, so this walk cannot be wrong about a record for a reason the
+/// lowering could later reword.
+///
+/// An OVER-approximation: a comprehension's bound variables are collected too,
+/// because separating them would need a scope walk this census does not need.
+/// That is sound provided no name in [`OUT_OF_DOMAIN_BINDINGS`] is ever a bound
+/// variable in the corpus, which
+/// `no_out_of_domain_name_is_bound_by_a_corpus_macro` re-checks against the
+/// corpus text rather than leaving as a comment.
 ///
 /// The base of a `Select` chain needs no special case: it is an `Ident` node in
 /// the operand position, so the plain recursion reaches it.
-fn collect_idents(e: &IdedExpr, out: &mut BTreeSet<String>) {
+fn collect_out_of_domain(e: &IdedExpr, out: &mut BTreeSet<String>) {
     match &e.expr {
         Expr::Ident(name) => {
-            out.insert(name.clone());
+            if OUT_OF_DOMAIN_BINDINGS.contains(&name.as_str()) {
+                out.insert(name.clone());
+            }
         }
-        Expr::Select(sel) => collect_idents(&sel.operand, out),
+        Expr::Select(sel) => collect_out_of_domain(&sel.operand, out),
         Expr::Call(call) => {
             if let Some(target) = &call.target {
-                collect_idents(target, out);
+                collect_out_of_domain(target, out);
             }
             for arg in &call.args {
-                collect_idents(arg, out);
+                collect_out_of_domain(arg, out);
             }
         }
         Expr::Comprehension(comp) => {
@@ -242,22 +350,22 @@ fn collect_idents(e: &IdedExpr, out: &mut BTreeSet<String>) {
                 &comp.loop_step,
                 &comp.result,
             ] {
-                collect_idents(part, out);
+                collect_out_of_domain(part, out);
             }
         }
         Expr::List(list) => {
             for element in &list.elements {
-                collect_idents(element, out);
+                collect_out_of_domain(element, out);
             }
         }
         Expr::Map(map) => {
             for entry in &map.entries {
                 match &entry.expr {
                     EntryExpr::MapEntry(kv) => {
-                        collect_idents(&kv.key, out);
-                        collect_idents(&kv.value, out);
+                        collect_out_of_domain(&kv.key, out);
+                        collect_out_of_domain(&kv.value, out);
                     }
-                    EntryExpr::StructField(field) => collect_idents(&field.value, out),
+                    EntryExpr::StructField(field) => collect_out_of_domain(&field.value, out),
                 }
             }
         }
@@ -265,10 +373,10 @@ fn collect_idents(e: &IdedExpr, out: &mut BTreeSet<String>) {
             for entry in &structure.entries {
                 match &entry.expr {
                     EntryExpr::MapEntry(kv) => {
-                        collect_idents(&kv.key, out);
-                        collect_idents(&kv.value, out);
+                        collect_out_of_domain(&kv.key, out);
+                        collect_out_of_domain(&kv.value, out);
                     }
-                    EntryExpr::StructField(field) => collect_idents(&field.value, out),
+                    EntryExpr::StructField(field) => collect_out_of_domain(&field.value, out),
                 }
             }
         }
@@ -279,6 +387,33 @@ fn collect_idents(e: &IdedExpr, out: &mut BTreeSet<String>) {
 // ---------------------------------------------------------------------------
 // decline normalisation
 // ---------------------------------------------------------------------------
+
+/// One histogram cell: how many records landed on a reason, and how many of
+/// those the corpus declares should RAISE (`want: error(...)`).
+///
+/// The second number is what separates a coverage GAP from correct behaviour. A
+/// bucket whose records are all error cases is one where declining may be the
+/// right answer — the corpus wrote those rows to fail — and a bucket with no
+/// error cases is asking for work. A total alone cannot tell them apart.
+#[derive(Default, Clone, Copy)]
+struct DeclineCell {
+    total: usize,
+    wants_error: usize,
+}
+
+impl DeclineCell {
+    /// The cell covering every cell in `cells`, for rolling raw reasons up into
+    /// their normalised bucket.
+    fn sum<'a>(cells: impl IntoIterator<Item = &'a DeclineCell>) -> DeclineCell {
+        cells
+            .into_iter()
+            .fold(DeclineCell::default(), |mut acc, cell| {
+                acc.total += cell.total;
+                acc.wants_error += cell.wants_error;
+                acc
+            })
+    }
+}
 
 /// Collapses a `LowerError::reason` to its bucket key. The two rewrites are
 /// spelled out in this file's header, and are the whole rule.
@@ -335,7 +470,10 @@ fn lower_typed_coverage_over_the_oracle_corpus() {
     let mut lowered = 0usize;
     let mut declined = 0usize;
 
-    let mut decline_histogram: BTreeMap<String, usize> = BTreeMap::new();
+    // Normalised bucket -> the distinct RAW reasons in it -> how many each.
+    // Two levels rather than one: the outer key is what makes the histogram
+    // countable, the inner keys are what make it a work list.
+    let mut decline_histogram: BTreeMap<String, BTreeMap<String, DeclineCell>> = BTreeMap::new();
     let mut sum_reducible = 0usize;
     let mut row_projection = 0usize;
     let mut lowered_wanting_error = 0usize;
@@ -363,18 +501,15 @@ fn lower_typed_coverage_over_the_oracle_corpus() {
             continue;
         };
 
-        let mut idents = BTreeSet::new();
-        collect_idents(&expr, &mut idents);
-        let out_of_domain: Vec<&str> = OUT_OF_DOMAIN_BINDINGS
-            .iter()
-            .copied()
-            .filter(|name| idents.contains(*name))
-            .collect();
+        // A binding settles it without asking the lowering anything: no schema
+        // can name the column, so the answer is the same for every schema. This
+        // test is deliberately narrow; the header says why nothing else is in
+        // it.
+        let mut out_of_domain = BTreeSet::new();
+        collect_out_of_domain(&expr, &mut out_of_domain);
         if !out_of_domain.is_empty() {
-            domain.push(format!(
-                "  line {line}: {source}   [{}]",
-                out_of_domain.join(" ")
-            ));
+            let label = out_of_domain.iter().cloned().collect::<Vec<_>>().join(" ");
+            domain.push(format!("  line {line}: {source}   [{label}]"));
             continue;
         }
 
@@ -396,10 +531,14 @@ fn lower_typed_coverage_over_the_oracle_corpus() {
             }
             Err(error) => {
                 declined += 1;
-                *decline_histogram
+                let cell = decline_histogram
                     .entry(normalise_reason(&error.reason))
-                    .or_default() += 1;
+                    .or_default()
+                    .entry(error.reason.clone())
+                    .or_default();
+                cell.total += 1;
                 if wants_error {
+                    cell.wants_error += 1;
                     declined_wanting_error += 1;
                 }
             }
@@ -448,14 +587,49 @@ fn lower_typed_coverage_over_the_oracle_corpus() {
         "  in-domain  {lowered}/{in_domain_denominator} = {}   LOWERED / (LOWERED + DECLINED)",
         pct(lowered, in_domain_denominator)
     );
+    println!("  ---");
+    println!("  `raw` is INVARIANT under where the DOMAIN boundary is drawn: moving a");
+    println!("  record between DECLINED and DOMAIN reclassifies it inside the SAME");
+    println!("  denominator, so only `in-domain` responds. raw is a measurement;");
+    println!("  in-domain is a measurement PLUS a judgement about that boundary.");
+    println!("  WHEN THE TWO DISAGREE, QUOTE raw -- widening the definition of DOMAIN");
+    println!("  can inflate in-domain without a single change to lower_typed.");
 
     println!("\ndecline histogram (reasons normalised: backtick spans -> `_`, digit runs -> N)");
-    let mut rows: Vec<(&String, &usize)> = decline_histogram.iter().collect();
-    rows.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
-    for (reason, count) in &rows {
-        println!("  {count:>4}  {reason}");
+    println!("  indented rows are the DISTINCT RAW reasons inside the bucket above them");
+    println!("  (n err) = how many of that row's records carry `want: error(...)`, i.e. are");
+    println!("  corpus rows written to RAISE -- where declining may be correct, not a gap");
+    let mut rows: Vec<(&String, DeclineCell, &BTreeMap<String, DeclineCell>)> = decline_histogram
+        .iter()
+        .map(|(reason, raw)| (reason, DeclineCell::sum(raw.values()), raw))
+        .collect();
+    rows.sort_by(|a, b| b.1.total.cmp(&a.1.total).then_with(|| a.0.cmp(b.0)));
+    let mut distinct_raw = 0usize;
+    for (reason, cell, raw) in &rows {
+        println!(
+            "  {:>4} ({:>2} err)  {reason}",
+            cell.total, cell.wants_error
+        );
+        distinct_raw += raw.len();
+        // A bucket holding exactly one raw reason equal to the bucket string
+        // is one normalisation did nothing to: there is no name to recover,
+        // and printing the same line indented would say it twice.
+        if raw.len() == 1 && raw.contains_key(*reason) {
+            continue;
+        }
+        let mut raw_rows: Vec<(&String, &DeclineCell)> = raw.iter().collect();
+        raw_rows.sort_by(|a, b| b.1.total.cmp(&a.1.total).then_with(|| a.0.cmp(b.0)));
+        for (text, sub) in raw_rows {
+            println!(
+                "        {:>4} ({:>2} err)  {text}",
+                sub.total, sub.wants_error
+            );
+        }
     }
-    println!("  ({} distinct normalised reasons)", rows.len());
+    println!(
+        "  ({} distinct normalised reasons, {distinct_raw} distinct raw)",
+        rows.len()
+    );
 
     println!("\nthe two gates AFTER lowering (of the {lowered} LOWERED)");
     println!(
@@ -480,7 +654,10 @@ fn lower_typed_coverage_over_the_oracle_corpus() {
         "  LOWERED  with a value answer     {:>4}",
         lowered - lowered_wanting_error
     );
-    println!("  DECLINED with want: error(...)   {declined_wanting_error:>4}");
+    println!(
+        "  DECLINED with want: error(...)   {declined_wanting_error:>4}   \
+         (per reason: the (n err) column above)"
+    );
     if !lowered_error_cases.is_empty() {
         println!("  the lowered rows that RAISE in the tree-walker:");
         for case in &lowered_error_cases {
@@ -522,7 +699,7 @@ fn lower_typed_coverage_over_the_oracle_corpus() {
     );
 }
 
-/// The premise [`collect_idents`] over-approximates on: no out-of-domain
+/// The premise [`collect_out_of_domain`] over-approximates on: no out-of-domain
 /// binding is ever a macro's bound variable in the corpus, so counting bound
 /// variables as free cannot move a record into the DOMAIN bucket by mistake.
 ///
@@ -548,7 +725,7 @@ fn no_out_of_domain_name_is_bound_by_a_corpus_macro() {
     assert!(
         offenders.is_empty(),
         "an out-of-domain name is a bound variable, so the free-identifier \
-         over-approximation in `collect_idents` is no longer sound:\n{}",
+         over-approximation in `collect_out_of_domain` is no longer sound:\n{}",
         offenders.join("\n")
     );
 }
