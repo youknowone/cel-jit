@@ -627,6 +627,112 @@ pub fn prepare_batch<'a>(
 /// [`prepare_batch`] for a chosen reduction. Under [`BatchReduce::PerRow`] the
 /// run owns an `n`-element output buffer and the loop stores through its
 /// address, seeded like any other batch datum.
+/// Extra passes of one named stage of [`prepare_batch_reduce`], so that what a
+/// stage costs is a difference taken inside ONE binary.
+///
+/// The same discipline as [`float_bank::EntryStageRepeats`] and for the same
+/// reason: `bind` is tens of nanoseconds on the shapes that matter and
+/// `Instant::now()` costs 20-25 ns here, so a clock per stage would report
+/// itself. Time the call with every count at zero, again with one count at `k`,
+/// and the difference over `k` is that stage.
+///
+/// Read ONCE per call, ahead of every stage, so no stage's difference carries
+/// the read. A build carrying this feature therefore pays one thread-local read
+/// and seven zero-trip loop tests per bind that a default build does not, so no
+/// arm's ABSOLUTE figure is what the shipping door costs -- only differences are
+/// claims.
+///
+/// ⚠ Every stage here is repeated by RE-RUNNING it and discarding the answer,
+/// which is sound only because each is a pure function of inputs the loop does
+/// not mutate. The allocating stages ([`EncodeStageRepeats::trap`],
+/// [`EncodeStageRepeats::out`]) therefore price an allocation AND its matching
+/// free, which is an over-estimate of the allocation alone and is the honest
+/// reading of them.
+#[cfg(feature = "encode-stage-probe")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct EncodeStageRepeats {
+    /// Extra passes of the two assertion sweeps: column count and bank match,
+    /// then the row-length check over every `SlotKind::Row` column.
+    pub asserts: u32,
+    /// Extra `temporal_out_of_domain` scans. The shipping path runs this TWICE
+    /// per bind -- once as a checked `BatchError` in `BatchProgram::bind`'s
+    /// encode half, then again as the assert here -- so this stage priced at
+    /// `k` describes ONE of the two.
+    pub temporal: u32,
+    /// Extra `StrDict::build` calls over the same string set.
+    ///
+    /// The stage this probe exists to settle. It runs UNCONDITIONALLY, with no
+    /// guard on whether the batch carries a `Column::Str` or the expression a
+    /// `SeedKind::StrId`, so a scalar activation with no strings anywhere still
+    /// pays whatever it costs on an empty iterator.
+    pub strdict: u32,
+    /// Extra `bases` vectors: one `i64` per column, read back out of the
+    /// caller's buffers and the materialized id columns.
+    pub bases: u32,
+    /// Extra trap-word `Box`es.
+    pub trap: u32,
+    /// Extra per-row output buffers. Zero-trip under `BatchReduce::Sum`, which
+    /// allocates none.
+    pub out: u32,
+    /// Extra passes of an amplification loop with NO stage in it: the counter,
+    /// and the one optimization barrier every other field's loop also carries.
+    /// Subtracting it is what leaves a stage's own cost rather than its cost
+    /// plus the machinery that made it repeat.
+    pub barrier: u32,
+}
+
+#[cfg(feature = "encode-stage-probe")]
+std::thread_local! {
+    /// The counts the next bind on this thread runs with.
+    static ENCODE_STAGE_REPEATS: core::cell::Cell<EncodeStageRepeats> = const {
+        core::cell::Cell::new(EncodeStageRepeats {
+            asserts: 0,
+            temporal: 0,
+            strdict: 0,
+            bases: 0,
+            trap: 0,
+            out: 0,
+            barrier: 0,
+        })
+    };
+}
+
+#[cfg(feature = "encode-stage-probe")]
+std::thread_local! {
+    /// How many times the amplified `out` stage actually ran its body.
+    ///
+    /// Published by the stage rather than inferred outside it, because the two
+    /// ways that stage can read ~0 ns -- zero-trip under `BatchReduce::Sum`,
+    /// and elimination of an allocation nothing observes -- are
+    /// indistinguishable in the timing alone.
+    static ENCODE_STAGE_OUT_PASSES: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+}
+
+/// Passes the amplified `out` stage has run since [`reset_encode_stage_passes`].
+#[cfg(feature = "encode-stage-probe")]
+pub fn encode_stage_out_passes() -> u64 {
+    ENCODE_STAGE_OUT_PASSES.with(core::cell::Cell::get)
+}
+
+/// Zero the pass counter, so a section counts only its own arms.
+#[cfg(feature = "encode-stage-probe")]
+pub fn reset_encode_stage_passes() {
+    ENCODE_STAGE_OUT_PASSES.with(|c| c.set(0));
+}
+
+/// Set the repeat counts for subsequent binds on this thread, answering what
+/// they were.
+///
+/// A setter rather than a wrapper around one call, for the same reason
+/// [`float_bank::set_entry_stage_repeats`] is one: the whole-cost figure this
+/// splits is read through `BatchProgram::bind_per_row_resolved`, so the stages
+/// have to be read through it too, or the parts and the whole describe
+/// different doors.
+#[cfg(feature = "encode-stage-probe")]
+pub fn set_encode_stage_repeats(repeats: EncodeStageRepeats) -> EncodeStageRepeats {
+    ENCODE_STAGE_REPEATS.with(|slot| slot.replace(repeats))
+}
+
 pub fn prepare_batch_reduce<'a>(
     lowered: &super::lower::LoweredF,
     columns: &[Column<'a>],
@@ -634,6 +740,14 @@ pub fn prepare_batch_reduce<'a>(
     what: &str,
     reduce: BatchReduce,
 ) -> BatchRun<'a> {
+    // Read once per call, ahead of every stage, so no stage's difference
+    // carries it. See [`EncodeStageRepeats`].
+    #[cfg(feature = "encode-stage-probe")]
+    let repeats = ENCODE_STAGE_REPEATS.with(core::cell::Cell::get);
+    #[cfg(feature = "encode-stage-probe")]
+    for _ in 0..repeats.barrier {
+        std::hint::black_box(&columns);
+    }
     assert_eq!(
         columns.len(),
         lowered.slots.len(),
@@ -660,6 +774,22 @@ pub fn prepare_batch_reduce<'a>(
         }
         assert_eq!(c.len(), n, "{what}: column {k} length {} != {n}", c.len());
     }
+    #[cfg(feature = "encode-stage-probe")]
+    for _ in 0..repeats.asserts {
+        for (col, slot) in columns.iter().zip(&lowered.slots) {
+            std::hint::black_box(col.matches(slot.ty));
+        }
+        for (c, slot) in columns.iter().zip(&lowered.slots) {
+            if slot.kind != SlotKind::Row {
+                continue;
+            }
+            std::hint::black_box(c.len() == n);
+        }
+    }
+    #[cfg(feature = "encode-stage-probe")]
+    for _ in 0..repeats.temporal {
+        std::hint::black_box(lowered.temporal_out_of_domain(columns).is_none());
+    }
     // Temporal arithmetic is exact only inside the domain the lowering
     // recorded. Callers on the public path ask first and get a `BatchError`;
     // reaching here out of domain is a harness bug, and a wrong sum is a worse
@@ -669,6 +799,25 @@ pub fn prepare_batch_reduce<'a>(
         "{what}: temporal column outside the ±{:?}ns arithmetic domain",
         lowered.temporal_bound
     );
+    // The unconditional dictionary build, amplified. Re-running it is sound
+    // because it reads only `columns` and `lowered`, neither of which any pass
+    // mutates.
+    #[cfg(feature = "encode-stage-probe")]
+    for _ in 0..repeats.strdict {
+        std::hint::black_box(StrDict::build(
+            columns
+                .iter()
+                .filter_map(|c| match c {
+                    Column::Str(s) => Some(s.iter().map(String::as_str)),
+                    _ => None,
+                })
+                .flatten()
+                .chain(lowered.scalar_seeds.iter().filter_map(|s| match &s.kind {
+                    super::lower::SeedKind::StrId(t) => Some(t.as_str()),
+                    super::lower::SeedKind::StrPredicate(_) => None,
+                })),
+        ));
+    }
     // Rank every string this batch can be asked about — the column values and
     // the expression's literals together — so all of them share one order.
     let dict = StrDict::build(
@@ -694,6 +843,26 @@ pub fn prepare_batch_reduce<'a>(
             _ => None,
         })
         .collect();
+    // `bases` reads the id columns positionally, so an amplified pass needs its
+    // own cursor rather than sharing the real one.
+    #[cfg(feature = "encode-stage-probe")]
+    for _ in 0..repeats.bases {
+        let mut id_col = 0;
+        let v: Vec<i64> = columns
+            .iter()
+            .map(|c| match c {
+                Column::Int(x) => x.as_ptr() as i64,
+                Column::Float(x) => x.as_ptr() as i64,
+                Column::Bool(x) => x.as_ptr() as i64,
+                Column::Str(_) => {
+                    let base = str_ids[id_col].as_ptr() as i64;
+                    id_col += 1;
+                    base
+                }
+            })
+            .collect();
+        std::hint::black_box(v);
+    }
     let mut next_id_col = 0;
     let bases: Vec<i64> = columns
         .iter()
@@ -708,6 +877,26 @@ pub fn prepare_batch_reduce<'a>(
             }
         })
         .collect();
+    // Allocation stages price an allocation AND its matching free, since the
+    // amplified copy is dropped at the end of each pass. That is an
+    // over-estimate of the allocation alone and is how they must be read.
+    #[cfg(feature = "encode-stage-probe")]
+    for _ in 0..repeats.trap {
+        std::hint::black_box(Box::new(0i64));
+    }
+    #[cfg(feature = "encode-stage-probe")]
+    for _ in 0..repeats.out {
+        // Counted, not just run. This stage is zero-trip under
+        // `BatchReduce::Sum`, and a stage the compiler ELIDED would report the
+        // same near-zero figure as one that never executed. The counter is what
+        // tells the two apart; without it the report cannot distinguish
+        // "genuinely skipped" from "optimized away", and those have opposite
+        // consequences for whether the cost is real.
+        if reduce == BatchReduce::PerRow {
+            std::hint::black_box(vec![0i64; n.max(1)].into_boxed_slice());
+            ENCODE_STAGE_OUT_PASSES.with(|c| c.set(c.get() + 1));
+        }
+    }
     let mut trap: Box<i64> = Box::new(0);
     let trap_addr = (&mut *trap) as *mut i64 as i64;
     // A zero-row batch never enters the loop, but the seed still asserts a

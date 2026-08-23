@@ -350,6 +350,28 @@ entry-stage-probe = [
     "majit-metainterp?/yield-stage-probe",
 ]
 
+# The fifth measurement probe, and never a shipping feature either. It gives
+# `prepare_batch_reduce` a per-stage repeat count, read once per bind out of a
+# thread-local, so what one named stage of the columnar ENCODE costs is a
+# difference taken inside ONE binary -- the same bind against itself, once with
+# every count at zero and once with one stage repeated k extra times.
+#
+# Repetition and not a clock, for the reason `entry-stage-probe` gives: `bind`
+# is 44-770 ns across the shapes that matter and `Instant::now()` costs 20-25 ns
+# here, so a clock per stage would report itself.
+#
+# Encode is where the cost is. `bind` splits into a resolution (one map lookup
+# per declared path) and this encoding, and the encoding is 62-97% of it --
+# 94-97% on the CHEAPEST expressions, which carry no list and no string and so
+# should have the least to encode. That is the question this feature exists to
+# answer.
+#
+# Off by default, and selected only by measurement examples under `examples/`.
+# A build carrying it pays one thread-local read and seven zero-trip loop tests
+# per bind that a default build does not, so an absolute figure taken from such
+# a build is not what the shipping door costs; only differences are claims.
+encode-stage-probe = []
+
 # Route `Program::execute` through the bytecode VM instead of the tree walker.
 #
 # On by default, so the VM is what a caller gets. The tree walker is not
