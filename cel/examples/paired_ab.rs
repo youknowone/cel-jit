@@ -2339,6 +2339,77 @@ fn encode_stage_split(cfg: &Config) {
             }),
         ];
 
+        // ⛔ VALIDITY CHECK, and it runs BEFORE the stages so a failure is seen
+        // before the figures it would invalidate. Every stage's inputs are
+        // loop-invariant, so the compiler may hoist the work out of the
+        // amplification loop and leave `black_box` consuming one computed value
+        // K times.
+        //
+        // Neither of the two guards already here can see that. A pass counter
+        // cannot: the loop is still entered K times. Comparing against the
+        // barrier cannot either, and that is the trap -- hoisted work costs
+        // `stage x K` ONCE, which divided by K reports the same number a
+        // genuine stage does, sitting just as far above the barrier.
+        //
+        // Scaling separates them, with no disassembly and no counter:
+        //
+        //     per-iteration work  ->  ns/pass is INVARIANT in K
+        //     hoisted work        ->  ns/pass scales as 1/K
+        //
+        // ⭐ It is not only a hoisting check. ANY per-arming cost that leaked
+        // into a stage -- a setup, a cold miss, a first-touch fault -- decays
+        // as 1/K too, so this is a soundness check on the amplification method
+        // itself rather than on one optimisation.
+        if rows == SIZES[0] {
+            println!();
+            println!("== K-SWEEP: does each stage's cost SCALE with the repeat count?");
+            println!("  ratio = (ns/pass at K=16) / (ns/pass at K=64), barrier netted at each K");
+            println!("  ~1 SOUND: per-iteration.   ~4 HOISTED: the figure is stage/K and is void.");
+            let per_pass = |r: EncodeStageRepeats, k: u32| -> f64 {
+                let run = {
+                    let mut a = Arm::new("repeats all zero", arm(zero));
+                    let mut b = Arm::new("swept", arm(r));
+                    run_pair(&mut a, &mut b, cfg)
+                };
+                stats(&run.a.cpu, &run.b.cpu, cfg).median_diff / k as f64
+            };
+            for (label, make) in stages {
+                let at = |k: u32| {
+                    per_pass(make(k, zero), k)
+                        - per_pass(EncodeStageRepeats { barrier: k, ..zero }, k)
+                };
+                let (lo, hi) = (at(16), at(64));
+                // ⛔ BOTH readings must clear the floor, not just one. The
+                // verdict is a RATIO, so a denominator inside the noise makes
+                // it meaningless however large the numerator looks -- and a
+                // ratio of two near-zero readings is pure noise. Grading on
+                // `hi` alone gave `temporal` three different verdicts across
+                // three runs of the same binary (HOISTED, SOUND, UNRESOLVED),
+                // which is worse than declining to grade it at all: a guard
+                // that answers differently each run cannot be trusted when it
+                // finally says something alarming.
+                let floor = floors.cpu / 16.0;
+                let verdict = if hi.abs() < floor || lo.abs() < floor {
+                    format!(
+                        "UNRESOLVED — |{:.4}| or |{:.4}| below this section's floor {floor:.4}; \
+                         a ratio of unresolved readings is not evidence",
+                        lo, hi
+                    )
+                } else {
+                    let ratio = lo / hi;
+                    let call = if ratio < 1.5 {
+                        "SOUND — per-iteration"
+                    } else if ratio > 2.5 {
+                        "⛔ HOISTED — this stage's figure is void"
+                    } else {
+                        "⚠ AMBIGUOUS — neither flat nor 1/K; do not bank this stage"
+                    };
+                    format!("ratio {ratio:6.2}   {call}")
+                };
+                println!("  {label:<26} K=16 {lo:8.4}  K=64 {hi:8.4}   {verdict}");
+            }
+        }
+
         let mut named_total = 0.0;
         let mut whole = 0.0;
         for (label, make) in stages {
@@ -2383,6 +2454,26 @@ fn encode_stage_split(cfg: &Config) {
         // median: one `bind_per_row_resolved`, which is the encode this section
         // is splitting.
         println!();
+        // ⭐ A STRUCTURAL count, not a timing: how many heap allocations does
+        // one bind perform? This is the check on the story the stage figures
+        // tell. Three of the named stages are allocations and the residual's
+        // enumerated candidates are mostly more of them, so if the fixed cost
+        // is "a pile of small allocations" then `allocs x ~9 ns` should land on
+        // the fitted fixed term. A count needs no quiet box and cannot drift.
+        let (allocs, deallocs) = count_allocs(|| {
+            set_encode_stage_repeats(zero);
+            black_box(
+                lowered
+                    .bind_per_row_resolved(&resolved)
+                    .expect("encodes")
+                    .body_words(),
+            );
+        });
+        println!(
+            "  allocations per bind             {allocs} alloc / {deallocs} dealloc   \
+             at ~9.16 ns each that is ~{:.0} ns",
+            allocs as f64 * 9.16
+        );
         println!("  WHOLE encode (arm A median)      {whole:9.4} ns");
         println!("  named stages, net of barrier     {named_total:9.4} ns");
         println!(
