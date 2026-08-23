@@ -985,6 +985,14 @@ fn main() {
     #[cfg(all(feature = "jit", feature = "loop-key-arm-probe"))]
     loop_key_probe(&cfg);
 
+    // -- THE ENCODE SPLIT ---------------------------------------------------
+    // Task #58: what the columnar encoding is MADE OF for an activation with
+    // no list and no string, behind `--features jit-<backend>,encode-stage-probe`.
+    // Same bracket, and its own floor per size for the same reason the others
+    // set theirs.
+    #[cfg(all(feature = "jit", feature = "encode-stage-probe"))]
+    encode_stage_split(&cfg);
+
     // -- THE ARMS UNDER TEST ------------------------------------------------
     // Replace these two closures to measure something else. Nothing above needs
     // to change: the controls, the floor and the verdicts are all machinery.
@@ -1220,11 +1228,12 @@ fn probe_code(src: &str) -> cel::vm::CelCode {
 /// claim a resolution three orders of magnitude finer than the one measured.
 /// An unresolved comparison prints no number at all: below the floor there is
 /// nothing to divide.
-// Shared by both probes; the cfg names each one exactly so that enabling
-// either alone leaves no unused item behind.
+// Shared by the probes; the cfg names each one exactly so that enabling any one
+// alone leaves no unused item behind.
 #[cfg(any(
     feature = "drop-arm-probe",
     feature = "elem-attr-probe",
+    all(feature = "jit", feature = "encode-stage-probe"),
     all(feature = "jit", feature = "loop-key-arm-probe")
 ))]
 fn per_unit(label: &str, s: &Stats, floor: f64, units: f64, unit: &str) {
@@ -1252,11 +1261,12 @@ fn per_unit(label: &str, s: &Stats, floor: f64, units: f64, unit: &str) {
 /// noise scales with the length of the batch it lands in, so grading one
 /// against the other would understate the noise by the ratio of the two. Every
 /// comparison below is graded against a null run on its own arms instead.
-// Shared by both probes; the cfg names each one exactly so that enabling
-// either alone leaves no unused item behind.
+// Shared by the probes; the cfg names each one exactly so that enabling any one
+// alone leaves no unused item behind.
 #[cfg(any(
     feature = "drop-arm-probe",
     feature = "elem-attr-probe",
+    all(feature = "jit", feature = "encode-stage-probe"),
     all(feature = "jit", feature = "loop-key-arm-probe")
 ))]
 fn local_floor<F: FnMut()>(title: &str, mut make: impl FnMut() -> F, cfg: &Config) -> Floors {
@@ -2145,6 +2155,257 @@ fn loop_key_columns(n: usize) -> LoopKeyColumns {
 /// by the scan and equal targets collapse to one key. The count is asserted
 /// rather than assumed, because a divisor derived from intent instead of from
 /// the door's own answer is how a per-unit figure goes wrong by a factor.
+/// Task #58: what the columnar ENCODE is made of, split by amplification.
+///
+/// `bind` is a resolution (one map lookup per declared path) followed by this
+/// encoding, and the encoding is 62-97% of it -- 94-97% on the CHEAPEST
+/// expressions, which carry no list and no string and so should have the least
+/// to encode. This section asks what those rows are paying for.
+///
+/// ⭐ NO RECOMBINATION IN THE WHOLE FIGURE. `BatchProgram` exposes both halves
+/// of `bind` as public entry points -- `resolve` and `bind_per_row_resolved` --
+/// so encode is timed as its OWN arm rather than as `bind - resolve`. The
+/// halves' doc comment says they exist for exactly this.
+///
+/// Each named stage IS a two-term subtraction (its own delta less the
+/// barrier's), which is the amplification discipline
+/// `float_bank::EntryStageRepeats` established and not the recombination that
+/// ran +19.5% high on the fusion ladder: both terms are measured in THIS
+/// section, against THIS section's floor, on the same two arms.
+///
+/// Both arms call `set_encode_stage_repeats` inside the timed closure, so that
+/// cost is common to them and cancels out of every difference.
+///
+/// ⭐ PRE-REGISTERED, written before the number existed. Encode at n=1 is
+/// expected to be mostly FIXED:
+///
+///     encode(n) ~ a + b*n   with a >= 30 ns, and a > b*n at n=1, 10 and 100
+///
+/// ⛔ REFUTES: a fixed term under 15 ns, or a proportional term that already
+/// dominates at n=10. Either means encode SCALES, and then no amount of
+/// fixed-cost work lets a tier-aware `execute` win at small n -- which bounds
+/// the design to a threshold form and closes #58 as a lever rather than
+/// qualifying it.
+/// ⛔ SUSPICIOUS: a fixed term close to the whole of `bind`, which would mean
+/// this timed a door that skips the work rather than encode itself.
+///
+/// ⛔⛔ EVERY STAGE FIGURE BELOW IS AN UPPER BOUND ON WHAT REMOVING THAT STAGE
+/// WOULD BUY, and the gap is a factor rather than a rounding error. Amplifying
+/// an operation k times back-to-back measures its ISOLATED, SERIALIZED cost;
+/// deleting it from a real path measures its MARGINAL cost, with whatever the
+/// surrounding code overlaps with it already discounted. Measured on this box:
+/// one isolated 8-byte alloc+free is 9.16 ns, while removing one from the JIT
+/// entry bought 2.62 ns -- both correct, 3.5x apart.
+///
+/// Two smaller over-counts stack on top, in the same direction: an allocating
+/// stage prices the alloc AND the free together, and `black_box` forces a spill
+/// and reload per pass that production never pays.
+///
+/// ⇒ Read a stage as "no more than this much is here", never as a budget for a
+/// fix. The worked case is `StrDict::build` on a string-free batch: this probe
+/// prices it at 12.47 ns and a standalone of its exact body costs 5.36 ns.
+///
+/// ⭐ SECOND PRE-REGISTRATION, about the SPLIT rather than the fit, because the
+/// split is what decides whether #58 has a target at all:
+///
+///     the six named stages account for UNDER HALF of encode,
+///     so the residual is > 50%
+///
+/// Registered pessimistically on the E3 precedent, where the residual dominated
+/// at every level until it was split (entry->E 81.2%, E->E3 83.7%). A residual
+/// that then comes back at 70% is a CONFIRMED PREDICTION and the follow-on
+/// ("split the residual") is already justified by it -- not a disappointing run.
+///
+/// The residual is not opaque — `prepare_batch_reduce` continues past the six
+/// named stages, and everything below is in it by construction. Read this as
+/// the candidate list a large residual selects from, not as a measurement:
+///
+///     per bind, unconditional   `scalars` Vec, `regs_list`, `shape.code`
+///                               clone, the `batch_shape` OnceLock probe, and
+///                               a full re-collect of `str_ids` that runs even
+///                               when there are no predicate tables to chain
+///     per bind, PerRow + list   one `list_out` buffer per output field, sized
+///                               by summing the source's `size(..)` column
+///     per bind, string result   `dict.sorted()`, then ONE OWNED `String` PER
+///                               DISTINCT STRING in the batch
+///     per bind, projection      a copy or widening pass over all n rows
+///
+/// ⚠ NAMED IN ADVANCE so it does not read as inconclusive: both
+/// pre-registrations can pass while #58 still fails as a lever. Encode can be
+/// mostly FIXED (the fit holds) AND that fixed cost can sit entirely in the
+/// RESIDUAL (no named stage is the target). On the E3 precedent that is the
+/// most likely single outcome.
+///
+/// ⛔ THE RESIDUAL IS A REPORTED ROW, NOT A LEFTOVER. At every level of the JIT
+/// entry's itemisation the residual dominated until it was split -- 81.2% of
+/// the entry, then 83.7% of that. Assume the same here until shown otherwise,
+/// and read a large residual as "not yet split", never as "the named stages are
+/// the answer".
+#[cfg(all(feature = "jit", feature = "encode-stage-probe"))]
+fn encode_stage_split(cfg: &Config) {
+    use cel::majit::batch::{Batch, BatchProgram, ColumnRef};
+    use cel::majit::bytecode::{
+        encode_stage_out_passes, reset_encode_stage_passes, set_encode_stage_repeats,
+        EncodeStageRepeats,
+    };
+    use cel::majit::lower::{Schema, ValType};
+
+    /// A scalar shape: no list, no string, nothing for the encoding to build.
+    /// The question is what it pays anyway.
+    const SRC: &str = "x * 2 + 1";
+    /// Extra passes per amplified stage. Large enough that one stage's total
+    /// clears the section floor, small enough that the loop stays in cache.
+    const K: u32 = 64;
+    const SIZES: &[usize] = &[1, 10, 100];
+
+    println!();
+    println!("###########################################################");
+    println!("# ENCODE SPLIT: `{SRC}`, {K} extra passes per stage");
+    println!("# pre-registered: mostly FIXED, a >= 30 ns");
+    println!("###########################################################");
+
+    let program = Program::compile(SRC).expect("compiles");
+    let schema: Schema = [("x".to_string(), ValType::Int)].into_iter().collect();
+    let lowered = BatchProgram::from_program(&program, &schema).expect("lowers");
+
+    for &rows in SIZES {
+        let vals: Vec<i64> = (0..rows as i64).collect();
+        let batch = Batch::new(rows).column("x".to_string(), ColumnRef::Int(&vals));
+        let resolved = lowered.resolve(&batch).expect("resolves");
+
+        let arm = |r: EncodeStageRepeats| {
+            let lowered = &lowered;
+            let resolved = &resolved;
+            move || {
+                set_encode_stage_repeats(r);
+                black_box(
+                    lowered
+                        .bind_per_row_resolved(resolved)
+                        .expect("encodes")
+                        .body_words(),
+                );
+            }
+        };
+        let zero = EncodeStageRepeats::default();
+
+        println!();
+        println!("== rows={rows}");
+        let floors = local_floor(
+            &format!("LOCAL NULL CONTROL: encode rows={rows} vs an identical copy"),
+            || arm(zero),
+            cfg,
+        );
+
+        // The barrier first: every stage below is reported net of it, so a
+        // section that could not resolve the barrier cannot report a stage
+        // either.
+        let barrier_ns = {
+            let run = {
+                let mut a = Arm::new("repeats all zero", arm(zero));
+                let mut b = Arm::new(
+                    "barrier only",
+                    arm(EncodeStageRepeats { barrier: K, ..zero }),
+                );
+                run_pair(&mut a, &mut b, cfg)
+            };
+            let (cpu, _) = report(
+                &format!("BARRIER: an amplification loop with no stage in it, rows={rows}"),
+                &run,
+                cfg,
+                Some(floors),
+            );
+            per_unit("barrier", &cpu, floors.cpu, K as f64, "pass");
+            cpu.median_diff / K as f64
+        };
+
+        let stages: [(&str, fn(u32, EncodeStageRepeats) -> EncodeStageRepeats); 6] = [
+            ("asserts", |k, z| EncodeStageRepeats { asserts: k, ..z }),
+            ("temporal (1 of the 2)", |k, z| EncodeStageRepeats {
+                temporal: k,
+                ..z
+            }),
+            ("StrDict::build", |k, z| EncodeStageRepeats {
+                strdict: k,
+                ..z
+            }),
+            ("bases", |k, z| EncodeStageRepeats { bases: k, ..z }),
+            ("trap Box (alloc+free)", |k, z| EncodeStageRepeats {
+                trap: k,
+                ..z
+            }),
+            ("out buffer (alloc+free)", |k, z| EncodeStageRepeats {
+                out: k,
+                ..z
+            }),
+        ];
+
+        let mut named_total = 0.0;
+        let mut whole = 0.0;
+        for (label, make) in stages {
+            reset_encode_stage_passes();
+            let run = {
+                let mut a = Arm::new("repeats all zero", arm(zero));
+                let mut b = Arm::new(label, arm(make(K, zero)));
+                run_pair(&mut a, &mut b, cfg)
+            };
+            let passes = encode_stage_out_passes();
+            let (cpu, _) = report(
+                &format!("STAGE `{label}` x{K}, rows={rows}"),
+                &run,
+                cfg,
+                Some(floors),
+            );
+            per_unit(label, &cpu, floors.cpu, K as f64, "pass");
+            whole = cpu.a_median;
+            if verdict(&cpu, floors.cpu).resolved() {
+                let net = cpu.median_diff / K as f64 - barrier_ns;
+                println!("    net of barrier: {net:+.4} ns");
+                named_total += net;
+            } else {
+                println!("    UNRESOLVED — contributes nothing to the named total");
+            }
+            // The `out` stage is zero-trip under `BatchReduce::Sum`, and an
+            // ELIDED stage reads the same. Only the counter separates them.
+            if label.starts_with("out buffer") {
+                println!(
+                    "    body ran {passes} times ({}); a near-zero figure with a \
+                     NON-ZERO count means possibly ELIDED, and needs the disassembly",
+                    if passes == 0 {
+                        "zero-trip: this batch reduces by Sum, so the stage genuinely never runs"
+                    } else {
+                        "the stage really executed"
+                    }
+                );
+            }
+        }
+
+        // The residual, reported rather than inferred. `whole` is arm A's own
+        // median: one `bind_per_row_resolved`, which is the encode this section
+        // is splitting.
+        println!();
+        println!("  WHOLE encode (arm A median)      {whole:9.4} ns");
+        println!("  named stages, net of barrier     {named_total:9.4} ns");
+        println!(
+            "  RESIDUAL                         {:9.4} ns   ({:.1}% of the whole)",
+            whole - named_total,
+            100.0 * (whole - named_total) / whole,
+        );
+        println!(
+            "  ⚠ a residual above ~50% means NOT YET SPLIT, not `the named stages are the answer`"
+        );
+        println!(
+            "  ⛔ every stage above is an UPPER BOUND on what removing it buys. Amplification"
+        );
+        println!(
+            "     prices an operation SERIALIZED and in ISOLATION; a removal prices it at the"
+        );
+        println!(
+            "     margin. On this box an isolated 8-byte alloc+free is 9.16 ns while removing"
+        );
+        println!("     one bought 2.62 ns. Do not read a stage as a budget for a fix.");
+    }
+}
+
 #[cfg(all(feature = "jit", feature = "loop-key-arm-probe"))]
 fn loop_key_program(
     cols: &LoopKeyColumns,
