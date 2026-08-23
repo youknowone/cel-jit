@@ -227,10 +227,13 @@ const MAJIT_FIRST: usize = 9;
 /// D's three sub-arms. Parts of `D` rather than entries in the entry's sum —
 /// see the note on [`STAGE_LABELS`]. They are cel-side, so their reachability
 /// is proved by cel's own counters and not by majit's.
-#[cfg(feature = "entry-stage-probe")]
+///
+/// UNGATED, like every other index constant here, because the report reads
+/// these arms from code that the probe feature does not gate. Gating the
+/// definition while the uses stay open builds only under
+/// `entry-stage-probe` -- the one configuration that hides it.
 const D_SUB: std::ops::Range<usize> = 4..8;
 /// D itself, which its sub-arms follow immediately.
-#[cfg(feature = "entry-stage-probe")]
 const D_IDX: usize = D_SUB.start - 1;
 
 // ⚠ DERIVED, never literals. Every one of these was written as a literal once,
