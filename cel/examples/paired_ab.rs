@@ -2318,26 +2318,52 @@ fn encode_stage_split(cfg: &Config) {
             cpu.median_diff / K as f64
         };
 
-        let stages: [(&str, fn(u32, EncodeStageRepeats) -> EncodeStageRepeats); 6] = [
-            ("asserts", |k, z| EncodeStageRepeats { asserts: k, ..z }),
-            ("temporal (1 of the 2)", |k, z| EncodeStageRepeats {
-                temporal: k,
-                ..z
-            }),
-            ("StrDict::build", |k, z| EncodeStageRepeats {
-                strdict: k,
-                ..z
-            }),
-            ("bases", |k, z| EncodeStageRepeats { bases: k, ..z }),
-            ("trap Box (alloc+free)", |k, z| EncodeStageRepeats {
-                trap: k,
-                ..z
-            }),
-            ("out buffer (alloc+free)", |k, z| EncodeStageRepeats {
-                out: k,
-                ..z
-            }),
+        // Each row carries its label, its setter, AND whether it owns the pass
+        // counter, so the three cannot drift apart. The counter used to be
+        // attached by matching on the label text, which the compiler cannot
+        // check: renaming the label would have silently stopped the counter
+        // printing, and a missing counter line reads as "this stage has none"
+        // rather than as a fault.
+        type StageRow = (
+            &'static str,
+            fn(u32, EncodeStageRepeats) -> EncodeStageRepeats,
+            bool,
+        );
+        let stages: [StageRow; 6] = [
+            (
+                "asserts",
+                |k, z| EncodeStageRepeats { asserts: k, ..z },
+                false,
+            ),
+            (
+                "temporal (1 of the 2)",
+                |k, z| EncodeStageRepeats { temporal: k, ..z },
+                false,
+            ),
+            (
+                "StrDict::build",
+                |k, z| EncodeStageRepeats { strdict: k, ..z },
+                false,
+            ),
+            ("bases", |k, z| EncodeStageRepeats { bases: k, ..z }, false),
+            (
+                "trap Box (alloc+free)",
+                |k, z| EncodeStageRepeats { trap: k, ..z },
+                false,
+            ),
+            (
+                "out buffer (alloc+free)",
+                |k, z| EncodeStageRepeats { out: k, ..z },
+                true,
+            ),
         ];
+        // The counter exists, so exactly one stage must own it. A table edit
+        // that drops or duplicates the owner is a fault, not a quiet omission.
+        assert_eq!(
+            stages.iter().filter(|(_, _, c)| *c).count(),
+            1,
+            "exactly one stage owns the pass counter"
+        );
 
         // ⛔ VALIDITY CHECK, and it runs BEFORE the stages so a failure is seen
         // before the figures it would invalidate. Every stage's inputs are
@@ -2381,7 +2407,7 @@ fn encode_stage_split(cfg: &Config) {
                 null_a.push(st.a_median);
                 st.median_diff / k as f64
             };
-            for (label, make) in stages {
+            for (label, make, _) in stages {
                 let mut at = |k: u32| {
                     per_pass(make(k, zero), k)
                         - per_pass(EncodeStageRepeats { barrier: k, ..zero }, k)
@@ -2430,7 +2456,7 @@ fn encode_stage_split(cfg: &Config) {
 
         let mut named_total = 0.0;
         let mut whole = 0.0;
-        for (label, make) in stages {
+        for (label, make, counted) in stages {
             reset_encode_stage_passes();
             let run = {
                 let mut a = Arm::new("repeats all zero", arm(zero));
@@ -2455,7 +2481,7 @@ fn encode_stage_split(cfg: &Config) {
             }
             // The `out` stage is zero-trip under `BatchReduce::Sum`, and an
             // ELIDED stage reads the same. Only the counter separates them.
-            if label.starts_with("out buffer") {
+            if counted {
                 println!(
                     "    body ran {passes} times ({}); a near-zero figure with a \
                      NON-ZERO count means possibly ELIDED, and needs the disassembly",
