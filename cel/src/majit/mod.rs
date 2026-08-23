@@ -176,6 +176,10 @@
 
 pub mod batch;
 pub mod bytecode;
+/// The encode path's frame-held buffers. Private: it is an implementation
+/// detail of `bind`, and both `batch` and `bytecode` hold one, which is why it
+/// sits beside them rather than inside either.
+mod inline;
 pub mod lower;
 
 #[cfg(test)]

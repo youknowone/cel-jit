@@ -200,6 +200,16 @@ required-features = ["jit"]
 name = "allocs"
 required-features = ["jit"]
 
+# The per-bind allocation census for the columnar encode path (#59). `jit`, for
+# the reason every block above it names: it opens `cel::majit`, which
+# `src/lib.rs` gates on that feature. Like `allocs` it installs a
+# `#[global_allocator]`, which is why it is an example rather than a test — the
+# default libtest runner is multi-threaded and a process-global counter would
+# race across concurrently running tests.
+[[example]]
+name = "bindallocs"
+required-features = ["jit"]
+
 [[example]]
 name = "livescale"
 required-features = ["jit"]

@@ -65,6 +65,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::bytecode::{float_bank, prepare_batch_reduce, BatchRun, Column};
+use super::inline::{Inline, InlineOwned, INLINE_SLOTS};
 use super::lower::{
     concat_slot_index, concat_slot_path, elem_slot_source, lower_typed, offset_slot_source,
     size_slot_source, string_slot_source, BatchReduce, ConcatSide, LoweredF, Schema, SlotKind,
@@ -486,7 +487,10 @@ impl BatchProgram {
     /// with the encoding, where it has always been, so that the order two
     /// different mistakes are reported in does not change.
     pub fn resolve<'a>(&self, batch: &'a Batch<'a>) -> Result<ResolvedBatch<'a>, BatchError> {
-        let mut sources = Vec::with_capacity(self.lowered.slots.len());
+        // Frame-held: a resolution is one entry per declared path, and a bind
+        // that goes straight on to encode drops it before it returns. See
+        // [`super::inline`].
+        let mut sources = InlineOwned::with_capacity(self.lowered.slots.len());
         for slot in &self.lowered.slots {
             sources.push(self.resolve_slot(batch, slot.path.as_str(), slot.ty)?);
         }
@@ -528,14 +532,17 @@ impl BatchProgram {
         // either a borrowed column or an index into them. Building the plan
         // first keeps `derived` from reallocating under a borrow.
         let mut derived: Vec<DerivedColumn> = Vec::new();
-        let mut plan: Vec<Plan<'a>> = Vec::new();
-        for source in &resolved.sources {
+        // Frame-held. `derived` is not: it moves into the `BoundBatch` and the
+        // pointers baked into the program point into its boxed buffers.
+        let mut plan: Inline<Plan<'a>, INLINE_SLOTS> =
+            Inline::with_capacity(Plan::Derived(0), self.lowered.slots.len());
+        for source in resolved.sources.iter() {
             plan.push(materialize_slot(source, resolved.rows, &mut derived));
         }
 
         // Row columns must be as long as the batch says. An ELEMENT column is
         // as long as the flattened element count instead, so it is exempt.
-        for (slot, p) in self.lowered.slots.iter().zip(&plan) {
+        for (slot, p) in self.lowered.slots.iter().zip(plan.iter()) {
             if slot.kind != SlotKind::Row {
                 continue;
             }
@@ -554,16 +561,20 @@ impl BatchProgram {
 
         // Build the batch program once, from the caller's buffers and the ones
         // the encoding materialized.
-        let columns: Vec<Column<'a>> = plan
-            .iter()
-            .map(|p| match p {
+        // Frame-held, like `plan`: the program `prepare_batch_reduce` builds
+        // from these bakes the base ADDRESSES in, so nothing downstream keeps
+        // the list of columns itself.
+        let mut columns: Inline<Column<'a>, INLINE_SLOTS> =
+            Inline::with_capacity(Column::Int(&[]), plan.len());
+        for p in plan.iter() {
+            columns.push(match p {
                 Plan::Borrowed(c) => *c,
                 // SAFETY: `derived` moves into the `BoundBatch` returned below,
                 // which owns the program these pointers are baked into, so the
                 // boxed buffers outlive every run made through it.
                 Plan::Derived(k) => unsafe { derived[*k].column() },
-            })
-            .collect();
+            });
+        }
         // Temporal arithmetic agrees with chrono only inside the domain the
         // lowering recorded; outside it this batch has no answer, though
         // another batch of the same expression may.
@@ -591,7 +602,7 @@ impl BatchProgram {
             .lowered
             .slots
             .iter()
-            .zip(&columns)
+            .zip(columns.iter())
             .filter(|(slot, _)| slot.kind != SlotKind::Row)
             .map(|(_, c)| c.len())
             .max()
@@ -878,6 +889,11 @@ impl DerivedColumn {
 
 /// Where one slot's data comes from: straight out of the caller's buffer, or
 /// out of a buffer the encoding built.
+///
+/// `Copy` so it can live in an [`Inline`], whose slice view needs every element
+/// of its array initialized. Both variants already are — a [`Column`] is a
+/// borrow and an index is a `usize`.
+#[derive(Clone, Copy)]
 enum Plan<'a> {
     Borrowed(Column<'a>),
     Derived(usize),
@@ -930,7 +946,7 @@ enum SlotSource<'a> {
 /// [`BatchProgram::bind_per_row_resolved`]; see the first of those for why the
 /// two halves are worth separating.
 pub struct ResolvedBatch<'a> {
-    sources: Vec<SlotSource<'a>>,
+    sources: InlineOwned<SlotSource<'a>, INLINE_SLOTS>,
     /// The caller's row count, carried so the encoding does not need the
     /// [`Batch`] again. It cannot drift: `Batch::column` consumes and returns
     /// the batch, so a batch a resolution was taken from can no longer change.

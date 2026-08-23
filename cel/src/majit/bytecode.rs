@@ -344,6 +344,7 @@ fn majit_raw_store_i64(base: i64, ea: i64, val: i64) {
     }
 }
 
+use super::inline::{Inline, INLINE_SLOTS};
 use super::lower::BatchReduce;
 
 /// One input column for the two-bank batch evaluator: an `i64` column for an
@@ -878,9 +879,11 @@ pub fn prepare_batch_reduce<'a>(
         std::hint::black_box(v);
     }
     let mut next_id_col = 0;
-    let bases: Vec<i64> = columns
-        .iter()
-        .map(|c| match c {
+    // Frame-held: `regs_list` copies these into the seed it returns, so nothing
+    // downstream reads the list of bases itself. See [`super::inline`].
+    let mut bases: Inline<i64, INLINE_SLOTS> = Inline::with_capacity(0, columns.len());
+    for c in columns {
+        bases.push(match c {
             Column::Int(x) => x.as_ptr() as i64,
             Column::Float(x) => x.as_ptr() as i64,
             Column::Bool(x) => x.as_ptr() as i64,
@@ -889,8 +892,8 @@ pub fn prepare_batch_reduce<'a>(
                 next_id_col += 1;
                 base
             }
-        })
-        .collect();
+        });
+    }
     // Allocation stages price an allocation AND its matching free, since the
     // amplified copy is dropped at the end of each pass. That is an
     // over-estimate of the allocation alone and is how they must be read.
@@ -955,7 +958,12 @@ pub fn prepare_batch_reduce<'a>(
         }
         _ => Vec::new(),
     };
-    let list_addrs: Vec<i64> = list_out.iter_mut().map(|b| b.as_mut_ptr() as i64).collect();
+    // Frame-held, like `bases`: one entry per output field, copied into the
+    // seed and not kept.
+    let mut list_addrs: Inline<i64, INLINE_SLOTS> = Inline::with_capacity(0, list_out.len());
+    for b in list_out.iter_mut() {
+        list_addrs.push(b.as_mut_ptr() as i64);
+    }
     let shape = lowered.batch_shape(true, reduce);
     // Column bases, the row count, the trap address and the string literals'
     // ids are all this batch's data, and all reach the program the same way:
@@ -965,19 +973,27 @@ pub fn prepare_batch_reduce<'a>(
     // `pred_tables` for as long as the run is, alongside the id columns.
     let mut pred_tables: Vec<Box<[i64]>> = Vec::new();
     let mut distinct: Option<Vec<&str>> = None;
-    let scalars: Vec<i64> = lowered
-        .scalar_seeds
-        .iter()
-        .map(|seed| match &seed.kind {
+    // Frame-held, like `bases`: the broadcast scalars are copied into the seed.
+    // The predicate TABLES they may point at are not — those go on to the run.
+    let mut scalars: Inline<i64, INLINE_SLOTS> =
+        Inline::with_capacity(0, lowered.scalar_seeds.len());
+    for seed in &lowered.scalar_seeds {
+        scalars.push(match &seed.kind {
             super::lower::SeedKind::StrId(t) => dict.id(t),
             super::lower::SeedKind::StrPredicate(p) => {
                 let strings = distinct.get_or_insert_with(|| dict.sorted());
                 pred_tables.push(p.table(strings).into_boxed_slice());
                 pred_tables[pred_tables.len() - 1].as_ptr() as i64
             }
-        })
-        .collect();
-    let str_ids: Vec<Box<[i64]>> = str_ids.into_iter().chain(pred_tables).collect();
+        });
+    }
+    // Appended rather than re-collected. The boxes MOVE and the buffers they
+    // point at do not, so the addresses already baked into `scalars` stay
+    // valid — and a batch with no predicate table, which is every batch that
+    // carries no string predicate, now pays no allocation here at all where the
+    // `chain(..).collect()` this replaces built a second vector unconditionally.
+    let mut str_ids = str_ids;
+    str_ids.append(&mut pred_tables);
     // A string-banked per-row output stores ids, which mean nothing without the
     // order they were ranked in. A COLLECTED list stores them just the same, and
     // its bank is on the output's fields rather than on the row result — which
