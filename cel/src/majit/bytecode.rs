@@ -2920,6 +2920,28 @@ pub mod float_bank {
         /// Always the RESOLVED form, so under `loop-key-arm-probe` this prices
         /// the shipping scan whichever arm the door itself is taking.
         pub loop_keys: u32,
+        /// Extra passes of the yield scan's WALK half alone: `key.resolve`,
+        /// with neither table lookup after it.
+        ///
+        /// `resolve_cell_key` answers an empty or single-cell bucket from the
+        /// walk alone, so on every bucket a real program here has produced
+        /// this is one celltable walk and nothing else -- no allocation, and
+        /// the answer it returns is the raw hash.
+        pub loop_walk: u32,
+        /// Extra passes of the yield scan's TOKEN half: `has_compiled_loop`,
+        /// which is `entry_procedure_token(..).is_some()` -- a celltable
+        /// lookup, a `Weak::upgrade`, the `invalidated` and `has_compiled_code`
+        /// loads, and the drop of the `Arc` the upgrade produced.
+        ///
+        /// Asked on `key.hash`, not on `key.resolve`, so that the walk this
+        /// splits out is not paid twice and the arm prices the lookup alone.
+        /// The two agree on every bucket holding one cell or none -- the same
+        /// equivalence `LoopKeyArm` is built on.
+        pub loop_token: u32,
+        /// Extra passes of the yield scan's META half: `get_compiled_meta`,
+        /// one `compiled_loops` hash and probe. Asked on `key.hash` for the
+        /// same reason as [`Self::loop_token`].
+        pub loop_meta: u32,
         /// Extra passes of an amplification loop with NO stage in it: the
         /// counter, and the one optimization barrier every other field's loop
         /// also carries. Subtracting it is what leaves a stage's own cost
@@ -2936,6 +2958,9 @@ pub mod float_bank {
                 pool: 0,
                 reseed: 0,
                 loop_keys: 0,
+                loop_walk: 0,
+                loop_token: 0,
+                loop_meta: 0,
                 barrier: 0,
             })
         };
@@ -2951,6 +2976,16 @@ pub mod float_bank {
         /// the scan is being amplified, so the arm the difference is taken
         /// against does not carry the store.
         static ENTRY_STAGE_LOOP_KEYS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+
+        /// Passes run by the three sub-arms of the yield scan, in the order
+        /// `[walk, token, meta]`.
+        ///
+        /// What proves an arm is REACHED rather than merely armed. A sub-arm
+        /// that compiled to nothing would still leave its repeat count set and
+        /// its difference indistinguishable from noise; a counter the arm's own
+        /// loop increments cannot be satisfied that way.
+        static ENTRY_STAGE_SUB_PASSES: core::cell::Cell<[u64; 3]> =
+            const { core::cell::Cell::new([0; 3]) };
     }
 
     /// Set the repeat counts for subsequent calls on this thread, answering
@@ -2970,6 +3005,20 @@ pub mod float_bank {
     #[cfg(feature = "entry-stage-probe")]
     pub fn entry_stage_loop_keys() -> usize {
         ENTRY_STAGE_LOOP_KEYS.with(core::cell::Cell::get)
+    }
+
+    /// Passes run by the yield scan's `[walk, token, meta]` sub-arms since the
+    /// last [`reset_entry_stage_sub_passes`].
+    #[cfg(feature = "entry-stage-probe")]
+    pub fn entry_stage_sub_passes() -> [u64; 3] {
+        ENTRY_STAGE_SUB_PASSES.with(core::cell::Cell::get)
+    }
+
+    /// Zero the sub-arm pass counters, so one arm's reachability is read
+    /// against the calls made under it and not against every call so far.
+    #[cfg(feature = "entry-stage-probe")]
+    pub fn reset_entry_stage_sub_passes() {
+        ENTRY_STAGE_SUB_PASSES.with(|slot| slot.set([0; 3]));
     }
 
     /// [`run_jit_seeded_f`] on a driver that outlives the call, so a program
@@ -3104,6 +3153,75 @@ pub mod float_bank {
                     // barrier inside that read is what stops the next pass
                     // reusing this one's bucket loads.
                     std::hint::black_box(yielded);
+                }
+            }
+            // The three halves the scan above is made of, each amplified on its
+            // own so which of them carries the stage is a measurement rather
+            // than a reading of the code.
+            //
+            // All three are pure reads and answer the same thing every pass, so
+            // all three amplify honestly -- none of the single-shot treatment
+            // `E3c` needs applies here.
+            //
+            // ⚠ These are three INDEPENDENT arms, not a cumulative ladder, so
+            // `walk + token + meta` against the whole scan is a CHECK on the
+            // split rather than an assumption behind it. It is expected to be
+            // close, not exact: the shipping scan short-circuits, asking
+            // `get_compiled_meta` only where a token was found, whereas the
+            // `meta` arm asks unconditionally. Warm, where a token is always
+            // present, the short-circuit never fires and the two agree.
+            #[cfg(feature = "entry-stage-probe")]
+            if repeats.loop_walk != 0 {
+                ENTRY_STAGE_LOOP_KEYS.with(|slot| slot.set(pooled_program.loop_keys.len()));
+                ENTRY_STAGE_SUB_PASSES.with(|slot| {
+                    let mut p = slot.get();
+                    p[0] += u64::from(repeats.loop_walk);
+                    slot.set(p);
+                });
+                for _ in 0..repeats.loop_walk {
+                    for key in &pooled_program.loop_keys {
+                        // The driver goes through the barrier too, not just the
+                        // answer. Both inputs are loop-invariant, so barriering
+                        // only the result would let the walk be computed once
+                        // and the same value handed to the barrier every pass --
+                        // an arm that counts its passes and prices nothing. All
+                        // three sub-arms carry it, so it cancels between them.
+                        std::hint::black_box(key.resolve(std::hint::black_box(&*driver)));
+                    }
+                }
+            }
+            #[cfg(feature = "entry-stage-probe")]
+            if repeats.loop_token != 0 {
+                ENTRY_STAGE_LOOP_KEYS.with(|slot| slot.set(pooled_program.loop_keys.len()));
+                ENTRY_STAGE_SUB_PASSES.with(|slot| {
+                    let mut p = slot.get();
+                    p[1] += u64::from(repeats.loop_token);
+                    slot.set(p);
+                });
+                for _ in 0..repeats.loop_token {
+                    for key in &pooled_program.loop_keys {
+                        std::hint::black_box(
+                            std::hint::black_box(&*driver).has_compiled_loop(key.hash),
+                        );
+                    }
+                }
+            }
+            #[cfg(feature = "entry-stage-probe")]
+            if repeats.loop_meta != 0 {
+                ENTRY_STAGE_LOOP_KEYS.with(|slot| slot.set(pooled_program.loop_keys.len()));
+                ENTRY_STAGE_SUB_PASSES.with(|slot| {
+                    let mut p = slot.get();
+                    p[2] += u64::from(repeats.loop_meta);
+                    slot.set(p);
+                });
+                for _ in 0..repeats.loop_meta {
+                    for key in &pooled_program.loop_keys {
+                        std::hint::black_box(
+                            std::hint::black_box(&*driver)
+                                .get_compiled_meta(key.hash)
+                                .is_some(),
+                        );
+                    }
                 }
             }
             // The call-counted door, ahead of the first instruction. It answers
