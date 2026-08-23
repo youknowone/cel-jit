@@ -203,6 +203,19 @@ const MAJIT_FIRST: usize = 9;
 #[cfg(feature = "entry-stage-probe")]
 const D_SUB: std::ops::Range<usize> = 4..8;
 
+// ⚠ DERIVED, never literals. Every one of these was written as a literal once,
+// and inserting arms left them all pointing at the previous occupant -- which
+// prints another stage's number under this one's name, or differences a stage
+// against a stage. `check_barrier_wiring` asserts the result.
+/// The barrier closing each group: the last arm before the next group starts.
+const CEL_BARRIER: usize = MAJIT_FIRST - 1;
+const MAJIT_BARRIER: usize = EXEC_FIRST - 1;
+const EXEC_BARRIER: usize = STAGE_LABELS.len() - 1;
+/// The three arms inside E3, in table order.
+const E3A: usize = EXEC_FIRST;
+const E3B: usize = EXEC_FIRST + 1;
+const E3D: usize = EXEC_FIRST + 2;
+
 /// Where the arms INSIDE E3 start. Everything from here down is about
 /// `execute_assembler_at_dispatch_key`, and `E3b` is a part of the call rather
 /// than a sibling of it — see [`Split::e3_residual`].
@@ -473,13 +486,20 @@ impl Split {
     /// The barrier arm a stage is differenced against: its OWN side's. The two
     /// amplification loops are in different crates and a barrier prices the
     /// loop, not the door.
+    /// ⚠ DERIVED, never written as literals. Each barrier is the LAST arm of
+    /// its group, so its index is one before the next group starts. Spelling
+    /// them as constants is what went wrong before: inserting arms moved every
+    /// barrier and left `barrier_for` returning the old positions, so each
+    /// stage was differenced against another STAGE instead of against its
+    /// barrier -- which produces a full table of plausible, confidently
+    /// negative numbers that no pass-counter check can detect.
     fn barrier_for(i: usize) -> usize {
         if i < MAJIT_FIRST {
-            4
+            CEL_BARRIER
         } else if i < EXEC_FIRST {
-            8
+            MAJIT_BARRIER
         } else {
-            12
+            EXEC_BARRIER
         }
     }
     /// One stage, with the amplification's own cost taken off it.
@@ -735,7 +755,37 @@ fn armcheck() {
     println!("armcheck needs `entry-stage-probe`; this binary has no arms to reach.");
 }
 
+/// Every arm must be differenced against an arm that is actually a BARRIER.
+///
+/// The pass counters prove an arm ran; nothing proved the arithmetic pointed
+/// anywhere sensible. When arms were inserted, the barriers moved and
+/// `barrier_for` kept returning their old indices, so stages were differenced
+/// against other STAGES -- and the run printed a full table of confident
+/// negative nanoseconds rather than failing. This is the check that catches
+/// that class, and it costs one pass over a 17-element array.
+fn check_barrier_wiring() {
+    for i in 0..STAGE_LABELS.len() {
+        let b = Split::barrier_for(i);
+        assert!(
+            STAGE_LABELS[b].contains("barrier"),
+            "arm `{}` is differenced against `{}`, which is not a barrier",
+            STAGE_LABELS[i],
+            STAGE_LABELS[b]
+        );
+    }
+    // The E3 block prints these three by index under hand-written prose, so a
+    // stale index there shows another stage's number under this one's name.
+    for (idx, want) in [(E3A, "E3a"), (E3B, "E3b"), (E3D, "E3d")] {
+        assert!(
+            STAGE_LABELS[idx].starts_with(want),
+            "E3 label slot holds `{}`, expected the {want} arm",
+            STAGE_LABELS[idx]
+        );
+    }
+}
+
 fn main() {
+    check_barrier_wiring();
     if std::env::args().nth(1).as_deref() == Some("armcheck") {
         armcheck();
         return;
@@ -802,7 +852,7 @@ fn main() {
             s.stage(1),
             s.stage(2),
             s.stage(3),
-            s.raw[4],
+            s.raw[CEL_BARRIER],
             s.residual()
         );
     }
@@ -819,7 +869,7 @@ fn main() {
             s.stage(5),
             s.stage(6),
             s.stage(7),
-            s.raw[8],
+            s.raw[MAJIT_BARRIER],
             s.e_residual()
         );
     }
@@ -828,7 +878,7 @@ fn main() {
     let stage_med: Vec<f64> = (0..4)
         .map(|i| median(splits.iter().map(|s| s.stage(i)).collect()))
         .collect();
-    let barrier = median(splits.iter().map(|s| s.raw[4]).collect());
+    let barrier = median(splits.iter().map(|s| s.raw[CEL_BARRIER]).collect());
     let measured: f64 = stage_med.iter().sum();
     let residual = entry - measured;
     let (lo, hi) = splits
@@ -889,7 +939,7 @@ fn main() {
     let e_stage_med: Vec<f64> = (MAJIT_FIRST..12)
         .map(|i| median(splits.iter().map(|s| s.stage(i)).collect()))
         .collect();
-    let e_barrier = median(splits.iter().map(|s| s.raw[8]).collect());
+    let e_barrier = median(splits.iter().map(|s| s.raw[MAJIT_BARRIER]).collect());
     let e_measured: f64 = e_stage_med.iter().sum();
     let e_residual = residual - e_measured;
     println!("\n  E SPLIT — the same medians, inside the {residual:.2} ns residual above");
@@ -923,17 +973,17 @@ fn main() {
     // comparable: E3a and E3d are amplified, the call is a single-shot clock
     // reading, and E3b is a PART of the call rather than a sibling of it, so it
     // is printed as "of which" and never added into the sum.
-    let e3a = median(splits.iter().map(|s| s.stage(13)).collect());
-    let e3b = median(splits.iter().map(|s| s.stage(14)).collect());
-    let e3d = median(splits.iter().map(|s| s.stage(15)).collect());
-    let e3_barrier = median(splits.iter().map(|s| s.raw[12]).collect());
+    let e3a = median(splits.iter().map(|s| s.stage(E3A)).collect());
+    let e3b = median(splits.iter().map(|s| s.stage(E3B)).collect());
+    let e3d = median(splits.iter().map(|s| s.stage(E3D)).collect());
+    let e3_barrier = median(splits.iter().map(|s| s.raw[EXEC_BARRIER]).collect());
     let call = median(splits.iter().map(|s| s.call_ns).collect());
     let e3 = e_residual;
     let e3_rest = e3 - e3a - e3d - call;
     println!("\n  E3 SPLIT — inside the {e3:.2} ns residual above");
     println!(
         "    {:<28} {e3a:8.2} ns   {:5.1}% of E3   AMPLIFIED",
-        STAGE_LABELS[9],
+        STAGE_LABELS[E3A],
         100.0 * e3a / e3
     );
     println!(
@@ -949,7 +999,7 @@ fn main() {
     );
     println!(
         "    {:<28} {e3d:8.2} ns   {:5.1}% of E3   AMPLIFIED",
-        STAGE_LABELS[11],
+        STAGE_LABELS[E3D],
         100.0 * e3d / e3
     );
     println!(
