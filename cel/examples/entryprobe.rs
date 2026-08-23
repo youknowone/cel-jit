@@ -229,6 +229,9 @@ const MAJIT_FIRST: usize = 9;
 /// is proved by cel's own counters and not by majit's.
 #[cfg(feature = "entry-stage-probe")]
 const D_SUB: std::ops::Range<usize> = 4..8;
+/// D itself, which its sub-arms follow immediately.
+#[cfg(feature = "entry-stage-probe")]
+const D_IDX: usize = D_SUB.start - 1;
 
 // ⚠ DERIVED, never literals. Every one of these was written as a literal once,
 // and inserting arms left them all pointing at the previous occupant -- which
@@ -545,13 +548,13 @@ impl Split {
     }
     /// E1 + E2 + E4 — the measured part of E.
     fn e_measured(&self) -> f64 {
-        (MAJIT_FIRST..12).map(|i| self.stage(i)).sum()
+        (MAJIT_FIRST..MAJIT_BARRIER).map(|i| self.stage(i)).sum()
     }
     /// E3a + E3d — the AMPLIFIED stages inside E3. Deliberately excludes E3b,
     /// which is a part of the call and not a sibling of it, and excludes the
     /// call, which is single-shot.
     fn e3_amplified(&self) -> f64 {
-        self.stage(13) + self.stage(15)
+        self.stage(E3A) + self.stage(E3D)
     }
     /// What E3 has left once its two amplified stages and its single-shot call
     /// are taken off: the result construction and the drops. A RESIDUAL, and
@@ -809,6 +812,28 @@ fn check_barrier_wiring() {
             STAGE_LABELS[idx]
         );
     }
+    // `Split::measured` sums 0..4 as "the entry's four stages" and
+    // `Split::e_measured` sums MAJIT_FIRST..MAJIT_BARRIER as "the measured part
+    // of E". Neither range can be derived from anything that moves with an
+    // insertion, so both are pinned here by the labels they are meant to cover.
+    for (idx, want) in [(0, "A "), (1, "BF"), (2, "C "), (3, "D ")] {
+        assert!(
+            STAGE_LABELS[idx].starts_with(want),
+            "entry stage slot {idx} holds `{}`, which `Split::measured` would sum as `{want}`",
+            STAGE_LABELS[idx]
+        );
+    }
+    for (idx, want) in [
+        (MAJIT_FIRST, "E1"),
+        (MAJIT_FIRST + 1, "E2"),
+        (MAJIT_FIRST + 2, "E4"),
+    ] {
+        assert!(
+            STAGE_LABELS[idx].starts_with(want),
+            "E stage slot {idx} holds `{}`, which `Split::e_measured` would sum as `{want}`",
+            STAGE_LABELS[idx]
+        );
+    }
 }
 
 fn main() {
@@ -897,7 +922,7 @@ fn main() {
             s.stage(0),
             s.stage(1),
             s.stage(2),
-            s.stage(3),
+            s.stage(D_IDX),
             s.raw[CEL_BARRIER],
             s.residual()
         );
@@ -912,9 +937,9 @@ fn main() {
         println!(
             "  {:<42} {:>8.2} {:>8.2} {:>8.2} {:>9.2} {:>11.2}",
             s.label,
-            s.stage(5),
-            s.stage(6),
-            s.stage(7),
+            s.stage(MAJIT_FIRST),
+            s.stage(MAJIT_FIRST + 1),
+            s.stage(MAJIT_FIRST + 2),
             s.raw[MAJIT_BARRIER],
             s.e_residual()
         );
@@ -941,10 +966,10 @@ fn main() {
         println!(
             "  {:<42} {:>8.2} {:>10.2} {:>10.2} {:>8.2} {:>10.2}",
             s.label,
-            s.stage(9),
+            s.stage(E3A),
             s.call_ns,
-            s.stage(10),
-            s.stage(11),
+            s.stage(E3B),
+            s.stage(E3D),
             s.e3_residual()
         );
     }
@@ -982,7 +1007,7 @@ fn main() {
         "(cel barrier)"
     );
 
-    let e_stage_med: Vec<f64> = (MAJIT_FIRST..12)
+    let e_stage_med: Vec<f64> = (MAJIT_FIRST..MAJIT_BARRIER)
         .map(|i| median(splits.iter().map(|s| s.stage(i)).collect()))
         .collect();
     let e_barrier = median(splits.iter().map(|s| s.raw[MAJIT_BARRIER]).collect());
@@ -1101,7 +1126,7 @@ fn main() {
             println!(
                 "    D per key, {:<42} {:6.2} ns over {} key(s)",
                 s.label,
-                s.stage(3) / s.loop_keys as f64,
+                s.stage(D_IDX) / s.loop_keys as f64,
                 s.loop_keys
             );
         }
@@ -1116,11 +1141,11 @@ fn main() {
     // these three are what D is made of. `walk + token + meta` against D is a
     // CHECK on the split; the short-circuit named on `EntryStageRepeats`
     // is why it is expected close rather than exact.
-    let d = median(splits.iter().map(|s| s.stage(3)).collect());
-    let walk = median(splits.iter().map(|s| s.stage(4)).collect());
-    let token = median(splits.iter().map(|s| s.stage(5)).collect());
-    let upgrade = median(splits.iter().map(|s| s.stage(6)).collect());
-    let meta = median(splits.iter().map(|s| s.stage(7)).collect());
+    let d = median(splits.iter().map(|s| s.stage(D_IDX)).collect());
+    let walk = median(splits.iter().map(|s| s.stage(D_SUB.start)).collect());
+    let token = median(splits.iter().map(|s| s.stage(D_SUB.start + 1)).collect());
+    let upgrade = median(splits.iter().map(|s| s.stage(D_SUB.start + 2)).collect());
+    let meta = median(splits.iter().map(|s| s.stage(D_SUB.start + 3)).collect());
     let pct = |v: f64| if d != 0.0 { 100.0 * v / d } else { f64::NAN };
     println!("\n  D split — medians over the shapes above, PARTS of D and not entries beside it");
     println!("    D  loop-key yield scan       {d:7.2} ns");
