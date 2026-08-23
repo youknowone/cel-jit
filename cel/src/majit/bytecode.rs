@@ -776,6 +776,15 @@ pub fn prepare_batch_reduce<'a>(
     }
     #[cfg(feature = "encode-stage-probe")]
     for _ in 0..repeats.asserts {
+        // The INPUTS are barriered, not only the results. Both `columns` and
+        // `lowered` are loop-invariant and these two checks are pure, so
+        // barriering only the answers would let the work be computed once and
+        // the same values handed to the barrier every pass -- a stage that
+        // counts its passes and prices nothing. The allocating stages below do
+        // not need this: an allocation has effects the optimizer must keep
+        // once its result is observed. A PURE stage has no such protection.
+        let columns = std::hint::black_box(columns);
+        let lowered = std::hint::black_box(lowered);
         for (col, slot) in columns.iter().zip(&lowered.slots) {
             std::hint::black_box(col.matches(slot.ty));
         }
@@ -788,6 +797,11 @@ pub fn prepare_batch_reduce<'a>(
     }
     #[cfg(feature = "encode-stage-probe")]
     for _ in 0..repeats.temporal {
+        // Inputs barriered for the reason given on `asserts` above: this is a
+        // pure, loop-invariant computation and is the stage most exposed to
+        // being hoisted.
+        let columns = std::hint::black_box(columns);
+        let lowered = std::hint::black_box(lowered);
         std::hint::black_box(lowered.temporal_out_of_domain(columns).is_none());
     }
     // Temporal arithmetic is exact only inside the domain the lowering

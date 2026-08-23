@@ -2365,16 +2365,24 @@ fn encode_stage_split(cfg: &Config) {
             println!("== K-SWEEP: does each stage's cost SCALE with the repeat count?");
             println!("  ratio = (ns/pass at K=16) / (ns/pass at K=64), barrier netted at each K");
             println!("  ~1 SOUND: per-iteration.   ~4 HOISTED: the figure is stage/K and is void.");
-            let per_pass = |r: EncodeStageRepeats, k: u32| -> f64 {
+            // Arm A carries ZERO repeats, so it is the same code at every K and
+            // its own median STRUCTURALLY cannot depend on K. Recording it turns
+            // the sweep into its own null control: whatever spread arm A shows
+            // across K is this comparison's noise floor, measured rather than
+            // assumed, and no stage ratio can mean anything inside it.
+            let mut null_a: Vec<f64> = Vec::new();
+            let mut per_pass = |r: EncodeStageRepeats, k: u32| -> f64 {
                 let run = {
                     let mut a = Arm::new("repeats all zero", arm(zero));
                     let mut b = Arm::new("swept", arm(r));
                     run_pair(&mut a, &mut b, cfg)
                 };
-                stats(&run.a.cpu, &run.b.cpu, cfg).median_diff / k as f64
+                let st = stats(&run.a.cpu, &run.b.cpu, cfg);
+                null_a.push(st.a_median);
+                st.median_diff / k as f64
             };
             for (label, make) in stages {
-                let at = |k: u32| {
+                let mut at = |k: u32| {
                     per_pass(make(k, zero), k)
                         - per_pass(EncodeStageRepeats { barrier: k, ..zero }, k)
                 };
@@ -2408,6 +2416,16 @@ fn encode_stage_split(cfg: &Config) {
                 };
                 println!("  {label:<26} K=16 {lo:8.4}  K=64 {hi:8.4}   {verdict}");
             }
+            let (nlo, nhi) = (
+                null_a.iter().cloned().fold(f64::MAX, f64::min),
+                null_a.iter().cloned().fold(f64::MIN, f64::max),
+            );
+            println!(
+                "  NULL CONTROL: arm A ({} readings, identical code at every K) {nlo:.3}..{nhi:.3} ns, \
+                 max/min {:.3}x — this sweep's own noise floor. A pure hoist reads 4.000x.",
+                null_a.len(),
+                nhi / nlo
+            );
         }
 
         let mut named_total = 0.0;
