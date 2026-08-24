@@ -1811,8 +1811,12 @@ pub mod float_bank {
     /// every door in this file decide on the cell it means.
     struct PooledGreenKey {
         hash: u64,
-        values: [i64; 3],
-        types: [majit_ir::GreenType; 3],
+        /// The `(i64 bits, GreenType)` pair per slot, as
+        /// `__majit_green_key_run_mainloop_f` built them. Held rather than
+        /// split into parallel arrays because that is the shape the generated
+        /// builder hands back, and re-splitting it here would be a second place
+        /// for a slot to move.
+        slots: [(i64, majit_ir::GreenType); 3],
     }
 
     impl PooledGreenKey {
@@ -1826,7 +1830,10 @@ pub mod float_bank {
         /// the probes asked before this existed.
         fn resolve(&self, driver: &majit_metainterp::JitDriver<VmStateF>) -> u64 {
             driver.resolve_cell_key(self.hash, || {
-                majit_ir::GreenKey::with_types(self.values.to_vec(), self.types.to_vec())
+                majit_ir::GreenKey::with_types(
+                    self.slots.iter().map(|slot| slot.0).collect(),
+                    self.slots.iter().map(|slot| slot.1).collect(),
+                )
             })
         }
     }
@@ -1904,25 +1911,18 @@ pub mod float_bank {
 
     /// The green key a door arming at `pc` in `program` files under.
     ///
-    /// The three slots are the ones `can_enter_jit!` builds for a `greens = [pc,
-    /// program]` driver: the marker's own position argument, then each declared
-    /// green with the arming position substituted for `pc`. Both have to be
-    /// spelled the same way here as there — the hash is what the compiled-loop
-    /// probes answer on, and the typed values are what `comparekey` resolves a
-    /// cell collision with — or a door would file under a key nothing else can
-    /// name.
+    /// The slots are the ones `can_enter_jit!` builds for this mainloop — the
+    /// marker's own position argument, then each declared green with the arming
+    /// position substituted for `pc` — and they are no longer spelled twice.
+    /// `#[jit_interp]` emits the builder from the same `greens` list it lowers
+    /// the merge point from, so the two cannot drift; this used to write the
+    /// seed and the per-slot fold out by hand next to a comment saying they had
+    /// to match. A mismatch was undetectable from here: a wrong slot still
+    /// hashes, just to a cell nothing files under, and the door would then
+    /// probe forever for an artifact that exists.
     fn green_key_at(program: &Code, pc: usize) -> PooledGreenKey {
-        use majit_ir::GreenAsI64 as _;
-        let slots = [pc.__green_repr(), pc.__green_repr(), program.__green_repr()];
-        let mut hash = majit_ir::GREEN_UHASH_SEED;
-        for (value, ty) in slots {
-            hash = majit_ir::green_uhash_step(hash, ty, value);
-        }
-        PooledGreenKey {
-            hash,
-            values: [slots[0].0, slots[1].0, slots[2].0],
-            types: [slots[0].1, slots[1].1, slots[2].1],
-        }
+        let (hash, slots) = __majit_green_key_run_mainloop_f(pc, program);
+        PooledGreenKey { hash, slots }
     }
 
     /// The green keys of `program`'s own loop headers — the target of every
