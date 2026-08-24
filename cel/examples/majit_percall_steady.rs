@@ -82,14 +82,10 @@
 
 use std::collections::HashMap;
 use std::hint::black_box;
-use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use cel::majit::batch::{Batch, BatchProgram, BoundBatch, ColumnRef, RowReader, Tier};
-use cel::majit::bytecode::float_bank::{
-    jit_stats, reset_jit_stats, reset_persistent_state, COMPILED_ENTRIES, COMPILES, GUARD_FAILS,
-    TRACE_ABORTS,
-};
+use cel::majit::bytecode::float_bank::{jit_stats, reset_jit_stats, reset_persistent_state};
 use cel::majit::lower::{Schema, ValType};
 use cel::{Context, Program, Value};
 
@@ -482,10 +478,10 @@ struct Counters {
 
 fn counters() -> Counters {
     Counters {
-        compiles: COMPILES.load(Ordering::Relaxed),
-        aborts: TRACE_ABORTS.load(Ordering::Relaxed),
-        entries: COMPILED_ENTRIES.load(Ordering::Relaxed),
-        guard_fails: GUARD_FAILS.load(Ordering::Relaxed),
+        compiles: jit_stats().loops_compiled,
+        aborts: jit_stats().loops_aborted,
+        entries: jit_stats().compiled_entries,
+        guard_fails: jit_stats().guard_failures,
         bridges: jit_stats().bridges_compiled,
     }
 }
@@ -769,11 +765,11 @@ fn run_case(case: &Case, cfg: &Config) -> Row {
     let mut replay_entries: Option<(usize, usize)> = None;
     for i in 0..cfg.steady {
         let v = i % bounds.len();
-        let before_call = COMPILED_ENTRIES.load(Ordering::Relaxed);
+        let before_call = jit_stats().compiled_entries;
         let got = bounds[v]
             .collect_on(Tier::Jit)
             .unwrap_or_else(|e| panic!("{}: oracle call {i}: {e}", case.label));
-        let delta = COMPILED_ENTRIES.load(Ordering::Relaxed) - before_call;
+        let delta = jit_stats().compiled_entries - before_call;
         replay_entries = Some(match replay_entries {
             Some((lo, hi)) => (lo.min(delta), hi.max(delta)),
             None => (delta, delta),

@@ -32,11 +32,8 @@
 //! regression.
 
 use cel::majit::batch::{Batch, BatchProgram, Tier};
-use cel::majit::bytecode::float_bank::{
-    jit_stats, reset_jit_stats, reset_persistent_state, COMPILED_ENTRIES, COMPILES,
-};
+use cel::majit::bytecode::float_bank::{jit_stats, reset_jit_stats, reset_persistent_state};
 use cel::majit::lower::{BatchReduce, Schema, ValType};
-use std::sync::atomic::Ordering;
 
 const OP_JUMP_IF_ABOVE: i64 = 16;
 
@@ -108,8 +105,8 @@ fn probe(label: &str, src: &str, list_col: Option<(&str, Vec<i64>)>) {
     let (mut pc, mut pe) = (0usize, 0usize);
     for call in 0..64 {
         bound.collect_on(Tier::Jit).unwrap();
-        let c = COMPILES.load(Ordering::Relaxed);
-        let e = COMPILED_ENTRIES.load(Ordering::Relaxed);
+        let c = jit_stats().loops_compiled;
+        let e = jit_stats().compiled_entries;
         if c > pc && first_compile.is_none() {
             first_compile = Some(call + 1);
         }

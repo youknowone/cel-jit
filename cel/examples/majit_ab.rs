@@ -35,12 +35,11 @@
 
 use std::collections::HashMap;
 use std::hint::black_box;
-use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use cel::majit::bytecode::float_bank::{
-    clean_interp_seeded_f, pooled_driver_bytes, pooled_driver_inline_bytes, run_jit_persistent_f,
-    run_jit_seeded_f, COMPILES, GUARD_FAILS,
+    clean_interp_seeded_f, jit_stats, pooled_driver_bytes, pooled_driver_inline_bytes,
+    reset_jit_stats, run_jit_persistent_f, run_jit_seeded_f,
 };
 use cel::majit::lower::{lower_typed, Schema, ValType};
 use cel::{Context, Program, Value};
@@ -246,13 +245,13 @@ fn engine_only() {
     let (balance, amount, frozen) = make_engine_columns(ENGINE_ROWS);
     let (code, regs, nf) = engine_program(ENGINE_ROWS, &balance, &amount, &frozen);
 
-    COMPILES.store(0, Ordering::Relaxed);
+    reset_jit_stats();
     let clean = clean_interp_seeded_f(&code, &regs, nf);
     let off = run_jit_seeded_f(&code, &regs, nf, JIT_OFF);
-    assert_eq!(COMPILES.load(Ordering::Relaxed), 0);
-    COMPILES.store(0, Ordering::Relaxed);
+    assert_eq!(jit_stats().loops_compiled, 0);
+    reset_jit_stats();
     let compiled = run_jit_seeded_f(&code, &regs, nf, JIT_ON);
-    let compiles = COMPILES.load(Ordering::Relaxed);
+    let compiles = jit_stats().loops_compiled;
     assert_eq!(clean, off, "clean VM vs majit interpreter divergence");
     assert_eq!(clean, compiled, "clean VM vs compiled trace divergence");
     assert!(compiles >= 1, "hot engine loop did not compile");
@@ -348,8 +347,8 @@ fn warm_break_even() {
         let mut clean_times = Vec::with_capacity(COLD_ROUNDS);
         let mut idle_times = Vec::with_capacity(COLD_ROUNDS);
         let mut jit_times = Vec::with_capacity(COLD_ROUNDS);
-        let g0 = GUARD_FAILS.load(Ordering::Relaxed);
-        let c0 = COMPILES.load(Ordering::Relaxed);
+        let g0 = jit_stats().guard_failures;
+        let c0 = jit_stats().loops_compiled;
         let mut calls = 0usize;
         for _ in 0..COLD_ROUNDS {
             let start = Instant::now();
@@ -365,8 +364,8 @@ fn warm_break_even() {
             jit_times.push(start.elapsed());
             calls += 1;
         }
-        let fails = (GUARD_FAILS.load(Ordering::Relaxed) - g0) as f64 / calls as f64;
-        let compiles = COMPILES.load(Ordering::Relaxed) - c0;
+        let fails = (jit_stats().guard_failures - g0) as f64 / calls as f64;
+        let compiles = jit_stats().loops_compiled - c0;
         let clean = median_duration(clean_times);
         let idle = median_duration(idle_times);
         let jit = median_duration(jit_times);
@@ -402,9 +401,9 @@ fn cold_break_even() {
     for &n in SIZES {
         let (code, regs, nf) = engine_program(n, &balance[..n], &amount[..n], &frozen[..n]);
         let expected = clean_interp_seeded_f(&code, &regs, nf);
-        COMPILES.store(0, Ordering::Relaxed);
+        reset_jit_stats();
         assert_eq!(run_jit_seeded_f(&code, &regs, nf, JIT_ON), expected);
-        let compiles = COMPILES.load(Ordering::Relaxed);
+        let compiles = jit_stats().loops_compiled;
 
         let mut clean_times = Vec::with_capacity(COLD_ROUNDS);
         let mut jit_times = Vec::with_capacity(COLD_ROUNDS);
@@ -413,7 +412,7 @@ fn cold_break_even() {
             black_box(clean_interp_seeded_f(&code, &regs, nf));
             clean_times.push(start.elapsed());
 
-            COMPILES.store(0, Ordering::Relaxed);
+            reset_jit_stats();
             let start = Instant::now();
             black_box(run_jit_seeded_f(&code, &regs, nf, JIT_ON));
             jit_times.push(start.elapsed());

@@ -36,11 +36,10 @@
 //! tolerance); a 4-way equality gate enforces it. RELEASE ONLY.
 
 use std::hint::black_box;
-use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use cel::majit::batch::{Batch, BatchProgram, ColumnRef, Tier};
-use cel::majit::bytecode::float_bank::COMPILES;
+use cel::majit::bytecode::float_bank::{jit_stats, reset_jit_stats};
 use cel::majit::lower::{Schema, ValType};
 use cel::{Context, Program, Value};
 
@@ -127,14 +126,14 @@ fn main() {
     };
 
     // Correctness gate: stock == clean VM == JIT-off == JIT-on.
-    COMPILES.store(0, Ordering::Relaxed);
+    reset_jit_stats();
     let base = naive();
     let clean = count(bound.sum_on(Tier::Clean).expect("clean tier"));
     let off = count(bound.sum_on(Tier::Interpreter).expect("interp tier"));
-    let off_c = COMPILES.load(Ordering::Relaxed);
-    COMPILES.store(0, Ordering::Relaxed);
+    let off_c = jit_stats().loops_compiled;
+    reset_jit_stats();
     let on = count(bound.sum_on(Tier::Jit).expect("jit tier"));
-    let on_c = COMPILES.load(Ordering::Relaxed);
+    let on_c = jit_stats().loops_compiled;
     assert_eq!(base, clean, "stock vs clean VM divergence");
     assert_eq!(base, off, "naive vs JIT-off divergence");
     assert_eq!(base, on, "naive vs JIT-on divergence -> miscompile");
@@ -222,9 +221,9 @@ fn main() {
     let base_a = naive_agg();
     let clean_a = total(agg_bound.sum_on(Tier::Clean).expect("clean tier"));
     let off_a = total(agg_bound.sum_on(Tier::Interpreter).expect("interp tier"));
-    COMPILES.store(0, Ordering::Relaxed);
+    reset_jit_stats();
     let on_a = total(agg_bound.sum_on(Tier::Jit).expect("jit tier"));
-    let on_ac = COMPILES.load(Ordering::Relaxed);
+    let on_ac = jit_stats().loops_compiled;
     assert_eq!(
         base_a.to_bits(),
         clean_a.to_bits(),

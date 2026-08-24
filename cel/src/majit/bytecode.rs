@@ -1111,45 +1111,18 @@ pub fn eval_batch_sum_float(
 /// colliding items. The single-bank int path above is untouched.
 pub mod float_bank {
     use super::Code;
-    use core::sync::atomic::AtomicUsize;
+    use majit_metainterp::embed::Census;
 
-    /// Compile / guard-failure counters for the float path. Separate from the
-    /// int-path statics so parallel tests don't race on a shared counter.
-    pub static COMPILES: AtomicUsize = AtomicUsize::new(0);
-    pub static GUARD_FAILS: AtomicUsize = AtomicUsize::new(0);
-    /// Traces the tracer started and threw away. A loop that never appears in
-    /// [`COMPILES`] is either aborting (counted here) or never reaching its
-    /// merge point hot enough to be traced at all; the two have different
-    /// causes, and only this counter tells them apart.
-    pub static TRACE_ABORTS: AtomicUsize = AtomicUsize::new(0);
-    /// Calls that ENTERED compiled code, as opposed to artifacts that exist.
+    /// The tier's counters are [`Census`]'s, not this module's.
     ///
-    /// [`COMPILES`] rises when a loop is minted and says nothing about whether
-    /// anything ran it, and the two genuinely come apart here: the row loop is
-    /// bottom-tested, so an `n`-row batch takes `n - 1` back edges and a
-    /// ONE-row batch takes none — it never executes the instruction that
-    /// consults the compiled loop, however warm the driver already is. A
-    /// measurement that reports the compiled tier at one row is reporting the
-    /// tracing interpreter, and before this counter existed nothing in the
-    /// crate could say so.
+    /// They used to be eight statics here with four hand-installed callbacks
+    /// bumping six of them and the other two read off the drivers. Every one of
+    /// those is a thing an embedder must not get wrong on its own, and two of
+    /// them were: a tally read only from RETIRED drivers is zero for a pool
+    /// whose drivers all live, and a per-counter reset is not a window.
     ///
-    /// Not a substitute for [`GUARD_FAILS`] as an entry proxy — that one is
-    /// unsound in both directions: a bridge covering the loop-exit guard stops
-    /// the deopt being recorded while entry continues every call.
-    pub static COMPILED_ENTRIES: AtomicUsize = AtomicUsize::new(0);
-    /// Trace length summed over every compiled loop, before and after the
-    /// optimizer. `set_on_compile_loop` has always been handed both numbers and
-    /// dropped them; the pair is what says whether the boxing the lowerer emits
-    /// survives optimization or is removed by it.
-    pub static TRACE_OPS_BEFORE: AtomicUsize = AtomicUsize::new(0);
-    pub static TRACE_OPS_AFTER: AtomicUsize = AtomicUsize::new(0);
-
-    /// Driver-internal totals absorbed from one-off drivers just before they are
-    /// dropped ([`run_jit_seeded_f`]). Neither has a callback hook, so a driver
-    /// that is not kept in [`DRIVERS`] would otherwise take its tallies with it.
-    static ABSORBED_BRIDGES: AtomicUsize = AtomicUsize::new(0);
-    static ABSORBED_PANICS: AtomicUsize = AtomicUsize::new(0);
-
+    /// [`jit_stats`] and [`reset_jit_stats`] stay as the names this crate reads
+    /// them under. What moved is who owns the counters.
     use super::{
         OP_ADD, OP_ADD_IMM, OP_ADD_OVF, OP_AND, OP_COL_LOAD, OP_COL_LOAD_B, OP_COL_LOAD_F,
         OP_COL_STORE, OP_COL_STORE_F, OP_DIV, OP_DIV_CHK, OP_EQ, OP_F2I, OP_F2U, OP_FADD, OP_FDIV,
@@ -1159,7 +1132,6 @@ pub mod float_bank {
         OP_OR, OP_RETURN, OP_RETURN_F, OP_SELECT, OP_SUB, OP_SUB_OVF, OP_TRAP_STORE, OP_U2F,
         OP_UADD_OVF, OP_UDIV, OP_ULE, OP_ULT, OP_UMOD, OP_UMUL_OVF, OP_USUB_OVF,
     };
-    use core::sync::atomic::Ordering;
 
     // majit's intrinsics, not a local copy: the `#[jit_interp]` macro matches a
     // call by its LAST PATH SEGMENT, so an imported name lowers to the same
@@ -2655,24 +2627,10 @@ pub mod float_bank {
                 driver.set_param("retrace_limit", n);
             }
         }
-        // The fourth parameter is the compiled body's opcode kinds, added
-        // upstream so a gate can ask whether the body actually closes a loop
-        // rather than inferring it from `ops_after`. These counters are totals
-        // and have no use for it; a shape check here would be its own change.
-        driver.set_on_compile_loop(|_green_key, ops_before, ops_after, _opcodes_after| {
-            COMPILES.fetch_add(1, Ordering::Relaxed);
-            TRACE_OPS_BEFORE.fetch_add(ops_before, Ordering::Relaxed);
-            TRACE_OPS_AFTER.fetch_add(ops_after, Ordering::Relaxed);
-        });
-        driver.set_on_guard_failure(|_green_key, _a, _b| {
-            GUARD_FAILS.fetch_add(1, Ordering::Relaxed);
-        });
-        driver.set_on_trace_abort(|_green_key, _permanent| {
-            TRACE_ABORTS.fetch_add(1, Ordering::Relaxed);
-        });
-        driver.set_on_compiled_entry(|_green_key, _target_pc| {
-            COMPILED_ENTRIES.fetch_add(1, Ordering::Relaxed);
-        });
+        // Every driver, not just the pooled ones: the counters are shared and
+        // the callbacks are not, so a driver that skipped this would run
+        // uncounted and read as a tier that never fired.
+        Census::install(&mut driver);
         let seed = VmStateF {
             regs: majit_metainterp::virt_array::VirtArray::filled(0, num_regs),
             fregs: majit_metainterp::virt_array::VirtArray::filled(0.0, num_fregs),
@@ -2716,11 +2674,9 @@ pub mod float_bank {
         if epoch != 0 {
             DRIVERS.with(|d| d.borrow_mut().published_epoch = epoch);
         }
-        // The driver dies at the end of this scope, so read the two tallies that
-        // have no callback out of it first.
-        let stats = driver.get_stats();
-        ABSORBED_BRIDGES.fetch_add(stats.bridges_compiled, Ordering::Relaxed);
-        ABSORBED_PANICS.fetch_add(stats.internal_compile_panics as usize, Ordering::Relaxed);
+        // Nothing to drain before this driver dies: bridges and compile panics
+        // reach the census through `set_on_compile_bridge` and
+        // `set_on_internal_compile_panic`, which fired while it ran.
         result
     }
 
@@ -3206,12 +3162,10 @@ pub mod float_bank {
                         .check_in(key, addr, home, program_index, pooled, keep)
                 {
                     // The pool declined the driver it had just handed out, so
-                    // the next pass would price a rebuild. Absorb its unreported
-                    // tallies exactly as the shipping path does, and stop.
-                    let stats = dropped.driver.get_stats();
-                    ABSORBED_BRIDGES.fetch_add(stats.bridges_compiled, Ordering::Relaxed);
-                    ABSORBED_PANICS
-                        .fetch_add(stats.internal_compile_panics as usize, Ordering::Relaxed);
+                    // the next pass would price a rebuild. Its tallies are
+                    // already counted — every one of them arrived by callback
+                    // while it ran — so there is nothing to drain here.
+                    let _ = dropped;
                     break;
                 }
             }
@@ -3404,14 +3358,7 @@ pub mod float_bank {
             let dropped = cell
                 .borrow_mut()
                 .check_in(key, addr, home, program_index, pooled, keep);
-            if let Some(dropped) = dropped {
-                // Read the two tallies that have no callback out of the driver
-                // before it goes.
-                let stats = dropped.driver.get_stats();
-                ABSORBED_BRIDGES.fetch_add(stats.bridges_compiled, Ordering::Relaxed);
-                ABSORBED_PANICS
-                    .fetch_add(stats.internal_compile_panics as usize, Ordering::Relaxed);
-            }
+            drop(dropped);
             result
         })
     }
@@ -3517,105 +3464,44 @@ pub mod float_bank {
         }
     }
 
-    /// One reading of the tier's trace census, in the same five key names the
-    /// pyre runner prints (`pyrex/src/lib.rs`'s `[jit-stats]` line) so a cel
-    /// number and a pyre number are read off the same vocabulary.
+    /// One reading of the tier's trace census.
     ///
-    /// The fields do not all share one window, and the difference matters when
-    /// reading a warm measurement:
+    /// [`majit_metainterp::embed::CensusCounts`] under this crate's own name:
+    /// the fields were the same eight, and a second struct restating them is a
+    /// place for the two to drift. It carries two more —
+    /// `last_ops_after` and `last_loop_body_shape` — which say whether the last
+    /// compiled body is a loop at all. `loops_compiled > 0` does not: an empty
+    /// dispatch still compiles a trace, one whose whole optimized body is
+    /// `Finish()`.
     ///
-    /// * `loops_compiled`, `loops_aborted`, `guard_failures`, `trace_ops_*` are
-    ///   the callback counters ([`COMPILES`], [`TRACE_ABORTS`],
-    ///   [`GUARD_FAILS`]), counted since the last [`reset_jit_stats`].
-    /// * `bridges_compiled` and `internal_compile_panics` have no callback, so
-    ///   they are read out of the drivers themselves — the live ones in
-    ///   [`DRIVERS`] plus those already absorbed from one-off drivers. Their
-    ///   window is therefore "since the last [`reset_persistent_state`]", which
-    ///   is the same instant for any caller that resets both.
-    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-    pub struct JitStats {
-        pub loops_compiled: usize,
-        pub bridges_compiled: usize,
-        pub loops_aborted: usize,
-        pub guard_failures: usize,
-        /// Non-zero means a trace was dropped by a panic inside compilation and
-        /// the tier fell back to the interpreter for it. `pyjitpl.rs:1583-1586`.
-        /// Nothing else reports this: a run that silently stops compiling still
-        /// answers correctly, so every other counter here stays plausible.
-        pub internal_compile_panics: usize,
-        pub trace_ops_before: usize,
-        pub trace_ops_after: usize,
-        /// Calls that entered compiled code. See [`COMPILED_ENTRIES`]: this is
-        /// the only field here that distinguishes "an artifact exists" from
-        /// "an artifact ran", and it belongs to the callback window, like
-        /// `loops_compiled` and unlike `bridges_compiled`.
-        pub compiled_entries: usize,
-    }
+    /// Every field now shares ONE window. That is the change: `bridges_compiled`
+    /// and `internal_compile_panics` used to be read off the drivers instead of
+    /// a callback, so their window was "since the last
+    /// [`reset_persistent_state`]" while the rest were "since the last
+    /// [`reset_jit_stats`]", and a caller that reset only one of the two was
+    /// comparing counts taken over different spans.
+    pub use majit_metainterp::embed::CensusCounts as JitStats;
 
-    impl core::fmt::Display for JitStats {
-        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-            write!(
-                f,
-                "loops_compiled={} bridges_compiled={} loops_aborted={} \
-                 guard_failures={} internal_compile_panics={} \
-                 trace_ops_before={} trace_ops_after={} compiled_entries={}",
-                self.loops_compiled,
-                self.bridges_compiled,
-                self.loops_aborted,
-                self.guard_failures,
-                self.internal_compile_panics,
-                self.trace_ops_before,
-                self.trace_ops_after,
-                self.compiled_entries,
-            )
-        }
-    }
-
-    /// Read the tier's counters. See [`JitStats`] for the two windows.
+    /// Read the tier's counters.
+    ///
+    /// A total, not a window — the same reading this module always returned.
+    /// [`majit_metainterp::embed::Census::begin`] is the windowed form, and it
+    /// is deliberately not used here: it holds a process-global mutex for the
+    /// window's whole life and is not reentrant, so it cannot be what a
+    /// free-standing `jit_stats()` call opens.
     pub fn jit_stats() -> JitStats {
-        let (live_bridges, live_panics) = DRIVERS.with(|d| {
-            d.borrow()
-                .entries
-                .iter()
-                .filter_map(|slot| slot.driver.as_ref())
-                .fold((0usize, 0usize), |(b, p), driver| {
-                    let s = driver.driver.get_stats();
-                    (
-                        b + s.bridges_compiled,
-                        p + s.internal_compile_panics as usize,
-                    )
-                })
-        });
-        JitStats {
-            loops_compiled: COMPILES.load(Ordering::Relaxed),
-            bridges_compiled: live_bridges + ABSORBED_BRIDGES.load(Ordering::Relaxed),
-            loops_aborted: TRACE_ABORTS.load(Ordering::Relaxed),
-            guard_failures: GUARD_FAILS.load(Ordering::Relaxed),
-            internal_compile_panics: live_panics + ABSORBED_PANICS.load(Ordering::Relaxed),
-            trace_ops_before: TRACE_OPS_BEFORE.load(Ordering::Relaxed),
-            trace_ops_after: TRACE_OPS_AFTER.load(Ordering::Relaxed),
-            compiled_entries: COMPILED_ENTRIES.load(Ordering::Relaxed),
-        }
+        Census::totals()
     }
 
-    /// Zero every counter this module owns, opening a fresh measurement window.
+    /// Zero every counter, opening a fresh measurement window.
     ///
-    /// This cannot zero the live drivers' own tallies — they belong to the
-    /// drivers, and only [`reset_persistent_state`] drops those. A caller that
-    /// wants both halves aligned calls that first.
+    /// It no longer matters whether [`reset_persistent_state`] is called with
+    /// it. Every counter is now fed by a callback, so none of them lives on a
+    /// driver and dropping the drivers neither zeroes nor preserves anything
+    /// this reads — which is what used to make a reset of one without the other
+    /// return two different windows in one struct.
     pub fn reset_jit_stats() {
-        for c in [
-            &COMPILES,
-            &GUARD_FAILS,
-            &TRACE_ABORTS,
-            &COMPILED_ENTRIES,
-            &TRACE_OPS_BEFORE,
-            &TRACE_OPS_AFTER,
-            &ABSORBED_BRIDGES,
-            &ABSORBED_PANICS,
-        ] {
-            c.store(0, Ordering::Relaxed);
-        }
+        Census::reset();
     }
 
     /// Snapshot majit's abort-reason tallies as `(label, count)` pairs.
@@ -3646,14 +3532,7 @@ pub mod float_bank {
     ///
     /// ⚠ `MC_DIAG` is process-global, cumulative, and has no reset. Diff two
     /// snapshots with [`abort_reasons_since`] rather than reading one directly.
-    pub fn abort_reasons() -> Vec<(&'static str, u64)> {
-        majit_metainterp::MC_DIAG_LABELS
-            .iter()
-            .enumerate()
-            .filter(|(_, label)| label.starts_with("abrt_"))
-            .map(|(slot, label)| (*label, majit_metainterp::mc_diag(slot)))
-            .collect()
-    }
+    pub use majit_metainterp::embed::abort_reasons;
 
     /// Render the abort reasons that fired since `before`, as `label=delta`.
     ///
@@ -3664,23 +3543,7 @@ pub mod float_bank {
     /// Empty string when nothing aborted, so a caller can print it
     /// unconditionally and a quiet window stays quiet.
     pub fn abort_reasons_since(before: &[(&'static str, u64)]) -> String {
-        abort_reasons()
-            .iter()
-            .zip(before)
-            .filter_map(|((label, now), (_, then))| {
-                let delta = now.saturating_sub(*then);
-                if delta == 0 {
-                    return None;
-                }
-                let name = if *label == "abrt_bridge" {
-                    "unclassified(abrt_bridge)"
-                } else {
-                    label
-                };
-                Some(format!("{name}={delta}"))
-            })
-            .collect::<Vec<_>>()
-            .join(" ")
+        majit_metainterp::embed::render_abort_delta(before, &abort_reasons())
     }
 
     /// Render majit's per-guard deopt census as `distinct=N total=M top=…`.

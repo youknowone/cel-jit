@@ -75,14 +75,13 @@
 //! `jit-cranelift` compiles it differently.
 
 use std::hint::black_box;
-use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use cel::majit::batch::{
     Batch, BatchProgram, BoundBatch, ColumnRef, Tier, GAIN_PER_ITERATION_PS, GAIN_PER_WORD_PS,
     JIT_ENTRY_PS,
 };
-use cel::majit::bytecode::float_bank::{reset_persistent_state, COMPILED_ENTRIES};
+use cel::majit::bytecode::float_bank::{jit_stats, reset_persistent_state};
 use cel::majit::lower::{Schema, ValType};
 use cel::Value;
 
@@ -150,12 +149,12 @@ fn warm(bound: &BoundBatch<'_, '_>, out: &mut Vec<Value>) -> f64 {
         bound.collect_into_on(Tier::Jit, out).expect("warm run");
         black_box(out.as_slice());
     }
-    let before = COMPILED_ENTRIES.load(Ordering::Relaxed);
+    let before = jit_stats().compiled_entries;
     for _ in 0..PROBE_CALLS {
         bound.collect_into_on(Tier::Jit, out).expect("probe run");
         black_box(out.as_slice());
     }
-    (COMPILED_ENTRIES.load(Ordering::Relaxed) - before) as f64 / PROBE_CALLS as f64
+    (jit_stats().compiled_entries - before) as f64 / PROBE_CALLS as f64
 }
 
 /// One sweep point of one shape: both tiers on ONE bound batch.

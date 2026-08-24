@@ -1001,6 +1001,27 @@ fn nested_list_loop_deopt_census() {
             aborts, 0,
             "per_row={per_row}: no trace should be refused (reasons: [{reasons}])"
         );
+        // `bridges` has no callback: majit keeps the tally on the driver, so a
+        // reader that only sums drivers it has already absorbed at their end of
+        // life reports zero for a pool whose drivers are all still alive. The
+        // budget below cannot notice that — a zero only makes it TIGHTER, and
+        // 201 deopts still fit inside the 401 that `bridges = 0` allows — and
+        // `allocs_per_eval` asserts `bridges == 0`, so it passes on a dead
+        // reader too. This is the failing-capable direction.
+        //
+        // The pin is a biconditional rather than `bridges > 0`, because three of
+        // these five shapes attach no bridge and are right not to: `deopts == 1`
+        // is the loop's single final exit, with no guard failing repeatedly for
+        // anything to bridge. Past that, a guard that keeps failing stops only
+        // when a bridge attaches to it — `aborts == 0` is asserted above, so the
+        // other way for it to keep failing is excluded here.
+        assert_eq!(
+            bridges > 0,
+            deopts > 1,
+            "per_row={per_row}: {deopts} deopt(s) and {bridges} bridge(s) — a \
+             guard that failed more than the one final exit has a bridge \
+             attached to it, and only a bridge stops it failing"
+        );
         let budget = warmup_budget(bridges);
         assert!(
             deopts <= budget,

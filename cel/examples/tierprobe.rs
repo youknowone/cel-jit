@@ -34,10 +34,8 @@
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
-use std::sync::atomic::Ordering;
-
 use cel::majit::batch::{Batch, BatchProgram, BoundBatch, ColumnRef, Tier};
-use cel::majit::bytecode::float_bank::{reset_persistent_state, COMPILED_ENTRIES};
+use cel::majit::bytecode::float_bank::{jit_stats, reset_persistent_state};
 use cel::majit::lower::{Schema, ValType};
 
 /// One timed batch must last at least this long, so the clock's own resolution
@@ -88,11 +86,11 @@ fn warm(bound: &BoundBatch<'_, '_>) -> f64 {
     for _ in 0..512 {
         black_box(bound.collect_on(Tier::Jit).expect("warm run"));
     }
-    let before = COMPILED_ENTRIES.load(Ordering::Relaxed);
+    let before = jit_stats().compiled_entries;
     for _ in 0..PROBE_CALLS {
         black_box(bound.collect_on(Tier::Jit).expect("probe run"));
     }
-    (COMPILED_ENTRIES.load(Ordering::Relaxed) - before) as f64 / PROBE_CALLS as f64
+    (jit_stats().compiled_entries - before) as f64 / PROBE_CALLS as f64
 }
 
 /// One sweep point: both tiers on one bound batch, plus the word count the

@@ -187,7 +187,6 @@ mod tests {
     use super::bytecode::{clean_batch_sum_f, eval_batch_sum_f, Column};
     use super::lower::{lower_typed, size_slot_source, Schema, ValType};
     use crate::{Context, Program, Value};
-    use core::sync::atomic::Ordering;
     use std::collections::HashMap;
 
     #[derive(Debug, Clone, Copy)]
@@ -290,7 +289,7 @@ mod tests {
     /// tree-walker raises.
     #[test]
     fn overflow_deopt_on_compiled_trace() {
-        use super::bytecode::float_bank::{clean_interp_f, run_jit_f, COMPILES as COMPILES_F};
+        use super::bytecode::float_bank::{clean_interp_f, jit_stats, run_jit_f};
         use super::bytecode::{
             OP_ADD, OP_ADD_OVF, OP_JUMP_IF_ABOVE, OP_LOAD_CONST, OP_RETURN, OP_TRAP_STORE,
         };
@@ -326,7 +325,7 @@ mod tests {
             OP_TRAP_STORE, 6, 5,             // *trap_addr = trap_flag
             OP_RETURN, 2,
         ]);
-        let before = COMPILES_F.load(Ordering::Relaxed);
+        let before = jit_stats().loops_compiled;
         let jit = run_jit_f(&prog, 7, 0, 3);
         let jit_trap = *trap;
         *trap = 0;
@@ -341,7 +340,7 @@ mod tests {
         );
         assert_eq!(*trap, 1, "the reference tier must set the trap flag too");
         assert!(
-            COMPILES_F.load(Ordering::Relaxed) > before,
+            jit_stats().loops_compiled > before,
             "loop must tier-compile so the overflow lands in the compiled trace",
         );
     }
@@ -613,7 +612,7 @@ mod tests {
     /// before the lowerer emits it. clean == jit-off == jit-on, jit-on compiles.
     #[test]
     fn float_vm_count_ge() {
-        use super::bytecode::float_bank::{clean_interp_f, run_jit_f, COMPILES as COMPILES_F};
+        use super::bytecode::float_bank::{clean_interp_f, jit_stats, run_jit_f};
         use super::bytecode::{
             OP_ADD, OP_COL_LOAD_F, OP_FGE, OP_JUMP_IF_ABOVE, OP_LOAD_CONST, OP_MUL, OP_RETURN,
         };
@@ -671,10 +670,10 @@ mod tests {
             expected,
             "jit-off vs oracle"
         );
-        let before = COMPILES_F.load(Ordering::Relaxed);
+        let before = jit_stats().loops_compiled;
         assert_eq!(run_jit_f(&prog, ni, nf, 8), expected, "jit-on vs oracle");
         assert!(
-            COMPILES_F.load(Ordering::Relaxed) > before,
+            jit_stats().loops_compiled > before,
             "float batch must compile the hot loop"
         );
         core::hint::black_box((&cola, &colb));
@@ -822,7 +821,7 @@ mod tests {
     /// reached the driver. The compiled tier must still trace the loop:
     /// refusing is a guard exit taken on some row, not a failure to compile.
     fn check_batch_f_refuses(expr_src: &str, cols: &[(&str, ColData)]) {
-        use super::bytecode::float_bank::COMPILES as COMPILES_F;
+        use super::bytecode::float_bank::jit_stats;
 
         let program =
             Program::compile(expr_src).unwrap_or_else(|e| panic!("parse `{expr_src}`: {e:?}"));
@@ -863,14 +862,14 @@ mod tests {
         // Start the compiled tier cold: the driver persists across calls, so a
         // loop an earlier case already compiled would not compile again.
         super::bytecode::float_bank::reset_persistent_state();
-        let before = COMPILES_F.load(Ordering::Relaxed);
+        let before = jit_stats().loops_compiled;
         assert_eq!(
             eval_batch_sum_f(&lowered, &columns, n, 8),
             None,
             "batch jit-on must refuse `{expr_src}`"
         );
         assert!(
-            COMPILES_F.load(Ordering::Relaxed) > before,
+            jit_stats().loops_compiled > before,
             "float batch `{expr_src}` must still compile the hot loop"
         );
     }
@@ -881,7 +880,7 @@ mod tests {
     /// the compiled tier must all equal the stock tree-walker's per-row sum, and
     /// the compiled run must actually trace the hot loop.
     fn check_batch_f(expr_src: &str, cols: &[(&str, ColData)]) {
-        use super::bytecode::float_bank::COMPILES as COMPILES_F;
+        use super::bytecode::float_bank::jit_stats;
 
         let program =
             Program::compile(expr_src).unwrap_or_else(|e| panic!("parse `{expr_src}`: {e:?}"));
@@ -959,11 +958,11 @@ mod tests {
         // Start the compiled tier cold: the driver persists across calls, so a
         // loop an earlier case already compiled would not compile again.
         super::bytecode::float_bank::reset_persistent_state();
-        let before = COMPILES_F.load(Ordering::Relaxed);
+        let before = jit_stats().loops_compiled;
         let on = eval_batch_sum_f(&lowered, &columns, n, 8);
         assert_eq!(on, Some(expected), "batch jit-on vs stock for `{expr_src}`");
         assert!(
-            COMPILES_F.load(Ordering::Relaxed) > before,
+            jit_stats().loops_compiled > before,
             "float batch `{expr_src}` must compile the hot loop"
         );
     }
@@ -975,7 +974,7 @@ mod tests {
     /// compare bits, never a tolerance). The compiled run must trace the loop.
     fn check_batch_float(expr_src: &str, cols: &[(&str, ColData)]) {
         use super::bytecode::eval_batch_sum_float;
-        use super::bytecode::float_bank::COMPILES as COMPILES_F;
+        use super::bytecode::float_bank::jit_stats;
 
         let program =
             Program::compile(expr_src).unwrap_or_else(|e| panic!("parse `{expr_src}`: {e:?}"));
@@ -1058,7 +1057,7 @@ mod tests {
         // Start the compiled tier cold: the driver persists across calls, so a
         // loop an earlier case already compiled would not compile again.
         super::bytecode::float_bank::reset_persistent_state();
-        let before = COMPILES_F.load(Ordering::Relaxed);
+        let before = jit_stats().loops_compiled;
         let on = eval_batch_sum_float(&lowered, &columns, n, 8)
             .unwrap_or_else(|| panic!("jit-on tier trapped on `{expr_src}`"));
         assert_eq!(
@@ -1067,7 +1066,7 @@ mod tests {
             "batch jit-on vs stock for `{expr_src}`"
         );
         assert!(
-            COMPILES_F.load(Ordering::Relaxed) > before,
+            jit_stats().loops_compiled > before,
             "float aggregate `{expr_src}` must compile the hot loop"
         );
     }
@@ -1095,7 +1094,7 @@ mod tests {
     /// / compiled tiers must all equal the stock tree-walker's per-row bool/int
     /// sum, and the compiled run must trace the loop.
     fn check_batch_str(expr_src: &str, cols: &[(&str, ColData)]) {
-        use super::bytecode::float_bank::COMPILES as COMPILES_F;
+        use super::bytecode::float_bank::jit_stats;
 
         let program =
             Program::compile(expr_src).unwrap_or_else(|e| panic!("parse `{expr_src}`: {e:?}"));
@@ -1216,11 +1215,11 @@ mod tests {
         // Start the compiled tier cold: the driver persists across calls, so a
         // loop an earlier case already compiled would not compile again.
         super::bytecode::float_bank::reset_persistent_state();
-        let before = COMPILES_F.load(Ordering::Relaxed);
+        let before = jit_stats().loops_compiled;
         let on = eval_batch_sum_f(&lowered, &columns, n, 8);
         assert_eq!(on, Some(expected), "batch jit-on vs stock for `{expr_src}`");
         assert!(
-            COMPILES_F.load(Ordering::Relaxed) > before,
+            jit_stats().loops_compiled > before,
             "string batch `{expr_src}` must compile the hot loop"
         );
     }
@@ -1309,7 +1308,7 @@ mod tests {
         lists: &[(&str, ListCol)],
         expect_refusal: bool,
     ) {
-        use super::bytecode::float_bank::COMPILES as COMPILES_F;
+        use super::bytecode::float_bank::jit_stats;
         use super::lower::{
             elem_slot_path, elem_slot_source, offset_slot_source, size_slot_path, SlotKind,
         };
@@ -1462,14 +1461,14 @@ mod tests {
         // Start the compiled tier cold: the driver persists across calls, so a
         // loop an earlier case already compiled would not compile again.
         super::bytecode::float_bank::reset_persistent_state();
-        let before = COMPILES_F.load(Ordering::Relaxed);
+        let before = jit_stats().loops_compiled;
         assert_eq!(
             eval_batch_sum_f(&lowered, &columns, n, 8),
             expected,
             "batch jit-on vs stock for `{expr_src}`"
         );
         assert!(
-            COMPILES_F.load(Ordering::Relaxed) > before,
+            jit_stats().loops_compiled > before,
             "list batch `{expr_src}` must compile a hot loop"
         );
     }
@@ -1808,7 +1807,7 @@ mod tests {
     /// A LIST-valued expression's per-row result, against the tree-walker's.
     fn check_collect_list(expr_src: &str, rows: &[(&str, ColData)], lists: &[(&str, ListCol)]) {
         use super::batch::{Batch, BatchProgram, Tier};
-        use super::bytecode::float_bank::COMPILES as COMPILES_F;
+        use super::bytecode::float_bank::jit_stats;
 
         let n = lists[0].1.lens.len();
         let program = Program::compile(expr_src).unwrap();
@@ -1856,7 +1855,7 @@ mod tests {
             if tier == Tier::Jit {
                 super::bytecode::float_bank::reset_persistent_state();
             }
-            let before = COMPILES_F.load(Ordering::Relaxed);
+            let before = jit_stats().loops_compiled;
             let got = bound
                 .collect_on(tier)
                 .unwrap_or_else(|e| panic!("{tier:?}: {e}"));
@@ -1866,7 +1865,7 @@ mod tests {
             }
             if tier == Tier::Jit {
                 assert!(
-                    COMPILES_F.load(Ordering::Relaxed) > before,
+                    jit_stats().loops_compiled > before,
                     "collected `{expr_src}` must compile the hot loop"
                 );
             }
@@ -1882,7 +1881,7 @@ mod tests {
     /// through their nanoseconds.
     fn check_collect(expr_src: &str, cols: &[(&str, ColData)]) {
         use super::batch::{Batch, BatchProgram, Tier};
-        use super::bytecode::float_bank::COMPILES as COMPILES_F;
+        use super::bytecode::float_bank::jit_stats;
         let n = cols[0].1.len();
         let schema: Schema = cols
             .iter()
@@ -1912,7 +1911,7 @@ mod tests {
             if tier == Tier::Jit {
                 super::bytecode::float_bank::reset_persistent_state();
             }
-            let before = COMPILES_F.load(Ordering::Relaxed);
+            let before = jit_stats().loops_compiled;
             let got = bound
                 .collect_on(tier)
                 .unwrap_or_else(|e| panic!("{tier:?}: {e}"));
@@ -1926,7 +1925,7 @@ mod tests {
             // abort the trace if the frontend could not take it.
             if tier == Tier::Jit {
                 assert!(
-                    COMPILES_F.load(Ordering::Relaxed) > before,
+                    jit_stats().loops_compiled > before,
                     "per-row `{expr_src}` must compile the hot loop"
                 );
             }
@@ -3139,7 +3138,7 @@ mod tests {
     /// failing inside compiled code and not merely from the interpreter tier.
     #[test]
     fn batch_int_overflow_refuses() {
-        use super::bytecode::float_bank::COMPILES as COMPILES_F;
+        use super::bytecode::float_bank::jit_stats;
         let n = 3000;
         let base_a = gen_i64(n, 0x3141_5926_5358_9793, 1, 1000);
         let base_b = gen_i64(n, 0x2718_2818_2845_9045, 1, 1000);
@@ -3191,14 +3190,14 @@ mod tests {
             // Start the compiled tier cold: the driver persists across calls, so a
             // loop an earlier case already compiled would not compile again.
             super::bytecode::float_bank::reset_persistent_state();
-            let before = COMPILES_F.load(Ordering::Relaxed);
+            let before = jit_stats().loops_compiled;
             assert_eq!(
                 eval_batch_sum_f(&lowered, &columns, n, 8),
                 None,
                 "jit-on tier must refuse `{expr}`"
             );
             assert!(
-                COMPILES_F.load(Ordering::Relaxed) > before,
+                jit_stats().loops_compiled > before,
                 "`{expr}` must tier-compile so the refusal comes from a compiled guard"
             );
         }
@@ -5155,12 +5154,11 @@ mod tests {
             }
             acc
         };
-        use super::bytecode::float_bank::COMPILES as COMPILES_F;
-        use core::sync::atomic::Ordering;
+        use super::bytecode::float_bank::jit_stats;
 
         let program = BatchProgram::compile("items[0]", &schema).unwrap();
         let bound = program.bind(&long_batch).unwrap();
-        let before = COMPILES_F.load(Ordering::Relaxed);
+        let before = jit_stats().loops_compiled;
         assert_eq!(
             bound.sum_on(Tier::Jit).unwrap(),
             Value::Int(in_range),
@@ -5169,7 +5167,7 @@ mod tests {
         // Otherwise the assertions above only re-ran the tracing interpreter
         // and said nothing about the compiled loop.
         assert!(
-            COMPILES_F.load(Ordering::Relaxed) > before,
+            jit_stats().loops_compiled > before,
             "the loop must actually have been traced and compiled"
         );
         let program = BatchProgram::compile("items[1]", &schema).unwrap();

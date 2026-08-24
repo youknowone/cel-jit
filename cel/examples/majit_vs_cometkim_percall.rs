@@ -93,14 +93,11 @@
 
 use std::collections::HashMap;
 use std::hint::black_box;
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use cel::context::VariableResolver;
 use cel::majit::batch::{Batch, BatchProgram, BoundBatch, ColumnRef, RawOutput, RowReader, Tier};
-use cel::majit::bytecode::float_bank::{
-    jit_stats, reset_persistent_state, COMPILED_ENTRIES, COMPILES, GUARD_FAILS, TRACE_ABORTS,
-};
+use cel::majit::bytecode::float_bank::{jit_stats, reset_jit_stats, reset_persistent_state};
 use cel::majit::lower::{Schema, ValType};
 use cel::vm::OpCode;
 use cel::{Context, IdedExpr, Program, Value};
@@ -1051,7 +1048,7 @@ fn run_case(case: &Case) -> Row {
     // TIMES: a gate that checked only `collect_on` would leave the measured
     // door unchecked, and a measured door that produced nothing would read as
     // a very fast one.
-    COMPILES.store(0, Ordering::Relaxed);
+    reset_jit_stats();
     let mut gate = Vec::new();
     for tier in [Tier::Clean, Tier::Interpreter, Tier::Jit] {
         let got = bound
@@ -1078,25 +1075,25 @@ fn run_case(case: &Case) -> Row {
     // compiled would be the tracing interpreter's number under the compiled
     // tier's heading.
     warm(&bound);
-    let compiles = COMPILES.load(Ordering::Relaxed);
+    let compiles = jit_stats().loops_compiled;
     // What the driver is still doing per call once it is as warm as it will get.
     const SETTLED: usize = 1_000;
     let (a0, g0, b0, e0) = (
-        TRACE_ABORTS.load(Ordering::Relaxed),
-        GUARD_FAILS.load(Ordering::Relaxed),
+        jit_stats().loops_aborted,
+        jit_stats().guard_failures,
         jit_stats().bridges_compiled,
-        COMPILED_ENTRIES.load(Ordering::Relaxed),
+        jit_stats().compiled_entries,
     );
     for _ in 0..SETTLED {
         black_box(bound.collect_on(Tier::Jit).expect("settled run"));
     }
-    let aborts = (TRACE_ABORTS.load(Ordering::Relaxed) - a0) as f64 / SETTLED as f64;
-    let guard_fails = (GUARD_FAILS.load(Ordering::Relaxed) - g0) as f64 / SETTLED as f64;
+    let aborts = (jit_stats().loops_aborted - a0) as f64 / SETTLED as f64;
+    let guard_fails = (jit_stats().guard_failures - g0) as f64 / SETTLED as f64;
     // The fact the `majit` column's heading has always asserted and never
     // checked. `compiles` above cannot answer it: it counts artifacts minted,
     // and a loop that is minted and never entered leaves every other counter
     // here plausible while the interpreter produces the answers.
-    let entries_delta = COMPILED_ENTRIES.load(Ordering::Relaxed) - e0;
+    let entries_delta = jit_stats().compiled_entries - e0;
     let entries = entries_delta as f64 / SETTLED as f64;
     let entered_every_settled_call = entries_delta >= SETTLED;
     // `saturating_sub` where the two above subtract plainly, because the two
@@ -1333,18 +1330,18 @@ fn row_cost(case: &Case, lowered: &BatchProgram, tier: Tier) -> (Option<f64>, Op
     // by invoking its closure an unbounded number of times, so a probe that ran
     // through it could not state its own denominator.
     const PROBE: usize = 200;
-    let e0 = COMPILED_ENTRIES.load(Ordering::Relaxed);
+    let e0 = jit_stats().compiled_entries;
     for _ in 0..PROBE {
         black_box(run_hi());
     }
-    if !entry_ok(COMPILED_ENTRIES.load(Ordering::Relaxed) - e0, PROBE) {
+    if !entry_ok(jit_stats().compiled_entries - e0, PROBE) {
         return (None, None);
     }
 
     let (c0, ab0, en0) = (
-        COMPILES.load(Ordering::Relaxed),
-        TRACE_ABORTS.load(Ordering::Relaxed),
-        COMPILED_ENTRIES.load(Ordering::Relaxed),
+        jit_stats().loops_compiled,
+        jit_stats().loops_aborted,
+        jit_stats().compiled_entries,
     );
     let (t_hi, calls_hi) = per_call_counted(run_hi);
     let (t_lo, calls_lo) = per_call_counted(run_lo);
@@ -1352,11 +1349,10 @@ fn row_cost(case: &Case, lowered: &BatchProgram, tier: Tier) -> (Option<f64>, Op
     // GATE 2 — every timed call entered, not merely one of them. Under
     // `must_enter == false` this is the opposite claim about the same counter:
     // not one of them did.
-    let entered = COMPILED_ENTRIES.load(Ordering::Relaxed) - en0;
+    let entered = jit_stats().compiled_entries - en0;
     // GATE 3 — steady state: the slope must not be measuring trace/compile
     // churn, and the bigger batch must actually cost more.
-    let churned =
-        COMPILES.load(Ordering::Relaxed) != c0 || TRACE_ABORTS.load(Ordering::Relaxed) != ab0;
+    let churned = jit_stats().loops_compiled != c0 || jit_stats().loops_aborted != ab0;
     if !entry_ok(entered, calls_hi + calls_lo) || churned || !(t_hi > t_lo) {
         return (None, None);
     }

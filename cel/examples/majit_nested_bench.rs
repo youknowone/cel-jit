@@ -53,11 +53,10 @@
 
 use std::collections::HashMap;
 use std::hint::black_box;
-use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use cel::majit::batch::{Batch, BatchProgram, ColumnRef, Tier};
-use cel::majit::bytecode::float_bank::{COMPILES, GUARD_FAILS, TRACE_ABORTS};
+use cel::majit::bytecode::float_bank::{jit_stats, reset_jit_stats};
 use cel::majit::lower::{Schema, ValType};
 use cel::{Context, Program, Value};
 
@@ -175,13 +174,11 @@ fn measure_at(
 
     // Oracle first: never report a timing taken off a miscompile.
     let expected = bound.sum_on(Tier::Clean).ok();
-    COMPILES.store(0, Ordering::Relaxed);
-    GUARD_FAILS.store(0, Ordering::Relaxed);
-    TRACE_ABORTS.store(0, Ordering::Relaxed);
+    reset_jit_stats();
     let compiled = bound.sum_on(Tier::Jit).ok();
-    let compiles = COMPILES.load(Ordering::Relaxed);
-    let deopts = GUARD_FAILS.load(Ordering::Relaxed);
-    let aborts = TRACE_ABORTS.load(Ordering::Relaxed);
+    let compiles = jit_stats().loops_compiled;
+    let deopts = jit_stats().guard_failures;
+    let aborts = jit_stats().loops_aborted;
     assert_eq!(
         expected, compiled,
         "{label} @{rows}: compiled tier diverged from the oracle tier"

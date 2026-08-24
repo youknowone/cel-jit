@@ -45,11 +45,10 @@
 //! RELEASE ONLY. Run: `./bench.sh majit_vs_cometkim`.
 
 use std::hint::black_box;
-use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use cel::majit::batch::{Batch, BatchProgram, ColumnRef, RawOutput, RowReader, Tier};
-use cel::majit::bytecode::float_bank::{reset_persistent_state, COMPILES};
+use cel::majit::bytecode::float_bank::{jit_stats, reset_jit_stats, reset_persistent_state};
 use cel::majit::lower::{Schema, ValType};
 use cel::{Context, Program, Value};
 
@@ -544,7 +543,7 @@ fn run_case(case: &Case) -> Row {
     };
 
     // Miscompile gate: all three tiers, and the tree-walker, agree.
-    COMPILES.store(0, Ordering::Relaxed);
+    reset_jit_stats();
     for tier in [Tier::Clean, Tier::Interpreter, Tier::Jit] {
         let got = if per_row {
             Oracle::PerRow(
@@ -569,7 +568,7 @@ fn run_case(case: &Case) -> Row {
             _ => unreachable!("the reduction is chosen once"),
         }
     }
-    let compiles = COMPILES.load(Ordering::Relaxed);
+    let compiles = jit_stats().loops_compiled;
     // Without this the `majit` column of a case that never compiled would be the
     // tracing interpreter's number under the compiled tier's heading. The driver
     // was reset just above, so every case has to compile on its own.

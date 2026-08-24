@@ -26,12 +26,9 @@
 //! Optional args: `<rows> <rounds>`
 
 use std::hint::black_box;
-use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use cel::majit::bytecode::float_bank::{
-    reset_persistent_state, COMPILES, GUARD_FAILS, TRACE_ABORTS,
-};
+use cel::majit::bytecode::float_bank::{jit_stats, reset_jit_stats, reset_persistent_state};
 use cel::majit::bytecode::{clean_batch_sum_f, eval_batch_sum_f, Column};
 use cel::majit::lower::{lower_typed, LoweredF, Schema, ValType};
 use cel::Program;
@@ -134,18 +131,16 @@ fn run_batch(
     rows: usize,
 ) -> (Duration, usize, usize, usize, Option<i64>) {
     let columns = cols.columns();
-    COMPILES.store(0, Ordering::Relaxed);
-    GUARD_FAILS.store(0, Ordering::Relaxed);
-    TRACE_ABORTS.store(0, Ordering::Relaxed);
+    reset_jit_stats();
     let t0 = Instant::now();
     let result = eval_batch_sum_f(lowered, &columns, rows, threshold());
     let elapsed = t0.elapsed();
     black_box(result);
     (
         elapsed,
-        COMPILES.load(Ordering::Relaxed),
-        GUARD_FAILS.load(Ordering::Relaxed),
-        TRACE_ABORTS.load(Ordering::Relaxed),
+        jit_stats().loops_compiled,
+        jit_stats().guard_failures,
+        jit_stats().loops_aborted,
         result,
     )
 }
