@@ -1339,12 +1339,9 @@ impl<'a> Vm<'a> {
                 let value = read.map_err(|e| self.park(e))?;
                 self.push(value);
             }
-            OpCode::OptSelect => {
-                let operand = self.pop()?;
-                let field = Value::String(Arc::new(self.name(a)?.to_string()));
-                let value = self.opt_select(operand, field)?;
-                self.push(value);
-            }
+            // Held out of the dispatch loop's own body; see
+            // `Vm::opt_select_arm`.
+            OpCode::OptSelect => self.opt_select_arm(a)?,
 
             // -- aggregates ----------------------------------------------
             OpCode::NewList => self.push_operand(Operand::List(Vec::new())),
@@ -1360,7 +1357,8 @@ impl<'a> Vm<'a> {
                     OptView::Plain => self.list_mut()?.push(value),
                 }
             }
-            OpCode::NewMap => self.push_operand(Operand::Map(Arc::default())),
+            // Held out too, and for the same reason; see `Vm::new_map_arm`.
+            OpCode::NewMap => self.new_map_arm(),
             OpCode::MapInsert | OpCode::MapInsertOptional => {
                 let value = self.pop()?;
                 let key = self.pop()?;
@@ -1828,6 +1826,57 @@ impl<'a> Vm<'a> {
         }
         let _ = (pc, next);
         Ok(Step::Next)
+    }
+
+    // -- the two arms the tracer is not shown -------------------------------
+    //
+    // [`Vm::step`] is the graph a meta-tracing JIT has to be able to annotate:
+    // it is the dispatch loop, so everything the JIT could ever see is reached
+    // through it. Two of its arms build an [`Arc`] in `step`'s OWN body, and
+    // `Arc::new`/`Arc::default` are callees the tracer's front end has no
+    // registry entry for. The annotator stops at the first such callee, so
+    // those two arms alone were what made the whole loop fall back to the
+    // legacy walker.
+    //
+    // Moved out and marked opaque, the call is recorded and the body is not
+    // walked, which is enough for `step` itself to annotate. The marker is
+    // read out of the extracted LLBC rather than off the generated code -- the
+    // extractor turns the MIR optimizations off, so no marked body is folded
+    // back into this one and the host inliner stays free to inline both.
+    //
+    // ORDINARY INHERENT METHODS, deliberately: the marker is an associated
+    // const the attribute puts in this impl, and a closure or a synthetic body
+    // carries neither it nor a path the registry can name.
+    //
+    // ONLY THESE TWO, equally deliberately: what an opaque callee costs is a
+    // residual call in the trace, so quarantining an arm that does not need it
+    // buys nothing and hides work the JIT could have optimized. An arm that
+    // reaches an `Arc` only THROUGH a helper -- `map_mut`'s `Arc::get_mut`,
+    // `Value::list`'s allocation, the refcount pair a slot's `clone` takes --
+    // is not one of these: the callee is in that helper's body, so it is that
+    // helper's graph that stops on it and not this one's.
+
+    /// [`OpCode::OptSelect`]: the field name, as a [`Value`], then the select.
+    ///
+    /// The name is what needs the [`Arc`]: `opt_select` indexes with a
+    /// [`Value`] because a map key is one, and the operand it is given is
+    /// spelled the same way the walker spells it.
+    #[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+    fn opt_select_arm(&mut self, a: u32) -> CelResult<()> {
+        let operand = self.pop()?;
+        let field = Value::String(Arc::new(self.name(a)?.to_string()));
+        let value = self.opt_select(operand, field)?;
+        self.push(value);
+        Ok(())
+    }
+
+    /// [`OpCode::NewMap`]: open a map literal.
+    ///
+    /// The table is built in the [`Arc`] it is handed over in, which is what
+    /// [`Operand::Map`] documents; the allocation is the whole arm.
+    #[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+    fn new_map_arm(&mut self) {
+        self.push_operand(Operand::Map(Arc::default()));
     }
 
     fn name(&self, id: u32) -> CelResult<&'a str> {
