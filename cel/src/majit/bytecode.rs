@@ -297,53 +297,6 @@ pub const OPERANDS: [&[Operand]; OP_ADD_IMM as usize + 1] = [
     &[Int, Imm, IntOut],            // 58 ADD_IMM
 ];
 
-/// Raw native-memory load intrinsic recognized by the `#[jit_interp]` proc
-/// macro (lowered to `raw_load_i`); at the interpreter tier this real fn runs.
-/// `base` is a column buffer's base address, `ea` a byte offset — reading
-/// `col[i]` at a data-dependent (red) row index `i` when `ea == i * 8`. The
-/// base is a loop-invariant carried in the register file (NOT a scalar state
-/// field, which would force the virtualizable frame to a Ref and trip
-/// `VirtualStatesCantMatch` at loop close), exactly as a loop-invariant `rffi`
-/// pointer is in PyPy. This is what lets a compiled trace read real context
-/// columns per row instead of baking one row's inputs as constants.
-#[inline]
-fn majit_raw_load_i64(base: i64, ea: i64) -> i64 {
-    // SAFETY: `base + ea` addresses element `ea/8` of a live `&[i64]` column
-    // whose length the batch builder guarantees covers every row index.
-    unsafe { core::ptr::read_unaligned((base as usize).wrapping_add(ea as usize) as *const i64) }
-}
-
-/// One-byte unsigned raw load intrinsic, recognized by the `#[jit_interp]` proc
-/// macro as `raw_load_i` with an ITEMSIZE-1 UNSIGNED array descr; at the
-/// interpreter tier this real fn runs.
-///
-/// Same shape as [`majit_raw_load_i64`] with a narrower descr, which is exactly
-/// how upstream distinguishes them — one `raw_load_i` op whose descr carries the
-/// width, and a backend that widens into the register at the load. `ea` is the
-/// element index, because a byte column's stride is one.
-#[inline]
-fn majit_raw_load_u8(base: i64, ea: i64) -> i64 {
-    // SAFETY: `base + ea` addresses element `ea` of a live `&[bool]` column
-    // whose length the batch builder guarantees covers every row index. `bool`
-    // is one byte and only ever holds `0` or `1`, so reading it as `u8` is
-    // defined and the widened value is already the `0`/`1` the machine wants.
-    unsafe {
-        core::ptr::read_unaligned((base as usize).wrapping_add(ea as usize) as *const u8) as i64
-    }
-}
-
-/// Raw native-memory store intrinsic (`raw_store_i`), the write-side analogue of
-/// [`majit_raw_load_i64`]. Used only by [`OP_TRAP_STORE`] to publish the
-/// overflow flag to the batch driver.
-#[inline]
-fn majit_raw_store_i64(base: i64, ea: i64, val: i64) {
-    // SAFETY: `base + ea` addresses the caller's live `i64` trap word, which the
-    // batch driver keeps alive across the whole run.
-    unsafe {
-        core::ptr::write_unaligned((base as usize).wrapping_add(ea as usize) as *mut i64, val)
-    }
-}
-
 use super::inline::{Inline, INLINE_SLOTS};
 use super::lower::BatchReduce;
 
@@ -1208,99 +1161,29 @@ pub mod float_bank {
     };
     use core::sync::atomic::Ordering;
 
-    /// Raw native-memory store intrinsic (`raw_store_i`) — see the int-bank
-    /// [`super::majit_raw_store_i64`]. Duplicated here because the `#[jit_interp]`
-    /// macro recognizes the call by name within the traced function's module.
-    #[inline]
-    fn majit_raw_store_i64(base: i64, ea: i64, val: i64) {
-        // SAFETY: `base + ea` addresses the caller's live `i64` trap word, which
-        // the batch driver keeps alive across the whole run.
-        unsafe {
-            core::ptr::write_unaligned((base as usize).wrapping_add(ea as usize) as *mut i64, val)
-        }
-    }
-
-    /// One-byte unsigned raw load — see the int-bank
-    /// [`super::majit_raw_load_u8`]. Duplicated here because the `#[jit_interp]`
-    /// macro recognizes the call by name within the traced function's module.
-    #[inline]
-    fn majit_raw_load_u8(base: i64, ea: i64) -> i64 {
-        // SAFETY: `base + ea` addresses element `ea` of a live `&[bool]` column
-        // whose length the batch builder guarantees covers every row index.
-        unsafe {
-            core::ptr::read_unaligned((base as usize).wrapping_add(ea as usize) as *const u8) as i64
-        }
-    }
-
-    #[inline]
-    fn majit_raw_load_f(base: i64, ea: i64) -> f64 {
-        // SAFETY: `base + ea` addresses element `ea/8` of a live `&[f64]`
-        // column whose length the batch builder guarantees covers every row.
-        unsafe {
-            core::ptr::read_unaligned((base as usize).wrapping_add(ea as usize) as *const f64)
-        }
-    }
-
-    /// Reinterpret a float's 64-bit pattern as an int — recognized by the
-    /// `#[jit_interp]` proc macro as `convert_float_bytes_to_longlong`; at the
-    /// interpreter tier this real fn runs. Used by the branchless float select.
-    #[inline]
-    fn majit_f64_to_bits(x: f64) -> i64 {
-        x.to_bits() as i64
-    }
-
-    /// The inverse bitcast — `convert_longlong_bytes_to_float`.
-    #[inline]
-    fn majit_bits_to_f64(x: i64) -> f64 {
-        f64::from_bits(x as u64)
-    }
-
-    /// Unsigned `<` on the int bank — recognized by the `#[jit_interp]` proc
-    /// macro as `uint_lt`; at the interpreter tier this real fn runs. The int
-    /// register file carries uint columns as their raw 64-bit pattern.
-    #[inline]
-    fn majit_uint_lt(a: i64, b: i64) -> i64 {
-        ((a as u64) < (b as u64)) as i64
-    }
-
-    /// Unsigned `<=` — `uint_le`.
-    #[inline]
-    fn majit_uint_le(a: i64, b: i64) -> i64 {
-        ((a as u64) <= (b as u64)) as i64
-    }
-
-    /// Unsigned `/` on the int bank. The macro recognizes the name and lowers it
-    /// to the `int.udiv` oopspec residual call (`ll_uint_py_div`), NOT to a
-    /// trace opcode: RPython deleted `UINT_FLOORDIV` from the resop set in 2016
-    /// and routes unsigned division through that elidable call instead. A bare
-    /// Rust `/` would lower to the SIGNED `int.py_div`, which disagrees with
-    /// this fn for any operand above `2^63` — the interpreter and compiled tiers
-    /// would then diverge silently.
-    ///
-    /// Caller must guarantee `b != 0`; the helper divides unconditionally.
-    #[inline]
-    fn majit_uint_div(a: i64, b: i64) -> i64 {
-        ((a as u64) / (b as u64)) as i64
-    }
-
-    /// Unsigned `%` — `int.umod` / `ll_uint_py_mod`. See [`majit_uint_div`].
-    #[inline]
-    fn majit_uint_mod(a: i64, b: i64) -> i64 {
-        ((a as u64) % (b as u64)) as i64
-    }
-
-    /// High 64 bits of the 128-bit unsigned product — the `uint_mul_high`
-    /// resop, reached through the mainloop's `native_int_binops` alias rather
-    /// than a hard-coded intrinsic name. It is zero exactly when `a * b` fits in
-    /// a `u64`, which is the unsigned multiply-overflow test.
-    ///
-    /// The `u128` here is interpreter-tier only: the alias rewrites the CALL to
-    /// the opcode, so the trace never looks inside this body (the backends emit
-    /// `mulhi`/`umulh` for it).
-    #[inline]
-    fn majit_uint_mul_high(a: i64, b: i64) -> i64 {
-        (((a as u64 as u128) * (b as u64 as u128)) >> 64) as u64 as i64
-    }
+    // majit's intrinsics, not a local copy: the `#[jit_interp]` macro matches a
+    // call by its LAST PATH SEGMENT, so an imported name lowers to the same
+    // trace op a definition here did.
+    //
+    // `majit_uint_mul_high` is the documented exception — it has no hard-coded
+    // name and is reached only through this mainloop's `native_int_binops`
+    // alias, which matches the call's FULL path against the configured key. The
+    // alias and these call sites must therefore both stay on the bare name.
+    //
+    // The obligations stay cel's. A load's `base` is a column buffer's address
+    // and `ea` a byte offset, so it reads `col[i]` at a red row index when
+    // `ea == i * 8`; `base` is a loop-invariant in the register file, NOT a
+    // scalar state field, which would force the virtualizable frame to a Ref
+    // and trip `VirtualStatesCantMatch` at loop close. A `&[bool]` column's
+    // stride is one, so `majit_raw_load_u8` takes an element index. The batch
+    // builder covers every row index; the trap word `OP_TRAP_STORE` publishes
+    // through outlives the run; `OP_UDIV`/`OP_UMOD` guard `b != 0` before they
+    // call.
+    use majit_metainterp::intrinsics::{
+        majit_bits_to_f64, majit_f64_to_bits, majit_raw_load_f, majit_raw_load_i64,
+        majit_raw_load_u8, majit_raw_store_i64, majit_uint_div, majit_uint_le, majit_uint_lt,
+        majit_uint_mod, majit_uint_mul_high,
+    };
 
     struct VmStateF {
         regs: majit_metainterp::virt_array::VirtArray<i64>,
@@ -1769,7 +1652,7 @@ pub mod float_bank {
                 OP_COL_LOAD => {
                     let base = state.regs[program[pc + 1] as usize];
                     let ea = state.regs[program[pc + 2] as usize];
-                    state.regs[program[pc + 3] as usize] = super::majit_raw_load_i64(base, ea);
+                    state.regs[program[pc + 3] as usize] = majit_raw_load_i64(base, ea);
                     pc += 4;
                 }
                 OP_COL_LOAD_B => {
@@ -2611,7 +2494,7 @@ pub mod float_bank {
                 OP_COL_LOAD => {
                     let base = regs[program[pc + 1] as usize];
                     let ea = regs[program[pc + 2] as usize];
-                    regs[program[pc + 3] as usize] = super::majit_raw_load_i64(base, ea);
+                    regs[program[pc + 3] as usize] = majit_raw_load_i64(base, ea);
                     pc += 4;
                 }
                 OP_COL_LOAD_B => {

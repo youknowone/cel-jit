@@ -98,7 +98,9 @@ fn last_measured_stats() -> JitStats {
 /// One swept data shape: a label and the per-row element count it produces.
 type Shape = (&'static str, fn(usize) -> i64);
 
-/// `rlib/jit.py:590` / `warmstate.rs:259 DEFAULT_TRACE_EAGERNESS`.
+/// `rlib/jit.py:590`, read off `majit_metainterp::jit::PARAMETERS` rather than
+/// restated: a copy here would keep passing after the engine moved the default,
+/// and the budget it feeds would then be wrong by exactly that difference.
 ///
 /// A guard does not bridge on its first failure: each failure ticks its own
 /// counter by `1/trace_eagerness` and the bridge is attached when that counter
@@ -112,7 +114,7 @@ type Shape = (&'static str, fn(usize) -> i64);
 /// what the old constant-16 budgets asserted, and they were recorded when the
 /// inner element loop was still inlined into the outer row trace and there was
 /// no separate inner-loop exit guard to warm up.
-const TRACE_EAGERNESS: usize = 200;
+const TRACE_EAGERNESS: usize = majit_metainterp::jit::PARAMETERS.trace_eagerness as usize;
 
 /// Guards that are still mid-warmup when the batch ends: they have ticked
 /// without having attached a bridge yet, so they cost failures that
