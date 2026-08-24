@@ -179,9 +179,13 @@ macro_rules! scalar_leaf {
         $class:ident = ($name:literal, $kind:expr)
         $(#[$ctor_doc:meta])*
         $ctor:ident
-        $marker:ident
     ) => {
         $(#[$leaf_doc])*
+        // The payload is written once, at allocation, and never again, so its
+        // reads may fold to a pure getfield. The attribute leaves the
+        // `_immutable_fields_<Struct>` marker Charon extracts; spelling it by
+        // hand here is what the marker's own consumer stopped needing.
+        #[cfg_attr(feature = "jit", majit_macros::jit_immutable_fields($payload))]
         #[repr(C)]
         #[allow(non_camel_case_types)]
         pub struct $leaf {
@@ -196,12 +200,6 @@ macro_rules! scalar_leaf {
         const _: () = {
             assert!(offset_of!($leaf, ob_header) == 0);
         };
-
-        /// The payload is written once, at allocation, and never again, so its
-        /// reads may fold to a pure getfield. `harvest_immutable_fields_from_llbcs`
-        /// collects this marker by its `_immutable_fields_` prefix.
-        #[allow(non_upper_case_globals)]
-        pub const $marker: &str = stringify!($payload);
 
         $(#[$ctor_doc])*
         pub fn $ctor(value: $pty) -> *mut $leaf {
@@ -219,7 +217,6 @@ scalar_leaf! {
     CEL_INT_CLASS = ("int", CelKind::Int)
     /// Box `value` as a CEL `int`.
     new_int
-    _immutable_fields_W_IntObject
 }
 
 scalar_leaf! {
@@ -228,7 +225,6 @@ scalar_leaf! {
     CEL_UINT_CLASS = ("uint", CelKind::UInt)
     /// Box `value` as a CEL `uint`.
     new_uint
-    _immutable_fields_W_UIntObject
 }
 
 scalar_leaf! {
@@ -237,7 +233,6 @@ scalar_leaf! {
     CEL_DOUBLE_CLASS = ("double", CelKind::Double)
     /// Box `value` as a CEL `double`.
     new_double
-    _immutable_fields_W_DoubleObject
 }
 
 scalar_leaf! {
@@ -251,7 +246,6 @@ scalar_leaf! {
     CEL_BOOL_CLASS = ("bool", CelKind::Bool)
     /// Box `value` as a CEL `bool`.
     new_bool_raw
-    _immutable_fields_W_BoolObject
 }
 
 scalar_leaf! {
@@ -264,7 +258,6 @@ scalar_leaf! {
     CEL_DURATION_CLASS = ("duration", CelKind::Duration)
     /// Box `nanos` as a CEL `duration`.
     new_duration
-    _immutable_fields_W_DurationObject
 }
 
 scalar_leaf! {
@@ -288,7 +281,6 @@ scalar_leaf! {
     /// null: there the null is a literal inside the allocation body rather than
     /// a value arriving as an argument.
     new_optional
-    _immutable_fields_W_OptionalObject
 }
 
 /// Allocate the absent CEL `optional`.
@@ -346,6 +338,7 @@ pub fn new_null() -> *mut W_NullObject {
 /// the value was written with — so it does not go through [`scalar_leaf`]
 /// either. CEL compares timestamps by instant and formats them by offset, so
 /// dropping the offset would be lossy at the boundary.
+#[cfg_attr(feature = "jit", majit_macros::jit_immutable_fields(nanos, off_s))]
 #[repr(C)]
 #[allow(non_camel_case_types)]
 pub struct W_TimestampObject {
@@ -360,10 +353,6 @@ pub static CEL_TIMESTAMP_CLASS: CelClass = CelClass::new("timestamp", CelKind::T
 const _: () = {
     assert!(offset_of!(W_TimestampObject, ob_header) == 0);
 };
-
-/// Both payload fields are write-once.
-#[allow(non_upper_case_globals)]
-pub const _immutable_fields_W_TimestampObject: &str = "nanos,off_s";
 
 /// Box an instant as a CEL `timestamp`.
 pub fn new_timestamp(nanos: i64, off_s: i64) -> *mut W_TimestampObject {
@@ -390,6 +379,7 @@ pub fn new_timestamp(nanos: i64, off_s: i64) -> *mut W_TimestampObject {
 // delete.
 
 /// A CEL `bytes`.
+#[cfg_attr(feature = "jit", majit_macros::jit_immutable_fields(data, length))]
 #[repr(C)]
 #[allow(non_camel_case_types)]
 pub struct W_BytesObject {
@@ -407,10 +397,6 @@ pub static CEL_BYTES_CLASS: CelClass = CelClass::new("bytes", CelKind::Bytes);
 const _: () = {
     assert!(offset_of!(W_BytesObject, ob_header) == 0);
 };
-
-/// Both written once at allocation. A mutation allocates a new value.
-#[allow(non_upper_case_globals)]
-pub const _immutable_fields_W_BytesObject: &str = "data,length";
 
 /// Box `bytes` as a CEL `bytes`.
 ///
@@ -437,6 +423,7 @@ pub fn new_bytes(bytes: &[u8]) -> *mut W_BytesObject {
 ///
 /// The payload is UTF-8, so `byte_len` is what indexes the block and is not the
 /// character count.
+#[cfg_attr(feature = "jit", majit_macros::jit_immutable_fields(chars, byte_len))]
 #[repr(C)]
 #[allow(non_camel_case_types)]
 pub struct W_StringObject {
@@ -450,9 +437,6 @@ pub static CEL_STRING_CLASS: CelClass = CelClass::new("string", CelKind::Str);
 const _: () = {
     assert!(offset_of!(W_StringObject, ob_header) == 0);
 };
-
-#[allow(non_upper_case_globals)]
-pub const _immutable_fields_W_StringObject: &str = "chars,byte_len";
 
 /// Box `s` as a CEL `string`.
 pub fn new_string(s: &str) -> *mut W_StringObject {
@@ -475,6 +459,7 @@ pub fn new_string(s: &str) -> *mut W_StringObject {
 /// those for the phase that lands the unboxed columns. Adding the field now
 /// would be a shape with one inhabitant and no reader. It is a scalar field, so
 /// adding it later does not change how this leaf fuses.
+#[cfg_attr(feature = "jit", majit_macros::jit_immutable_fields(items, length))]
 #[repr(C)]
 #[allow(non_camel_case_types)]
 pub struct W_ListObject {
@@ -492,10 +477,6 @@ const _: () = {
 
 /// ⚠ Immutable in the sense the JIT means: written once at allocation, so a
 /// read may fold. CEL lists are immutable values, so this is not the bet it
-/// would be for a mutable list — a `.append` here builds a new value.
-#[allow(non_upper_case_globals)]
-pub const _immutable_fields_W_ListObject: &str = "items,length";
-
 /// Box `values` as a CEL `list`.
 ///
 /// The elements are the family's first MULTIPLE managed edges from one value,
@@ -520,6 +501,7 @@ pub fn new_list(values: &[CelRef]) -> *mut W_ListObject {
 /// `type(type(1)) == type(string)` hold, and it is why the two spellings must
 /// not be collapsed: `(*type_value).cls` is a class, `(*any_value).ob_type` is
 /// a class, and only the type value itself is an allocated object.
+#[cfg_attr(feature = "jit", majit_macros::jit_immutable_fields(cls))]
 #[repr(C)]
 #[allow(non_camel_case_types)]
 pub struct W_TypeObject {
@@ -533,10 +515,6 @@ pub static CEL_TYPE_CLASS: CelClass = CelClass::new("type", CelKind::Type);
 const _: () = {
     assert!(offset_of!(W_TypeObject, ob_header) == 0);
 };
-
-/// Written once at allocation.
-#[allow(non_upper_case_globals)]
-pub const _immutable_fields_W_TypeObject: &str = "cls";
 
 /// The type value denoting `cls`.
 pub fn new_type(cls: &'static CelClass) -> *mut W_TypeObject {
