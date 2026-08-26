@@ -100,7 +100,7 @@ harness = false
 
 # Declared with no `required-features`, unlike every block below it, because it
 # genuinely needs none: the timing machinery is plain `std`, and the probe arms
-# it can select are behind `#[cfg(feature = "drop-arm-probe")]` inside the file.
+# it can select are behind `#[cfg(feature = "__drop-arm-probe")]` inside the file.
 # The block still has to exist. `scripts/feature-matrix.sh` checks the manifest
 # and `examples/` for set equality by NAME, so an undeclared example is a
 # failure there whether or not it compiles -- it would otherwise be built in
@@ -111,7 +111,7 @@ name = "paired_ab"
 
 # `jit` and not the bare timing machinery, unlike `paired_ab` above: this file
 # names `majit_ir` and `majit_metainterp` at module scope, so it does not build
-# without them. The loop-key census inside it needs `loop-key-arm-probe` as
+# without them. The loop-key census inside it needs `__loop-key-arm-probe` as
 # well, but that arm is behind a `#[cfg]` and the file builds without it, so it
 # is not required here -- a required-feature would force the probe into every
 # row that runs this example.
@@ -140,7 +140,7 @@ name = "routeprobe"
 required-features = ["jit"]
 
 # `jit` only, like `loopkey_ab` above and for the same reason: the stage arms
-# are behind `#[cfg(feature = "entry-stage-probe")]` inside the file, and the
+# are behind `#[cfg(feature = "__entry-stage-probe")]` inside the file, and the
 # file builds and runs without them -- it reports the entry whole and says which
 # feature the split needs. Requiring the probe feature here would instead force
 # it into every matrix row that builds this example.
@@ -300,7 +300,7 @@ dhat-heap = [ ] # if you are doing heap profiling
 # the drop policies LEAKS by design; see `DropArm::ForgetUnsound`, which is
 # sound only for an integer body over a list of integers and is guarded by an
 # allocation witness before any timing runs.
-drop-arm-probe = []
+__drop-arm-probe = []
 
 # The third measurement probe, and never a shipping feature either. It lets the
 # dispatch loop FUSE the per-element instruction block of an appending
@@ -313,7 +313,7 @@ drop-arm-probe = []
 # does. The harness asserts each arm's result against the stock arm's before
 # any timing, so an arm that removed work it should not have is a failure and
 # not a faster number. Off by default; only `examples/paired_ab.rs` selects it.
-elem-attr-probe = []
+__elem-attr-probe = []
 
 # The second measurement probe, and never a shipping feature either. It makes
 # the function-entry door's yield probe choose its key form at run time --
@@ -326,7 +326,7 @@ elem-attr-probe = []
 # moment another one reads the arm. Both arms DECIDE the same thing on every
 # bucket holding one cell or none, which is every bucket a program here has
 # produced; see `float_bank::LoopKeyArm`.
-loop-key-arm-probe = []
+__loop-key-arm-probe = []
 
 # The fourth measurement probe, and never a shipping feature either. It gives
 # `float_bank::run_jit_persistent_f` a per-stage repeat count, read once per
@@ -354,10 +354,10 @@ loop-key-arm-probe = []
 # four more zero-trip tests per compiled entry on the majit side, so an absolute
 # figure taken from such a build is not what the shipping door costs; only
 # differences are claims.
-entry-stage-probe = [
-    "majit-metainterp?/back-edge-stage-probe",
-    "majit-metainterp?/execute-stage-probe",
-    "majit-metainterp?/yield-stage-probe",
+__entry-stage-probe = [
+    "majit-metainterp?/__back-edge-stage-probe",
+    "majit-metainterp?/__execute-stage-probe",
+    "majit-metainterp?/__yield-stage-probe",
 ]
 
 # The fifth measurement probe, and never a shipping feature either. It gives
@@ -366,7 +366,7 @@ entry-stage-probe = [
 # difference taken inside ONE binary -- the same bind against itself, once with
 # every count at zero and once with one stage repeated k extra times.
 #
-# Repetition and not a clock, for the reason `entry-stage-probe` gives: `bind`
+# Repetition and not a clock, for the reason `__entry-stage-probe` gives: `bind`
 # is 44-770 ns across the shapes that matter and `Instant::now()` costs 20-25 ns
 # here, so a clock per stage would report itself.
 #
@@ -380,7 +380,7 @@ entry-stage-probe = [
 # A build carrying it pays one thread-local read and seven zero-trip loop tests
 # per bind that a default build does not, so an absolute figure taken from such
 # a build is not what the shipping door costs; only differences are claims.
-encode-stage-probe = []
+__encode-stage-probe = []
 
 # Route `Program::execute` through the bytecode VM instead of the tree walker.
 #

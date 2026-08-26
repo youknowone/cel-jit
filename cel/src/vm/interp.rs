@@ -47,11 +47,11 @@ use std::cmp::Ordering;
 /// `&&` and `||` absorb errors and so raise them on ordinary control flow.
 pub fn cel_eval_loop(code: &CelCode, ctx: &Context) -> Result<Value, ExecutionError> {
     let mut vm = Vm::new(code, ctx);
-    #[cfg(feature = "drop-arm-probe")]
+    #[cfg(feature = "__drop-arm-probe")]
     {
         vm.probe = PROBE.with(std::cell::Cell::get);
     }
-    #[cfg(feature = "elem-attr-probe")]
+    #[cfg(feature = "__elem-attr-probe")]
     {
         // The shape was recognised unconditionally in `Vm::new`, so every arm
         // pays the scan. What the arm decides is only whether the fused path
@@ -89,7 +89,7 @@ pub fn cel_eval_loop(code: &CelCode, ctx: &Context) -> Result<Value, ExecutionEr
 /// function starts from inside this one inherits the enclosing policy rather
 /// than a stale one. A panic escaping the evaluation leaves the policy set;
 /// that is a probe, not a library, and the process is going down anyway.
-#[cfg(feature = "drop-arm-probe")]
+#[cfg(feature = "__drop-arm-probe")]
 pub fn cel_eval_loop_with_probe(
     code: &CelCode,
     ctx: &Context,
@@ -133,7 +133,7 @@ pub fn cel_eval_loop_with_probe(
 /// dispatch and nothing else. The block holds no push and no pop at all: the
 /// only operand it touches is the builder the append mutates in place, which
 /// was put on the stack before the loop and comes off after it.
-#[cfg(feature = "elem-attr-probe")]
+#[cfg(feature = "__elem-attr-probe")]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FuseArm {
     /// What the interpreter does without the probe: `IterGuard ; IterBind ;
@@ -226,7 +226,7 @@ pub enum FuseArm {
     AdvancePlusArcRoundTrip,
 }
 
-#[cfg(feature = "elem-attr-probe")]
+#[cfg(feature = "__elem-attr-probe")]
 std::thread_local! {
     /// Which arm the next evaluation on this thread runs under.
     static FUSE: std::cell::Cell<FuseArm> = const { std::cell::Cell::new(FuseArm::None) };
@@ -238,7 +238,7 @@ std::thread_local! {
 /// reason [`cel_eval_loop_with_probe`]'s documentation gives: `interp.rs` is
 /// pinned to exactly one `Vm::new` and one `run`, so a second entry point that
 /// built its own machine would look like a nested interpreter.
-#[cfg(feature = "elem-attr-probe")]
+#[cfg(feature = "__elem-attr-probe")]
 pub fn cel_eval_loop_with_fuse(
     code: &CelCode,
     ctx: &Context,
@@ -257,7 +257,7 @@ pub fn cel_eval_loop_with_fuse(
 /// Every field is read off the stream rather than assumed, so a program that
 /// does not have this exact shape is simply not recognised and every arm runs
 /// the stock dispatch loop over it.
-#[cfg(feature = "elem-attr-probe")]
+#[cfg(feature = "__elem-attr-probe")]
 #[derive(Clone, Copy, Debug)]
 struct MapLoop {
     /// `IterGuard`, the loop header. `u32::MAX` when no block matched, which is
@@ -281,7 +281,7 @@ struct MapLoop {
     after_body: u32,
 }
 
-#[cfg(feature = "elem-attr-probe")]
+#[cfg(feature = "__elem-attr-probe")]
 const NO_MAP_LOOP: MapLoop = MapLoop {
     top: u32::MAX,
     done: 0,
@@ -298,7 +298,7 @@ const NO_MAP_LOOP: MapLoop = MapLoop {
 ///
 /// Run once per evaluation by EVERY arm, so its cost is a constant that cancels
 /// out of any difference between two of them.
-#[cfg(feature = "elem-attr-probe")]
+#[cfg(feature = "__elem-attr-probe")]
 fn recognize_map_loop(code: &CelCode) -> MapLoop {
     const WANT: [OpCode; 4] = [
         OpCode::IterGuard,
@@ -368,7 +368,7 @@ fn recognize_map_loop(code: &CelCode) -> MapLoop {
 /// stream's range, EVERY arm runs the stock dispatch loop -- and every arm
 /// still agrees on the answer, because they all compute the same value. The
 /// harness would report a full ladder of zeroes as a measurement.
-#[cfg(feature = "elem-attr-probe")]
+#[cfg(feature = "__elem-attr-probe")]
 pub fn map_loop_is_fusable(code: &CelCode) -> bool {
     recognize_map_loop(code).top != u32::MAX
 }
@@ -429,7 +429,7 @@ const _: () = {
 /// and branches that do nothing -- is the cost the CALL, or the work inside
 /// it? The three policies bracket that. The difference between the first two
 /// is the call; the difference between the second two is the work.
-#[cfg(feature = "drop-arm-probe")]
+#[cfg(feature = "__drop-arm-probe")]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DropArm {
     /// What the interpreter does without the probe: hand the operand to the
@@ -457,7 +457,7 @@ pub enum DropArm {
 /// The second half of the same probe, and here for the same reason: two
 /// spellings of one instruction, chosen per run, so both live in one binary
 /// and neither can be a different compilation of the other.
-#[cfg(feature = "drop-arm-probe")]
+#[cfg(feature = "__drop-arm-probe")]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum IterAtArm {
     /// Hand both slots to `value_index`, which decides the container's kind,
@@ -476,14 +476,14 @@ pub enum IterAtArm {
 /// a different branch. Both cancel exactly out of any difference between two
 /// arms -- which is also why no arm's ABSOLUTE figure is what the shipping
 /// interpreter costs. Only differences are claims.
-#[cfg(feature = "drop-arm-probe")]
+#[cfg(feature = "__drop-arm-probe")]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct ProbePolicy {
     pub drop_arm: DropArm,
     pub iter_at: IterAtArm,
 }
 
-#[cfg(feature = "drop-arm-probe")]
+#[cfg(feature = "__drop-arm-probe")]
 impl ProbePolicy {
     /// What the interpreter does without the probe.
     ///
@@ -496,7 +496,7 @@ impl ProbePolicy {
     };
 }
 
-#[cfg(feature = "drop-arm-probe")]
+#[cfg(feature = "__drop-arm-probe")]
 impl Default for ProbePolicy {
     /// What the interpreter does without the probe, so that a run that names
     /// only one half leaves the other half alone.
@@ -505,7 +505,7 @@ impl Default for ProbePolicy {
     }
 }
 
-#[cfg(feature = "drop-arm-probe")]
+#[cfg(feature = "__drop-arm-probe")]
 std::thread_local! {
     /// The policy the next evaluation on this thread runs under.
     ///
@@ -533,7 +533,7 @@ std::thread_local! {
 /// immediately for every one of their discriminants. A variant added to
 /// [`Value`] that owns anything falls to the `else`, because the list is
 /// explicit rather than a wildcard.
-#[cfg(feature = "drop-arm-probe")]
+#[cfg(feature = "__drop-arm-probe")]
 #[inline(always)]
 fn discard_inline(value: Value) {
     #[cfg(feature = "chrono")]
@@ -650,20 +650,20 @@ struct Vm<'a> {
     /// absorbs it and the method call never runs.
     pending_args: Option<Vec<Value>>,
     /// Which lowering the probe's sites take. Probe only; see [`ProbePolicy`].
-    #[cfg(feature = "drop-arm-probe")]
+    #[cfg(feature = "__drop-arm-probe")]
     probe: ProbePolicy,
     /// Which groups of the per-element block run as one step. Probe only; see
     /// [`FuseArm`].
-    #[cfg(feature = "elem-attr-probe")]
+    #[cfg(feature = "__elem-attr-probe")]
     fuse: FuseArm,
     /// Where that block is. Probe only; see [`MapLoop`].
-    #[cfg(feature = "elem-attr-probe")]
+    #[cfg(feature = "__elem-attr-probe")]
     shape: MapLoop,
     /// The one `pc` at which the fused path is taken, or `u32::MAX` for an arm
     /// that fuses nothing. A field rather than a second test, so that the
     /// dispatch loop's per-instruction cost is identical in every arm however
     /// many anchors the probe grows. Probe only.
-    #[cfg(feature = "elem-attr-probe")]
+    #[cfg(feature = "__elem-attr-probe")]
     anchor: u32,
 }
 
@@ -720,15 +720,15 @@ impl<'a> Vm<'a> {
             logic: scratch.logic,
             cold: scratch.cold,
             pending_args: None,
-            #[cfg(feature = "drop-arm-probe")]
+            #[cfg(feature = "__drop-arm-probe")]
             probe: ProbePolicy::default(),
-            #[cfg(feature = "elem-attr-probe")]
+            #[cfg(feature = "__elem-attr-probe")]
             fuse: FuseArm::None,
             // Scanned by every arm, including the one that fuses nothing, so
             // the scan is a constant rather than a term of any difference.
-            #[cfg(feature = "elem-attr-probe")]
+            #[cfg(feature = "__elem-attr-probe")]
             shape: recognize_map_loop(code),
-            #[cfg(feature = "elem-attr-probe")]
+            #[cfg(feature = "__elem-attr-probe")]
             anchor: u32::MAX,
         }
     }
@@ -903,7 +903,7 @@ impl<'a> Vm<'a> {
     /// Written as a call rather than left to end of scope so the discard has
     /// one name a measurement probe can substitute for. Without the probe this
     /// is the drop the arm performed anyway, at the same point.
-    #[cfg(not(feature = "drop-arm-probe"))]
+    #[cfg(not(feature = "__drop-arm-probe"))]
     #[inline(always)]
     fn discard(&self, value: Value) {
         drop(value);
@@ -915,7 +915,7 @@ impl<'a> Vm<'a> {
     /// so its cost is a constant that cancels out of any difference between two
     /// arms. The absolute figure an arm produces is therefore NOT what the
     /// shipping interpreter costs; only the differences are claims.
-    #[cfg(feature = "drop-arm-probe")]
+    #[cfg(feature = "__drop-arm-probe")]
     #[inline(always)]
     fn discard(&self, value: Value) {
         match self.probe.drop_arm {
@@ -1075,7 +1075,7 @@ impl<'a> Vm<'a> {
             // own overhead: an arm that removes k dispatches also removes k
             // executions of this test, which inflates that arm's measured
             // saving by k times the cost of one predicted compare.
-            #[cfg(feature = "elem-attr-probe")]
+            #[cfg(feature = "__elem-attr-probe")]
             if pc == self.anchor {
                 pc = self.fused_element(pc)?;
                 continue;
@@ -1149,7 +1149,7 @@ impl<'a> Vm<'a> {
     /// The operand stack is left at the depth the fused instructions would have
     /// left it: every group below is stack-neutral end to end, so the builder
     /// the loop appends into stays exactly where it was.
-    #[cfg(feature = "elem-attr-probe")]
+    #[cfg(feature = "__elem-attr-probe")]
     fn fused_element(&mut self, pc: u32) -> CelResult<u32> {
         let shape = self.shape;
         let arm = self.fuse;
@@ -1257,7 +1257,7 @@ impl<'a> Vm<'a> {
     ///
     /// Its own function only because two arms reach it: the cumulative ladder
     /// falls into it, and [`FuseArm::AdvanceOnly`] enters directly at it.
-    #[cfg(feature = "elem-attr-probe")]
+    #[cfg(feature = "__elem-attr-probe")]
     #[inline(always)]
     fn fused_advance(&mut self, shape: MapLoop) -> CelResult<u32> {
         let slot = self
@@ -1933,7 +1933,7 @@ impl<'a> Vm<'a> {
         // decides the container's kind, then the key's kind, then
         // bounds-checks, then answers in `ExecutionError` -- which `park` has
         // to record on `&mut self`, per element.
-        #[cfg(feature = "drop-arm-probe")]
+        #[cfg(feature = "__drop-arm-probe")]
         if self.probe.iter_at == IterAtArm::ViaValueIndex {
             let element = {
                 let sequence = self
@@ -2214,7 +2214,7 @@ mod tests {
     /// running the stock dispatch loop and reporting agreement -- a silent pass
     /// rather than a failure -- so the match itself is asserted before the
     /// answers are.
-    #[cfg(feature = "elem-attr-probe")]
+    #[cfg(feature = "__elem-attr-probe")]
     #[test]
     fn every_fusion_arm_answers_what_the_stock_arm_answers() {
         let mut ctx = Context::default();

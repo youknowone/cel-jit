@@ -668,7 +668,7 @@ pub fn prepare_batch<'a>(
 /// [`EncodeStageRepeats::out`]) therefore price an allocation AND its matching
 /// free, which is an over-estimate of the allocation alone and is the honest
 /// reading of them.
-#[cfg(feature = "encode-stage-probe")]
+#[cfg(feature = "__encode-stage-probe")]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct EncodeStageRepeats {
     /// Extra passes of the two assertion sweeps: column count and bank match,
@@ -705,7 +705,7 @@ pub struct EncodeStageRepeats {
     pub barrier: u32,
 }
 
-#[cfg(feature = "encode-stage-probe")]
+#[cfg(feature = "__encode-stage-probe")]
 std::thread_local! {
     /// The counts the next bind on this thread runs with.
     static ENCODE_STAGE_REPEATS: core::cell::Cell<EncodeStageRepeats> = const {
@@ -721,7 +721,7 @@ std::thread_local! {
     };
 }
 
-#[cfg(feature = "encode-stage-probe")]
+#[cfg(feature = "__encode-stage-probe")]
 std::thread_local! {
     /// How many times the amplified `out` stage actually ran its body.
     ///
@@ -733,13 +733,13 @@ std::thread_local! {
 }
 
 /// Passes the amplified `out` stage has run since [`reset_encode_stage_passes`].
-#[cfg(feature = "encode-stage-probe")]
+#[cfg(feature = "__encode-stage-probe")]
 pub fn encode_stage_out_passes() -> u64 {
     ENCODE_STAGE_OUT_PASSES.with(core::cell::Cell::get)
 }
 
 /// Zero the pass counter, so a section counts only its own arms.
-#[cfg(feature = "encode-stage-probe")]
+#[cfg(feature = "__encode-stage-probe")]
 pub fn reset_encode_stage_passes() {
     ENCODE_STAGE_OUT_PASSES.with(|c| c.set(0));
 }
@@ -752,7 +752,7 @@ pub fn reset_encode_stage_passes() {
 /// splits is read through `BatchProgram::bind_per_row_resolved`, so the stages
 /// have to be read through it too, or the parts and the whole describe
 /// different doors.
-#[cfg(feature = "encode-stage-probe")]
+#[cfg(feature = "__encode-stage-probe")]
 pub fn set_encode_stage_repeats(repeats: EncodeStageRepeats) -> EncodeStageRepeats {
     ENCODE_STAGE_REPEATS.with(|slot| slot.replace(repeats))
 }
@@ -766,9 +766,9 @@ pub fn prepare_batch_reduce<'a>(
 ) -> BatchRun<'a> {
     // Read once per call, ahead of every stage, so no stage's difference
     // carries it. See [`EncodeStageRepeats`].
-    #[cfg(feature = "encode-stage-probe")]
+    #[cfg(feature = "__encode-stage-probe")]
     let repeats = ENCODE_STAGE_REPEATS.with(core::cell::Cell::get);
-    #[cfg(feature = "encode-stage-probe")]
+    #[cfg(feature = "__encode-stage-probe")]
     for _ in 0..repeats.barrier {
         std::hint::black_box(&columns);
     }
@@ -798,7 +798,7 @@ pub fn prepare_batch_reduce<'a>(
         }
         assert_eq!(c.len(), n, "{what}: column {k} length {} != {n}", c.len());
     }
-    #[cfg(feature = "encode-stage-probe")]
+    #[cfg(feature = "__encode-stage-probe")]
     for _ in 0..repeats.asserts {
         // The INPUTS are barriered, not only the results. Both `columns` and
         // `lowered` are loop-invariant and these two checks are pure, so
@@ -819,7 +819,7 @@ pub fn prepare_batch_reduce<'a>(
             std::hint::black_box(c.len() == n);
         }
     }
-    #[cfg(feature = "encode-stage-probe")]
+    #[cfg(feature = "__encode-stage-probe")]
     for _ in 0..repeats.temporal {
         // Inputs barriered for the reason given on `asserts` above: this is a
         // pure, loop-invariant computation and is the stage most exposed to
@@ -840,7 +840,7 @@ pub fn prepare_batch_reduce<'a>(
     // The unconditional dictionary build, amplified. Re-running it is sound
     // because it reads only `columns` and `lowered`, neither of which any pass
     // mutates.
-    #[cfg(feature = "encode-stage-probe")]
+    #[cfg(feature = "__encode-stage-probe")]
     for _ in 0..repeats.strdict {
         std::hint::black_box(StrDict::build_columns(
             columns,
@@ -867,7 +867,7 @@ pub fn prepare_batch_reduce<'a>(
     );
     // `bases` reads the id columns positionally, so an amplified pass needs its
     // own cursor rather than sharing the real one.
-    #[cfg(feature = "encode-stage-probe")]
+    #[cfg(feature = "__encode-stage-probe")]
     for _ in 0..repeats.bases {
         let mut id_col = 0;
         let v: Vec<i64> = columns
@@ -904,11 +904,11 @@ pub fn prepare_batch_reduce<'a>(
     // Allocation stages price an allocation AND its matching free, since the
     // amplified copy is dropped at the end of each pass. That is an
     // over-estimate of the allocation alone and is how they must be read.
-    #[cfg(feature = "encode-stage-probe")]
+    #[cfg(feature = "__encode-stage-probe")]
     for _ in 0..repeats.trap {
         std::hint::black_box(Box::new(0i64));
     }
-    #[cfg(feature = "encode-stage-probe")]
+    #[cfg(feature = "__encode-stage-probe")]
     for _ in 0..repeats.out {
         // Counted, not just run. This stage is zero-trip under
         // `BatchReduce::Sum`, and a stage the compiler ELIDED would report the
@@ -1905,7 +1905,7 @@ pub mod float_bank {
     /// [`PooledGreenKey::resolve`] answers such a bucket from the walk alone
     /// and returns the raw hash. So this is a cost probe, not a behaviour
     /// switch: the arms differ in what they DO, not in what they decide.
-    #[cfg(feature = "loop-key-arm-probe")]
+    #[cfg(feature = "__loop-key-arm-probe")]
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     pub enum LoopKeyArm {
         /// The bare bucket hash, which is what the probe asked before the
@@ -1917,7 +1917,7 @@ pub mod float_bank {
         Resolved,
     }
 
-    #[cfg(feature = "loop-key-arm-probe")]
+    #[cfg(feature = "__loop-key-arm-probe")]
     std::thread_local! {
         /// The arm the next call on this thread takes at the yield probe.
         ///
@@ -1937,7 +1937,7 @@ pub mod float_bank {
     /// and a parameter would have to be spelled in the shipping signature too.
     /// Saved and restored around the one call, so two arms interleaved in one
     /// process never observe each other's setting.
-    #[cfg(feature = "loop-key-arm-probe")]
+    #[cfg(feature = "__loop-key-arm-probe")]
     pub fn run_jit_persistent_probe_f(
         program: &std::sync::Arc<Code>,
         init_regs: &[i64],
@@ -1957,7 +1957,7 @@ pub mod float_bank {
     /// caller quoting a per-key cost has to divide by the count the door
     /// actually walks, and that count is [`loop_header_keys`]'s answer rather
     /// than the number of loops a reader would count in the source.
-    #[cfg(feature = "loop-key-arm-probe")]
+    #[cfg(feature = "__loop-key-arm-probe")]
     pub fn loop_key_count(program: &Code) -> usize {
         loop_header_keys(program).len()
     }
@@ -2111,19 +2111,19 @@ pub mod float_bank {
         // two probes now decide on the same footing, which is what stops the
         // weaker one from being read as evidence about the stronger.
         //
-        // Under `loop-key-arm-probe` the key form is selected at RUN time, so
+        // Under `__loop-key-arm-probe` the key form is selected at RUN time, so
         // this walk and the bare-hash probe that preceded it are two branches
         // of one compiled door. See [`LoopKeyArm`]; the default build has
         // neither the branch nor the read.
-        #[cfg(feature = "loop-key-arm-probe")]
+        #[cfg(feature = "__loop-key-arm-probe")]
         let arm = LOOP_KEY_ARM.with(core::cell::Cell::get);
         if pooled.loop_keys.iter().any(|key| {
-            #[cfg(feature = "loop-key-arm-probe")]
+            #[cfg(feature = "__loop-key-arm-probe")]
             let probe = match arm {
                 LoopKeyArm::BareHash => key.hash,
                 LoopKeyArm::Resolved => key.resolve(driver),
             };
-            #[cfg(not(feature = "loop-key-arm-probe"))]
+            #[cfg(not(feature = "__loop-key-arm-probe"))]
             let probe = key.resolve(driver);
             driver.has_runnable_compiled_loop(probe)
         }) {
@@ -2999,7 +2999,7 @@ pub mod float_bank {
     /// shipping door costs: a build carrying this feature pays that read and
     /// five zero-trip loop tests per call that a default build does not have.
     /// Only differences are claims.
-    #[cfg(feature = "entry-stage-probe")]
+    #[cfg(feature = "__entry-stage-probe")]
     #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
     pub struct EntryStageRepeats {
         /// Extra [`DRIVERS`] accesses.
@@ -3028,7 +3028,7 @@ pub mod float_bank {
         /// key of every loop header the program has, which is what the entry
         /// door opens with.
         ///
-        /// Always the RESOLVED form, so under `loop-key-arm-probe` this prices
+        /// Always the RESOLVED form, so under `__loop-key-arm-probe` this prices
         /// the shipping scan whichever arm the door itself is taking.
         pub loop_keys: u32,
         /// Extra passes of the yield scan's WALK half alone: `key.resolve`,
@@ -3075,7 +3075,7 @@ pub mod float_bank {
         pub barrier: u32,
     }
 
-    #[cfg(feature = "entry-stage-probe")]
+    #[cfg(feature = "__entry-stage-probe")]
     std::thread_local! {
         /// The counts the next call on this thread runs with.
         static ENTRY_STAGE_REPEATS: core::cell::Cell<EntryStageRepeats> = const {
@@ -3093,7 +3093,7 @@ pub mod float_bank {
         };
     }
 
-    #[cfg(feature = "entry-stage-probe")]
+    #[cfg(feature = "__entry-stage-probe")]
     std::thread_local! {
         /// How many loop keys the yield scan last walked.
         ///
@@ -3135,14 +3135,14 @@ pub mod float_bank {
     /// [`run_jit_persistent_probe_f`]: the entry's whole-cost figure is read
     /// through `BoundBatch::collect_into_on`, so the stages have to be read
     /// through it too, or the parts and the whole are about different doors.
-    #[cfg(feature = "entry-stage-probe")]
+    #[cfg(feature = "__entry-stage-probe")]
     pub fn set_entry_stage_repeats(repeats: EntryStageRepeats) -> EntryStageRepeats {
         ENTRY_STAGE_REPEATS.with(|slot| slot.replace(repeats))
     }
 
     /// The loop-key count the last amplified scan walked. Zero until one has
     /// run.
-    #[cfg(feature = "entry-stage-probe")]
+    #[cfg(feature = "__entry-stage-probe")]
     pub fn entry_stage_loop_keys() -> usize {
         ENTRY_STAGE_LOOP_KEYS.with(core::cell::Cell::get)
     }
@@ -3151,14 +3151,14 @@ pub mod float_bank {
     /// since the last [`reset_entry_stage_sub_passes`], and in slot 4 the
     /// number of loop keys whose `resolve` disagreed with their raw hash --
     /// zero on every bucket holding one cell or none.
-    #[cfg(feature = "entry-stage-probe")]
+    #[cfg(feature = "__entry-stage-probe")]
     pub fn entry_stage_sub_passes() -> [u64; 5] {
         ENTRY_STAGE_SUB_PASSES.with(core::cell::Cell::get)
     }
 
     /// Zero the sub-arm pass counters, so one arm's reachability is read
     /// against the calls made under it and not against every call so far.
-    #[cfg(feature = "entry-stage-probe")]
+    #[cfg(feature = "__entry-stage-probe")]
     pub fn reset_entry_stage_sub_passes() {
         ENTRY_STAGE_SUB_PASSES.with(|slot| slot.set([0; 5]));
     }
@@ -3182,9 +3182,9 @@ pub mod float_bank {
         // Read once per call, ahead of every stage, so no stage's difference
         // carries it. See [`EntryStageRepeats`]; a default build has neither
         // this read nor the five loops it feeds.
-        #[cfg(feature = "entry-stage-probe")]
+        #[cfg(feature = "__entry-stage-probe")]
         let repeats = ENTRY_STAGE_REPEATS.with(core::cell::Cell::get);
-        #[cfg(feature = "entry-stage-probe")]
+        #[cfg(feature = "__entry-stage-probe")]
         for _ in 0..repeats.tls {
             DRIVERS.with(|cell| {
                 std::hint::black_box(cell as *const core::cell::RefCell<DriverPool>);
@@ -3197,7 +3197,7 @@ pub mod float_bank {
             // The pool round trip, amplified as a PAIR. See
             // [`EntryStageRepeats::pool`] for why the halves cannot be repeated
             // apart -- a bare second `check_out` prices a cold start.
-            #[cfg(feature = "entry-stage-probe")]
+            #[cfg(feature = "__entry-stage-probe")]
             for _ in 0..repeats.pool {
                 let Checkout {
                     pooled,
@@ -3261,7 +3261,7 @@ pub mod float_bank {
             if driver.state_field_fvc_epoch() != published_epoch {
                 driver.republish_state_field_fvc();
             }
-            #[cfg(feature = "entry-stage-probe")]
+            #[cfg(feature = "__entry-stage-probe")]
             for _ in 0..repeats.reseed {
                 reseed_state_f(state, init_regs, num_fregs);
                 // Every pass writes the same bytes over the same banks, so
@@ -3272,7 +3272,7 @@ pub mod float_bank {
             // The same loop and the same barrier with no stage in them, so what
             // the amplification itself costs is subtracted rather than reported
             // as a stage.
-            #[cfg(feature = "entry-stage-probe")]
+            #[cfg(feature = "__entry-stage-probe")]
             for _ in 0..repeats.barrier {
                 std::hint::black_box(&mut *state);
             }
@@ -3281,7 +3281,7 @@ pub mod float_bank {
             // than inside [`try_function_entry_jit_f`] because both of its
             // inputs are already in hand at this point, which leaves that
             // door's signature the shipping one.
-            #[cfg(feature = "entry-stage-probe")]
+            #[cfg(feature = "__entry-stage-probe")]
             if repeats.loop_keys != 0 {
                 ENTRY_STAGE_LOOP_KEYS.with(|slot| slot.set(pooled_program.loop_keys.len()));
                 for _ in 0..repeats.loop_keys {
@@ -3310,7 +3310,7 @@ pub mod float_bank {
             // `get_compiled_meta` only where a token was found, whereas the
             // `meta` arm asks unconditionally. Warm, where a token is always
             // present, the short-circuit never fires and the two agree.
-            #[cfg(feature = "entry-stage-probe")]
+            #[cfg(feature = "__entry-stage-probe")]
             if repeats.loop_walk != 0 {
                 ENTRY_STAGE_LOOP_KEYS.with(|slot| slot.set(pooled_program.loop_keys.len()));
                 ENTRY_STAGE_SUB_PASSES.with(|slot| {
@@ -3342,7 +3342,7 @@ pub mod float_bank {
                     }
                 }
             }
-            #[cfg(feature = "entry-stage-probe")]
+            #[cfg(feature = "__entry-stage-probe")]
             if repeats.loop_token != 0 {
                 ENTRY_STAGE_LOOP_KEYS.with(|slot| slot.set(pooled_program.loop_keys.len()));
                 ENTRY_STAGE_SUB_PASSES.with(|slot| {
@@ -3358,7 +3358,7 @@ pub mod float_bank {
                     }
                 }
             }
-            #[cfg(feature = "entry-stage-probe")]
+            #[cfg(feature = "__entry-stage-probe")]
             if repeats.loop_upgrade != 0 {
                 ENTRY_STAGE_LOOP_KEYS.with(|slot| slot.set(pooled_program.loop_keys.len()));
                 ENTRY_STAGE_SUB_PASSES.with(|slot| {
@@ -3374,7 +3374,7 @@ pub mod float_bank {
                     }
                 }
             }
-            #[cfg(feature = "entry-stage-probe")]
+            #[cfg(feature = "__entry-stage-probe")]
             if repeats.loop_meta != 0 {
                 ENTRY_STAGE_LOOP_KEYS.with(|slot| slot.set(pooled_program.loop_keys.len()));
                 ENTRY_STAGE_SUB_PASSES.with(|slot| {

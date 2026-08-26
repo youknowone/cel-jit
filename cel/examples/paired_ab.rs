@@ -1010,33 +1010,33 @@ fn main() {
 
     // -- THE PROBE ----------------------------------------------------------
     // Task #36's drop decomposition and the `IterAt` arm, behind
-    // `--features drop-arm-probe`. Placed here so that the closing null
+    // `--features __drop-arm-probe`. Placed here so that the closing null
     // control below still brackets them; each section inside sets its own
     // floor, because the one above was measured on a much shorter arm.
-    #[cfg(feature = "drop-arm-probe")]
+    #[cfg(feature = "__drop-arm-probe")]
     probe(&cfg);
 
     // -- THE ELEMENT-ATTRIBUTION PROBE --------------------------------------
     // Task #40: what the bytecode VM's flat per-element excess over the tree
     // walker on `list.map(x, x * 2)` is MADE OF, behind
-    // `--features elem-attr-probe`. Same bracket, same rule about floors.
-    #[cfg(feature = "elem-attr-probe")]
+    // `--features __elem-attr-probe`. Same bracket, same rule about floors.
+    #[cfg(feature = "__elem-attr-probe")]
     element_attribution(&cfg);
 
     // -- THE LOOP-KEY PROBE -------------------------------------------------
     // Task #31: what the function-entry door's per-call loop-key resolution
-    // costs, behind `--features jit-<backend>,loop-key-arm-probe`. Bracketed by
+    // costs, behind `--features jit-<backend>,__loop-key-arm-probe`. Bracketed by
     // the same two null controls, and each section sets its own floor for the
     // same reason the drop probe's do.
-    #[cfg(all(feature = "jit", feature = "loop-key-arm-probe"))]
+    #[cfg(all(feature = "jit", feature = "__loop-key-arm-probe"))]
     loop_key_probe(&cfg);
 
     // -- THE ENCODE SPLIT ---------------------------------------------------
     // Task #58: what the columnar encoding is MADE OF for an activation with
-    // no list and no string, behind `--features jit-<backend>,encode-stage-probe`.
+    // no list and no string, behind `--features jit-<backend>,__encode-stage-probe`.
     // Same bracket, and its own floor per size for the same reason the others
     // set theirs.
-    #[cfg(all(feature = "jit", feature = "encode-stage-probe"))]
+    #[cfg(all(feature = "jit", feature = "__encode-stage-probe"))]
     encode_stage_split(&cfg);
 
     // -- THE ARMS UNDER TEST ------------------------------------------------
@@ -1202,7 +1202,7 @@ fn main() {
 }
 
 // ---------------------------------------------------------------------------
-// The probe (feature `drop-arm-probe`)
+// The probe (feature `__drop-arm-probe`)
 // ---------------------------------------------------------------------------
 //
 // Two questions, both answered as a difference taken inside ONE binary:
@@ -1227,7 +1227,7 @@ fn main() {
 /// is the floor divided by the discards one iteration performs. A thousand
 /// elements buys three orders of magnitude of that division; the price is that
 /// the figure is an average over a loop, which is what a per-element cost is.
-#[cfg(feature = "drop-arm-probe")]
+#[cfg(feature = "__drop-arm-probe")]
 const DROP_PROBE_ELEMS: usize = 1000;
 
 /// A context binding `xs` to `n` integers.
@@ -1237,7 +1237,7 @@ const DROP_PROBE_ELEMS: usize = 1000;
 /// still a perfectly well-behaved arm -- it just measures a loop that did not
 /// run. The `assert` on each ladder's answer is what turns that from a thing
 /// to remember into a thing that fails.
-#[cfg(feature = "drop-arm-probe")]
+#[cfg(feature = "__drop-arm-probe")]
 fn int_list_ctx(n: usize) -> Context<'static> {
     let mut ctx = Context::default();
     ctx.add_variable_from_value("xs", (1..=n as i64).collect::<Vec<i64>>());
@@ -1245,7 +1245,7 @@ fn int_list_ctx(n: usize) -> Context<'static> {
 }
 
 /// A context binding `xs` to `n` strings, each its own allocation.
-#[cfg(feature = "drop-arm-probe")]
+#[cfg(feature = "__drop-arm-probe")]
 fn string_list_ctx(n: usize) -> Context<'static> {
     let mut ctx = Context::default();
     ctx.add_variable_from_value(
@@ -1258,7 +1258,7 @@ fn string_list_ctx(n: usize) -> Context<'static> {
 }
 
 /// Compile `src` to a code object the probe can run under an explicit policy.
-#[cfg(any(feature = "drop-arm-probe", feature = "elem-attr-probe"))]
+#[cfg(any(feature = "__drop-arm-probe", feature = "__elem-attr-probe"))]
 fn probe_code(src: &str) -> cel::vm::CelCode {
     let expr = cel::parser::Parser::default()
         .parse(src)
@@ -1277,10 +1277,10 @@ fn probe_code(src: &str) -> cel::vm::CelCode {
 // Shared by the probes; the cfg names each one exactly so that enabling any one
 // alone leaves no unused item behind.
 #[cfg(any(
-    feature = "drop-arm-probe",
-    feature = "elem-attr-probe",
-    all(feature = "jit", feature = "encode-stage-probe"),
-    all(feature = "jit", feature = "loop-key-arm-probe")
+    feature = "__drop-arm-probe",
+    feature = "__elem-attr-probe",
+    all(feature = "jit", feature = "__encode-stage-probe"),
+    all(feature = "jit", feature = "__loop-key-arm-probe")
 ))]
 fn per_unit(label: &str, s: &Stats, floor: f64, units: f64, unit: &str) {
     if verdict(s, floor).resolved() {
@@ -1310,10 +1310,10 @@ fn per_unit(label: &str, s: &Stats, floor: f64, units: f64, unit: &str) {
 // Shared by the probes; the cfg names each one exactly so that enabling any one
 // alone leaves no unused item behind.
 #[cfg(any(
-    feature = "drop-arm-probe",
-    feature = "elem-attr-probe",
-    all(feature = "jit", feature = "encode-stage-probe"),
-    all(feature = "jit", feature = "loop-key-arm-probe")
+    feature = "__drop-arm-probe",
+    feature = "__elem-attr-probe",
+    all(feature = "jit", feature = "__encode-stage-probe"),
+    all(feature = "jit", feature = "__loop-key-arm-probe")
 ))]
 fn local_floor<F: FnMut()>(title: &str, mut make: impl FnMut() -> F, cfg: &Config) -> Floors {
     let run = {
@@ -1353,7 +1353,7 @@ fn local_floor<F: FnMut()>(title: &str, mut make: impl FnMut() -> F, cfg: &Confi
 /// operands by value and drop them inside `objects.rs`, which the tree walker
 /// shares. Each ladder below therefore measures a MAJORITY of its per-element
 /// `Value` drops, not all of them.
-#[cfg(feature = "drop-arm-probe")]
+#[cfg(feature = "__drop-arm-probe")]
 fn drop_decomposition(cfg: &Config) {
     use cel::vm::{cel_eval_loop_with_probe, DropArm, IterAtArm, ProbePolicy};
     use cel::Value;
@@ -1580,7 +1580,7 @@ fn drop_decomposition(cfg: &Config) {
 /// evaluation — separates from the O(N) one the instruction is, and over two
 /// element types because the boxing on the way out of a list differs between
 /// an unboxed integer column and an interned string.
-#[cfg(feature = "drop-arm-probe")]
+#[cfg(feature = "__drop-arm-probe")]
 fn iter_at_sweep(cfg: &Config) {
     use cel::vm::{cel_eval_loop_with_probe, DropArm, IterAtArm, ProbePolicy};
 
@@ -1656,7 +1656,7 @@ fn iter_at_sweep(cfg: &Config) {
 }
 
 // ---------------------------------------------------------------------------
-// The element-attribution probe (feature `elem-attr-probe`)
+// The element-attribution probe (feature `__elem-attr-probe`)
 // ---------------------------------------------------------------------------
 //
 // Task #40. On the `map_list_scaling` ladder the bytecode VM's excess over the
@@ -1684,11 +1684,11 @@ fn iter_at_sweep(cfg: &Config) {
 // an arm that removed the wrong thing fails rather than prints a better number.
 
 /// The ladder's source and its input, verbatim from `map_list_scaling`.
-#[cfg(feature = "elem-attr-probe")]
+#[cfg(feature = "__elem-attr-probe")]
 const ELEM_SRC: &str = "list.map(x, x * 2)";
 
 /// A context binding `list` to `n` integers, as the ladder binds it.
-#[cfg(feature = "elem-attr-probe")]
+#[cfg(feature = "__elem-attr-probe")]
 fn elem_ctx(n: usize) -> Context<'static> {
     let mut ctx = Context::default();
     ctx.add_variable_from_value("list", (0..n as i64).collect::<Vec<i64>>());
@@ -1704,7 +1704,7 @@ fn elem_ctx(n: usize) -> Context<'static> {
 /// lowering change can leave behind, and one already had been -- the body
 /// group was still labelled with the four instructions and six stack
 /// operations it had before its operator absorbed the constant load.
-#[cfg(feature = "elem-attr-probe")]
+#[cfg(feature = "__elem-attr-probe")]
 const ELEM_OPS: [cel::vm::OpCode; 4] = {
     use cel::vm::OpCode;
     [
@@ -1715,7 +1715,7 @@ const ELEM_OPS: [cel::vm::OpCode; 4] = {
     ]
 };
 
-#[cfg(feature = "elem-attr-probe")]
+#[cfg(feature = "__elem-attr-probe")]
 const ELEM_BLOCK: usize = ELEM_OPS.len();
 
 /// What fusing `ELEM_OPS[range]` removes, spelled for the report.
@@ -1723,7 +1723,7 @@ const ELEM_BLOCK: usize = ELEM_OPS.len();
 /// The dispatch count is the number of instructions; the stack counts are the
 /// declared effect of each, which is the same table `Compiler::emit` sizes the
 /// operand stack from. Nothing here is a second opinion about the block.
-#[cfg(feature = "elem-attr-probe")]
+#[cfg(feature = "__elem-attr-probe")]
 fn removed_by(range: std::ops::Range<usize>) -> String {
     let (mut pushes, mut pops) = (0u32, 0u32);
     for op in &ELEM_OPS[range.clone()] {
@@ -1759,7 +1759,7 @@ fn removed_by(range: std::ops::Range<usize>) -> String {
 /// anything. A window here that had drifted from the recogniser's would let
 /// every arm quietly run the stock loop and still agree on the answer, so the
 /// recogniser is the authority and this window is the description of it.
-#[cfg(feature = "elem-attr-probe")]
+#[cfg(feature = "__elem-attr-probe")]
 fn assert_element_block(code: &cel::vm::CelCode) {
     use cel::vm::OpCode;
     let want = ELEM_OPS;
@@ -1785,7 +1785,7 @@ fn assert_element_block(code: &cel::vm::CelCode) {
 /// This is the measurement being attributed, re-taken here rather than quoted,
 /// because everything below is a decomposition OF it and a decomposition of a
 /// number this binary cannot reproduce is a decomposition of nothing.
-#[cfg(feature = "elem-attr-probe")]
+#[cfg(feature = "__elem-attr-probe")]
 fn elem_ladder(cfg: &Config) {
     use cel::vm::{cel_eval_loop_with_fuse, FuseArm};
 
@@ -1847,7 +1847,7 @@ fn elem_ladder(cfg: &Config) {
 }
 
 /// The fusion ladder: what the per-element excess is made of.
-#[cfg(feature = "elem-attr-probe")]
+#[cfg(feature = "__elem-attr-probe")]
 fn elem_fusion(cfg: &Config, n: usize) {
     use cel::vm::{cel_eval_loop_with_fuse, FuseArm};
 
@@ -2102,12 +2102,12 @@ fn elem_fusion(cfg: &Config, n: usize) {
     );
 }
 
-/// Everything behind `elem-attr-probe`.
-#[cfg(feature = "elem-attr-probe")]
+/// Everything behind `__elem-attr-probe`.
+#[cfg(feature = "__elem-attr-probe")]
 fn element_attribution(cfg: &Config) {
     println!();
     println!("===========================================================");
-    println!("=  ELEMENT ATTRIBUTION (feature `elem-attr-probe`)");
+    println!("=  ELEMENT ATTRIBUTION (feature `__elem-attr-probe`)");
     println!("=  Each section sets its OWN floor. Every arm is the same");
     println!("=  dispatch loop taking a different branch, and every arm's");
     println!("=  answer is asserted equal to the stock arm's.");
@@ -2118,13 +2118,13 @@ fn element_attribution(cfg: &Config) {
     }
 }
 
-/// Everything behind `drop-arm-probe`, run inside the bracket the opening and
+/// Everything behind `__drop-arm-probe`, run inside the bracket the opening and
 /// closing null controls form.
-#[cfg(feature = "drop-arm-probe")]
+#[cfg(feature = "__drop-arm-probe")]
 fn probe(cfg: &Config) {
     println!();
     println!("===========================================================");
-    println!("=  PROBE (feature `drop-arm-probe`)");
+    println!("=  PROBE (feature `__drop-arm-probe`)");
     println!("=  Every section below sets its OWN floor from a null");
     println!("=  control on its own arms. The floor printed above was");
     println!("=  measured on an arm costing tens of nanoseconds and does");
@@ -2135,7 +2135,7 @@ fn probe(cfg: &Config) {
 }
 
 // ---------------------------------------------------------------------------
-// The loop-key probe (feature `loop-key-arm-probe`, with a JIT backend)
+// The loop-key probe (feature `__loop-key-arm-probe`, with a JIT backend)
 // ---------------------------------------------------------------------------
 //
 // Task #31. `dc9146c` made the function-entry door's yield probe ask
@@ -2150,7 +2150,7 @@ fn probe(cfg: &Config) {
 // difference is the walk and nothing else.
 
 /// The threshold the tier compiles at, matching `majit_ab`'s board.
-#[cfg(all(feature = "jit", feature = "loop-key-arm-probe"))]
+#[cfg(all(feature = "jit", feature = "__loop-key-arm-probe"))]
 const LOOP_KEY_JIT_ON: u32 = 8;
 
 /// Rows per call.
@@ -2161,7 +2161,7 @@ const LOOP_KEY_JIT_ON: u32 = 8;
 /// answers NO, so `any` walks the whole list instead of short-circuiting on
 /// its first key — which is what makes the per-key divisor below the number of
 /// walks actually performed.
-#[cfg(all(feature = "jit", feature = "loop-key-arm-probe"))]
+#[cfg(all(feature = "jit", feature = "__loop-key-arm-probe"))]
 const LOOP_KEY_ROWS: usize = 1;
 
 /// The columns the lowered program reads.
@@ -2169,14 +2169,14 @@ const LOOP_KEY_ROWS: usize = 1;
 /// Owned by the caller for as long as the program runs: the words carry their
 /// ADDRESSES as seeded registers, so dropping these while a program naming
 /// them is still callable would leave the run reading freed memory.
-#[cfg(all(feature = "jit", feature = "loop-key-arm-probe"))]
+#[cfg(all(feature = "jit", feature = "__loop-key-arm-probe"))]
 struct LoopKeyColumns {
     balance: Vec<i64>,
     amount: Vec<i64>,
     frozen: Vec<i64>,
 }
 
-#[cfg(all(feature = "jit", feature = "loop-key-arm-probe"))]
+#[cfg(all(feature = "jit", feature = "__loop-key-arm-probe"))]
 fn loop_key_columns(n: usize) -> LoopKeyColumns {
     LoopKeyColumns {
         balance: (0..n as i64).map(|i| 100 + i).collect(),
@@ -2287,7 +2287,7 @@ fn loop_key_columns(n: usize) -> LoopKeyColumns {
 /// the entry, then 83.7% of that. Assume the same here until shown otherwise,
 /// and read a large residual as "not yet split", never as "the named stages are
 /// the answer".
-#[cfg(all(feature = "jit", feature = "encode-stage-probe"))]
+#[cfg(all(feature = "jit", feature = "__encode-stage-probe"))]
 fn encode_stage_split(cfg: &Config) {
     use cel::majit::batch::{Batch, BatchProgram, ColumnRef};
     use cel::majit::bytecode::{
@@ -2587,7 +2587,7 @@ fn encode_stage_split(cfg: &Config) {
     }
 }
 
-#[cfg(all(feature = "jit", feature = "loop-key-arm-probe"))]
+#[cfg(all(feature = "jit", feature = "__loop-key-arm-probe"))]
 fn loop_key_program(
     cols: &LoopKeyColumns,
     extra: usize,
@@ -2630,7 +2630,7 @@ fn loop_key_program(
 /// `keys` is read back out of the door rather than passed in, so the divisor
 /// is the number of walks the door performs and not the number a reader of
 /// this file would expect it to.
-#[cfg(all(feature = "jit", feature = "loop-key-arm-probe"))]
+#[cfg(all(feature = "jit", feature = "__loop-key-arm-probe"))]
 fn loop_key_section(cols: &LoopKeyColumns, extra: usize, cfg: &Config) {
     use cel::majit::bytecode::float_bank::{
         jit_stats, loop_key_count, reset_jit_stats, reset_persistent_state,
@@ -2749,7 +2749,7 @@ fn loop_key_section(cols: &LoopKeyColumns, extra: usize, cfg: &Config) {
 /// is `OP_JUMP_IF_ABOVE`, so `loop_keys` is empty and the walk never begins.
 /// The structural claim is that the two arms cannot differ here; the timing is
 /// what says the harness agrees.
-#[cfg(all(feature = "jit", feature = "loop-key-arm-probe"))]
+#[cfg(all(feature = "jit", feature = "__loop-key-arm-probe"))]
 fn loop_key_zero_section(cfg: &Config) {
     use cel::majit::bytecode::float_bank::{
         loop_key_count, reset_jit_stats, reset_persistent_state, run_jit_persistent_probe_f,
@@ -2828,13 +2828,13 @@ fn loop_key_zero_section(cfg: &Config) {
     }
 }
 
-/// Everything behind `loop-key-arm-probe`, run inside the bracket the opening
+/// Everything behind `__loop-key-arm-probe`, run inside the bracket the opening
 /// and closing null controls form.
-#[cfg(all(feature = "jit", feature = "loop-key-arm-probe"))]
+#[cfg(all(feature = "jit", feature = "__loop-key-arm-probe"))]
 fn loop_key_probe(cfg: &Config) {
     println!();
     println!("===========================================================");
-    println!("=  LOOP-KEY PROBE (feature `loop-key-arm-probe`)");
+    println!("=  LOOP-KEY PROBE (feature `__loop-key-arm-probe`)");
     println!("=  One call is one iteration here, so the paired median IS");
     println!("=  a per-call figure. Every section sets its own floor from");
     println!("=  a null control on its own arms.");

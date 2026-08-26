@@ -840,7 +840,7 @@ fn probe_resolved(warm: &WarmEnterState, hash: u64, make: &dyn Fn() -> GreenKey)
 /// equal 16 contributes a key. The function's own doc records one such spurious
 /// match. Quoting a per-call cost without this census would be quoting the
 /// structural loop count, which is a different and smaller number.
-#[cfg(feature = "loop-key-arm-probe")]
+#[cfg(feature = "__loop-key-arm-probe")]
 fn loop_key_census() {
     use cel::majit::batch::BatchProgram;
     use cel::majit::lower::{BatchReduce, Schema, ValType};
@@ -1117,7 +1117,7 @@ fn main() {
         Some(floors),
     );
 
-    #[cfg(feature = "loop-key-arm-probe")]
+    #[cfg(feature = "__loop-key-arm-probe")]
     loop_key_census();
 
     // -- CLOSING NULL CONTROL -----------------------------------------------

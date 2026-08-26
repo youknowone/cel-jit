@@ -109,11 +109,11 @@
 //!
 //! ```text
 //! cargo build --release -p cel \
-//!     --features jit-cranelift,entry-stage-probe --example entryprobe
+//!     --features jit-cranelift,__entry-stage-probe --example entryprobe
 //! target/release/examples/entryprobe
 //! ```
 //!
-//! Without `entry-stage-probe` the file still builds and still reports the
+//! Without `__entry-stage-probe` the file still builds and still reports the
 //! entry whole; it prints which feature the split needs and stops there.
 
 use std::hint::black_box;
@@ -124,14 +124,14 @@ use cel::majit::bytecode::float_bank::{jit_stats, reset_persistent_state};
 use cel::majit::lower::{Schema, ValType};
 use cel::Value;
 
-#[cfg(feature = "entry-stage-probe")]
+#[cfg(feature = "__entry-stage-probe")]
 use cel::majit::bytecode::float_bank::{
     entry_stage_loop_keys, entry_stage_sub_passes, reset_entry_stage_sub_passes,
     set_entry_stage_repeats, EntryStageRepeats,
 };
-#[cfg(feature = "entry-stage-probe")]
+#[cfg(feature = "__entry-stage-probe")]
 use majit_metainterp::{back_edge_stage_passes, set_back_edge_stage_repeats, BackEdgeStageRepeats};
-#[cfg(feature = "entry-stage-probe")]
+#[cfg(feature = "__entry-stage-probe")]
 use majit_metainterp::{
     call_shot_totals, execute_stage_clock_floor_ns, execute_stage_passes, frame_build_passes,
     reset_call_shot_totals, set_execute_stage_repeats, set_frame_build_repeats,
@@ -176,11 +176,11 @@ const SWEEP: [usize; 4] = [1, 2, 3, 4];
 /// The same sweep prices any other per-ARMING cost that leaked into a stage --
 /// a setup, a cold miss, a first-touch fault -- since all of them decay as
 /// `1/count` while the stage itself does not.
-#[cfg(feature = "entry-stage-probe")]
+#[cfg(feature = "__entry-stage-probe")]
 static REPEAT_K: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(32);
 
 /// Extra passes each amplified arm asks for. See [`REPEAT_K`].
-#[cfg(feature = "entry-stage-probe")]
+#[cfg(feature = "__entry-stage-probe")]
 fn repeat() -> u32 {
     REPEAT_K.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -188,7 +188,7 @@ fn repeat() -> u32 {
 /// Entries the single-shot call arm clocks. Higher than the amplified arms
 /// need: each entry contributes ONE reading rather than [`repeat`] of them, so
 /// the averaging an amplified arm gets for free has to be bought here.
-#[cfg(feature = "entry-stage-probe")]
+#[cfg(feature = "__entry-stage-probe")]
 const CALL_SHOTS: usize = 20_000;
 
 /// The amplified arms, in the order [`Split::raw`] holds them: cel's four
@@ -257,7 +257,7 @@ const EXEC_FIRST: usize = 13;
 ///
 /// One type and not two so every arm sets BOTH, and the two setter calls are a
 /// constant every arm pays rather than a difference between them.
-#[cfg(feature = "entry-stage-probe")]
+#[cfg(feature = "__entry-stage-probe")]
 #[derive(Clone, Copy, Default, Debug)]
 struct Repeats {
     cel: EntryStageRepeats,
@@ -270,7 +270,7 @@ struct Repeats {
     frame_build: u32,
 }
 
-#[cfg(feature = "entry-stage-probe")]
+#[cfg(feature = "__entry-stage-probe")]
 fn set_repeats(repeats: Repeats) {
     // All four, on every arm, so the setters are a constant every arm pays
     // rather than a difference between them.
@@ -281,7 +281,7 @@ fn set_repeats(repeats: Repeats) {
 }
 
 /// Which repeat count each arm raises. Index-parallel with [`STAGE_LABELS`].
-#[cfg(feature = "entry-stage-probe")]
+#[cfg(feature = "__entry-stage-probe")]
 const STAGE_ARMS: [fn(&mut Repeats); 17] = [
     |r| r.cel.tls = repeat(),
     |r| r.cel.pool = repeat(),
@@ -377,14 +377,14 @@ fn point(bound: &BoundBatch<'_, '_>, n: usize) -> (usize, f64, f64, f64) {
 /// Nothing is subtracted here: the two barrier arms are returned alongside the
 /// seven stages rather than folded into them, so the report can print what the
 /// amplification itself cost next to what it was used to measure.
-#[cfg(feature = "entry-stage-probe")]
+#[cfg(feature = "__entry-stage-probe")]
 fn arms(bound: &BoundBatch<'_, '_>) -> ([f64; 17], usize, f64, f64, u64) {
     let mut out: Vec<Value> = Vec::new();
     let entered = warm(bound, &mut out);
     // Every arm computes the same answer, and an amplification that broke that
     // would still return `Ok` -- so each arm is checked against the clean tier's
     // answer before any of them is timed. That is the convention
-    // `elem-attr-probe` binds its arms under: an arm that removed work it should
+    // `__elem-attr-probe` binds its arms under: an arm that removed work it should
     // not have is a failure and not a faster number.
     let mut want: Vec<Value> = Vec::new();
     bound
@@ -462,7 +462,7 @@ fn arms(bound: &BoundBatch<'_, '_>) -> ([f64; 17], usize, f64, f64, u64) {
 
 /// Without the feature there are no arms to run, and the file reports the entry
 /// whole rather than pretending to split it.
-#[cfg(not(feature = "entry-stage-probe"))]
+#[cfg(not(feature = "__entry-stage-probe"))]
 fn arms(bound: &BoundBatch<'_, '_>) -> ([f64; 17], usize, f64, f64, u64) {
     let mut out: Vec<Value> = Vec::new();
     let entered = warm(bound, &mut out);
@@ -694,7 +694,7 @@ fn split_elems(label: &'static str, source: &'static str) -> Split {
 /// not yet evidence that any arm was REACHED — a stage figure differenced out
 /// of two arms that ran the same code describes the box and nothing else. This
 /// is that evidence, and it takes a second rather than a sweep.
-#[cfg(feature = "entry-stage-probe")]
+#[cfg(feature = "__entry-stage-probe")]
 fn armcheck() {
     let mut schema = Schema::new();
     schema.insert("x".to_string(), ValType::Int);
@@ -782,9 +782,9 @@ fn armcheck() {
     }
 }
 
-#[cfg(not(feature = "entry-stage-probe"))]
+#[cfg(not(feature = "__entry-stage-probe"))]
 fn armcheck() {
-    println!("armcheck needs `entry-stage-probe`; this binary has no arms to reach.");
+    println!("armcheck needs `__entry-stage-probe`; this binary has no arms to reach.");
 }
 
 /// Every arm must be differenced against an arm that is actually a BARRIER.
@@ -867,12 +867,12 @@ fn main() {
          batch.rs ships JIT_ENTRY_PS = {JIT_ENTRY_PS} ps.",
         MIN_BATCH.as_millis()
     );
-    #[cfg(not(feature = "entry-stage-probe"))]
+    #[cfg(not(feature = "__entry-stage-probe"))]
     println!(
-        "\n⚠ built WITHOUT `entry-stage-probe`: the entry is reported whole and every stage\n\
-         \x20 reads NaN. Rebuild with --features jit-cranelift,entry-stage-probe for the split."
+        "\n⚠ built WITHOUT `__entry-stage-probe`: the entry is reported whole and every stage\n\
+         \x20 reads NaN. Rebuild with --features jit-cranelift,__entry-stage-probe for the split."
     );
-    #[cfg(feature = "entry-stage-probe")]
+    #[cfg(feature = "__entry-stage-probe")]
     {
         let k = repeat();
         println!("each stage repeated {k} extra times per call; delta / {k} is the stage.");
@@ -1093,13 +1093,13 @@ fn main() {
              \x20 clock pair's residue and is an UPPER bound. Do not read the three as one column."
         );
     }
-    #[cfg(feature = "entry-stage-probe")]
+    #[cfg(feature = "__entry-stage-probe")]
     println!(
         "    passes reached: exec {:?}, frame builds {}",
         execute_stage_passes(),
         frame_build_passes()
     );
-    #[cfg(feature = "entry-stage-probe")]
+    #[cfg(feature = "__entry-stage-probe")]
     println!(
         "    amplified passes reached, [gate, in, out, barrier]: {:?}",
         back_edge_stage_passes()

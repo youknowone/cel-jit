@@ -21,7 +21,7 @@
 //!
 //! # Two arms, one binary
 //!
-//! `drop-arm-probe`, `loop-key-arm-probe` and `entry-stage-probe` all exist
+//! `__drop-arm-probe`, `__loop-key-arm-probe` and `__entry-stage-probe` all exist
 //! because two `cargo build` invocations cannot answer what one lowering costs
 //! against another: they admit compile drift and stale binaries, and neither is
 //! visible in the numbers they produce. The arm here is the same shape, one
@@ -151,7 +151,7 @@ fn point(bound: &BoundBatch<'_, '_>, n: usize) -> (usize, f64, f64, f64, f64) {
     // stopped clearing it would still return `Ok` — and would return the last
     // entry's `jf_descr` to a guard that reads it. Both arms are checked
     // against the clean tier's answer before either is timed, which is the
-    // convention `entryprobe::arms` and `elem-attr-probe` bind their arms under.
+    // convention `entryprobe::arms` and `__elem-attr-probe` bind their arms under.
     let mut want: Vec<Value> = Vec::new();
     bound
         .collect_into_on(Tier::Clean, &mut want)
