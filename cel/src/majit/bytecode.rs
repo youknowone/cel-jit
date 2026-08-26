@@ -402,40 +402,82 @@ impl<'s> StrDict<'s> {
         out.into_iter().map(|(_, s)| s).collect()
     }
 
-    /// Rank `strings`, which must include every string the batch will ask for.
+    /// Rank every string the batch can be asked about — the `Column::Str`
+    /// values and the expression's own literals — and encode each string column
+    /// into the ids the machine runs on.
     ///
-    /// `ordered` is the program's [`super::lower::LoweredF::orders_strings`]:
-    /// pass it, do not guess it. Passing `true` when the program never orders
-    /// is only slow; passing `false` when it does is a WRONG ANSWER, because
-    /// the ordering lowered to a signed compare of the ids.
-    fn build(strings: impl Iterator<Item = &'s str>, ordered: bool) -> Self {
+    /// One call rather than a build and then an encode, because the UNORDERED
+    /// arm can do both in a single pass over the rows: a string's id is known
+    /// the moment it is first seen, so the same lookup that files it also
+    /// writes it. An ordered assignment cannot — no string has an id until
+    /// every string has been seen and sorted — so that arm still reads the rows
+    /// twice, and one shape covering both is what keeps the two from being
+    /// spelled differently at the two call sites.
+    ///
+    /// `ordered` is [`super::lower::LoweredF::needs_ordered_str_ids`]: pass it,
+    /// do not guess it. Passing `true` when the program never orders is only
+    /// slow; passing `false` when it does is a WRONG ANSWER, because the
+    /// ordering lowered to a signed compare of the two ids.
+    fn build_columns(
+        columns: &'s [Column<'s>],
+        seeds: impl Iterator<Item = &'s str>,
+        ordered: bool,
+    ) -> (Self, Vec<Box<[i64]>>) {
+        let str_cols = || {
+            columns.iter().filter_map(|c| match c {
+                Column::Str(s) => Some(*s),
+                _ => None,
+            })
+        };
+        // One entry per input string. Exact where the batch's values are
+        // distinct, which is where the table would otherwise grow through every
+        // power of two on the way up; an over-reserve bounded by the input
+        // where they are not, which measured as no slower and is smaller than
+        // the `Vec<String>` it is reading.
+        let capacity = str_cols().map(<[String]>::len).sum::<usize>();
         if !ordered {
-            // Ids in arrival order. One hash per string and one table, against
-            // the ordered arm's two tables and a sort — and the assignment is
-            // still injective, which is all `==` and `!=` read.
             let mut rank: std::collections::HashMap<&'s str, i64> =
-                std::collections::HashMap::new();
-            for s in strings {
+                std::collections::HashMap::with_capacity(capacity);
+            let mut ids = Vec::with_capacity(str_cols().count());
+            for col in str_cols() {
+                let mut out: Vec<i64> = Vec::with_capacity(col.len());
+                for s in col {
+                    let next = rank.len() as i64;
+                    out.push(*rank.entry(s.as_str()).or_insert(next));
+                }
+                ids.push(out.into_boxed_slice());
+            }
+            // After the columns, so a literal the columns already carry keeps
+            // the id its rows gave it. Which of the two files it first cannot
+            // matter — the assignment is injective either way — but ranking the
+            // seeds first would push every column's ids up by the number of
+            // literals, for no reason a reader could see.
+            for s in seeds {
                 let next = rank.len() as i64;
                 rank.entry(s).or_insert(next);
             }
-            return StrDict { rank };
+            return (StrDict { rank }, ids);
         }
         // Dedup BEFORE sorting, so the sort is over the DISTINCT set rather
         // than the rows. That is the whole of the saving where a batch is many
         // rows over few values; where the values are mostly distinct there is
         // nothing to dedup and the sort is the encoding's largest single cost,
         // which is what the arm above exists to skip.
-        let distinct: std::collections::HashSet<&'s str> = strings.collect();
+        let mut distinct: std::collections::HashSet<&'s str> =
+            std::collections::HashSet::with_capacity(capacity);
+        distinct.extend(str_cols().flatten().map(String::as_str));
+        distinct.extend(seeds);
         let mut distinct: Vec<&'s str> = distinct.into_iter().collect();
         distinct.sort_unstable();
-        StrDict {
+        let dict = StrDict {
             rank: distinct
                 .into_iter()
                 .enumerate()
                 .map(|(k, s)| (s, k as i64))
                 .collect(),
-        }
+        };
+        let ids = str_cols().map(|c| dict.encode(c)).collect();
+        (dict, ids)
     }
 
     /// The id of a string that was in the build set.
@@ -637,12 +679,16 @@ pub struct EncodeStageRepeats {
     /// encode half, then again as the assert here -- so this stage priced at
     /// `k` describes ONE of the two.
     pub temporal: u32,
-    /// Extra `StrDict::build` calls over the same string set.
+    /// Extra `StrDict::build_columns` calls over the same columns.
     ///
     /// The stage this probe exists to settle. It runs UNCONDITIONALLY, with no
     /// guard on whether the batch carries a `Column::Str` or the expression a
     /// `SeedKind::StrId`, so a scalar activation with no strings anywhere still
-    /// pays whatever it costs on an empty iterator.
+    /// pays whatever it costs with nothing to rank.
+    ///
+    /// It covers the id COLUMNS as well as the table, because the two are one
+    /// pass where the ids need no order — there is no separate encode stage
+    /// left to amplify on that arm.
     pub strdict: u32,
     /// Extra `bases` vectors: one `i64` per column, read back out of the
     /// caller's buffers and the materialized id columns.
@@ -796,47 +842,29 @@ pub fn prepare_batch_reduce<'a>(
     // mutates.
     #[cfg(feature = "encode-stage-probe")]
     for _ in 0..repeats.strdict {
-        std::hint::black_box(StrDict::build(
-            columns
-                .iter()
-                .filter_map(|c| match c {
-                    Column::Str(s) => Some(s.iter().map(String::as_str)),
-                    _ => None,
-                })
-                .flatten()
-                .chain(lowered.scalar_seeds.iter().filter_map(|s| match &s.kind {
-                    super::lower::SeedKind::StrId(t) => Some(t.as_str()),
-                    super::lower::SeedKind::StrPredicate(_) => None,
-                })),
+        std::hint::black_box(StrDict::build_columns(
+            columns,
+            lowered.scalar_seeds.iter().filter_map(|s| match &s.kind {
+                super::lower::SeedKind::StrId(t) => Some(t.as_str()),
+                super::lower::SeedKind::StrPredicate(_) => None,
+            }),
             lowered.needs_ordered_str_ids(),
         ));
     }
     // Rank every string this batch can be asked about — the column values and
-    // the expression's literals together — so all of them share one order.
-    let dict = StrDict::build(
-        columns
-            .iter()
-            .filter_map(|c| match c {
-                Column::Str(s) => Some(s.iter().map(String::as_str)),
-                _ => None,
-            })
-            .flatten()
-            // An id seed is compared against column ids, so it must share their
-            // order. A PREDICATE's argument is not — it is never an id — so it
-            // stays out of the dictionary.
-            .chain(lowered.scalar_seeds.iter().filter_map(|s| match &s.kind {
-                super::lower::SeedKind::StrId(t) => Some(t.as_str()),
-                super::lower::SeedKind::StrPredicate(_) => None,
-            })),
+    // the expression's literals together — so all of them share one assignment,
+    // and encode the columns in the same call.
+    let (dict, str_ids) = StrDict::build_columns(
+        columns,
+        // An id seed is compared against column ids, so it must share their
+        // assignment. A PREDICATE's argument is not — it is never an id — so it
+        // stays out of the dictionary.
+        lowered.scalar_seeds.iter().filter_map(|s| match &s.kind {
+            super::lower::SeedKind::StrId(t) => Some(t.as_str()),
+            super::lower::SeedKind::StrPredicate(_) => None,
+        }),
         lowered.needs_ordered_str_ids(),
     );
-    let str_ids: Vec<Box<[i64]>> = columns
-        .iter()
-        .filter_map(|c| match c {
-            Column::Str(s) => Some(dict.encode(s)),
-            _ => None,
-        })
-        .collect();
     // `bases` reads the id columns positionally, so an amplified pass needs its
     // own cursor rather than sharing the real one.
     #[cfg(feature = "encode-stage-probe")]
