@@ -372,24 +372,30 @@ impl Column<'_> {
     }
 }
 
-/// A batch's strings encoded as **order-preserving** `i64` ids: id `k` is the
-/// `k`-th smallest distinct string in the batch.
+/// A batch's strings encoded as `i64` ids, injective by construction — so
+/// unlike a content hash there is no collision to check for and no
+/// data-dependent bail.
 ///
-/// This is ordinary dictionary encoding, and it is what makes an id compare a
-/// content compare for ORDERING and not only for equality — a content hash
-/// could do equality but had no order to read, which is why string `<` used to
-/// bail. It is also injective by construction, so unlike a hash there is no
-/// collision to check for and no data-dependent bail.
+/// The ids are **order-preserving** — id `k` is the `k`-th smallest distinct
+/// string — only when the program asks for it ([`super::lower::LoweredF::orders_strings`]).
+/// That is what makes an id compare a content compare for ORDERING and not only
+/// for equality, and it is why string `<` no longer bails. It is not free:
+/// ordering the ids means sorting the distinct set at every bind, which is
+/// `O(d log d)` STRING comparisons — and a batch whose values are mostly
+/// distinct has `d ≈ rows`, where that sort is over half the encoding's cost.
+/// Equality reads no order, so a program that only compares strings for `==`
+/// and `!=` takes ids in arrival order and pays none of it.
 ///
 /// Built over every string the batch carries AND every literal the expression
-/// mentions, so column-vs-column and column-vs-literal share one order.
+/// mentions, so column-vs-column and column-vs-literal share one assignment.
 struct StrDict<'s> {
     rank: std::collections::HashMap<&'s str, i64>,
 }
 
 impl<'s> StrDict<'s> {
     /// The distinct strings in id order, which is what a predicate table is
-    /// indexed by.
+    /// indexed by. In ID order and not in lexicographic order: the two coincide
+    /// only on the ordered arm, and both consumers index by id.
     fn sorted(&self) -> Vec<&'s str> {
         let mut out: Vec<(i64, &'s str)> = self.rank.iter().map(|(s, &k)| (k, *s)).collect();
         out.sort_unstable();
@@ -397,11 +403,29 @@ impl<'s> StrDict<'s> {
     }
 
     /// Rank `strings`, which must include every string the batch will ask for.
-    fn build(strings: impl Iterator<Item = &'s str>) -> Self {
-        // Dedup BEFORE sorting. A batch is millions of rows over a handful of
-        // distinct values, so the sort is over the distinct set and the
-        // per-row cost stays one hash lookup, the same order as the content
-        // hashing this replaced.
+    ///
+    /// `ordered` is the program's [`super::lower::LoweredF::orders_strings`]:
+    /// pass it, do not guess it. Passing `true` when the program never orders
+    /// is only slow; passing `false` when it does is a WRONG ANSWER, because
+    /// the ordering lowered to a signed compare of the ids.
+    fn build(strings: impl Iterator<Item = &'s str>, ordered: bool) -> Self {
+        if !ordered {
+            // Ids in arrival order. One hash per string and one table, against
+            // the ordered arm's two tables and a sort — and the assignment is
+            // still injective, which is all `==` and `!=` read.
+            let mut rank: std::collections::HashMap<&'s str, i64> =
+                std::collections::HashMap::new();
+            for s in strings {
+                let next = rank.len() as i64;
+                rank.entry(s).or_insert(next);
+            }
+            return StrDict { rank };
+        }
+        // Dedup BEFORE sorting, so the sort is over the DISTINCT set rather
+        // than the rows. That is the whole of the saving where a batch is many
+        // rows over few values; where the values are mostly distinct there is
+        // nothing to dedup and the sort is the encoding's largest single cost,
+        // which is what the arm above exists to skip.
         let distinct: std::collections::HashSet<&'s str> = strings.collect();
         let mut distinct: Vec<&'s str> = distinct.into_iter().collect();
         distinct.sort_unstable();
@@ -784,6 +808,7 @@ pub fn prepare_batch_reduce<'a>(
                     super::lower::SeedKind::StrId(t) => Some(t.as_str()),
                     super::lower::SeedKind::StrPredicate(_) => None,
                 })),
+            lowered.needs_ordered_str_ids(),
         ));
     }
     // Rank every string this batch can be asked about — the column values and
@@ -803,6 +828,7 @@ pub fn prepare_batch_reduce<'a>(
                 super::lower::SeedKind::StrId(t) => Some(t.as_str()),
                 super::lower::SeedKind::StrPredicate(_) => None,
             })),
+        lowered.needs_ordered_str_ids(),
     );
     let str_ids: Vec<Box<[i64]>> = columns
         .iter()
@@ -951,12 +977,11 @@ pub fn prepare_batch_reduce<'a>(
     // order they were ranked in. A COLLECTED list stores them just the same, and
     // its bank is on the output's fields rather than on the row result — which
     // is an int count whatever the elements are.
-    let str_result = lowered.result_bank == super::lower::ValType::Str
-        || lowered.list_output.as_ref().is_some_and(|o| {
-            o.fields
-                .iter()
-                .any(|(_, t)| *t == super::lower::ValType::Str)
-        });
+    // The same predicate `needs_ordered_str_ids` consulted when the dictionary
+    // was built, asked through the same accessor: this table is what makes the
+    // promise that the ids in it are comparable, so a second spelling here
+    // could order the ids and then hand back a table built on the other rule.
+    let str_result = lowered.has_string_result();
     let distinct: Vec<String> = match (reduce, str_result) {
         (BatchReduce::PerRow, true) => distinct
             .get_or_insert_with(|| dict.sorted())

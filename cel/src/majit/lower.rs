@@ -438,6 +438,19 @@ pub struct LoweredF {
     /// With the usual single operation the bound is ±146 years around the
     /// epoch.
     pub temporal_bound: Option<i64>,
+    /// Set when the body ORDERS two strings (`<`, `<=`, `>`, `>=`).
+    ///
+    /// A string is its rank among the batch's distinct strings, so an ordering
+    /// is only the signed int compare because the ranks are assigned in
+    /// lexicographic order — which costs a sort over the distinct set at every
+    /// bind. Equality does not read that order at all: any injective
+    /// assignment answers `==` and `!=` identically.
+    ///
+    /// Recorded where the ordering is EMITTED, so it cannot disagree with the
+    /// body it describes. It is the body's half of the question and not the
+    /// answer — ask [`LoweredF::needs_ordered_str_ids`], which also accounts
+    /// for a result the caller reads ids back out of.
+    pub orders_strings: bool,
     /// Positions **within [`LoweredF::body`]** of jump target words, which the
     /// lowering writes body-relative because it cannot know where the body
     /// lands. [`LoweredF::batch_sum_shape`] relocates each to an
@@ -688,6 +701,33 @@ impl BatchSeed {
 }
 
 impl LoweredF {
+    /// Whether a RESULT of this program is a string: the scalar result itself,
+    /// or any field of a collected list. Such a result leaves the machine as an
+    /// id, so the caller is handed the id table to read it back with.
+    pub fn has_string_result(&self) -> bool {
+        self.result_bank == ValType::Str
+            || self
+                .list_output
+                .as_ref()
+                .is_some_and(|o| o.fields.iter().any(|(_, t)| *t == ValType::Str))
+    }
+
+    /// Whether this program's batch must assign string ids in LEXICOGRAPHIC
+    /// order, rather than in whatever order the strings arrive.
+    ///
+    /// Two things read the order, and skipping the sort for one while the other
+    /// needs it is a silent wrong answer, so they are answered here together
+    /// rather than at each use:
+    ///
+    /// * an ordering in the BODY ([`LoweredF::orders_strings`]), which lowered
+    ///   to a signed compare of the two ids; and
+    /// * a string RESULT, because `RawOutput::Scalar` hands the caller the ids
+    ///   themselves alongside the table, and promises that comparing them
+    ///   compares the strings.
+    pub fn needs_ordered_str_ids(&self) -> bool {
+        self.orders_strings || self.has_string_result()
+    }
+
     /// Whether the row body iterates elements: a comprehension, a chain of
     /// them, or a runtime `in` over a list column. False for the straight-line
     /// shapes — arithmetic, comparison, a ternary, a member read, a constant
@@ -1281,6 +1321,9 @@ struct LowerCtxF<'s> {
     /// Folded `timestamp(...)` / `duration(...)` constants, which are operands
     /// too and so must satisfy the same bound the columns do.
     temporal_consts: Vec<i64>,
+    /// Set when the body ORDERS two strings, which is the only thing that reads
+    /// the dictionary's order rather than only its injectivity.
+    orders_strings: bool,
     /// Derived concatenation columns, in the order the batch builder must
     /// materialize them.
     concats: Vec<ConcatSpec>,
@@ -1543,6 +1586,7 @@ pub fn lower_typed(expr: &IdedExpr, schema: &Schema) -> Result<LoweredF, LowerEr
         scalar_seeds: Vec::new(),
         temporal_ops: 0,
         temporal_consts: Vec::new(),
+        orders_strings: false,
         concats: Vec::new(),
         elem_map: HashMap::new(),
         list_loop: Vec::new(),
@@ -1597,6 +1641,7 @@ pub fn lower_typed(expr: &IdedExpr, schema: &Schema) -> Result<LoweredF, LowerEr
         concats: ctx.concats,
         list_output: ctx.list_output,
         temporal_bound,
+        orders_strings: ctx.orders_strings,
         jump_fixups: ctx.jump_fixups,
         shapes: std::array::from_fn(|_| std::sync::OnceLock::new()),
     })
@@ -2785,6 +2830,12 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
             a.bank,
             ValType::Str | ValType::Timestamp | ValType::Duration
         ) {
+            // Recorded here rather than by re-walking the AST: this is the one
+            // site that turns a string ordering into an int compare, so the
+            // flag and the op it describes are emitted together.
+            if a.bank == ValType::Str && !matches!(name, ops::EQUALS | ops::NOT_EQUALS) {
+                ctx.orders_strings = true;
+            }
             return Ok(emit_bin(ctx, iop, a, b, ValType::Bool));
         }
         // One int and one uint operand: compare NUMERICALLY, which is neither
@@ -3741,6 +3792,7 @@ fn probe_ctx<'a>(ctx: &LowerCtxF<'a>) -> LowerCtxF<'a> {
         scalar_seeds: Vec::new(),
         temporal_ops: 0,
         temporal_consts: Vec::new(),
+        orders_strings: false,
         concats: Vec::new(),
         elem_map: HashMap::new(),
         list_loop: Vec::new(),
