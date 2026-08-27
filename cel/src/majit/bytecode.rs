@@ -1889,6 +1889,27 @@ pub mod float_bank {
                 )
             })
         }
+
+        /// The typed key these greens build, for the bucket walk that needs it.
+        fn green_key(&self) -> majit_ir::GreenKey {
+            majit_ir::GreenKey::with_types(
+                self.slots.iter().map(|slot| slot.0).collect(),
+                self.slots.iter().map(|slot| slot.1).collect(),
+            )
+        }
+
+        /// [`Self::resolve`] and the resolved cell's runnable token, from ONE
+        /// bucket walk.
+        ///
+        /// Both doors below want the pair, and asking for it in two steps walks
+        /// the chain twice for the same cell: once to name it and once to read
+        /// its token. The answer is the same either way.
+        fn resolve_runnable(
+            &self,
+            driver: &majit_metainterp::JitDriver<VmStateF>,
+        ) -> (u64, Option<std::sync::Arc<majit_metainterp::JitCellToken>>) {
+            driver.resolved_runnable_procedure_token(self.hash, || self.green_key())
+        }
     }
 
     /// Which key form the yield probe in [`try_function_entry_jit_f`] asks on.
@@ -2117,15 +2138,25 @@ pub mod float_bank {
         // neither the branch nor the read.
         #[cfg(feature = "__loop-key-arm-probe")]
         let arm = LOOP_KEY_ARM.with(core::cell::Cell::get);
+        //
+        // One walk per key, not two. The resolve and the token read the
+        // predicate is made of are about the same cell, and asking for them in
+        // two steps walked the bucket once for each; `resolve_runnable` reads
+        // the token off the cell the walk already found. Both probe arms carry
+        // the same fusion, so what the probe prices stays the resolution
+        // itself rather than a walk one arm pays and the other does not.
         if pooled.loop_keys.iter().any(|key| {
             #[cfg(feature = "__loop-key-arm-probe")]
-            let probe = match arm {
-                LoopKeyArm::BareHash => key.hash,
-                LoopKeyArm::Resolved => key.resolve(driver),
-            };
+            {
+                match arm {
+                    LoopKeyArm::BareHash => driver.has_runnable_compiled_loop(key.hash),
+                    LoopKeyArm::Resolved => key.resolve_runnable(driver).1.is_some(),
+                }
+            }
             #[cfg(not(feature = "__loop-key-arm-probe"))]
-            let probe = key.resolve(driver);
-            driver.has_runnable_compiled_loop(probe)
+            {
+                key.resolve_runnable(driver).1.is_some()
+            }
         }) {
             return None;
         }
@@ -2141,7 +2172,11 @@ pub mod float_bank {
         // the bare hash on, which was two resolutions per warm call and, on a
         // chained bucket, a decision about one cell followed by a run keyed
         // through another.
-        let entry_key = pooled.entry_key.resolve(driver);
+        //
+        // Resolved together with the token below, from one walk: the cell the
+        // greens own and the code that cell holds are one question asked in two
+        // halves, and each half used to walk the bucket for itself.
+        let (entry_key, entry_token) = pooled.entry_key.resolve_runnable(driver);
         // The token IS the decision — `Some` is the runnable-compiled-loop
         // answer this branch used to ask for as a predicate, and it is the same
         // object the run below enters, so nothing between the two can make them
@@ -2158,7 +2193,7 @@ pub mod float_bank {
         // CALL_ASSEMBLER token today — tmp callbacks come from recursive calls
         // this VM has no opcode for — so this is defense, not a live crash
         // being fixed.
-        if let Some(procedure_token) = driver.runnable_procedure_token(entry_key) {
+        if let Some(procedure_token) = entry_token {
             // The same run the row loop's back edge reaches, so entry, guard
             // failure, blackhole resume and bridge start are all handled the one
             // way — only reached with the cell and its token already in hand
@@ -3285,10 +3320,14 @@ pub mod float_bank {
             if repeats.loop_keys != 0 {
                 ENTRY_STAGE_LOOP_KEYS.with(|slot| slot.set(pooled_program.loop_keys.len()));
                 for _ in 0..repeats.loop_keys {
-                    let yielded = pooled_program.loop_keys.iter().any(|key| {
-                        let probe = key.resolve(driver);
-                        driver.has_runnable_compiled_loop(probe)
-                    });
+                    // The shipping predicate verbatim. It used to be spelled
+                    // here as a resolve followed by a separate token read, and
+                    // stayed that way after the door fused the two, which left
+                    // this arm pricing a walk the door no longer pays.
+                    let yielded = pooled_program
+                        .loop_keys
+                        .iter()
+                        .any(|key| key.resolve_runnable(driver).1.is_some());
                     // Reading the answer is what keeps the walk, and the
                     // barrier inside that read is what stops the next pass
                     // reusing this one's bucket loads.
