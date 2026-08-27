@@ -230,7 +230,7 @@ const MAJIT_FIRST: usize = 9;
 /// UNGATED, like every other index constant here, because the report reads
 /// these arms from code that the probe feature does not gate. Gating the
 /// definition while the uses stay open builds only under
-/// `entry-stage-probe` -- the one configuration that hides it.
+/// `__entry-stage-probe` -- the one configuration that hides it.
 const D_SUB: std::ops::Range<usize> = 4..8;
 /// D itself, which its sub-arms follow immediately.
 const D_IDX: usize = D_SUB.start - 1;
@@ -840,7 +840,7 @@ fn check_barrier_wiring() {
 
 fn main() {
     check_barrier_wiring();
-    #[cfg(feature = "entry-stage-probe")]
+    #[cfg(feature = "__entry-stage-probe")]
     {
         if let Ok(raw) = std::env::var("ENTRYPROBE_REPEAT") {
             let k: u32 = raw
@@ -1202,9 +1202,9 @@ fn main() {
     );
     // Cumulative over every call this process made, which is the right
     // denominator: the claim is about the corpus, not about one shape.
-    #[cfg(feature = "entry-stage-probe")]
+    #[cfg(feature = "__entry-stage-probe")]
     let chained = entry_stage_sub_passes()[4];
-    #[cfg(not(feature = "entry-stage-probe"))]
+    #[cfg(not(feature = "__entry-stage-probe"))]
     let chained = 0u64;
     println!(
         "      chained buckets: {chained}  (resolve(driver) != key.hash).  ZERO is what licenses\n      \
