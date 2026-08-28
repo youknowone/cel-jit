@@ -2145,19 +2145,33 @@ pub mod float_bank {
         // the token off the cell the walk already found. Both probe arms carry
         // the same fusion, so what the probe prices stays the resolution
         // itself rather than a walk one arm pays and the other does not.
-        if pooled.loop_keys.iter().any(|key| {
-            #[cfg(feature = "__loop-key-arm-probe")]
-            {
-                match arm {
-                    LoopKeyArm::BareHash => driver.has_runnable_compiled_loop(key.hash),
-                    LoopKeyArm::Resolved => key.resolve_runnable(driver).1.is_some(),
+        #[cfg(feature = "__loop-key-arm-probe")]
+        let sibling_runnable = pooled.loop_keys.iter().any(|key| match arm {
+            LoopKeyArm::BareHash => driver.has_runnable_compiled_loop(key.hash),
+            LoopKeyArm::Resolved => key.resolve_runnable(driver).1.is_some(),
+        });
+        // Walked once per change, not once per call. The answer is a property
+        // of which cells hold runnable code, and `runnable_generation` moves
+        // at every event that can alter that — a compile, an invalidation, a
+        // cell dropped or filed, a token let go — so a call that reads the
+        // same number the last scan read gets the last scan's answer. The
+        // probe arm above keeps walking, since the walk is what it prices.
+        #[cfg(not(feature = "__loop-key-arm-probe"))]
+        let sibling_runnable = {
+            let generation = driver.runnable_generation();
+            match pooled.sibling_runnable.get() {
+                Some((seen, answer)) if seen == generation => answer,
+                _ => {
+                    let answer = pooled
+                        .loop_keys
+                        .iter()
+                        .any(|key| key.resolve_runnable(driver).1.is_some());
+                    pooled.sibling_runnable.set(Some((generation, answer)));
+                    answer
                 }
             }
-            #[cfg(not(feature = "__loop-key-arm-probe"))]
-            {
-                key.resolve_runnable(driver).1.is_some()
-            }
-        }) {
+        };
+        if sibling_runnable {
             return None;
         }
         // Read, not recomputed: the key is `green_key_at(program, ENTRY_PC)`,
@@ -2841,6 +2855,13 @@ pub mod float_bank {
         /// files under. The hash folds the program POINTER, so it is a property
         /// of this pinned address and not of the words alone.
         entry_key: PooledGreenKey,
+        /// The yield scan's last answer — whether any of `loop_keys` had
+        /// runnable code — with the driver's `runnable_generation` it was
+        /// taken at. The scan walks one cell chain per loop key on every call,
+        /// and its answer changes only at the events that generation counts,
+        /// so a call that finds the generation unchanged reads this instead.
+        /// `None` until the first scan.
+        sibling_runnable: core::cell::Cell<Option<(u64, bool)>>,
     }
 
     impl PooledProgram {
@@ -2849,6 +2870,7 @@ pub mod float_bank {
                 words: std::sync::Arc::clone(program),
                 loop_keys: loop_header_keys(program),
                 entry_key: green_key_at(program, ENTRY_PC),
+                sibling_runnable: core::cell::Cell::new(None),
             }
         }
     }
