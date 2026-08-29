@@ -490,6 +490,9 @@ pub struct LoweredF {
     /// initializers agree because only one wins and the loser's words are
     /// dropped before anyone can key on them.
     shapes: [std::sync::OnceLock<BatchShape>; 4],
+    /// The one-row shape ([`LoweredF::single_row_shape`]), memoized like the
+    /// four above and for the same reason.
+    single_row: std::sync::OnceLock<Option<BatchShape>>,
 }
 
 /// Index of the memo slot for one `(with_trap, reduce)` pair.
@@ -919,13 +922,45 @@ impl LoweredF {
     /// to batch. See [`LoweredF::shapes`].
     pub fn batch_shape(&self, with_trap: bool, reduce: BatchReduce) -> &BatchShape {
         self.shapes[shape_slot(with_trap, reduce)]
-            .get_or_init(|| self.build_batch_shape(with_trap, reduce))
+            .get_or_init(|| self.build_batch_shape(with_trap, reduce, false))
+    }
+
+    /// The per-row program for a batch of exactly ONE row, with the trap
+    /// published: the same prelude, column reads, body and output store as
+    /// [`LoweredF::batch_shape`]`(true, PerRow)`, without the loop around
+    /// them — no induction variables to step, no back-edge to test, no
+    /// accumulator to clear. Same seed protocol, same registers by role, so a
+    /// caller seeds it exactly as it seeds the loop shape.
+    ///
+    /// The clean tier runs it when the batch it was bound to has one row; the
+    /// tracing tiers keep the loop, which is the shape their compiled code and
+    /// entry door are keyed on. `None` for a program the straight-line form
+    /// cannot express: a list-valued result, whose elements stream through a
+    /// cursor the loop owns, or an element slot, whose reads live inside an
+    /// inner loop the body carries.
+    pub fn single_row_shape(&self) -> Option<&BatchShape> {
+        self.single_row
+            .get_or_init(|| {
+                let expressible = self.list_output.is_none()
+                    && self.slots.iter().all(|s| s.kind == SlotKind::Row);
+                expressible.then(|| self.build_batch_shape(true, BatchReduce::PerRow, true))
+            })
+            .as_ref()
     }
 
     /// [`LoweredF::batch_shape`]'s builder. Split out so the memo above holds
     /// the only call: a second caller would mint a second address for one
     /// program, which is the defect the memo exists to prevent.
-    fn build_batch_shape(&self, with_trap: bool, reduce: BatchReduce) -> BatchShape {
+    fn build_batch_shape(
+        &self,
+        with_trap: bool,
+        reduce: BatchReduce,
+        single_row: bool,
+    ) -> BatchShape {
+        debug_assert!(
+            !single_row || (with_trap && reduce == BatchReduce::PerRow),
+            "the one-row shape is a per-row program with its trap published"
+        );
         // The accumulate below would fold a result the sum cannot consume into
         // the int total — adding string RANKS, nanoseconds, or a collected
         // list's element COUNT. Every public door asks `sum_reducible` first;
@@ -993,6 +1028,8 @@ impl LoweredF {
             }
             // A `PerRow` loop carries no accumulator, but zeroing `r_acc` costs
             // one setup instruction and leaves the bank in one known state.
+            // The one-row form has no loop to keep a state for, and skips it.
+            _ if single_row => {}
             _ => load_const(&mut p, 0, r_acc),
         }
         // Overflow trap: the flag starts clear. Where it is published is data,
@@ -1074,11 +1111,15 @@ impl LoweredF {
             ],
         };
         p.extend_from_slice(&tail);
-        p.extend_from_slice(&[OP_ADD_IMM, r_i as i64, 1, r_i as i64]);
-        if needs_ea {
-            p.extend_from_slice(&[OP_ADD_IMM, r_ea as i64, 8, r_ea as i64]);
+        // The one row was read and its result stored at offset zero; there is
+        // no next row to step to and no back-edge to take.
+        if !single_row {
+            p.extend_from_slice(&[OP_ADD_IMM, r_i as i64, 1, r_i as i64]);
+            if needs_ea {
+                p.extend_from_slice(&[OP_ADD_IMM, r_ea as i64, 8, r_ea as i64]);
+            }
+            p.extend_from_slice(&[OP_JUMP_IF_ABOVE, r_n as i64, r_i as i64, body_pc as i64]);
         }
-        p.extend_from_slice(&[OP_JUMP_IF_ABOVE, r_n as i64, r_i as i64, body_pc as i64]);
         // Publish the overflow flag. Outside the loop, so it costs the traced
         // body nothing and runs once when the back-edge guard finally exits.
         if with_trap {
@@ -1089,6 +1130,9 @@ impl LoweredF {
         match (reduce, self.result_bank) {
             (BatchReduce::Sum, ValType::Float) => p.extend_from_slice(&[OP_RETURN_F, f_acc as i64]),
             (BatchReduce::Sum, _) => p.extend_from_slice(&[OP_RETURN, r_acc as i64]),
+            // The one-row form never stepped `r_i`; the count it wrote is the
+            // seeded row count, which is what the loop's `r_i` ends at.
+            (BatchReduce::PerRow, _) if single_row => p.extend_from_slice(&[OP_RETURN, r_n as i64]),
             (BatchReduce::PerRow, _) => p.extend_from_slice(&[OP_RETURN, r_i as i64]),
         }
         // Only a per-row run writes elements; a sum never reaches them.
@@ -1711,6 +1755,7 @@ pub fn lower_typed_in(
         orders_strings: ctx.orders_strings,
         jump_fixups: ctx.jump_fixups,
         shapes: std::array::from_fn(|_| std::sync::OnceLock::new()),
+        single_row: std::sync::OnceLock::new(),
     })
 }
 

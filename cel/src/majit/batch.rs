@@ -1256,7 +1256,16 @@ impl BoundBatch<'_, '_> {
         // The bind-time flag is asked first so that a program which is NOT a
         // projection — every other case on this door — pays one bool test and
         // not a call that would answer the same thing.
-        if !(tier == Tier::Clean && self.projected && run.project()) {
+        if tier == Tier::Clean && self.projected && run.project() {
+            // Answered at bind.
+        } else if tier == Tier::Clean && run.has_single_row() {
+            // One row: the straight-line form, on the clean tier only — the
+            // tracing tiers stay on the loop their compiled code is keyed on.
+            run.run_single_row(|code, regs, _, banks, check| {
+                float_bank::clean_interp_checked_f_in(code, check, regs, banks)
+            })
+            .ok_or(BatchError::Trapped)?;
+        } else {
             run.run(|code, regs, nf, banks, check| {
                 dispatch(tier, threshold, code, regs, nf, banks, check)
             })
@@ -1887,6 +1896,76 @@ mod tests {
                 "{src} should decline"
             );
         }
+    }
+
+    /// A one-row batch on the clean tier runs the straight-line form, and it
+    /// answers what the loop answers on every tier and what the tree-walker
+    /// answers: int, float, bool and string banks, a bool column, a broadcast
+    /// string literal, and a row that traps.
+    #[test]
+    fn a_one_row_batch_runs_the_straight_line_form_and_agrees_with_the_loop() {
+        let s = schema(&[
+            ("x", ValType::Int),
+            ("f", ValType::Float),
+            ("b", ValType::Bool),
+            ("name", ValType::Str),
+        ]);
+        let x = vec![15i64];
+        let f = vec![2.5f64];
+        let b = vec![true];
+        let name = vec!["alice".to_string()];
+        let batch = Batch::new(1)
+            .column("x", ColumnRef::Int(&x))
+            .column("f", ColumnRef::Float(&f))
+            .column("b", ColumnRef::Bool(&b))
+            .column("name", ColumnRef::Str(&name));
+        let mut ctx = Context::default();
+        ctx.add_variable_from_value("x", 15i64);
+        ctx.add_variable_from_value("f", 2.5f64);
+        ctx.add_variable_from_value("b", true);
+        ctx.add_variable_from_value("name", "alice");
+        for src in [
+            "x > 10 ? x * 2 : x + 5",
+            "x + 1",
+            "f * 2.0 + 0.5",
+            "b && x > 3",
+            "!b",
+            "name == \"alice\"",
+            "b ? \"yes\" : \"no\"",
+            "name",
+            "x * 0 + 7",
+        ] {
+            let program = Program::compile(src).unwrap();
+            let batched =
+                BatchProgram::from_program(&program, &s).unwrap_or_else(|e| panic!("{src}: {e}"));
+            let bound = batched.bind_per_row(&batch).unwrap();
+            let walker = vec![program.execute(&ctx).unwrap()];
+            for tier in [Tier::Clean, Tier::Interpreter, Tier::Jit] {
+                assert_eq!(bound.collect_on(tier).unwrap(), walker, "{src} on {tier:?}");
+            }
+        }
+        // The straight-line form is shorter than the loop it stands in for.
+        let program = Program::compile("x > 10 ? x * 2 : x + 5").unwrap();
+        let batched = BatchProgram::from_program(&program, &s).unwrap();
+        let single = batched.lowered().single_row_shape().unwrap();
+        let looped = batched.lowered().batch_shape(true, BatchReduce::PerRow);
+        assert!(single.code.len() < looped.code.len());
+
+        // A trapping row traps on the straight-line form too.
+        let big = vec![i64::MAX];
+        let batch = Batch::new(1).column("x", ColumnRef::Int(&big));
+        let program = Program::compile("x + 1").unwrap();
+        let batched =
+            BatchProgram::from_program(&program, &schema(&[("x", ValType::Int)])).unwrap();
+        let bound = batched.bind_per_row(&batch).unwrap();
+        assert!(matches!(
+            bound.collect_on(Tier::Clean),
+            Err(BatchError::Trapped)
+        ));
+        assert!(matches!(
+            bound.collect_on(Tier::Jit),
+            Err(BatchError::Trapped)
+        ));
     }
 
     #[test]

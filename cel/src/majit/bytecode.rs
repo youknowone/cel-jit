@@ -650,7 +650,19 @@ pub struct BatchRun<'a> {
     /// and its greens bind by position, so a new parameter is not a local
     /// change.
     banks: float_bank::Banks,
+    /// The straight-line program for this run, when the batch has one row and
+    /// the lowering has one ([`super::lower::LoweredF::single_row_shape`]).
+    /// Seeded from the same data as `init_regs`, under its own packing.
+    single_row: Option<SingleRow>,
     columns: core::marker::PhantomData<&'a ()>,
+}
+
+/// [`BatchRun::single_row`]: a program and the bank it starts from.
+struct SingleRow {
+    code: std::sync::Arc<[i64]>,
+    init_regs: Vec<i64>,
+    num_float_regs: usize,
+    check: CodeCheck,
 }
 
 impl<'a> BatchRun<'a> {
@@ -686,6 +698,37 @@ impl<'a> BatchRun<'a> {
             self.num_float_regs,
             &mut self.banks,
             &self.check,
+        );
+        if *self.trap != 0 {
+            return None;
+        }
+        Some(result)
+    }
+
+    /// Whether [`BatchRun::run_single_row`] has a program to run.
+    #[inline]
+    pub fn has_single_row(&self) -> bool {
+        self.single_row.is_some()
+    }
+
+    /// [`BatchRun::run`] on the one-row program instead of the loop. Same trap
+    /// protocol; the output buffer it fills is the one [`BatchRun::output`]
+    /// reads. The caller asks [`BatchRun::has_single_row`] first.
+    pub fn run_single_row(
+        &mut self,
+        run: impl FnOnce(&[i64], &[i64], usize, &mut float_bank::Banks, &CodeCheck) -> i64,
+    ) -> Option<i64> {
+        let single = self
+            .single_row
+            .as_ref()
+            .expect("run_single_row on a run without a one-row program");
+        *self.trap = 0;
+        let result = run(
+            &single.code,
+            &single.init_regs,
+            single.num_float_regs,
+            &mut self.banks,
+            &single.check,
         );
         if *self.trap != 0 {
             return None;
@@ -1181,6 +1224,22 @@ pub fn prepare_batch_reduce<'a>(
     // A refcount bump on the words `lowered` owns, not a copy: every batch of
     // this expression runs the same allocation, so the JIT's green key — and
     // with it the compiled loop the driver holds — stays put between batches.
+    // One row, and not already answered at bind: the clean tier runs the
+    // straight-line form. Seeded from the same bases, scalars and addresses
+    // under that shape's own register packing.
+    let single_row = match reduce {
+        BatchReduce::PerRow if n == 1 && !projection => {
+            lowered.single_row_shape().map(|s| SingleRow {
+                code: s.code.clone(),
+                init_regs: s
+                    .seed
+                    .regs_list(&bases, &scalars, 1, trap_addr, out_addr, &[]),
+                num_float_regs: s.num_float_regs,
+                check: s.check,
+            })
+        }
+        _ => None,
+    };
     let code = shape.code.clone();
     BatchRun {
         code,
@@ -1195,6 +1254,7 @@ pub fn prepare_batch_reduce<'a>(
         list_out,
         distinct,
         banks: float_bank::Banks::default(),
+        single_row,
         columns: core::marker::PhantomData,
     }
 }
