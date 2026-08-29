@@ -549,6 +549,10 @@ pub struct BatchShape {
     pub num_float_regs: usize,
     /// Which int registers the caller fills in per batch.
     pub seed: BatchSeed,
+    /// [`check_code`](super::bytecode::check_code) over `code` and the two
+    /// bank widths the seed fills, taken once here so the clean tier can run
+    /// the words without bounds checks on every register read.
+    pub check: super::bytecode::CodeCheck,
 }
 
 /// A LIST-valued per-row result: the shape of the ragged output the loop writes.
@@ -1110,8 +1114,13 @@ impl LoweredF {
         // count, an address, a broadcast scalar — travels in the int file.
         let floats = pack_file(&mut p, RegFile::Floats, total_float_regs, &[]);
 
+        let code: std::sync::Arc<[i64]> = p.into();
+        let check =
+            super::bytecode::check_code(&code, ints.width, floats.width).unwrap_or_else(|why| {
+                panic!("the lowering built a program its interpreter cannot run: {why}")
+            });
         BatchShape {
-            code: p.into(),
+            code,
             num_float_regs: floats.width,
             seed: BatchSeed {
                 r_n: ints.of(r_n),
@@ -1122,6 +1131,7 @@ impl LoweredF {
                 scalar_regs: scalar_regs.iter().map(|&r| ints.of(r)).collect(),
                 num_int_regs: ints.width,
             },
+            check,
         }
     }
 }

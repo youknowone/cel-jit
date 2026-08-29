@@ -64,7 +64,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use super::bytecode::{float_bank, prepare_batch_reduce, BatchRun, Column};
+use super::bytecode::{float_bank, prepare_batch_reduce, BatchRun, CodeCheck, Column};
 use super::inline::{Inline, InlineOwned, INLINE_SLOTS};
 use super::lower::{
     concat_slot_index, concat_slot_path, elem_slot_source, lower_typed, offset_slot_source,
@@ -1240,8 +1240,10 @@ impl BoundBatch<'_, '_> {
         // projection — every other case on this door — pays one bool test and
         // not a call that would answer the same thing.
         if !(tier == Tier::Clean && self.projected && run.project()) {
-            run.run(|code, regs, nf, banks| dispatch(tier, threshold, code, regs, nf, banks))
-                .ok_or(BatchError::Trapped)?;
+            run.run(|code, regs, nf, banks, check| {
+                dispatch(tier, threshold, code, regs, nf, banks, check)
+            })
+            .ok_or(BatchError::Trapped)?;
         }
         // A LIST-valued result stored each row's element COUNT rather than a
         // value, and the elements themselves went to their own flat buffers at
@@ -1268,9 +1270,9 @@ impl BoundBatch<'_, '_> {
     }
 
     fn execute(&self, tier: Tier, threshold: u32) -> Option<i64> {
-        self.run
-            .borrow_mut()
-            .run(|code, regs, nf, banks| dispatch(tier, threshold, code, regs, nf, banks))
+        self.run.borrow_mut().run(|code, regs, nf, banks, check| {
+            dispatch(tier, threshold, code, regs, nf, banks, check)
+        })
     }
 }
 
@@ -1290,9 +1292,10 @@ fn dispatch(
     regs: &[i64],
     nf: usize,
     banks: &mut float_bank::Banks,
+    check: &CodeCheck,
 ) -> i64 {
     match tier {
-        Tier::Auto | Tier::Clean => float_bank::clean_interp_seeded_f_in(code, regs, nf, banks),
+        Tier::Auto | Tier::Clean => float_bank::clean_interp_checked_f_in(code, check, regs, banks),
         // No bank hand-off here: these enter through the traced portal, which
         // builds its own. See the field's doc on `BatchRun`.
         Tier::Interpreter | Tier::Jit => {

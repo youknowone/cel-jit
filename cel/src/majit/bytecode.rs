@@ -297,6 +297,97 @@ pub const OPERANDS: [&[Operand]; OP_ADD_IMM as usize + 1] = [
     &[Int, Imm, IntOut],            // 58 ADD_IMM
 ];
 
+/// What one [`check_code`] established about one program: the words it read,
+/// by address and length, and the two bank widths every register operand in
+/// them was checked against.
+///
+/// The words are named by identity rather than carried, because the check is
+/// only about those words: [`float_bank::clean_interp_checked_f_in`] asks
+/// [`CodeCheck::covers`] before it reads a register without a bounds check, so
+/// a check taken on one program cannot license reads of another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CodeCheck {
+    addr: usize,
+    len: usize,
+    /// Int registers the program was checked against: every `Int`, `IntOut`
+    /// and `IntTrap` operand is below this.
+    pub num_regs: usize,
+    /// Float registers, likewise, for every `Float` and `FloatOut` operand.
+    pub num_fregs: usize,
+}
+
+impl CodeCheck {
+    /// Whether `code` is the slice this check was taken on.
+    #[inline]
+    pub fn covers(&self, code: &Code) -> bool {
+        code.as_ptr() as usize == self.addr && code.len() == self.len
+    }
+}
+
+/// Check a program once so its interpreter can run it without checking again.
+///
+/// Walks the words as the interpreter would, by [`OPERANDS`]: every word is an
+/// opcode the table knows, every op fits inside the slice, every register
+/// operand is below its bank's width, every jump target is the first word of
+/// an op, and the last op is a return, so no path runs off the end. A program
+/// the lowering built that fails this is a lowering bug, not a data error.
+pub fn check_code(code: &Code, num_regs: usize, num_fregs: usize) -> Result<CodeCheck, String> {
+    let mut starts = vec![false; code.len()];
+    let mut targets: Vec<(usize, i64)> = Vec::new();
+    let mut last_op = None;
+    let mut pc = 0usize;
+    while pc < code.len() {
+        starts[pc] = true;
+        let op = code[pc];
+        let layout = usize::try_from(op)
+            .ok()
+            .and_then(|i| OPERANDS.get(i))
+            .ok_or_else(|| format!("word {pc}: unknown op {op}"))?;
+        let end = pc + 1 + layout.len();
+        if end > code.len() {
+            return Err(format!(
+                "word {pc}: op {op} runs past the end of the program"
+            ));
+        }
+        for (k, kind) in layout.iter().enumerate() {
+            let word = code[pc + 1 + k];
+            let width = match kind {
+                Imm => continue,
+                Target => {
+                    targets.push((pc, word));
+                    continue;
+                }
+                Int | IntOut | IntTrap => num_regs,
+                Float | FloatOut => num_fregs,
+            };
+            if word < 0 || word as usize >= width {
+                return Err(format!(
+                    "word {pc}: op {op} names {kind:?} register {word}, bank width {width}"
+                ));
+            }
+        }
+        last_op = Some(op);
+        pc = end;
+    }
+    for (at, target) in targets {
+        if target < 0 || target as usize >= code.len() || !starts[target as usize] {
+            return Err(format!(
+                "word {at}: jump target {target} is not the start of an op"
+            ));
+        }
+    }
+    match last_op {
+        Some(OP_RETURN | OP_RETURN_F) => Ok(CodeCheck {
+            addr: code.as_ptr() as usize,
+            len: code.len(),
+            num_regs,
+            num_fregs,
+        }),
+        Some(op) => Err(format!("the last op is {op}, not a return")),
+        None => Err("an empty program".to_string()),
+    }
+}
+
 use super::inline::{Inline, INLINE_SLOTS};
 use super::lower::BatchReduce;
 
@@ -503,6 +594,8 @@ pub struct BatchRun<'a> {
     code: std::sync::Arc<[i64]>,
     init_regs: Vec<i64>,
     num_float_regs: usize,
+    /// The shape's [`check_code`] result, for the clean tier's unchecked run.
+    check: CodeCheck,
     /// The word the program publishes the overflow flag to. Boxed so its
     /// address is stable, and never aliased by a reference while the program
     /// writes it through the raw pointer seeded into `init_regs`.
@@ -558,7 +651,13 @@ impl<'a> BatchRun<'a> {
     /// nothing per run. A tier that cannot is free to ignore them.
     pub fn run(
         &mut self,
-        run: impl FnOnce(&std::sync::Arc<Code>, &[i64], usize, &mut float_bank::Banks) -> i64,
+        run: impl FnOnce(
+            &std::sync::Arc<Code>,
+            &[i64],
+            usize,
+            &mut float_bank::Banks,
+            &CodeCheck,
+        ) -> i64,
     ) -> Option<i64> {
         // A zero-row batch reduces to the accumulator's initial value without
         // entering the loop, and its column bases point at nothing.
@@ -571,6 +670,7 @@ impl<'a> BatchRun<'a> {
             &self.init_regs,
             self.num_float_regs,
             &mut self.banks,
+            &self.check,
         );
         if *self.trap != 0 {
             return None;
@@ -1071,6 +1171,7 @@ pub fn prepare_batch_reduce<'a>(
         code,
         init_regs,
         num_float_regs: shape.num_float_regs,
+        check: shape.check,
         trap,
         rows: n,
         str_ids,
@@ -1089,7 +1190,7 @@ fn batch_sum_with(
     columns: &[Column],
     n: usize,
     what: &str,
-    run: impl FnOnce(&std::sync::Arc<Code>, &[i64], usize, &mut float_bank::Banks) -> i64,
+    run: impl FnOnce(&std::sync::Arc<Code>, &[i64], usize, &mut float_bank::Banks, &CodeCheck) -> i64,
 ) -> Option<i64> {
     prepare_batch(lowered, columns, n, what).run(run)
 }
@@ -1123,7 +1224,7 @@ pub fn eval_batch_sum_f(
         columns,
         n,
         "eval_batch_sum_f",
-        |prog, regs, nf, _| float_bank::run_jit_persistent_f(prog, regs, nf, threshold),
+        |prog, regs, nf, _, _| float_bank::run_jit_persistent_f(prog, regs, nf, threshold),
     )
 }
 
@@ -1143,7 +1244,9 @@ pub fn clean_batch_sum_f(
         "clean_batch_sum_f",
         // The oracle tier keys nothing on the address, so it takes the words as
         // a plain slice and the `Arc` is dropped at the boundary.
-        |code, regs, nf, banks| float_bank::clean_interp_seeded_f_in(code, regs, nf, banks),
+        |code, regs, _, banks, check| {
+            float_bank::clean_interp_checked_f_in(code, check, regs, banks)
+        },
     )
 }
 
@@ -1174,7 +1277,7 @@ pub fn eval_batch_sum_float(
 /// its own module because two `#[jit_interp]` mainloops in one module emit
 /// colliding items. The single-bank int path above is untouched.
 pub mod float_bank {
-    use super::Code;
+    use super::{Code, CodeCheck};
     use majit_metainterp::embed::Census;
 
     /// The tier's counters are [`Census`]'s, not this module's.
@@ -2311,6 +2414,88 @@ pub mod float_bank {
         let fregs = &mut banks.fregs;
         fregs.clear();
         fregs.resize(num_fregs, 0.0);
+        interp_words(program, regs.as_mut_slice(), fregs.as_mut_slice())
+    }
+
+    /// [`clean_interp_seeded_f_in`] over a program [`super::check_code`] has
+    /// passed, reading its words and registers without bounds checks.
+    ///
+    /// Sound by the check, not by the caller: `check` names the program by
+    /// identity and the two bank widths it was taken against, and the only
+    /// thing this function trusts is that `program` is that slice and the
+    /// banks are those widths — both asserted here, once per run. Every read
+    /// the loop then makes is one the check already found in range, and a
+    /// program's words never change once lowered.
+    pub fn clean_interp_checked_f_in(
+        program: &Code,
+        check: &CodeCheck,
+        init_regs: &[i64],
+        banks: &mut Banks,
+    ) -> i64 {
+        assert!(
+            check.covers(program),
+            "the check was taken on another program"
+        );
+        assert_eq!(
+            init_regs.len(),
+            check.num_regs,
+            "int bank width differs from the check's"
+        );
+        let regs = &mut banks.regs;
+        regs.resize(init_regs.len(), 0);
+        regs.copy_from_slice(init_regs);
+        let fregs = &mut banks.fregs;
+        fregs.clear();
+        fregs.resize(check.num_fregs, 0.0);
+        interp_words(
+            &Unchecked(program),
+            &mut UncheckedMut(regs.as_mut_slice()),
+            &mut UncheckedMut(fregs.as_mut_slice()),
+        )
+    }
+
+    /// A slice read without bounds checks, for words and registers a
+    /// [`CodeCheck`] has already found in range. See
+    /// [`clean_interp_checked_f_in`] for what makes the reads sound.
+    struct Unchecked<'a, T>(&'a [T]);
+
+    impl<T> core::ops::Index<usize> for Unchecked<'_, T> {
+        type Output = T;
+        #[inline(always)]
+        fn index(&self, i: usize) -> &T {
+            debug_assert!(i < self.0.len());
+            unsafe { self.0.get_unchecked(i) }
+        }
+    }
+
+    /// Mutable [`Unchecked`].
+    struct UncheckedMut<'a, T>(&'a mut [T]);
+
+    impl<T> core::ops::Index<usize> for UncheckedMut<'_, T> {
+        type Output = T;
+        #[inline(always)]
+        fn index(&self, i: usize) -> &T {
+            debug_assert!(i < self.0.len());
+            unsafe { self.0.get_unchecked(i) }
+        }
+    }
+
+    impl<T> core::ops::IndexMut<usize> for UncheckedMut<'_, T> {
+        #[inline(always)]
+        fn index_mut(&mut self, i: usize) -> &mut T {
+            debug_assert!(i < self.0.len());
+            unsafe { self.0.get_unchecked_mut(i) }
+        }
+    }
+
+    /// The dispatch loop, over whatever indexes the caller hands it: plain
+    /// slices check every access, the [`Unchecked`] pair checks none.
+    fn interp_words<P, R, F>(program: &P, regs: &mut R, fregs: &mut F) -> i64
+    where
+        P: ?Sized + core::ops::Index<usize, Output = i64>,
+        R: ?Sized + core::ops::IndexMut<usize, Output = i64>,
+        F: ?Sized + core::ops::IndexMut<usize, Output = f64>,
+    {
         let mut pc = 0usize;
         loop {
             match program[pc] {
