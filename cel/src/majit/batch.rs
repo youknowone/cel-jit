@@ -67,9 +67,9 @@ use std::sync::Arc;
 use super::bytecode::{float_bank, prepare_batch_reduce, BatchRun, CodeCheck, Column};
 use super::inline::{Inline, InlineOwned, INLINE_SLOTS};
 use super::lower::{
-    concat_slot_index, concat_slot_path, elem_slot_source, lower_typed, offset_slot_source,
-    size_slot_source, string_slot_source, BatchReduce, ConcatSide, LoweredF, Schema, SlotKind,
-    ValType,
+    concat_slot_index, concat_slot_path, elem_slot_source, lower_typed, lower_typed_in,
+    offset_slot_source, size_slot_source, string_slot_source, BatchReduce, ConcatSide, LoweredF,
+    Schema, SlotKind, ValType,
 };
 use crate::objects::{Key, ListRef, ListStorage, RecordSchema, ScalarBank, StrBank, ValueColumn};
 use crate::{Context, Program, Value};
@@ -442,6 +442,23 @@ impl BatchProgram {
         // bind: `sum` refuses a string or a timestamp, `bind_per_row` takes any
         // bank, and one program can be bound either way.
         let lowered = lower_typed(program.expression(), schema)?;
+        Ok(BatchProgram { lowered })
+    }
+
+    /// [`BatchProgram::from_program`], with `functions` supplying the user
+    /// functions the expression may call — the same [`Context::add_function`]
+    /// registrations the tree-walker uses. A function is called in the loop
+    /// only in its scalar form ([`crate::magic::ScalarFn`]); an expression
+    /// calling any other kind still declines.
+    ///
+    /// Nothing borrowed: the lowering keeps its own handle on each function it
+    /// calls, so the program outlives the context it was compiled against.
+    pub fn from_program_in(
+        program: &Program,
+        schema: &Schema,
+        functions: &Context<'_>,
+    ) -> Result<Self, BatchError> {
+        let lowered = lower_typed_in(program.expression(), schema, Some(functions))?;
         Ok(BatchProgram { lowered })
     }
 
@@ -1783,6 +1800,93 @@ mod tests {
 
     fn schema(pairs: &[(&str, ValType)]) -> Schema {
         pairs.iter().map(|(p, t)| (p.to_string(), *t)).collect()
+    }
+
+    /// A user function with a scalar form is called by every tier on its
+    /// registers, and the tree-walker's answer is the oracle. The float case
+    /// runs the float convention; the arity-one cases run the other two.
+    #[test]
+    fn a_user_function_in_scalar_form_is_called_on_every_tier() {
+        let mut ctx = Context::default();
+        ctx.add_function("add", |a: i64, b: i64| a + b);
+        ctx.add_function("multiply", |a: i64, b: i64| a * b);
+        ctx.add_function("twice", |a: i64| a * 2);
+        ctx.add_function("scale", |a: f64, b: f64| a * b + 0.5);
+        ctx.add_function("half", |a: f64| a / 2.0);
+        let xs: Vec<i64> = (0..300).collect();
+        let ys: Vec<i64> = (0..300).map(|i| i * 3 - 7).collect();
+        let fs: Vec<f64> = (0..300).map(|i| i as f64 * 0.25).collect();
+        let batch = Batch::new(300)
+            .column("x", ColumnRef::Int(&xs))
+            .column("y", ColumnRef::Int(&ys))
+            .column("f", ColumnRef::Float(&fs));
+        let s = schema(&[
+            ("x", ValType::Int),
+            ("y", ValType::Int),
+            ("f", ValType::Float),
+        ]);
+        for src in [
+            "add(x, y) + multiply(x, 3)",
+            "twice(add(x, y))",
+            "scale(f, 2.0) + half(f)",
+        ] {
+            let program = Program::compile(src).unwrap();
+            let batched = BatchProgram::from_program_in(&program, &s, &ctx)
+                .unwrap_or_else(|e| panic!("{src}: {e}"));
+            let bound = batched.bind_per_row(&batch).unwrap();
+            let walker: Vec<Value> = (0..300)
+                .map(|i| {
+                    let mut row = Context::default();
+                    row.add_function("add", |a: i64, b: i64| a + b);
+                    row.add_function("multiply", |a: i64, b: i64| a * b);
+                    row.add_function("twice", |a: i64| a * 2);
+                    row.add_function("scale", |a: f64, b: f64| a * b + 0.5);
+                    row.add_function("half", |a: f64| a / 2.0);
+                    row.add_variable_from_value("x", xs[i]);
+                    row.add_variable_from_value("y", ys[i]);
+                    row.add_variable_from_value("f", fs[i]);
+                    program.execute(&row).unwrap()
+                })
+                .collect();
+            for tier in [Tier::Clean, Tier::Interpreter, Tier::Jit] {
+                assert_eq!(bound.collect_on(tier).unwrap(), walker, "{src} on {tier:?}");
+            }
+        }
+    }
+
+    /// What is NOT lowered: a call with no context to look it up in, a function
+    /// without a scalar form, an arity or bank that does not match the closure,
+    /// and a user function under a name the stdlib declares an overload for.
+    #[test]
+    fn a_user_function_call_declines_outside_the_scalar_forms() {
+        let mut ctx = Context::default();
+        ctx.add_function("add", |a: i64, b: i64| a + b);
+        ctx.add_function("fallible", |a: i64| -> Result<i64, crate::ExecutionError> {
+            Ok(a)
+        });
+        ctx.add_function("with_ctx", |_: &crate::FunctionContext, a: i64| a);
+        ctx.add_function("size", |a: i64, b: i64| a - b);
+        let s = schema(&[("x", ValType::Int), ("f", ValType::Float)]);
+        let program = Program::compile("add(x, 1)").unwrap();
+        assert!(
+            BatchProgram::from_program(&program, &s).is_err(),
+            "no context"
+        );
+        assert!(BatchProgram::from_program_in(&program, &s, &ctx).is_ok());
+        for src in [
+            "fallible(x)",
+            "with_ctx(x)",
+            "add(x)",
+            "add(f, 1.0)",
+            "size(x, 1)",
+            "missing(x)",
+        ] {
+            let program = Program::compile(src).unwrap();
+            assert!(
+                BatchProgram::from_program_in(&program, &s, &ctx).is_err(),
+                "{src} should decline"
+            );
+        }
     }
 
     #[test]

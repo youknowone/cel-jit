@@ -128,6 +128,14 @@ impl Env {
         }
     }
 
+    /// Whether any global overload is declared under `name`, for any argument
+    /// types. [`Env::find_overload`] is the answer for one call; this is the
+    /// answer for a NAME, which is what a caller that has no argument values
+    /// yet can ask.
+    pub fn declares_function(&self, name: &str) -> bool {
+        self.functions.contains_key(name)
+    }
+
     /// Finds a global function overload that matches the given name and arguments.
     pub fn find_overload(&self, name: &str, args: &[Value]) -> Option<Function> {
         match self.functions.get(name) {

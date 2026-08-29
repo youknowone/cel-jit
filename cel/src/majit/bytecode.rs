@@ -198,6 +198,17 @@ pub const OP_MUL_IMM: i64 = 57; // [a, imm, dst]           regs[dst] = regs[a] *
 /// [`OP_MUL_IMM`] for addition — the loop's `i += 1` step.
 pub const OP_ADD_IMM: i64 = 58; // [a, imm, dst]           regs[dst] = regs[a] + imm
 
+// A call to a user function in its scalar form (`magic::ScalarFn`). `f` is an
+// int register holding the closure's entry word (`ScalarFn::entry_word`), a
+// loop invariant the lowering loads in the prelude; the call itself is a
+// residual helper, `host_call_*` below, that the trace records as a call. Each
+// signature is its own opcode because the operand banks differ, and the
+// operand table is how the interpreter and `check_code` know which is which.
+pub const OP_HOST_CALL1_I: i64 = 59; // [f, a, dst]          regs[dst] = f(regs[a])
+pub const OP_HOST_CALL2_I: i64 = 60; // [f, a, b, dst]       regs[dst] = f(regs[a], regs[b])
+pub const OP_HOST_CALL1_F: i64 = 61; // [f, fa, fdst]        fregs[fdst] = f(fregs[fa])
+pub const OP_HOST_CALL2_F: i64 = 62; // [f, fa, fb, fdst]    fregs[fdst] = f(fregs[fa], fregs[fb])
+
 /// What one word after an opcode means, for a consumer that walks a program
 /// without running it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -235,7 +246,7 @@ use Operand::{Float, FloatOut, Imm, Int, IntOut, IntTrap, Target};
 /// so an opcode added past it without a row here is a compile error on this
 /// array instead of an out-of-bounds index the first time that opcode is
 /// decoded.
-pub const OPERANDS: [&[Operand]; OP_ADD_IMM as usize + 1] = [
+pub const OPERANDS: [&[Operand]; OP_HOST_CALL2_F as usize + 1] = [
     &[Imm, IntOut],                 // 0  LOAD_CONST
     &[Int, IntOut],                 // 1  MOV
     &[Int, Int, IntOut],            // 2  ADD
@@ -295,6 +306,10 @@ pub const OPERANDS: [&[Operand]; OP_ADD_IMM as usize + 1] = [
     &[Int, Int, IntOut],            // 56 COL_LOAD_B
     &[Int, Imm, IntOut],            // 57 MUL_IMM
     &[Int, Imm, IntOut],            // 58 ADD_IMM
+    &[Int, Int, IntOut],            // 59 HOST_CALL1_I
+    &[Int, Int, Int, IntOut],       // 60 HOST_CALL2_I
+    &[Int, Float, FloatOut],        // 61 HOST_CALL1_F
+    &[Int, Float, Float, FloatOut], // 62 HOST_CALL2_F
 ];
 
 /// What one [`check_code`] established about one program: the words it read,
@@ -1294,11 +1309,42 @@ pub mod float_bank {
         OP_ADD, OP_ADD_IMM, OP_ADD_OVF, OP_AND, OP_COL_LOAD, OP_COL_LOAD_B, OP_COL_LOAD_F,
         OP_COL_STORE, OP_COL_STORE_F, OP_DIV, OP_DIV_CHK, OP_EQ, OP_F2I, OP_F2U, OP_FADD, OP_FDIV,
         OP_FEQ, OP_FGE, OP_FGT, OP_FLE, OP_FLT, OP_FMOV, OP_FMUL, OP_FNE, OP_FNEG, OP_FSELECT,
-        OP_FSUB, OP_GE, OP_GT, OP_I2F, OP_JUMP_IF_ABOVE, OP_LE, OP_LOAD_CONST, OP_LOAD_CONST_F,
-        OP_LT, OP_MOD, OP_MOD_CHK, OP_MOV, OP_MUL, OP_MUL_IMM, OP_MUL_OVF, OP_NE, OP_NEG, OP_NOT,
-        OP_OR, OP_RETURN, OP_RETURN_F, OP_SELECT, OP_SUB, OP_SUB_OVF, OP_TRAP_STORE, OP_U2F,
-        OP_UADD_OVF, OP_UDIV, OP_ULE, OP_ULT, OP_UMOD, OP_UMUL_OVF, OP_USUB_OVF,
+        OP_FSUB, OP_GE, OP_GT, OP_HOST_CALL1_F, OP_HOST_CALL1_I, OP_HOST_CALL2_F, OP_HOST_CALL2_I,
+        OP_I2F, OP_JUMP_IF_ABOVE, OP_LE, OP_LOAD_CONST, OP_LOAD_CONST_F, OP_LT, OP_MOD, OP_MOD_CHK,
+        OP_MOV, OP_MUL, OP_MUL_IMM, OP_MUL_OVF, OP_NE, OP_NEG, OP_NOT, OP_OR, OP_RETURN,
+        OP_RETURN_F, OP_SELECT, OP_SUB, OP_SUB_OVF, OP_TRAP_STORE, OP_U2F, OP_UADD_OVF, OP_UDIV,
+        OP_ULE, OP_ULT, OP_UMOD, OP_UMUL_OVF, OP_USUB_OVF,
     };
+
+    // The four calling conventions of `magic::ScalarFn`, each reading its
+    // entry word back as the `Box` that `ScalarFn::entry_word` took the
+    // address of. Residual on purpose: a closure body is not something a
+    // trace can look inside, and the call is what the trace records.
+    //
+    // SAFETY (all four): `f` is `ScalarFn::entry_word` of the matching arm --
+    // the lowering emits each opcode only for that arm -- and the `ScalarFn`
+    // is alive because `LoweredF::host_fns` holds the `Arc` for as long as the
+    // program that names it exists.
+    #[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+    fn host_call1_i(f: i64, a: i64) -> i64 {
+        let f = unsafe { &*(f as usize as *const Box<dyn Fn(i64) -> i64 + Send + Sync>) };
+        f(a)
+    }
+    #[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+    fn host_call2_i(f: i64, a: i64, b: i64) -> i64 {
+        let f = unsafe { &*(f as usize as *const Box<dyn Fn(i64, i64) -> i64 + Send + Sync>) };
+        f(a, b)
+    }
+    #[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+    fn host_call1_f(f: i64, a: f64) -> f64 {
+        let f = unsafe { &*(f as usize as *const Box<dyn Fn(f64) -> f64 + Send + Sync>) };
+        f(a)
+    }
+    #[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+    fn host_call2_f(f: i64, a: f64, b: f64) -> f64 {
+        let f = unsafe { &*(f as usize as *const Box<dyn Fn(f64, f64) -> f64 + Send + Sync>) };
+        f(a, b)
+    }
 
     // majit's intrinsics, not a local copy: the `#[jit_interp]` macro matches a
     // call by its LAST PATH SEGMENT, so an imported name lowers to the same
@@ -1454,6 +1500,36 @@ pub mod float_bank {
                     let d = program[pc + 3] as usize;
                     state.regs[d] = state.regs[a] + program[pc + 2];
                     pc += 4;
+                }
+                OP_HOST_CALL1_I => {
+                    let f = program[pc + 1] as usize;
+                    let a = program[pc + 2] as usize;
+                    let d = program[pc + 3] as usize;
+                    state.regs[d] = host_call1_i(state.regs[f], state.regs[a]);
+                    pc += 4;
+                }
+                OP_HOST_CALL2_I => {
+                    let f = program[pc + 1] as usize;
+                    let a = program[pc + 2] as usize;
+                    let b = program[pc + 3] as usize;
+                    let d = program[pc + 4] as usize;
+                    state.regs[d] = host_call2_i(state.regs[f], state.regs[a], state.regs[b]);
+                    pc += 5;
+                }
+                OP_HOST_CALL1_F => {
+                    let f = program[pc + 1] as usize;
+                    let a = program[pc + 2] as usize;
+                    let d = program[pc + 3] as usize;
+                    state.fregs[d] = host_call1_f(state.regs[f], state.fregs[a]);
+                    pc += 4;
+                }
+                OP_HOST_CALL2_F => {
+                    let f = program[pc + 1] as usize;
+                    let a = program[pc + 2] as usize;
+                    let b = program[pc + 3] as usize;
+                    let d = program[pc + 4] as usize;
+                    state.fregs[d] = host_call2_f(state.regs[f], state.fregs[a], state.fregs[b]);
+                    pc += 5;
                 }
                 OP_ADD_OVF => {
                     let a = program[pc + 1] as usize;
@@ -2531,6 +2607,36 @@ pub mod float_bank {
                     regs[program[pc + 3] as usize] =
                         regs[program[pc + 1] as usize] + program[pc + 2];
                     pc += 4;
+                }
+                OP_HOST_CALL1_I => {
+                    regs[program[pc + 3] as usize] = host_call1_i(
+                        regs[program[pc + 1] as usize],
+                        regs[program[pc + 2] as usize],
+                    );
+                    pc += 4;
+                }
+                OP_HOST_CALL2_I => {
+                    regs[program[pc + 4] as usize] = host_call2_i(
+                        regs[program[pc + 1] as usize],
+                        regs[program[pc + 2] as usize],
+                        regs[program[pc + 3] as usize],
+                    );
+                    pc += 5;
+                }
+                OP_HOST_CALL1_F => {
+                    fregs[program[pc + 3] as usize] = host_call1_f(
+                        regs[program[pc + 1] as usize],
+                        fregs[program[pc + 2] as usize],
+                    );
+                    pc += 4;
+                }
+                OP_HOST_CALL2_F => {
+                    fregs[program[pc + 4] as usize] = host_call2_f(
+                        regs[program[pc + 1] as usize],
+                        fregs[program[pc + 2] as usize],
+                        fregs[program[pc + 3] as usize],
+                    );
+                    pc += 5;
                 }
                 // The reference tier mirrors the fused-ovf None arm (wrapping
                 // value + trap flag) so it agrees with the JIT's overflow deopt

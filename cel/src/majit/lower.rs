@@ -416,6 +416,10 @@ pub struct LoweredF {
     /// element COUNT (in `result_reg`), and the elements themselves were stored
     /// through this description as the loop ran.
     pub list_output: Option<ListOutput>,
+    /// The user functions the body calls in scalar form, held so the entry
+    /// words the prelude loads for them stay valid for as long as this
+    /// lowering does. Nothing reads the list; owning it is its job.
+    pub host_fns: Vec<std::sync::Arc<crate::magic::ScalarFn>>,
     /// Operands of the derived `concat#k` columns, indexed by `k`. Each entry's
     /// [`ConcatSide::Derived`] references are all lower indices, so
     /// materializing the table in order resolves them.
@@ -1394,6 +1398,13 @@ struct LowerCtxF<'s> {
     /// Set when the top-level expression is collected as a list.
     list_output: Option<ListOutput>,
     schema: &'s Schema,
+    /// Where a call to a name no arm above knows is looked up, when the caller
+    /// gave one. Only a function with a scalar form ([`crate::magic::ScalarFn`])
+    /// is lowered, and only when no stdlib overload is declared under the name,
+    /// since the tree-walker tries those first.
+    functions: Option<&'s Context<'s>>,
+    /// See [`LoweredF::host_fns`].
+    host_fns: Vec<std::sync::Arc<crate::magic::ScalarFn>>,
 }
 
 /// The runtime-list comprehension being lowered — what an iteration variable
@@ -1615,6 +1626,17 @@ impl LowerCtxF<'_> {
 /// arithmetic (no int->float cast for arithmetic), float modulo, and a
 /// mixed-bank ternary still bail (the caller falls back to the tree-walker).
 pub fn lower_typed(expr: &IdedExpr, schema: &Schema) -> Result<LoweredF, LowerError> {
+    lower_typed_in(expr, schema, None)
+}
+
+/// [`lower_typed`], with `functions` supplying the user functions a call may
+/// resolve to. A call to a name that is not a lowered builtin looks the name up
+/// there; with `None`, such a call is a decline.
+pub fn lower_typed_in(
+    expr: &IdedExpr,
+    schema: &Schema,
+    functions: Option<&Context<'_>>,
+) -> Result<LoweredF, LowerError> {
     let mut ctx = LowerCtxF {
         prelude: Vec::new(),
         body: Vec::new(),
@@ -1637,6 +1659,8 @@ pub fn lower_typed(expr: &IdedExpr, schema: &Schema) -> Result<LoweredF, LowerEr
         elem_words: 0,
         list_output: None,
         schema,
+        functions,
+        host_fns: Vec::new(),
     };
     // A list-valued TOP-LEVEL result is collected rather than declined: the
     // elements stream to their own buffers and the row's value becomes the
@@ -1682,6 +1706,7 @@ pub fn lower_typed(expr: &IdedExpr, schema: &Schema) -> Result<LoweredF, LowerEr
         scalar_seeds: ctx.scalar_seeds,
         concats: ctx.concats,
         list_output: ctx.list_output,
+        host_fns: ctx.host_fns,
         temporal_bound,
         orders_strings: ctx.orders_strings,
         jump_fixups: ctx.jump_fixups,
@@ -3118,9 +3143,70 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
                     .extend_from_slice(&[op, a.idx as i64, d.idx as i64]);
                 Ok(d)
             }
-            _ => Err(LowerError::unsupported(format!("call `{name}`"))),
+            _ => compile_host_call_t(ctx, name, call),
         }
     }
+}
+
+/// A call to a user function, in its scalar form.
+///
+/// The function comes from the [`Context`] the lowering was given, and only
+/// when it has a [`ScalarFn`] form and the stdlib declares no overload under
+/// the name — the tree-walker consults `Env::find_overload` before the
+/// context's functions (`objects.rs`, the `call.target == None` arm), so a
+/// user function under a stdlib name may or may not be the one it calls, and
+/// this tier does not guess. Each argument must already be in the closure's
+/// bank: `i64` arguments read the int bank, and only [`ValType::Int`] is one
+/// (`bool`, `uint` and the temporal types share the bank but are not `i64` to
+/// the walker's `FromValue`). The closure's entry word is a loop invariant, so
+/// its load goes in the prelude with the literals.
+fn compile_host_call_t(
+    ctx: &mut LowerCtxF,
+    name: &str,
+    call: &CallExpr,
+) -> Result<TReg, LowerError> {
+    use crate::magic::ScalarFn;
+    let decline = || LowerError::unsupported(format!("call `{name}`"));
+    let Some(functions) = ctx.functions else {
+        return Err(decline());
+    };
+    if functions.env().declares_function(name) {
+        return Err(decline());
+    }
+    let Some(scalar) = functions
+        .get_function(name)
+        .and_then(|f| f.scalar().cloned())
+    else {
+        return Err(decline());
+    };
+    let (arity, bank, op) = match &*scalar {
+        ScalarFn::Int1(_) => (1, ValType::Int, OP_HOST_CALL1_I),
+        ScalarFn::Int2(_) => (2, ValType::Int, OP_HOST_CALL2_I),
+        ScalarFn::Float1(_) => (1, ValType::Float, OP_HOST_CALL1_F),
+        ScalarFn::Float2(_) => (2, ValType::Float, OP_HOST_CALL2_F),
+    };
+    if call.args.len() != arity {
+        return Err(LowerError::unsupported(format!("call `{name}` arity")));
+    }
+    let mut args = Vec::with_capacity(arity);
+    for arg in &call.args {
+        let r = compile_t(ctx, arg)?;
+        if r.bank != bank {
+            return Err(LowerError::unsupported(format!(
+                "call `{name}` on {:?}",
+                r.bank
+            )));
+        }
+        args.push(r.idx as i64);
+    }
+    let f = ctx.const_reg(ValType::Int, scalar.entry_word());
+    ctx.host_fns.push(scalar);
+    let d = ctx.fresh(bank);
+    ctx.body.push(op);
+    ctx.body.push(f.idx as i64);
+    ctx.body.extend_from_slice(&args);
+    ctx.body.push(d.idx as i64);
+    Ok(d)
 }
 
 /// `size()` of a runtime-list ELEMENT — the loop variable itself, or one of its
@@ -3843,6 +3929,8 @@ fn probe_ctx<'a>(ctx: &LowerCtxF<'a>) -> LowerCtxF<'a> {
         elem_words: 0,
         list_output: None,
         schema: ctx.schema,
+        functions: ctx.functions,
+        host_fns: Vec::new(),
     }
 }
 
