@@ -3884,3 +3884,47 @@ pub mod float_bank {
         eprintln!("[jit-stats] {label} {}", jit_stats());
     }
 }
+
+#[cfg(test)]
+mod check_code_tests {
+    use super::*;
+
+    fn check(words: &[i64]) -> Result<CodeCheck, String> {
+        check_code(words, 2, 1)
+    }
+
+    #[test]
+    fn a_well_formed_program_is_accepted_and_covers_only_its_own_words() {
+        let words = [OP_LOAD_CONST, 7, 0, OP_RETURN, 0];
+        let check = check(&words).unwrap();
+        assert!(check.covers(&words));
+        assert_eq!((check.num_regs, check.num_fregs), (2, 1));
+        let copy = words;
+        assert!(!check.covers(&copy), "a copy is another program");
+    }
+
+    #[test]
+    fn a_malformed_program_is_rejected_with_the_word_that_broke_it() {
+        let cases: [(&[i64], &str); 6] = [
+            (&[], "an empty program"),
+            (&[999, OP_RETURN, 0], "unknown op 999"),
+            (&[OP_LOAD_CONST, 7], "runs past the end"),
+            (
+                &[OP_LOAD_CONST, 7, 2, OP_RETURN, 0],
+                "register 2, bank width 2",
+            ),
+            (
+                &[OP_LOAD_CONST, 7, 0, OP_JUMP_IF_ABOVE, 0, 1, 1, OP_RETURN, 0],
+                "jump target 1 is not the start of an op",
+            ),
+            (&[OP_LOAD_CONST, 7, 0], "not a return"),
+        ];
+        for (words, why) in cases {
+            let err = check(words).unwrap_err();
+            assert!(
+                err.contains(why),
+                "{words:?}: {err:?} does not mention {why:?}"
+            );
+        }
+    }
+}
