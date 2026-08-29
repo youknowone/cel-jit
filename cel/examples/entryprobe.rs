@@ -84,6 +84,14 @@
 //! is therefore the shipping entry plus that, and the report says so beside the
 //! number. Differences between arms are unaffected; both arms pay it.
 //!
+//! JITFRAME allocation is not an amplified arm once the backend allocates it
+//! from the moving GC. Between allocating the real entry frame and entering
+//! compiled code there is no root that an extra collecting allocation could
+//! update, while a no-collect repetition would retain every scratch frame and
+//! eventually measure nursery growth. The whole-entry and single-shot call
+//! figures still include the allocation. Process-allocation effects are
+//! measured separately by `allocs_per_eval`.
+//!
 //! Every measured stage is a WARM repeat as well. The passes after the first
 //! find the caches the first one filled, so each figure is a LOWER bound on
 //! what the call's single execution of that stage costs -- and the residual,
@@ -1065,11 +1073,18 @@ fn main() {
         100.0 * call / e3,
         splits.first().map_or(0, |s| s.call_shots)
     );
-    println!(
-        "    {:<28} {e3b:8.2} ns   {:5.1}% of E3   AMPLIFIED, and INSIDE the call above",
-        "  of which frame build",
-        100.0 * e3b / e3
-    );
+    if frame_build_passes() == 0 {
+        println!(
+            "    {:<28} {:>8}      GC-managed JITFRAME: not safely amplifiable",
+            "  of which frame build", "n/a"
+        );
+    } else {
+        println!(
+            "    {:<28} {e3b:8.2} ns   {:5.1}% of E3   AMPLIFIED, and INSIDE the call above",
+            "  of which frame build",
+            100.0 * e3b / e3
+        );
+    }
     println!(
         "    {:<28} {e3d:8.2} ns   {:5.1}% of E3   AMPLIFIED",
         STAGE_LABELS[E3D],

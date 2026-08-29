@@ -658,6 +658,8 @@ struct Row {
 
 fn run_case(case: &Case, cfg: &Config) -> Row {
     let schema: Schema = case.schema.iter().cloned().collect();
+    let mut activation = Context::default();
+    (case.stock)(&mut activation);
 
     // PHASE 0 — the one-time cost, before any record is seen.
     let mut prepare = f64::INFINITY;
@@ -666,7 +668,7 @@ fn run_case(case: &Case, cfg: &Config) -> Row {
         let start = Instant::now();
         let parsed = Program::compile(&case.src)
             .unwrap_or_else(|e| panic!("{}: parse error: {e:?}", case.label));
-        let lowered = BatchProgram::from_program(&parsed, &schema);
+        let lowered = BatchProgram::from_program_in(&parsed, &schema, &activation);
         prepare = prepare.min(start.elapsed().as_nanos() as f64);
         prepared = Some((parsed, lowered));
     }
@@ -714,8 +716,6 @@ fn run_case(case: &Case, cfg: &Config) -> Row {
     // `RowReader` fills from the very columns the compiled tier reads. Without
     // that second reading a column and the variable it stands for can disagree
     // and every ratio below silently compares two different workloads.
-    let mut activation = Context::default();
-    (case.stock)(&mut activation);
     let mut answers = Vec::with_capacity(cfg.pool);
     for (v, (batch, bound)) in batches.iter().zip(&bounds).enumerate() {
         let clean = match bound.collect_on(Tier::Clean) {

@@ -98,7 +98,7 @@ const CRANELIFT: bool = cfg!(feature = "jit-cranelift");
 /// Picoseconds the compiled tier saves for each body WORD the plain
 /// interpreter would have dispatched. See [`JIT_ENTRY_PS`] for the rule the
 /// three constants feed and for how all three were measured.
-pub const GAIN_PER_WORD_PS: i64 = if CRANELIFT { 124 } else { 137 };
+pub const GAIN_PER_WORD_PS: i64 = if CRANELIFT { 124 } else { 60 };
 
 /// Picoseconds the compiled tier saves per ITERATION — per row of the batch,
 /// and per element a comprehension's inner loop visits — beyond what that
@@ -112,7 +112,7 @@ pub const GAIN_PER_WORD_PS: i64 = if CRANELIFT { 124 } else { 137 };
 /// rule stated in words alone has nowhere to put that: `routeprobe` measures a
 /// 25-word row body crossing at 535 body words and a 59-word one at 1049, on
 /// the same box in the same run.
-pub const GAIN_PER_ITERATION_PS: i64 = if CRANELIFT { 3_974 } else { 2_622 };
+pub const GAIN_PER_ITERATION_PS: i64 = if CRANELIFT { 3_974 } else { 1_418 };
 
 /// Picoseconds a call must expect to SAVE before [`Tier::Auto`] hands it to the
 /// compiled tier — the fixed cost of getting there: the driver lookup, the
@@ -172,12 +172,11 @@ pub const GAIN_PER_ITERATION_PS: i64 = if CRANELIFT { 3_974 } else { 2_622 };
 /// 240 points where a fresh fit named it on 8, 9 and 8. The medians of those
 /// three runs are what this arm now ships.
 ///
-/// The dynasm arm was measured in the same campaign and deliberately NOT
-/// changed. Its entry moved the same way (108.9, 116.9, 125.4 ns against the
-/// shipped 142.55), but its live constants graded 5, 7 and 6 wrong against a
-/// fresh fit's 5, 6 and 5 — a difference inside what the runs move by. Re-fitting
-/// an arm whose ranking does not improve is fitting the noise the pooling rule
-/// above exists to refuse.
+/// The dynasm arm was re-fitted after its entry JITFRAME moved from one host
+/// allocation per call onto the framework GC. Three fresh runs put the entry
+/// at 71.7, 75.0 and 72.8 ns. The constants then live named the losing tier on
+/// 10, 12 and 11 of 240 points; each run's fresh fit named it on 9, 8 and 7.
+/// The medians of those runs are what this arm now ships.
 ///
 /// # What invalidates them
 ///
@@ -193,7 +192,7 @@ pub const GAIN_PER_ITERATION_PS: i64 = if CRANELIFT { 3_974 } else { 2_622 };
 /// 359..523 it was set from. What does NOT invalidate them is the machine being
 /// uniformly faster or slower, since the decision depends only on the ratios
 /// among the three.
-pub const JIT_ENTRY_PS: i64 = if CRANELIFT { 83_593 } else { 142_550 };
+pub const JIT_ENTRY_PS: i64 = if CRANELIFT { 83_593 } else { 72_825 };
 
 /// Picoseconds the compiled tier is expected to save on a run of `lowered` over
 /// `rows` rows carrying `elems` flattened list elements — the left-hand side of

@@ -414,6 +414,10 @@ vm = []
 jit = [
     "dep:majit-ir",
     "dep:majit-gc",
+    # The scalar tier's only managed value is a thread-confined JITFRAME, so
+    # each execution thread owns a tiny collector instead of joining a
+    # process-global language heap and its GIL.
+    "majit-gc/gc_box",
     "dep:majit-macros",
     "dep:majit-metainterp",
     # The temporal columnar subset (timestamp/duration) lowers to i64-nanos

@@ -3081,6 +3081,7 @@ pub mod float_bank {
         // the guard, so `new` is now the whole constructor.
         let mut driver: majit_metainterp::JitDriver<VmStateF> =
             majit_metainterp::JitDriver::new(threshold);
+        crate::runtime::registration::install_jitframe_gc(&mut driver);
         // `JitDriver::new` sets only the back-edge threshold; the counter the
         // function-entry door consults is a second one, and it defaults to
         // upstream's `rlib/jit.py:589 function_threshold = 1619` — over 200x

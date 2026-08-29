@@ -306,7 +306,7 @@ fn varsize_block(token: &ArrayToken, items_have_gc_ptrs: bool) -> TypeInfo {
 /// answers "no" to every subclass test. The blocks are unaffected either way:
 /// `assign_inheritance_ids` walks only the types that declare a subclass range,
 /// and a varsize type declares none.
-pub fn register_cel_classes(gc: &mut MiniMarkGC) -> CelTypeIds {
+fn register_cel_classes_unfrozen(gc: &mut MiniMarkGC) -> CelTypeIds {
     let root = gc.register_type(TypeInfo::object(size_of::<CelObject>()));
     let mut classes = Vec::with_capacity(CEL_CLASS_LAYOUTS.len());
     for layout in CEL_CLASS_LAYOUTS {
@@ -335,13 +335,18 @@ pub fn register_cel_classes(gc: &mut MiniMarkGC) -> CelTypeIds {
     // traced at all.
     let items_block = gc.register_type(varsize_block(&CEL_ITEMS_BLOCK_TOKEN, true));
     let bytes_block = gc.register_type(varsize_block(&CEL_BYTES_BLOCK_TOKEN, false));
-    GcAllocator::freeze_types(gc);
     CelTypeIds {
         root,
         classes,
         items_block,
         bytes_block,
     }
+}
+
+pub fn register_cel_classes(gc: &mut MiniMarkGC) -> CelTypeIds {
+    let ids = register_cel_classes_unfrozen(gc);
+    GcAllocator::freeze_types(gc);
+    ids
 }
 
 /// Publish a `SizeDescr` and its `FieldDescr`s for every class, keyed on the
@@ -472,8 +477,50 @@ fn array_flag(ty: Type, signed: bool) -> ArrayFlag {
 /// has to have them before it hands the collector over.
 pub fn cel_gc(config: GcConfig) -> (Box<dyn GcAllocator>, CelTypeIds) {
     let mut gc = MiniMarkGC::with_config(config);
-    let ids = register_cel_classes(&mut gc);
+    let ids = register_cel_classes_unfrozen(&mut gc);
+    #[cfg(not(target_arch = "wasm32"))]
+    majit_metainterp::register_active_backend_jitframe_gc_type(&mut gc);
+    GcAllocator::freeze_types(&mut gc);
     (Box::new(gc), ids)
+}
+
+thread_local! {
+    /// Whether this execution thread has installed its scalar-tier collector.
+    ///
+    /// This is deliberately execution-context state: the collector owns only
+    /// temporary JITFRAMEs, deadframes are thread-confined, and no CEL object
+    /// identity or root is duplicated. Once CEL values move onto this heap,
+    /// `install_cel_gc` replaces this temporary boundary with their real owner.
+    static JITFRAME_GC_INSTALLED: core::cell::Cell<bool> = const {
+        core::cell::Cell::new(false)
+    };
+}
+
+/// Install the smallest collector the scalar compiled tier needs.
+///
+/// RPython's `gc_ll_descr.malloc_jitframe` allocates every entry frame as a
+/// typed GC object. The scalar tier constructs no CEL heap object yet, so its
+/// collector needs exactly that one type. Installation is once per execution
+/// thread because the selected native backend owns its active allocator there.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn install_jitframe_gc<S: majit_metainterp::JitState>(
+    driver: &mut majit_metainterp::JitDriver<S>,
+) {
+    JITFRAME_GC_INSTALLED.with(|installed| {
+        if installed.get() {
+            return;
+        }
+        let mut gc = MiniMarkGC::new();
+        majit_metainterp::register_active_backend_jitframe_gc_type(&mut gc);
+        driver.set_gc_allocator(Box::new(gc));
+        installed.set(true);
+    });
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn install_jitframe_gc<S: majit_metainterp::JitState>(
+    _driver: &mut majit_metainterp::JitDriver<S>,
+) {
 }
 
 /// All three registrations against one driver.
@@ -500,6 +547,7 @@ pub fn install_cel_gc<S: majit_metainterp::JitState>(
     driver.set_gc_allocator(gc);
     driver.set_new_via_gc(true);
     driver.set_vtable_offset(Some(0));
+    JITFRAME_GC_INSTALLED.with(|installed| installed.set(true));
     ids
 }
 
