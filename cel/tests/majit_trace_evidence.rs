@@ -1232,3 +1232,67 @@ fn nested_loop_deopts_are_a_warmup_cost_not_a_per_row_cost() {
         );
     }
 }
+
+/// A user function in scalar form is a residual call in the trace, not an
+/// abort: the row loop compiles, is entered, and answers what the clean tier
+/// answers — on the int convention and on the float one, whose values cross
+/// the call as bits. Without this the parity test in `batch.rs` could pass
+/// with the JIT tier quietly answering out of the interpreter.
+#[test]
+fn a_host_call_loop_compiles_and_is_entered() {
+    use cel::majit::batch::{Batch, BatchProgram, ColumnRef, Tier};
+    use cel::Context;
+    let _serial = serial();
+    let mut ctx = Context::default();
+    ctx.add_function("add", |a: i64, b: i64| a + b);
+    ctx.add_function("multiply", |a: i64, b: i64| a * b);
+    ctx.add_function("scale", |a: f64, b: f64| a * b + 0.5);
+    ctx.add_function("half", |a: f64| a / 2.0);
+    let schema: Schema = [
+        ("x", ValType::Int),
+        ("y", ValType::Int),
+        ("f", ValType::Float),
+    ]
+    .into_iter()
+    .map(|(p, t)| (p.to_string(), t))
+    .collect();
+    let n = 50_000usize;
+    let xs: Vec<i64> = (0..n as i64).collect();
+    let ys: Vec<i64> = (0..n as i64).map(|i| i * 3 - 7).collect();
+    let fs: Vec<f64> = (0..n as i64).map(|i| i as f64 * 0.25).collect();
+    let batch = Batch::new(n)
+        .column("x", ColumnRef::Int(&xs))
+        .column("y", ColumnRef::Int(&ys))
+        .column("f", ColumnRef::Float(&fs));
+    for src in ["add(x, y) + multiply(x, 3)", "scale(f, 2.0) + half(f)"] {
+        let program = Program::compile(src).unwrap();
+        let batched = BatchProgram::from_program_in(&program, &schema, &ctx).unwrap();
+        let bound = batched.bind_per_row(&batch).unwrap();
+
+        reset_persistent_state();
+        reset_jit_stats();
+        let before = abort_reasons();
+        let clean = bound.collect_on(Tier::Clean).unwrap();
+        let jit = bound.collect_on(Tier::Jit).unwrap();
+        let stats = jit_stats();
+        assert_eq!(
+            clean, jit,
+            "{src}: compiled tier diverged from the clean tier"
+        );
+        assert_eq!(stats.internal_compile_panics, 0, "{src}");
+        assert_eq!(
+            stats.loops_aborted,
+            0,
+            "{src}: the host call aborted the trace: {}",
+            abort_reasons_since(&before)
+        );
+        assert!(
+            stats.loops_compiled >= 1,
+            "{src}: the host-call loop did not compile: {stats:?}"
+        );
+        assert!(
+            stats.compiled_entries >= 1,
+            "{src}: compiled but never entered: {stats:?}"
+        );
+    }
+}

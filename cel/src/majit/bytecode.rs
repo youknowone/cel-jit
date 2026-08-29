@@ -1319,31 +1319,39 @@ pub mod float_bank {
     // The four calling conventions of `magic::ScalarFn`, each reading its
     // entry word back as the `Box` that `ScalarFn::entry_word` took the
     // address of. Residual on purpose: a closure body is not something a
-    // trace can look inside, and the call is what the trace records.
+    // trace can look inside, and the call is what the trace records — the
+    // mainloop's `calls = { .. }` names each one `residual_int_cannot_raise`,
+    // and a helper the attribute does not name lowers its arm to an abort
+    // stub, which is a JIT tier that quietly answers out of the interpreter
+    // (`majit_trace_evidence.rs` `a_host_call_loop_compiles_and_is_entered`).
+    //
+    // The float pair passes `f64` as its bits in an `i64`, on both sides: the
+    // int-returning residual policy is the one every value crosses on, so a
+    // float never has to be a call operand or a call result of its own.
     //
     // SAFETY (all four): `f` is `ScalarFn::entry_word` of the matching arm --
     // the lowering emits each opcode only for that arm -- and the `ScalarFn`
     // is alive because `LoweredF::host_fns` holds the `Arc` for as long as the
     // program that names it exists.
     #[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
-    fn host_call1_i(f: i64, a: i64) -> i64 {
+    extern "C" fn host_call1_i(f: i64, a: i64) -> i64 {
         let f = unsafe { &*(f as usize as *const Box<dyn Fn(i64) -> i64 + Send + Sync>) };
         f(a)
     }
     #[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
-    fn host_call2_i(f: i64, a: i64, b: i64) -> i64 {
+    extern "C" fn host_call2_i(f: i64, a: i64, b: i64) -> i64 {
         let f = unsafe { &*(f as usize as *const Box<dyn Fn(i64, i64) -> i64 + Send + Sync>) };
         f(a, b)
     }
     #[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
-    fn host_call1_f(f: i64, a: f64) -> f64 {
+    extern "C" fn host_call1_f(f: i64, a_bits: i64) -> i64 {
         let f = unsafe { &*(f as usize as *const Box<dyn Fn(f64) -> f64 + Send + Sync>) };
-        f(a)
+        f(f64::from_bits(a_bits as u64)).to_bits() as i64
     }
     #[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
-    fn host_call2_f(f: i64, a: f64, b: f64) -> f64 {
+    extern "C" fn host_call2_f(f: i64, a_bits: i64, b_bits: i64) -> i64 {
         let f = unsafe { &*(f as usize as *const Box<dyn Fn(f64, f64) -> f64 + Send + Sync>) };
-        f(a, b)
+        f(f64::from_bits(a_bits as u64), f64::from_bits(b_bits as u64)).to_bits() as i64
     }
 
     // majit's intrinsics, not a local copy: the `#[jit_interp]` macro matches a
@@ -1442,6 +1450,13 @@ pub mod float_bank {
         // no signedness, so the unsigned multiply-high resop is reached by
         // aliasing the helper call to the opcode.
         native_int_binops = { majit_uint_mul_high => UintMulHigh },
+        // A user function in scalar form: a call the trace keeps as a call.
+        calls = {
+            host_call1_i => residual_int_cannot_raise,
+            host_call2_i => residual_int_cannot_raise,
+            host_call1_f => residual_int_cannot_raise,
+            host_call2_f => residual_int_cannot_raise,
+        },
     )]
     fn run_mainloop_f(
         mut driver: &mut majit_metainterp::JitDriver<VmStateF>,
@@ -1520,7 +1535,10 @@ pub mod float_bank {
                     let f = program[pc + 1] as usize;
                     let a = program[pc + 2] as usize;
                     let d = program[pc + 3] as usize;
-                    state.fregs[d] = host_call1_f(state.regs[f], state.fregs[a]);
+                    state.fregs[d] = f64::from_bits(host_call1_f(
+                        state.regs[f],
+                        state.fregs[a].to_bits() as i64,
+                    ) as u64);
                     pc += 4;
                 }
                 OP_HOST_CALL2_F => {
@@ -1528,7 +1546,11 @@ pub mod float_bank {
                     let a = program[pc + 2] as usize;
                     let b = program[pc + 3] as usize;
                     let d = program[pc + 4] as usize;
-                    state.fregs[d] = host_call2_f(state.regs[f], state.fregs[a], state.fregs[b]);
+                    state.fregs[d] = f64::from_bits(host_call2_f(
+                        state.regs[f],
+                        state.fregs[a].to_bits() as i64,
+                        state.fregs[b].to_bits() as i64,
+                    ) as u64);
                     pc += 5;
                 }
                 OP_ADD_OVF => {
@@ -2624,18 +2646,18 @@ pub mod float_bank {
                     pc += 5;
                 }
                 OP_HOST_CALL1_F => {
-                    fregs[program[pc + 3] as usize] = host_call1_f(
+                    fregs[program[pc + 3] as usize] = f64::from_bits(host_call1_f(
                         regs[program[pc + 1] as usize],
-                        fregs[program[pc + 2] as usize],
-                    );
+                        fregs[program[pc + 2] as usize].to_bits() as i64,
+                    ) as u64);
                     pc += 4;
                 }
                 OP_HOST_CALL2_F => {
-                    fregs[program[pc + 4] as usize] = host_call2_f(
+                    fregs[program[pc + 4] as usize] = f64::from_bits(host_call2_f(
                         regs[program[pc + 1] as usize],
-                        fregs[program[pc + 2] as usize],
-                        fregs[program[pc + 3] as usize],
-                    );
+                        fregs[program[pc + 2] as usize].to_bits() as i64,
+                        fregs[program[pc + 3] as usize].to_bits() as i64,
+                    ) as u64);
                     pc += 5;
                 }
                 // The reference tier mirrors the fused-ovf None arm (wrapping
