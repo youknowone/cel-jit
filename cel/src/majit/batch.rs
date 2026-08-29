@@ -626,7 +626,8 @@ impl BatchProgram {
             reduce,
             body_words: self.lowered.body_words_for(resolved.rows, elems),
             compiled_saving_ps: compiled_saving_ps(&self.lowered, resolved.rows, elems),
-            projected: reduce == BatchReduce::PerRow && self.lowered.is_row_projection(),
+            projected: reduce == BatchReduce::PerRow
+                && (self.lowered.is_row_projection() || self.lowered.constant_result().is_some()),
             run: std::cell::RefCell::new(run),
             _derived: derived,
         })
@@ -2054,6 +2055,56 @@ mod tests {
                     .lowered()
                     .is_row_projection(),
                 "`{src}` has a body"
+            );
+        }
+    }
+
+    /// A constant program answers the way a projection does — the buffer is
+    /// filled when the batch is prepared and the clean tier runs nothing — and
+    /// what it is filled with agrees with the tiers that do run it.
+    #[test]
+    fn a_constant_program_answers_what_the_loop_it_replaces_answers() {
+        let s = schema(&[("x", ValType::Int)]);
+        let xs = [1i64, 2, 3, 4];
+        let cases = [
+            ("1 + 2 * 3 - 4 / 2", Value::Int(5)),
+            ("10 > 5 && 3 < 7 || 1 == 1", Value::Bool(true)),
+            ("1.5 * 2.0", Value::Float(3.0)),
+        ];
+        for (src, want_one) in cases {
+            let program = BatchProgram::compile(src, &s).unwrap();
+            assert!(
+                program.lowered().constant_result().is_some(),
+                "`{src}` folds to one word, so it is a constant program"
+            );
+            for rows in [1usize, 4] {
+                let batch = Batch::new(rows).column("x", ColumnRef::Int(&xs[..rows]));
+                let bound = program.bind_per_row(&batch).unwrap();
+                let cold_clean = bound.collect_on(Tier::Clean).unwrap();
+                let want = bound.collect_on(Tier::Interpreter).unwrap();
+                assert_eq!(want, vec![want_one.clone(); rows], "{src} at {rows} rows");
+                assert_eq!(cold_clean, want, "{src} at {rows} rows, before any run");
+                for tier in [Tier::Auto, Tier::Clean, Tier::Jit] {
+                    assert_eq!(bound.collect_on(tier).unwrap(), want, "{src}: {tier:?}");
+                }
+                assert_eq!(bound.route(Tier::Auto), Tier::Clean, "{src} at {rows} rows");
+            }
+        }
+    }
+
+    /// The other side: a string literal is seeded, not loaded, and anything
+    /// reading a column has a body, so neither is a constant program.
+    #[test]
+    fn a_seeded_or_computed_result_is_not_a_constant_program() {
+        let s = schema(&[("x", ValType::Int)]);
+        for src in ["x", "x + 1", "'a'"] {
+            assert_eq!(
+                BatchProgram::compile(src, &s)
+                    .unwrap()
+                    .lowered()
+                    .constant_result(),
+                None,
+                "`{src}` is not a constant program"
             );
         }
     }

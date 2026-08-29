@@ -771,6 +771,38 @@ impl LoweredF {
             && self.slots[0].reg == self.result_reg
     }
 
+    /// The word every row of this program answers with, when the program is a
+    /// constant: no slot, no body, no list output, and a prelude that is one
+    /// load of that word into the result register.
+    ///
+    /// The sibling of [`Self::is_row_projection`] with the column replaced by
+    /// a literal. The row loop such a program stands in for stores the same
+    /// word for every row, so the batch builder fills the output with it once
+    /// and the clean tier answers without running. A folded expression lands
+    /// here — `const_reg` puts the one literal the fold left in the prelude and
+    /// the body has nothing left to do.
+    ///
+    /// A string constant is not one: its register is seeded with a batch-ranked
+    /// id through `scalar_seeds`, not loaded by the prelude, and the answer
+    /// would need the distinct table the loop builds.
+    pub fn constant_result(&self) -> Option<i64> {
+        let [op, word, reg] = self.prelude.as_slice() else {
+            return None;
+        };
+        let load = if self.result_bank == ValType::Float {
+            OP_LOAD_CONST_F
+        } else {
+            OP_LOAD_CONST
+        };
+        (*op == load
+            && *reg as usize == self.result_reg
+            && self.body.is_empty()
+            && self.list_output.is_none()
+            && self.slots.is_empty()
+            && self.scalar_seeds.is_empty())
+        .then_some(*word)
+    }
+
     /// Build a **columnar batch** program over the two-bank machine: for each
     /// row `i` in `0..n`, load each slot's `col_k[i]` via a red-index `raw_load`
     /// (`OP_COL_LOAD` for int slots, `OP_COL_LOAD_F` for float slots), run the

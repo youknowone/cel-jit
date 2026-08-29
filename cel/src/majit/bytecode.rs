@@ -1030,8 +1030,11 @@ pub fn prepare_batch_reduce<'a>(
     // as the ids the loop would have loaded rather than as the caller's
     // strings, and those are `str_ids`' only entry — a program with a body is
     // not a projection, and only a body can ask for a predicate table.
-    let projection = match (reduce, lowered.is_row_projection()) {
-        (BatchReduce::PerRow, true) => {
+    // A constant program is the same shortcut with the column replaced by the
+    // one word its prelude loads: every row the loop would have stored is that
+    // word, so the buffer is filled with it here.
+    let projection = match reduce {
+        BatchReduce::PerRow if lowered.is_row_projection() => {
             let buf = out.as_mut().expect("a per-row run owns an output buffer");
             let buf = &mut buf[..n];
             match columns[0] {
@@ -1050,6 +1053,14 @@ pub fn prepare_batch_reduce<'a>(
             }
             true
         }
+        BatchReduce::PerRow => match lowered.constant_result() {
+            Some(word) => {
+                let buf = out.as_mut().expect("a per-row run owns an output buffer");
+                buf[..n].fill(word);
+                true
+            }
+            None => false,
+        },
         _ => false,
     };
     // A refcount bump on the words `lowered` owns, not a copy: every batch of
