@@ -221,6 +221,14 @@ pub const OP_HOST_CALL2_F: i64 = 62; // [f, fa, fb, fdst]    fregs[fdst] = f(fre
 pub const OP_INDEX_K: i64 = 63; // [off, len, k, base, dst, trap]    regs[dst] = *(regs[base] + (regs[off]+k)*8) if k < len else 0 (trap)
 pub const OP_INDEX_K_F: i64 = 64; // [off, len, k, base, fdst, trap] float twin
 
+// Append one value to a collected list: store it at the cursor's slot and
+// advance the cursor. The cursor is read and written by one instruction, so it
+// appears twice, once in each role, and the operand table stays honest about
+// both. One opcode where the expanded form took three: the byte scale, the
+// store and the advance.
+pub const OP_COL_PUSH: i64 = 65; // [base, cur, src, cur]   *(regs[base] + regs[cur]*8) = regs[src]; regs[cur] += 1
+pub const OP_COL_PUSH_F: i64 = 66; // [base, cur, fsrc, cur] float twin
+
 /// What one word after an opcode means, for a consumer that walks a program
 /// without running it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -258,7 +266,7 @@ use Operand::{Float, FloatOut, Imm, Int, IntOut, IntTrap, Target};
 /// so an opcode added past it without a row here is a compile error on this
 /// array instead of an out-of-bounds index the first time that opcode is
 /// decoded.
-pub const OPERANDS: [&[Operand]; OP_INDEX_K_F as usize + 1] = [
+pub const OPERANDS: [&[Operand]; OP_COL_PUSH_F as usize + 1] = [
     &[Imm, IntOut],                           // 0  LOAD_CONST
     &[Int, IntOut],                           // 1  MOV
     &[Int, Int, IntOut],                      // 2  ADD
@@ -324,6 +332,8 @@ pub const OPERANDS: [&[Operand]; OP_INDEX_K_F as usize + 1] = [
     &[Int, Float, Float, FloatOut],           // 62 HOST_CALL2_F
     &[Int, Int, Imm, Int, IntOut, IntTrap],   // 63 INDEX_K
     &[Int, Int, Imm, Int, FloatOut, IntTrap], // 64 INDEX_K_F
+    &[Int, Int, Int, IntOut],                 // 65 COL_PUSH
+    &[Int, Int, Float, IntOut],               // 66 COL_PUSH_F
 ];
 
 /// What one [`check_code`] established about one program: the words it read,
@@ -1381,13 +1391,14 @@ pub mod float_bank {
     /// them under. What moved is who owns the counters.
     use super::{
         OP_ADD, OP_ADD_IMM, OP_ADD_OVF, OP_AND, OP_COL_LOAD, OP_COL_LOAD_B, OP_COL_LOAD_F,
-        OP_COL_STORE, OP_COL_STORE_F, OP_DIV, OP_DIV_CHK, OP_EQ, OP_F2I, OP_F2U, OP_FADD, OP_FDIV,
-        OP_FEQ, OP_FGE, OP_FGT, OP_FLE, OP_FLT, OP_FMOV, OP_FMUL, OP_FNE, OP_FNEG, OP_FSELECT,
-        OP_FSUB, OP_GE, OP_GT, OP_HOST_CALL1_F, OP_HOST_CALL1_I, OP_HOST_CALL2_F, OP_HOST_CALL2_I,
-        OP_I2F, OP_INDEX_K, OP_INDEX_K_F, OP_JUMP_IF_ABOVE, OP_LE, OP_LOAD_CONST, OP_LOAD_CONST_F,
-        OP_LT, OP_MOD, OP_MOD_CHK, OP_MOV, OP_MUL, OP_MUL_IMM, OP_MUL_OVF, OP_NE, OP_NEG, OP_NOT,
-        OP_OR, OP_RETURN, OP_RETURN_F, OP_SELECT, OP_SUB, OP_SUB_OVF, OP_TRAP_STORE, OP_U2F,
-        OP_UADD_OVF, OP_UDIV, OP_ULE, OP_ULT, OP_UMOD, OP_UMUL_OVF, OP_USUB_OVF,
+        OP_COL_PUSH, OP_COL_PUSH_F, OP_COL_STORE, OP_COL_STORE_F, OP_DIV, OP_DIV_CHK, OP_EQ,
+        OP_F2I, OP_F2U, OP_FADD, OP_FDIV, OP_FEQ, OP_FGE, OP_FGT, OP_FLE, OP_FLT, OP_FMOV, OP_FMUL,
+        OP_FNE, OP_FNEG, OP_FSELECT, OP_FSUB, OP_GE, OP_GT, OP_HOST_CALL1_F, OP_HOST_CALL1_I,
+        OP_HOST_CALL2_F, OP_HOST_CALL2_I, OP_I2F, OP_INDEX_K, OP_INDEX_K_F, OP_JUMP_IF_ABOVE,
+        OP_LE, OP_LOAD_CONST, OP_LOAD_CONST_F, OP_LT, OP_MOD, OP_MOD_CHK, OP_MOV, OP_MUL,
+        OP_MUL_IMM, OP_MUL_OVF, OP_NE, OP_NEG, OP_NOT, OP_OR, OP_RETURN, OP_RETURN_F, OP_SELECT,
+        OP_SUB, OP_SUB_OVF, OP_TRAP_STORE, OP_U2F, OP_UADD_OVF, OP_UDIV, OP_ULE, OP_ULT, OP_UMOD,
+        OP_UMUL_OVF, OP_USUB_OVF,
     };
 
     // The four calling conventions of `magic::ScalarFn`, each reading its
@@ -2010,6 +2021,21 @@ pub mod float_bank {
                     };
                     state.fregs[d] = majit_bits_to_f64(bits);
                     pc += 7;
+                }
+                OP_COL_PUSH => {
+                    let base = state.regs[program[pc + 1] as usize];
+                    let c = state.regs[program[pc + 2] as usize];
+                    majit_raw_store_i64(base, c * 8, state.regs[program[pc + 3] as usize]);
+                    state.regs[program[pc + 4] as usize] = c + 1;
+                    pc += 5;
+                }
+                OP_COL_PUSH_F => {
+                    let base = state.regs[program[pc + 1] as usize];
+                    let c = state.regs[program[pc + 2] as usize];
+                    let bits = majit_f64_to_bits(state.fregs[program[pc + 3] as usize]);
+                    majit_raw_store_i64(base, c * 8, bits);
+                    state.regs[program[pc + 4] as usize] = c + 1;
+                    pc += 5;
                 }
                 OP_LOAD_CONST_F => {
                     state.fregs[program[pc + 2] as usize] = f64::from_bits(program[pc + 1] as u64);
@@ -3043,6 +3069,21 @@ pub mod float_bank {
                         0.0
                     };
                     pc += 7;
+                }
+                OP_COL_PUSH => {
+                    let base = regs[program[pc + 1] as usize];
+                    let c = regs[program[pc + 2] as usize];
+                    majit_raw_store_i64(base, c * 8, regs[program[pc + 3] as usize]);
+                    regs[program[pc + 4] as usize] = c + 1;
+                    pc += 5;
+                }
+                OP_COL_PUSH_F => {
+                    let base = regs[program[pc + 1] as usize];
+                    let c = regs[program[pc + 2] as usize];
+                    let bits = majit_f64_to_bits(fregs[program[pc + 3] as usize]);
+                    majit_raw_store_i64(base, c * 8, bits);
+                    regs[program[pc + 4] as usize] = c + 1;
+                    pc += 5;
                 }
                 OP_LOAD_CONST_F => {
                     fregs[program[pc + 2] as usize] = f64::from_bits(program[pc + 1] as u64);

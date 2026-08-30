@@ -4231,8 +4231,8 @@ fn emit_element_store(
         bank: ValType::Int,
         idx: cursor,
     };
-    let ea = emit_int_bin_k(ctx, OP_MUL, cur, 8);
-    for (k, (field, ty)) in out.fields.iter().enumerate() {
+    let mut values = Vec::with_capacity(out.fields.len());
+    for (field, ty) in &out.fields {
         let v = match appended {
             Appended::Element(name) => {
                 ctx.iter_var_slot(name, field.as_deref())?.ok_or_else(|| {
@@ -4244,7 +4244,29 @@ fn emit_element_store(
         if v.bank != *ty {
             return Err(LowerError::unsupported("collected element bank"));
         }
-        let op = if *ty == ValType::Float {
+        values.push(v);
+    }
+    // One output column appends in one instruction: the store and the advance
+    // fused, the byte scale inside. Several columns share one scaled address
+    // and advance once after the last store.
+    if let [v] = values[..] {
+        let op = if v.bank == ValType::Float {
+            OP_COL_PUSH_F
+        } else {
+            OP_COL_PUSH
+        };
+        ctx.body.extend_from_slice(&[
+            op,
+            out.base_regs[0] as i64,
+            cursor as i64,
+            v.idx as i64,
+            cursor as i64,
+        ]);
+        return Ok(());
+    }
+    let ea = emit_int_bin_k(ctx, OP_MUL, cur, 8);
+    for (k, v) in values.into_iter().enumerate() {
+        let op = if v.bank == ValType::Float {
             OP_COL_STORE_F
         } else {
             OP_COL_STORE

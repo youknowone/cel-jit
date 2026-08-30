@@ -1964,6 +1964,74 @@ mod tests {
         }
     }
 
+    /// A single-column collect appends in one fused instruction, on the
+    /// unrolled literal shape and on the runtime-list loop alike; a record
+    /// output with several columns keeps the shared scaled address.
+    #[test]
+    fn a_single_column_collect_appends_in_one_instruction() {
+        use crate::majit::bytecode::{OPERANDS, OP_ADD_IMM, OP_COL_PUSH, OP_COL_STORE};
+        let opcodes = |code: &[i64]| -> Vec<i64> {
+            let mut pc = 0;
+            let mut ops = Vec::new();
+            while pc < code.len() {
+                ops.push(code[pc]);
+                pc += 1 + OPERANDS[code[pc] as usize].len();
+            }
+            ops
+        };
+        let s = schema(&[("xs[]", ValType::Int)]);
+        let lens = vec![3i64];
+        let xs = vec![1i64, 2, 3];
+        let batch = Batch::new(1).column(
+            "xs",
+            ColumnRef::List {
+                lens: &lens,
+                fields: vec![(None, ColumnRef::Int(&xs))],
+            },
+        );
+        let mut ctx = Context::default();
+        ctx.add_variable_from_value("xs", vec![1i64, 2, 3]);
+        for src in [
+            "[1, 2, 3].map(x, x * 2)",
+            "xs.map(x, x * 2)",
+            "xs.filter(x, x > 1)",
+        ] {
+            let program = Program::compile(src).unwrap();
+            let batched =
+                BatchProgram::from_program(&program, &s).unwrap_or_else(|e| panic!("{src}: {e}"));
+            let ops = opcodes(&batched.lowered().body);
+            assert!(
+                ops.contains(&OP_COL_PUSH),
+                "{src}: no fused append: {ops:?}"
+            );
+            assert!(
+                !ops.contains(&OP_COL_STORE),
+                "{src}: an unfused store: {ops:?}"
+            );
+            let bound = batched.bind_per_row(&batch).unwrap();
+            let walker = vec![program.execute(&ctx).unwrap()];
+            for tier in [Tier::Clean, Tier::Interpreter, Tier::Jit] {
+                assert_eq!(bound.collect_on(tier).unwrap(), walker, "{src} on {tier:?}");
+            }
+        }
+        // Two declared columns: two stores at one scaled address, one advance.
+        let s = schema(&[
+            ("items[].price", ValType::Int),
+            ("items[].qty", ValType::Int),
+        ]);
+        let program = Program::compile("items.filter(i, i.price > 1)").unwrap();
+        let batched = BatchProgram::from_program(&program, &s).unwrap();
+        let ops = opcodes(&batched.lowered().body);
+        assert!(
+            !ops.contains(&OP_COL_PUSH),
+            "a two-column collect has no single column to fuse"
+        );
+        assert!(
+            ops.contains(&OP_ADD_IMM),
+            "the two-column collect advances after its stores"
+        );
+    }
+
     #[test]
     fn a_one_row_batch_runs_the_straight_line_form_and_agrees_with_the_loop() {
         let s = schema(&[
