@@ -209,6 +209,18 @@ pub const OP_HOST_CALL2_I: i64 = 60; // [f, a, b, dst]       regs[dst] = f(regs[
 pub const OP_HOST_CALL1_F: i64 = 61; // [f, fa, fdst]        fregs[fdst] = f(fregs[fa])
 pub const OP_HOST_CALL2_F: i64 = 62; // [f, fa, fb, fdst]    fregs[fdst] = f(fregs[fa], fregs[fb])
 
+// A constant-index list read, `list[k]`, in one instruction. `off` and `len`
+// are the row's `offset(list)` / `size(list)` registers, `k` the literal index,
+// `base` the flattened element column. In range, the element at
+// `(off + k) * 8` lands in `dst`; out of range the trap flag is set and `dst`
+// is 0 — the row is refused either way, but the register the rest of the body
+// reads must not depend on what a previous row left behind. One opcode where
+// the expanded form took eight: the default store, the compare, the OR into the
+// trap flag, the skip jump, the index add, the byte scale, the load and the
+// move back.
+pub const OP_INDEX_K: i64 = 63; // [off, len, k, base, dst, trap]    regs[dst] = *(regs[base] + (regs[off]+k)*8) if k < len else 0 (trap)
+pub const OP_INDEX_K_F: i64 = 64; // [off, len, k, base, fdst, trap] float twin
+
 /// What one word after an opcode means, for a consumer that walks a program
 /// without running it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -246,70 +258,72 @@ use Operand::{Float, FloatOut, Imm, Int, IntOut, IntTrap, Target};
 /// so an opcode added past it without a row here is a compile error on this
 /// array instead of an out-of-bounds index the first time that opcode is
 /// decoded.
-pub const OPERANDS: [&[Operand]; OP_HOST_CALL2_F as usize + 1] = [
-    &[Imm, IntOut],                 // 0  LOAD_CONST
-    &[Int, IntOut],                 // 1  MOV
-    &[Int, Int, IntOut],            // 2  ADD
-    &[Int, Int, IntOut],            // 3  SUB
-    &[Int, Int, IntOut],            // 4  MUL
-    &[Int, IntOut],                 // 5  NEG
-    &[Int, Int, IntOut],            // 6  GE
-    &[Int, Int, IntOut],            // 7  GT
-    &[Int, Int, IntOut],            // 8  LE
-    &[Int, Int, IntOut],            // 9  LT
-    &[Int, Int, IntOut],            // 10 EQ
-    &[Int, Int, IntOut],            // 11 NE
-    &[Int, Int, IntOut],            // 12 AND
-    &[Int, Int, IntOut],            // 13 OR
-    &[Int, IntOut],                 // 14 NOT
-    &[Int, Int, Int, IntOut],       // 15 SELECT
-    &[Int, Int, Target],            // 16 JUMP_IF_ABOVE
-    &[Int],                         // 17 RETURN
-    &[Int, Int, IntOut],            // 18 DIV
-    &[Int, Int, IntOut],            // 19 MOD
-    &[Int, Int, IntOut],            // 20 COL_LOAD
-    &[Int, Int, FloatOut],          // 21 COL_LOAD_F
-    &[Imm, FloatOut],               // 22 LOAD_CONST_F
-    &[Float, FloatOut],             // 23 FMOV
-    &[Float, Float, FloatOut],      // 24 FADD
-    &[Float, Float, FloatOut],      // 25 FSUB
-    &[Float, Float, FloatOut],      // 26 FMUL
-    &[Float, Float, FloatOut],      // 27 FDIV
-    &[Float, FloatOut],             // 28 FNEG
-    &[Float, Float, IntOut],        // 29 FGE
-    &[Float, Float, IntOut],        // 30 FGT
-    &[Float, Float, IntOut],        // 31 FLE
-    &[Float, Float, IntOut],        // 32 FLT
-    &[Float, Float, IntOut],        // 33 FEQ
-    &[Float, Float, IntOut],        // 34 FNE
-    &[Int, FloatOut],               // 35 I2F
-    &[Float],                       // 36 RETURN_F
-    &[Int, Float, Float, FloatOut], // 37 FSELECT
-    &[Int, Int, IntOut],            // 38 ULT
-    &[Int, Int, IntOut],            // 39 ULE
-    &[Int, Int, IntOut, IntTrap],   // 40 ADD_OVF
-    &[Int, Int, IntOut, IntTrap],   // 41 SUB_OVF
-    &[Int, Int, IntOut, IntTrap],   // 42 MUL_OVF
-    &[Int, Int],                    // 43 TRAP_STORE
-    &[Float, IntOut],               // 44 F2I
-    &[Int, Int, IntOut, IntTrap],   // 45 DIV_CHK
-    &[Int, Int, IntOut, IntTrap],   // 46 MOD_CHK
-    &[Int, Int, IntOut, IntTrap],   // 47 UDIV
-    &[Int, Int, IntOut, IntTrap],   // 48 UMOD
-    &[Int, Int, IntOut, IntTrap],   // 49 UADD_OVF
-    &[Int, Int, IntOut, IntTrap],   // 50 USUB_OVF
-    &[Int, Int, IntOut, IntTrap],   // 51 UMUL_OVF
-    &[Int, FloatOut],               // 52 U2F
-    &[Float, IntOut],               // 53 F2U
-    &[Int, Int, Int],               // 54 COL_STORE
-    &[Int, Int, Float],             // 55 COL_STORE_F
-    &[Int, Int, IntOut],            // 56 COL_LOAD_B
-    &[Int, Imm, IntOut],            // 57 MUL_IMM
-    &[Int, Imm, IntOut],            // 58 ADD_IMM
-    &[Int, Int, IntOut],            // 59 HOST_CALL1_I
-    &[Int, Int, Int, IntOut],       // 60 HOST_CALL2_I
-    &[Int, Float, FloatOut],        // 61 HOST_CALL1_F
-    &[Int, Float, Float, FloatOut], // 62 HOST_CALL2_F
+pub const OPERANDS: [&[Operand]; OP_INDEX_K_F as usize + 1] = [
+    &[Imm, IntOut],                           // 0  LOAD_CONST
+    &[Int, IntOut],                           // 1  MOV
+    &[Int, Int, IntOut],                      // 2  ADD
+    &[Int, Int, IntOut],                      // 3  SUB
+    &[Int, Int, IntOut],                      // 4  MUL
+    &[Int, IntOut],                           // 5  NEG
+    &[Int, Int, IntOut],                      // 6  GE
+    &[Int, Int, IntOut],                      // 7  GT
+    &[Int, Int, IntOut],                      // 8  LE
+    &[Int, Int, IntOut],                      // 9  LT
+    &[Int, Int, IntOut],                      // 10 EQ
+    &[Int, Int, IntOut],                      // 11 NE
+    &[Int, Int, IntOut],                      // 12 AND
+    &[Int, Int, IntOut],                      // 13 OR
+    &[Int, IntOut],                           // 14 NOT
+    &[Int, Int, Int, IntOut],                 // 15 SELECT
+    &[Int, Int, Target],                      // 16 JUMP_IF_ABOVE
+    &[Int],                                   // 17 RETURN
+    &[Int, Int, IntOut],                      // 18 DIV
+    &[Int, Int, IntOut],                      // 19 MOD
+    &[Int, Int, IntOut],                      // 20 COL_LOAD
+    &[Int, Int, FloatOut],                    // 21 COL_LOAD_F
+    &[Imm, FloatOut],                         // 22 LOAD_CONST_F
+    &[Float, FloatOut],                       // 23 FMOV
+    &[Float, Float, FloatOut],                // 24 FADD
+    &[Float, Float, FloatOut],                // 25 FSUB
+    &[Float, Float, FloatOut],                // 26 FMUL
+    &[Float, Float, FloatOut],                // 27 FDIV
+    &[Float, FloatOut],                       // 28 FNEG
+    &[Float, Float, IntOut],                  // 29 FGE
+    &[Float, Float, IntOut],                  // 30 FGT
+    &[Float, Float, IntOut],                  // 31 FLE
+    &[Float, Float, IntOut],                  // 32 FLT
+    &[Float, Float, IntOut],                  // 33 FEQ
+    &[Float, Float, IntOut],                  // 34 FNE
+    &[Int, FloatOut],                         // 35 I2F
+    &[Float],                                 // 36 RETURN_F
+    &[Int, Float, Float, FloatOut],           // 37 FSELECT
+    &[Int, Int, IntOut],                      // 38 ULT
+    &[Int, Int, IntOut],                      // 39 ULE
+    &[Int, Int, IntOut, IntTrap],             // 40 ADD_OVF
+    &[Int, Int, IntOut, IntTrap],             // 41 SUB_OVF
+    &[Int, Int, IntOut, IntTrap],             // 42 MUL_OVF
+    &[Int, Int],                              // 43 TRAP_STORE
+    &[Float, IntOut],                         // 44 F2I
+    &[Int, Int, IntOut, IntTrap],             // 45 DIV_CHK
+    &[Int, Int, IntOut, IntTrap],             // 46 MOD_CHK
+    &[Int, Int, IntOut, IntTrap],             // 47 UDIV
+    &[Int, Int, IntOut, IntTrap],             // 48 UMOD
+    &[Int, Int, IntOut, IntTrap],             // 49 UADD_OVF
+    &[Int, Int, IntOut, IntTrap],             // 50 USUB_OVF
+    &[Int, Int, IntOut, IntTrap],             // 51 UMUL_OVF
+    &[Int, FloatOut],                         // 52 U2F
+    &[Float, IntOut],                         // 53 F2U
+    &[Int, Int, Int],                         // 54 COL_STORE
+    &[Int, Int, Float],                       // 55 COL_STORE_F
+    &[Int, Int, IntOut],                      // 56 COL_LOAD_B
+    &[Int, Imm, IntOut],                      // 57 MUL_IMM
+    &[Int, Imm, IntOut],                      // 58 ADD_IMM
+    &[Int, Int, IntOut],                      // 59 HOST_CALL1_I
+    &[Int, Int, Int, IntOut],                 // 60 HOST_CALL2_I
+    &[Int, Float, FloatOut],                  // 61 HOST_CALL1_F
+    &[Int, Float, Float, FloatOut],           // 62 HOST_CALL2_F
+    &[Int, Int, Imm, Int, IntOut, IntTrap],   // 63 INDEX_K
+    &[Int, Int, Imm, Int, FloatOut, IntTrap], // 64 INDEX_K_F
 ];
 
 /// What one [`check_code`] established about one program: the words it read,
@@ -1370,10 +1384,10 @@ pub mod float_bank {
         OP_COL_STORE, OP_COL_STORE_F, OP_DIV, OP_DIV_CHK, OP_EQ, OP_F2I, OP_F2U, OP_FADD, OP_FDIV,
         OP_FEQ, OP_FGE, OP_FGT, OP_FLE, OP_FLT, OP_FMOV, OP_FMUL, OP_FNE, OP_FNEG, OP_FSELECT,
         OP_FSUB, OP_GE, OP_GT, OP_HOST_CALL1_F, OP_HOST_CALL1_I, OP_HOST_CALL2_F, OP_HOST_CALL2_I,
-        OP_I2F, OP_JUMP_IF_ABOVE, OP_LE, OP_LOAD_CONST, OP_LOAD_CONST_F, OP_LT, OP_MOD, OP_MOD_CHK,
-        OP_MOV, OP_MUL, OP_MUL_IMM, OP_MUL_OVF, OP_NE, OP_NEG, OP_NOT, OP_OR, OP_RETURN,
-        OP_RETURN_F, OP_SELECT, OP_SUB, OP_SUB_OVF, OP_TRAP_STORE, OP_U2F, OP_UADD_OVF, OP_UDIV,
-        OP_ULE, OP_ULT, OP_UMOD, OP_UMUL_OVF, OP_USUB_OVF,
+        OP_I2F, OP_INDEX_K, OP_INDEX_K_F, OP_JUMP_IF_ABOVE, OP_LE, OP_LOAD_CONST, OP_LOAD_CONST_F,
+        OP_LT, OP_MOD, OP_MOD_CHK, OP_MOV, OP_MUL, OP_MUL_IMM, OP_MUL_OVF, OP_NE, OP_NEG, OP_NOT,
+        OP_OR, OP_RETURN, OP_RETURN_F, OP_SELECT, OP_SUB, OP_SUB_OVF, OP_TRAP_STORE, OP_U2F,
+        OP_UADD_OVF, OP_UDIV, OP_ULE, OP_ULT, OP_UMOD, OP_UMUL_OVF, OP_USUB_OVF,
     };
 
     // The four calling conventions of `magic::ScalarFn`, each reading its
@@ -1963,6 +1977,39 @@ pub mod float_bank {
                     let ea = state.regs[program[pc + 2] as usize];
                     state.fregs[program[pc + 3] as usize] = majit_raw_load_f(base, ea);
                     pc += 4;
+                }
+                OP_INDEX_K => {
+                    let off = state.regs[program[pc + 1] as usize];
+                    let len = state.regs[program[pc + 2] as usize];
+                    let k = program[pc + 3];
+                    let base = state.regs[program[pc + 4] as usize];
+                    let d = program[pc + 5] as usize;
+                    let t = program[pc + 6] as usize;
+                    state.regs[d] = if k < len {
+                        majit_raw_load_i64(base, (off + k) * 8)
+                    } else {
+                        state.regs[t] = 1;
+                        0
+                    };
+                    pc += 7;
+                }
+                OP_INDEX_K_F => {
+                    let off = state.regs[program[pc + 1] as usize];
+                    let len = state.regs[program[pc + 2] as usize];
+                    let k = program[pc + 3];
+                    let base = state.regs[program[pc + 4] as usize];
+                    let d = program[pc + 5] as usize;
+                    let t = program[pc + 6] as usize;
+                    // Carried as bits: the lowerer expresses a float only as
+                    // the result of one float op, not as a branch's value.
+                    let bits = if k < len {
+                        majit_f64_to_bits(majit_raw_load_f(base, (off + k) * 8))
+                    } else {
+                        state.regs[t] = 1;
+                        0
+                    };
+                    state.fregs[d] = majit_bits_to_f64(bits);
+                    pc += 7;
                 }
                 OP_LOAD_CONST_F => {
                     state.fregs[program[pc + 2] as usize] = f64::from_bits(program[pc + 1] as u64);
@@ -2966,6 +3013,36 @@ pub mod float_bank {
                     let ea = regs[program[pc + 2] as usize];
                     fregs[program[pc + 3] as usize] = majit_raw_load_f(base, ea);
                     pc += 4;
+                }
+                OP_INDEX_K => {
+                    let off = regs[program[pc + 1] as usize];
+                    let len = regs[program[pc + 2] as usize];
+                    let k = program[pc + 3];
+                    let base = regs[program[pc + 4] as usize];
+                    let d = program[pc + 5] as usize;
+                    let t = program[pc + 6] as usize;
+                    regs[d] = if k < len {
+                        majit_raw_load_i64(base, (off + k) * 8)
+                    } else {
+                        regs[t] = 1;
+                        0
+                    };
+                    pc += 7;
+                }
+                OP_INDEX_K_F => {
+                    let off = regs[program[pc + 1] as usize];
+                    let len = regs[program[pc + 2] as usize];
+                    let k = program[pc + 3];
+                    let base = regs[program[pc + 4] as usize];
+                    let d = program[pc + 5] as usize;
+                    let t = program[pc + 6] as usize;
+                    fregs[d] = if k < len {
+                        majit_raw_load_f(base, (off + k) * 8)
+                    } else {
+                        regs[t] = 1;
+                        0.0
+                    };
+                    pc += 7;
                 }
                 OP_LOAD_CONST_F => {
                     fregs[program[pc + 2] as usize] = f64::from_bits(program[pc + 1] as u64);

@@ -1588,6 +1588,21 @@ impl LowerCtxF<'_> {
             .map_or(ea_reg, |l| l.idx_reg)
     }
 
+    /// Park an element column's base for a load the CALLER emits — the fused
+    /// constant-index read — and return the base register. `value` is the
+    /// register that load writes, recorded on the slot like
+    /// [`LowerCtxF::elem_slot_typed`] records its own.
+    fn elem_base(&mut self, path: String, ty: ValType, value: TReg) -> usize {
+        let base_reg = self.fresh(ValType::Int).idx;
+        self.slots.push(SlotInfoF {
+            path,
+            ty,
+            reg: value.idx,
+            kind: SlotKind::Element { base_reg },
+        });
+        base_reg
+    }
+
     fn elem_slot_typed(&mut self, path: String, ty: ValType, ea_reg: usize) -> TReg {
         if let Some(&r) = self.elem_map.get(&(path.clone(), ea_reg)) {
             return r;
@@ -4294,21 +4309,38 @@ fn lower_const_index(
     }
     let len = ctx.slot_typed(size_slot_path(list), ValType::Int);
     let off = ctx.slot_typed(offset_slot_path(list), ValType::Int);
+
+    // An int or double element reads in one fused instruction, `OP_INDEX_K`,
+    // which carries the range check, the trap, the default and the load. A
+    // `bool` element column is one byte per element and has no fused form, so
+    // it keeps the expanded shape below.
+    if matches!(ty, ValType::Int | ValType::Float) {
+        let out = ctx.fresh(ty);
+        let base_reg = ctx.elem_base(elem_path, ty, out);
+        let op = match ty {
+            ValType::Float => OP_INDEX_K_F,
+            _ => OP_INDEX_K,
+        };
+        ctx.body.extend_from_slice(&[
+            op,
+            off.idx as i64,
+            len.idx as i64,
+            k,
+            base_reg as i64,
+            out.idx as i64,
+            OVF_FLAG_REG as i64,
+        ]);
+        return Ok(out);
+    }
+
     let kr = emit_int_const(ctx, k);
 
     // The result register is written on the in-range path only, so give it a
     // defined value first: the row traps either way, but a register the loop
     // reads must not depend on what a previous row left behind.
     let out = ctx.fresh(ty);
-    match ty {
-        ValType::Float => {
-            let zero = emit_float_const(ctx, 0.0);
-            emit_mov(ctx, zero, out);
-        }
-        _ => ctx
-            .body
-            .extend_from_slice(&[OP_LOAD_CONST, 0, out.idx as i64]),
-    }
+    ctx.body
+        .extend_from_slice(&[OP_LOAD_CONST, 0, out.idx as i64]);
 
     let trap = TReg {
         bank: ValType::Int,

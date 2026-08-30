@@ -5178,6 +5178,82 @@ mod tests {
         );
     }
 
+    /// `list[k]` over a `double` element column: the float twin of the fused
+    /// constant-index read, against the tree-walker on every tier, and the
+    /// compiled tier both answering the in-range rows and refusing a batch
+    /// with a short row.
+    #[test]
+    fn constant_index_float_elements() {
+        use super::batch::{Batch, BatchProgram, ColumnRef, Tier};
+        use super::bytecode::float_bank::{abort_reasons, abort_reasons_since, jit_stats};
+
+        let mut lens = Vec::new();
+        let mut elems = Vec::new();
+        for r in 0..400i64 {
+            let n = if r % 7 == 3 { 1 } else { 3 };
+            lens.push(n);
+            for k in 0..n {
+                elems.push((r * 10 + k) as f64 * 0.5);
+            }
+        }
+        let walker_sum = |src: &str| -> Option<f64> {
+            let program = Program::compile(src).unwrap();
+            let mut total = 0.0;
+            let mut off = 0usize;
+            for len in &lens {
+                let n = *len as usize;
+                let list: Vec<Value> = elems[off..off + n]
+                    .iter()
+                    .map(|v| Value::Float(*v))
+                    .collect();
+                off += n;
+                let mut ctx = Context::default();
+                ctx.add_variable_from_value("items", Value::list(list));
+                total += match program.execute(&ctx).ok()? {
+                    Value::Float(f) => f,
+                    other => panic!("`{src}`: unexpected {other:?}"),
+                };
+            }
+            Some(total)
+        };
+        let schema: Schema = [("items[]".to_string(), ValType::Float)]
+            .into_iter()
+            .collect();
+        let batch = Batch::new(lens.len()).column(
+            "items",
+            ColumnRef::List {
+                lens: &lens,
+                fields: vec![(None, ColumnRef::Float(&elems))],
+            },
+        );
+        for src in ["items[0]", "items[1]", "items[0] + items[2] * 2.0"] {
+            let program = BatchProgram::compile(src, &schema)
+                .unwrap_or_else(|e| panic!("lower `{src}`: {e}"));
+            let bound = program.bind(&batch).unwrap();
+            let expected = walker_sum(src);
+            let before = jit_stats();
+            let reasons_before = abort_reasons();
+            for tier in [Tier::Clean, Tier::Interpreter, Tier::Jit] {
+                let got = bound.sum_on(tier).ok().map(|v| match v {
+                    Value::Float(f) => f,
+                    other => panic!("`{src}`: unexpected {other:?}"),
+                });
+                assert_eq!(got, expected, "`{src}` on {tier:?}: machine vs tree-walker");
+            }
+            let after = jit_stats();
+            assert_eq!(
+                after.loops_aborted,
+                before.loops_aborted,
+                "`{src}`: the fused float read aborted the trace: {}",
+                abort_reasons_since(&reasons_before)
+            );
+            assert!(
+                after.loops_compiled > before.loops_compiled,
+                "`{src}`: the loop must actually have been traced and compiled"
+            );
+        }
+    }
+
     /// The same read through a list of STRUCTS, where the index picks the
     /// element and the field picks the column. `resolve_path` stops at the
     /// index, so this shape is recognised before it is asked.
