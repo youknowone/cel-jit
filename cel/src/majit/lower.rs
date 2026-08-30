@@ -1521,6 +1521,19 @@ impl LowerCtxF<'_> {
         r
     }
 
+    /// The word `r` holds on every row, when `r` is one the prelude loads: the
+    /// reverse of [`Self::const_reg`]. A register the body writes never comes
+    /// from the pool, so a hit here is a value the lowering can compute once,
+    /// now, instead of the row loop computing it on every row — which is what
+    /// an unrolled literal comprehension leaves behind: its iteration variable
+    /// is a pool register, so `x * 2` over `[1, 2, 3]` is three constant
+    /// products.
+    fn const_of(&self, r: TReg) -> Option<i64> {
+        self.const_pool
+            .iter()
+            .find_map(|(&(bank, word), p)| (bank == r.bank && p.idx == r.idx).then_some(word))
+    }
+
     /// Resolve a row slot whose type the schema must declare. An UNDECLARED path
     /// is a decline, not a guess: the bank decides which ops the path is legal
     /// under (`!x` needs `bool`, `x + 1` needs a numeric bank), so defaulting it
@@ -1907,6 +1920,19 @@ fn emit_int_const(ctx: &mut LowerCtxF, v: i64) -> TReg {
 
 /// Emit a three-address int-bank op `dst = a <op> b` into the body.
 fn emit_int_bin(ctx: &mut LowerCtxF, op: i64, a: TReg, b: TReg) -> TReg {
+    // Two pool constants fold to a third; these are the machine's own wrapping
+    // ops, so the fold wraps the same way the row loop would have.
+    if let (Some(x), Some(y)) = (ctx.const_of(a), ctx.const_of(b)) {
+        let folded = match op {
+            OP_ADD => Some(x.wrapping_add(y)),
+            OP_SUB => Some(x.wrapping_sub(y)),
+            OP_MUL => Some(x.wrapping_mul(y)),
+            _ => None,
+        };
+        if let Some(v) = folded {
+            return emit_int_const(ctx, v);
+        }
+    }
     let d = ctx.fresh(ValType::Int);
     ctx.body
         .extend_from_slice(&[op, a.idx as i64, b.idx as i64, d.idx as i64]);
@@ -2946,6 +2972,12 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
                 ))),
             };
         }
+        // Two constants of one numeric or bool bank compare now, once.
+        if let (Some(x), Some(y)) = (ctx.const_of(a), ctx.const_of(b)) {
+            if let Some(word) = fold_cmp(name, a.bank, b.bank, x, y) {
+                return Ok(ctx.const_reg(ValType::Bool, word));
+            }
+        }
         // String, timestamp and duration all compare as signed ints, for the
         // same reason: their `i64` encoding is order-preserving. A timestamp and
         // a duration are i64 nanoseconds, whose signed order is the
@@ -3111,6 +3143,16 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
             // trap here would mean the bound was not enforced.
             ctx.temporal_ops += 1;
             return Ok(emit_trapping(ctx, iop, result_bank));
+        }
+        // Both operands known while lowering — an unrolled literal
+        // comprehension's `x * 2`, a literal appended by a step — fold to one
+        // constant. Only where the row loop would have ANSWERED: an overflow or
+        // a zero divisor stays an op, so the row traps the way the tree-walker
+        // raises.
+        if let (Some(x), Some(y)) = (ctx.const_of(a), ctx.const_of(b)) {
+            if let Some(word) = fold_arith(name, a.bank, b.bank, x, y) {
+                return Ok(ctx.const_reg(a.bank, word));
+            }
         }
         match (a.bank, b.bank) {
             (ValType::Int, ValType::Int) => Ok(emit_trapping(ctx, iop, ValType::Int)),
@@ -4360,6 +4402,74 @@ fn lower_const_index(
     emit_mov(ctx, v, out);
     ctx.patch_jump(skip);
     Ok(out)
+}
+
+/// `x <name> y` for two same-bank constants, as the word the bank stores, or
+/// `None` where the op would trap (or the banks are not one numeric bank).
+fn fold_arith(name: &str, bank_a: ValType, bank_b: ValType, x: i64, y: i64) -> Option<i64> {
+    if bank_a != bank_b {
+        return None;
+    }
+    match bank_a {
+        ValType::Int => match name {
+            ops::ADD => x.checked_add(y),
+            ops::SUBSTRACT => x.checked_sub(y),
+            ops::MULTIPLY => x.checked_mul(y),
+            ops::DIVIDE => x.checked_div(y),
+            ops::MODULO => x.checked_rem(y),
+            _ => None,
+        },
+        ValType::UInt => {
+            let (x, y) = (x as u64, y as u64);
+            match name {
+                ops::ADD => x.checked_add(y),
+                ops::SUBSTRACT => x.checked_sub(y),
+                ops::MULTIPLY => x.checked_mul(y),
+                ops::DIVIDE => x.checked_div(y),
+                ops::MODULO => x.checked_rem(y),
+                _ => None,
+            }
+            .map(|v| v as i64)
+        }
+        ValType::Float => {
+            let (x, y) = (f64::from_bits(x as u64), f64::from_bits(y as u64));
+            match name {
+                ops::ADD => Some(x + y),
+                ops::SUBSTRACT => Some(x - y),
+                ops::MULTIPLY => Some(x * y),
+                ops::DIVIDE => Some(x / y),
+                _ => None,
+            }
+            .map(|v| v.to_bits() as i64)
+        }
+        _ => None,
+    }
+}
+
+/// `x <name> y` for two same-bank constants of a numeric or bool bank, as the
+/// bool word, or `None` for a bank whose word is not its value (a string is a
+/// rank the batch assigns).
+fn fold_cmp(name: &str, bank_a: ValType, bank_b: ValType, x: i64, y: i64) -> Option<i64> {
+    use std::cmp::Ordering;
+    if bank_a != bank_b {
+        return None;
+    }
+    let ord = match bank_a {
+        ValType::Int | ValType::Bool => x.cmp(&y),
+        ValType::UInt => (x as u64).cmp(&(y as u64)),
+        ValType::Float => f64::from_bits(x as u64).partial_cmp(&f64::from_bits(y as u64))?,
+        _ => return None,
+    };
+    let v = match name {
+        ops::GREATER_EQUALS => ord != Ordering::Less,
+        ops::GREATER => ord == Ordering::Greater,
+        ops::LESS_EQUALS => ord != Ordering::Greater,
+        ops::LESS => ord == Ordering::Less,
+        ops::EQUALS => ord == Ordering::Equal,
+        ops::NOT_EQUALS => ord != Ordering::Equal,
+        _ => return None,
+    };
+    Some(v as i64)
 }
 
 /// Emit a bank-matched register move `dst = src`.

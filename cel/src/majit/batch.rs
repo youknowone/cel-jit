@@ -1901,6 +1901,69 @@ mod tests {
     /// answers what the loop answers on every tier and what the tree-walker
     /// answers: int, float, bool and string banks, a bool column, a broadcast
     /// string literal, and a row that traps.
+    /// An unrolled literal comprehension leaves its iteration variable as a
+    /// pool constant, so the body's arithmetic and comparisons over it fold at
+    /// lowering time — and the fold answers exactly what the row loop would
+    /// have, trapping included: an overflow or a zero divisor is NOT folded.
+    #[test]
+    fn a_literal_comprehension_body_folds_its_constant_arithmetic() {
+        use crate::majit::bytecode::{OPERANDS, OP_ADD_OVF, OP_DIV_CHK, OP_GT, OP_MUL_OVF};
+        let s = schema(&[("x", ValType::Int)]);
+        let x = vec![15i64];
+        let batch = Batch::new(1).column("x", ColumnRef::Int(&x));
+        let mut ctx = Context::default();
+        ctx.add_variable_from_value("x", 15i64);
+        let opcodes = |code: &[i64]| -> Vec<i64> {
+            let mut pc = 0;
+            let mut ops = Vec::new();
+            while pc < code.len() {
+                ops.push(code[pc]);
+                pc += 1 + OPERANDS[code[pc] as usize].len();
+            }
+            ops
+        };
+        for (src, absent) in [
+            ("[1, 2, 3, 4, 5].map(x, x * 2)", OP_MUL_OVF),
+            ("[1, 2, 3].map(x, x * 2 > 3)", OP_GT),
+            ("[1.5, 2.5].map(x, x * 2.0)", OP_MUL_OVF),
+            ("[1, 2, 3].map(x, x + 1 + x)", OP_ADD_OVF),
+        ] {
+            let program = Program::compile(src).unwrap();
+            let batched =
+                BatchProgram::from_program(&program, &s).unwrap_or_else(|e| panic!("{src}: {e}"));
+            let bound = batched.bind_per_row(&batch).unwrap();
+            let walker = vec![program.execute(&ctx).unwrap()];
+            for tier in [Tier::Clean, Tier::Interpreter, Tier::Jit] {
+                assert_eq!(bound.collect_on(tier).unwrap(), walker, "{src} on {tier:?}");
+            }
+            assert!(
+                !opcodes(&batched.lowered().body).contains(&absent),
+                "{src}: the constant op was not folded: {:?}",
+                opcodes(&batched.lowered().body)
+            );
+        }
+        // Where the tree-walker raises, the op stays and the row traps.
+        for (src, kept) in [
+            ("[9223372036854775807].map(x, x + 1)", OP_ADD_OVF),
+            ("[1].map(x, x / 0)", OP_DIV_CHK),
+        ] {
+            let program = Program::compile(src).unwrap();
+            assert!(program.execute(&ctx).is_err(), "{src}: the walker answers");
+            let batched = BatchProgram::from_program(&program, &s).unwrap();
+            assert!(
+                opcodes(&batched.lowered().body).contains(&kept),
+                "{src}: a trapping op was folded away"
+            );
+            let bound = batched.bind_per_row(&batch).unwrap();
+            for tier in [Tier::Clean, Tier::Jit] {
+                assert!(
+                    matches!(bound.collect_on(tier), Err(BatchError::Trapped)),
+                    "{src} on {tier:?}: must trap"
+                );
+            }
+        }
+    }
+
     #[test]
     fn a_one_row_batch_runs_the_straight_line_form_and_agrees_with_the_loop() {
         let s = schema(&[
