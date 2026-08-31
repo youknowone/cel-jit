@@ -2001,6 +2001,23 @@ fn emit_int_bin(ctx: &mut LowerCtxF, op: i64, a: TReg, b: TReg) -> TReg {
     d
 }
 
+/// `dst = 1 - c`, for a register holding a predicate.
+///
+/// `OP_NOT` carries its `1` in the instruction stream, where a trace reads it as
+/// a constant; a pooled `1` lives in a register, which is red. A predicate the
+/// lowering already folded takes its complement with it instead, and costs no
+/// instruction at all.
+fn emit_complement(ctx: &mut LowerCtxF, c: TReg) -> TReg {
+    if ctx.const_of(c).is_some() {
+        let one = emit_int_const(ctx, 1);
+        return emit_int_bin(ctx, OP_SUB, one, c);
+    }
+    let d = ctx.fresh(ValType::Int);
+    ctx.body
+        .extend_from_slice(&[OP_NOT, c.idx as i64, d.idx as i64]);
+    d
+}
+
 /// `dst = a <op> k` for a green constant `k`.
 ///
 /// `OP_MUL`, `OP_ADD`, `OP_DIV` and `OP_MOD` have immediate forms, and those
@@ -4048,7 +4065,6 @@ fn emit_chain_collect(
         None => Appended::Element(links[0].iter_var),
     };
     emit_element_store(ctx, appended, cursor)?;
-    let one = emit_int_const(ctx, 1);
     let Some(c) = cond else {
         return Ok(emit_int_bin_k(ctx, OP_ADD, accu, 1));
     };
@@ -4056,18 +4072,14 @@ fn emit_chain_collect(
     // cursor advances only where the predicate holds — so a rejected element
     // writes to the slot the next accepted one will overwrite. That is what
     // keeps the body straight-line, with no branch around the store.
-    let zero = emit_int_const(ctx, 0);
-    let delta = ctx.fresh(ValType::Int);
-    ctx.body.extend_from_slice(&[
-        OP_SELECT,
-        c.idx as i64,
-        one.idx as i64,
-        zero.idx as i64,
-        delta.idx as i64,
-    ]);
+    //
+    // The advance IS the predicate. `OP_SELECT c, t, f` computes `f + c * (t - f)`,
+    // so selecting between the constants 1 and 0 is `0 + c * 1` — the condition
+    // register itself, for any word it holds.
+    let delta = c;
     // Undo the unconditional advance the store made, where the predicate
     // rejected.
-    let back = emit_int_bin(ctx, OP_SUB, one, delta);
+    let back = emit_complement(ctx, delta);
     ctx.body
         .extend_from_slice(&[OP_SUB, cursor as i64, back.idx as i64, cursor as i64]);
     Ok(emit_int_bin(ctx, OP_ADD, accu, delta))
@@ -4395,26 +4407,44 @@ fn compile_len_step(
             // branch around the store.
             let zero = emit_int_const(ctx, 0);
             let taken = compile_len_step(ctx, &call.args[1], comp, zero, mode)?;
-            let none = emit_int_const(ctx, 0);
-            let delta = ctx.fresh(ValType::Int);
-            ctx.body.extend_from_slice(&[
-                OP_SELECT,
-                c.idx as i64,
-                taken.idx as i64,
-                none.idx as i64,
-                delta.idx as i64,
-            ]);
-            if let AccuMode::Collect { cursor } = mode {
-                // Undo the unconditional advance the store made, where the
-                // predicate rejected.
-                let back = ctx.fresh(ValType::Int);
+            // `OP_SELECT c, t, f` is `f + c * (t - f)`, so against the constant
+            // zero the advance is `c * taken` and the rewind is `taken * (1 - c)`.
+            // A branch that appends exactly one element makes those `c` and `!c`,
+            // which the condition register already holds. A branch that appends
+            // some other count — `c ? (@result + [a, b]) : @result`, or a nested
+            // conditional whose own count is not a constant — makes them neither,
+            // and there the select is the operation rather than a spelling of it.
+            let one_element = ctx.const_of(taken) == Some(1);
+            let delta = if one_element {
+                c
+            } else {
+                let none = emit_int_const(ctx, 0);
+                let d = ctx.fresh(ValType::Int);
                 ctx.body.extend_from_slice(&[
                     OP_SELECT,
                     c.idx as i64,
-                    zero.idx as i64,
                     taken.idx as i64,
-                    back.idx as i64,
+                    none.idx as i64,
+                    d.idx as i64,
                 ]);
+                d
+            };
+            if let AccuMode::Collect { cursor } = mode {
+                // Undo the unconditional advance the store made, where the
+                // predicate rejected.
+                let back = if one_element {
+                    emit_complement(ctx, c)
+                } else {
+                    let b = ctx.fresh(ValType::Int);
+                    ctx.body.extend_from_slice(&[
+                        OP_SELECT,
+                        c.idx as i64,
+                        zero.idx as i64,
+                        taken.idx as i64,
+                        b.idx as i64,
+                    ]);
+                    b
+                };
                 ctx.body.extend_from_slice(&[
                     OP_SUB,
                     cursor as i64,
