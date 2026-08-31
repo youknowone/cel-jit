@@ -16,9 +16,7 @@
 use std::collections::BTreeMap;
 
 use cel::majit::batch::{Batch, BatchProgram, ColumnRef, Tier};
-use cel::majit::bytecode::float_bank::{
-    jit_stats, reset_jit_stats, reset_persistent_state,
-};
+use cel::majit::bytecode::float_bank::{jit_stats, reset_jit_stats, reset_persistent_state};
 use cel::majit::lower::{Schema, ValType};
 use majit_metainterp::embed::Census;
 
@@ -55,7 +53,11 @@ fn probe(label: &str, src: &str, n: i64) {
             .iter()
             .rposition(|op| format!("{op:?}") == "Label")
             .map_or(0, |p| p + 1);
-        println!("   loop[{i}] ops={} body={}", ops.len(), ops.len() - body_at);
+        println!(
+            "   loop[{i}] ops={} body={}",
+            ops.len(),
+            ops.len() - body_at
+        );
         for (tag, seg) in [("pre", &ops[..body_at]), ("body", &ops[body_at..])] {
             let mut hist: BTreeMap<String, usize> = BTreeMap::new();
             for op in seg {
@@ -84,7 +86,10 @@ fn time_pair(n: i64, rounds: usize, calls: usize) {
             fields: vec![(None, ColumnRef::Int(&elems))],
         },
     );
-    let cases = [("map", "list.map(x, x * 2)"), ("filter", "list.filter(x, x % 2 == 0)")];
+    let cases = [
+        ("map", "list.map(x, x * 2)"),
+        ("filter", "list.filter(x, x % 2 == 0)"),
+    ];
     let lowered: Vec<_> = cases
         .iter()
         .map(|(_, src)| BatchProgram::compile(src, &schema).expect("lowers"))

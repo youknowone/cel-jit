@@ -1345,13 +1345,19 @@ fn a_power_of_two_modulus_filter_keeps_no_residual_call_in_its_loop() {
         }
         let stats = jit_stats();
         assert_eq!(stats.internal_compile_panics, 0, "{src}");
-        assert_eq!(stats.loops_aborted, 0, "{src}: the modulus aborted the trace");
+        assert_eq!(
+            stats.loops_aborted, 0,
+            "{src}: the modulus aborted the trace"
+        );
         assert!(
             stats.loops_compiled >= 1,
             "{src}: the filter loop did not compile: {stats:?}"
         );
         let log = majit_metainterp::embed::Census::compiled_opcode_log();
-        assert!(!log.is_empty(), "{src}: compiled but the opcode log is empty");
+        assert!(
+            !log.is_empty(),
+            "{src}: compiled but the opcode log is empty"
+        );
         let calls: usize = log
             .iter()
             .flatten()

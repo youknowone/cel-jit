@@ -2791,7 +2791,10 @@ mod tests {
         assert!(gate("name in [\"ab\", \"cd\"]"));
         assert!(!gate("name == other"), "column-vs-column equality");
         assert!(!gate("name < \"ab\""), "ordering reads the ids' order");
-        assert!(!gate("name.startsWith(\"a\")"), "a predicate table is per-distinct");
+        assert!(
+            !gate("name.startsWith(\"a\")"),
+            "a predicate table is per-distinct"
+        );
         assert!(!gate("name"), "a string result hands the ids back");
     }
 
