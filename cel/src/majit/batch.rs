@@ -2775,6 +2775,54 @@ mod tests {
         ));
     }
 
+    /// The literal-scan gate: the sound shapes take it, and every shape that
+    /// needs per-distinct ids refuses it.
+    #[test]
+    fn literal_scan_licenses_exactly_the_literal_equality_shapes() {
+        let s = schema(&[("name", ValType::Str), ("other", ValType::Str)]);
+        let gate = |src: &str| {
+            BatchProgram::compile(src, &s)
+                .unwrap()
+                .lowered()
+                .str_ids_literal_only()
+        };
+        assert!(gate("name == \"ab\""));
+        assert!(gate("name != \"ab\" && name == \"cd\""));
+        assert!(gate("name in [\"ab\", \"cd\"]"));
+        assert!(!gate("name == other"), "column-vs-column equality");
+        assert!(!gate("name < \"ab\""), "ordering reads the ids' order");
+        assert!(!gate("name.startsWith(\"a\")"), "a predicate table is per-distinct");
+        assert!(!gate("name"), "a string result hands the ids back");
+    }
+
+    /// Literal-scan ids answer equality exactly as ranked ids do, on data
+    /// where distinct non-literal strings all share the sentinel — including
+    /// the empty string and a superstring of the literal.
+    #[test]
+    fn literal_scan_equality_matches_the_ranked_answer() {
+        let s = schema(&[("name", ValType::Str)]);
+        let name: Vec<String> = ["ab", "cd", "ef", "ab", "", "abc"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let batch = Batch::new(6).column("name", ColumnRef::Str(&name));
+        for (src, expect) in [
+            ("name == \"ab\"", 2),
+            ("name != \"ab\"", 4),
+            ("name == \"zz\"", 0),
+            ("name in [\"ab\", \"ef\"]", 3),
+            ("name == \"\"", 1),
+        ] {
+            let program = BatchProgram::compile(src, &s).unwrap();
+            assert!(program.lowered().str_ids_literal_only(), "{src}");
+            assert_eq!(
+                program.bind(&batch).unwrap().sum_on(Tier::Clean).unwrap(),
+                Value::Int(expect),
+                "{src}"
+            );
+        }
+    }
+
     #[test]
     fn string_equality_goes_through_ranked_ids() {
         let s = schema(&[("name", ValType::Str)]);

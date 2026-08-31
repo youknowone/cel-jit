@@ -1371,3 +1371,51 @@ fn a_power_of_two_modulus_filter_keeps_no_residual_call_in_its_loop() {
         }
     }
 }
+
+/// The literal-scan string encoding answers on the compiled tier exactly as it
+/// does on the clean one. The data holds distinct non-literal strings — which
+/// all share the scan's sentinel id — beside rows equal to each literal, so a
+/// sentinel leaking into an equality would change the count.
+#[test]
+fn a_literal_scan_string_batch_answers_like_the_clean_tier() {
+    use cel::majit::batch::{Batch, BatchProgram, ColumnRef, Tier};
+    let _serial = serial();
+    let n = 50_000usize;
+    let names: Vec<String> = (0..n)
+        .map(|i| match i % 5 {
+            0 => "zz".to_string(),
+            1 => "ab".to_string(),
+            _ => format!("n{i}"),
+        })
+        .collect();
+    let lens = vec![n as i64];
+    let schema: Schema = [("items[].name".to_string(), ValType::Str)]
+        .into_iter()
+        .collect();
+    let batch = Batch::new(1).column(
+        "items".to_string(),
+        ColumnRef::List {
+            lens: &lens,
+            fields: vec![(Some("name"), ColumnRef::Str(&names))],
+        },
+    );
+    for src in [
+        r#"items.exists(i, i.name == "zz")"#,
+        r#"items.all(i, i.name != "qq")"#,
+    ] {
+        let lowered = BatchProgram::compile(src, &schema).expect(src);
+        assert!(lowered.lowered().str_ids_literal_only(), "{src}");
+        let bound = lowered.bind_per_row(&batch).expect(src);
+        reset_persistent_state();
+        reset_jit_stats();
+        let clean = bound.collect_on(Tier::Clean).unwrap();
+        let jit = bound.collect_on(Tier::Jit).unwrap();
+        assert_eq!(clean, jit, "{src}: compiled tier diverged from clean");
+        let stats = jit_stats();
+        assert_eq!(stats.internal_compile_panics, 0, "{src}");
+        assert!(
+            stats.loops_compiled >= 1,
+            "{src}: the string loop did not compile: {stats:?}"
+        );
+    }
+}

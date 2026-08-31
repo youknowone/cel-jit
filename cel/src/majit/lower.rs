@@ -455,6 +455,11 @@ pub struct LoweredF {
     /// answer — ask [`LoweredF::needs_ordered_str_ids`], which also accounts
     /// for a result the caller reads ids back out of.
     pub orders_strings: bool,
+    /// Whether some string use needs ids injective over every distinct string.
+    /// `false` alone is not a license — ask
+    /// [`LoweredF::str_ids_literal_only`], which also accounts for ordering
+    /// and a string result.
+    pub str_dict_required: bool,
     /// Positions **within [`LoweredF::body`]** of jump target words, which the
     /// lowering writes body-relative because it cannot know where the body
     /// lands. [`LoweredF::batch_sum_shape`] relocates each to an
@@ -737,6 +742,17 @@ impl LoweredF {
     ///   compares the strings.
     pub fn needs_ordered_str_ids(&self) -> bool {
         self.orders_strings || self.has_string_result()
+    }
+
+    /// Whether the batch may encode string ids by LITERAL SCAN — each row
+    /// compared against the expression's literals, a match taking that
+    /// literal's id and every other string one shared sentinel — instead of
+    /// ranking every distinct string. Sound exactly when every id the program
+    /// consumes is an equality with a literal on one side: distinct
+    /// non-literal strings then share the sentinel without ever being asked
+    /// to differ.
+    pub fn str_ids_literal_only(&self) -> bool {
+        !self.str_dict_required && !self.needs_ordered_str_ids()
     }
 
     /// Whether the row body iterates elements: a comprehension, a chain of
@@ -1414,6 +1430,11 @@ struct LowerCtxF<'s> {
     /// Set when the body ORDERS two strings, which is the only thing that reads
     /// the dictionary's order rather than only its injectivity.
     orders_strings: bool,
+    /// Set when some string USE needs the dictionary's injectivity over every
+    /// distinct string -- an equality with no literal side, a membership whose
+    /// needle is not a literal, a predicate table -- rather than only "equal
+    /// to this literal or not".
+    str_dict_required: bool,
     /// Derived concatenation columns, in the order the batch builder must
     /// materialize them.
     concats: Vec<ConcatSpec>,
@@ -1467,6 +1488,15 @@ struct ListLoop {
 }
 
 impl LowerCtxF<'_> {
+    /// Whether `r` is a register seeded with a string LITERAL's id.
+    fn is_str_literal_seed(&self, r: &TReg) -> bool {
+        r.bank == ValType::Str
+            && self
+                .scalar_seeds
+                .iter()
+                .any(|s| s.reg == r.idx && matches!(s.kind, SeedKind::StrId(_)))
+    }
+
     fn fresh(&mut self, bank: ValType) -> TReg {
         let idx = match bank {
             // `Str` ids share the int register file (an `i64` rank).
@@ -1723,6 +1753,7 @@ pub fn lower_typed_in(
         temporal_ops: 0,
         temporal_consts: Vec::new(),
         orders_strings: false,
+        str_dict_required: false,
         concats: Vec::new(),
         elem_map: HashMap::new(),
         list_loop: Vec::new(),
@@ -1781,6 +1812,7 @@ pub fn lower_typed_in(
         host_fns: ctx.host_fns,
         temporal_bound,
         orders_strings: ctx.orders_strings,
+        str_dict_required: ctx.str_dict_required,
         jump_fixups: ctx.jump_fixups,
         shapes: std::array::from_fn(|_| std::sync::OnceLock::new()),
         single_row: std::sync::OnceLock::new(),
@@ -2182,6 +2214,9 @@ fn str_predicate(name: &str, args: &[IdedExpr]) -> Option<Result<StrPredicate, L
 /// Read `pred`'s answer for `s` out of the bind-time table: `ea = id * 8`, then
 /// the same `*(base + ea)` load a column read is.
 fn emit_str_predicate(ctx: &mut LowerCtxF, pred: StrPredicate, s: TReg) -> TReg {
+    // The table is indexed by the string's id, one answer per DISTINCT string,
+    // which the literal-scan encoding's shared sentinel cannot carry.
+    ctx.str_dict_required = true;
     let table = ctx.fresh(ValType::Int);
     ctx.scalar_seeds.push(ScalarSeed {
         kind: SeedKind::StrPredicate(pred),
@@ -2807,6 +2842,12 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
             if ev.bank != x.bank {
                 return Err(LowerError::unsupported("@in heterogeneous element"));
             }
+            if x.bank == ValType::Str
+                && !ctx.is_str_literal_seed(&x)
+                && !ctx.is_str_literal_seed(&ev)
+            {
+                ctx.str_dict_required = true;
+            }
             let t = ctx.fresh(ValType::Bool);
             ctx.body
                 .extend_from_slice(&[eq_op, x.idx as i64, ev.idx as i64, t.idx as i64]);
@@ -2994,6 +3035,14 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
             // flag and the op it describes are emitted together.
             if a.bank == ValType::Str && !matches!(name, ops::EQUALS | ops::NOT_EQUALS) {
                 ctx.orders_strings = true;
+            }
+            if a.bank == ValType::Str
+                && !ctx.is_str_literal_seed(&a)
+                && !ctx.is_str_literal_seed(&b)
+            {
+                // Neither side is a literal: the ids must separate every
+                // distinct string, not only the literals.
+                ctx.str_dict_required = true;
             }
             return Ok(emit_bin(ctx, iop, a, b, ValType::Bool));
         }
@@ -4023,6 +4072,7 @@ fn probe_ctx<'a>(ctx: &LowerCtxF<'a>) -> LowerCtxF<'a> {
         temporal_ops: 0,
         temporal_consts: Vec::new(),
         orders_strings: false,
+        str_dict_required: false,
         concats: Vec::new(),
         elem_map: HashMap::new(),
         list_loop: Vec::new(),
@@ -4312,6 +4362,11 @@ fn lower_runtime_in(
         // A list whose elements cannot equal the needle's bank is `false` in the
         // tree-walker rather than an error; declining lets the walker own it.
         return Err(LowerError::unsupported("@in element bank"));
+    }
+    if ty == ValType::Str && !ctx.is_str_literal_seed(&x) {
+        // The needle is not a literal: element ids must separate every
+        // distinct string.
+        ctx.str_dict_required = true;
     }
 
     let len = ctx.slot_typed(size_slot_path(list), ValType::Int);

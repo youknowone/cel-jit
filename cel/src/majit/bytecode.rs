@@ -610,6 +610,46 @@ impl<'s> StrDict<'s> {
         (dict, ids)
     }
 
+    /// Ids by LITERAL SCAN: every row compared against the expression's
+    /// literals -- a match takes that literal's id, every other string the
+    /// shared `-1`. Injective over the literals and deliberately NOT over the
+    /// rows, which is exactly what
+    /// [`super::lower::LoweredF::str_ids_literal_only`] licenses: no consumer
+    /// asks two non-literal strings to differ. Skips the per-row hash the
+    /// dictionary build pays, which is the whole of a string column's bind
+    /// cost where the values are mostly distinct.
+    fn build_literal_scan(
+        columns: &'s [Column<'s>],
+        seeds: impl Iterator<Item = &'s str>,
+    ) -> (Self, Vec<Box<[i64]>>) {
+        let mut rank: std::collections::HashMap<&'s str, i64> = std::collections::HashMap::new();
+        let mut literals: Vec<&'s str> = Vec::new();
+        for s in seeds {
+            rank.entry(s).or_insert_with(|| {
+                literals.push(s);
+                literals.len() as i64 - 1
+            });
+        }
+        let ids = columns
+            .iter()
+            .filter_map(|c| match c {
+                Column::Str(col) => Some(
+                    col.iter()
+                        .map(|s| {
+                            literals
+                                .iter()
+                                .position(|l| *l == s.as_str())
+                                .map_or(-1, |k| k as i64)
+                        })
+                        .collect::<Vec<i64>>()
+                        .into_boxed_slice(),
+                ),
+                _ => None,
+            })
+            .collect();
+        (StrDict { rank }, ids)
+    }
+
     /// The id of a string that was in the build set.
     fn id(&self, s: &str) -> i64 {
         self.rank[s]
@@ -1036,17 +1076,20 @@ pub fn prepare_batch_reduce<'a>(
     // Rank every string this batch can be asked about — the column values and
     // the expression's literals together — so all of them share one assignment,
     // and encode the columns in the same call.
-    let (dict, str_ids) = StrDict::build_columns(
-        columns,
-        // An id seed is compared against column ids, so it must share their
-        // assignment. A PREDICATE's argument is not — it is never an id — so it
-        // stays out of the dictionary.
+    // An id seed is compared against column ids, so it must share their
+    // assignment. A PREDICATE's argument is not — it is never an id — so it
+    // stays out of the dictionary.
+    let str_seeds = || {
         lowered.scalar_seeds.iter().filter_map(|s| match &s.kind {
             super::lower::SeedKind::StrId(t) => Some(t.as_str()),
             super::lower::SeedKind::StrPredicate(_) => None,
-        }),
-        lowered.needs_ordered_str_ids(),
-    );
+        })
+    };
+    let (dict, str_ids) = if lowered.str_ids_literal_only() {
+        StrDict::build_literal_scan(columns, str_seeds())
+    } else {
+        StrDict::build_columns(columns, str_seeds(), lowered.needs_ordered_str_ids())
+    };
     // `bases` reads the id columns positionally, so an amplified pass needs its
     // own cursor rather than sharing the real one.
     #[cfg(feature = "__encode-stage-probe")]
