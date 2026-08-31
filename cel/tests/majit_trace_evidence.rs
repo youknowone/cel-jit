@@ -1714,3 +1714,95 @@ fn a_literal_scan_string_batch_answers_like_the_clean_tier() {
         );
     }
 }
+
+/// A runtime index is one fused instruction in the compiled loop, not a
+/// residual call and not a decline.
+///
+/// `lower_typed` refused a non-constant index outright, and a decline is not
+/// local: the WHOLE expression falls to the tree-walker, so `nums[x % 4]` lost
+/// the compiled tier for the arithmetic around the read as well as for the read
+/// itself. The census measured the repair -- `nums[x % 4]` went from "declines"
+/// to a 24-op body with no call in it.
+#[test]
+fn a_runtime_index_keeps_no_residual_call_in_its_loop() {
+    use cel::majit::batch::{Batch, BatchProgram, ColumnRef, Tier};
+    let _serial = serial();
+    let rows = 4096usize;
+    let len = 8i64;
+    let lens = vec![len; rows];
+    let nums: Vec<i64> = (0..rows as i64 * len).map(|i| i % 97).collect();
+    let fs: Vec<f64> = (0..rows as i64 * len).map(|i| i as f64 * 0.5).collect();
+    let prices: Vec<i64> = (0..rows as i64 * len).map(|i| i * 3 - 5).collect();
+    let x: Vec<i64> = (0..rows as i64).collect();
+    let u: Vec<u64> = (0..rows as u64).collect();
+    let schema: Schema = [
+        ("nums[]".to_string(), ValType::Int),
+        ("fs[]".to_string(), ValType::Float),
+        ("items[].price".to_string(), ValType::Int),
+        ("x".to_string(), ValType::Int),
+        ("u".to_string(), ValType::UInt),
+    ]
+    .into_iter()
+    .collect();
+    let batch = Batch::new(rows)
+        .column(
+            "nums".to_string(),
+            ColumnRef::List {
+                lens: &lens,
+                fields: vec![(None, ColumnRef::Int(&nums))],
+            },
+        )
+        .column(
+            "fs".to_string(),
+            ColumnRef::List {
+                lens: &lens,
+                fields: vec![(None, ColumnRef::Float(&fs))],
+            },
+        )
+        .column(
+            "items".to_string(),
+            ColumnRef::List {
+                lens: &lens,
+                fields: vec![(Some("price"), ColumnRef::Int(&prices))],
+            },
+        )
+        .column("x".to_string(), ColumnRef::Int(&x))
+        .column("u".to_string(), ColumnRef::UInt(&u));
+    for src in [
+        "nums[x % 8]",
+        "nums[x % 4] + nums[x % 8]",
+        "nums[x % 8] * 3 + 1",
+        "nums[u % 8u]",
+        "fs[x % 8] * 2.0",
+        "items[x % 8].price",
+        "nums[x % 8] > 40",
+    ] {
+        let lowered = BatchProgram::compile(src, &schema).expect(src);
+        let bound = lowered.bind_per_row(&batch).expect(src);
+        reset_persistent_state();
+        reset_jit_stats();
+        let clean = bound.collect_on(Tier::Clean).expect(src);
+        let jit = bound.collect_on(Tier::Jit).expect(src);
+        assert_eq!(clean, jit, "{src}: compiled tier diverged from clean");
+        let stats = jit_stats();
+        assert_eq!(stats.internal_compile_panics, 0, "{src}");
+        assert!(
+            stats.loops_compiled >= 1,
+            "{src}: the runtime-index loop did not compile: {stats:?}"
+        );
+        let log = majit_metainterp::embed::Census::compiled_opcode_log();
+        assert!(
+            !log.is_empty(),
+            "{src}: compiled but the opcode log is empty"
+        );
+        let calls: usize = log
+            .iter()
+            .flatten()
+            .filter(|op| format!("{op:?}").starts_with("Call"))
+            .count();
+        assert_eq!(
+            calls, 0,
+            "{src}: the runtime index left a residual call in the loop"
+        );
+    }
+}

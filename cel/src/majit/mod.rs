@@ -5178,6 +5178,123 @@ mod tests {
         );
     }
 
+    /// `list[k]` for an index the ROW supplies, over the same jagged column:
+    /// each row reads its own element at its own index, and a row whose index
+    /// falls outside its own span refuses the batch.
+    ///
+    /// The runtime index has one hazard the constant form does not: the index
+    /// is compared against a length that varies per row, so a trace that
+    /// recorded only in-range rows would answer the others out of a
+    /// neighbouring row's storage rather than refusing them.
+    #[test]
+    fn runtime_index_reads_the_rows_own_list() {
+        use super::batch::{Batch, BatchProgram, ColumnRef, Tier};
+        use super::bytecode::float_bank::jit_stats;
+
+        // 400 rows, every seventh short. `safe` indexes inside every row's own
+        // span; `risky` does not, on the short rows whose `r % 3` is 1 or 2.
+        let mut lens: Vec<i64> = Vec::new();
+        let mut elems: Vec<i64> = Vec::new();
+        for r in 0..400i64 {
+            let n = if r % 7 == 3 { 1 } else { 3 };
+            lens.push(n);
+            for j in 0..n {
+                elems.push(r * 10 + j);
+            }
+        }
+        let risky: Vec<i64> = (0..400i64).map(|r| r % 3).collect();
+        let safe: Vec<i64> = lens
+            .iter()
+            .zip(&risky)
+            .map(|(len, k)| if *k < *len { *k } else { 0 })
+            .collect();
+
+        let walker_sum = |src: &str, ks: &[i64]| -> Option<i64> {
+            let program = Program::compile(src).unwrap();
+            let mut total = 0;
+            let mut off = 0usize;
+            for (row, len) in lens.iter().enumerate() {
+                let n = *len as usize;
+                let list: Vec<Value> = elems[off..off + n].iter().map(|v| Value::Int(*v)).collect();
+                off += n;
+                let mut ctx = Context::default();
+                ctx.add_variable_from_value("items", Value::list(list));
+                ctx.add_variable_from_value("k", ks[row]);
+                total += match program.execute(&ctx).ok()? {
+                    Value::Int(i) => i,
+                    Value::Bool(b) => b as i64,
+                    other => panic!("`{src}`: unexpected {other:?}"),
+                };
+            }
+            Some(total)
+        };
+
+        let schema: Schema = [
+            ("items[]".to_string(), ValType::Int),
+            ("k".to_string(), ValType::Int),
+        ]
+        .into_iter()
+        .collect();
+        for ks in [&safe, &risky] {
+            for src in ["items[k]", "items[k] + items[0]", "items[k] > 5"] {
+                let program = BatchProgram::compile(src, &schema)
+                    .unwrap_or_else(|e| panic!("lower `{src}`: {e}"));
+                let batch = Batch::new(lens.len())
+                    .column(
+                        "items",
+                        ColumnRef::List {
+                            lens: &lens,
+                            fields: vec![(None, ColumnRef::Int(&elems))],
+                        },
+                    )
+                    .column("k", ColumnRef::Int(ks));
+                let bound = program
+                    .bind(&batch)
+                    .unwrap_or_else(|e| panic!("bind `{src}`: {e}"));
+                let before = jit_stats().loops_compiled;
+                for tier in [Tier::Clean, Tier::Interpreter, Tier::Jit] {
+                    let got = match bound.sum_on(tier) {
+                        Ok(Value::Int(i)) => Some(i),
+                        Ok(other) => panic!("`{src}`: unexpected {other:?}"),
+                        Err(_) => None,
+                    };
+                    assert_eq!(
+                        got,
+                        walker_sum(src, ks),
+                        "`{src}` on {tier:?}: machine vs tree-walker"
+                    );
+                }
+                // Otherwise the comparison above says nothing about the
+                // compiled loop, only about the tracing interpreter.
+                assert!(
+                    jit_stats().loops_compiled > before,
+                    "`{src}`: the loop must actually have been traced and compiled"
+                );
+            }
+        }
+
+        // A negative index is out of range on the row that carries it, and the
+        // batch is refused for the same reason an index past the end is.
+        let mut negative = safe.clone();
+        negative[137] = -1;
+        let program = BatchProgram::compile("items[k]", &schema).unwrap();
+        let batch = Batch::new(lens.len())
+            .column(
+                "items",
+                ColumnRef::List {
+                    lens: &lens,
+                    fields: vec![(None, ColumnRef::Int(&elems))],
+                },
+            )
+            .column("k", ColumnRef::Int(&negative));
+        let bound = program.bind(&batch).unwrap();
+        assert!(
+            bound.sum_on(Tier::Jit).is_err(),
+            "the compiled tier must refuse a negative index"
+        );
+        assert_eq!(walker_sum("items[k]", &negative), None);
+    }
+
     /// `list[k]` over a `double` element column: the float twin of the fused
     /// constant-index read, against the tree-walker on every tier, and the
     /// compiled tier both answering the in-range rows and refusing a batch

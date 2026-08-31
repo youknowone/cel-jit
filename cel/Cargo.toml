@@ -280,6 +280,10 @@ name = "rca_callcensus"
 required-features = ["jit"]
 
 [[example]]
+name = "rca_indexcost"
+required-features = ["jit"]
+
+[[example]]
 name = "rca_divcost"
 required-features = ["jit"]
 

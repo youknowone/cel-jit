@@ -1856,11 +1856,14 @@ fn compile_t(ctx: &mut LowerCtxF, e: &IdedExpr) -> Result<TReg, LowerError> {
             // recognise the shape before asking it.
             if let (false, Expr::Call(inner)) = (sel.test, &sel.operand.expr) {
                 if inner.func_name == ops::INDEX && inner.args.len() == 2 {
-                    if let (Ok(base), Some(k)) =
-                        (resolve_path(&inner.args[0]), as_int_literal(&inner.args[1]))
-                    {
+                    if let Ok(base) = resolve_path(&inner.args[0]) {
                         if declares_list(ctx.schema, &base) {
-                            return lower_const_index(ctx, &base, Some(&sel.field), k);
+                            return match as_int_literal(&inner.args[1]) {
+                                Some(k) => lower_const_index(ctx, &base, Some(&sel.field), k),
+                                None => {
+                                    lower_var_index(ctx, &base, Some(&sel.field), &inner.args[1])
+                                }
+                            };
                         }
                     }
                 }
@@ -2914,8 +2917,16 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
             return Err(LowerError::unsupported("_[_] arity"));
         }
         let base = resolve_path(&call.args[0])?;
-        let idx = as_int_literal(&call.args[1])
-            .ok_or_else(|| LowerError::unsupported("non-constant index"))?;
+        let Some(idx) = as_int_literal(&call.args[1]) else {
+            // A RUNTIME index reads the same flattened element column at an
+            // address the row supplies. Only a list has that form: a caller's
+            // flattened `base[k]` column names one FIXED index and cannot
+            // answer a varying one.
+            if declares_list(ctx.schema, &base) {
+                return lower_var_index(ctx, &base, None, &call.args[1]);
+            }
+            return Err(LowerError::unsupported("non-constant index"));
+        };
         // A caller may flatten one index into a column of its own, in which
         // case `base[k]` names that column and reads like any other row value.
         let path = format!("{base}[{idx}]");
@@ -4519,6 +4530,56 @@ fn lower_const_index(
     let v = ctx.elem_slot(elem_path, ea.idx)?;
     emit_mov(ctx, v, out);
     ctx.patch_jump(skip);
+    Ok(out)
+}
+
+/// [`lower_const_index`] for an index the ROW supplies: `list[i]` where `i` is
+/// any int- or uint-bank expression rather than a literal.
+///
+/// One fused instruction, like the constant form: `OP_INDEX_R` carries the
+/// range check, the trap, the default and the load. The expanded shape the
+/// constant form falls back to for a `bool` element cannot be reused here --
+/// it skips the load with a forward jump whose target the const index fixes --
+/// so a non-numeric element still declines and takes the tree-walker.
+fn lower_var_index(
+    ctx: &mut LowerCtxF,
+    list: &str,
+    field: Option<&str>,
+    index: &IdedExpr,
+) -> Result<TReg, LowerError> {
+    let elem_path = elem_slot_path(list, field);
+    let ty =
+        ctx.schema.get(&elem_path).copied().ok_or_else(|| {
+            LowerError::unsupported(format!("undeclared element path `{elem_path}`"))
+        })?;
+    if !matches!(ty, ValType::Int | ValType::Float) {
+        return Err(LowerError::unsupported(
+            "runtime index of a non-numeric element",
+        ));
+    }
+    // cel indexes with `int` or `uint`; anything else is NoSuchOverload in the
+    // tree-walker, so it is not an answer this can give either.
+    let k = compile_t(ctx, index)?;
+    if !matches!(k.bank, ValType::Int | ValType::UInt) {
+        return Err(LowerError::unsupported("index must be int or uint"));
+    }
+    let len = ctx.slot_typed(size_slot_path(list), ValType::Int);
+    let off = ctx.slot_typed(offset_slot_path(list), ValType::Int);
+    let out = ctx.fresh(ty);
+    let base_reg = ctx.elem_base(elem_path, ty, out);
+    let op = match ty {
+        ValType::Float => OP_INDEX_R_F,
+        _ => OP_INDEX_R,
+    };
+    ctx.body.extend_from_slice(&[
+        op,
+        off.idx as i64,
+        len.idx as i64,
+        k.idx as i64,
+        base_reg as i64,
+        out.idx as i64,
+        OVF_FLAG_REG as i64,
+    ]);
     Ok(out)
 }
 

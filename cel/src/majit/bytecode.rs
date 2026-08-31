@@ -256,6 +256,24 @@ pub const OP_UMOD_K: i64 = 70; // [a, k, dst, trap]  regs[dst] = (a as u64) % (k
 pub const OP_DIV_K: i64 = 71; // [a, k, dst]  regs[dst] = a / k   (trunc toward zero)
 pub const OP_MOD_K: i64 = 72; // [a, k, dst]  regs[dst] = a % k   (sign of dividend)
 
+/// The RUNTIME-index peers of [`OP_INDEX_K`]: the element index is a register
+/// rather than an immediate, so `list[i]` reaches the compiled tier instead of
+/// declining the whole expression to the tree-walker.
+///
+/// One range test covers both ends. A constant index is non-negative by the
+/// time it is emitted, so [`OP_INDEX_K`] tests only `k < len`; a register index
+/// may be negative, and cel's `uint` index may be a bit pattern above
+/// `i64::MAX`. Read UNSIGNED, both are out of range against a length that is
+/// never negative, so `(k as u64) < (len as u64)` is the whole check -- spelled
+/// here as the two signed tests the machine already has, since a trace records
+/// only the arm it takes.
+///
+/// Out of range the trap flag is set and `dst` is 0, exactly as
+/// [`OP_INDEX_K`] does: the batch falls back to the row-by-row walker, which
+/// is what raises the error cel's semantics ask for.
+pub const OP_INDEX_R: i64 = 73; // [off, len, k, base, dst, trap]   regs[dst] = *(regs[base] + (regs[off]+regs[k])*8) if 0 <= regs[k] < len else 0 (trap)
+pub const OP_INDEX_R_F: i64 = 74; // [off, len, k, base, fdst, trap] float twin
+
 /// What one word after an opcode means, for a consumer that walks a program
 /// without running it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -293,7 +311,7 @@ use Operand::{Float, FloatOut, Imm, Int, IntOut, IntTrap, Target};
 /// so an opcode added past it without a row here is a compile error on this
 /// array instead of an out-of-bounds index the first time that opcode is
 /// decoded.
-pub const OPERANDS: [&[Operand]; OP_MOD_K as usize + 1] = [
+pub const OPERANDS: [&[Operand]; OP_INDEX_R_F as usize + 1] = [
     &[Imm, IntOut],                           // 0  LOAD_CONST
     &[Int, IntOut],                           // 1  MOV
     &[Int, Int, IntOut],                      // 2  ADD
@@ -367,6 +385,8 @@ pub const OPERANDS: [&[Operand]; OP_MOD_K as usize + 1] = [
     &[Int, Imm, IntOut],                      // 70 UMOD_K
     &[Int, Imm, IntOut],                      // 71 DIV_K
     &[Int, Imm, IntOut],                      // 72 MOD_K
+    &[Int, Int, Int, Int, IntOut, IntTrap],   // 73 INDEX_R
+    &[Int, Int, Int, Int, FloatOut, IntTrap], // 74 INDEX_R_F
 ];
 
 /// What one [`check_code`] established about one program: the words it read,
@@ -1471,11 +1491,11 @@ pub mod float_bank {
         OP_DIV_K, OP_EQ, OP_F2I, OP_F2U, OP_FADD, OP_FDIV, OP_FEQ, OP_FGE, OP_FGT, OP_FLE, OP_FLT,
         OP_FMOV, OP_FMUL, OP_FNE, OP_FNEG, OP_FSELECT, OP_FSUB, OP_GE, OP_GT, OP_HOST_CALL1_F,
         OP_HOST_CALL1_I, OP_HOST_CALL2_F, OP_HOST_CALL2_I, OP_I2F, OP_INDEX_K, OP_INDEX_K_F,
-        OP_JUMP_IF_ABOVE, OP_LE, OP_LOAD_CONST, OP_LOAD_CONST_F, OP_LT, OP_MOD, OP_MOD_CHK,
-        OP_MOD_CHK_K, OP_MOD_K, OP_MOV, OP_MUL, OP_MUL_IMM, OP_MUL_OVF, OP_NE, OP_NEG, OP_NOT,
-        OP_OR, OP_RETURN, OP_RETURN_F, OP_SELECT, OP_SUB, OP_SUB_OVF, OP_TRAP_STORE, OP_U2F,
-        OP_UADD_OVF, OP_UDIV, OP_UDIV_K, OP_ULE, OP_ULT, OP_UMOD, OP_UMOD_K, OP_UMUL_OVF,
-        OP_USUB_OVF,
+        OP_INDEX_R, OP_INDEX_R_F, OP_JUMP_IF_ABOVE, OP_LE, OP_LOAD_CONST, OP_LOAD_CONST_F, OP_LT,
+        OP_MOD, OP_MOD_CHK, OP_MOD_CHK_K, OP_MOD_K, OP_MOV, OP_MUL, OP_MUL_IMM, OP_MUL_OVF, OP_NE,
+        OP_NEG, OP_NOT, OP_OR, OP_RETURN, OP_RETURN_F, OP_SELECT, OP_SUB, OP_SUB_OVF,
+        OP_TRAP_STORE, OP_U2F, OP_UADD_OVF, OP_UDIV, OP_UDIV_K, OP_ULE, OP_ULT, OP_UMOD, OP_UMOD_K,
+        OP_UMUL_OVF, OP_USUB_OVF,
     };
 
     // The four calling conventions of `magic::ScalarFn`, each reading its
@@ -2229,6 +2249,45 @@ pub mod float_bank {
                     // Carried as bits: the lowerer expresses a float only as
                     // the result of one float op, not as a branch's value.
                     let bits = if k < len {
+                        majit_f64_to_bits(majit_raw_load_f(base, (off + k) * 8))
+                    } else {
+                        state.regs[t] = 1;
+                        0
+                    };
+                    state.fregs[d] = majit_bits_to_f64(bits);
+                    pc += 7;
+                }
+                OP_INDEX_R => {
+                    let off = state.regs[program[pc + 1] as usize];
+                    let len = state.regs[program[pc + 2] as usize];
+                    let k = state.regs[program[pc + 3] as usize];
+                    let base = state.regs[program[pc + 4] as usize];
+                    let d = program[pc + 5] as usize;
+                    let t = program[pc + 6] as usize;
+                    // `k >= 0 && k < len` is the unsigned range test the
+                    // instruction's doc states, in the two signed compares the
+                    // machine has. A `uint` index above `i64::MAX` reads
+                    // negative and is refused, which is the same answer the
+                    // unsigned form gives against a non-negative length.
+                    state.regs[d] = if k >= 0 && k < len {
+                        majit_raw_load_i64(base, (off + k) * 8)
+                    } else {
+                        state.regs[t] = 1;
+                        0
+                    };
+                    pc += 7;
+                }
+                OP_INDEX_R_F => {
+                    let off = state.regs[program[pc + 1] as usize];
+                    let len = state.regs[program[pc + 2] as usize];
+                    let k = state.regs[program[pc + 3] as usize];
+                    let base = state.regs[program[pc + 4] as usize];
+                    let d = program[pc + 5] as usize;
+                    let t = program[pc + 6] as usize;
+                    // Carried as bits, as in `OP_INDEX_K_F`: the lowerer
+                    // expresses a float only as the result of one float op, not
+                    // as a branch's value.
+                    let bits = if k >= 0 && k < len {
                         majit_f64_to_bits(majit_raw_load_f(base, (off + k) * 8))
                     } else {
                         state.regs[t] = 1;
@@ -3324,6 +3383,36 @@ pub mod float_bank {
                     let d = program[pc + 5] as usize;
                     let t = program[pc + 6] as usize;
                     fregs[d] = if k < len {
+                        majit_raw_load_f(base, (off + k) * 8)
+                    } else {
+                        regs[t] = 1;
+                        0.0
+                    };
+                    pc += 7;
+                }
+                OP_INDEX_R => {
+                    let off = regs[program[pc + 1] as usize];
+                    let len = regs[program[pc + 2] as usize];
+                    let k = regs[program[pc + 3] as usize];
+                    let base = regs[program[pc + 4] as usize];
+                    let d = program[pc + 5] as usize;
+                    let t = program[pc + 6] as usize;
+                    regs[d] = if k >= 0 && k < len {
+                        majit_raw_load_i64(base, (off + k) * 8)
+                    } else {
+                        regs[t] = 1;
+                        0
+                    };
+                    pc += 7;
+                }
+                OP_INDEX_R_F => {
+                    let off = regs[program[pc + 1] as usize];
+                    let len = regs[program[pc + 2] as usize];
+                    let k = regs[program[pc + 3] as usize];
+                    let base = regs[program[pc + 4] as usize];
+                    let d = program[pc + 5] as usize;
+                    let t = program[pc + 6] as usize;
+                    fregs[d] = if k >= 0 && k < len {
                         majit_raw_load_f(base, (off + k) * 8)
                     } else {
                         regs[t] = 1;

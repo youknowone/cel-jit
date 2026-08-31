@@ -2032,6 +2032,95 @@ mod tests {
         );
     }
 
+    /// `list[i]` for an index the row supplies reads through the fused
+    /// `OP_INDEX_R`, and answers what the tree-walker answers -- in range, and
+    /// on both ends of the range where the walker raises and every tier traps.
+    ///
+    /// Before this the lowering declined a non-constant index outright, which
+    /// took the WHOLE expression to the tree-walker, not just the read.
+    #[test]
+    fn a_runtime_index_reads_in_one_instruction_and_agrees_with_the_walker() {
+        use crate::majit::bytecode::{OPERANDS, OP_INDEX_K, OP_INDEX_R, OP_INDEX_R_F};
+        let opcodes = |code: &[i64]| -> Vec<i64> {
+            let mut pc = 0;
+            let mut ops = Vec::new();
+            while pc < code.len() {
+                ops.push(code[pc]);
+                pc += 1 + OPERANDS[code[pc] as usize].len();
+            }
+            ops
+        };
+        let s = schema(&[
+            ("xs[]", ValType::Int),
+            ("fs[]", ValType::Float),
+            ("i", ValType::Int),
+            ("u", ValType::UInt),
+        ]);
+        let lens = vec![4i64];
+        let xs = vec![10i64, 20, 30, 40];
+        let fs = vec![1.5f64, 2.5, 3.5, 4.5];
+        let i = vec![2i64];
+        let u = vec![1u64];
+        let batch = Batch::new(1)
+            .column(
+                "xs",
+                ColumnRef::List {
+                    lens: &lens,
+                    fields: vec![(None, ColumnRef::Int(&xs))],
+                },
+            )
+            .column(
+                "fs",
+                ColumnRef::List {
+                    lens: &lens,
+                    fields: vec![(None, ColumnRef::Float(&fs))],
+                },
+            )
+            .column("i", ColumnRef::Int(&i))
+            .column("u", ColumnRef::UInt(&u));
+        let mut ctx = Context::default();
+        ctx.add_variable_from_value("xs", vec![10i64, 20, 30, 40]);
+        ctx.add_variable_from_value("fs", vec![1.5f64, 2.5, 3.5, 4.5]);
+        ctx.add_variable_from_value("i", 2i64);
+        ctx.add_variable_from_value("u", 1u64);
+        for (src, op) in [
+            ("xs[i]", OP_INDEX_R),
+            ("xs[i - 1] + xs[i]", OP_INDEX_R),
+            ("xs[i % 3]", OP_INDEX_R),
+            ("xs[u]", OP_INDEX_R),
+            ("fs[i] * 2.0", OP_INDEX_R_F),
+        ] {
+            let program = Program::compile(src).unwrap();
+            let batched =
+                BatchProgram::from_program(&program, &s).unwrap_or_else(|e| panic!("{src}: {e}"));
+            let ops = opcodes(&batched.lowered().body);
+            assert!(ops.contains(&op), "{src}: not a fused read: {ops:?}");
+            assert!(
+                !ops.contains(&OP_INDEX_K),
+                "{src}: a runtime index took the constant form: {ops:?}"
+            );
+            let bound = batched.bind_per_row(&batch).unwrap();
+            let walker = vec![program.execute(&ctx).unwrap()];
+            for tier in [Tier::Clean, Tier::Interpreter, Tier::Jit] {
+                assert_eq!(bound.collect_on(tier).unwrap(), walker, "{src} on {tier:?}");
+            }
+        }
+        // Both ends of the range: the walker raises and every tier traps, which
+        // is what sends the batch to the row-by-row door that raises too.
+        for src in ["xs[i + 10]", "xs[i - 10]", "fs[i + 4]"] {
+            let program = Program::compile(src).unwrap();
+            assert!(program.execute(&ctx).is_err(), "{src}: the walker answers");
+            let batched = BatchProgram::from_program(&program, &s).unwrap();
+            let bound = batched.bind_per_row(&batch).unwrap();
+            for tier in [Tier::Clean, Tier::Interpreter, Tier::Jit] {
+                assert!(
+                    matches!(bound.collect_on(tier), Err(BatchError::Trapped)),
+                    "{src} on {tier:?}: must trap"
+                );
+            }
+        }
+    }
+
     #[test]
     fn a_one_row_batch_runs_the_straight_line_form_and_agrees_with_the_loop() {
         let s = schema(&[
