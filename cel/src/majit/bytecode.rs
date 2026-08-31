@@ -1938,7 +1938,15 @@ pub mod float_bank {
                         state.regs[t] = 1;
                         state.regs[d] = 0;
                     } else {
-                        state.regs[d] = majit_uint_mod(a, b);
+                        // A power-of-two modulus is a mask, as in `OP_MOD_CHK`:
+                        // one `int_and` instead of a residual call per element.
+                        // Read unsigned, `2^63` is a power of two like any
+                        // other, and `b - 1` masks it correctly.
+                        state.regs[d] = if b & b.wrapping_sub(1) == 0 {
+                            a & b.wrapping_sub(1)
+                        } else {
+                            majit_uint_mod(a, b)
+                        };
                     }
                     pc += 5;
                 }

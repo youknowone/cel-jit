@@ -1806,3 +1806,87 @@ fn a_runtime_index_keeps_no_residual_call_in_its_loop() {
         );
     }
 }
+
+/// The `uint` twin of the mask arm above. Read unsigned, `2^63` is a power of
+/// two like any other, and `b - 1` masks it -- so the one divisor that reads
+/// negative as an `i64` is in the fast path rather than outside it.
+#[test]
+fn an_unsigned_power_of_two_modulus_keeps_no_residual_call_in_its_loop() {
+    use cel::majit::batch::{Batch, BatchProgram, ColumnRef, Tier};
+    let _serial = serial();
+    let us: Vec<u64> = vec![
+        0,
+        1,
+        2,
+        7,
+        8,
+        9,
+        97,
+        (1u64 << 63) - 1,
+        1u64 << 63,
+        (1u64 << 63) + 1,
+        u64::MAX - 1,
+        u64::MAX,
+    ];
+    let lens = vec![us.len() as i64];
+    let schema: Schema = [
+        ("us[]".to_string(), ValType::UInt),
+        ("d".to_string(), ValType::UInt),
+    ]
+    .into_iter()
+    .collect();
+    // The last divisor is NOT a power of two: it keeps the helper call, which
+    // is what proves the assertion below can fail.
+    let cases = [
+        (2u64, true),
+        (8, true),
+        (1, true),
+        (1u64 << 63, true),
+        (3, false),
+    ];
+    let src = "us.filter(u, u % d == 0u)";
+    for (divisor, mask_only) in cases {
+        let ds = [divisor];
+        let batch = Batch::new(1)
+            .column(
+                "us".to_string(),
+                ColumnRef::List {
+                    lens: &lens,
+                    fields: vec![(None, ColumnRef::UInt(&us))],
+                },
+            )
+            .column("d".to_string(), ColumnRef::UInt(&ds));
+        let lowered = BatchProgram::compile(src, &schema).expect(src);
+        let bound = lowered.bind_per_row(&batch).expect(src);
+        reset_persistent_state();
+        reset_jit_stats();
+        let clean = bound.collect_on(Tier::Clean).unwrap();
+        for _ in 0..64 {
+            let jit = bound.collect_on(Tier::Jit).unwrap();
+            assert_eq!(clean, jit, "{src}: compiled tier diverged from clean");
+        }
+        let stats = jit_stats();
+        assert_eq!(stats.internal_compile_panics, 0, "d={divisor}");
+        assert!(
+            stats.loops_compiled >= 1,
+            "d={divisor}: the filter loop did not compile: {stats:?}"
+        );
+        let calls: usize = majit_metainterp::embed::Census::compiled_opcode_log()
+            .iter()
+            .flatten()
+            .filter(|op| format!("{op:?}").starts_with("Call"))
+            .count();
+        if mask_only {
+            assert_eq!(
+                calls, 0,
+                "d={divisor}: a power-of-two modulus left a residual call in the loop"
+            );
+        } else {
+            assert!(
+                calls > 0,
+                "d={divisor}: the non-power-of-two control lost its helper call, \
+                 so the zero-call assertion above can no longer fail"
+            );
+        }
+    }
+}
