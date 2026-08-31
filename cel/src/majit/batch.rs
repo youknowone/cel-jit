@@ -2032,6 +2032,89 @@ mod tests {
         );
     }
 
+    /// `a % K == 0` for a power-of-two `K` masks instead of taking the
+    /// remainder, and answers what the tree-walker answers -- including on the
+    /// negative dividends whose sign the mask never computes.
+    ///
+    /// `% -1` is the exclusion that matters: `1` is a power of two, but
+    /// `i64::MIN % -1` overflows and the walker raises, where a mask would
+    /// answer. It must still trap.
+    #[test]
+    fn a_zero_test_on_a_power_of_two_modulus_masks_and_agrees_with_the_walker() {
+        use crate::majit::bytecode::{OPERANDS, OP_AND, OP_MOD_CHK_K};
+        let opcodes = |code: &[i64]| -> Vec<i64> {
+            let mut pc = 0;
+            let mut ops = Vec::new();
+            while pc < code.len() {
+                ops.push(code[pc]);
+                pc += 1 + OPERANDS[code[pc] as usize].len();
+            }
+            ops
+        };
+        let mut xs: Vec<i64> = (-9..=9).collect();
+        xs.extend([i64::MIN, i64::MIN + 1, i64::MAX, i64::MAX - 1]);
+        let lens = vec![xs.len() as i64];
+        let s = schema(&[("xs[]", ValType::Int)]);
+        let batch = Batch::new(1).column(
+            "xs",
+            ColumnRef::List {
+                lens: &lens,
+                fields: vec![(None, ColumnRef::Int(&xs))],
+            },
+        );
+        let mut ctx = Context::default();
+        ctx.add_variable_from_value(
+            "xs",
+            Value::list(xs.iter().map(|v| Value::Int(*v)).collect::<Vec<_>>()),
+        );
+        // `masked` says whether the rewrite is expected to fire. The controls
+        // are what keep the assertion able to fail: a non-power-of-two divisor,
+        // a non-zero right-hand side, and a use of the REMAINDER rather than of
+        // its zero test all keep the sign round trip.
+        for (src, masked) in [
+            ("xs.filter(x, x % 2 == 0)", true),
+            ("xs.filter(x, x % 2 != 0)", true),
+            ("xs.filter(x, 0 == x % 8)", true),
+            ("xs.filter(x, x % -4 == 0)", true),
+            ("xs.filter(x, x % 9223372036854775807 == 0)", false),
+            ("xs.filter(x, x % 3 == 0)", false),
+            ("xs.filter(x, x % 4 == 1)", false),
+            ("xs.filter(x, x % 1 == 0)", false),
+            ("xs.map(x, x % 2)", false),
+        ] {
+            let program = Program::compile(src).unwrap();
+            let batched =
+                BatchProgram::from_program(&program, &s).unwrap_or_else(|e| panic!("{src}: {e}"));
+            let ops = opcodes(&batched.lowered().body);
+            assert_eq!(
+                !ops.contains(&OP_MOD_CHK_K),
+                masked,
+                "{src}: wrong route: {ops:?}"
+            );
+            if masked {
+                assert!(ops.contains(&OP_AND), "{src}: no mask: {ops:?}");
+            }
+            let bound = batched.bind_per_row(&batch).unwrap();
+            let walker = vec![program.execute(&ctx).unwrap()];
+            for tier in [Tier::Clean, Tier::Interpreter, Tier::Jit] {
+                assert_eq!(bound.collect_on(tier).unwrap(), walker, "{src} on {tier:?}");
+            }
+        }
+        // `|K| == 1`: the walker raises on `i64::MIN % -1`, so every tier must
+        // trap rather than answer -- which is what excluding it buys.
+        let src = "xs.filter(x, x % -1 == 0)";
+        let program = Program::compile(src).unwrap();
+        assert!(program.execute(&ctx).is_err(), "{src}: the walker answers");
+        let batched = BatchProgram::from_program(&program, &s).unwrap();
+        let bound = batched.bind_per_row(&batch).unwrap();
+        for tier in [Tier::Clean, Tier::Interpreter, Tier::Jit] {
+            assert!(
+                matches!(bound.collect_on(tier), Err(BatchError::Trapped)),
+                "{src} on {tier:?}: must trap"
+            );
+        }
+    }
+
     /// `list[i]` for an index the row supplies reads through the fused
     /// `OP_INDEX_R`, and answers what the tree-walker answers -- in range, and
     /// on both ends of the range where the walker raises and every tier traps.

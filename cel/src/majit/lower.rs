@@ -3016,6 +3016,15 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
                 }
             }
         }
+        // `a % K == 0` for a power-of-two `K` is `(a & (|K| - 1)) == 0`.
+        // Divisibility does not depend on the dividend's sign, so the magnitude
+        // round trip `OP_MOD_CHK_K` needs in order to ANSWER `a % K` is dead
+        // when the only consumer is a zero test.
+        if matches!(name, ops::EQUALS | ops::NOT_EQUALS) {
+            if let Some(r) = lower_divisibility(ctx, iop, call)? {
+                return Ok(r);
+            }
+        }
         let (mut a, mut b) = compile_cmp_operands(ctx, &call.args[0], &call.args[1])?;
         // Operands of two DIFFERENT type classes are never equal and always
         // unequal, whatever the row holds, so `==`/`!=` fold to a constant. The
@@ -4581,6 +4590,60 @@ fn lower_var_index(
         OVF_FLAG_REG as i64,
     ]);
     Ok(out)
+}
+
+/// The mask `|k| - 1` when `k` divides exactly the values `k` masks -- i.e.
+/// when `|k|` is a power of two of at least 2 -- and `None` otherwise.
+///
+/// `|k| == 1` is excluded, and that is the whole subtlety: `1` IS a power of
+/// two, but `a % -1` overflows on `i64::MIN` and the tree-walker raises there,
+/// where a mask would answer `true`. Every other power of two makes `a % k`
+/// total, so the rewritten form has no trap to reproduce.
+///
+/// `i64::MIN` is admitted: `unsigned_abs` gives `2^63` exactly, and its mask
+/// `2^63 - 1` is `i64::MAX`.
+fn divisibility_mask(k: i64) -> Option<i64> {
+    let m = k.unsigned_abs();
+    (m >= 2 && m.is_power_of_two()).then(|| (m - 1) as i64)
+}
+
+/// `a % K == 0` -- either operand order -- as `(a & (|K| - 1)) == 0`, or `None`
+/// where the shape is not that and the ordinary comparison path answers.
+///
+/// Recognised on the AST rather than on the emitted ops: `OP_MOD_CHK_K` has
+/// already reapplied the dividend's sign by then, and the sign is exactly what
+/// a zero test does not read. The dividend is compiled first because its BANK
+/// decides whether the rewrite applies at all, and compiling it is the only way
+/// to learn that; a pool constant is handed back to the ordinary path, which
+/// folds the whole comparison instead of masking it.
+fn lower_divisibility(
+    ctx: &mut LowerCtxF,
+    iop: i64,
+    call: &CallExpr,
+) -> Result<Option<TReg>, LowerError> {
+    for (m, z) in [(0usize, 1usize), (1, 0)] {
+        let (m, z) = (&call.args[m], &call.args[z]);
+        if as_int_literal(z) != Some(0) {
+            continue;
+        }
+        let Expr::Call(inner) = &m.expr else {
+            continue;
+        };
+        if inner.func_name != ops::MODULO || inner.args.len() != 2 {
+            continue;
+        }
+        let Some(mask) = as_int_literal(&inner.args[1]).and_then(divisibility_mask) else {
+            continue;
+        };
+        let a = compile_t(ctx, &inner.args[0])?;
+        if a.bank != ValType::Int || ctx.const_of(a).is_some() {
+            return Ok(None);
+        }
+        let masked = emit_int_bin_k(ctx, OP_AND, a, mask);
+        let zero = emit_int_const(ctx, 0);
+        return Ok(Some(emit_bin(ctx, iop, masked, zero, ValType::Bool)));
+    }
+    Ok(None)
 }
 
 /// `x <name> y` for two same-bank constants, as the word the bank stores, or
