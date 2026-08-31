@@ -69,6 +69,26 @@ fn as_bool_literal(e: &IdedExpr) -> Option<bool> {
     }
 }
 
+/// Whether `e` is the operand that absorbs a `&&` / `||` whole.
+///
+/// A bare `true` / `false` is the usual spelling, but absorption is a property
+/// of the VALUE: `1 < 2 || x` absorbs exactly as `true || x` does. The
+/// resolution is [`fold_constant`]'s — `Context::default()`, no host functions
+/// — so the two places agree about which expressions have a constant value, and
+/// an operand that raises rather than resolves absorbs nothing.
+fn absorbs(e: &IdedExpr, absorbing: bool) -> bool {
+    if let Some(b) = as_bool_literal(e) {
+        return b == absorbing;
+    }
+    if !is_constant(e, &mut Vec::new()) {
+        return false;
+    }
+    matches!(
+        Value::resolve(e, &Context::default()),
+        Ok(Value::Bool(b)) if b == absorbing
+    )
+}
+
 fn as_string_literal(e: &IdedExpr) -> Option<&str> {
     match &e.expr {
         Expr::Literal(LiteralValue::String(s)) => Some(s.as_str()),
@@ -3058,14 +3078,10 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
         // CEL's logical operators are commutative and absorb the other operand
         // whole — its value, its errors and its type. `1 || true` is `true` and
         // `1 && false` is `false`, though `1` alone is NoSuchOverload under
-        // either. So an absorbing literal answers before anything else is
+        // either. So an absorbing operand answers before anything else is
         // compiled; without one, `1 || false` stays the type error it is.
         let absorbing = name == ops::LOGICAL_OR;
-        if call
-            .args
-            .iter()
-            .any(|a| as_bool_literal(a) == Some(absorbing))
-        {
+        if call.args.iter().any(|a| absorbs(a, absorbing)) {
             return Ok(emit_bool_const(ctx, absorbing));
         }
         let mut acc = compile_t(ctx, &call.args[0])?;
