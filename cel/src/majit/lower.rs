@@ -3203,6 +3203,39 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
                 return Ok(ctx.const_reg(a.bank, word));
             }
         }
+        // A constant divisor rides in the instruction stream, not in a register.
+        // `program` is a green argument, so the immediate is a CONSTANT the
+        // trace optimizer expands into multiply-and-shift, while the same value
+        // in a prelude-loaded register reaches the row loop as an opaque
+        // loop-invariant and leaves the `int.udiv`/`int.umod` residual call in
+        // the body. A zero divisor keeps the register form, whose guard traps it
+        // the way the tree-walker raises.
+        let const_divisor = ctx.const_of(b).filter(|k| *k != 0);
+        let kop = if a.bank == b.bank {
+            match (name, a.bank) {
+                (ops::DIVIDE, ValType::Int) => Some(OP_DIV_CHK_K),
+                (ops::MODULO, ValType::Int) => Some(OP_MOD_CHK_K),
+                (ops::DIVIDE, ValType::UInt) => Some(OP_UDIV_K),
+                (ops::MODULO, ValType::UInt) => Some(OP_UMOD_K),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if let (Some(k), Some(kop)) = (const_divisor, kop) {
+            let d = ctx.fresh(a.bank);
+            ctx.body
+                .extend_from_slice(&[kop, a.idx as i64, k, d.idx as i64]);
+            // Only the signed pair can still trap: `INT_MIN / -1` and
+            // `INT_MIN % -1` are what the tree-walker's `checked_div`/
+            // `checked_rem` report as `Overflow`. Every `uint` pair with a
+            // nonzero divisor has a representable answer, so those two carry no
+            // trap word.
+            if a.bank == ValType::Int {
+                ctx.body.push(OVF_FLAG_REG as i64);
+            }
+            return Ok(d);
+        }
         match (a.bank, b.bank) {
             (ValType::Int, ValType::Int) => Ok(emit_trapping(ctx, iop, ValType::Int)),
             (ValType::UInt, ValType::UInt) => Ok(emit_trapping(ctx, uop, ValType::UInt)),

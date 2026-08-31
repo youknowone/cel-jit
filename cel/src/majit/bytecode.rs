@@ -229,6 +229,26 @@ pub const OP_INDEX_K_F: i64 = 64; // [off, len, k, base, fdst, trap] float twin
 pub const OP_COL_PUSH: i64 = 65; // [base, cur, src, cur]   *(regs[base] + regs[cur]*8) = regs[src]; regs[cur] += 1
 pub const OP_COL_PUSH_F: i64 = 66; // [base, cur, fsrc, cur] float twin
 
+/// The constant-divisor peers of [`OP_DIV_CHK`]/[`OP_MOD_CHK`]/[`OP_UDIV`]/
+/// [`OP_UMOD`]: the divisor is an IMMEDIATE word in the instruction stream
+/// rather than a register.
+///
+/// `program` is a green argument, so an immediate is a CONSTANT to the trace
+/// optimizer while a register holding the same value is not — the prelude loads
+/// it once, outside the row loop, and it reaches the body as a loop-invariant
+/// argument with no known value. That distinction is the whole point of these
+/// four: on a constant divisor the optimizer expands the division into
+/// multiply-and-shift (`optimize_call_int_py_div` / `_py_mod`), while the
+/// register form leaves the `int.udiv`/`int.umod` residual call the census
+/// measured at one per element.
+///
+/// The lowering emits these only for a nonzero divisor, so they carry no zero
+/// guard; a literal zero keeps the register form and traps there.
+pub const OP_DIV_CHK_K: i64 = 67; // [a, k, dst, trap]  regs[dst] = a / k   (trunc toward zero)
+pub const OP_MOD_CHK_K: i64 = 68; // [a, k, dst, trap]  regs[dst] = a % k   (sign of dividend)
+pub const OP_UDIV_K: i64 = 69; // [a, k, dst, trap]  regs[dst] = (a as u64) / (k as u64)
+pub const OP_UMOD_K: i64 = 70; // [a, k, dst, trap]  regs[dst] = (a as u64) % (k as u64)
+
 /// What one word after an opcode means, for a consumer that walks a program
 /// without running it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -266,7 +286,7 @@ use Operand::{Float, FloatOut, Imm, Int, IntOut, IntTrap, Target};
 /// so an opcode added past it without a row here is a compile error on this
 /// array instead of an out-of-bounds index the first time that opcode is
 /// decoded.
-pub const OPERANDS: [&[Operand]; OP_COL_PUSH_F as usize + 1] = [
+pub const OPERANDS: [&[Operand]; OP_UMOD_K as usize + 1] = [
     &[Imm, IntOut],                           // 0  LOAD_CONST
     &[Int, IntOut],                           // 1  MOV
     &[Int, Int, IntOut],                      // 2  ADD
@@ -334,6 +354,10 @@ pub const OPERANDS: [&[Operand]; OP_COL_PUSH_F as usize + 1] = [
     &[Int, Int, Imm, Int, FloatOut, IntTrap], // 64 INDEX_K_F
     &[Int, Int, Int, IntOut],                 // 65 COL_PUSH
     &[Int, Int, Float, IntOut],               // 66 COL_PUSH_F
+    &[Int, Imm, IntOut, IntTrap],             // 67 DIV_CHK_K
+    &[Int, Imm, IntOut, IntTrap],             // 68 MOD_CHK_K
+    &[Int, Imm, IntOut],                      // 69 UDIV_K
+    &[Int, Imm, IntOut],                      // 70 UMOD_K
 ];
 
 /// What one [`check_code`] established about one program: the words it read,
@@ -1434,14 +1458,14 @@ pub mod float_bank {
     /// them under. What moved is who owns the counters.
     use super::{
         OP_ADD, OP_ADD_IMM, OP_ADD_OVF, OP_AND, OP_COL_LOAD, OP_COL_LOAD_B, OP_COL_LOAD_F,
-        OP_COL_PUSH, OP_COL_PUSH_F, OP_COL_STORE, OP_COL_STORE_F, OP_DIV, OP_DIV_CHK, OP_EQ,
-        OP_F2I, OP_F2U, OP_FADD, OP_FDIV, OP_FEQ, OP_FGE, OP_FGT, OP_FLE, OP_FLT, OP_FMOV, OP_FMUL,
-        OP_FNE, OP_FNEG, OP_FSELECT, OP_FSUB, OP_GE, OP_GT, OP_HOST_CALL1_F, OP_HOST_CALL1_I,
-        OP_HOST_CALL2_F, OP_HOST_CALL2_I, OP_I2F, OP_INDEX_K, OP_INDEX_K_F, OP_JUMP_IF_ABOVE,
-        OP_LE, OP_LOAD_CONST, OP_LOAD_CONST_F, OP_LT, OP_MOD, OP_MOD_CHK, OP_MOV, OP_MUL,
-        OP_MUL_IMM, OP_MUL_OVF, OP_NE, OP_NEG, OP_NOT, OP_OR, OP_RETURN, OP_RETURN_F, OP_SELECT,
-        OP_SUB, OP_SUB_OVF, OP_TRAP_STORE, OP_U2F, OP_UADD_OVF, OP_UDIV, OP_ULE, OP_ULT, OP_UMOD,
-        OP_UMUL_OVF, OP_USUB_OVF,
+        OP_COL_PUSH, OP_COL_PUSH_F, OP_COL_STORE, OP_COL_STORE_F, OP_DIV, OP_DIV_CHK, OP_DIV_CHK_K,
+        OP_EQ, OP_F2I, OP_F2U, OP_FADD, OP_FDIV, OP_FEQ, OP_FGE, OP_FGT, OP_FLE, OP_FLT, OP_FMOV,
+        OP_FMUL, OP_FNE, OP_FNEG, OP_FSELECT, OP_FSUB, OP_GE, OP_GT, OP_HOST_CALL1_F,
+        OP_HOST_CALL1_I, OP_HOST_CALL2_F, OP_HOST_CALL2_I, OP_I2F, OP_INDEX_K, OP_INDEX_K_F,
+        OP_JUMP_IF_ABOVE, OP_LE, OP_LOAD_CONST, OP_LOAD_CONST_F, OP_LT, OP_MOD, OP_MOD_CHK,
+        OP_MOD_CHK_K, OP_MOV, OP_MUL, OP_MUL_IMM, OP_MUL_OVF, OP_NE, OP_NEG, OP_NOT, OP_OR,
+        OP_RETURN, OP_RETURN_F, OP_SELECT, OP_SUB, OP_SUB_OVF, OP_TRAP_STORE, OP_U2F, OP_UADD_OVF,
+        OP_UDIV, OP_UDIV_K, OP_ULE, OP_ULT, OP_UMOD, OP_UMOD_K, OP_UMUL_OVF, OP_USUB_OVF,
     };
 
     // The four calling conventions of `magic::ScalarFn`, each reading its
@@ -1887,6 +1911,102 @@ pub mod float_bank {
                         state.regs[d] = majit_uint_mod(a, b);
                     }
                     pc += 5;
+                }
+                // The four constant-divisor arms. Every test below that reads
+                // only `k` is decided while tracing, so the compiled body keeps
+                // just the division the optimizer expanded and nothing of the
+                // dispatch.
+                OP_DIV_CHK_K => {
+                    let a = state.regs[program[pc + 1] as usize];
+                    let k = program[pc + 2];
+                    let d = program[pc + 3] as usize;
+                    let t = program[pc + 4] as usize;
+                    // Magnitudes, as in `OP_DIV_CHK`: floor and truncation agree
+                    // on non-negative operands, and only the magnitude form has a
+                    // constant the optimizer can expand.
+                    let ma = a >> 63;
+                    let mk = k >> 63;
+                    let ua = (a ^ ma).wrapping_sub(ma);
+                    let ub = (k ^ mk).wrapping_sub(mk);
+                    let s = ma ^ mk; // -1 iff signs differ
+                    let uq = if ub < 0 {
+                        // `|k| == 2^63`, which reads negative: every dividend but
+                        // `i64::MIN` has a smaller magnitude and divides to 0.
+                        if ua < 0 {
+                            1
+                        } else {
+                            0
+                        }
+                    } else if ua < 0 {
+                        // `|i64::MIN|` is 2^63 and reads negative too, so the
+                        // expanded division would answer for the wrong sign. One
+                        // dividend in 2^64 keeps the residual call.
+                        majit_uint_div(ua, ub)
+                    } else {
+                        ua / ub
+                    };
+                    if ua < 0 && ub == 1 && s == 0 {
+                        // The `INT_MIN / -1` corner `OP_DIV_CHK` guards.
+                        state.regs[t] = 1;
+                    }
+                    state.regs[d] = (uq ^ s).wrapping_sub(s);
+                    pc += 5;
+                }
+                OP_MOD_CHK_K => {
+                    let a = state.regs[program[pc + 1] as usize];
+                    let k = program[pc + 2];
+                    let d = program[pc + 3] as usize;
+                    let t = program[pc + 4] as usize;
+                    let ma = a >> 63;
+                    let mk = k >> 63;
+                    let ua = (a ^ ma).wrapping_sub(ma);
+                    let ub = (k ^ mk).wrapping_sub(mk);
+                    let ur = if ub & ub.wrapping_sub(1) == 0 {
+                        // A power-of-two magnitude is a mask, `|i64::MIN|`
+                        // included; `|k| == 1` masks to 0, which is the answer.
+                        ua & ub.wrapping_sub(1)
+                    } else if ua < 0 {
+                        majit_uint_mod(ua, ub)
+                    } else {
+                        // Off the mask `|k|` is at least 3 and below 2^63, so it
+                        // reads non-negative and the expansion applies.
+                        ua % ub
+                    };
+                    if ua < 0 && ub == 1 && (ma ^ mk) == 0 {
+                        state.regs[t] = 1;
+                    }
+                    state.regs[d] = (ur ^ ma).wrapping_sub(ma);
+                    pc += 5;
+                }
+                OP_UDIV_K => {
+                    let a = state.regs[program[pc + 1] as usize];
+                    let k = program[pc + 2];
+                    let d = program[pc + 3] as usize;
+                    // A `uint` travels as its raw bit pattern, so an operand at
+                    // or above 2^63 reads negative and only the unsigned call
+                    // answers it. Below that the signed division agrees, and it
+                    // is the one carrying the constant.
+                    state.regs[d] = if k >= 0 && a >= 0 {
+                        a / k
+                    } else {
+                        majit_uint_div(a, k)
+                    };
+                    pc += 4;
+                }
+                OP_UMOD_K => {
+                    let a = state.regs[program[pc + 1] as usize];
+                    let k = program[pc + 2];
+                    let d = program[pc + 3] as usize;
+                    state.regs[d] = if k & k.wrapping_sub(1) == 0 {
+                        // A power-of-two divisor masks EVERY dividend, the
+                        // patterns at or above 2^63 included.
+                        a & k.wrapping_sub(1)
+                    } else if k >= 0 && a >= 0 {
+                        a % k
+                    } else {
+                        majit_uint_mod(a, k)
+                    };
+                    pc += 4;
                 }
                 OP_UADD_OVF => {
                     let a = state.regs[program[pc + 1] as usize];
@@ -2968,6 +3088,42 @@ pub mod float_bank {
                         }
                     }
                     pc += 5;
+                }
+                // The constant-divisor peers. The reference tier reads the
+                // divisor from the stream and answers exactly as the register
+                // forms above do; the lowering guarantees it is nonzero, so only
+                // the `INT_MIN / -1` corner can still trap.
+                OP_DIV_CHK_K => {
+                    let a = regs[program[pc + 1] as usize];
+                    match a.checked_div(program[pc + 2]) {
+                        Some(q) => regs[program[pc + 3] as usize] = q,
+                        None => {
+                            regs[program[pc + 4] as usize] = 1;
+                            regs[program[pc + 3] as usize] = 0;
+                        }
+                    }
+                    pc += 5;
+                }
+                OP_MOD_CHK_K => {
+                    let a = regs[program[pc + 1] as usize];
+                    match a.checked_rem(program[pc + 2]) {
+                        Some(r) => regs[program[pc + 3] as usize] = r,
+                        None => {
+                            regs[program[pc + 4] as usize] = 1;
+                            regs[program[pc + 3] as usize] = 0;
+                        }
+                    }
+                    pc += 5;
+                }
+                OP_UDIV_K => {
+                    let a = regs[program[pc + 1] as usize] as u64;
+                    regs[program[pc + 3] as usize] = (a / program[pc + 2] as u64) as i64;
+                    pc += 4;
+                }
+                OP_UMOD_K => {
+                    let a = regs[program[pc + 1] as usize] as u64;
+                    regs[program[pc + 3] as usize] = (a % program[pc + 2] as u64) as i64;
+                    pc += 4;
                 }
                 // The unsigned overflow trio: the reference tier spells the
                 // condition as `u64::checked_*`, which is the tree-walker's own
