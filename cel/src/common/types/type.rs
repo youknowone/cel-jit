@@ -132,9 +132,56 @@ pub(crate) fn type_ident(name: &str) -> Option<Value> {
     Some(Value::Opaque(Arc::new(TypeValue(denoted))))
 }
 
+/// The type names a JIT `ValType::Type` index denotes, in index order.
+///
+/// A type value is inert -- equality and its own name are all it has -- so an
+/// index into a FIXED table is a complete encoding of one, and no side table
+/// has to travel with a lowered program the way the string ranks do. The names
+/// are exactly [`type_ident`]'s keys, which is what lets one index answer both
+/// directions: the lowering takes a folded `type(x)` constant to an index by
+/// name, and the output takes the index back to a value through `type_ident`.
+/// `type_const_names_are_type_idents` holds the two lists together.
+///
+/// A type OUTSIDE the table has no index and the lowering declines it. That is
+/// every message type, `google.protobuf.Timestamp` included: `type_ident` does
+/// not bind those either, because they are not spellable as an identifier.
+pub(crate) const TYPE_CONST_NAMES: [&str; 11] = [
+    "bool",
+    "bytes",
+    "double",
+    "int",
+    "list",
+    "map",
+    "null_type",
+    "optional_type",
+    "string",
+    "type",
+    "uint",
+];
+
+/// The index [`TYPE_CONST_NAMES`] gives `name`, or `None` for a type it does
+/// not carry.
+pub(crate) fn type_const_id(name: &str) -> Option<i64> {
+    TYPE_CONST_NAMES
+        .iter()
+        .position(|n| *n == name)
+        .map(|i| i as i64)
+}
+
+/// The type value an index denotes -- the inverse of [`type_const_id`].
+///
+/// Panics on an index no [`type_const_id`] produced, which is a lowering that
+/// minted an index this table cannot answer for.
+pub(crate) fn type_const_value(id: i64) -> Value {
+    let name = TYPE_CONST_NAMES
+        .get(id as usize)
+        .expect("an index type_const_id minted");
+    type_ident(name).expect("a name type_ident binds")
+}
+
 #[cfg(test)]
 mod tests {
-    use super::TypeValue;
+    use super::{type_const_id, type_const_value, TypeValue, TYPE_CONST_NAMES};
     use crate::common::types::TYPE_TYPE;
     use crate::objects::Value;
     use crate::{Context, Program};
@@ -251,6 +298,27 @@ mod tests {
     fn a_type_value_is_not_equal_to_its_name() {
         // `type()` returns a type, not the string spelling one.
         assert_eq!(eval("type(1) == 'int'"), Ok(false.into()));
+    }
+
+    /// Every index name is a name `type_ident` binds, and the round trip
+    /// `name -> id -> value` lands on a value denoting that same name. Without
+    /// this the two lists drift and an index starts denoting a different type
+    /// than the lowering meant, which no test of either list alone would see.
+    #[test]
+    fn type_const_names_are_type_idents() {
+        for (i, name) in TYPE_CONST_NAMES.iter().enumerate() {
+            assert_eq!(type_const_id(name), Some(i as i64), "id of `{name}`");
+            let v = type_const_value(i as i64);
+            let Value::Opaque(o) = &v else {
+                panic!("`{name}` is not an opaque");
+            };
+            assert_eq!(
+                o.downcast_ref::<TypeValue>().expect("a type value").name(),
+                *name
+            );
+        }
+        assert_eq!(type_const_id("google.protobuf.Timestamp"), None);
+        assert_eq!(type_const_id("dyn"), None);
     }
 
     #[test]

@@ -30,6 +30,7 @@
 use super::bytecode::*;
 use crate::common::ast::operators as ops;
 use crate::common::ast::{CallExpr, ComprehensionExpr, EntryExpr, Expr, IdedExpr, LiteralValue};
+use crate::common::types::{type_const_id, TypeValue};
 use crate::{Context, Value};
 use std::collections::HashMap;
 
@@ -125,6 +126,22 @@ pub enum ValType {
     /// [`ValType::Timestamp`], comparisons lower to the signed int ops; a
     /// timestamp vs duration comparison is NoSuchOverload and bails.
     Duration,
+    /// A CEL `type` used as a value, carried in the int register file as its
+    /// index into [`LoweredF::type_consts`].
+    ///
+    /// Types are values in CEL, so `type(x)` has to return one, and the checker
+    /// FOLDS such a call to a `Value::Opaque` holding a
+    /// [`TypeValue`](crate::common::types::TypeValue) -- a compile-time
+    /// constant. So this bank never carries a column and never computes: the
+    /// index is minted while lowering and the only operations are `==` and
+    /// `!=`, which are index comparisons because the interning is injective by
+    /// construction.
+    ///
+    /// The index is NOT a stable type id. It is a rank over the type constants
+    /// THIS expression mentions, the way [`ValType::Str`] ranks the batch's
+    /// distinct strings, so two programs may number the same type differently
+    /// and only comparisons within one lowering are meaningful.
+    Type,
 }
 
 /// Declared type of each input path. Every path an expression reads must appear
@@ -1088,7 +1105,11 @@ impl LoweredF {
                 | ValType::UInt
                 | ValType::Str
                 | ValType::Timestamp
-                | ValType::Duration => (OP_COL_LOAD, r_ea),
+                | ValType::Duration
+                // No `ColumnRef` builds one, so a `Type` slot cannot bind; the
+                // arm is here because the bank IS an int-file word and an
+                // `unreachable!` would be a claim about the caller's schema.
+                | ValType::Type => (OP_COL_LOAD, r_ea),
                 ValType::Bool => (OP_COL_LOAD_B, r_i),
                 ValType::Float => (OP_COL_LOAD_F, r_ea),
             };
@@ -1504,6 +1525,7 @@ impl LowerCtxF<'_> {
             | ValType::Bool
             | ValType::UInt
             | ValType::Str
+            | ValType::Type
             | ValType::Timestamp
             | ValType::Duration => {
                 let r = self.next_int;
@@ -1571,11 +1593,16 @@ impl LowerCtxF<'_> {
     /// column, built from the same declaration, would then be read in the wrong
     /// bank.
     fn slot(&mut self, path: String) -> Result<TReg, LowerError> {
-        let ty = self
-            .schema
-            .get(&path)
-            .copied()
-            .ok_or_else(|| LowerError::unsupported(format!("undeclared path `{path}`")))?;
+        let Some(ty) = self.schema.get(&path).copied() else {
+            // CEL binds the type names as identifiers, so `int` is a value and
+            // not an undeclared column. The schema is consulted FIRST, which is
+            // the tree-walker's own order (`context.rs:167` reaches
+            // `type_ident` only after the variables), so a column may still be
+            // named `int`.
+            let id = type_const_id(&path)
+                .ok_or_else(|| LowerError::unsupported(format!("undeclared path `{path}`")))?;
+            return Ok(self.const_reg(ValType::Type, id));
+        };
         Ok(self.slot_typed(path, ty))
     }
 
@@ -2159,6 +2186,7 @@ enum CmpClass {
     Str,
     Timestamp,
     Duration,
+    Type,
 }
 
 fn cmp_class(bank: ValType) -> CmpClass {
@@ -2168,6 +2196,7 @@ fn cmp_class(bank: ValType) -> CmpClass {
         ValType::Str => CmpClass::Str,
         ValType::Timestamp => CmpClass::Timestamp,
         ValType::Duration => CmpClass::Duration,
+        ValType::Type => CmpClass::Type,
     }
 }
 
@@ -2669,6 +2698,34 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
     }
     let name = call.func_name.as_str();
 
+    // `type(x)` the checker could not fold, because its argument is not a
+    // literal. The answer is still decided while lowering: the argument's BANK
+    // is its CEL type, so the call is a green type constant and the argument's
+    // ops are the only thing left of it.
+    //
+    // Reading the bank is sound because a bank is only assigned to a value the
+    // machine actually carries: a list-valued expression has no scalar
+    // register and declines before this point, so no `type(xs)` can arrive here
+    // and be answered `int` from its element bank. `timestamp` and `duration`
+    // decline because their type names -- `google.protobuf.Timestamp` and
+    // `.Duration` -- are message types, which the index table does not carry.
+    if name == "type" && call.args.len() == 1 {
+        let a = compile_t(ctx, &call.args[0])?;
+        let denoted = match a.bank {
+            ValType::Int => "int",
+            ValType::UInt => "uint",
+            ValType::Float => "double",
+            ValType::Bool => "bool",
+            ValType::Str => "string",
+            ValType::Type => "type",
+            ValType::Timestamp | ValType::Duration => {
+                return Err(LowerError::unsupported("type() of a message type"))
+            }
+        };
+        let id = type_const_id(denoted).expect("a bank name the index table carries");
+        return Ok(ctx.const_reg(ValType::Type, id));
+    }
+
     // `timestamp("...")` / `duration("...")` over a string literal are green
     // constants: parse the literal the same way the tree-walker does and fold it
     // to an i64-nanoseconds constant in the prelude. A non-literal argument, a
@@ -3068,6 +3125,20 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
                 ))),
             };
         }
+        // A type value carries equality and nothing else -- `type(1) < type(2)`
+        // is NoSuchOverload -- and it is a constant by construction, because the
+        // only thing that mints one is a `type(x)` the checker already folded.
+        // Its index comes from one injective table, so equality is an index
+        // compare and both sides being constant it answers here.
+        if a.bank == ValType::Type {
+            if !matches!(name, ops::EQUALS | ops::NOT_EQUALS) {
+                return Err(LowerError::unsupported("ordering on type values"));
+            }
+            return Ok(match (ctx.const_of(a), ctx.const_of(b)) {
+                (Some(x), Some(y)) => emit_bool_const(ctx, (x == y) == (name == ops::EQUALS)),
+                _ => emit_bin(ctx, iop, a, b, ValType::Bool),
+            });
+        }
         // Two constants of one numeric or bool bank compare now, once.
         if let (Some(x), Some(y)) = (ctx.const_of(a), ctx.const_of(b)) {
             if let Some(word) = fold_cmp(name, a.bank, b.bank, x, y) {
@@ -3355,6 +3426,7 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
                     ValType::Bool => unreachable!("handled above"),
                     ValType::UInt => return Err(LowerError::unsupported("unary negate on uint")),
                     ValType::Str => return Err(LowerError::unsupported("unary negate on string")),
+                    ValType::Type => return Err(LowerError::unsupported("unary negate on type")),
                     // `-duration` is CEL and the walker answers it
                     // (`objects.rs` `Value::Duration(d) => Value::Duration(-d)`);
                     // `-timestamp` has no overload, so the walker raises and
@@ -3642,6 +3714,18 @@ fn emit_constant_value(ctx: &mut LowerCtxF, v: &Value) -> Result<TReg, LowerErro
             d.num_nanoseconds()
                 .ok_or_else(|| LowerError::unsupported("folded duration outside i64-nanos"))?,
         ),
+        // `type(x)` is folded by the checker, so a type value reaches the
+        // lowering as a constant opaque and never as a call. It carries no
+        // payload beyond which type it denotes, so its index into
+        // `TYPE_CONST_NAMES` IS the value.
+        Value::Opaque(o) => {
+            let tv = o
+                .downcast_ref::<TypeValue>()
+                .ok_or_else(|| LowerError::unsupported("constant of type `opaque`"))?;
+            let id = type_const_id(tv.name())
+                .ok_or_else(|| LowerError::unsupported(format!("type constant `{}`", tv.name())))?;
+            (ValType::Type, id)
+        }
         other => {
             return Err(LowerError::unsupported(format!(
                 "constant of type `{}`",

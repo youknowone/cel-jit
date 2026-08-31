@@ -65,6 +65,11 @@ fn decode_local(bank: ValType, v: i64, interned: &[std::sync::Arc<String>]) -> V
             Value::Timestamp(chrono::DateTime::from_timestamp_nanos(v).fixed_offset())
         }
         ValType::Duration => Value::Duration(chrono::Duration::nanoseconds(v)),
+        // Spelled rather than wildcarded so a new bank still breaks this copy
+        // -- that break is the only thing keeping it a copy of the decoder.
+        // The probe feeds one bank and never reaches here; decoding a type
+        // value needs a crate-private table an example cannot see.
+        ValType::Type => unreachable!("the probe feeds no type values"),
     }
 }
 

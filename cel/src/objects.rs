@@ -124,6 +124,10 @@ pub enum ScalarBank {
     /// Nanoseconds.
     #[cfg(feature = "chrono")]
     Duration,
+    /// An index into the fixed table of CEL type names, which is the whole of a
+    /// type value: nothing indexes, adds or iterates one, so there is no
+    /// payload for the index to stand in for.
+    Type,
 }
 
 impl ValueColumn {
@@ -142,6 +146,7 @@ impl ValueColumn {
                     ),
                     #[cfg(feature = "chrono")]
                     ScalarBank::Duration => Value::Duration(chrono::Duration::nanoseconds(word)),
+                    ScalarBank::Type => crate::common::types::type_const_value(word),
                 }
             }
             ValueColumn::Str(bank) => bank.value_at(index),

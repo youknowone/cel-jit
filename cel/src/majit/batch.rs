@@ -71,6 +71,7 @@ use super::lower::{
     offset_slot_source, size_slot_source, string_slot_source, BatchReduce, ConcatSide, LoweredF,
     Schema, SlotKind, ValType,
 };
+use crate::common::types::type_const_value;
 use crate::objects::{Key, ListRef, ListStorage, RecordSchema, ScalarBank, StrBank, ValueColumn};
 use crate::{Context, Program, Value};
 
@@ -1681,6 +1682,9 @@ impl RawOutput<'_> {
                             .iter()
                             .map(|&v| Value::Duration(chrono::Duration::nanoseconds(v))),
                     ),
+                    // A type value's word is its index into the fixed name
+                    // table, so decoding it reads no batch-side table at all.
+                    ValType::Type => out.extend(values.iter().map(|&v| type_const_value(v))),
                 }
             }
             RawOutput::List {
@@ -1770,6 +1774,7 @@ fn column_of(bank: ValType, words: &[i64], interned: Option<&Arc<[Arc<String>]>>
         ValType::Float => ScalarBank::Float,
         ValType::Timestamp => ScalarBank::Timestamp,
         ValType::Duration => ScalarBank::Duration,
+        ValType::Type => ScalarBank::Type,
         ValType::Str => {
             // Reachable only through the predicate that built the table, so a
             // `None` here is that predicate and this arm having disagreed.

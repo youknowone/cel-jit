@@ -2501,6 +2501,46 @@ mod tests {
         }
     }
 
+    /// A CEL type is a value, and `type(x)` is folded by the checker, so one
+    /// arrives at the lowering as a constant opaque. It is carried as an index
+    /// into a fixed table of type names -- equality and its own name are all a
+    /// type value has -- and these rows check both halves against the
+    /// tree-walker: the index comparisons, and the decode of an index back to a
+    /// value on a per-row output.
+    ///
+    /// Every expression reads `i`, because a program that reads no column is a
+    /// constant and would not compile a loop for the tier check to grade.
+    #[test]
+    fn batch_type_values() {
+        let n = 600;
+        let ints = gen_i64(n, 0x51A5_1A51_A51A_51A5, -50, 50);
+        let cols = [("i", ColData::Int(ints))];
+        for expr in [
+            // Equality between two type values, both directions.
+            "type(1) == type(2) && i > 0",
+            "type(1) == type(1u) || i > 0",
+            "type(2.0) == type(1.5) && i > 0",
+            "type(type(1)) == type(type(\"a\")) && i > 0",
+            // A type value is not the string spelling one.
+            "type(1) == \"int\" || i > 0",
+            // CEL binds the type names as identifiers, so these are values.
+            "type(1) == int && i > 0",
+            "type(\"a\") == string || i > 0",
+            "type(1) == uint || i > 0",
+            "type(int) == type && i > 0",
+            // The decode: the row's own answer IS a type value.
+            "i > 0 ? type(1) : type(\"a\")",
+            "i > 0 ? type(true) : type(1u)",
+            "i > 0 ? int : string",
+            // `type(x)` the checker could not fold: the argument's bank decides.
+            "type(i) == int && i > 0",
+            "type(i > 0) == bool && i > 0",
+            "type(i) == string || i > 0",
+        ] {
+            check_collect(expr, &cols);
+        }
+    }
+
     #[test]
     fn batch_timestamp_accessors_at_the_range_ends() {
         // The lowering divides by immediates whose DIVIDEND it claims cannot be

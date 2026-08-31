@@ -24,6 +24,7 @@ use crate::objects::{OptionalValue, Value};
 #[cfg(feature = "structs")]
 pub use r#struct::Struct as CelStruct;
 pub use r#type::TypeValue;
+pub(crate) use r#type::{type_const_id, type_const_value};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Kind {
     Unspecified,
