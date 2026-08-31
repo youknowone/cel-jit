@@ -1796,7 +1796,19 @@ pub mod float_bank {
                         let mb = b >> 63;
                         let ua = (a ^ ma).wrapping_sub(ma);
                         let ub = (b ^ mb).wrapping_sub(mb);
-                        let ur = majit_uint_mod(ua, ub);
+                        // A power-of-two magnitude keeps the remainder inline:
+                        // one mask instead of a residual call per element. The
+                        // test is loop-invariant when the divisor is, so the
+                        // trace hoists it and the body keeps only the mask.
+                        // `|i64::MIN|` wraps negative, and the mask arm still
+                        // answers it: `MIN & MAX` is 0 when the dividend is
+                        // `i64::MIN` too, and `ua & i64::MAX` is `ua` -- the
+                        // whole magnitude -- for any smaller dividend.
+                        let ur = if ub & ub.wrapping_sub(1) == 0 {
+                            ua & ub.wrapping_sub(1)
+                        } else {
+                            majit_uint_mod(ua, ub)
+                        };
                         if ua < 0 && ub == 1 && (ma ^ mb) == 0 {
                             // `INT_MIN % -1` is mathematically 0, but
                             // `checked_rem` reports it as `Overflow` and the

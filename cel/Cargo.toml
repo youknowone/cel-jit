@@ -272,6 +272,10 @@ name = "regprobe"
 required-features = ["jit"]
 
 [[example]]
+name = "rca_filtercost"
+required-features = ["jit"]
+
+[[example]]
 name = "rca_listmap"
 required-features = ["jit"]
 

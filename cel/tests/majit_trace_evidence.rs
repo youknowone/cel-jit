@@ -1296,3 +1296,78 @@ fn a_host_call_loop_compiles_and_is_entered() {
         );
     }
 }
+
+/// A power-of-two modulus is one mask in the compiled loop, not a residual
+/// call per element.
+///
+/// `OP_MOD_CHK`'s dispatch arm computes the remainder on unsigned magnitudes
+/// through the `majit_uint_mod` helper, and a helper is a residual call in the
+/// trace -- `filter(x, x % 2 == 0)` paid one `CallI` per element, which is
+/// what held `filter_list_scaling/10000` at 2.85x `map_list_scaling`'s
+/// per-element cost (2.47 vs 0.86 ns/elem; 2.03x once the call was gone --
+/// `examples/rca_filtercost.rs` is the instrument). The arm now answers a
+/// power-of-two magnitude with a mask, so the loop keeps no call. The data
+/// runs every sign combination and both `i64` extremes through the mask arm,
+/// with the clean tier as the oracle.
+#[test]
+fn a_power_of_two_modulus_filter_keeps_no_residual_call_in_its_loop() {
+    use cel::majit::batch::{Batch, BatchProgram, ColumnRef, Tier};
+    let _serial = serial();
+    let mut xs: Vec<i64> = (-17..=17).collect();
+    xs.extend([i64::MIN, i64::MIN + 1, i64::MAX, i64::MAX - 1]);
+    let lens = vec![xs.len() as i64];
+    let schema: Schema = [("xs[]".to_string(), ValType::Int)].into_iter().collect();
+    let batch = Batch::new(1).column(
+        "xs".to_string(),
+        ColumnRef::List {
+            lens: &lens,
+            fields: vec![(None, ColumnRef::Int(&xs))],
+        },
+    );
+    // The last source's divisor is NOT a power of two: it keeps the helper
+    // call, which is what proves the assertion below can fail.
+    let cases = [
+        ("xs.filter(x, x % 2 == 0)", true),
+        ("xs.filter(x, x % 8 > 2)", true),
+        ("xs.filter(x, x % -4 == 1)", true),
+        ("xs.filter(x, x % 1 == 0)", true),
+        ("xs.filter(x, x % 3 == 1)", false),
+    ];
+    for (src, mask_only) in cases {
+        let lowered = BatchProgram::compile(src, &schema).expect(src);
+        let bound = lowered.bind_per_row(&batch).expect(src);
+        reset_persistent_state();
+        reset_jit_stats();
+        let clean = bound.collect_on(Tier::Clean).unwrap();
+        for _ in 0..64 {
+            let jit = bound.collect_on(Tier::Jit).unwrap();
+            assert_eq!(clean, jit, "{src}: compiled tier diverged from clean");
+        }
+        let stats = jit_stats();
+        assert_eq!(stats.internal_compile_panics, 0, "{src}");
+        assert_eq!(stats.loops_aborted, 0, "{src}: the modulus aborted the trace");
+        assert!(
+            stats.loops_compiled >= 1,
+            "{src}: the filter loop did not compile: {stats:?}"
+        );
+        let log = majit_metainterp::embed::Census::compiled_opcode_log();
+        assert!(!log.is_empty(), "{src}: compiled but the opcode log is empty");
+        let calls: usize = log
+            .iter()
+            .flatten()
+            .filter(|op| format!("{op:?}").starts_with("Call"))
+            .count();
+        if mask_only {
+            assert_eq!(
+                calls, 0,
+                "{src}: a power-of-two modulus left a residual call in the loop"
+            );
+        } else {
+            assert!(
+                calls > 0,
+                "{src}: the non-power-of-two control lost its helper call, so \
+                 the zero-call assertion above can no longer fail"
+            );
+        }
+    }
+}
