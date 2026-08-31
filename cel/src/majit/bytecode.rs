@@ -271,6 +271,22 @@ pub const OP_MOD_K: i64 = 72; // [a, k, dst]  regs[dst] = a % k   (sign of divid
 /// Out of range the trap flag is set and `dst` is 0, exactly as
 /// [`OP_INDEX_K`] does: the batch falls back to the row-by-row walker, which
 /// is what raises the error cel's semantics ask for.
+/// The NON-NEGATIVE-dividend peers of [`OP_DIV_K`]/[`OP_MOD_K`].
+///
+/// `OP_DIV_K` divides MAGNITUDES so that a negative dividend truncates toward
+/// zero, which costs five live ops around the division -- three of them on its
+/// critical path, before the divide, and two after it. Where the lowering
+/// already knows the dividend cannot be negative those five are dead work, and
+/// the sign test that replaces them is also what lets the optimizer expand the
+/// constant divisor at all: `optimize_int_floor_div` is gated on the dividend
+/// being `known_nonnegative`.
+///
+/// The caller owes the non-negativity. The other arm answers a negative
+/// dividend correctly anyway -- the test is a GUARD in the trace, not an
+/// assumption -- so a wrong claim costs a bridge, never a wrong answer.
+pub const OP_DIVN_K: i64 = 75; // [a, k, dst]  regs[dst] = a / k   (a >= 0 expected)
+pub const OP_MODN_K: i64 = 76; // [a, k, dst]  regs[dst] = a % k   (a >= 0 expected)
+
 pub const OP_INDEX_R: i64 = 73; // [off, len, k, base, dst, trap]   regs[dst] = *(regs[base] + (regs[off]+regs[k])*8) if 0 <= regs[k] < len else 0 (trap)
 pub const OP_INDEX_R_F: i64 = 74; // [off, len, k, base, fdst, trap] float twin
 
@@ -311,7 +327,7 @@ use Operand::{Float, FloatOut, Imm, Int, IntOut, IntTrap, Target};
 /// so an opcode added past it without a row here is a compile error on this
 /// array instead of an out-of-bounds index the first time that opcode is
 /// decoded.
-pub const OPERANDS: [&[Operand]; OP_INDEX_R_F as usize + 1] = [
+pub const OPERANDS: [&[Operand]; OP_MODN_K as usize + 1] = [
     &[Imm, IntOut],                           // 0  LOAD_CONST
     &[Int, IntOut],                           // 1  MOV
     &[Int, Int, IntOut],                      // 2  ADD
@@ -387,6 +403,8 @@ pub const OPERANDS: [&[Operand]; OP_INDEX_R_F as usize + 1] = [
     &[Int, Imm, IntOut],                      // 72 MOD_K
     &[Int, Int, Int, Int, IntOut, IntTrap],   // 73 INDEX_R
     &[Int, Int, Int, Int, FloatOut, IntTrap], // 74 INDEX_R_F
+    &[Int, Imm, IntOut],                      // 75 DIVN_K
+    &[Int, Imm, IntOut],                      // 76 MODN_K
 ];
 
 /// What one [`check_code`] established about one program: the words it read,
@@ -1487,15 +1505,15 @@ pub mod float_bank {
     /// them under. What moved is who owns the counters.
     use super::{
         OP_ADD, OP_ADD_IMM, OP_ADD_OVF, OP_AND, OP_COL_LOAD, OP_COL_LOAD_B, OP_COL_LOAD_F,
-        OP_COL_PUSH, OP_COL_PUSH_F, OP_COL_STORE, OP_COL_STORE_F, OP_DIV, OP_DIV_CHK, OP_DIV_CHK_K,
-        OP_DIV_K, OP_EQ, OP_F2I, OP_F2U, OP_FADD, OP_FDIV, OP_FEQ, OP_FGE, OP_FGT, OP_FLE, OP_FLT,
-        OP_FMOV, OP_FMUL, OP_FNE, OP_FNEG, OP_FSELECT, OP_FSUB, OP_GE, OP_GT, OP_HOST_CALL1_F,
-        OP_HOST_CALL1_I, OP_HOST_CALL2_F, OP_HOST_CALL2_I, OP_I2F, OP_INDEX_K, OP_INDEX_K_F,
-        OP_INDEX_R, OP_INDEX_R_F, OP_JUMP_IF_ABOVE, OP_LE, OP_LOAD_CONST, OP_LOAD_CONST_F, OP_LT,
-        OP_MOD, OP_MOD_CHK, OP_MOD_CHK_K, OP_MOD_K, OP_MOV, OP_MUL, OP_MUL_IMM, OP_MUL_OVF, OP_NE,
-        OP_NEG, OP_NOT, OP_OR, OP_RETURN, OP_RETURN_F, OP_SELECT, OP_SUB, OP_SUB_OVF,
-        OP_TRAP_STORE, OP_U2F, OP_UADD_OVF, OP_UDIV, OP_UDIV_K, OP_ULE, OP_ULT, OP_UMOD, OP_UMOD_K,
-        OP_UMUL_OVF, OP_USUB_OVF,
+        OP_COL_PUSH, OP_COL_PUSH_F, OP_COL_STORE, OP_COL_STORE_F, OP_DIV, OP_DIVN_K, OP_DIV_CHK,
+        OP_DIV_CHK_K, OP_DIV_K, OP_EQ, OP_F2I, OP_F2U, OP_FADD, OP_FDIV, OP_FEQ, OP_FGE, OP_FGT,
+        OP_FLE, OP_FLT, OP_FMOV, OP_FMUL, OP_FNE, OP_FNEG, OP_FSELECT, OP_FSUB, OP_GE, OP_GT,
+        OP_HOST_CALL1_F, OP_HOST_CALL1_I, OP_HOST_CALL2_F, OP_HOST_CALL2_I, OP_I2F, OP_INDEX_K,
+        OP_INDEX_K_F, OP_INDEX_R, OP_INDEX_R_F, OP_JUMP_IF_ABOVE, OP_LE, OP_LOAD_CONST,
+        OP_LOAD_CONST_F, OP_LT, OP_MOD, OP_MODN_K, OP_MOD_CHK, OP_MOD_CHK_K, OP_MOD_K, OP_MOV,
+        OP_MUL, OP_MUL_IMM, OP_MUL_OVF, OP_NE, OP_NEG, OP_NOT, OP_OR, OP_RETURN, OP_RETURN_F,
+        OP_SELECT, OP_SUB, OP_SUB_OVF, OP_TRAP_STORE, OP_U2F, OP_UADD_OVF, OP_UDIV, OP_UDIV_K,
+        OP_ULE, OP_ULT, OP_UMOD, OP_UMOD_K, OP_UMUL_OVF, OP_USUB_OVF,
     };
 
     // The four calling conventions of `magic::ScalarFn`, each reading its
@@ -2096,6 +2114,55 @@ pub mod float_bank {
                         ua % ub
                     };
                     state.regs[d] = (ur ^ ma).wrapping_sub(ma);
+                    pc += 4;
+                }
+                OP_DIVN_K => {
+                    let a = state.regs[program[pc + 1] as usize];
+                    let k = program[pc + 2];
+                    let d = program[pc + 3] as usize;
+                    // `k > 0` reads only the instruction stream and is decided
+                    // while tracing; `a >= 0` is the one live test, and it is a
+                    // guard OFF the division's critical path where the five
+                    // magnitude ops it replaces were on it.
+                    state.regs[d] = if a >= 0 && k > 0 {
+                        a / k
+                    } else {
+                        // `OP_DIV_K`'s arm verbatim, `|i64::MIN|` corner
+                        // included: a wrong non-negativity claim must cost a
+                        // bridge, never an answer.
+                        let ma = a >> 63;
+                        let mk = k >> 63;
+                        let ua = (a ^ ma).wrapping_sub(ma);
+                        let ub = (k ^ mk).wrapping_sub(mk);
+                        let uq = if ua < 0 {
+                            majit_uint_div(ua, ub)
+                        } else {
+                            ua / ub
+                        };
+                        let s = ma ^ mk;
+                        (uq ^ s).wrapping_sub(s)
+                    };
+                    pc += 4;
+                }
+                OP_MODN_K => {
+                    let a = state.regs[program[pc + 1] as usize];
+                    let k = program[pc + 2];
+                    let d = program[pc + 3] as usize;
+                    state.regs[d] = if a >= 0 && k > 0 {
+                        a % k
+                    } else {
+                        // `OP_MOD_K`'s arm verbatim -- see `OP_DIVN_K`.
+                        let ma = a >> 63;
+                        let mk = k >> 63;
+                        let ua = (a ^ ma).wrapping_sub(ma);
+                        let ub = (k ^ mk).wrapping_sub(mk);
+                        let ur = if ua < 0 {
+                            majit_uint_mod(ua, ub)
+                        } else {
+                            ua % ub
+                        };
+                        (ur ^ ma).wrapping_sub(ma)
+                    };
                     pc += 4;
                 }
                 OP_UADD_OVF => {
@@ -3260,6 +3327,16 @@ pub mod float_bank {
                     pc += 4;
                 }
                 OP_MOD_K => {
+                    regs[program[pc + 3] as usize] =
+                        regs[program[pc + 1] as usize] % program[pc + 2];
+                    pc += 4;
+                }
+                OP_DIVN_K => {
+                    regs[program[pc + 3] as usize] =
+                        regs[program[pc + 1] as usize] / program[pc + 2];
+                    pc += 4;
+                }
+                OP_MODN_K => {
                     regs[program[pc + 3] as usize] =
                         regs[program[pc + 1] as usize] % program[pc + 2];
                     pc += 4;

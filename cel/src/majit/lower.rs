@@ -2020,7 +2020,13 @@ const NANOS_PER_DAY: i64 = 86_400_000_000_000;
 /// plain arithmetic with no branch (the traced loop lowers no control flow).
 fn emit_days_and_nanos_of_day(ctx: &mut LowerCtxF, ts: TReg) -> (TReg, TReg) {
     let q = emit_int_bin_k(ctx, OP_DIV, ts, NANOS_PER_DAY);
-    let r = emit_int_bin_k(ctx, OP_MOD, ts, NANOS_PER_DAY);
+    // `ts == q * NANOS_PER_DAY + r` holds exactly for a truncating quotient, so
+    // the remainder is a multiply and a subtract rather than a second division
+    // -- and a second magnitude round trip, which is what a signed `%` by a
+    // constant costs. `q * NANOS_PER_DAY` cannot overflow: its magnitude is at
+    // most `|ts|`.
+    let qd = emit_int_bin_k(ctx, OP_MUL, q, NANOS_PER_DAY);
+    let r = emit_int_bin(ctx, OP_SUB, ts, qd);
     let neg = emit_int_bin_k(ctx, OP_LT, r, 0);
     let days = emit_int_bin(ctx, OP_SUB, q, neg);
     let back = emit_int_bin_k(ctx, OP_MUL, neg, NANOS_PER_DAY);
@@ -2028,35 +2034,53 @@ fn emit_days_and_nanos_of_day(ctx: &mut LowerCtxF, ts: TReg) -> (TReg, TReg) {
     (days, nanos_of_day)
 }
 
+/// [`emit_int_bin_k`] for a division whose DIVIDEND the lowering knows cannot
+/// be negative -- see [`OP_DIVN_K`] for what that buys and what it owes.
+fn emit_nonneg_div_k(ctx: &mut LowerCtxF, a: TReg, k: i64) -> TReg {
+    let d = ctx.fresh(ValType::Int);
+    ctx.body
+        .extend_from_slice(&[OP_DIVN_K, a.idx as i64, k, d.idx as i64]);
+    d
+}
+
+/// The remainder twin of [`emit_nonneg_div_k`].
+fn emit_nonneg_mod_k(ctx: &mut LowerCtxF, a: TReg, k: i64) -> TReg {
+    let d = ctx.fresh(ValType::Int);
+    ctx.body
+        .extend_from_slice(&[OP_MODN_K, a.idx as i64, k, d.idx as i64]);
+    d
+}
+
 /// Howard Hinnant's `civil_from_days`: days since 1970-01-01 to
 /// `(year, month 1-12, day 1-31)`.
 ///
-/// Every division below has a non-negative dividend, so `OP_DIV`'s truncation
-/// is the floor the algorithm calls for: an i64-nanosecond instant only spans
+/// Every division below has a non-negative dividend, so truncation is the floor
+/// the algorithm calls for and [`OP_DIVN_K`] is the instruction that carries
+/// that claim: an i64-nanosecond instant only spans
 /// ~1678-2262, which keeps `days` inside ±106752 and `z = days + 719468` inside
 /// [612716, 826220]. A timestamp outside that range cannot exist in this VM —
 /// the column payload is i64 nanos.
 fn emit_civil_from_days(ctx: &mut LowerCtxF, days: TReg) -> (TReg, TReg, TReg) {
     let z = emit_int_bin_k(ctx, OP_ADD, days, 719_468);
-    let era = emit_int_bin_k(ctx, OP_DIV, z, 146_097);
+    let era = emit_nonneg_div_k(ctx, z, 146_097);
     let era_days = emit_int_bin_k(ctx, OP_MUL, era, 146_097);
     let doe = emit_int_bin(ctx, OP_SUB, z, era_days);
 
     // yoe = (doe - doe/1460 + doe/36524 - doe/146096) / 365
-    let by_1460 = emit_int_bin_k(ctx, OP_DIV, doe, 1_460);
-    let by_36524 = emit_int_bin_k(ctx, OP_DIV, doe, 36_524);
-    let by_146096 = emit_int_bin_k(ctx, OP_DIV, doe, 146_096);
+    let by_1460 = emit_nonneg_div_k(ctx, doe, 1_460);
+    let by_36524 = emit_nonneg_div_k(ctx, doe, 36_524);
+    let by_146096 = emit_nonneg_div_k(ctx, doe, 146_096);
     let t1 = emit_int_bin(ctx, OP_SUB, doe, by_1460);
     let t2 = emit_int_bin(ctx, OP_ADD, t1, by_36524);
     let t3 = emit_int_bin(ctx, OP_SUB, t2, by_146096);
-    let yoe = emit_int_bin_k(ctx, OP_DIV, t3, 365);
+    let yoe = emit_nonneg_div_k(ctx, t3, 365);
     let era400 = emit_int_bin_k(ctx, OP_MUL, era, 400);
     let year_of_era = emit_int_bin(ctx, OP_ADD, yoe, era400);
 
     // doy = doe - (365*yoe + yoe/4 - yoe/100)   (days since 1 March)
     let y365 = emit_int_bin_k(ctx, OP_MUL, yoe, 365);
-    let y4 = emit_int_bin_k(ctx, OP_DIV, yoe, 4);
-    let y100 = emit_int_bin_k(ctx, OP_DIV, yoe, 100);
+    let y4 = emit_nonneg_div_k(ctx, yoe, 4);
+    let y100 = emit_nonneg_div_k(ctx, yoe, 100);
     let s1 = emit_int_bin(ctx, OP_ADD, y365, y4);
     let s2 = emit_int_bin(ctx, OP_SUB, s1, y100);
     let doy = emit_int_bin(ctx, OP_SUB, doe, s2);
@@ -2064,10 +2088,10 @@ fn emit_civil_from_days(ctx: &mut LowerCtxF, days: TReg) -> (TReg, TReg, TReg) {
     // mp = (5*doy + 2)/153 ; day = doy - (153*mp + 2)/5 + 1
     let d5 = emit_int_bin_k(ctx, OP_MUL, doy, 5);
     let d5p2 = emit_int_bin_k(ctx, OP_ADD, d5, 2);
-    let mp = emit_int_bin_k(ctx, OP_DIV, d5p2, 153);
+    let mp = emit_nonneg_div_k(ctx, d5p2, 153);
     let m153 = emit_int_bin_k(ctx, OP_MUL, mp, 153);
     let m153p2 = emit_int_bin_k(ctx, OP_ADD, m153, 2);
-    let month_start = emit_int_bin_k(ctx, OP_DIV, m153p2, 5);
+    let month_start = emit_nonneg_div_k(ctx, m153p2, 5);
     let dm = emit_int_bin(ctx, OP_SUB, doy, month_start);
     let day = emit_int_bin_k(ctx, OP_ADD, dm, 1);
 
@@ -2093,12 +2117,12 @@ fn emit_civil_from_days(ctx: &mut LowerCtxF, days: TReg) -> (TReg, TReg, TReg) {
 /// truncation is again the floor the algorithm wants.
 fn emit_days_of_jan1(ctx: &mut LowerCtxF, year: TReg) -> TReg {
     let y = emit_int_bin_k(ctx, OP_SUB, year, 1);
-    let era = emit_int_bin_k(ctx, OP_DIV, y, 400);
+    let era = emit_nonneg_div_k(ctx, y, 400);
     let era400 = emit_int_bin_k(ctx, OP_MUL, era, 400);
     let yoe = emit_int_bin(ctx, OP_SUB, y, era400);
     let y365 = emit_int_bin_k(ctx, OP_MUL, yoe, 365);
-    let y4 = emit_int_bin_k(ctx, OP_DIV, yoe, 4);
-    let y100 = emit_int_bin_k(ctx, OP_DIV, yoe, 100);
+    let y4 = emit_nonneg_div_k(ctx, yoe, 4);
+    let y100 = emit_nonneg_div_k(ctx, yoe, 100);
     let s1 = emit_int_bin(ctx, OP_ADD, y365, y4);
     let s2 = emit_int_bin(ctx, OP_SUB, s1, y100);
     let doe = emit_int_bin_k(ctx, OP_ADD, s2, 306);
@@ -2553,28 +2577,31 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
                     }
                     let (days, nanos_of_day) = emit_days_and_nanos_of_day(ctx, a);
                     return Ok(match call.func_name.as_str() {
-                        "getHours" => emit_int_bin_k(ctx, OP_DIV, nanos_of_day, 3_600_000_000_000),
+                        "getHours" => emit_nonneg_div_k(ctx, nanos_of_day, 3_600_000_000_000),
                         "getMinutes" => {
-                            let m = emit_int_bin_k(ctx, OP_DIV, nanos_of_day, 60_000_000_000);
-                            emit_int_bin_k(ctx, OP_MOD, m, 60)
+                            let m = emit_nonneg_div_k(ctx, nanos_of_day, 60_000_000_000);
+                            emit_nonneg_mod_k(ctx, m, 60)
                         }
                         "getSeconds" => {
-                            let s = emit_int_bin_k(ctx, OP_DIV, nanos_of_day, 1_000_000_000);
-                            emit_int_bin_k(ctx, OP_MOD, s, 60)
+                            let s = emit_nonneg_div_k(ctx, nanos_of_day, 1_000_000_000);
+                            emit_nonneg_mod_k(ctx, s, 60)
                         }
                         "getMilliseconds" => {
-                            let ms = emit_int_bin_k(ctx, OP_DIV, nanos_of_day, 1_000_000);
-                            emit_int_bin_k(ctx, OP_MOD, ms, 1_000)
+                            let ms = emit_nonneg_div_k(ctx, nanos_of_day, 1_000_000);
+                            emit_nonneg_mod_k(ctx, ms, 1_000)
                         }
                         // `weekday().num_days_from_sunday()`: 1970-01-01 was a
-                        // Thursday (4 days from Sunday), and `days` can be
-                        // negative, so the remainder is floored back into [0, 7).
+                        // Thursday (4 days from Sunday). `days` can be negative,
+                        // so it is first shifted past zero by a MULTIPLE OF 7 --
+                        // `106_757` is `7 * 15_251` and exceeds the `106_752`
+                        // days an i64-nanosecond instant can reach -- which
+                        // leaves the residue unchanged and the remainder already
+                        // in `[0, 7)`. The alternative is a signed remainder plus
+                        // a floor correction: a magnitude round trip and three
+                        // more ops to undo it.
                         "getDayOfWeek" => {
-                            let shifted = emit_int_bin_k(ctx, OP_ADD, days, 4);
-                            let rem = emit_int_bin_k(ctx, OP_MOD, shifted, 7);
-                            let neg = emit_int_bin_k(ctx, OP_LT, rem, 0);
-                            let back = emit_int_bin_k(ctx, OP_MUL, neg, 7);
-                            emit_int_bin(ctx, OP_ADD, rem, back)
+                            let shifted = emit_int_bin_k(ctx, OP_ADD, days, 4 + 106_757);
+                            emit_nonneg_mod_k(ctx, shifted, 7)
                         }
                         "getFullYear" => emit_civil_from_days(ctx, days).0,
                         // `month0()` / `day0()` are 0-based; `day()` is 1-based.
