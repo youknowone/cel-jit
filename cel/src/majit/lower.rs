@@ -1973,16 +1973,21 @@ fn emit_int_bin(ctx: &mut LowerCtxF, op: i64, a: TReg, b: TReg) -> TReg {
 
 /// `dst = a <op> k` for a green constant `k`.
 ///
-/// `OP_MUL` and `OP_ADD` have immediate forms, and those are the ones to reach
-/// for: the immediate rides in the word stream, which is green, so the traced
-/// op is `int_mul(reg, ConstInt(k))`. Hoisting the constant into a prelude
-/// register instead puts the store outside the merge point, and the in-loop
-/// read is then an opaque input argument — `dependency.py:896-948` builds no
-/// `IndexVar` for it. Any other op still hoists.
+/// `OP_MUL`, `OP_ADD`, `OP_DIV` and `OP_MOD` have immediate forms, and those
+/// are the ones to reach for: the immediate rides in the word stream, which is
+/// green, so the traced op is `int_mul(reg, ConstInt(k))`. Hoisting the
+/// constant into a prelude register instead puts the store outside the merge
+/// point, and the in-loop read is then an opaque input argument —
+/// `dependency.py:896-948` builds no `IndexVar` for it. Division is where that
+/// costs the most: only a CONSTANT divisor is expanded into
+/// multiply-and-shift, so through a register every divide stayed a residual
+/// `int.udiv` call. Any other op still hoists.
 fn emit_int_bin_k(ctx: &mut LowerCtxF, op: i64, a: TReg, k: i64) -> TReg {
     let imm_op = match op {
         OP_MUL => Some(OP_MUL_IMM),
         OP_ADD => Some(OP_ADD_IMM),
+        OP_DIV => Some(OP_DIV_K),
+        OP_MOD => Some(OP_MOD_K),
         _ => None,
     };
     match imm_op {
@@ -2484,17 +2489,20 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
         // zero (`num_seconds` adds one back when secs is negative and nanos
         // positive, so `-1.5s` is `-1`, not `-2`). A duration is already carried
         // as i64 nanoseconds in the int file, so each is one truncating divide
-        // by a green constant — and `OP_DIV` is exactly toward-zero
-        // (bytecode.rs:205-221 divides the magnitudes and reapplies the sign),
-        // so this is bit-exact with the tree-walker and needs no new opcode. The
-        // divisor is a loop invariant, so its load goes in the prelude. The six
-        // calendar names have no `duration` overload and bail there.
+        // by a constant — and `OP_DIV_K` is exactly toward-zero (it divides the
+        // magnitudes and reapplies the sign, as `OP_DIV` does), so this is
+        // bit-exact with the tree-walker. The divisor rides in the word stream,
+        // which is what lets the optimizer expand it; the same constant in a
+        // prelude register left a residual call per row. The six calendar names
+        // have no `duration` overload and bail there.
         //
         // On a `timestamp` the answer is a calendar field instead: split the
         // instant into a FLOORED day count plus nanoseconds-of-day, read the
         // clock fields off the remainder and the date fields off the day count
-        // via civil-from-days. All of it is int-file arithmetic on green
-        // constants, so the whole conversion stays inside the traced loop.
+        // via civil-from-days. All of it is int-file arithmetic on immediates,
+        // so the whole conversion stays inside the traced loop with no call in
+        // it -- `t.getDayOfMonth()` is eleven divisions, and through registers
+        // it was eleven residual calls per row.
         if TEMPORAL_ACCESSORS.contains(&call.func_name.as_str()) {
             if !call.args.is_empty() {
                 return Err(LowerError::unsupported(format!(

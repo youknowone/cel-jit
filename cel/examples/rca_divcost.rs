@@ -75,4 +75,68 @@ fn main() {
             best[i] / best[0],
         );
     }
+    temporal(n as usize, rounds, calls / 4);
+}
+
+/// The calendar accessors, per row, against an int control the division change
+/// does not touch. A calendar field is a chain of divisions by fixed scales, so
+/// this is where a per-division residual call is paid the most times.
+fn temporal(rows: usize, rounds: usize, calls: usize) {
+    let schema: Schema = [
+        ("t".to_string(), ValType::Timestamp),
+        ("x".to_string(), ValType::Int),
+    ]
+    .into_iter()
+    .collect();
+    let ts: Vec<i64> = (0..rows as i64)
+        .map(|i| 1_700_000_000_000_000_000 + i * 1_000_000_007)
+        .collect();
+    let xs: Vec<i64> = (0..rows as i64).collect();
+    let batch = Batch::new(rows)
+        .column("t".to_string(), ColumnRef::Timestamp(&ts))
+        .column("x".to_string(), ColumnRef::Int(&xs));
+    let cases = [
+        ("ctl", "x + 1"),
+        ("hours", "t.getHours()"),
+        ("minutes", "t.getMinutes()"),
+        ("seconds", "t.getSeconds()"),
+        ("dayofmonth", "t.getDayOfMonth()"),
+        ("dayofweek", "t.getDayOfWeek()"),
+    ];
+    let lowered: Vec<_> = cases
+        .iter()
+        .map(|(_, src)| BatchProgram::compile(src, &schema).expect("lowers"))
+        .collect();
+    let bound: Vec<_> = lowered
+        .iter()
+        .map(|l| l.bind_per_row(&batch).expect("binds"))
+        .collect();
+    reset_persistent_state();
+    for b in &bound {
+        for _ in 0..64 {
+            b.collect_on(Tier::Jit).unwrap();
+        }
+    }
+    let mut best = vec![f64::INFINITY; cases.len()];
+    for _ in 0..rounds {
+        for (i, b) in bound.iter().enumerate() {
+            let t = std::time::Instant::now();
+            for _ in 0..calls {
+                b.collect_on(Tier::Jit).unwrap();
+            }
+            let ns = t.elapsed().as_nanos() as f64 / calls as f64;
+            if ns < best[i] {
+                best[i] = ns;
+            }
+        }
+    }
+    println!("== temporal accessors, rows={rows}, min of {rounds} x {calls}");
+    for (i, (label, src)) in cases.iter().enumerate() {
+        println!(
+            "   {label:10} {:10.1} ns/call  {:6.3} ns/row  {:5.2}x ctl  ({src})",
+            best[i],
+            best[i] / rows as f64,
+            best[i] / best[0],
+        );
+    }
 }

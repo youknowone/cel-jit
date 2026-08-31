@@ -1581,6 +1581,92 @@ fn a_constant_divisor_answers_the_extremes_like_the_clean_tier() {
     }
 }
 
+/// A calendar field is a chain of divisions by fixed scales, and none of them
+/// is a residual call.
+///
+/// `emit_int_bin_k` had immediate forms for `OP_MUL` and `OP_ADD` only, so
+/// every temporal divide went through a prelude-loaded register -- opaque to
+/// the optimizer, which expands only a CONSTANT divisor. The census measured
+/// what that cost: `t.getDayOfMonth()` carried 11 calls in a 100-op body,
+/// `t.getMinutes()` and `t.getSeconds()` 4 each, `t.getHours()` and
+/// `t.getDayOfWeek()` 3, `dur.getSeconds()` 1. With `OP_DIV_K`/`OP_MOD_K` the
+/// whole conversion is call-free. The instants span both sides of the epoch, so
+/// the floored day count and its non-negative remainder are exercised in both
+/// directions against the clean tier.
+#[test]
+fn the_temporal_accessors_keep_no_residual_call_in_their_loop() {
+    use cel::majit::batch::{Batch, BatchProgram, ColumnRef, Tier};
+    let _serial = serial();
+    let rows = 64usize;
+    // ~1953 through ~1986, one step of 1e16 ns (~115 days) per row, so the
+    // column crosses the epoch and lands on every weekday and many months.
+    let ts: Vec<i64> = (0..rows as i64)
+        .map(|i| -520_000_000_000_000_000 + i * 10_000_000_000_000_000)
+        .collect();
+    let ds: Vec<i64> = (0..rows as i64)
+        .map(|i| i * 1_000_000_007 - 3_000_000_000)
+        .collect();
+    let schema: Schema = [
+        ("t".to_string(), ValType::Timestamp),
+        ("d".to_string(), ValType::Duration),
+    ]
+    .into_iter()
+    .collect();
+    let batch = Batch::new(rows)
+        .column("t".to_string(), ColumnRef::Timestamp(&ts))
+        .column("d".to_string(), ColumnRef::Duration(&ds));
+    let sources = [
+        "t.getHours()",
+        "t.getMinutes()",
+        "t.getSeconds()",
+        "t.getMilliseconds()",
+        "t.getDayOfMonth()",
+        "t.getDayOfWeek()",
+        "t.getDayOfYear()",
+        "t.getMonth()",
+        "t.getFullYear()",
+        "d.getHours()",
+        "d.getMinutes()",
+        "d.getSeconds()",
+        "d.getMilliseconds()",
+    ];
+    for src in sources {
+        let lowered = BatchProgram::compile(src, &schema).expect(src);
+        let bound = lowered.bind_per_row(&batch).expect(src);
+        reset_persistent_state();
+        reset_jit_stats();
+        let clean = bound.collect_on(Tier::Clean).unwrap();
+        for _ in 0..64 {
+            let jit = bound.collect_on(Tier::Jit).unwrap();
+            assert_eq!(clean, jit, "{src}: compiled tier diverged from clean");
+        }
+        let stats = jit_stats();
+        assert_eq!(stats.internal_compile_panics, 0, "{src}");
+        assert_eq!(
+            stats.loops_aborted, 0,
+            "{src}: the accessor aborted the trace"
+        );
+        assert!(
+            stats.loops_compiled >= 1,
+            "{src}: the row loop did not compile: {stats:?}"
+        );
+        let log = majit_metainterp::embed::Census::compiled_opcode_log();
+        assert!(
+            !log.is_empty(),
+            "{src}: compiled but the opcode log is empty"
+        );
+        let calls: usize = log
+            .iter()
+            .flatten()
+            .filter(|op| format!("{op:?}").starts_with("Call"))
+            .count();
+        assert_eq!(
+            calls, 0,
+            "{src}: a division by a fixed scale left a residual call in the loop"
+        );
+    }
+}
+
 /// The literal-scan string encoding answers on the compiled tier exactly as it
 /// does on the clean one. The data holds distinct non-literal strings — which
 /// all share the scan's sentinel id — beside rows equal to each literal, so a

@@ -248,6 +248,13 @@ pub const OP_DIV_CHK_K: i64 = 67; // [a, k, dst, trap]  regs[dst] = a / k   (tru
 pub const OP_MOD_CHK_K: i64 = 68; // [a, k, dst, trap]  regs[dst] = a % k   (sign of dividend)
 pub const OP_UDIV_K: i64 = 69; // [a, k, dst, trap]  regs[dst] = (a as u64) / (k as u64)
 pub const OP_UMOD_K: i64 = 70; // [a, k, dst, trap]  regs[dst] = (a as u64) % (k as u64)
+/// The constant-divisor peers of the UNGUARDED [`OP_DIV`]/[`OP_MOD`], carrying
+/// the divisor the same way and for the same reason. These are what the
+/// temporal accessors divide by: a calendar field is a chain of divisions by
+/// fixed scales, and through a register every one of them left a residual call
+/// -- `t.getDayOfMonth()` measured 11 calls in a 100-op body.
+pub const OP_DIV_K: i64 = 71; // [a, k, dst]  regs[dst] = a / k   (trunc toward zero)
+pub const OP_MOD_K: i64 = 72; // [a, k, dst]  regs[dst] = a % k   (sign of dividend)
 
 /// What one word after an opcode means, for a consumer that walks a program
 /// without running it.
@@ -286,7 +293,7 @@ use Operand::{Float, FloatOut, Imm, Int, IntOut, IntTrap, Target};
 /// so an opcode added past it without a row here is a compile error on this
 /// array instead of an out-of-bounds index the first time that opcode is
 /// decoded.
-pub const OPERANDS: [&[Operand]; OP_UMOD_K as usize + 1] = [
+pub const OPERANDS: [&[Operand]; OP_MOD_K as usize + 1] = [
     &[Imm, IntOut],                           // 0  LOAD_CONST
     &[Int, IntOut],                           // 1  MOV
     &[Int, Int, IntOut],                      // 2  ADD
@@ -358,6 +365,8 @@ pub const OPERANDS: [&[Operand]; OP_UMOD_K as usize + 1] = [
     &[Int, Imm, IntOut, IntTrap],             // 68 MOD_CHK_K
     &[Int, Imm, IntOut],                      // 69 UDIV_K
     &[Int, Imm, IntOut],                      // 70 UMOD_K
+    &[Int, Imm, IntOut],                      // 71 DIV_K
+    &[Int, Imm, IntOut],                      // 72 MOD_K
 ];
 
 /// What one [`check_code`] established about one program: the words it read,
@@ -1459,13 +1468,14 @@ pub mod float_bank {
     use super::{
         OP_ADD, OP_ADD_IMM, OP_ADD_OVF, OP_AND, OP_COL_LOAD, OP_COL_LOAD_B, OP_COL_LOAD_F,
         OP_COL_PUSH, OP_COL_PUSH_F, OP_COL_STORE, OP_COL_STORE_F, OP_DIV, OP_DIV_CHK, OP_DIV_CHK_K,
-        OP_EQ, OP_F2I, OP_F2U, OP_FADD, OP_FDIV, OP_FEQ, OP_FGE, OP_FGT, OP_FLE, OP_FLT, OP_FMOV,
-        OP_FMUL, OP_FNE, OP_FNEG, OP_FSELECT, OP_FSUB, OP_GE, OP_GT, OP_HOST_CALL1_F,
+        OP_DIV_K, OP_EQ, OP_F2I, OP_F2U, OP_FADD, OP_FDIV, OP_FEQ, OP_FGE, OP_FGT, OP_FLE, OP_FLT,
+        OP_FMOV, OP_FMUL, OP_FNE, OP_FNEG, OP_FSELECT, OP_FSUB, OP_GE, OP_GT, OP_HOST_CALL1_F,
         OP_HOST_CALL1_I, OP_HOST_CALL2_F, OP_HOST_CALL2_I, OP_I2F, OP_INDEX_K, OP_INDEX_K_F,
         OP_JUMP_IF_ABOVE, OP_LE, OP_LOAD_CONST, OP_LOAD_CONST_F, OP_LT, OP_MOD, OP_MOD_CHK,
-        OP_MOD_CHK_K, OP_MOV, OP_MUL, OP_MUL_IMM, OP_MUL_OVF, OP_NE, OP_NEG, OP_NOT, OP_OR,
-        OP_RETURN, OP_RETURN_F, OP_SELECT, OP_SUB, OP_SUB_OVF, OP_TRAP_STORE, OP_U2F, OP_UADD_OVF,
-        OP_UDIV, OP_UDIV_K, OP_ULE, OP_ULT, OP_UMOD, OP_UMOD_K, OP_UMUL_OVF, OP_USUB_OVF,
+        OP_MOD_CHK_K, OP_MOD_K, OP_MOV, OP_MUL, OP_MUL_IMM, OP_MUL_OVF, OP_NE, OP_NEG, OP_NOT,
+        OP_OR, OP_RETURN, OP_RETURN_F, OP_SELECT, OP_SUB, OP_SUB_OVF, OP_TRAP_STORE, OP_U2F,
+        OP_UADD_OVF, OP_UDIV, OP_UDIV_K, OP_ULE, OP_ULT, OP_UMOD, OP_UMOD_K, OP_UMUL_OVF,
+        OP_USUB_OVF,
     };
 
     // The four calling conventions of `magic::ScalarFn`, each reading its
@@ -2006,6 +2016,36 @@ pub mod float_bank {
                     } else {
                         majit_uint_mod(a, k)
                     };
+                    pc += 4;
+                }
+                OP_DIV_K => {
+                    let a = state.regs[program[pc + 1] as usize];
+                    let k = program[pc + 2];
+                    let d = program[pc + 3] as usize;
+                    // `OP_DIV`'s toward-zero divide with the divisor read from
+                    // the instruction stream. `program` is green, so every word
+                    // below that depends only on `k` is decided while tracing,
+                    // and the division is one the optimizer expands rather than
+                    // the residual call a register divisor leaves per element.
+                    let ma = a >> 63;
+                    let mk = k >> 63;
+                    let ua = (a ^ ma).wrapping_sub(ma);
+                    let ub = (k ^ mk).wrapping_sub(mk);
+                    let uq = ua / ub;
+                    let s = ma ^ mk;
+                    state.regs[d] = (uq ^ s).wrapping_sub(s);
+                    pc += 4;
+                }
+                OP_MOD_K => {
+                    let a = state.regs[program[pc + 1] as usize];
+                    let k = program[pc + 2];
+                    let d = program[pc + 3] as usize;
+                    let ma = a >> 63;
+                    let mk = k >> 63;
+                    let ua = (a ^ ma).wrapping_sub(ma);
+                    let ub = (k ^ mk).wrapping_sub(mk);
+                    let ur = ua % ub;
+                    state.regs[d] = (ur ^ ma).wrapping_sub(ma);
                     pc += 4;
                 }
                 OP_UADD_OVF => {
@@ -3123,6 +3163,16 @@ pub mod float_bank {
                 OP_UMOD_K => {
                     let a = regs[program[pc + 1] as usize] as u64;
                     regs[program[pc + 3] as usize] = (a % program[pc + 2] as u64) as i64;
+                    pc += 4;
+                }
+                OP_DIV_K => {
+                    regs[program[pc + 3] as usize] =
+                        regs[program[pc + 1] as usize] / program[pc + 2];
+                    pc += 4;
+                }
+                OP_MOD_K => {
+                    regs[program[pc + 3] as usize] =
+                        regs[program[pc + 1] as usize] % program[pc + 2];
                     pc += 4;
                 }
                 // The unsigned overflow trio: the reference tier spells the
