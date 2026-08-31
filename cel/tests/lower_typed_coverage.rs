@@ -1,4 +1,4 @@
-//! **A census of what `majit::lower::lower_typed` accepts**, taken over the
+//! **A census of what `majit::lower::lower_typed_in` accepts**, taken over the
 //! widest checked-in statement of what cel must evaluate: the 250 `expr:`
 //! records of `tests/oracle_corpus.txt`.
 //!
@@ -170,8 +170,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use cel::common::ast::{EntryExpr, Expr, IdedExpr};
-use cel::majit::lower::{elem_slot_path, lower_typed, Schema, ValType};
+use cel::majit::lower::{elem_slot_path, lower_typed_in, Schema, ValType};
 use cel::parser::Parser;
+use cel::{Context, ExecutionError};
 
 // ---------------------------------------------------------------------------
 // the corpus
@@ -448,9 +449,28 @@ fn normalise_reason(reason: &str) -> String {
 // the census
 // ---------------------------------------------------------------------------
 
+/// The host functions the corpus is written against, registered exactly as the
+/// oracle registers them (`tests/oracle.rs`, "a host function and a host
+/// function that fails").
+///
+/// The lowering resolves a call to a name that is not a builtin through this
+/// context, and with `None` every such call is a decline. Asking without it
+/// measures a narrower question than the header claims -- not "what does the
+/// lowering accept", but "what does it accept from a program with no host
+/// functions" -- and charges the difference to op coverage.
+fn corpus_functions() -> Context<'static> {
+    let mut ctx = Context::default();
+    ctx.add_function("double_it", |v: i64| v * 2);
+    ctx.add_function("boom", || -> Result<i64, ExecutionError> {
+        Err(ExecutionError::function_error("boom", "deliberate"))
+    });
+    ctx
+}
+
 #[test]
 fn lower_typed_coverage_over_the_oracle_corpus() {
     let records = corpus_records();
+    let functions = corpus_functions();
 
     // A corpus this test cannot find would make it measure nothing, which is
     // the failure mode that looks most like success.
@@ -514,7 +534,7 @@ fn lower_typed_coverage_over_the_oracle_corpus() {
         }
 
         let wants_error = record.want.starts_with("error(");
-        match lower_typed(&expr, &schema) {
+        match lower_typed_in(&expr, &schema, Some(&functions)) {
             Ok(low) => {
                 lowered += 1;
                 if low.sum_reducible().is_ok() {
@@ -573,8 +593,8 @@ fn lower_typed_coverage_over_the_oracle_corpus() {
         domain.len(),
         OUT_OF_DOMAIN_BINDINGS.join("/")
     );
-    println!("  LOWERED      {lowered:>4}   lower_typed returned Ok");
-    println!("  DECLINED     {declined:>4}   lower_typed returned Err");
+    println!("  LOWERED      {lowered:>4}   lower_typed_in returned Ok");
+    println!("  DECLINED     {declined:>4}   lower_typed_in returned Err");
     println!("  ------------------");
     println!("  TOTAL        {total:>4}");
 
