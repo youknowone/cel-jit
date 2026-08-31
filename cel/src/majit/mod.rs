@@ -2502,6 +2502,48 @@ mod tests {
     }
 
     #[test]
+    fn batch_timestamp_accessors_at_the_range_ends() {
+        // The lowering divides by immediates whose DIVIDEND it claims cannot be
+        // negative, and it shifts the weekday past zero by a fixed multiple of
+        // 7. Both claims are bounds on `days`, which only an instant at the very
+        // end of the i64-nanosecond range can reach — a random span in the
+        // middle never tests them. So the column is the two ends themselves,
+        // the day either side of each, and the epoch's own boundary, and every
+        // field is still checked per row against the tree-walker.
+        const DAY: i64 = 86_400_000_000_000;
+        let mut ts = vec![
+            i64::MIN,
+            i64::MIN + 1,
+            i64::MIN + DAY,
+            i64::MAX,
+            i64::MAX - 1,
+            i64::MAX - DAY,
+            0,
+            -1,
+            1,
+            -DAY,
+            DAY,
+        ];
+        // Enough rows to reach the compiled tier, drawn from the same ends.
+        ts.extend((0..400).map(|k| i64::MIN + k * DAY));
+        ts.extend((0..400).map(|k| i64::MAX - k * DAY));
+        for expr in [
+            "t.getFullYear()",
+            "t.getMonth()",
+            "t.getDate()",
+            "t.getDayOfMonth()",
+            "t.getDayOfYear()",
+            "t.getDayOfWeek()",
+            "t.getHours()",
+            "t.getMinutes()",
+            "t.getSeconds()",
+            "t.getMilliseconds()",
+        ] {
+            check_batch_f(expr, &[("t", ColData::Timestamp(ts.clone()))]);
+        }
+    }
+
+    #[test]
     fn temporal_accessor_bails() {
         // The accessor names are registered ONLY as member overloads
         // (`common/types/duration.rs:191-222`, `timestamp.rs:278-357`), so

@@ -1814,7 +1814,12 @@ pub mod float_bank {
                     let mb = b >> 63;
                     let ua = (a ^ ma).wrapping_sub(ma);
                     let ub = (b ^ mb).wrapping_sub(mb);
-                    let uq = ua / ub;
+                    // `|i64::MIN|` reads back negative -- see `OP_DIV_K`.
+                    let uq = if ua < 0 {
+                        majit_uint_div(ua, ub)
+                    } else {
+                        ua / ub
+                    };
                     let s = ma ^ mb;
                     state.regs[d] = (uq ^ s).wrapping_sub(s);
                     pc += 4;
@@ -1831,7 +1836,12 @@ pub mod float_bank {
                     let mb = b >> 63;
                     let ua = (a ^ ma).wrapping_sub(ma);
                     let ub = (b ^ mb).wrapping_sub(mb);
-                    let ur = ua % ub;
+                    // `|i64::MIN|` reads back negative -- see `OP_DIV_K`.
+                    let ur = if ua < 0 {
+                        majit_uint_mod(ua, ub)
+                    } else {
+                        ua % ub
+                    };
                     state.regs[d] = (ur ^ ma).wrapping_sub(ma);
                     pc += 4;
                 }
@@ -2059,7 +2069,15 @@ pub mod float_bank {
                     let mk = k >> 63;
                     let ua = (a ^ ma).wrapping_sub(ma);
                     let ub = (k ^ mk).wrapping_sub(mk);
-                    let uq = ua / ub;
+                    // `|i64::MIN|` is 2^63, which reads back negative, so the
+                    // signed expansion would answer for the wrong sign -- the
+                    // same corner `OP_DIV_CHK_K` names. One dividend in 2^64
+                    // keeps the residual call.
+                    let uq = if ua < 0 {
+                        majit_uint_div(ua, ub)
+                    } else {
+                        ua / ub
+                    };
                     let s = ma ^ mk;
                     state.regs[d] = (uq ^ s).wrapping_sub(s);
                     pc += 4;
@@ -2072,7 +2090,11 @@ pub mod float_bank {
                     let mk = k >> 63;
                     let ua = (a ^ ma).wrapping_sub(ma);
                     let ub = (k ^ mk).wrapping_sub(mk);
-                    let ur = ua % ub;
+                    let ur = if ua < 0 {
+                        majit_uint_mod(ua, ub)
+                    } else {
+                        ua % ub
+                    };
                     state.regs[d] = (ur ^ ma).wrapping_sub(ma);
                     pc += 4;
                 }
