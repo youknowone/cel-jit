@@ -85,6 +85,8 @@ fn temporal(rows: usize, rounds: usize, calls: usize) {
     let schema: Schema = [
         ("t".to_string(), ValType::Timestamp),
         ("x".to_string(), ValType::Int),
+        ("y".to_string(), ValType::Int),
+        ("yodd".to_string(), ValType::Int),
     ]
     .into_iter()
     .collect();
@@ -92,9 +94,19 @@ fn temporal(rows: usize, rounds: usize, calls: usize) {
         .map(|i| 1_700_000_000_000_000_000 + i * 1_000_000_007)
         .collect();
     let xs: Vec<i64> = (0..rows as i64).collect();
+    // Never zero: a division that traps falls back to the row-by-row walker,
+    // and a fallback would be timing the walker rather than the compiled loop.
+    let ys: Vec<i64> = (0..rows as i64).map(|i| i % 97 + 1).collect();
+    // Never a power of two, so `OP_MOD_CHK`'s mask arm is never the answer.
+    // Read against `modvar`, whose column MIXES the two arms: a guard the trace
+    // records one side of and the data then contradicts is paid as a bridge
+    // entry per row, which a uniform column does not pay.
+    let yodds: Vec<i64> = (0..rows as i64).map(|i| (i % 97) * 2 + 3).collect();
     let batch = Batch::new(rows)
         .column("t".to_string(), ColumnRef::Timestamp(&ts))
-        .column("x".to_string(), ColumnRef::Int(&xs));
+        .column("x".to_string(), ColumnRef::Int(&xs))
+        .column("y".to_string(), ColumnRef::Int(&ys))
+        .column("yodd".to_string(), ColumnRef::Int(&yodds));
     let cases = [
         ("ctl", "x + 1"),
         ("hours", "t.getHours()"),
@@ -102,6 +114,17 @@ fn temporal(rows: usize, rounds: usize, calls: usize) {
         ("seconds", "t.getSeconds()"),
         ("dayofmonth", "t.getDayOfMonth()"),
         ("dayofweek", "t.getDayOfWeek()"),
+        // The residual-call question, with its two controls: `divk` is the same
+        // division with the divisor in the instruction stream, which the
+        // optimizer expands, and `mulvar` is the same two columns under an
+        // operation that has a native opcode. The gap between `divvar` and
+        // those two is what an unsigned divide opcode would be worth.
+        ("divvar", "x / y"),
+        ("divk", "x / 97"),
+        ("mulvar", "x * y"),
+        ("modvar", "x % y"),
+        ("mododd", "x % yodd"),
+        ("divodd", "x / yodd"),
     ];
     let lowered: Vec<_> = cases
         .iter()
