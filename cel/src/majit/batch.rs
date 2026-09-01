@@ -3762,6 +3762,60 @@ mod tests {
         }
     }
 
+    /// The row loop carries two induction variables, a row counter and a byte
+    /// offset, and only one of them has to be stepped: whichever the close
+    /// tests. The other is stepped only when something reads its value.
+    #[test]
+    fn the_row_counter_is_stepped_only_where_something_reads_it() {
+        use crate::majit::bytecode::{OPERANDS, OP_ADD_IMM, OP_MUL_IMM};
+        // None of the expressions below multiplies or adds a constant, so every
+        // `OP_MUL_IMM` and `OP_ADD_IMM` counted here belongs to the loop.
+        let steps = |cols: &[(&str, ValType)], src: &str, reduce: BatchReduce| {
+            let s = schema(cols);
+            let p = BatchProgram::compile(src, &s).unwrap_or_else(|e| panic!("`{src}`: {e:?}"));
+            let code = &p.lowered.batch_shape(true, reduce).code;
+            let (mut pc, mut adds, mut muls) = (0, 0, 0);
+            while pc < code.len() {
+                adds += (code[pc] == OP_ADD_IMM) as usize;
+                muls += (code[pc] == OP_MUL_IMM) as usize;
+                pc += 1 + OPERANDS[code[pc] as usize].len();
+            }
+            (adds, muls)
+        };
+        let int = &[("a", ValType::Int)][..];
+
+        // Every column is addressed by the byte offset, and a summing run
+        // returns the accumulator, so nothing reads the counter: the loop steps
+        // the offset alone and closes on it against the byte limit, which the
+        // counter's register is seeded with in the counter's place.
+        assert_eq!(steps(int, "a > 0", BatchReduce::Sum), (1, 1));
+        assert_eq!(
+            steps(&[("f", ValType::Float)], "f > 0.0", BatchReduce::Sum),
+            (1, 1),
+            "a float column is addressed the same way"
+        );
+
+        // A bool column is addressed by the counter, so both step.
+        assert_eq!(
+            steps(
+                &[("a", ValType::Int), ("b", ValType::Bool)],
+                "a > 0 && b",
+                BatchReduce::Sum
+            ),
+            (2, 0)
+        );
+
+        // With no column the offset addresses, there is nothing else to close
+        // on, so the counter is the loop's only induction variable.
+        assert_eq!(
+            steps(&[("b", ValType::Bool)], "b", BatchReduce::Sum),
+            (1, 0)
+        );
+
+        // A per-row run returns the counter as its row count.
+        assert_eq!(steps(int, "a > 0", BatchReduce::PerRow), (2, 0));
+    }
+
     /// The civil accessors answer in the base the helper computes, so the four
     /// that read ONE component out of `civil_from_days` cost the same program.
     ///

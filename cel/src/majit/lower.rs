@@ -196,6 +196,14 @@ const ROW_SLOT_WORDS: usize = 4;
 /// Words the row loop spends on a row besides its body and its column loads:
 /// the accumulate or the output store, the induction step, the element-address
 /// step, and the back edge — four four-word instructions.
+///
+/// An UPPER bound, and it has to be: one [`LoweredF`] serves every reduction
+/// and both loop shapes, while which of the two induction variables a shape
+/// actually steps is decided per shape in [`LoweredF::batch_sum_shape`]. A
+/// shape that steps only one spends four words fewer than this says. Making
+/// the estimate exact would mean making it depend on the reduction, which is
+/// not known here — and it feeds [`LoweredF::body_words_for`], hence the route
+/// the batch takes, so it is a contract as much as a count.
 const ROW_LOOP_WORDS: usize = 16;
 
 /// Words an element loop's preamble reserves for the one op whose identity is
@@ -1068,11 +1076,37 @@ impl LoweredF {
                 .iter()
                 .any(|slot| slot.kind == SlotKind::Row && slot.ty != ValType::Bool);
 
+        // Whether the row COUNTER is stepped at all. The back edge closes on
+        // either induction variable, so the counter earns its step only where
+        // something else reads its value: a `bool` column addresses by it, a
+        // `PerRow` run returns it as the count it wrote, and a shape with no
+        // byte offset has nothing else to close on. Where none of the three
+        // holds the offset carries the loop alone, and the step is dead work a
+        // row. micronumpy spells the same rule as a flag its iterator carries —
+        // `iterators.py:154-155` steps the index under `if self.track_index:`,
+        // and `loop.py:24` clears it on the operand whose position nobody asks
+        // for.
+        let track_index = single_row
+            || !needs_ea
+            || reduce == BatchReduce::PerRow
+            || self
+                .slots
+                .iter()
+                .any(|slot| slot.kind == SlotKind::Row && slot.ty == ValType::Bool);
+
         let mut p = Vec::new();
         let load_const = |p: &mut Vec<i64>, imm: i64, dst: usize| {
             p.extend_from_slice(&[OP_LOAD_CONST, imm, dst as i64]);
         };
-        load_const(&mut p, 0, r_i);
+        if track_index {
+            load_const(&mut p, 0, r_i);
+        } else {
+            // A loop that does not step the counter still has to end, so the
+            // counter's register carries the byte limit the close compares
+            // against. Reusing it rather than reserving one keeps the bank the
+            // same width, which is what the seed and `check_code` are sized on.
+            p.extend_from_slice(&[OP_MUL_IMM, r_n as i64, 8, r_i as i64]);
+        }
         // The byte offset is a SECOND induction variable, stepped by its own
         // stride, rather than `i * 8` recomputed each row. Both forms cost the
         // same one instruction, but only this one is analyzable: the optimizer
@@ -1188,11 +1222,16 @@ impl LoweredF {
         // The one row was read and its result stored at offset zero; there is
         // no next row to step to and no back-edge to take.
         if !single_row {
-            p.extend_from_slice(&[OP_ADD_IMM, r_i as i64, 1, r_i as i64]);
+            if track_index {
+                p.extend_from_slice(&[OP_ADD_IMM, r_i as i64, 1, r_i as i64]);
+            }
             if needs_ea {
                 p.extend_from_slice(&[OP_ADD_IMM, r_ea as i64, 8, r_ea as i64]);
             }
-            p.extend_from_slice(&[OP_JUMP_IF_ABOVE, r_n as i64, r_i as i64, body_pc as i64]);
+            // Whichever variable the loop stepped is the one it closes on, and
+            // the other register holds that variable's limit.
+            let (limit, iv) = if track_index { (r_n, r_i) } else { (r_i, r_ea) };
+            p.extend_from_slice(&[OP_JUMP_IF_ABOVE, limit as i64, iv as i64, body_pc as i64]);
         }
         // Publish the overflow flag. Outside the loop, so it costs the traced
         // body nothing and runs once when the back-edge guard finally exits.
