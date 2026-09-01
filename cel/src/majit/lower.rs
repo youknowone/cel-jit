@@ -198,6 +198,13 @@ const ROW_SLOT_WORDS: usize = 4;
 /// step, and the back edge — four four-word instructions.
 const ROW_LOOP_WORDS: usize = 16;
 
+/// Words an element loop's preamble reserves for the one op whose identity is
+/// not known until its body has been compiled — the element index's
+/// initialiser, or the byte limit its close needs instead. Both spellings are
+/// one four-word instruction, which is what lets a single reservation serve
+/// either; see [`compile_list_comprehension_mode`].
+const PREAMBLE_SLOT_WORDS: usize = 4;
+
 /// Where in the batch program a slot's column is read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SlotKind {
@@ -5035,8 +5042,8 @@ fn emit_mov(ctx: &mut LowerCtxF, src: TReg, dst: TReg) {
 /// ```text
 ///     accu = <accu_init>
 ///     if 1 > size(L) goto after          ; zero-trip guard ([].all(..) is true)
-///     i = offset(L); ea = i * 8
-///     last = offset(L) + size(L); limit = last * 8
+///     ea = offset(L) * 8; last = offset(L) + size(L)
+///     limit = last * 8                   ; or `i = offset(L)`, per the close
 ///   inner:
 ///     <element loads at ea, on first reference>
 ///     accu = <loop_step>; ea = ea + 8
@@ -5047,9 +5054,12 @@ fn emit_mov(ctx: &mut LowerCtxF, src: TReg, dst: TReg) {
 ///
 /// A body that reads a `bool` element column reads it at the element INDEX, so
 /// that loop advances `i` as well and closes on `last > i` instead. Every other
-/// loop leaves `i` where the preamble put it: the byte offset is the whole
-/// induction variable, and an index nothing addresses with is four words an
-/// element that buy nothing.
+/// loop has no `i` at all: the byte offset is the whole induction variable, and
+/// an index nothing addresses with is four words an element that buy nothing.
+///
+/// The two closes want different preamble ops and exactly one each, so the
+/// preamble reserves [`PREAMBLE_SLOT_WORDS`] and the close writes whichever it
+/// took. A loop therefore carries no op its own close does not read.
 ///
 /// As in the literal unroll, `loop_cond`'s short-circuit is dropped: every
 /// element is evaluated. Where the walker would stop early and the eager fold
@@ -5098,17 +5108,20 @@ fn compile_list_comprehension_mode(
     // Whichever addresses the body needs advance by a constant, so they are
     // carried across the back edge rather than derived inside the loop from a
     // counter: deriving the byte offset from an index costs a multiply an
-    // element on top of the counter's own add. The index is minted here because
-    // a byte column read decides it is needed only once the body is compiled.
-    let idx = ctx.fresh(ValType::Int);
-    emit_mov(ctx, off, idx);
+    // element on top of the counter's own add.
     let ea = emit_int_bin_k(ctx, OP_MUL, off, 8);
     let last = emit_int_bin(ctx, OP_ADD, off, len);
-    // Both limits, because which one the back edge takes is not known until the
-    // body has been compiled and has or has not read a byte column. Each is one
-    // op ONCE per loop, against the four words an element would pay to advance
-    // an index the body never addressed with.
-    let limit_ea = emit_int_bin_k(ctx, OP_MUL, last, 8);
+    // The two closes need ONE preamble op each, so the words are reserved here
+    // and written at the close, by which time the body has said whether it read
+    // a byte column. Reserving is what keeps the choice free -- emitting both
+    // ops charges every loop for the one its close does not read. It is also
+    // why the choice is not made by inserting the op later: every jump the body
+    // records is an absolute position into `body`, and `inner` below is one of
+    // them, so nothing may shift once the body has begun.
+    let idx = ctx.fresh(ValType::Int);
+    let limit_ea = ctx.fresh(ValType::Int);
+    let preamble_slot = ctx.body.len();
+    ctx.body.extend_from_slice(&[0; PREAMBLE_SLOT_WORDS]);
 
     let inner = ctx.body.len();
     // The loop's element is bound to the FIRST link's variable: the chain runs
@@ -5148,8 +5161,9 @@ fn compile_list_comprehension_mode(
     }
     // The index is carried only for a byte column, which reads at the element
     // index rather than at its word address. Where the body read none, the byte
-    // offset is the whole induction variable and the index does not advance.
-    if ctx.elem_idx_addressed.contains(&idx.idx) {
+    // offset is the whole induction variable and the index does not advance --
+    // and the limit it closes on is the one the reserved preamble word becomes.
+    let preamble_op = if ctx.elem_idx_addressed.contains(&idx.idx) {
         ctx.body.extend_from_slice(&[
             OP_ADD_IMM,
             idx.idx as i64,
@@ -5161,11 +5175,17 @@ fn compile_list_comprehension_mode(
             ea.idx as i64,
         ]);
         ctx.emit_back_edge(last, idx, inner);
+        // `idx = offset(L)`, spelled as an add of zero because the reserved
+        // words are a fixed width: a three-word move would leave a word the
+        // interpreter reaches and decodes as an opcode.
+        [OP_ADD_IMM, off.idx as i64, 0, idx.idx as i64]
     } else {
         ctx.body
             .extend_from_slice(&[OP_ADD_IMM, ea.idx as i64, 8, ea.idx as i64]);
         ctx.emit_back_edge(limit_ea, ea, inner);
-    }
+        [OP_MUL_IMM, last.idx as i64, 8, limit_ea.idx as i64]
+    };
+    ctx.body[preamble_slot..preamble_slot + PREAMBLE_SLOT_WORDS].copy_from_slice(&preamble_op);
     ctx.patch_jump(zero_trip);
 
     ctx.locals.insert(comp.accu_var.clone(), accu);

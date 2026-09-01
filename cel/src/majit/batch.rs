@@ -3750,6 +3750,39 @@ mod tests {
         }
     }
 
+    /// An element loop's preamble carries no op its own close does not read.
+    ///
+    /// The equality is the durable half: the byte close needs the element
+    /// index's initialiser and the other needs the byte limit, one reservation
+    /// serves either, so the two shapes cost the same row however much else the
+    /// row loop grows. The total is pinned as well because there is no sibling
+    /// spelling to subtract it from -- the reserved word is one constant in
+    /// EVERY comprehension, so a difference of differences cancels it.
+    #[test]
+    fn a_loop_reserves_one_preamble_word_for_whichever_close_it_takes() {
+        let s = schema(&[
+            ("items[].a", ValType::Int),
+            ("items[].b", ValType::Bool),
+            ("items[].c", ValType::Int),
+        ]);
+        let row_words = |src: &str| {
+            BatchProgram::compile(src, &s)
+                .unwrap_or_else(|e| panic!("`{src}`: {e:?}"))
+                .lowered
+                .row_words
+        };
+        let byte_close = row_words("items.all(i, i.a > 0 && i.b)");
+        let plain_close = row_words("items.all(i, i.a > 0 && i.c > 1)");
+        assert_eq!(
+            byte_close, plain_close,
+            "each close reads exactly one preamble op and the reservation is one op wide"
+        );
+        assert_eq!(
+            plain_close, 43,
+            "a 46 is both ops emitted again, one of which the close never reads"
+        );
+    }
+
     /// The op that computes a comprehension's step writes the accumulator, so
     /// no move an element carries the value there.
     ///
