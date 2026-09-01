@@ -4217,10 +4217,6 @@ fn emit_chain_collect(
         // element itself — under the name the BASE loop registered.
         None => Appended::Element(links[0].iter_var),
     };
-    emit_element_store(ctx, appended, cursor)?;
-    let Some(c) = cond else {
-        return Ok(());
-    };
     // Collecting under a predicate: the store runs for every element, and the
     // cursor advances only where the predicate holds — so a rejected element
     // writes to the slot the next accepted one will overwrite. That is what
@@ -4228,14 +4224,18 @@ fn emit_chain_collect(
     //
     // The advance IS the predicate. `OP_SELECT c, t, f` computes `f + c * (t - f)`,
     // so selecting between the constants 1 and 0 is `0 + c * 1` — the condition
-    // register itself, for any word it holds.
-    let delta = c;
-    // Undo the unconditional advance the store made, where the predicate
-    // rejected.
-    let back = emit_complement(ctx, delta);
-    ctx.body
-        .extend_from_slice(&[OP_SUB, cursor as i64, back.idx as i64, cursor as i64]);
-    Ok(())
+    // register itself, for any word it holds. Handing it to the store as the
+    // advance rather than advancing by one and subtracting the complement is
+    // what keeps the append one instruction: the two ops that dance cancel.
+    emit_element_store(
+        ctx,
+        appended,
+        cursor,
+        match cond {
+            Some(c) => Advance::By(c),
+            None => Advance::One,
+        },
+    )
 }
 
 /// Lower a top-level `list.map(..)` / `list.filter(..)` by COLLECTING it: the
@@ -4536,7 +4536,7 @@ fn compile_len_step(
                     // bound, so it compiles like any other expression.
                     AccuMode::Collect { cursor } => {
                         let v = compile_t(ctx, e)?;
-                        emit_element_store(ctx, Appended::Value(v), cursor)?
+                        emit_element_store(ctx, Appended::Value(v), cursor, Advance::One)?
                     }
                     // Counting: the element is compiled only for the errors it
                     // can raise, and a bare iteration variable raises none.
@@ -4613,6 +4613,15 @@ fn compile_len_step(
     }
 }
 
+/// How far the cursor moves once one collected element has been stored.
+enum Advance {
+    /// Past the element just written, which is kept.
+    One,
+    /// By what a bool register holds. A rejected element leaves the cursor
+    /// where it was, so the next accepted store overwrites the slot.
+    By(TReg),
+}
+
 /// What one collected iteration appends.
 enum Appended<'a> {
     /// The loop's element itself — what `filter` hands back — named by the
@@ -4625,10 +4634,16 @@ enum Appended<'a> {
 }
 
 /// Write one appended element to the ragged output and advance the cursor.
+///
+/// The advance is a parameter rather than a fixed step because a predicated
+/// append is the same store: only how far the cursor travels afterwards
+/// differs, and every spelling below carries that in the advance it already
+/// had to emit.
 fn emit_element_store(
     ctx: &mut LowerCtxF,
     appended: Appended,
     cursor: usize,
+    advance: Advance,
 ) -> Result<(), LowerError> {
     let out = ctx
         .list_output
@@ -4657,18 +4672,16 @@ fn emit_element_store(
     // fused, the byte scale inside. Several columns share one scaled address
     // and advance once after the last store.
     if let [v] = values[..] {
-        let op = if v.bank == ValType::Float {
-            OP_COL_PUSH_F
-        } else {
-            OP_COL_PUSH
+        let (op, pred) = match (v.bank == ValType::Float, advance) {
+            (false, Advance::One) => (OP_COL_PUSH, None),
+            (true, Advance::One) => (OP_COL_PUSH_F, None),
+            (false, Advance::By(p)) => (OP_COL_PUSH_IF, Some(p)),
+            (true, Advance::By(p)) => (OP_COL_PUSH_IF_F, Some(p)),
         };
-        ctx.body.extend_from_slice(&[
-            op,
-            out.base_regs[0] as i64,
-            cursor as i64,
-            v.idx as i64,
-            cursor as i64,
-        ]);
+        ctx.body
+            .extend_from_slice(&[op, out.base_regs[0] as i64, cursor as i64, v.idx as i64]);
+        ctx.body.extend(pred.map(|p: TReg| p.idx as i64));
+        ctx.body.push(cursor as i64);
         return Ok(());
     }
     let ea = emit_int_bin_k(ctx, OP_MUL, cur, 8);
@@ -4681,8 +4694,10 @@ fn emit_element_store(
         ctx.body
             .extend_from_slice(&[op, out.base_regs[k] as i64, ea.idx as i64, v.idx as i64]);
     }
-    ctx.body
-        .extend_from_slice(&[OP_ADD_IMM, cursor as i64, 1, cursor as i64]);
+    ctx.body.extend_from_slice(&match advance {
+        Advance::One => [OP_ADD_IMM, cursor as i64, 1, cursor as i64],
+        Advance::By(p) => [OP_ADD, cursor as i64, p.idx as i64, cursor as i64],
+    });
     Ok(())
 }
 

@@ -1972,9 +1972,14 @@ mod tests {
     /// A single-column collect appends in one fused instruction, on the
     /// unrolled literal shape and on the runtime-list loop alike; a record
     /// output with several columns keeps the shared scaled address.
+    ///
+    /// Under a predicate the fused append is the PREDICATED one, whose advance
+    /// carries the condition. `OP_NOT` is what says it does not: the expanded
+    /// form advanced by one and then subtracted the complement, and the
+    /// complement is the only thing in any of these bodies that takes one.
     #[test]
     fn a_single_column_collect_appends_in_one_instruction() {
-        use crate::majit::bytecode::{OPERANDS, OP_ADD_IMM, OP_COL_PUSH, OP_COL_STORE};
+        use crate::majit::bytecode::{OPERANDS, OP_COL_PUSH, OP_COL_PUSH_IF, OP_COL_STORE, OP_NOT};
         let opcodes = |code: &[i64]| -> Vec<i64> {
             let mut pc = 0;
             let mut ops = Vec::new();
@@ -1996,22 +2001,23 @@ mod tests {
         );
         let mut ctx = Context::default();
         ctx.add_variable_from_value("xs", vec![1i64, 2, 3]);
-        for src in [
-            "[1, 2, 3].map(x, x * 2)",
-            "xs.map(x, x * 2)",
-            "xs.filter(x, x > 1)",
+        for (src, push) in [
+            ("[1, 2, 3].map(x, x * 2)", OP_COL_PUSH),
+            ("xs.map(x, x * 2)", OP_COL_PUSH),
+            ("xs.filter(x, x > 1)", OP_COL_PUSH_IF),
         ] {
             let program = Program::compile(src).unwrap();
             let batched =
                 BatchProgram::from_program(&program, &s).unwrap_or_else(|e| panic!("{src}: {e}"));
             let ops = opcodes(&batched.lowered().body);
-            assert!(
-                ops.contains(&OP_COL_PUSH),
-                "{src}: no fused append: {ops:?}"
-            );
+            assert!(ops.contains(&push), "{src}: no fused append: {ops:?}");
             assert!(
                 !ops.contains(&OP_COL_STORE),
                 "{src}: an unfused store: {ops:?}"
+            );
+            assert!(
+                !ops.contains(&OP_NOT),
+                "{src}: the advance was undone afterwards: {ops:?}"
             );
             let bound = batched.bind_per_row(&batch).unwrap();
             let walker = vec![program.execute(&ctx).unwrap()];
@@ -2019,7 +2025,8 @@ mod tests {
                 assert_eq!(bound.collect_on(tier).unwrap(), walker, "{src} on {tier:?}");
             }
         }
-        // Two declared columns: two stores at one scaled address, one advance.
+        // Two declared columns: two stores at one scaled address, one advance,
+        // and under a predicate that one advance IS the predicate.
         let s = schema(&[
             ("items[].price", ValType::Int),
             ("items[].qty", ValType::Int),
@@ -2029,11 +2036,16 @@ mod tests {
         let ops = opcodes(&batched.lowered().body);
         assert!(
             !ops.contains(&OP_COL_PUSH),
-            "a two-column collect has no single column to fuse"
+            "a two-column collect has no single column to fuse: {ops:?}"
+        );
+        assert_eq!(
+            ops.iter().filter(|&&o| o == OP_COL_STORE).count(),
+            2,
+            "the two columns store at one shared scaled address: {ops:?}"
         );
         assert!(
-            ops.contains(&OP_ADD_IMM),
-            "the two-column collect advances after its stores"
+            !ops.contains(&OP_NOT),
+            "the advance after those stores carries the predicate: {ops:?}"
         );
     }
 
@@ -3755,9 +3767,14 @@ mod tests {
     ///
     /// The totals are decompositions, and each op below is one the disassembly
     /// names: `map` is a column load (4), the store (5), the byte-offset step
-    /// (4) and the back edge (4); `filter` adds the predicate (4), its
-    /// complement (3) and the cursor rewind (4) that makes the store
-    /// unconditional. A count update would be a fifth resp. eighth op.
+    /// (4) and the back edge (4); `filter` adds the predicate (4) and widens
+    /// the store to 6, because its advance names the predicate. A count update
+    /// would be a fifth resp. sixth op.
+    ///
+    /// The DIFFERENCE is the sharper of the two readings, and the reason both
+    /// are here: everything the two shapes share cancels in it, so what is left
+    /// -- 5 -- is the whole price of filtering, the predicate and the one word
+    /// that hands it to the store.
     ///
     /// `size(list.filter(..))` is the gate: it keeps a REAL running total,
     /// because it has no cursor to read one off, and must not lose it.
@@ -3777,8 +3794,13 @@ mod tests {
         );
         assert_eq!(
             elem_words("items.filter(i, i.price > 10)"),
-            4 + 4 + 5 + 3 + 4 + 4 + 4,
-            "a 32 is the count update back an element"
+            4 + 4 + 6 + 4 + 4,
+            "a 28 is the unconditional advance and the rewind that undid it"
+        );
+        assert_eq!(
+            elem_words("items.filter(i, i.price > 10)") - elem_words("items.map(i, i.price)"),
+            4 + 1,
+            "filtering costs its predicate and the one word that names it"
         );
         assert_eq!(
             elem_words("size(items.filter(i, i.price > 10))"),
