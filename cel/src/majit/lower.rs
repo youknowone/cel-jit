@@ -146,21 +146,21 @@ pub enum ValType {
     /// [`ValType::Timestamp`], comparisons lower to the signed int ops; a
     /// timestamp vs duration comparison is NoSuchOverload and bails.
     Duration,
-    /// A CEL `type` used as a value, carried in the int register file as its
-    /// index into [`LoweredF::type_consts`].
+    /// A CEL `type` used as a value, carried in the int register file as the
+    /// index [`type_const_id`] gives its name.
     ///
     /// Types are values in CEL, so `type(x)` has to return one, and the checker
     /// FOLDS such a call to a `Value::Opaque` holding a
     /// [`TypeValue`](crate::common::types::TypeValue) -- a compile-time
     /// constant. So this bank never carries a column and never computes: the
     /// index is minted while lowering and the only operations are `==` and
-    /// `!=`, which are index comparisons because the interning is injective by
-    /// construction.
+    /// `!=`, which are index comparisons because the table names each type once.
     ///
-    /// The index is NOT a stable type id. It is a rank over the type constants
-    /// THIS expression mentions, the way [`ValType::Str`] ranks the batch's
-    /// distinct strings, so two programs may number the same type differently
-    /// and only comparisons within one lowering are meaningful.
+    /// Unlike [`ValType::Str`], whose rank is over the batch's own distinct
+    /// strings, this index is a position in a fixed table and so denotes the
+    /// same type in every program. It has to: the batch decodes a stored word
+    /// back to a value with `type_const_value`, outside any lowering. A type
+    /// the table does not name has no index, and the lowering declines it.
     Type,
 }
 
