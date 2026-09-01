@@ -288,10 +288,18 @@ pub const OP_MOD_K: i64 = 72; // [a, k, dst]  regs[dst] = a % k   (sign of divid
 /// `OP_DIV_K` divides MAGNITUDES so that a negative dividend truncates toward
 /// zero, which costs five live ops around the division -- three of them on its
 /// critical path, before the divide, and two after it. Where the lowering
-/// already knows the dividend cannot be negative those five are dead work, and
-/// the sign test that replaces them is also what lets the optimizer expand the
-/// constant divisor at all: `optimize_int_floor_div` is gated on the dividend
-/// being `known_nonnegative`.
+/// already knows the dividend cannot be negative those five are dead work: the
+/// bare divide is already the answer, and a sign test is the cheaper way to say
+/// so.
+///
+/// The constant divisor is expanded either way. A bare `/` records an
+/// `int.py_div` call, and `optimize_call_int_py_div` reaches
+/// `intdiv::division_operations` for it whatever the dividend's bounds -- the
+/// residual call always goes. What a non-negative dividend buys there is the
+/// SHORT expansion, a multiply-high and a shift, in place of the longer form
+/// that carries the sign through. (`optimize_int_floor_div` IS gated on
+/// non-negativity, but it matches the `IntFloorDiv` op, which a `/` in a traced
+/// body never becomes.)
 ///
 /// The caller owes the non-negativity. The other arm answers a negative
 /// dividend correctly anyway -- the test is a GUARD in the trace, not an
@@ -2002,9 +2010,10 @@ pub mod float_bank {
                     let k = program[pc + 2];
                     let d = program[pc + 3] as usize;
                     let t = program[pc + 4] as usize;
-                    // Magnitudes, as in `OP_DIV_CHK`: floor and truncation agree
-                    // on non-negative operands, and only the magnitude form has a
-                    // constant the optimizer can expand.
+                    // Magnitudes, as in `OP_DIV_CHK`: a bare `/` in this loop
+                    // records Python FLOOR division and this opcode's answer
+                    // truncates, so the sign comes off and goes back on around a
+                    // divide of the magnitudes, where the two agree.
                     let ma = a >> 63;
                     let mk = k >> 63;
                     let ua = (a ^ ma).wrapping_sub(ma);
