@@ -3750,6 +3750,41 @@ mod tests {
         }
     }
 
+    /// Only a loop that READS a byte column advances an element index.
+    ///
+    /// A `bool` column is the caller's own `&[bool]`, one byte an element, so it
+    /// is addressed by the index while every other column is addressed by the
+    /// byte offset. A loop that reads no byte column therefore needs no index,
+    /// and carrying one would cost an add an element for nothing.
+    ///
+    /// Measured as a DIFFERENCE OF DIFFERENCES so no op's own width has to be
+    /// named here: both a compare and a byte load write one register from an
+    /// operand pair, so the two conjuncts below cost the same but for the
+    /// advance the byte one obliges.
+    #[test]
+    fn only_a_byte_column_read_makes_its_loop_advance_an_index() {
+        let s = schema(&[("items[].a", ValType::Int), ("items[].b", ValType::Bool)]);
+        let elem_words = |src: &str| {
+            BatchProgram::compile(src, &s)
+                .unwrap_or_else(|e| panic!("`{src}`: {e:?}"))
+                .lowered
+                .elem_words
+        };
+        let plain = elem_words("items.all(i, i.a > 0)");
+        let int_conjunct = elem_words("items.all(i, i.a > 0 && i.a > 1)");
+        let byte_conjunct = elem_words("items.all(i, i.a > 0 && i.b)");
+        assert!(
+            int_conjunct > plain,
+            "the second conjunct should cost something: {plain} -> {int_conjunct}"
+        );
+        assert_eq!(
+            byte_conjunct - int_conjunct,
+            4,
+            "a byte conjunct should cost its loop exactly one advance more than \
+             an int one: plain {plain}, int {int_conjunct}, byte {byte_conjunct}"
+        );
+    }
+
     /// The same one-byte read reached from OUTSIDE a list loop, which has no
     /// element index to read it at.
     ///

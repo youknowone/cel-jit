@@ -32,7 +32,7 @@ use crate::common::ast::operators as ops;
 use crate::common::ast::{CallExpr, ComprehensionExpr, EntryExpr, Expr, IdedExpr, LiteralValue};
 use crate::common::types::{type_const_id, TypeValue};
 use crate::{Context, Value};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 /// Reason a CEL expression could not be lowered to the traceable subset.
 #[derive(Debug, Clone)]
@@ -1503,6 +1503,15 @@ struct LowerCtxF<'s> {
     /// need per-element offsets a flat row column cannot express — and that
     /// declines on its own, since such a path is not one the schema declares.
     list_loop: Vec<ListLoop>,
+    /// Element index registers some emitted op ADDRESSED with, rather than
+    /// every one a loop minted. Only [`OP_COL_LOAD_B`] reads a column at the
+    /// index -- a `bool` column is the caller's own `&[bool]`, one byte an
+    /// element -- so a loop no byte column was read inside does not have to
+    /// advance its index at all, and the back edge counts the byte offset that
+    /// every other load already needs. Recorded by register rather than by
+    /// loop, because a fused chain link shares its base loop's index and would
+    /// otherwise set the flag on an entry the close never sees.
+    elem_idx_addressed: BTreeSet<usize>,
     /// Registers holding a loop-invariant constant, keyed by the bank and the
     /// word loaded into it. See [`LowerCtxF::const_reg`].
     const_pool: HashMap<(ValType, i64), TReg>,
@@ -1723,11 +1732,15 @@ impl LowerCtxF<'_> {
         // tree-walker; answering from `ea_reg` would read past the slice.
         let (op, addr_reg) = match ty {
             ValType::Float => (OP_COL_LOAD_F, ea_reg),
-            ValType::Bool => (
-                OP_COL_LOAD_B,
-                self.elem_idx_reg(ea_reg)
-                    .ok_or_else(|| LowerError::unsupported("bool element outside its list loop"))?,
-            ),
+            ValType::Bool => {
+                let idx = self
+                    .elem_idx_reg(ea_reg)
+                    .ok_or_else(|| LowerError::unsupported("bool element outside its list loop"))?;
+                // This load is the reason the index exists; say so, so the
+                // loop's close knows it has to advance it.
+                self.elem_idx_addressed.insert(idx);
+                (OP_COL_LOAD_B, idx)
+            }
             _ => (OP_COL_LOAD, ea_reg),
         };
         self.body
@@ -1828,6 +1841,7 @@ pub fn lower_typed_in(
         concats: Vec::new(),
         elem_map: HashMap::new(),
         list_loop: Vec::new(),
+        elem_idx_addressed: BTreeSet::new(),
         const_pool: HashMap::new(),
         jump_fixups: Vec::new(),
         elem_words: 0,
@@ -4348,6 +4362,7 @@ fn probe_ctx<'a>(ctx: &LowerCtxF<'a>) -> LowerCtxF<'a> {
         concats: Vec::new(),
         elem_map: HashMap::new(),
         list_loop: Vec::new(),
+        elem_idx_addressed: BTreeSet::new(),
         const_pool: HashMap::new(),
         jump_fixups: Vec::new(),
         elem_words: 0,
@@ -4974,14 +4989,21 @@ fn emit_mov(ctx: &mut LowerCtxF, src: TReg, dst: TReg) {
 /// ```text
 ///     accu = <accu_init>
 ///     if 1 > size(L) goto after          ; zero-trip guard ([].all(..) is true)
-///     i = offset(L); ea = i * 8; limit = offset(L) + size(L)
+///     i = offset(L); ea = i * 8
+///     last = offset(L) + size(L); limit = last * 8
 ///   inner:
 ///     <element loads at ea, on first reference>
-///     accu = <loop_step>; i = i + 1; ea = ea + 8
-///     if limit > i goto inner            ; back-edge -> can_enter_jit
+///     accu = <loop_step>; ea = ea + 8
+///     if limit > ea goto inner           ; back-edge -> can_enter_jit
 ///   after:
 ///     <result>
 /// ```
+///
+/// A body that reads a `bool` element column reads it at the element INDEX, so
+/// that loop advances `i` as well and closes on `last > i` instead. Every other
+/// loop leaves `i` where the preamble put it: the byte offset is the whole
+/// induction variable, and an index nothing addresses with is four words an
+/// element that buy nothing.
 ///
 /// As in the literal unroll, `loop_cond`'s short-circuit is dropped: every
 /// element is evaluated. Where the walker would stop early and the eager fold
@@ -5027,15 +5049,20 @@ fn compile_list_comprehension_mode(
     // below is a do-while.
     let zero_trip = ctx.emit_jump_if_above(one, len);
 
-    // The element index and its byte offset both advance by a constant, so both
-    // are carried across the back edge rather than derived inside the loop from
-    // a counter. The index is then the counter as well, which is what pays for
-    // the second one: deriving the pair costs an add and a multiply an element
-    // on top of the counter's own add, and advancing it costs two adds.
+    // Whichever addresses the body needs advance by a constant, so they are
+    // carried across the back edge rather than derived inside the loop from a
+    // counter: deriving the byte offset from an index costs a multiply an
+    // element on top of the counter's own add. The index is minted here because
+    // a byte column read decides it is needed only once the body is compiled.
     let idx = ctx.fresh(ValType::Int);
     emit_mov(ctx, off, idx);
     let ea = emit_int_bin_k(ctx, OP_MUL, off, 8);
-    let limit = emit_int_bin(ctx, OP_ADD, off, len);
+    let last = emit_int_bin(ctx, OP_ADD, off, len);
+    // Both limits, because which one the back edge takes is not known until the
+    // body has been compiled and has or has not read a byte column. Each is one
+    // op ONCE per loop, against the four words an element would pay to advance
+    // an index the body never addressed with.
+    let limit_ea = emit_int_bin_k(ctx, OP_MUL, last, 8);
 
     let inner = ctx.body.len();
     // The loop's element is bound to the FIRST link's variable: the chain runs
@@ -5068,17 +5095,26 @@ fn compile_list_comprehension_mode(
         ));
     }
     emit_mov(ctx, step, accu);
-    ctx.body.extend_from_slice(&[
-        OP_ADD_IMM,
-        idx.idx as i64,
-        1,
-        idx.idx as i64,
-        OP_ADD_IMM,
-        ea.idx as i64,
-        8,
-        ea.idx as i64,
-    ]);
-    ctx.emit_back_edge(limit, idx, inner);
+    // The index is carried only for a byte column, which reads at the element
+    // index rather than at its word address. Where the body read none, the byte
+    // offset is the whole induction variable and the index does not advance.
+    if ctx.elem_idx_addressed.contains(&idx.idx) {
+        ctx.body.extend_from_slice(&[
+            OP_ADD_IMM,
+            idx.idx as i64,
+            1,
+            idx.idx as i64,
+            OP_ADD_IMM,
+            ea.idx as i64,
+            8,
+            ea.idx as i64,
+        ]);
+        ctx.emit_back_edge(last, idx, inner);
+    } else {
+        ctx.body
+            .extend_from_slice(&[OP_ADD_IMM, ea.idx as i64, 8, ea.idx as i64]);
+        ctx.emit_back_edge(limit_ea, ea, inner);
+    }
     ctx.patch_jump(zero_trip);
 
     ctx.locals.insert(comp.accu_var.clone(), accu);
