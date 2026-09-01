@@ -3653,6 +3653,36 @@ mod tests {
         }
     }
 
+    /// The same one-byte read reached from OUTSIDE a list loop, which has no
+    /// element index to read it at.
+    ///
+    /// `items.filter(..)` above runs inside a loop that carries both the byte
+    /// offset and the element index, so the byte column is read at the index.
+    /// `items[0].active` carries only the byte offset: its address is
+    /// `(offset + 0) * 8`, and handing that to a one-byte load reads eight times
+    /// too far into the caller's `&[bool]` — past its end on the last rows,
+    /// which is an unchecked read and not an error. So the lowering must refuse
+    /// and let the tree-walker answer.
+    #[test]
+    fn a_bool_element_reached_without_its_loop_declines() {
+        let s = schema(&[
+            ("items[].price", ValType::Int),
+            ("items[].active", ValType::Bool),
+        ]);
+        let Err(err) = BatchProgram::compile("items[0].active", &s) else {
+            panic!("`items[0].active` lowered a byte column at a word address")
+        };
+        assert!(
+            format!("{err:?}").contains("bool element outside its list loop"),
+            "{err:?}"
+        );
+        // The word-column twin still reads at the byte offset, so the refusal is
+        // the byte column's and not the constant index's.
+        BatchProgram::compile("items[0].price", &s).unwrap();
+        // And the loop spelling above still lowers, so nothing was over-refused.
+        BatchProgram::compile("items.filter(i, i.active).map(i, i.price)", &s).unwrap();
+    }
+
     /// A `bool` slot takes a `bool` column and nothing else.
     ///
     /// The load reads one byte at the row index, so an `i64` column of `0`/`1`

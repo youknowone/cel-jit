@@ -1655,27 +1655,27 @@ impl LowerCtxF<'_> {
             self.schema.get(&path).copied().ok_or_else(|| {
                 LowerError::unsupported(format!("undeclared element path `{path}`"))
             })?;
-        Ok(self.elem_slot_typed(path, ty, ea_reg))
+        self.elem_slot_typed(path, ty, ea_reg)
     }
 
-    /// [`LowerCtxF::elem_slot`] for an element slot whose type the LOWERING
-    /// knows rather than the schema: the derived `size(<element>)` column,
-    /// which is a count — the element-level twin of [`LowerCtxF::slot_typed`].
     /// The element INDEX register belonging to the inner loop whose byte offset
     /// is `ea_reg` — the address a one-byte element column is read at.
     ///
     /// Looked up rather than threaded through every chain function: the loop
     /// that owns `ea_reg` is on the stack whenever one of its elements is being
     /// read, and a later chain link that aliases the base loop shares both
-    /// registers. Falls back to `ea_reg` only where no loop owns it, which is
-    /// unreachable for an element slot and would read the wrong byte rather
-    /// than the wrong word if it ever were.
-    fn elem_idx_reg(&self, ea_reg: usize) -> usize {
+    /// registers.
+    ///
+    /// `None` where no loop owns `ea_reg`. It is not interchangeable with
+    /// `ea_reg`: the two differ by the stride, so a byte column read at the word
+    /// address lands eight times too far into the caller's slice, which is an
+    /// unchecked read past its end rather than an error.
+    fn elem_idx_reg(&self, ea_reg: usize) -> Option<usize> {
         self.list_loop
             .iter()
             .rev()
             .find(|l| l.ea_reg == ea_reg)
-            .map_or(ea_reg, |l| l.idx_reg)
+            .map(|l| l.idx_reg)
     }
 
     /// Park an element column's base for a load the CALLER emits — the fused
@@ -1693,17 +1693,29 @@ impl LowerCtxF<'_> {
         base_reg
     }
 
-    fn elem_slot_typed(&mut self, path: String, ty: ValType, ea_reg: usize) -> TReg {
+    fn elem_slot_typed(
+        &mut self,
+        path: String,
+        ty: ValType,
+        ea_reg: usize,
+    ) -> Result<TReg, LowerError> {
         if let Some(&r) = self.elem_map.get(&(path.clone(), ea_reg)) {
-            return r;
+            return Ok(r);
         }
         let r = self.fresh(ty);
         let base_reg = self.fresh(ValType::Int).idx;
         // A `bool` element column is the caller's own `&[bool]`, one byte per
         // element, so it is read at the element INDEX and not at `index * 8`.
+        // Only a loop that owns `ea_reg` carries that index, so a byte column
+        // reached from outside one has no address here and declines to the
+        // tree-walker; answering from `ea_reg` would read past the slice.
         let (op, addr_reg) = match ty {
             ValType::Float => (OP_COL_LOAD_F, ea_reg),
-            ValType::Bool => (OP_COL_LOAD_B, self.elem_idx_reg(ea_reg)),
+            ValType::Bool => (
+                OP_COL_LOAD_B,
+                self.elem_idx_reg(ea_reg)
+                    .ok_or_else(|| LowerError::unsupported("bool element outside its list loop"))?,
+            ),
             _ => (OP_COL_LOAD, ea_reg),
         };
         self.body
@@ -1715,7 +1727,7 @@ impl LowerCtxF<'_> {
             reg: r.idx,
             kind: SlotKind::Element { base_reg },
         });
-        r
+        Ok(r)
     }
 
     /// Resolve `name` (optionally `.field`) against the list loop being
@@ -3590,7 +3602,7 @@ fn size_of_list_element(ctx: &mut LowerCtxF, e: &IdedExpr) -> Result<Option<TReg
         size_slot_path(&elem),
         ValType::Int,
         ea_reg,
-    )))
+    )?))
 }
 
 /// Green-length comprehension unroll for the typed path (mirrors
@@ -4026,12 +4038,20 @@ fn compile_chain_body(
         // The base loop already registered the first link's variable.
         if k > 0 {
             match value {
-                None => ctx.list_loop.push(ListLoop {
-                    iter_var: link.iter_var.to_string(),
-                    list: list.to_string(),
-                    ea_reg,
-                    idx_reg: ctx.elem_idx_reg(ea_reg),
-                }),
+                None => {
+                    // A later link iterates the SAME elements as the base loop,
+                    // so it shares that loop's index register; there is no
+                    // second one to derive.
+                    let idx_reg = ctx.elem_idx_reg(ea_reg).ok_or_else(|| {
+                        LowerError::unsupported("chain link outside its base loop")
+                    })?;
+                    ctx.list_loop.push(ListLoop {
+                        iter_var: link.iter_var.to_string(),
+                        list: list.to_string(),
+                        ea_reg,
+                        idx_reg,
+                    })
+                }
                 Some(v) => {
                     ctx.locals.insert(link.iter_var.to_string(), v);
                 }
