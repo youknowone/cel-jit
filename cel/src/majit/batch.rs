@@ -3750,6 +3750,28 @@ mod tests {
         }
     }
 
+    /// The op that computes a comprehension's step writes the accumulator, so
+    /// no move an element carries the value there.
+    ///
+    /// Pinned as a total rather than a difference because every comprehension
+    /// shape reaches this: the step of `all` is `accu && cond`, of `map` the
+    /// advanced cursor, and both end in an op that minted its own destination.
+    /// There is no sibling spelling that keeps the move to subtract, so the
+    /// decomposition is written out instead -- per element `items.all(i, i.a >
+    /// 0)` loads the column, compares it, ANDs the result into the accumulator,
+    /// advances the byte offset and closes, and nothing else.
+    #[test]
+    fn a_minted_step_writes_the_accumulator_without_a_move() {
+        let s = schema(&[("items[].a", ValType::Int)]);
+        let lowered = BatchProgram::compile("items.all(i, i.a > 0)", &s)
+            .unwrap()
+            .lowered;
+        assert_eq!(
+            lowered.elem_words, 20,
+            "five ops an element and no move; a 23 here is the move come back"
+        );
+    }
+
     /// Only a loop that READS a byte column advances an element index.
     ///
     /// A `bool` column is the caller's own `&[bool]`, one byte an element, so it

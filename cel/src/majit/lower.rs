@@ -1512,6 +1512,19 @@ struct LowerCtxF<'s> {
     /// loop, because a fused chain link shares its base loop's index and would
     /// otherwise set the flag on an entry the close never sees.
     elem_idx_addressed: BTreeSet<usize>,
+    /// Body length right after an op that MINTED its destination register and
+    /// wrote it as that op's last word. `None` where the last thing emitted was
+    /// anything else.
+    ///
+    /// The length is the guard, and it is why this is safe to consult. Anything
+    /// appended since -- by a helper that does not record here, or by one of the
+    /// many inline `extend_from_slice` calls -- moves it, and the record is then
+    /// refused rather than trusted. So an emitter that never learned about this
+    /// field costs a missed rewrite and can never cause a wrong one. Minted is
+    /// the other half: a register `fresh` returned and one op wrote is in no
+    /// slot, element, local or constant map, so retargeting it cannot rename
+    /// something another read still expects to find.
+    last_fresh_write: Option<usize>,
     /// Registers holding a loop-invariant constant, keyed by the bank and the
     /// word loaded into it. See [`LowerCtxF::const_reg`].
     const_pool: HashMap<(ValType, i64), TReg>,
@@ -1625,6 +1638,33 @@ impl LowerCtxF<'_> {
         self.const_pool
             .iter()
             .find_map(|(&(bank, word), p)| (bank == r.bank && p.idx == r.idx).then_some(word))
+    }
+
+    /// Note that the op just appended minted its destination and wrote it last.
+    /// See [`LowerCtxF::last_fresh_write`] for why only such an op may say so.
+    fn note_fresh_write(&mut self) {
+        self.last_fresh_write = Some(self.body.len());
+    }
+
+    /// Make the op that just wrote `src` write `dst` instead, and answer whether
+    /// it did. `false` means the caller still owes the move it was going to skip.
+    ///
+    /// Declines unless that op is still the last thing in the body, so a caller
+    /// may ask at any point and get a wrong answer at none. The banks must agree
+    /// because the destination decides which file the op writes.
+    fn retarget_last_write(&mut self, src: TReg, dst: TReg) -> bool {
+        if src.bank != dst.bank {
+            return false;
+        }
+        let Some(len) = self.last_fresh_write else {
+            return false;
+        };
+        if len != self.body.len() || self.body[len - 1] != src.idx as i64 {
+            return false;
+        }
+        self.body[len - 1] = dst.idx as i64;
+        self.last_fresh_write = None;
+        true
     }
 
     /// Resolve a row slot whose type the schema must declare. An UNDECLARED path
@@ -1842,6 +1882,7 @@ pub fn lower_typed_in(
         elem_map: HashMap::new(),
         list_loop: Vec::new(),
         elem_idx_addressed: BTreeSet::new(),
+        last_fresh_write: None,
         const_pool: HashMap::new(),
         jump_fixups: Vec::new(),
         elem_words: 0,
@@ -2056,6 +2097,7 @@ fn emit_int_bin(ctx: &mut LowerCtxF, op: i64, a: TReg, b: TReg) -> TReg {
     let d = ctx.fresh(ValType::Int);
     ctx.body
         .extend_from_slice(&[op, a.idx as i64, b.idx as i64, d.idx as i64]);
+    ctx.note_fresh_write();
     d
 }
 
@@ -2073,6 +2115,7 @@ fn emit_complement(ctx: &mut LowerCtxF, c: TReg) -> TReg {
     let d = ctx.fresh(ValType::Int);
     ctx.body
         .extend_from_slice(&[OP_NOT, c.idx as i64, d.idx as i64]);
+    ctx.note_fresh_write();
     d
 }
 
@@ -2100,6 +2143,7 @@ fn emit_int_bin_k(ctx: &mut LowerCtxF, op: i64, a: TReg, k: i64) -> TReg {
             let d = ctx.fresh(ValType::Int);
             ctx.body
                 .extend_from_slice(&[imm_op, a.idx as i64, k, d.idx as i64]);
+            ctx.note_fresh_write();
             d
         }
         None => {
@@ -3164,6 +3208,7 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
             let d = ctx.fresh(ValType::Bool);
             ctx.body
                 .extend_from_slice(&[op, acc.idx as i64, b.idx as i64, d.idx as i64]);
+            ctx.note_fresh_write();
             acc = d;
         }
         return Ok(acc);
@@ -4363,6 +4408,7 @@ fn probe_ctx<'a>(ctx: &LowerCtxF<'a>) -> LowerCtxF<'a> {
         elem_map: HashMap::new(),
         list_loop: Vec::new(),
         elem_idx_addressed: BTreeSet::new(),
+        last_fresh_write: None,
         const_pool: HashMap::new(),
         jump_fixups: Vec::new(),
         elem_words: 0,
@@ -5094,7 +5140,12 @@ fn compile_list_comprehension_mode(
             "comprehension accumulator changes bank",
         ));
     }
-    emit_mov(ctx, step, accu);
+    // The accumulator is where the step's value has to land, and the op that
+    // produced it can write there itself. A move an element buys nothing that
+    // naming the destination once does not.
+    if !ctx.retarget_last_write(step, accu) {
+        emit_mov(ctx, step, accu);
+    }
     // The index is carried only for a byte column, which reads at the element
     // index rather than at its word address. Where the body read none, the byte
     // offset is the whole induction variable and the index does not advance.
