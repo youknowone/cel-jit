@@ -1520,11 +1520,13 @@ struct ListLoop {
     iter_var: String,
     /// Schema path of the list, e.g. `items`.
     list: String,
-    /// Int register holding the inner loop's byte offset `(offset + j) * 8`.
+    /// Int register holding the inner loop's byte offset — the element index
+    /// scaled by the word stride.
     ea_reg: usize,
-    /// Int register holding the element INDEX `offset + j` — the same address
-    /// for a column whose stride is one byte. The `* 8` above is computed from
-    /// this one, so a byte-column read costs no scaling op of its own.
+    /// Int register holding the element INDEX — the same address for a column
+    /// whose stride is one byte. It advances alongside `ea_reg` rather than
+    /// being derived from it, so a byte-column read costs no scaling op of its
+    /// own.
     idx_reg: usize,
 }
 
@@ -3845,18 +3847,20 @@ fn lower_list_equality(ctx: &mut LowerCtxF, a: &str, b: &str) -> Result<TReg, Lo
     // The accumulator is loop-carried, so it lives in a fixed register.
     let eq = ctx.fresh(ValType::Bool);
     emit_mov(ctx, same_len, eq);
-    let j = ctx.fresh(ValType::Int);
-    ctx.body
-        .extend_from_slice(&[OP_LOAD_CONST, 0, j.idx as i64]);
     // Zero-trip guard: two empty lists are equal, and the back-edge is a
     // do-while.
     let zero_trip = ctx.emit_jump_if_above(one, n);
 
+    // Nothing here reads an element index, only the two byte offsets, so each
+    // list carries its own offset across the back edge and the first one is
+    // also the counter. Deriving them instead costs two adds and two multiplies
+    // an element, against the one add the counter would have cost anyway.
+    let ea_a = emit_int_bin_k(ctx, OP_MUL, off_a, 8);
+    let ea_b = emit_int_bin_k(ctx, OP_MUL, off_b, 8);
+    let last_a = emit_int_bin(ctx, OP_ADD, off_a, n);
+    let limit = emit_int_bin_k(ctx, OP_MUL, last_a, 8);
+
     let inner = ctx.body.len();
-    let ia = emit_int_bin(ctx, OP_ADD, off_a, j);
-    let ea_a = emit_int_bin_k(ctx, OP_MUL, ia, 8);
-    let ib = emit_int_bin(ctx, OP_ADD, off_b, j);
-    let ea_b = emit_int_bin_k(ctx, OP_MUL, ib, 8);
     for (field, ty) in &fa {
         let f = field.as_deref();
         let va = ctx.elem_slot(elem_slot_path(a, f), ea_a.idx)?;
@@ -3868,9 +3872,17 @@ fn lower_list_equality(ctx: &mut LowerCtxF, a: &str, b: &str) -> Result<TReg, Lo
     }
     ctx.elem_map
         .retain(|(_, reg), _| *reg != ea_a.idx && *reg != ea_b.idx);
-    ctx.body
-        .extend_from_slice(&[OP_ADD_IMM, j.idx as i64, 1, j.idx as i64]);
-    ctx.emit_back_edge(n, j, inner);
+    ctx.body.extend_from_slice(&[
+        OP_ADD_IMM,
+        ea_a.idx as i64,
+        8,
+        ea_a.idx as i64,
+        OP_ADD_IMM,
+        ea_b.idx as i64,
+        8,
+        ea_b.idx as i64,
+    ]);
+    ctx.emit_back_edge(limit, ea_a, inner);
     ctx.patch_jump(zero_trip);
     Ok(eq)
 }
@@ -4615,15 +4627,17 @@ fn lower_runtime_in(
     let found = ctx.fresh(ValType::Bool);
     ctx.body
         .extend_from_slice(&[OP_LOAD_CONST, 0, found.idx as i64]);
-    let j = ctx.fresh(ValType::Int);
-    ctx.body
-        .extend_from_slice(&[OP_LOAD_CONST, 0, j.idx as i64]);
     // Zero-trip guard: `x in []` is false, and the back-edge is a do-while.
     let zero_trip = ctx.emit_jump_if_above(one, len);
 
+    // Only the byte offset is read here, so the loop carries it across the back
+    // edge and counts with it. Deriving it instead costs an add and a multiply
+    // an element, against the one add the counter would have cost anyway.
+    let ea = emit_int_bin_k(ctx, OP_MUL, off, 8);
+    let last = emit_int_bin(ctx, OP_ADD, off, len);
+    let limit = emit_int_bin_k(ctx, OP_MUL, last, 8);
+
     let inner = ctx.body.len();
-    let idx = emit_int_bin(ctx, OP_ADD, off, j);
-    let ea = emit_int_bin_k(ctx, OP_MUL, idx, 8);
     let v = ctx.elem_slot(elem_path, ea.idx)?;
     ctx.elem_map.clear();
     let eq_op = if ty == ValType::Float { OP_FEQ } else { OP_EQ };
@@ -4633,8 +4647,8 @@ fn lower_runtime_in(
     ctx.body
         .extend_from_slice(&[OP_OR, found.idx as i64, hit.idx as i64, found.idx as i64]);
     ctx.body
-        .extend_from_slice(&[OP_ADD_IMM, j.idx as i64, 1, j.idx as i64]);
-    ctx.emit_back_edge(len, j, inner);
+        .extend_from_slice(&[OP_ADD_IMM, ea.idx as i64, 8, ea.idx as i64]);
+    ctx.emit_back_edge(limit, ea, inner);
     ctx.patch_jump(zero_trip);
     Ok(found)
 }
@@ -4915,16 +4929,16 @@ fn emit_mov(ctx: &mut LowerCtxF, src: TReg, dst: TReg) {
 /// columns — `size(list)` (element count) and `offset(list)` (start index).
 /// Locating a row's elements is then arithmetic, not a pointer chase.
 ///
-/// Emitted shape, with `L` the list and `j` the element index:
+/// Emitted shape, with `L` the list and `i` the element index:
 ///
 /// ```text
-///     accu = <accu_init>; j = 0
+///     accu = <accu_init>
 ///     if 1 > size(L) goto after          ; zero-trip guard ([].all(..) is true)
+///     i = offset(L); ea = i * 8; limit = offset(L) + size(L)
 ///   inner:
-///     ea = (offset(L) + j) * 8
 ///     <element loads at ea, on first reference>
-///     accu = <loop_step>; j = j + 1
-///     if size(L) > j goto inner          ; back-edge -> can_enter_jit
+///     accu = <loop_step>; i = i + 1; ea = ea + 8
+///     if limit > i goto inner            ; back-edge -> can_enter_jit
 ///   after:
 ///     <result>
 /// ```
@@ -4969,16 +4983,21 @@ fn compile_list_comprehension_mode(
     };
     let accu = ctx.fresh(init.bank);
     emit_mov(ctx, init, accu);
-    let j = ctx.fresh(ValType::Int);
-    ctx.body
-        .extend_from_slice(&[OP_LOAD_CONST, 0, j.idx as i64]);
     // Zero-trip guard: an empty list must yield `accu_init`, and the back-edge
     // below is a do-while.
     let zero_trip = ctx.emit_jump_if_above(one, len);
 
+    // The element index and its byte offset both advance by a constant, so both
+    // are carried across the back edge rather than derived inside the loop from
+    // a counter. The index is then the counter as well, which is what pays for
+    // the second one: deriving the pair costs an add and a multiply an element
+    // on top of the counter's own add, and advancing it costs two adds.
+    let idx = ctx.fresh(ValType::Int);
+    emit_mov(ctx, off, idx);
+    let ea = emit_int_bin_k(ctx, OP_MUL, off, 8);
+    let limit = emit_int_bin(ctx, OP_ADD, off, len);
+
     let inner = ctx.body.len();
-    let idx = emit_int_bin(ctx, OP_ADD, off, j);
-    let ea = emit_int_bin_k(ctx, OP_MUL, idx, 8);
     // The loop's element is bound to the FIRST link's variable: the chain runs
     // innermost-first, and the outer comprehension's own variable belongs to
     // its last link.
@@ -5009,9 +5028,17 @@ fn compile_list_comprehension_mode(
         ));
     }
     emit_mov(ctx, step, accu);
-    ctx.body
-        .extend_from_slice(&[OP_ADD_IMM, j.idx as i64, 1, j.idx as i64]);
-    ctx.emit_back_edge(len, j, inner);
+    ctx.body.extend_from_slice(&[
+        OP_ADD_IMM,
+        idx.idx as i64,
+        1,
+        idx.idx as i64,
+        OP_ADD_IMM,
+        ea.idx as i64,
+        8,
+        ea.idx as i64,
+    ]);
+    ctx.emit_back_edge(limit, idx, inner);
     ctx.patch_jump(zero_trip);
 
     ctx.locals.insert(comp.accu_var.clone(), accu);
