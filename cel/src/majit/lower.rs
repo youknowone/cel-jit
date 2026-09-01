@@ -96,6 +96,16 @@ fn as_string_literal(e: &IdedExpr) -> Option<&str> {
     }
 }
 
+/// Whether `name` is spellable as a CEL identifier, so that `base[name]` and
+/// `base.name` denote the same thing. A key that is not — `"a.b"`, `"1"`,
+/// `""` — would build a path some other expression could also spell, and the
+/// schema would answer for that other one.
+fn is_cel_ident(name: &str) -> bool {
+    let mut cs = name.chars();
+    cs.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && cs.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
 /// Resolve an `Ident` or a constant `Select` chain to a dotted variable path.
 fn resolve_path(e: &IdedExpr) -> Result<String, LowerError> {
     match &e.expr {
@@ -2755,12 +2765,28 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
     // ops are the only thing left of it.
     //
     // Reading the bank is sound because a bank is only assigned to a value the
-    // machine actually carries: a list-valued expression has no scalar
-    // register and declines before this point, so no `type(xs)` can arrive here
-    // and be answered `int` from its element bank. `timestamp` and `duration`
-    // decline because their type names -- `google.protobuf.Timestamp` and
-    // `.Duration` -- are message types, which the index table does not carry.
+    // machine actually carries: a list-valued expression has no scalar register
+    // and never reaches the bank read -- the arm just below answers the one
+    // shape that names a list, and any other list-valued argument declines in
+    // `compile_t` -- so no `type(xs)` can be answered `int` from its element
+    // bank. `timestamp` and `duration` decline because their type names --
+    // `google.protobuf.Timestamp` and `.Duration` -- are message types, which
+    // the index table does not carry.
     if name == "type" && call.args.len() == 1 {
+        // A declared list's type is `list` whatever it holds, so this one needs
+        // no register and does not have to be a value the machine carries. The
+        // name is resolved the way `compile_t` resolves it, because a local and
+        // an iteration variable both shadow the schema: in
+        // `xs.map(xs, type(xs))` the inner `xs` is an element, not the list.
+        if let Expr::Ident(v) = &call.args[0].expr {
+            if !ctx.locals.contains_key(v)
+                && !ctx.list_loop.iter().any(|l| l.iter_var == *v)
+                && declares_list(ctx.schema, v)
+            {
+                let id = type_const_id("list").expect("a bank name the index table carries");
+                return Ok(ctx.const_reg(ValType::Type, id));
+            }
+        }
         let a = compile_t(ctx, &call.args[0])?;
         let denoted = match a.bank {
             ValType::Int => "int",
@@ -3059,6 +3085,13 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
             // answer a varying one.
             if declares_list(ctx.schema, &base) {
                 return lower_var_index(ctx, &base, None, &call.args[1]);
+            }
+            // A literal string key is map lookup, which `base.key` spells the
+            // same way and the schema declares under that name. An undeclared
+            // key is not a hole here: the walker raises NoSuchKey for it, and
+            // declining is what lets it.
+            if let Some(key) = as_string_literal(&call.args[1]).filter(|k| is_cel_ident(k)) {
+                return ctx.slot(format!("{base}.{key}"));
             }
             return Err(LowerError::unsupported("non-constant index"));
         };

@@ -3653,6 +3653,78 @@ mod tests {
         }
     }
 
+    /// `m["a"]` is map lookup, and `m.a` spells the same lookup, so the two
+    /// lower to the same program.
+    ///
+    /// The schema decides, which is the tree-walker's own discriminator: a key
+    /// it declares resolves, and one it does not is `NoSuchKey`, which the
+    /// walker raises and this declines so it can. The key has to be spellable
+    /// as an identifier — `n["x.y"]` would otherwise build the path a nested
+    /// field already spells, and answer with that field.
+    #[test]
+    fn a_literal_map_key_lowers_to_what_its_dotted_spelling_lowers_to() {
+        let s = schema(&[("m.a", ValType::Int), ("n.x.y", ValType::Int)]);
+        let slots = |src: &str| {
+            BatchProgram::compile(src, &s)
+                .unwrap_or_else(|e| panic!("`{src}`: {e:?}"))
+                .lowered()
+                .slots
+                .iter()
+                .map(|slot| (slot.path.clone(), slot.ty))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(slots("m[\"a\"]"), slots("m.a"));
+        // Not declared, so the walker keeps it and raises NoSuchKey.
+        assert!(BatchProgram::compile("m[\"z\"]", &s).is_err());
+        // Declared, but under the nested spelling: a key literally named `x.y`
+        // is not that field, so the dotted key must not reach it.
+        assert_eq!(slots("n.x.y"), vec![("n.x.y".to_string(), ValType::Int)]);
+        assert!(BatchProgram::compile("n[\"x.y\"]", &s).is_err());
+    }
+
+    /// `type(xs)` on a declared list is the constant `list`. The answer does not
+    /// depend on what the list holds, which is what lets it lower at all — a
+    /// list-valued expression has no register for the bank read to consult.
+    ///
+    /// An iteration variable shadows the schema, so the inner `xs` of
+    /// `xs.all(xs, ...)` is an ELEMENT and its type is the element's. That case
+    /// ANSWERS rather than declining, so it is graded against the walker and not
+    /// merely checked for a refusal.
+    #[test]
+    fn the_type_of_a_declared_list_is_a_constant_its_iteration_variable_shadows() {
+        let s = schema(&[("xs", ValType::Int), ("xs[]", ValType::Int)]);
+        let lens = vec![3i64];
+        let flat = vec![10i64, 20, 30];
+        let batch = Batch::new(1).column(
+            "xs",
+            ColumnRef::List {
+                lens: &lens,
+                fields: vec![(None, ColumnRef::Int(&flat))],
+            },
+        );
+        for src in [
+            "type(xs) == list",
+            "type(xs) == int",
+            "xs.all(xs, type(xs) == int)",
+            "xs.all(xs, type(xs) == list)",
+        ] {
+            let program = Program::compile(src).unwrap();
+            let batched = BatchProgram::from_program(&program, &s)
+                .unwrap_or_else(|e| panic!("`{src}`: {e:?}"));
+            let bound = batched.bind_per_row(&batch).unwrap();
+            let mut row = Context::default();
+            row.add_variable_from_value("xs", vec![10i64, 20, 30]);
+            let walker = vec![program.execute(&row).unwrap()];
+            for tier in [Tier::Clean, Tier::Interpreter, Tier::Jit] {
+                assert_eq!(
+                    bound.collect_on(tier).unwrap(),
+                    walker,
+                    "`{src}` on {tier:?}"
+                );
+            }
+        }
+    }
+
     /// The same one-byte read reached from OUTSIDE a list loop, which has no
     /// element index to read it at.
     ///
