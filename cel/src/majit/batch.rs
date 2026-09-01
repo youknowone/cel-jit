@@ -3750,6 +3750,43 @@ mod tests {
         }
     }
 
+    /// A collected comprehension counts what it stored with its CURSOR, not
+    /// with a second running total an element.
+    ///
+    /// The totals are decompositions, and each op below is one the disassembly
+    /// names: `map` is a column load (4), the store (5), the byte-offset step
+    /// (4) and the back edge (4); `filter` adds the predicate (4), its
+    /// complement (3) and the cursor rewind (4) that makes the store
+    /// unconditional. A count update would be a fifth resp. eighth op.
+    ///
+    /// `size(list.filter(..))` is the gate: it keeps a REAL running total,
+    /// because it has no cursor to read one off, and must not lose it.
+    #[test]
+    fn a_collected_comprehension_keeps_no_count_an_element() {
+        let s = schema(&[("items[].price", ValType::Int)]);
+        let elem_words = |src: &str| {
+            BatchProgram::compile(src, &s)
+                .unwrap_or_else(|e| panic!("`{src}`: {e:?}"))
+                .lowered
+                .elem_words
+        };
+        assert_eq!(
+            elem_words("items.map(i, i.price)"),
+            4 + 5 + 4 + 4,
+            "a 21 is the count update back an element"
+        );
+        assert_eq!(
+            elem_words("items.filter(i, i.price > 10)"),
+            4 + 4 + 5 + 3 + 4 + 4 + 4,
+            "a 32 is the count update back an element"
+        );
+        assert_eq!(
+            elem_words("size(items.filter(i, i.price > 10))"),
+            20,
+            "the length mode has no cursor and must still count for itself"
+        );
+    }
+
     /// An element loop's preamble carries no op its own close does not read.
     ///
     /// The equality is the durable half: the byte close needs the element

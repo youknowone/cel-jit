@@ -4208,9 +4208,8 @@ fn emit_chain_collect(
     links: &[Link],
     list: &str,
     ea_reg: usize,
-    accu: TReg,
     cursor: usize,
-) -> Result<TReg, LowerError> {
+) -> Result<(), LowerError> {
     let (cond, value) = compile_chain(ctx, links, list, ea_reg)?;
     let appended = match value {
         Some(v) => Appended::Value(v),
@@ -4220,7 +4219,7 @@ fn emit_chain_collect(
     };
     emit_element_store(ctx, appended, cursor)?;
     let Some(c) = cond else {
-        return Ok(emit_int_bin_k(ctx, OP_ADD, accu, 1));
+        return Ok(());
     };
     // Collecting under a predicate: the store runs for every element, and the
     // cursor advances only where the predicate holds — so a rejected element
@@ -4236,7 +4235,7 @@ fn emit_chain_collect(
     let back = emit_complement(ctx, delta);
     ctx.body
         .extend_from_slice(&[OP_SUB, cursor as i64, back.idx as i64, cursor as i64]);
-    Ok(emit_int_bin(ctx, OP_ADD, accu, delta))
+    Ok(())
 }
 
 /// Lower a top-level `list.map(..)` / `list.filter(..)` by COLLECTING it: the
@@ -5100,7 +5099,27 @@ fn compile_list_comprehension_mode(
         AccuMode::Length | AccuMode::Collect { .. } => emit_int_const(ctx, 0),
     };
     let accu = ctx.fresh(init.bank);
-    emit_mov(ctx, init, accu);
+    // A collected comprehension's accumulator is written ONCE, after the loop,
+    // as the distance its cursor travelled -- so it takes no starting value
+    // here. The other modes carry theirs across the back edge and do.
+    let cursor_start = match mode {
+        AccuMode::Collect { cursor } => {
+            let start = ctx.fresh(ValType::Int);
+            emit_mov(
+                ctx,
+                TReg {
+                    bank: ValType::Int,
+                    idx: cursor,
+                },
+                start,
+            );
+            Some(start)
+        }
+        _ => {
+            emit_mov(ctx, init, accu);
+            None
+        }
+    };
     // Zero-trip guard: an empty list must yield `accu_init`, and the back-edge
     // below is a do-while.
     let zero_trip = ctx.emit_jump_if_above(one, len);
@@ -5138,26 +5157,32 @@ fn compile_list_comprehension_mode(
     });
     ctx.locals.insert(comp.accu_var.clone(), accu);
     let step = match mode {
-        AccuMode::Value => compile_t(ctx, &comp.loop_step),
-        AccuMode::Length => compile_len_step(ctx, &comp.loop_step, comp, accu, mode),
-        AccuMode::Collect { cursor } => emit_chain_collect(ctx, chain, list, ea.idx, accu, cursor),
+        AccuMode::Value => compile_t(ctx, &comp.loop_step).map(Some),
+        AccuMode::Length => compile_len_step(ctx, &comp.loop_step, comp, accu, mode).map(Some),
+        // Collecting keeps no running total: the cursor already counts what the
+        // store put in the buffer, so the accumulator is read off it once the
+        // loop is over rather than carried an element at a time.
+        AccuMode::Collect { cursor } => {
+            emit_chain_collect(ctx, chain, list, ea.idx, cursor).map(|()| None)
+        }
     };
     ctx.list_loop.pop();
     // Drop only THIS loop's element registers. Each comprehension gets its own
     // `ea` register, so keying the retirement on it leaves an enclosing loop's
     // elements — still live below — exactly where they were.
     ctx.elem_map.retain(|(_, reg), _| *reg != ea.idx);
-    let step = step?;
-    if step.bank != accu.bank {
-        return Err(LowerError::unsupported(
-            "comprehension accumulator changes bank",
-        ));
-    }
-    // The accumulator is where the step's value has to land, and the op that
-    // produced it can write there itself. A move an element buys nothing that
-    // naming the destination once does not.
-    if !ctx.retarget_last_write(step, accu) {
-        emit_mov(ctx, step, accu);
+    if let Some(step) = step? {
+        if step.bank != accu.bank {
+            return Err(LowerError::unsupported(
+                "comprehension accumulator changes bank",
+            ));
+        }
+        // The accumulator is where the step's value has to land, and the op that
+        // produced it can write there itself. A move an element buys nothing
+        // that naming the destination once does not.
+        if !ctx.retarget_last_write(step, accu) {
+            emit_mov(ctx, step, accu);
+        }
     }
     // The index is carried only for a byte column, which reads at the element
     // index rather than at its word address. Where the body read none, the byte
@@ -5187,6 +5212,16 @@ fn compile_list_comprehension_mode(
     };
     ctx.body[preamble_slot..preamble_slot + PREAMBLE_SLOT_WORDS].copy_from_slice(&preamble_op);
     ctx.patch_jump(zero_trip);
+    // Both paths reach here, so the empty list answers zero without the guard
+    // having had to seed anything: the cursor did not move.
+    if let (AccuMode::Collect { cursor }, Some(start)) = (mode, cursor_start) {
+        ctx.body.extend_from_slice(&[
+            OP_SUB,
+            cursor as i64,
+            start.idx as i64,
+            accu.idx as i64,
+        ]);
+    }
 
     ctx.locals.insert(comp.accu_var.clone(), accu);
     let result = compile_t(ctx, &comp.result)?;
