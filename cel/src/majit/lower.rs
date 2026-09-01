@@ -2205,7 +2205,16 @@ fn emit_nonneg_mod_k(ctx: &mut LowerCtxF, a: TReg, k: i64) -> TReg {
 }
 
 /// Howard Hinnant's `civil_from_days`: days since 1970-01-01 to
-/// `(year, month 1-12, day 1-31)`.
+/// `(year, month 0-11, day 0-30)`.
+///
+/// The month and day come back 0-BASED because that is the base most of the
+/// readers want: `getMonth` and `getDayOfMonth` are 0-based and would each
+/// subtract back the one this had just added, while `getDate` is the single
+/// 1-based reader and adds it itself. The pair does not cancel on its own —
+/// `OP_SUB` has no immediate form, so the constant it subtracts is hoisted into
+/// a prelude register and `int_sub(int_add(x, C), C)` never presents the
+/// optimizer with two constants to fold. It survives into the compiled trace,
+/// which is why the base is chosen here rather than left to a rewrite rule.
 ///
 /// Every division below has a non-negative dividend, so truncation is the floor
 /// the algorithm calls for and [`OP_DIVN_K`] is the instruction that carries
@@ -2238,28 +2247,27 @@ fn emit_civil_from_days(ctx: &mut LowerCtxF, days: TReg) -> (TReg, TReg, TReg) {
     let s2 = emit_int_bin(ctx, OP_SUB, s1, y100);
     let doy = emit_int_bin(ctx, OP_SUB, doe, s2);
 
-    // mp = (5*doy + 2)/153 ; day = doy - (153*mp + 2)/5 + 1
+    // mp = (5*doy + 2)/153 ; day0 = doy - (153*mp + 2)/5
     let d5 = emit_int_bin_k(ctx, OP_MUL, doy, 5);
     let d5p2 = emit_int_bin_k(ctx, OP_ADD, d5, 2);
     let mp = emit_nonneg_div_k(ctx, d5p2, 153);
     let m153 = emit_int_bin_k(ctx, OP_MUL, mp, 153);
     let m153p2 = emit_int_bin_k(ctx, OP_ADD, m153, 2);
     let month_start = emit_nonneg_div_k(ctx, m153p2, 5);
-    let dm = emit_int_bin(ctx, OP_SUB, doy, month_start);
-    let day = emit_int_bin_k(ctx, OP_ADD, dm, 1);
+    let day0 = emit_int_bin(ctx, OP_SUB, doy, month_start);
 
-    // month = mp + (mp < 10 ? 3 : -9), written as mp + 3 - 12*(mp >= 10) so the
-    // select is arithmetic on a 0/1 comparison rather than a branch.
+    // month0 = mp + (mp < 10 ? 2 : -10), written as mp + 2 - 12*(mp >= 10) so
+    // the select is arithmetic on a 0/1 comparison rather than a branch.
     let ge10 = emit_int_bin_k(ctx, OP_GE, mp, 10);
-    let mp3 = emit_int_bin_k(ctx, OP_ADD, mp, 3);
+    let mp2 = emit_int_bin_k(ctx, OP_ADD, mp, 2);
     let wrap = emit_int_bin_k(ctx, OP_MUL, ge10, 12);
-    let month = emit_int_bin(ctx, OP_SUB, mp3, wrap);
+    let month0 = emit_int_bin(ctx, OP_SUB, mp2, wrap);
 
     // The era year starts in March, so January and February belong to the next
-    // calendar year: year = year_of_era + (month <= 2).
-    let le2 = emit_int_bin_k(ctx, OP_LE, month, 2);
-    let year = emit_int_bin(ctx, OP_ADD, year_of_era, le2);
-    (year, month, day)
+    // calendar year: year = year_of_era + (month0 <= 1).
+    let le1 = emit_int_bin_k(ctx, OP_LE, month0, 1);
+    let year = emit_int_bin(ctx, OP_ADD, year_of_era, le1);
+    (year, month0, day0)
 }
 
 /// Days since the Unix epoch of 1 January of `year` — Hinnant's
@@ -2766,16 +2774,14 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
                             emit_nonneg_mod_k(ctx, shifted, 7)
                         }
                         "getFullYear" => emit_civil_from_days(ctx, days).0,
-                        // `month0()` / `day0()` are 0-based; `day()` is 1-based.
-                        "getMonth" => {
-                            let (_, month, _) = emit_civil_from_days(ctx, days);
-                            emit_int_bin_k(ctx, OP_SUB, month, 1)
+                        // `month0()` / `day0()` are 0-based, which is the base
+                        // the helper answers in; `day()` is the one that adds.
+                        "getMonth" => emit_civil_from_days(ctx, days).1,
+                        "getDate" => {
+                            let (_, _, day0) = emit_civil_from_days(ctx, days);
+                            emit_int_bin_k(ctx, OP_ADD, day0, 1)
                         }
-                        "getDate" => emit_civil_from_days(ctx, days).2,
-                        "getDayOfMonth" => {
-                            let (_, _, day) = emit_civil_from_days(ctx, days);
-                            emit_int_bin_k(ctx, OP_SUB, day, 1)
-                        }
+                        "getDayOfMonth" => emit_civil_from_days(ctx, days).2,
                         // 0-based: the walker subtracts month0 and day0 to reach
                         // 1 January of the same year and takes the day span.
                         "getDayOfYear" => {

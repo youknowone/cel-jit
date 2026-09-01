@@ -3762,6 +3762,35 @@ mod tests {
         }
     }
 
+    /// The civil accessors answer in the base the helper computes, so the four
+    /// that read ONE component out of `civil_from_days` cost the same program.
+    ///
+    /// `getFullYear`, `getMonth` and `getDayOfMonth` are equal because each is
+    /// one field of the same shared computation; `getDate` is the only 1-based
+    /// reader and is the only one that pays an instruction to shift the base.
+    /// Reverse the helper to 1-based and the equality breaks in both
+    /// directions at once -- `getMonth` and `getDayOfMonth` each grow the
+    /// instruction back and `getDate` loses it -- which is what makes this a
+    /// test of the BASE rather than of any one accessor.
+    #[test]
+    fn the_civil_accessors_pay_for_the_base_they_answer_in() {
+        let s = schema(&[("at", ValType::Timestamp)]);
+        let words = |src: &str| {
+            BatchProgram::compile(src, &s)
+                .unwrap_or_else(|e| panic!("`{src}`: {e:?}"))
+                .lowered
+                .row_words
+        };
+        let zero_based = words("at.getDayOfMonth()");
+        assert_eq!(words("at.getMonth()"), zero_based, "both 0-based readers");
+        assert_eq!(words("at.getFullYear()"), zero_based, "the same helper");
+        assert_eq!(
+            words("at.getDate()") - zero_based,
+            4,
+            "one OP_ADD_IMM, and only for the 1-based reader"
+        );
+    }
+
     /// A collected comprehension counts what it stored with its CURSOR, not
     /// with a second running total an element.
     ///
