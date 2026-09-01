@@ -542,6 +542,14 @@ pub struct LoweredF {
     /// nothing per row however tall the batch, which is exactly the case where
     /// the per-row cost is all there is.
     pub row_words: usize,
+    /// Set when the body emits a TRAPPING op at a position some condition
+    /// decides — a ternary arm, or a chain link past a `filter`. Such an op
+    /// runs for every row and every element regardless, because the row body is
+    /// straight-line, so a value the expression never selects can still write
+    /// the row's trap flag and cost the whole batch its answer. False for every
+    /// other program, and then this lowering and
+    /// [`lower_typed_safe_in`]'s are the same words.
+    pub has_guarded_trap: bool,
     /// The batch shapes this program can build, built at most once each and
     /// owned here, indexed by [`shape_slot`].
     ///
@@ -1589,7 +1597,25 @@ struct LowerCtxF<'s> {
     functions: Option<&'s Context<'s>>,
     /// See [`LoweredF::host_fns`].
     host_fns: Vec<std::sync::Arc<crate::magic::ScalarFn>>,
+    /// Emit the operand neutralization a guarded trapping op needs. Off for the
+    /// lowering a batch runs first, whose whole point is that it costs nothing;
+    /// on for the one it retries with. See [`lower_typed_safe_in`].
+    safe_speculation: bool,
+    /// How many conditions decide whether the position being lowered is read.
+    /// Maintained in BOTH lowerings, because it emits nothing: it is what tells
+    /// the fast one whether a safe peer would differ from it.
+    guard_depth: usize,
+    /// The conjunction of those conditions, as a bool register. `None` outside
+    /// [`LowerCtxF::safe_speculation`], where no such register is built.
+    guard: Option<TReg>,
+    /// See [`LoweredF::has_guarded_trap`].
+    has_guarded_trap: bool,
 }
+
+/// What [`LowerCtxF::push_guard`] displaced, so [`LowerCtxF::pop_guard`] can put
+/// it back. Carried by value rather than re-derived, because the conjunction is
+/// built by emitting ops and cannot be undone by recomputing it.
+struct GuardSave(Option<TReg>);
 
 /// The runtime-list comprehension being lowered — what an iteration variable
 /// resolves against.
@@ -1659,6 +1685,76 @@ impl LowerCtxF<'_> {
     /// machine word and not the same operand. A register the lowering will
     /// WRITE — a cursor, a loop counter, an accumulator seeded with 0 — is not
     /// a constant and must keep taking a private register from [`Self::fresh`].
+    /// Enter a position that is read only when `cond` holds (`when == true`) or
+    /// only when it does not (`when == false`) — a ternary arm, or a chain link
+    /// past a `filter`.
+    ///
+    /// Emits nothing in the lowering that speculates; there, this only records
+    /// that such a position exists, which is what
+    /// [`LoweredF::has_guarded_trap`] reports. In the safe lowering it builds
+    /// the conjunction with whatever guard already stood, so a trapping op
+    /// nested two conditions deep is neutralized by both.
+    fn push_guard(&mut self, cond: TReg, when: bool) -> GuardSave {
+        let saved = self.guard;
+        self.guard_depth += 1;
+        if self.safe_speculation {
+            let c = if when {
+                cond
+            } else {
+                let n = self.fresh(ValType::Bool);
+                self.body
+                    .extend_from_slice(&[OP_NOT, cond.idx as i64, n.idx as i64]);
+                n
+            };
+            self.guard = Some(match saved {
+                None => c,
+                Some(prev) => {
+                    let r = self.fresh(ValType::Bool);
+                    self.body.extend_from_slice(&[
+                        OP_AND,
+                        prev.idx as i64,
+                        c.idx as i64,
+                        r.idx as i64,
+                    ]);
+                    r
+                }
+            });
+        }
+        GuardSave(saved)
+    }
+
+    /// Leave the position [`LowerCtxF::push_guard`] entered.
+    fn pop_guard(&mut self, save: GuardSave) {
+        self.guard_depth -= 1;
+        self.guard = save.0;
+    }
+
+    /// The operand a trapping op should take instead of `operand`, so that the
+    /// op is TOTAL wherever the guard says nothing reads its result.
+    ///
+    /// `safe` is the word that makes this operator total: `0` for the
+    /// overflow-checked `+ - *`, since `x + 0`, `x - 0` and `x * 0` are all in
+    /// range for every `x`; `1` for `/` and `%`, since one divides everything
+    /// and is neither of the two divisors that trap. The guard selects, so the
+    /// answer where the position IS read is the operand unchanged.
+    ///
+    /// The identity outside the safe lowering, where `guard` is never set.
+    fn neutralize(&mut self, operand: TReg, safe: i64) -> TReg {
+        let Some(live) = self.guard else {
+            return operand;
+        };
+        let k = self.const_reg(operand.bank, safe);
+        let d = self.fresh(operand.bank);
+        self.body.extend_from_slice(&[
+            OP_SELECT,
+            live.idx as i64,
+            operand.idx as i64,
+            k.idx as i64,
+            d.idx as i64,
+        ]);
+        d
+    }
+
     fn const_reg(&mut self, bank: ValType, word: i64) -> TReg {
         if let Some(&r) = self.const_pool.get(&(bank, word)) {
             return r;
@@ -1909,6 +2005,34 @@ pub fn lower_typed_in(
     schema: &Schema,
     functions: Option<&Context<'_>>,
 ) -> Result<LoweredF, LowerError> {
+    lower_typed_with(expr, schema, functions, false)
+}
+
+/// [`lower_typed_in`], with each trapping op at a position some condition
+/// decides given an operand that makes it TOTAL wherever that condition does
+/// not hold — see [`LowerCtxF::neutralize`].
+///
+/// The same expression, the same answer, and more words: one select per such
+/// op, plus the conjunction the nesting needs. A batch runs
+/// [`lower_typed_in`]'s program first and retries with this one when that
+/// program traps, which is what keeps the cost on the rows that need it rather
+/// than on every row. Building it is worth nothing for a program whose
+/// [`LoweredF::has_guarded_trap`] is false, where the two lowerings agree word
+/// for word.
+pub fn lower_typed_safe_in(
+    expr: &IdedExpr,
+    schema: &Schema,
+    functions: Option<&Context<'_>>,
+) -> Result<LoweredF, LowerError> {
+    lower_typed_with(expr, schema, functions, true)
+}
+
+fn lower_typed_with(
+    expr: &IdedExpr,
+    schema: &Schema,
+    functions: Option<&Context<'_>>,
+    safe_speculation: bool,
+) -> Result<LoweredF, LowerError> {
     let mut ctx = LowerCtxF {
         prelude: Vec::new(),
         body: Vec::new(),
@@ -1936,6 +2060,10 @@ pub fn lower_typed_in(
         schema,
         functions,
         host_fns: Vec::new(),
+        safe_speculation,
+        guard_depth: 0,
+        guard: None,
+        has_guarded_trap: false,
     };
     // A list-valued TOP-LEVEL result is collected rather than declined: the
     // elements stream to their own buffers and the row's value becomes the
@@ -1982,6 +2110,7 @@ pub fn lower_typed_in(
         concats: ctx.concats,
         list_output: ctx.list_output,
         host_fns: ctx.host_fns,
+        has_guarded_trap: ctx.has_guarded_trap,
         temporal_bound,
         orders_strings: ctx.orders_strings,
         str_dict_required: ctx.str_dict_required,
@@ -3171,8 +3300,17 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
         if c.bank != ValType::Bool {
             return Err(LowerError::unsupported("ternary condition must be bool"));
         }
-        let t = compile_t(ctx, &call.args[1])?;
-        let f = compile_t(ctx, &call.args[2])?;
+        // Both arms are evaluated: the blend is branchless. So each arm is
+        // lowered under the condition that DECIDES it, which is what keeps an
+        // arm the row does not select from writing the row's trap flag.
+        let save = ctx.push_guard(c, true);
+        let t = compile_t(ctx, &call.args[1]);
+        ctx.pop_guard(save);
+        let t = t?;
+        let save = ctx.push_guard(c, false);
+        let f = compile_t(ctx, &call.args[2]);
+        ctx.pop_guard(save);
+        let f = f?;
         let (op, bank) = match (t.bank, f.bank) {
             (ValType::Float, ValType::Float) => (OP_FSELECT, ValType::Float),
             // Every other bank rides the int file, so the arithmetic select
@@ -3474,7 +3612,19 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
         // JIT either answers what the walker answers or records that it cannot
         // answer at all. The signed and unsigned peers differ only in which
         // bound they check — the values are bit-identical two's complement.
+        // The word that makes THIS operator total, for
+        // [`LowerCtxF::neutralize`]. The divisor is the right operand for both
+        // `/` and `%`, and the right operand is also the one whose identity
+        // element leaves `+ - *` in range, so one operand serves every arm.
+        let safe_operand = match name {
+            ops::DIVIDE | ops::MODULO => 1,
+            _ => 0,
+        };
         let emit_trapping = |ctx: &mut LowerCtxF, op: i64, bank: ValType| {
+            if ctx.guard_depth > 0 {
+                ctx.has_guarded_trap = true;
+            }
+            let b = ctx.neutralize(b, safe_operand);
             let d = ctx.fresh(bank);
             ctx.body.extend_from_slice(&[
                 op,
@@ -3547,6 +3697,19 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
             None
         };
         if let (Some(k), Some(kop)) = (const_divisor, kop) {
+            // A nonzero constant divisor leaves exactly one trapping pair, the
+            // signed `INT_MIN / -1` below, so that is the only `_K` divide a
+            // guard has anything to neutralize — and it is the DIVIDEND that
+            // moves, the divisor being in the instruction stream. Zero divides
+            // by minus one without trapping.
+            let a = if a.bank == ValType::Int && k == -1 {
+                if ctx.guard_depth > 0 {
+                    ctx.has_guarded_trap = true;
+                }
+                ctx.neutralize(a, 0)
+            } else {
+                a
+            };
             let d = ctx.fresh(a.bank);
             ctx.body
                 .extend_from_slice(&[kop, a.idx as i64, k, d.idx as i64]);
@@ -4220,8 +4383,24 @@ fn compile_chain_body(
                 }
             }
         }
+        // Every link past the first runs for elements the links before it
+        // rejected — the body is straight-line and only the CURSOR carries the
+        // predicate — so a link is lowered under the conjunction of the
+        // predicates that precede it. That holds for a later `filter`'s own
+        // predicate as much as for a `map`'s body.
+        let guarded = |ctx: &mut LowerCtxF<'_>,
+                       cond: Option<TReg>,
+                       e: &IdedExpr|
+         -> Result<TReg, LowerError> {
+            let save = cond.map(|c| ctx.push_guard(c, true));
+            let r = compile_t(ctx, e);
+            if let Some(save) = save {
+                ctx.pop_guard(save);
+            }
+            r
+        };
         if let Some(c) = link.cond {
-            let c = compile_t(ctx, c)?;
+            let c = guarded(ctx, cond, c)?;
             if c.bank != ValType::Bool {
                 return Err(LowerError::unsupported("filter predicate must be bool"));
             }
@@ -4240,7 +4419,7 @@ fn compile_chain_body(
             });
         }
         if !is_ident(link.elem, link.iter_var) {
-            value = Some(compile_t(ctx, link.elem)?);
+            value = Some(guarded(ctx, cond, link.elem)?);
         }
     }
     Ok((cond, value))
@@ -4467,6 +4646,13 @@ fn probe_ctx<'a>(ctx: &LowerCtxF<'a>) -> LowerCtxF<'a> {
         schema: ctx.schema,
         functions: ctx.functions,
         host_fns: Vec::new(),
+        // The probe is asked for a BANK, which neutralizing an operand does not
+        // change, so it costs nothing to ask the question of the cheaper
+        // lowering whichever one is being built.
+        safe_speculation: false,
+        guard_depth: 0,
+        guard: None,
+        has_guarded_trap: false,
     }
 }
 

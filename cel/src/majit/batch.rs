@@ -68,8 +68,8 @@ use super::bytecode::{float_bank, prepare_batch_reduce, BatchRun, CodeCheck, Col
 use super::inline::{Inline, InlineOwned, INLINE_SLOTS};
 use super::lower::{
     concat_slot_index, concat_slot_path, elem_slot_source, lower_typed, lower_typed_in,
-    offset_slot_source, size_slot_source, string_slot_source, BatchReduce, ConcatSide, LoweredF,
-    Schema, SlotKind, ValType,
+    lower_typed_safe_in, offset_slot_source, size_slot_source, string_slot_source, BatchReduce,
+    ConcatSide, LowerError, LoweredF, Schema, SlotKind, ValType,
 };
 use crate::common::types::type_const_value;
 use crate::objects::{Key, ListRef, ListStorage, RecordSchema, ScalarBank, StrBank, ValueColumn};
@@ -423,6 +423,16 @@ pub enum Tier {
 /// same shape. That reuse is the whole point — see `CONVERGENCE.md`.
 pub struct BatchProgram {
     lowered: LoweredF,
+    /// The same expression lowered so that a trapping op no condition selects
+    /// cannot write the row's trap flag — see [`lower_typed_safe_in`]. `None`
+    /// for a program that has no such op, where the two lowerings would be the
+    /// same words.
+    ///
+    /// A whole [`BatchProgram`] rather than a bare [`LoweredF`], so the retry
+    /// binds and runs it exactly as it binds and runs the first one, and so its
+    /// compiled loops are keyed on their OWN program address rather than
+    /// sharing the fast program's.
+    safe: Option<Box<BatchProgram>>,
 }
 
 impl BatchProgram {
@@ -442,7 +452,10 @@ impl BatchProgram {
         // bind: `sum` refuses a string or a timestamp, `bind_per_row` takes any
         // bank, and one program can be bound either way.
         let lowered = lower_typed(program.expression(), schema)?;
-        Ok(BatchProgram { lowered })
+        let safe = Self::safe_peer(&lowered, || {
+            lower_typed_safe_in(program.expression(), schema, None)
+        });
+        Ok(BatchProgram { lowered, safe })
     }
 
     /// [`BatchProgram::from_program`], with `functions` supplying the user
@@ -459,7 +472,43 @@ impl BatchProgram {
         functions: &Context<'_>,
     ) -> Result<Self, BatchError> {
         let lowered = lower_typed_in(program.expression(), schema, Some(functions))?;
-        Ok(BatchProgram { lowered })
+        let safe = Self::safe_peer(&lowered, || {
+            lower_typed_safe_in(program.expression(), schema, Some(functions))
+        });
+        Ok(BatchProgram { lowered, safe })
+    }
+
+    /// [`BatchProgram::safe`] for a lowering that was just built.
+    ///
+    /// Built HERE rather than on first trap because a `BatchProgram` borrows
+    /// nothing — it keeps neither the program nor the schema nor the functions
+    /// — so this call site is the last place that still holds what a second
+    /// lowering needs. It runs only for the programs that have a guarded
+    /// trapping op, which is the small subset the retry can help; for every
+    /// other program it costs one boolean.
+    ///
+    /// A safe lowering that declines is treated as absent. The same expression
+    /// lowered once already, so this would mean the neutralization itself was
+    /// refused, and the honest answer to that is the row-by-row door the caller
+    /// would have taken anyway.
+    fn safe_peer(
+        lowered: &LoweredF,
+        build: impl FnOnce() -> Result<LoweredF, LowerError>,
+    ) -> Option<Box<BatchProgram>> {
+        if !lowered.has_guarded_trap {
+            return None;
+        }
+        let safe = build().ok()?;
+        Some(Box::new(BatchProgram {
+            lowered: safe,
+            safe: None,
+        }))
+    }
+
+    /// The program a trapped batch retries with, when one exists. See
+    /// [`BatchProgram::safe`].
+    pub fn safe_program(&self) -> Option<&BatchProgram> {
+        self.safe.as_deref()
     }
 
     /// The lowering, for callers that drive the machine directly.
@@ -1479,6 +1528,15 @@ fn cell(col: &ColumnRef, k: usize) -> Value {
 pub enum Answered {
     /// The lowered bytecode, on the tier that was asked for.
     Batch,
+    /// The lowered bytecode again, after the first program trapped: the second
+    /// lowering neutralizes a trapping op wherever no condition selects its
+    /// result, so a batch the first one refused over a value the expression
+    /// never reads is still answered columnar. A row that genuinely traps traps
+    /// here too and takes [`Answered::RowByRow`].
+    ///
+    /// Distinguished from [`Answered::Batch`] because the batch was walked
+    /// twice: the same rows, the same columns, and the first pass thrown away.
+    BatchSafe,
     /// One [`crate::Program::execute`] per row: the expression did not lower,
     /// or a row trapped.
     ///
@@ -1541,10 +1599,26 @@ pub fn eval_per_row_on(
     base: &Context,
     tier: Tier,
 ) -> Result<(Vec<Value>, Answered), BatchError> {
-    let batched = BatchProgram::from_program(program, schema)
-        .and_then(|bp| bp.bind_per_row(batch)?.collect_on(tier));
+    let batched = BatchProgram::from_program(program, schema).and_then(|bp| {
+        match bp.bind_per_row(batch).and_then(|b| b.collect_on(tier)) {
+            // A trap says some row wrote the flag, not that the expression has
+            // no columnar answer: the body is straight-line, so an arm no row
+            // selected still ran. Retry with the lowering that neutralizes
+            // those before spending a `Program::execute` per row — it is the
+            // same machine over the same columns, and it answers wherever the
+            // trap was one the expression never asked for.
+            Err(BatchError::Trapped) => match bp.safe_program() {
+                Some(safe) => safe
+                    .bind_per_row(batch)
+                    .and_then(|b| b.collect_on(tier))
+                    .map(|v| (v, Answered::BatchSafe)),
+                None => Err(BatchError::Trapped),
+            },
+            other => other.map(|v| (v, Answered::Batch)),
+        }
+    });
     match batched {
-        Ok(v) => Ok((v, Answered::Batch)),
+        Ok(v) => Ok(v),
         // Only the two data-independent-of-the-caller outcomes fall back. A
         // missing or mistyped column is the caller's own description of the
         // batch being wrong, and the fallback would fail on it too.
@@ -3759,6 +3833,95 @@ mod tests {
                     "`{src}` on {tier:?}"
                 );
             }
+        }
+    }
+
+    /// A row body is straight-line, so an arm no row selects still runs. The
+    /// trap that arm writes is not the expression's answer, and the retry is
+    /// what keeps the batch from paying a `Program::execute` per row for it.
+    #[test]
+    fn a_trap_no_condition_selects_is_retried_rather_than_walked() {
+        let base = Context::default();
+        let run = |xs: &[i64], src: &str| {
+            let lens = vec![xs.len() as i64];
+            let sc = schema(&[("list[]", ValType::Int)]);
+            let program = Program::compile(src).unwrap();
+            let p = BatchProgram::from_program(&program, &sc)
+                .unwrap_or_else(|e| panic!("`{src}`: {e:?}"));
+            let b = Batch::new(1).column(
+                "list",
+                ColumnRef::List {
+                    lens: &lens,
+                    fields: vec![(None, ColumnRef::Int(xs))],
+                },
+            );
+            // The oracle is the door the fallback takes, so a disagreement here
+            // is a disagreement with what the caller would otherwise have got.
+            let reader = RowReader::new(&b);
+            let oracle = format!("{:?}", program.execute(&reader.scope(&base, 0)));
+            let mut seen = Vec::new();
+            for tier in [Tier::Clean, Tier::Interpreter, Tier::Jit] {
+                let got = match eval_per_row_on(&program, &sc, &b, &base, tier) {
+                    Ok((v, who)) => (who, format!("Ok({:?})", v[0])),
+                    Err(e) => (Answered::RowByRow, format!("Err({e:?})")),
+                };
+                seen.push(got);
+            }
+            assert!(
+                seen.windows(2).all(|w| w[0] == w[1]),
+                "`{src}`: the tiers disagree: {seen:?}"
+            );
+            (p.lowered().has_guarded_trap, seen.remove(0), oracle)
+        };
+
+        // A trapping op the condition rejects. The first program traps, the
+        // second answers, and the answer is the walker's.
+        for (xs, src) in [
+            (&[0i64, 1, 2][..], "list.filter(x, x != 0).map(x, 100 / x)"),
+            (&[0, 1, 2][..], "list.filter(x, x != 0).map(x, 100 % x)"),
+            (&[0, 1, 2][..], "list.map(x, x != 0 ? 100 / x : 0)"),
+            // Two conditions deep: the guard is their conjunction.
+            (
+                &[0, 1, 2][..],
+                "list.map(x, x != 0 ? (x > 1 ? 100 / x : 7) : 0)",
+            ),
+            // A CONSTANT divisor traps on one pair only, and it is the dividend
+            // that has to move.
+            (&[i64::MIN, 5][..], "list.filter(x, x > 0).map(x, x / -1)"),
+            (&[i64::MIN, 5][..], "list.filter(x, x > 0).map(x, x % -1)"),
+        ] {
+            let (guarded, (who, got), oracle) = run(xs, src);
+            assert!(guarded, "`{src}`: the trapping op is under a condition");
+            assert_eq!(who, Answered::BatchSafe, "`{src}`");
+            assert_eq!(got, oracle, "`{src}`");
+        }
+
+        // A trapping op at a position the condition SELECTS still traps, and
+        // the row-by-row door still owns it — the retry neutralizes only what
+        // nothing reads.
+        for (xs, src) in [
+            (&[1i64, i64::MAX][..], "list.filter(x, x > 0).map(x, x + 1)"),
+            (&[1, i64::MAX][..], "list.map(x, x > 0 ? x + 1 : 0)"),
+            (&[1, 0][..], "list.map(x, x >= 0 ? 100 / x : 0)"),
+        ] {
+            let (_, (who, got), _) = run(xs, src);
+            assert_eq!(who, Answered::RowByRow, "`{src}`");
+            assert!(
+                got.contains("Overflow") || got.contains("Division by zero"),
+                "`{src}`: the walker's own error, not a value: {got}"
+            );
+        }
+
+        // Nothing under a condition can trap, so there is no second lowering to
+        // build and the first one answers.
+        for (xs, src) in [
+            (&[0i64, 1, 2][..], "list.map(x, x * 2)"),
+            (&[0, 3, 4][..], "list.filter(x, x != 0).map(x, x % 3)"),
+        ] {
+            let (guarded, (who, got), oracle) = run(xs, src);
+            assert!(!guarded, "`{src}`: no trapping op under a condition");
+            assert_eq!(who, Answered::Batch, "`{src}`");
+            assert_eq!(got, oracle, "`{src}`");
         }
     }
 
