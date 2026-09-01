@@ -135,6 +135,10 @@ name = "majit_vs_cometkim_percall"
 required-features = ["jit"]
 
 [[example]]
+name = "host_fn_percall"
+required-features = ["jit"]
+
+[[example]]
 name = "tierprobe"
 required-features = ["jit"]
 
