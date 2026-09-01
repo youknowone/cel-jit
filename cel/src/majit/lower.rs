@@ -2361,7 +2361,14 @@ impl LowerCtxF<'_> {
         }
         // A register that already IS a derived concatenation, so chains fold
         // into one table rather than refusing.
-        if let Some(slot) = self.slots.iter().find(|s| s.reg == r.idx) {
+        // Filtered on the bank as well, like `slot_path_of` below: the int and
+        // float files number independently, so a register index alone names a
+        // slot in either of them.
+        if let Some(slot) = self
+            .slots
+            .iter()
+            .find(|s| s.reg == r.idx && s.ty == r.bank)
+        {
             if let Some(k) = concat_slot_index(&slot.path) {
                 return Ok(ConcatSide::Derived(k));
             }

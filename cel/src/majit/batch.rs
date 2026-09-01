@@ -3653,6 +3653,31 @@ mod tests {
         }
     }
 
+    /// A concatenation operand is found among the slots by its register index,
+    /// and the two register files number independently, so one index names a
+    /// slot in either of them. Where a float slot carries that index and is met
+    /// first, a lookup by index alone finds it instead of the string column,
+    /// and the operand reads as neither a column nor a literal — declining an
+    /// expression the machine can answer.
+    #[test]
+    fn a_string_concatenation_is_not_hidden_by_a_float_slot_at_the_same_index() {
+        let s = schema(&[
+            ("f0", ValType::Float),
+            ("f1", ValType::Float),
+            ("f2", ValType::Float),
+            ("f3", ValType::Float),
+            ("f4", ValType::Float),
+            ("f5", ValType::Float),
+            ("a", ValType::Str),
+            ("b", ValType::Str),
+        ]);
+        // Measured slot registers for this expression: the float file lands
+        // `f2` on 3, and the int file lands `b` on 3 as well. `f2` is met
+        // first, so it is what a lookup by index alone finds.
+        BatchProgram::compile("f0 + f1 + f2 + f3 + f4 + f5 > 0.0 && a + b == \"xy\"", &s)
+            .expect("a string column hidden by a float slot at the same index");
+    }
+
     /// `m["a"]` is map lookup, and `m.a` spells the same lookup, so the two
     /// lower to the same program.
     ///
