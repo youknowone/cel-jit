@@ -1,11 +1,18 @@
-//! Which compiled batch loops still carry a residual call per element.
+//! What every compiled batch loop carries per element: its body length, its
+//! residual calls, and its guards.
 //!
 //! The `%`-by-a-power-of-two wall was found by differencing two compiled
 //! traces op by op; this widens that instrument from one pair to a corpus, so
-//! the next wall is picked by census rather than by guess. For every
-//! expression it prints the compiled loop's body length and, whenever the body
-//! holds a `Call*`, the whole body histogram — a call in the steady-state body
-//! is a per-element cost the trace could not inline.
+//! the next wall is picked by census rather than by guess.
+//!
+//! Body length ALONE over-reports, and by a lot: the backend skips an
+//! operation that has no side effect and whose result nothing live reads
+//! (`backend/x86/regalloc.py:383-386`), so a pure op in the body may cost
+//! nothing at all. A `Call*` and a `Guard*` are the two kinds that always
+//! survive — a call is work the trace could not inline, and a guard is a
+//! comparison, a resume point and a bridge target that no dead-code screen
+//! removes. So those two are counted for every loop and ranked at the end,
+//! and the body histogram is printed for the loops that lead each ranking.
 //!
 //! Run it:
 //!
@@ -111,14 +118,38 @@ impl Data {
     }
 }
 
-/// One expression's census: `(body ops, calls in body)` per compiled loop.
-fn census(label: &str, src: &str, data: &Data) {
+/// One compiled loop's census.
+struct Row {
+    label: String,
+    loop_ix: usize,
+    body: usize,
+    calls: usize,
+    guards: usize,
+    hist: BTreeMap<String, usize>,
+    src: String,
+}
+
+/// Print `row`'s body histogram, most frequent first.
+fn print_hist(row: &Row) {
+    println!(
+        "   {} loop[{}] body={} calls={} guards={}  {}",
+        row.label, row.loop_ix, row.body, row.calls, row.guards, row.src
+    );
+    let mut items: Vec<_> = row.hist.iter().collect();
+    items.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+    for (name, c) in items {
+        println!("       {c:4}  {name}");
+    }
+}
+
+/// One expression's census: one [`Row`] per compiled loop.
+fn census(label: &str, src: &str, data: &Data) -> Vec<Row> {
     let schema = data.schema();
     let lowered = match BatchProgram::compile(src, &schema) {
         Ok(l) => l,
         Err(e) => {
             println!("-- {label:28} DECLINES  {src}\n     {e}");
-            return;
+            return Vec::new();
         }
     };
     let batch = data.batch();
@@ -126,7 +157,7 @@ fn census(label: &str, src: &str, data: &Data) {
         Ok(b) => b,
         Err(e) => {
             println!("-- {label:28} NO BIND   {src}\n     {e}");
-            return;
+            return Vec::new();
         }
     };
     reset_persistent_state();
@@ -134,15 +165,26 @@ fn census(label: &str, src: &str, data: &Data) {
     for _ in 0..48 {
         if let Err(e) = bound.collect_on(Tier::Jit) {
             println!("-- {label:28} RUN ERR   {src}\n     {e}");
-            return;
+            return Vec::new();
         }
     }
     let loops = Census::compiled_opcode_log();
     if loops.is_empty() {
         println!("-- {label:28} NO LOOP   {src}");
-        return;
+        return Vec::new();
     }
+    // `RCACC_DUMP=<label>` prints the whole trace, `Label` markers included.
+    // The histogram cannot answer where the body starts when a trace holds more
+    // than one `Label`, and a nested comprehension does.
+    let dump = std::env::var("RCACC_DUMP").is_ok_and(|d| d == label);
+    let mut rows = Vec::new();
     for (i, ops) in loops.into_iter().enumerate() {
+        if dump {
+            println!("== {label} loop[{i}] {} ops  {src}", ops.len());
+            for (j, op) in ops.iter().enumerate() {
+                println!("   [{j:3}] {op:?}");
+            }
+        }
         // The last Label starts the steady-state body; everything before it is
         // the preamble the peeled iteration hoists invariants into.
         let body_at = ops
@@ -154,24 +196,30 @@ fn census(label: &str, src: &str, data: &Data) {
         for op in body {
             *hist.entry(format!("{op:?}")).or_default() += 1;
         }
-        let calls: usize = hist
-            .iter()
-            .filter(|(k, _)| k.starts_with("Call"))
-            .map(|(_, c)| *c)
-            .sum();
+        let sum_of = |prefix: &str| -> usize {
+            hist.iter()
+                .filter(|(k, _)| k.starts_with(prefix))
+                .map(|(_, c)| *c)
+                .sum()
+        };
+        let calls = sum_of("Call");
+        let guards = sum_of("Guard");
         let flag = if calls > 0 { "CALL" } else { "    " };
         println!(
-            "{flag} {label:28} loop[{i}] body={:3} calls={calls}  {src}",
+            "{flag} {label:28} loop[{i}] body={:3} calls={calls} guards={guards}  {src}",
             body.len()
         );
-        if calls > 0 {
-            let mut items: Vec<_> = hist.into_iter().collect();
-            items.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-            for (name, c) in items {
-                println!("       {c:4}  {name}");
-            }
-        }
+        rows.push(Row {
+            label: label.to_string(),
+            loop_ix: i,
+            body: body.len(),
+            calls,
+            guards,
+            hist,
+            src: src.to_string(),
+        });
     }
+    rows
 }
 
 fn main() {
@@ -240,7 +288,33 @@ fn main() {
         ("math/abs_like", "x < 0 ? -x : x"),
         ("float/cmp_chain", "f > 1.0 && g < 100.0"),
     ];
+    let mut rows: Vec<Row> = Vec::new();
     for (label, src) in corpus {
-        census(label, src, &data);
+        rows.extend(census(label, src, &data));
+    }
+
+    // The two survivors of the backend's dead-code screen, ranked. A body
+    // number on its own does not say what a loop costs; these two do.
+    println!("\n== loops carrying a residual call");
+    rows.sort_by(|a, b| b.calls.cmp(&a.calls).then(a.label.cmp(&b.label)));
+    for row in rows.iter().filter(|r| r.calls > 0) {
+        print_hist(row);
+    }
+    if rows.iter().all(|r| r.calls == 0) {
+        println!("   none");
+    }
+
+    println!("\n== loops by guard count (top 8)");
+    rows.sort_by(|a, b| b.guards.cmp(&a.guards).then(a.label.cmp(&b.label)));
+    for row in rows.iter().take(8) {
+        print_hist(row);
+    }
+
+    // Body length is the weakest of the three readings, but it is the one that
+    // says where to look for the other two.
+    println!("\n== loops by body length (top 8)");
+    rows.sort_by(|a, b| b.body.cmp(&a.body).then(a.label.cmp(&b.label)));
+    for row in rows.iter().take(8) {
+        print_hist(row);
     }
 }
