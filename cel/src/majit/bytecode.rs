@@ -241,6 +241,46 @@ pub const OP_COL_PUSH_F: i64 = 66; // [base, cur, fsrc, cur] float twin
 pub const OP_COL_PUSH_IF: i64 = 77; // [base, cur, src, pred, cur]   *(regs[base] + regs[cur]*8) = regs[src]; regs[cur] += regs[pred]
 pub const OP_COL_PUSH_IF_F: i64 = 78; // [base, cur, fsrc, pred, cur] float twin
 
+/// The CONSTANT-operand peers of the six signed comparisons and of
+/// [`OP_AND`], carrying the constant in the word stream the way
+/// [`OP_DIV_K`] carries its divisor.
+///
+/// A comparison against a literal is what every `filter`/`exists`/`all`
+/// predicate is made of, and through a register the literal costs more than
+/// the compare: the load runs in the prelude, so the register is live across
+/// the whole row loop and lands in the traced loop's virtualizable array. Every
+/// word of that array is one `getarrayitem_gc_i` the BRIDGE that closes an
+/// element loop has to materialize before it can jump back — paid once per ROW,
+/// where the compare itself is paid once per element. The immediate is green,
+/// so it costs no word at all and the traced op is `int_gt(reg, ConstInt(k))`,
+/// which the optimizer's bounds can read.
+///
+/// Signed only. The two `uint` orderings are [`OP_ULT`]/[`OP_ULE`] and the
+/// float ones live in the other bank; a literal there keeps the register form.
+pub const OP_EQ_K: i64 = 79; // [a, k, dst]  regs[dst] = (regs[a] == k) as i64
+pub const OP_NE_K: i64 = 80; // [a, k, dst]  regs[dst] = (regs[a] != k) as i64
+pub const OP_LT_K: i64 = 81; // [a, k, dst]  regs[dst] = (regs[a] <  k) as i64
+pub const OP_LE_K: i64 = 82; // [a, k, dst]  regs[dst] = (regs[a] <= k) as i64
+pub const OP_GT_K: i64 = 83; // [a, k, dst]  regs[dst] = (regs[a] >  k) as i64
+pub const OP_GE_K: i64 = 84; // [a, k, dst]  regs[dst] = (regs[a] >= k) as i64
+pub const OP_AND_K: i64 = 85; // [a, k, dst]  regs[dst] = regs[a] & k
+
+/// The CONSTANT-operand peers of the three overflow-checked arithmetic ops.
+///
+/// `+ - *` on `int` are checked, so they carry the trap word and the plain
+/// [`OP_ADD_IMM`]/[`OP_MUL_IMM`] — which wrap — cannot stand in for them. What
+/// the immediate buys is what it buys everywhere: the operand is green, so it
+/// costs no word of the register bank, and the traced op is
+/// `int_mul_ovf(reg, ConstInt(k))` rather than a multiply of two opaque
+/// arguments.
+///
+/// The constant is the RIGHT operand only. `+` and `*` commute, so the lowering
+/// may put either side there; `-` does not, and `k - x` keeps the register
+/// form.
+pub const OP_ADD_OVF_K: i64 = 86; // [a, k, dst, trap]  regs[dst] = a + k
+pub const OP_SUB_OVF_K: i64 = 87; // [a, k, dst, trap]  regs[dst] = a - k
+pub const OP_MUL_OVF_K: i64 = 88; // [a, k, dst, trap]  regs[dst] = a * k
+
 /// The constant-divisor peers of [`OP_DIV_CHK`]/[`OP_MOD_CHK`]/[`OP_UDIV`]/
 /// [`OP_UMOD`]: the divisor is an IMMEDIATE word in the instruction stream
 /// rather than a register.
@@ -347,7 +387,7 @@ use Operand::{Float, FloatOut, Imm, Int, IntOut, IntTrap, Target};
 /// so an opcode added past it without a row here is a compile error on this
 /// array instead of an out-of-bounds index the first time that opcode is
 /// decoded.
-pub const OPERANDS: [&[Operand]; OP_COL_PUSH_IF_F as usize + 1] = [
+pub const OPERANDS: [&[Operand]; OP_MUL_OVF_K as usize + 1] = [
     &[Imm, IntOut],                           // 0  LOAD_CONST
     &[Int, IntOut],                           // 1  MOV
     &[Int, Int, IntOut],                      // 2  ADD
@@ -427,6 +467,16 @@ pub const OPERANDS: [&[Operand]; OP_COL_PUSH_IF_F as usize + 1] = [
     &[Int, Imm, IntOut],                      // 76 MODN_K
     &[Int, Int, Int, Int, IntOut],            // 77 COL_PUSH_IF
     &[Int, Int, Float, Int, IntOut],          // 78 COL_PUSH_IF_F
+    &[Int, Imm, IntOut],                      // 79 EQ_K
+    &[Int, Imm, IntOut],                      // 80 NE_K
+    &[Int, Imm, IntOut],                      // 81 LT_K
+    &[Int, Imm, IntOut],                      // 82 LE_K
+    &[Int, Imm, IntOut],                      // 83 GT_K
+    &[Int, Imm, IntOut],                      // 84 GE_K
+    &[Int, Imm, IntOut],                      // 85 AND_K
+    &[Int, Imm, IntOut, IntTrap],             // 86 ADD_OVF_K
+    &[Int, Imm, IntOut, IntTrap],             // 87 SUB_OVF_K
+    &[Int, Imm, IntOut, IntTrap],             // 88 MUL_OVF_K
 ];
 
 /// What one [`check_code`] established about one program: the words it read,
@@ -1526,16 +1576,17 @@ pub mod float_bank {
     /// [`jit_stats`] and [`reset_jit_stats`] stay as the names this crate reads
     /// them under. What moved is who owns the counters.
     use super::{
-        OP_ADD, OP_ADD_IMM, OP_ADD_OVF, OP_AND, OP_COL_LOAD, OP_COL_LOAD_B, OP_COL_LOAD_F,
-        OP_COL_PUSH, OP_COL_PUSH_F, OP_COL_PUSH_IF, OP_COL_PUSH_IF_F, OP_COL_STORE, OP_COL_STORE_F,
-        OP_DIV, OP_DIVN_K, OP_DIV_CHK, OP_DIV_CHK_K, OP_DIV_K, OP_EQ, OP_F2I, OP_F2U, OP_FADD,
-        OP_FDIV, OP_FEQ, OP_FGE, OP_FGT, OP_FLE, OP_FLT, OP_FMOV, OP_FMUL, OP_FNE, OP_FNEG,
-        OP_FSELECT, OP_FSUB, OP_GE, OP_GT, OP_HOST_CALL1_F, OP_HOST_CALL1_I, OP_HOST_CALL2_F,
-        OP_HOST_CALL2_I, OP_I2F, OP_INDEX_K, OP_INDEX_K_F, OP_INDEX_R, OP_INDEX_R_F,
-        OP_JUMP_IF_ABOVE, OP_LE, OP_LOAD_CONST, OP_LOAD_CONST_F, OP_LT, OP_MOD, OP_MODN_K,
-        OP_MOD_CHK, OP_MOD_CHK_K, OP_MOD_K, OP_MOV, OP_MUL, OP_MUL_IMM, OP_MUL_OVF, OP_NE, OP_NEG,
-        OP_NOT, OP_OR, OP_RETURN, OP_RETURN_F, OP_SELECT, OP_SUB, OP_SUB_OVF, OP_TRAP_STORE,
-        OP_U2F, OP_UADD_OVF, OP_UDIV, OP_UDIV_K, OP_ULE, OP_ULT, OP_UMOD, OP_UMOD_K, OP_UMUL_OVF,
+        OP_ADD, OP_ADD_IMM, OP_ADD_OVF, OP_ADD_OVF_K, OP_AND, OP_AND_K, OP_COL_LOAD, OP_COL_LOAD_B,
+        OP_COL_LOAD_F, OP_COL_PUSH, OP_COL_PUSH_F, OP_COL_PUSH_IF, OP_COL_PUSH_IF_F, OP_COL_STORE,
+        OP_COL_STORE_F, OP_DIV, OP_DIVN_K, OP_DIV_CHK, OP_DIV_CHK_K, OP_DIV_K, OP_EQ, OP_EQ_K,
+        OP_F2I, OP_F2U, OP_FADD, OP_FDIV, OP_FEQ, OP_FGE, OP_FGT, OP_FLE, OP_FLT, OP_FMOV, OP_FMUL,
+        OP_FNE, OP_FNEG, OP_FSELECT, OP_FSUB, OP_GE, OP_GE_K, OP_GT, OP_GT_K, OP_HOST_CALL1_F,
+        OP_HOST_CALL1_I, OP_HOST_CALL2_F, OP_HOST_CALL2_I, OP_I2F, OP_INDEX_K, OP_INDEX_K_F,
+        OP_INDEX_R, OP_INDEX_R_F, OP_JUMP_IF_ABOVE, OP_LE, OP_LE_K, OP_LOAD_CONST, OP_LOAD_CONST_F,
+        OP_LT, OP_LT_K, OP_MOD, OP_MODN_K, OP_MOD_CHK, OP_MOD_CHK_K, OP_MOD_K, OP_MOV, OP_MUL,
+        OP_MUL_IMM, OP_MUL_OVF, OP_MUL_OVF_K, OP_NE, OP_NEG, OP_NE_K, OP_NOT, OP_OR, OP_RETURN,
+        OP_RETURN_F, OP_SELECT, OP_SUB, OP_SUB_OVF, OP_SUB_OVF_K, OP_TRAP_STORE, OP_U2F,
+        OP_UADD_OVF, OP_UDIV, OP_UDIV_K, OP_ULE, OP_ULT, OP_UMOD, OP_UMOD_K, OP_UMUL_OVF,
         OP_USUB_OVF,
     };
 
@@ -2295,6 +2346,99 @@ pub mod float_bank {
                     let d = program[pc + 3] as usize;
                     state.regs[d] = state.regs[a] & state.regs[b];
                     pc += 4;
+                }
+                OP_EQ_K => {
+                    let a = state.regs[program[pc + 1] as usize];
+                    let k = program[pc + 2];
+                    state.regs[program[pc + 3] as usize] = (a == k) as i64;
+                    pc += 4;
+                }
+                OP_NE_K => {
+                    let a = state.regs[program[pc + 1] as usize];
+                    let k = program[pc + 2];
+                    state.regs[program[pc + 3] as usize] = (a != k) as i64;
+                    pc += 4;
+                }
+                OP_LT_K => {
+                    let a = state.regs[program[pc + 1] as usize];
+                    let k = program[pc + 2];
+                    state.regs[program[pc + 3] as usize] = (a < k) as i64;
+                    pc += 4;
+                }
+                OP_LE_K => {
+                    let a = state.regs[program[pc + 1] as usize];
+                    let k = program[pc + 2];
+                    state.regs[program[pc + 3] as usize] = (a <= k) as i64;
+                    pc += 4;
+                }
+                OP_GT_K => {
+                    let a = state.regs[program[pc + 1] as usize];
+                    let k = program[pc + 2];
+                    state.regs[program[pc + 3] as usize] = (a > k) as i64;
+                    pc += 4;
+                }
+                OP_GE_K => {
+                    let a = state.regs[program[pc + 1] as usize];
+                    let k = program[pc + 2];
+                    state.regs[program[pc + 3] as usize] = (a >= k) as i64;
+                    pc += 4;
+                }
+                OP_AND_K => {
+                    let a = state.regs[program[pc + 1] as usize];
+                    let k = program[pc + 2];
+                    state.regs[program[pc + 3] as usize] = a & k;
+                    pc += 4;
+                }
+                OP_ADD_OVF_K => {
+                    let a = state.regs[program[pc + 1] as usize];
+                    let k = program[pc + 2];
+                    let d = program[pc + 3] as usize;
+                    let t = program[pc + 4] as usize;
+                    // `OP_ADD_OVF`'s shape with the operand read from the
+                    // instruction stream: the None arm runs only on the
+                    // guard-exit resume and records the event.
+                    state.regs[d] = match a.checked_add(k) {
+                        Some(v) => v,
+                        None => {
+                            state.regs[t] = 1;
+                            a.wrapping_add(k)
+                        }
+                    };
+                    pc += 5;
+                }
+                OP_SUB_OVF_K => {
+                    let a = state.regs[program[pc + 1] as usize];
+                    let k = program[pc + 2];
+                    let d = program[pc + 3] as usize;
+                    let t = program[pc + 4] as usize;
+                    // `OP_ADD_OVF`'s shape with the operand read from the
+                    // instruction stream: the None arm runs only on the
+                    // guard-exit resume and records the event.
+                    state.regs[d] = match a.checked_sub(k) {
+                        Some(v) => v,
+                        None => {
+                            state.regs[t] = 1;
+                            a.wrapping_sub(k)
+                        }
+                    };
+                    pc += 5;
+                }
+                OP_MUL_OVF_K => {
+                    let a = state.regs[program[pc + 1] as usize];
+                    let k = program[pc + 2];
+                    let d = program[pc + 3] as usize;
+                    let t = program[pc + 4] as usize;
+                    // `OP_ADD_OVF`'s shape with the operand read from the
+                    // instruction stream: the None arm runs only on the
+                    // guard-exit resume and records the event.
+                    state.regs[d] = match a.checked_mul(k) {
+                        Some(v) => v,
+                        None => {
+                            state.regs[t] = 1;
+                            a.wrapping_mul(k)
+                        }
+                    };
+                    pc += 5;
                 }
                 OP_OR => {
                     let a = program[pc + 1] as usize;
@@ -3462,6 +3606,68 @@ pub mod float_bank {
                     regs[program[pc + 3] as usize] =
                         regs[program[pc + 1] as usize] & regs[program[pc + 2] as usize];
                     pc += 4;
+                }
+                OP_EQ_K => {
+                    regs[program[pc + 3] as usize] =
+                        (regs[program[pc + 1] as usize] == program[pc + 2]) as i64;
+                    pc += 4;
+                }
+                OP_NE_K => {
+                    regs[program[pc + 3] as usize] =
+                        (regs[program[pc + 1] as usize] != program[pc + 2]) as i64;
+                    pc += 4;
+                }
+                OP_LT_K => {
+                    regs[program[pc + 3] as usize] =
+                        (regs[program[pc + 1] as usize] < program[pc + 2]) as i64;
+                    pc += 4;
+                }
+                OP_LE_K => {
+                    regs[program[pc + 3] as usize] =
+                        (regs[program[pc + 1] as usize] <= program[pc + 2]) as i64;
+                    pc += 4;
+                }
+                OP_GT_K => {
+                    regs[program[pc + 3] as usize] =
+                        (regs[program[pc + 1] as usize] > program[pc + 2]) as i64;
+                    pc += 4;
+                }
+                OP_GE_K => {
+                    regs[program[pc + 3] as usize] =
+                        (regs[program[pc + 1] as usize] >= program[pc + 2]) as i64;
+                    pc += 4;
+                }
+                OP_AND_K => {
+                    regs[program[pc + 3] as usize] =
+                        regs[program[pc + 1] as usize] & program[pc + 2];
+                    pc += 4;
+                }
+                OP_ADD_OVF_K => {
+                    let a = regs[program[pc + 1] as usize];
+                    let k = program[pc + 2];
+                    if a.checked_add(k).is_none() {
+                        regs[program[pc + 4] as usize] = 1;
+                    }
+                    regs[program[pc + 3] as usize] = a.wrapping_add(k);
+                    pc += 5;
+                }
+                OP_SUB_OVF_K => {
+                    let a = regs[program[pc + 1] as usize];
+                    let k = program[pc + 2];
+                    if a.checked_sub(k).is_none() {
+                        regs[program[pc + 4] as usize] = 1;
+                    }
+                    regs[program[pc + 3] as usize] = a.wrapping_sub(k);
+                    pc += 5;
+                }
+                OP_MUL_OVF_K => {
+                    let a = regs[program[pc + 1] as usize];
+                    let k = program[pc + 2];
+                    if a.checked_mul(k).is_none() {
+                        regs[program[pc + 4] as usize] = 1;
+                    }
+                    regs[program[pc + 3] as usize] = a.wrapping_mul(k);
+                    pc += 5;
                 }
                 OP_OR => {
                     regs[program[pc + 3] as usize] =

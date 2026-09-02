@@ -1291,6 +1291,9 @@ impl LoweredF {
             .chain(scalar_regs.iter().copied())
             .chain(list_out_regs.iter().copied())
             .collect();
+        // Before narrowing, not after: a load whose register no operand reads
+        // is a register `pack_file` would still have colored.
+        drop_dead_loads(&mut p);
         let ints = pack_file(&mut p, RegFile::Ints, total_int_regs, &seeded);
         // No float register is seeded: every value the caller supplies — a
         // count, an address, a broadcast scalar — travels in the int file.
@@ -1357,6 +1360,80 @@ fn decode(p: &[i64]) -> Vec<Decoded> {
         at += 1 + ops.len();
     }
     out
+}
+
+/// Delete the constant loads whose register nothing reads, rewriting the jump
+/// targets the deletion moved.
+///
+/// A constant reaches the program through [`LowerCtxF::const_reg`], which
+/// emits its load as soon as an operand asks for the value — before the emitter
+/// that consumes it has decided whether it wants a register or an immediate
+/// (see [`emit_cmp`]). Where it takes the immediate the load is left behind
+/// with no reader, and a load with no reader is not free: [`pack_file`] colors
+/// every register the program NAMES, and a register that is written is named.
+/// So the word would stay in the bank — and a word of the bank is a word of the
+/// traced loop's virtualizable array, which every bridge reloads.
+///
+/// Only the two pure loads are candidates. They read no register, so one pass
+/// reaches the fixpoint, and they have no other effect, so nothing observes
+/// their absence.
+fn drop_dead_loads(p: &mut Vec<i64>) {
+    let code = decode(p);
+    // One set per bank: the two files number their registers independently, so
+    // a float read would otherwise vouch for the int register of that number.
+    let mut int_read: std::collections::BTreeSet<i64> = std::collections::BTreeSet::new();
+    let mut float_read: std::collections::BTreeSet<i64> = std::collections::BTreeSet::new();
+    for d in &code {
+        for (j, role) in d.ops.iter().enumerate() {
+            let w = p[d.at + 1 + j];
+            match role {
+                Operand::Int | Operand::IntTrap => {
+                    int_read.insert(w);
+                }
+                Operand::Float => {
+                    float_read.insert(w);
+                }
+                _ => {}
+            }
+        }
+    }
+    let dead: Vec<&Decoded> = code
+        .iter()
+        .filter(|d| match p[d.at] {
+            OP_LOAD_CONST => !int_read.contains(&p[d.at + 2]),
+            OP_LOAD_CONST_F => !float_read.contains(&p[d.at + 2]),
+            _ => false,
+        })
+        .collect();
+    if dead.is_empty() {
+        return;
+    }
+    // How many words each old address loses, so a target can be moved before
+    // anything is removed and the walk stays one pass.
+    let mut shift = vec![0usize; p.len() + 1];
+    for d in &dead {
+        for c in shift.iter_mut().skip(d.at + 1) {
+            *c += 1 + d.ops.len();
+        }
+    }
+    for d in &code {
+        for (j, role) in d.ops.iter().enumerate() {
+            if *role == Operand::Target {
+                let t = p[d.at + 1 + j] as usize;
+                p[d.at + 1 + j] -= shift[t] as i64;
+            }
+        }
+    }
+    let drop: std::collections::BTreeSet<usize> = dead
+        .iter()
+        .flat_map(|d| d.at..d.at + 1 + d.ops.len())
+        .collect();
+    let mut at = 0;
+    p.retain(|_| {
+        let keep = !drop.contains(&at);
+        at += 1;
+        keep
+    });
 }
 
 /// Narrow one register file to the width the program's own liveness allows,
@@ -2307,6 +2384,76 @@ fn emit_complement(ctx: &mut LowerCtxF, c: TReg) -> TReg {
     d
 }
 
+/// The opcode that takes `op`'s right operand from the WORD STREAM, for the ops
+/// that have such a form.
+///
+/// The word stream is green, so the immediate is a constant inside the trace
+/// while a prelude register is an opaque input argument. That is worth an
+/// opcode twice over: the traced op reads a `ConstInt` the optimizer's bounds
+/// can use, and the register the constant would have occupied is one word of
+/// the loop's virtualizable array that no bridge has to reload.
+fn imm_form(op: i64) -> Option<i64> {
+    Some(match op {
+        OP_MUL => OP_MUL_IMM,
+        OP_ADD => OP_ADD_IMM,
+        OP_DIV => OP_DIV_K,
+        OP_MOD => OP_MOD_K,
+        OP_AND => OP_AND_K,
+        OP_EQ => OP_EQ_K,
+        OP_NE => OP_NE_K,
+        OP_LT => OP_LT_K,
+        OP_LE => OP_LE_K,
+        OP_GT => OP_GT_K,
+        OP_GE => OP_GE_K,
+        _ => return None,
+    })
+}
+
+/// `op` with its operands exchanged: the comparison that answers `b op a` when
+/// spelled `a mirror(op) b`. `None` for an op that is not one of the six.
+///
+/// What it is for: only the RIGHT operand rides in the word stream, so a
+/// constant on the left reaches an immediate by swapping the operands, and
+/// swapping the operands of an ordering means mirroring it.
+fn mirror_cmp(op: i64) -> Option<i64> {
+    Some(match op {
+        OP_EQ => OP_EQ,
+        OP_NE => OP_NE,
+        OP_LT => OP_GT,
+        OP_LE => OP_GE,
+        OP_GT => OP_LT,
+        OP_GE => OP_LE,
+        _ => return None,
+    })
+}
+
+/// [`emit_bin`] for an op that has an [`imm_form`], taking a POOL CONSTANT
+/// operand as an immediate instead of reading it back from a register.
+///
+/// Either side may be the constant: a comparison with one on the left is
+/// emitted mirrored. Only the pool answers here, so a value that is constant to
+/// the SOURCE but not to the lowering — a string literal, whose id is the
+/// batch's dictionary rank and so arrives in a seeded register — keeps the
+/// register form, which is what it must do.
+fn emit_cmp(ctx: &mut LowerCtxF, op: i64, a: TReg, b: TReg, bank: ValType) -> TReg {
+    let imm = match (ctx.const_of(a), ctx.const_of(b)) {
+        // The right operand first: it needs no mirror, and a comparison of two
+        // constants is folded well before this.
+        (_, Some(k)) => imm_form(op).map(|i| (i, a, k)),
+        (Some(k), None) => mirror_cmp(op).and_then(imm_form).map(|i| (i, b, k)),
+        (None, None) => None,
+    };
+    match imm {
+        Some((imm_op, r, k)) => {
+            let d = ctx.fresh(bank);
+            ctx.body
+                .extend_from_slice(&[imm_op, r.idx as i64, k, d.idx as i64]);
+            d
+        }
+        None => emit_bin(ctx, op, a, b, bank),
+    }
+}
+
 /// `dst = a <op> k` for a green constant `k`.
 ///
 /// `OP_MUL`, `OP_ADD`, `OP_DIV` and `OP_MOD` have immediate forms, and those
@@ -2319,14 +2466,7 @@ fn emit_complement(ctx: &mut LowerCtxF, c: TReg) -> TReg {
 /// multiply-and-shift, so through a register every divide stayed a residual
 /// `int.udiv` call. Any other op still hoists.
 fn emit_int_bin_k(ctx: &mut LowerCtxF, op: i64, a: TReg, k: i64) -> TReg {
-    let imm_op = match op {
-        OP_MUL => Some(OP_MUL_IMM),
-        OP_ADD => Some(OP_ADD_IMM),
-        OP_DIV => Some(OP_DIV_K),
-        OP_MOD => Some(OP_MOD_K),
-        _ => None,
-    };
-    match imm_op {
+    match imm_form(op) {
         Some(imm_op) => {
             let d = ctx.fresh(ValType::Int);
             ctx.body
@@ -2770,7 +2910,7 @@ fn lower_int_uint_cmp(
         Some(_) => Ok(emit_bin(ctx, uop, lhs, rhs, ValType::Bool)),
         None => {
             let zero = emit_zero_const(ctx);
-            let sign = emit_bin(ctx, if and { OP_GE } else { OP_LT }, i, zero, ValType::Bool);
+            let sign = emit_cmp(ctx, if and { OP_GE } else { OP_LT }, i, zero, ValType::Bool);
             let cmp = emit_bin(ctx, uop, lhs, rhs, ValType::Bool);
             Ok(emit_bin(
                 ctx,
@@ -3548,7 +3688,7 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
                 // distinct string, not only the literals.
                 ctx.str_dict_required = true;
             }
-            return Ok(emit_bin(ctx, iop, a, b, ValType::Bool));
+            return Ok(emit_cmp(ctx, iop, a, b, ValType::Bool));
         }
         // One int and one uint operand: compare NUMERICALLY, which is neither
         // the signed nor the unsigned machine compare. The int side's sign
@@ -3619,10 +3759,9 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
             }
             _ => return Err(LowerError::unsupported("mixed-bank comparison")),
         };
-        let d = ctx.fresh(ValType::Bool);
-        ctx.body
-            .extend_from_slice(&[op, a.idx as i64, b.idx as i64, d.idx as i64]);
-        return Ok(d);
+        // `emit_cmp` and not the inline form: a float comparison has no
+        // immediate, so the two float arms above fall through it unchanged.
+        return Ok(emit_cmp(ctx, op, a, b, ValType::Bool));
     }
 
     // arithmetic — same-bank operands, same-bank result. No float modulo.
@@ -3764,6 +3903,51 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
                 ctx.body.push(OVF_FLAG_REG as i64);
             }
             return Ok(d);
+        }
+        // `+ - *` against a constant, for the same reason the divisor above
+        // rides in the instruction stream: the operand is green, so it costs no
+        // word of the register bank -- and a word of the bank is a word of the
+        // traced loop's virtualizable array, which the bridge that closes an
+        // element loop reloads once per ROW.
+        //
+        // A GUARDED position keeps the register form. What makes a trapping op
+        // total where no condition selects it is [`LowerCtxF::neutralize`]
+        // replacing its right operand with an identity element, and an
+        // immediate is not an operand a select can replace. `guard` is set only
+        // in the lowering that speculates safely, so testing it names exactly
+        // the positions that peer would have neutralized -- and the fast
+        // lowering still RECORDS the position, so the peer is still built.
+        let arith_kop = match name {
+            ops::ADD => Some(OP_ADD_OVF_K),
+            ops::SUBSTRACT => Some(OP_SUB_OVF_K),
+            ops::MULTIPLY => Some(OP_MUL_OVF_K),
+            _ => None,
+        }
+        .filter(|_| a.bank == ValType::Int && b.bank == ValType::Int && ctx.guard.is_none());
+        if let Some(kop) = arith_kop {
+            // `+` and `*` commute, overflow included, so a constant on either
+            // side reaches the stream. `-` does not, and `k - x` keeps both
+            // operands in registers.
+            let commutes = matches!(name, ops::ADD | ops::MULTIPLY);
+            let operand = match (ctx.const_of(b), ctx.const_of(a)) {
+                (Some(k), _) => Some((a, k)),
+                (None, Some(k)) if commutes => Some((b, k)),
+                _ => None,
+            };
+            if let Some((r, k)) = operand {
+                if ctx.guard_depth > 0 {
+                    ctx.has_guarded_trap = true;
+                }
+                let d = ctx.fresh(ValType::Int);
+                ctx.body.extend_from_slice(&[
+                    kop,
+                    r.idx as i64,
+                    k,
+                    d.idx as i64,
+                    OVF_FLAG_REG as i64,
+                ]);
+                return Ok(d);
+            }
         }
         match (a.bank, b.bank) {
             (ValType::Int, ValType::Int) => Ok(emit_trapping(ctx, iop, ValType::Int)),
@@ -5112,7 +5296,7 @@ fn lower_const_index(
         bank: ValType::Int,
         idx: OVF_FLAG_REG,
     };
-    let oob = emit_bin(ctx, OP_GE, kr, len, ValType::Bool);
+    let oob = emit_cmp(ctx, OP_GE, kr, len, ValType::Bool);
     ctx.body
         .extend_from_slice(&[OP_OR, trap.idx as i64, oob.idx as i64, trap.idx as i64]);
 
@@ -5227,7 +5411,7 @@ fn lower_divisibility(
         }
         let masked = emit_int_bin_k(ctx, OP_AND, a, mask);
         let zero = emit_int_const(ctx, 0);
-        return Ok(Some(emit_bin(ctx, iop, masked, zero, ValType::Bool)));
+        return Ok(Some(emit_cmp(ctx, iop, masked, zero, ValType::Bool)));
     }
     Ok(None)
 }

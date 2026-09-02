@@ -1986,7 +1986,10 @@ mod tests {
     /// have, trapping included: an overflow or a zero divisor is NOT folded.
     #[test]
     fn a_literal_comprehension_body_folds_its_constant_arithmetic() {
-        use crate::majit::bytecode::{OPERANDS, OP_ADD_OVF, OP_DIV_CHK, OP_GT, OP_MUL_OVF};
+        use crate::majit::bytecode::{
+            OPERANDS, OP_ADD_OVF, OP_ADD_OVF_K, OP_DIV_CHK, OP_DIV_CHK_K, OP_GT, OP_GT_K,
+            OP_MUL_OVF, OP_MUL_OVF_K,
+        };
         let s = schema(&[("x", ValType::Int)]);
         let x = vec![15i64];
         let batch = Batch::new(1).column("x", ColumnRef::Int(&x));
@@ -2001,11 +2004,14 @@ mod tests {
             }
             ops
         };
+        // Both spellings each time. An op whose constant operand rides in the
+        // word stream is a DIFFERENT opcode, so naming only the register form
+        // would let the immediate one satisfy "folded" without folding.
         for (src, absent) in [
-            ("[1, 2, 3, 4, 5].map(x, x * 2)", OP_MUL_OVF),
-            ("[1, 2, 3].map(x, x * 2 > 3)", OP_GT),
-            ("[1.5, 2.5].map(x, x * 2.0)", OP_MUL_OVF),
-            ("[1, 2, 3].map(x, x + 1 + x)", OP_ADD_OVF),
+            ("[1, 2, 3, 4, 5].map(x, x * 2)", [OP_MUL_OVF, OP_MUL_OVF_K]),
+            ("[1, 2, 3].map(x, x * 2 > 3)", [OP_GT, OP_GT_K]),
+            ("[1.5, 2.5].map(x, x * 2.0)", [OP_MUL_OVF, OP_MUL_OVF_K]),
+            ("[1, 2, 3].map(x, x + 1 + x)", [OP_ADD_OVF, OP_ADD_OVF_K]),
         ] {
             let program = Program::compile(src).unwrap();
             let batched =
@@ -2015,23 +2021,29 @@ mod tests {
             for tier in [Tier::Clean, Tier::Interpreter, Tier::Jit] {
                 assert_eq!(bound.collect_on(tier).unwrap(), walker, "{src} on {tier:?}");
             }
+            let ops = opcodes(&batched.lowered().body);
             assert!(
-                !opcodes(&batched.lowered().body).contains(&absent),
-                "{src}: the constant op was not folded: {:?}",
-                opcodes(&batched.lowered().body)
+                !absent.iter().any(|op| ops.contains(op)),
+                "{src}: the constant op was not folded: {ops:?}"
             );
         }
         // Where the tree-walker raises, the op stays and the row traps.
         for (src, kept) in [
-            ("[9223372036854775807].map(x, x + 1)", OP_ADD_OVF),
-            ("[1].map(x, x / 0)", OP_DIV_CHK),
+            (
+                "[9223372036854775807].map(x, x + 1)",
+                [OP_ADD_OVF, OP_ADD_OVF_K],
+            ),
+            // A ZERO divisor keeps the register form: only a nonzero constant
+            // divisor rides in the stream, the guard being what traps it.
+            ("[1].map(x, x / 0)", [OP_DIV_CHK, OP_DIV_CHK_K]),
         ] {
             let program = Program::compile(src).unwrap();
             assert!(program.execute(&ctx).is_err(), "{src}: the walker answers");
             let batched = BatchProgram::from_program(&program, &s).unwrap();
+            let ops = opcodes(&batched.lowered().body);
             assert!(
-                opcodes(&batched.lowered().body).contains(&kept),
-                "{src}: a trapping op was folded away"
+                kept.iter().any(|op| ops.contains(op)),
+                "{src}: a trapping op was folded away: {ops:?}"
             );
             let bound = batched.bind_per_row(&batch).unwrap();
             for tier in [Tier::Clean, Tier::Jit] {
@@ -2132,7 +2144,7 @@ mod tests {
     /// answer. It must still trap.
     #[test]
     fn a_zero_test_on_a_power_of_two_modulus_masks_and_agrees_with_the_walker() {
-        use crate::majit::bytecode::{OPERANDS, OP_AND, OP_MOD_CHK_K};
+        use crate::majit::bytecode::{OPERANDS, OP_AND_K, OP_MOD_CHK_K};
         let opcodes = |code: &[i64]| -> Vec<i64> {
             let mut pc = 0;
             let mut ops = Vec::new();
@@ -2161,7 +2173,8 @@ mod tests {
         // `masked` says whether the rewrite is expected to fire. The controls
         // are what keep the assertion able to fail: a non-power-of-two divisor,
         // a non-zero right-hand side, and a use of the REMAINDER rather than of
-        // its zero test all keep the sign round trip.
+        // its zero test all keep the sign round trip. The mask is an immediate
+        // (`OP_AND_K`): it is green by construction, so it takes no register.
         for (src, masked) in [
             ("xs.filter(x, x % 2 == 0)", true),
             ("xs.filter(x, x % 2 != 0)", true),
@@ -2183,7 +2196,7 @@ mod tests {
                 "{src}: wrong route: {ops:?}"
             );
             if masked {
-                assert!(ops.contains(&OP_AND), "{src}: no mask: {ops:?}");
+                assert!(ops.contains(&OP_AND_K), "{src}: no mask: {ops:?}");
             }
             let bound = batched.bind_per_row(&batch).unwrap();
             let walker = vec![program.execute(&ctx).unwrap()];
@@ -4010,6 +4023,138 @@ mod tests {
             words("at.getDate()") - words("at.getDayOfMonth()"),
             4,
             "one OP_ADD_IMM, and only for the 1-based reader"
+        );
+    }
+
+    /// A comparison against a literal answers what the tree-walker answers,
+    /// whichever side the literal is on.
+    ///
+    /// Only the RIGHT operand rides in the word stream, so a literal on the
+    /// left is emitted MIRRORED -- `5 < x` as `x > 5`. An ordering mirrored the
+    /// wrong way is not a slower answer, it is a wrong one on every row, and it
+    /// is wrong identically on all three tiers, so the walker has to be the
+    /// oracle rather than another tier.
+    #[test]
+    fn a_literal_operand_compares_the_same_on_either_side() {
+        let s = schema(&[("x", ValType::Int), ("t", ValType::Timestamp)]);
+        let xs: Vec<i64> = (-4..8).collect();
+        let ts: Vec<i64> = (0..xs.len() as i64)
+            .map(|i| 1_700_000_000_000_000_000 + i * 1_000_000_007)
+            .collect();
+        let batch = Batch::new(xs.len())
+            .column("x", ColumnRef::Int(&xs))
+            .column("t", ColumnRef::Timestamp(&ts));
+        let mut srcs: Vec<String> = Vec::new();
+        for op in ["==", "!=", "<", "<=", ">", ">="] {
+            for k in ["0", "3", "-2"] {
+                srcs.push(format!("x {op} {k}"));
+                srcs.push(format!("{k} {op} x"));
+            }
+            // The temporal banks are i64 nanoseconds and take the same signed
+            // ops, so a folded `timestamp(..)` is a pool constant too.
+            srcs.push(format!(r#"t {op} timestamp("2023-11-14T22:13:20Z")"#));
+        }
+        // The divisibility rewrite: a mask and a zero test, both immediates
+        // now, over dividends of both signs.
+        srcs.push("x % 2 == 0".to_string());
+        srcs.push("0 == x % 2".to_string());
+        srcs.push("x % 4 != 0".to_string());
+        // `+ - *` take the same treatment, and the first two commute, so a
+        // literal reaches the stream from either side there too. `k - x` is the
+        // control: subtraction does not commute and keeps both registers.
+        for k in ["3", "-2"] {
+            for op in ["+", "-", "*"] {
+                srcs.push(format!("x {op} {k}"));
+                srcs.push(format!("{k} {op} x"));
+            }
+        }
+        for src in &srcs {
+            let program = Program::compile(src).unwrap_or_else(|e| panic!("`{src}`: {e:?}"));
+            let batched = BatchProgram::from_program(&program, &s)
+                .unwrap_or_else(|e| panic!("`{src}`: {e:?}"));
+            let bound = batched.bind_per_row(&batch).unwrap();
+            let walker: Vec<Value> = (0..xs.len())
+                .map(|i| {
+                    let mut row = Context::default();
+                    row.add_variable_from_value("x", xs[i]);
+                    row.add_variable_from_value(
+                        "t",
+                        Value::Timestamp(
+                            chrono::DateTime::from_timestamp_nanos(ts[i]).fixed_offset(),
+                        ),
+                    );
+                    program.execute(&row).unwrap()
+                })
+                .collect();
+            for tier in [Tier::Clean, Tier::Interpreter, Tier::Jit] {
+                assert_eq!(
+                    bound.collect_on(tier).unwrap(),
+                    walker,
+                    "`{src}` on {tier:?}"
+                );
+            }
+        }
+
+        // The immediate forms still carry the trap word, so a row the walker
+        // raises on refuses on every tier rather than wrapping. An immediate
+        // that dropped its trap operand would answer the WRAPPED value here,
+        // and answer it fast.
+        let edge = [i64::MAX, i64::MIN];
+        let batch = Batch::new(edge.len()).column("x", ColumnRef::Int(&edge));
+        for src in ["x + 3", "3 + x", "x - 3", "x * 2", "-2 * x"] {
+            let program = Program::compile(src).unwrap();
+            let batched = BatchProgram::from_program(&program, &s).unwrap();
+            let bound = batched.bind_per_row(&batch).unwrap();
+            for tier in [Tier::Clean, Tier::Interpreter, Tier::Jit] {
+                assert!(
+                    matches!(bound.collect_on(tier), Err(BatchError::Trapped)),
+                    "`{src}` on {tier:?}: no trap"
+                );
+            }
+        }
+    }
+
+    /// A literal a comparison consumes costs no word of the register bank.
+    ///
+    /// The bank's width is the length of the array a traced loop carries, so it
+    /// is also how many `getarrayitem_gc_i` the BRIDGE that closes an element
+    /// loop runs before it can jump back -- paid once per ROW, where the
+    /// comparison itself is paid once per element. The two expressions differ
+    /// by exactly one DISTINCT literal and by nothing else: same op count, same
+    /// guards, same columns. A literal hoisted into a prelude register would
+    /// show up here as one word, and so would a literal whose load was left
+    /// behind after its reader took the immediate.
+    #[test]
+    fn a_compared_literal_costs_no_register() {
+        let s = schema(&[("x", ValType::Int)]);
+        let width = |src: &str| {
+            BatchProgram::compile(src, &s)
+                .unwrap_or_else(|e| panic!("`{src}`: {e:?}"))
+                .lowered
+                .batch_shape(true, BatchReduce::PerRow)
+                .seed
+                .num_int_regs()
+        };
+        assert_eq!(
+            width("x > 5 && x < 6"),
+            width("x > 5 && x < 5"),
+            "a second distinct literal, and no second word"
+        );
+        // The same claim where it is paid per row: an element loop's bridge
+        // reloads one word per register.
+        let l = schema(&[("nums[]", ValType::Int)]);
+        let elem = |src: &str| {
+            BatchProgram::compile(src, &l)
+                .unwrap_or_else(|e| panic!("`{src}`: {e:?}"))
+                .lowered
+                .batch_shape(true, BatchReduce::PerRow)
+                .seed
+                .num_int_regs()
+        };
+        assert_eq!(
+            elem("nums.exists(i, i > 5 && i < 6)"),
+            elem("nums.exists(i, i > 5 && i < 5)"),
+            "the same, inside a comprehension"
         );
     }
 
