@@ -102,7 +102,8 @@ fn as_string_literal(e: &IdedExpr) -> Option<&str> {
 /// schema would answer for that other one.
 fn is_cel_ident(name: &str) -> bool {
     let mut cs = name.chars();
-    cs.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+    cs.next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
         && cs.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
@@ -2605,11 +2606,7 @@ impl LowerCtxF<'_> {
         // Filtered on the bank as well, like `slot_path_of` below: the int and
         // float files number independently, so a register index alone names a
         // slot in either of them.
-        if let Some(slot) = self
-            .slots
-            .iter()
-            .find(|s| s.reg == r.idx && s.ty == r.bank)
-        {
+        if let Some(slot) = self.slots.iter().find(|s| s.reg == r.idx && s.ty == r.bank) {
             if let Some(k) = concat_slot_index(&slot.path) {
                 return Ok(ConcatSide::Derived(k));
             }
@@ -5461,12 +5458,8 @@ fn compile_list_comprehension_mode(
     // Both paths reach here, so the empty list answers zero without the guard
     // having had to seed anything: the cursor did not move.
     if let (AccuMode::Collect { cursor }, Some(start)) = (mode, cursor_start) {
-        ctx.body.extend_from_slice(&[
-            OP_SUB,
-            cursor as i64,
-            start.idx as i64,
-            accu.idx as i64,
-        ]);
+        ctx.body
+            .extend_from_slice(&[OP_SUB, cursor as i64, start.idx as i64, accu.idx as i64]);
     }
 
     ctx.locals.insert(comp.accu_var.clone(), accu);
