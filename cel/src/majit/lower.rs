@@ -5639,7 +5639,23 @@ fn compile_list_comprehension_mode(
             Some(start)
         }
         _ => {
-            emit_mov(ctx, init, accu);
+            // The starting value is a CONSTANT in every mode that has one --
+            // `false` for `exists`, `true` for `all`, `0` for a length -- and
+            // `const_reg` pools those in the prelude, where a register lives
+            // across both loops to be the source of one copy. Loading the word
+            // straight into the accumulator is the same one instruction a row
+            // and leaves the pooled register with no reader at all, which
+            // `drop_dead_loads` deletes before anything is coloured.
+            match ctx.const_of(init) {
+                Some(word) => {
+                    let op = match init.bank {
+                        ValType::Float => OP_LOAD_CONST_F,
+                        _ => OP_LOAD_CONST,
+                    };
+                    ctx.body.extend_from_slice(&[op, word, accu.idx as i64]);
+                }
+                None => emit_mov(ctx, init, accu),
+            }
             None
         }
     };

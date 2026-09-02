@@ -30,7 +30,19 @@ use cel::majit::lower::{BatchReduce, BatchShape};
 use cel::majit::lower::{Schema, ValType};
 use majit_metainterp::embed::Census;
 
-const ROWS: usize = 512;
+/// Rows a batch carries, overridable by `RCACC_ROWS`.
+///
+/// The default sits just past `trace_eagerness`, which is the threshold a
+/// guard must fail before it gets a bridge of its own -- so at the default a
+/// comprehension's row advance has only just stopped deopting, and what the
+/// steady state costs is a different question from what this census shows.
+/// Raising it is how that question is asked.
+fn rows() -> usize {
+    std::env::var("RCACC_ROWS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(512)
+}
 const LIST_LEN: i64 = 16;
 
 struct Data {
@@ -50,7 +62,7 @@ struct Data {
 
 impl Data {
     fn new() -> Self {
-        let n = ROWS;
+        let n = rows();
         Self {
             x: (0..n as i64).collect(),
             y: (0..n as i64).map(|i| i % 7 + 1).collect(),
@@ -93,7 +105,7 @@ impl Data {
     }
 
     fn batch(&self) -> Batch<'_> {
-        Batch::new(ROWS)
+        Batch::new(rows())
             .column("x", ColumnRef::Int(&self.x))
             .column("y", ColumnRef::Int(&self.y))
             .column("u", ColumnRef::UInt(&self.u))
