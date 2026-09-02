@@ -1138,11 +1138,15 @@ impl LoweredF {
         if track_index {
             load_const(&mut p, 0, r_i);
         } else {
-            // A loop that does not step the counter still has to end, so the
-            // counter's register carries the byte limit the close compares
-            // against. Reusing it rather than reserving one keeps the bank the
-            // same width, which is what the seed and `check_code` are sized on.
-            p.extend_from_slice(&[OP_MUL_IMM, r_n as i64, 8, r_i as i64]);
+            // A loop that does not step the counter still has to end, and what
+            // it ends on is the row count in BYTES. That goes over the seeded
+            // count rather than into the counter's register: written here, the
+            // counter is named by no instruction in the program at all, and
+            // `pack_file` colours only what the program names -- so this is a
+            // word of bank, and a reload a row in a comprehension's entry
+            // bridge, rather than the same width under another name. The count
+            // itself the epilogue divides back out, once, off the loop.
+            p.extend_from_slice(&[OP_MUL_IMM, r_n as i64, 8, r_n as i64]);
         }
         // The byte offset is a SECOND induction variable, stepped by its own
         // stride, rather than `i * 8` recomputed each row. Both forms cost the
@@ -1268,9 +1272,10 @@ impl LoweredF {
                 p.extend_from_slice(&[OP_ADD_IMM, r_ea as i64, 8, r_ea as i64]);
             }
             // Whichever variable the loop stepped is the one it closes on, and
-            // the other register holds that variable's limit.
-            let (limit, iv) = if track_index { (r_n, r_i) } else { (r_i, r_ea) };
-            p.extend_from_slice(&[OP_JUMP_IF_ABOVE, limit as i64, iv as i64, body_pc as i64]);
+            // `r_n` holds that variable's limit either way: the row count, or
+            // that same count in bytes.
+            let iv = if track_index { r_i } else { r_ea };
+            p.extend_from_slice(&[OP_JUMP_IF_ABOVE, r_n as i64, iv as i64, body_pc as i64]);
         }
         // Publish the overflow flag. Outside the loop, so it costs the traced
         // body nothing and runs once when the back-edge guard finally exits.
@@ -1282,14 +1287,20 @@ impl LoweredF {
         match (reduce, self.result_bank) {
             (BatchReduce::Sum, ValType::Float) => p.extend_from_slice(&[OP_RETURN_F, f_acc as i64]),
             (BatchReduce::Sum, _) => p.extend_from_slice(&[OP_RETURN, r_acc as i64]),
-            // Neither the one-row form nor a loop that never stepped the
-            // counter has an `r_i` holding a count -- the first stores at
-            // offset zero and stops, the second carries a byte limit there.
-            // Both wrote every seeded row, so the seeded count is the answer,
-            // and it is the same number a stepping counter ends at.
-            (BatchReduce::PerRow, _) if single_row || !track_index => {
-                p.extend_from_slice(&[OP_RETURN, r_n as i64])
+            // The one-row form stored at offset zero and stopped, so its seeded
+            // count is untouched and is the answer.
+            (BatchReduce::PerRow, _) if single_row => p.extend_from_slice(&[OP_RETURN, r_n as i64]),
+            // A loop that never stepped the counter scaled that seeded count to
+            // bytes to close on it, so the count is the limit back down. This
+            // sits after the back edge, so it is one instruction a BATCH and
+            // none a row; the divisor is a positive power of two over a
+            // non-negative dividend, which is what `OP_DIVN_K` is for.
+            (BatchReduce::PerRow, _) if !track_index => {
+                p.extend_from_slice(&[OP_DIVN_K, r_n as i64, 8, r_n as i64]);
+                p.extend_from_slice(&[OP_RETURN, r_n as i64]);
             }
+            // The counter was stepped, and a loop that reached its back edge
+            // stepped it once a row.
             (BatchReduce::PerRow, _) => p.extend_from_slice(&[OP_RETURN, r_i as i64]),
         }
         // Only a per-row run writes elements; a sum never reaches them.
