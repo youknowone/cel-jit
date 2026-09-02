@@ -25,7 +25,7 @@ use std::collections::BTreeMap;
 
 use cel::majit::batch::{Batch, BatchProgram, ColumnRef, Tier};
 use cel::majit::bytecode::float_bank::{reset_jit_stats, reset_persistent_state};
-use cel::majit::bytecode::{Operand, OPERANDS, OP_LOAD_CONST};
+use cel::majit::bytecode::{Operand, OPERANDS, OP_LOAD_CONST, OP_MUL_IMM};
 use cel::majit::lower::{BatchReduce, BatchShape};
 use cel::majit::lower::{Schema, ValType};
 use majit_metainterp::embed::Census;
@@ -240,6 +240,15 @@ fn census(label: &str, src: &str, data: &Data) -> Vec<Row> {
     let shape = lowered.lowered().batch_shape(true, BatchReduce::PerRow);
     let regs = shape.seed.num_int_regs();
     let raw = lowered.lowered().num_int_regs;
+    // Whether the row loop steps its COUNTER as well as its byte offset -- an
+    // instruction a row, on top of the body. The shape's first word decides it
+    // and nothing else can be there: the counter's register is either zeroed to
+    // count from, or seeded with the byte limit the close tests against.
+    let ti = match shape.code.first().copied() {
+        Some(OP_LOAD_CONST) => "i+",
+        Some(OP_MUL_IMM) => "  ",
+        other => panic!("a row loop opens on the counter's register, not {other:?}"),
+    };
     // `RCACC_REGS=<label>` profiles the packed int bank: what writes each
     // register and what reads it. The bridge reloads one word per register, so
     // a register whose whole profile is "written once before the loop, read
@@ -280,7 +289,7 @@ fn census(label: &str, src: &str, data: &Data) -> Vec<Row> {
         let guards = sum_of("Guard");
         let flag = if calls > 0 { "CALL" } else { "    " };
         println!(
-            "{flag} {label:28} loop[{i}] body={:3} calls={calls} guards={guards} regs={raw:2}->{regs:2}  {src}",
+            "{flag} {label:28} loop[{i}] body={:3} calls={calls} guards={guards} regs={raw:2}->{regs:2} {ti}  {src}",
             body.len()
         );
         rows.push(Row {

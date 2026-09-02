@@ -3943,7 +3943,7 @@ mod tests {
     /// tests. The other is stepped only when something reads its value.
     #[test]
     fn the_row_counter_is_stepped_only_where_something_reads_it() {
-        use crate::majit::bytecode::{OPERANDS, OP_ADD_IMM, OP_MUL_IMM};
+        use crate::majit::bytecode::{OPERANDS, OP_ADD_IMM, OP_MUL_IMM, OP_RETURN};
         // None of the expressions below multiplies or adds a constant, so every
         // `OP_MUL_IMM` and `OP_ADD_IMM` counted here belongs to the loop.
         let steps = |cols: &[(&str, ValType)], src: &str, reduce: BatchReduce| {
@@ -3988,8 +3988,39 @@ mod tests {
             (1, 0)
         );
 
-        // A per-row run returns the counter as its row count.
-        assert_eq!(steps(int, "a > 0", BatchReduce::PerRow), (2, 0));
+        // A per-row run stores through the byte offset like every column read
+        // does, so it reads the counter no more than a summing run does: the
+        // count it returns is the seeded row count, and the shape is the sum's.
+        assert_eq!(steps(int, "a > 0", BatchReduce::PerRow), (1, 1));
+        // The bool column still reads the counter, per-row or not.
+        assert_eq!(
+            steps(
+                &[("a", ValType::Int), ("b", ValType::Bool)],
+                "a > 0 && b",
+                BatchReduce::PerRow
+            ),
+            (2, 0)
+        );
+
+        // WHICH register the per-row form returns. Nothing in the crate reads a
+        // per-row run's return value -- the answer is in the output buffer, and
+        // `evaluate_raw` discards the word -- so naming the wrong register here
+        // would return `n * 8` forever without failing anything. The counter's
+        // register holds that byte limit; the row count is the register the
+        // limit was COMPUTED FROM, so the check is that the trailing `OP_RETURN`
+        // names the multiply's source and not its destination.
+        let s = schema(int);
+        let p = BatchProgram::compile("a > 0", &s).expect("`a > 0`");
+        let code = &p.lowered.batch_shape(true, BatchReduce::PerRow).code;
+        let mul = (0..code.len())
+            .find(|&i| code[i] == OP_MUL_IMM && code[i + 2] == 8)
+            .expect("the counter's register is seeded with the byte limit");
+        let (r_n, r_i) = (code[mul + 1], code[mul + 3]);
+        assert_eq!(
+            code[code.len() - 2..],
+            [OP_RETURN, r_n],
+            "the row count, not the byte limit in r{r_i}"
+        );
     }
 
     /// The civil accessors answer in the base the helper computes, and each

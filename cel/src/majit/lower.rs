@@ -1104,17 +1104,19 @@ impl LoweredF {
 
         // Whether the row COUNTER is stepped at all. The back edge closes on
         // either induction variable, so the counter earns its step only where
-        // something else reads its value: a `bool` column addresses by it, a
-        // `PerRow` run returns it as the count it wrote, and a shape with no
-        // byte offset has nothing else to close on. Where none of the three
-        // holds the offset carries the loop alone, and the step is dead work a
-        // row. micronumpy spells the same rule as a flag its iterator carries —
+        // something else reads its value: a `bool` column addresses by it, and
+        // a shape with no byte offset has nothing else to close on. Where
+        // neither holds, the offset carries the loop alone and the step is dead
+        // work a row. A `PerRow` run is not a third reason: its output store
+        // addresses by the byte offset like every column read does, and the
+        // count it returns is the seeded row count -- which is the number a
+        // loop that reached its back edge left in the counter anyway.
+        // micronumpy spells the same rule as a flag its iterator carries —
         // `iterators.py:154-155` steps the index under `if self.track_index:`,
         // and `loop.py:24` clears it on the operand whose position nobody asks
         // for.
         let track_index = single_row
             || !needs_ea
-            || reduce == BatchReduce::PerRow
             || self
                 .slots
                 .iter()
@@ -1280,9 +1282,14 @@ impl LoweredF {
         match (reduce, self.result_bank) {
             (BatchReduce::Sum, ValType::Float) => p.extend_from_slice(&[OP_RETURN_F, f_acc as i64]),
             (BatchReduce::Sum, _) => p.extend_from_slice(&[OP_RETURN, r_acc as i64]),
-            // The one-row form never stepped `r_i`; the count it wrote is the
-            // seeded row count, which is what the loop's `r_i` ends at.
-            (BatchReduce::PerRow, _) if single_row => p.extend_from_slice(&[OP_RETURN, r_n as i64]),
+            // Neither the one-row form nor a loop that never stepped the
+            // counter has an `r_i` holding a count -- the first stores at
+            // offset zero and stops, the second carries a byte limit there.
+            // Both wrote every seeded row, so the seeded count is the answer,
+            // and it is the same number a stepping counter ends at.
+            (BatchReduce::PerRow, _) if single_row || !track_index => {
+                p.extend_from_slice(&[OP_RETURN, r_n as i64])
+            }
             (BatchReduce::PerRow, _) => p.extend_from_slice(&[OP_RETURN, r_i as i64]),
         }
         // Only a per-row run writes elements; a sum never reaches them.
