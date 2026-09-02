@@ -2373,8 +2373,19 @@ fn emit_nonneg_mod_k(ctx: &mut LowerCtxF, a: TReg, k: i64) -> TReg {
     d
 }
 
-/// Howard Hinnant's `civil_from_days`: days since 1970-01-01 to
-/// `(year, month 0-11, day 0-30)`.
+/// What [`emit_civil_from_days`] answers: the two fields every reader of a
+/// calendar date can have for free, and the two intermediates the third —
+/// [`emit_civil_day0`] — needs.
+struct Civil {
+    year: TReg,
+    month0: TReg,
+    /// Days since 1 March, and the March-based month index `(5*doy + 2)/153`.
+    doy: TReg,
+    mp: TReg,
+}
+
+/// Howard Hinnant's `civil_from_days`: days since 1970-01-01 to a year and a
+/// month 0-11, plus what the day of month is derived from.
 ///
 /// The month and day come back 0-BASED because that is the base most of the
 /// readers want: `getMonth` and `getDayOfMonth` are 0-based and would each
@@ -2385,13 +2396,14 @@ fn emit_nonneg_mod_k(ctx: &mut LowerCtxF, a: TReg, k: i64) -> TReg {
 /// optimizer with two constants to fold. It survives into the compiled trace,
 /// which is why the base is chosen here rather than left to a rewrite rule.
 ///
-/// Every division below has a non-negative dividend, so truncation is the floor
+/// Every division here and in [`emit_civil_day0`] has a non-negative dividend,
+/// so truncation is the floor
 /// the algorithm calls for and [`OP_DIVN_K`] is the instruction that carries
 /// that claim: an i64-nanosecond instant only spans
 /// ~1678-2262, which keeps `days` inside ±106752 and `z = days + 719468` inside
 /// [612716, 826220]. A timestamp outside that range cannot exist in this VM —
 /// the column payload is i64 nanos.
-fn emit_civil_from_days(ctx: &mut LowerCtxF, days: TReg) -> (TReg, TReg, TReg) {
+fn emit_civil_from_days(ctx: &mut LowerCtxF, days: TReg) -> Civil {
     let z = emit_int_bin_k(ctx, OP_ADD, days, 719_468);
     let era = emit_nonneg_div_k(ctx, z, 146_097);
     let era_days = emit_int_bin_k(ctx, OP_MUL, era, 146_097);
@@ -2416,14 +2428,10 @@ fn emit_civil_from_days(ctx: &mut LowerCtxF, days: TReg) -> (TReg, TReg, TReg) {
     let s2 = emit_int_bin(ctx, OP_SUB, s1, y100);
     let doy = emit_int_bin(ctx, OP_SUB, doe, s2);
 
-    // mp = (5*doy + 2)/153 ; day0 = doy - (153*mp + 2)/5
+    // mp = (5*doy + 2)/153
     let d5 = emit_int_bin_k(ctx, OP_MUL, doy, 5);
     let d5p2 = emit_int_bin_k(ctx, OP_ADD, d5, 2);
     let mp = emit_nonneg_div_k(ctx, d5p2, 153);
-    let m153 = emit_int_bin_k(ctx, OP_MUL, mp, 153);
-    let m153p2 = emit_int_bin_k(ctx, OP_ADD, m153, 2);
-    let month_start = emit_nonneg_div_k(ctx, m153p2, 5);
-    let day0 = emit_int_bin(ctx, OP_SUB, doy, month_start);
 
     // month0 = mp + (mp < 10 ? 2 : -10), written as mp + 2 - 12*(mp >= 10) so
     // the select is arithmetic on a 0/1 comparison rather than a branch.
@@ -2436,7 +2444,28 @@ fn emit_civil_from_days(ctx: &mut LowerCtxF, days: TReg) -> (TReg, TReg, TReg) {
     // calendar year: year = year_of_era + (month0 <= 1).
     let le1 = emit_int_bin_k(ctx, OP_LE, month0, 1);
     let year = emit_int_bin(ctx, OP_ADD, year_of_era, le1);
-    (year, month0, day0)
+    Civil {
+        year,
+        month0,
+        doy,
+        mp,
+    }
+}
+
+/// Day of month, 0-based: `day0 = doy - (153*mp + 2)/5`.
+///
+/// Emitted apart from the rest of `civil_from_days` because it is the one
+/// answer that costs a DIVISION, and a division is not free where its quotient
+/// is dead: the non-negativity claim [`OP_DIVN_K`] rests on is a guard, and the
+/// backend skips only operations that have no side effect
+/// (`backend/x86/regalloc.py:383-386`). The year and the month it shares the
+/// chain with are plain arithmetic, so a reader that takes only those pays
+/// nothing for the ones it leaves.
+fn emit_civil_day0(ctx: &mut LowerCtxF, c: &Civil) -> TReg {
+    let m153 = emit_int_bin_k(ctx, OP_MUL, c.mp, 153);
+    let m153p2 = emit_int_bin_k(ctx, OP_ADD, m153, 2);
+    let month_start = emit_nonneg_div_k(ctx, m153p2, 5);
+    emit_int_bin(ctx, OP_SUB, c.doy, month_start)
 }
 
 /// Days since the Unix epoch of 1 January of `year` — Hinnant's
@@ -2938,19 +2967,23 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
                             let shifted = emit_int_bin_k(ctx, OP_ADD, days, 4 + 106_757);
                             emit_nonneg_mod_k(ctx, shifted, 7)
                         }
-                        "getFullYear" => emit_civil_from_days(ctx, days).0,
+                        "getFullYear" => emit_civil_from_days(ctx, days).year,
                         // `month0()` / `day0()` are 0-based, which is the base
                         // the helper answers in; `day()` is the one that adds.
-                        "getMonth" => emit_civil_from_days(ctx, days).1,
+                        "getMonth" => emit_civil_from_days(ctx, days).month0,
                         "getDate" => {
-                            let (_, _, day0) = emit_civil_from_days(ctx, days);
+                            let c = emit_civil_from_days(ctx, days);
+                            let day0 = emit_civil_day0(ctx, &c);
                             emit_int_bin_k(ctx, OP_ADD, day0, 1)
                         }
-                        "getDayOfMonth" => emit_civil_from_days(ctx, days).2,
+                        "getDayOfMonth" => {
+                            let c = emit_civil_from_days(ctx, days);
+                            emit_civil_day0(ctx, &c)
+                        }
                         // 0-based: the walker subtracts month0 and day0 to reach
                         // 1 January of the same year and takes the day span.
                         "getDayOfYear" => {
-                            let (year, _, _) = emit_civil_from_days(ctx, days);
+                            let year = emit_civil_from_days(ctx, days).year;
                             let jan1 = emit_days_of_jan1(ctx, year);
                             emit_int_bin(ctx, OP_SUB, days, jan1)
                         }
