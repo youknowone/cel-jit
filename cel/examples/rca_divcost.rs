@@ -9,10 +9,24 @@
 //! cargo run --release --package cel --no-default-features \
 //!   --features regex,chrono,jit-cranelift --example rca_divcost
 //! ```
+//!
+//! `RCADC_ONLY=<label>` keeps one case. The timing does not need it -- the
+//! cases are interleaved precisely so they can share a process -- but reading
+//! a compiled loop out of `MAJIT_LOG=1` does: that log names no case, so the
+//! only way to say WHICH loop a `p2[i]:` block belongs to is to leave one
+//! program in the process.
 
 use cel::majit::batch::{Batch, BatchProgram, ColumnRef, Tier};
 use cel::majit::bytecode::float_bank::reset_persistent_state;
 use cel::majit::lower::{Schema, ValType};
+
+/// The cases `RCADC_ONLY` leaves, or all of them when it is unset.
+fn selected<'a>(cases: &[(&'a str, &'a str)]) -> Vec<(&'a str, &'a str)> {
+    match std::env::var("RCADC_ONLY") {
+        Ok(only) => cases.iter().copied().filter(|(l, _)| *l == only).collect(),
+        Err(_) => cases.to_vec(),
+    }
+}
 
 fn main() {
     let n: i64 = std::env::var("RCADC_N")
@@ -31,14 +45,14 @@ fn main() {
             fields: vec![(None, ColumnRef::Int(&elems))],
         },
     );
-    let cases = [
+    let cases = selected(&[
         ("map", "list.map(x, x * 2)"),
         ("div2", "list.map(x, x / 2)"),
         ("div3", "list.map(x, x / 3)"),
         ("mod3", "list.map(x, x % 3)"),
         ("mod2f", "list.filter(x, x % 2 == 0)"),
         ("mod3f", "list.filter(x, x % 3 == 0)"),
-    ];
+    ]);
     let lowered: Vec<_> = cases
         .iter()
         .map(|(_, src)| BatchProgram::compile(src, &schema).expect("lowers"))
@@ -107,12 +121,19 @@ fn temporal(rows: usize, rounds: usize, calls: usize) {
         .column("x".to_string(), ColumnRef::Int(&xs))
         .column("y".to_string(), ColumnRef::Int(&ys))
         .column("yodd".to_string(), ColumnRef::Int(&yodds));
-    let cases = [
+    let cases = selected(&[
         ("ctl", "x + 1"),
         ("hours", "t.getHours()"),
         ("minutes", "t.getMinutes()"),
         ("seconds", "t.getSeconds()"),
+        // The four calendar readers of one `civil_from_days`, which is where
+        // the accessor family's divisions are concentrated. They differ in
+        // which of that function's three answers they read, so together they
+        // price what the answers a reader does NOT take cost it.
+        ("fullyear", "t.getFullYear()"),
+        ("month", "t.getMonth()"),
         ("dayofmonth", "t.getDayOfMonth()"),
+        ("dayofyear", "t.getDayOfYear()"),
         ("dayofweek", "t.getDayOfWeek()"),
         // The residual-call question, with its two controls: `divk` is the same
         // division with the divisor in the instruction stream, which the
@@ -125,7 +146,7 @@ fn temporal(rows: usize, rounds: usize, calls: usize) {
         ("modvar", "x % y"),
         ("mododd", "x % yodd"),
         ("divodd", "x / yodd"),
-    ];
+    ]);
     let lowered: Vec<_> = cases
         .iter()
         .map(|(_, src)| BatchProgram::compile(src, &schema).expect("lowers"))
