@@ -708,6 +708,18 @@ impl BatchSeed {
         self.scalar_regs.len()
     }
 
+    /// How wide the int bank is — the width [`pack_file`] settled on.
+    ///
+    /// Not merely a memory size. It is the length of the array a traced run
+    /// carries, so it is the number of words a compiled loop takes as inputargs
+    /// and the number a BRIDGE materializes before it can jump to that loop's
+    /// label. A comprehension pays the bridge once per ROW and the loop once
+    /// per element, so a word of bank the program does not need is paid at the
+    /// row rate rather than the element rate.
+    pub fn num_int_regs(&self) -> usize {
+        self.num_int_regs
+    }
+
     /// Build one batch's initial int register bank: the row count, the trap
     /// word's address, each column's base address and each broadcast scalar in
     /// its own register, every other register zero.

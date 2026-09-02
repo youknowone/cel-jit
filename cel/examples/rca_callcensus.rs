@@ -25,6 +25,8 @@ use std::collections::BTreeMap;
 
 use cel::majit::batch::{Batch, BatchProgram, ColumnRef, Tier};
 use cel::majit::bytecode::float_bank::{reset_jit_stats, reset_persistent_state};
+use cel::majit::bytecode::{Operand, OPERANDS, OP_LOAD_CONST};
+use cel::majit::lower::{BatchReduce, BatchShape};
 use cel::majit::lower::{Schema, ValType};
 use majit_metainterp::embed::Census;
 
@@ -142,6 +144,65 @@ fn print_hist(row: &Row) {
     }
 }
 
+/// Per-register def/use profile of one packed int bank.
+///
+/// Each register is one word of the array a traced loop carries, so it is also
+/// one `getarrayitem_gc_i` in every bridge that jumps to that loop. The columns
+/// say where the word comes from: a register written only before `body_pc` is
+/// loop-invariant, and one whose only writer is `OP_LOAD_CONST` is a literal
+/// the word stream could have carried as an immediate instead.
+fn profile_regs(label: &str, shape: &BatchShape, width: usize) {
+    let p = &shape.code;
+    let mut writes = vec![0usize; width];
+    let mut reads = vec![0usize; width];
+    let mut const_written = vec![0usize; width];
+    let mut written_before = vec![0usize; width];
+    // The loop header is the target of the closing back edge.
+    let mut header = 0usize;
+    let mut at = 0usize;
+    let mut decoded: Vec<(usize, i64)> = Vec::new();
+    while at < p.len() {
+        decoded.push((at, p[at]));
+        for (j, role) in OPERANDS[p[at] as usize].iter().enumerate() {
+            if *role == Operand::Target {
+                header = p[at + 1 + j] as usize;
+            }
+        }
+        at += 1 + OPERANDS[p[at] as usize].len();
+    }
+    for &(at, op) in &decoded {
+        for (j, role) in OPERANDS[op as usize].iter().enumerate() {
+            let w = p[at + 1 + j] as usize;
+            match role {
+                Operand::Int => reads[w] += 1,
+                Operand::IntOut | Operand::IntTrap => {
+                    writes[w] += 1;
+                    if at < header {
+                        written_before[w] += 1;
+                    }
+                    if op == OP_LOAD_CONST {
+                        const_written[w] += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    println!("== {label} int bank: {width} words, loop header at {header}");
+    for r in 0..width {
+        let kind = if writes[r] == 0 {
+            "SEEDED"
+        } else if const_written[r] > 0 && writes[r] == const_written[r] {
+            "CONST "
+        } else if written_before[r] == writes[r] {
+            "INVAR "
+        } else {
+            "      "
+        };
+        println!("   r{r:<3} {kind} writes={} reads={}", writes[r], reads[r]);
+    }
+}
+
 /// One expression's census: one [`Row`] per compiled loop.
 fn census(label: &str, src: &str, data: &Data) -> Vec<Row> {
     let schema = data.schema();
@@ -172,6 +233,19 @@ fn census(label: &str, src: &str, data: &Data) -> Vec<Row> {
     if loops.is_empty() {
         println!("-- {label:28} NO LOOP   {src}");
         return Vec::new();
+    }
+    // The int bank's width, which is what a bridge reloads before it can jump
+    // to the element loop's label. Printed beside the loops so the reload count
+    // in a dump can be read against the number the lowering actually asked for.
+    let shape = lowered.lowered().batch_shape(true, BatchReduce::PerRow);
+    let regs = shape.seed.num_int_regs();
+    let raw = lowered.lowered().num_int_regs;
+    // `RCACC_REGS=<label>` profiles the packed int bank: what writes each
+    // register and what reads it. The bridge reloads one word per register, so
+    // a register whose whole profile is "written once before the loop, read
+    // once inside it" is a constant the word stream could have carried.
+    if std::env::var("RCACC_REGS").is_ok_and(|d| d == label) {
+        profile_regs(label, shape, regs);
     }
     // `RCACC_DUMP=<label>` prints the whole trace, `Label` markers included.
     // The histogram cannot answer where the body starts when a trace holds more
@@ -206,7 +280,7 @@ fn census(label: &str, src: &str, data: &Data) -> Vec<Row> {
         let guards = sum_of("Guard");
         let flag = if calls > 0 { "CALL" } else { "    " };
         println!(
-            "{flag} {label:28} loop[{i}] body={:3} calls={calls} guards={guards}  {src}",
+            "{flag} {label:28} loop[{i}] body={:3} calls={calls} guards={guards} regs={raw:2}->{regs:2}  {src}",
             body.len()
         );
         rows.push(Row {
@@ -226,6 +300,10 @@ fn main() {
     let data = Data::new();
     let corpus: &[(&str, &str)] = &[
         ("int/add", "x + y"),
+        ("probe/one_const", "nums.exists(i, i > 5 && i < 5)"),
+        ("probe/two_const", "nums.exists(i, i > 5 && i < 6)"),
+        ("probe/one_const_s", "x > 5 && x < 5"),
+        ("probe/two_const_s", "x > 5 && x < 6"),
         ("int/mul_add", "x * 3 + 1"),
         ("int/sub", "x - y * 2"),
         ("int/neg", "-x"),
