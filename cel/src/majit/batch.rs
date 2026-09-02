@@ -4114,6 +4114,47 @@ mod tests {
         }
     }
 
+    /// A program with no trapping op publishes no trap.
+    ///
+    /// The flag and the seeded word holding the address it is published through
+    /// are two words of the register bank -- two `getarrayitem_gc_i` per row in
+    /// a comprehension's bridge -- and no comparison can set the flag, so a
+    /// predicate made of comparisons owes both to nobody. The controls are the
+    /// checked operators: `+` on `int` traps, and so does an index, which sets
+    /// the same flag when it is out of range.
+    #[test]
+    fn a_program_that_cannot_trap_publishes_no_trap() {
+        use crate::majit::bytecode::{OPERANDS, OP_TRAP_STORE};
+        let s = schema(&[("x", ValType::Int), ("nums[]", ValType::Int)]);
+        let publishes = |src: &str| {
+            let batched =
+                BatchProgram::compile(src, &s).unwrap_or_else(|e| panic!("`{src}`: {e:?}"));
+            let code = batched
+                .lowered
+                .batch_shape(true, BatchReduce::PerRow)
+                .code
+                .clone();
+            let mut pc = 0;
+            let mut found = false;
+            while pc < code.len() {
+                found |= code[pc] == OP_TRAP_STORE;
+                pc += 1 + OPERANDS[code[pc] as usize].len();
+            }
+            found
+        };
+        for src in [
+            "x > 5",
+            "x > 5 && x < 9",
+            "nums.filter(i, i > 3)",
+            "nums.exists(i, i % 2 == 0)",
+        ] {
+            assert!(!publishes(src), "`{src}`: nothing here can trap");
+        }
+        for src in ["x + 1", "x * 2 > 4", "nums[3] > 0", "nums.map(i, i * 2)"] {
+            assert!(publishes(src), "`{src}`: the flag is not published");
+        }
+    }
+
     /// A literal a comparison consumes costs no word of the register bank.
     ///
     /// The bank's width is the length of the array a traced loop carries, so it

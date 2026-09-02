@@ -678,8 +678,11 @@ pub struct ListOutput {
 pub struct BatchSeed {
     /// Register holding the row count.
     r_n: usize,
-    /// Register holding the overflow trap word's address.
-    r_trap: usize,
+    /// Register holding the overflow trap word's address, for a program that
+    /// has something to publish. `None` where no instruction names
+    /// [`OVF_FLAG_REG`]: such a program cannot trap, so the caller's word --
+    /// which it zeroed before the run -- already holds the answer.
+    r_trap: Option<usize>,
     /// Register holding the output buffer's base address, under
     /// [`BatchReduce::PerRow`]. Data like any column base, so it is seeded and
     /// never an immediate.
@@ -771,7 +774,9 @@ impl BatchSeed {
         assert!(n >= 1, "batch seed: n must be >= 1 (do-while back-edge)");
         let mut regs = vec![0i64; self.num_int_regs];
         regs[self.r_n] = n;
-        regs[self.r_trap] = trap_addr;
+        if let Some(reg) = self.r_trap {
+            regs[reg] = trap_addr;
+        }
         for (&base, &reg) in bases.iter().zip(&self.base_regs) {
             regs[reg] = base;
         }
@@ -1115,6 +1120,15 @@ impl LoweredF {
                 .iter()
                 .any(|slot| slot.kind == SlotKind::Row && slot.ty == ValType::Bool);
 
+        // Whether anything in this program can trap. `LowerCtxF::fresh` never
+        // hands out `OVF_FLAG_REG`, so an operand naming that register IS a
+        // trapping op and a body with none of them cannot set the flag. Such a
+        // program owes no zeroing, no epilogue store and no seeded register for
+        // the address to store through -- two words of bank between them, on
+        // exactly the comparisons a comprehension's predicate is made of.
+        let flag_used = names_trap_flag(&self.body) || names_trap_flag(&self.prelude);
+        let publish_trap = with_trap && flag_used;
+
         let mut p = Vec::new();
         let load_const = |p: &mut Vec<i64>, imm: i64, dst: usize| {
             p.extend_from_slice(&[OP_LOAD_CONST, imm, dst as i64]);
@@ -1160,7 +1174,9 @@ impl LoweredF {
         // Overflow trap: the flag starts clear. Where it is published is data,
         // so the address arrives in a seeded register rather than as an
         // immediate, and the epilogue stores through it once the loop is done.
-        load_const(&mut p, 0, OVF_FLAG_REG);
+        if flag_used {
+            load_const(&mut p, 0, OVF_FLAG_REG);
+        }
         // The row count and every column base are data as well, and reach the
         // program the same way, so the words emitted below are identical for
         // every batch of this shape. Each base is still a loop-invariant int
@@ -1256,7 +1272,7 @@ impl LoweredF {
         }
         // Publish the overflow flag. Outside the loop, so it costs the traced
         // body nothing and runs once when the back-edge guard finally exits.
-        if with_trap {
+        if publish_trap {
             p.extend_from_slice(&[OP_TRAP_STORE, r_trap as i64, OVF_FLAG_REG as i64]);
         }
         // A `PerRow` loop's answer is in the output buffer; what it returns is
@@ -1284,8 +1300,9 @@ impl LoweredF {
         // the packer's answer, not the lowering's: the words are rewritten in
         // place, so the seed has to be rewritten with them or it would fill
         // registers the program no longer reads.
-        let seeded: Vec<usize> = [r_n, r_trap]
+        let seeded: Vec<usize> = [Some(r_n), publish_trap.then_some(r_trap)]
             .into_iter()
+            .flatten()
             .chain(r_out)
             .chain(base_regs.iter().copied())
             .chain(scalar_regs.iter().copied())
@@ -1309,7 +1326,7 @@ impl LoweredF {
             num_float_regs: floats.width,
             seed: BatchSeed {
                 r_n: ints.of(r_n),
-                r_trap: ints.of(r_trap),
+                r_trap: publish_trap.then(|| ints.of(r_trap)),
                 r_out: r_out.map(|r| ints.of(r)),
                 list_out_regs: list_out_regs.iter().map(|&r| ints.of(r)).collect(),
                 base_regs: base_regs.iter().map(|&r| ints.of(r)).collect(),
@@ -1360,6 +1377,22 @@ fn decode(p: &[i64]) -> Vec<Decoded> {
         at += 1 + ops.len();
     }
     out
+}
+
+/// Whether `words` names the overflow/bounds trap flag.
+///
+/// [`LowerCtxF::fresh`] allocates above [`OVF_FLAG_REG`] and never hands it
+/// out, so the register is the flag and nothing else, and an operand naming it
+/// is a trapping op. `Imm` and `Target` operands are skipped for the same
+/// reason `decode` exists: a word that is not a register may hold 0 without
+/// meaning register 0.
+fn names_trap_flag(words: &[i64]) -> bool {
+    decode(words).iter().any(|d| {
+        d.ops.iter().enumerate().any(|(j, role)| {
+            matches!(role, Operand::Int | Operand::IntOut | Operand::IntTrap)
+                && words[d.at + 1 + j] == OVF_FLAG_REG as i64
+        })
+    })
 }
 
 /// Delete the constant loads whose register nothing reads, rewriting the jump
