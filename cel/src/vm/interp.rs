@@ -34,7 +34,7 @@ use super::opcode::OpCode;
 use crate::context::Context;
 use crate::objects::{
     as_optional, binary_values, compare_values, optional_none, optional_of, value_contains,
-    value_field, value_index, value_iter, value_key, value_negate, Key, Map,
+    value_field, value_index, value_iter, value_key, value_negate, Key, ListStorage, Map,
 };
 use crate::{ExecutionError, Value};
 
@@ -379,6 +379,18 @@ pub fn map_loop_is_fusable(code: &CelCode) -> bool {
 /// documentation.
 enum Operand {
     Value(Value),
+    /// A list being built, before its first element decides a strategy: the
+    /// capacity that first append reserves. `EmptyListStrategy`.
+    EmptyList(usize),
+    /// A list being built whose every element so far is an integer, as a
+    /// buffer of words: a quarter of the writes of a boxed buffer, nothing to
+    /// drop element by element when the list goes away, and closed as a
+    /// [`ListStorage::Ints`], which every consumer of a list reads through
+    /// the same accessors as a boxed one. `IntegerListStrategy`. The first
+    /// element that is not an integer boxes what was collected so far, once,
+    /// into [`Operand::List`].
+    Ints(Vec<i64>),
+    /// A list being built, boxed. `ObjectListStrategy`.
     List(Vec<Value>),
     /// Behind a pointer because an inline [`HashMap`] is 48 bytes and would
     /// set the width of every entry on the stack, including the
@@ -1029,6 +1041,8 @@ impl<'a> Vm<'a> {
     fn finish(&mut self, operand: Operand) -> CelResult<Value> {
         match operand {
             Operand::Value(value) => Ok(value),
+            Operand::EmptyList(_) => Ok(Value::list(Vec::new())),
+            Operand::Ints(words) => Ok(Value::list(ListStorage::Ints(words))),
             Operand::List(items) => Ok(Value::list(items)),
             Operand::Map(entries) => Ok(Value::Map(Map::object(entries))),
             Operand::Struct(name, fields) => self.close_struct(name, fields),
@@ -1119,11 +1133,43 @@ impl<'a> Vm<'a> {
         Ok(args)
     }
 
-    fn list_mut(&mut self) -> CelResult<&mut Vec<Value>> {
-        match self.top_mut() {
-            Some(Operand::List(items)) => Ok(items),
-            _ => Err(CelErr::InternalError),
+    /// Append `value` to the list being built on top of the stack.
+    ///
+    /// The strategy switch lives here and nowhere else: an integer joins an
+    /// integer buffer, anything else turns that buffer into a boxed one. A
+    /// switch boxes once and never switches back.
+    #[inline(always)]
+    fn append_to_list(&mut self, value: Value) -> CelResult<()> {
+        let top = self.top_mut().ok_or(CelErr::InternalError)?;
+        match top {
+            Operand::List(items) => items.push(value),
+            Operand::Ints(words) => match value {
+                Value::Int(word) => words.push(word),
+                other => {
+                    let mut items = Vec::with_capacity(words.capacity().max(words.len() + 1));
+                    items.extend(words.iter().map(|&w| Value::Int(w)));
+                    items.push(other);
+                    *top = Operand::List(items);
+                }
+            },
+            Operand::EmptyList(hint) => {
+                let hint = (*hint).max(1);
+                *top = match value {
+                    Value::Int(word) => {
+                        let mut words = Vec::with_capacity(hint);
+                        words.push(word);
+                        Operand::Ints(words)
+                    }
+                    other => {
+                        let mut items = Vec::with_capacity(hint);
+                        items.push(other);
+                        Operand::List(items)
+                    }
+                };
+            }
+            _ => return Err(CelErr::InternalError),
         }
+        Ok(())
     }
 
     /// The map literal on top of the stack, open for the next insert.
@@ -1321,7 +1367,7 @@ impl<'a> Vm<'a> {
             .ok_or(CelErr::InternalError)?
             .clone();
         let value = binary_values("mul", lhs, rhs).map_err(|e| self.park(e))?;
-        self.list_mut()?.push(value);
+        self.append_to_list(value)?;
         if arm == FuseArm::Body {
             return Ok(shape.after_body);
         }
@@ -1415,21 +1461,21 @@ impl<'a> Vm<'a> {
             OpCode::OptSelect => self.opt_select_arm(a)?,
 
             // -- aggregates ----------------------------------------------
-            OpCode::NewList => self.push_operand(Operand::List(Vec::new())),
+            OpCode::NewList => self.push_operand(Operand::EmptyList(a as usize)),
             OpCode::NewListFromArg => {
                 let len = self.sequence_len(a)?;
-                self.push_operand(Operand::List(Vec::with_capacity(len as usize)));
+                self.push_operand(Operand::EmptyList(len as usize));
             }
             OpCode::ListAppend => {
                 let value = self.pop()?;
-                self.list_mut()?.push(value);
+                self.append_to_list(value)?;
             }
             OpCode::ListAppendOptional => {
                 let value = self.pop()?;
                 match optional_inner(&value) {
                     OptView::Empty => {}
-                    OptView::Present(inner) => self.list_mut()?.push(inner),
-                    OptView::Plain => self.list_mut()?.push(value),
+                    OptView::Present(inner) => self.append_to_list(inner)?,
+                    OptView::Plain => self.append_to_list(value)?,
                 }
             }
             // Held out too, and for the same reason; see `Vm::new_map_arm`.
@@ -1604,12 +1650,12 @@ impl<'a> Vm<'a> {
             // answer is computed exactly as the producer computes it -- same
             // slot, same pool entry, same helper, same operand order, so the
             // error a failure raises is the pair's -- and handed to the
-            // builder instead of pushed. `list_mut` reads the builder off the
+            // builder instead of pushed. `append_to_list` reads the builder off the
             // top of the stack without popping it, which is what `ListAppend`
             // does too.
             OpCode::LoadLocalAppend => {
                 let value = self.local(a).ok_or(CelErr::InternalError)?.clone();
-                self.list_mut()?.push(value);
+                self.append_to_list(value)?;
             }
             OpCode::GetFieldLocalAppend | OpCode::HasFieldLocalAppend => {
                 let read = {
@@ -1622,7 +1668,7 @@ impl<'a> Vm<'a> {
                     }
                 };
                 let value = read.map_err(|e| self.park(e))?;
-                self.list_mut()?.push(value);
+                self.append_to_list(value)?;
             }
             OpCode::AddLocalConstAppend
             | OpCode::MulLocalConstAppend
@@ -1635,7 +1681,7 @@ impl<'a> Vm<'a> {
                     _ => "rem",
                 };
                 let value = binary_values(name, lhs, rhs).map_err(|e| self.park(e))?;
-                self.list_mut()?.push(value);
+                self.append_to_list(value)?;
             }
             OpCode::EqualsLocalConstAppend | OpCode::NotEqualsLocalConstAppend => {
                 let equal = {
@@ -1644,7 +1690,7 @@ impl<'a> Vm<'a> {
                     lhs == rhs
                 };
                 let value = Value::Bool(equal == (op == OpCode::EqualsLocalConstAppend));
-                self.list_mut()?.push(value);
+                self.append_to_list(value)?;
             }
             OpCode::LessLocalConstAppend
             | OpCode::GreaterLocalConstAppend
@@ -1657,7 +1703,7 @@ impl<'a> Vm<'a> {
                     _ => |o| o != Ordering::Less,
                 };
                 let value = compare_values(lhs, rhs, accept).map_err(|e| self.park(e))?;
-                self.list_mut()?.push(value);
+                self.append_to_list(value)?;
             }
 
             // -- unary operators -------------------------------------------
@@ -1731,7 +1777,8 @@ impl<'a> Vm<'a> {
                     // -- and both go through `Arc::get_mut`, which cannot answer
                     // for as long as this slot holds a reference of its own. The
                     // accumulator cannot be that other reference either: on the
-                    // appending path it is an `Operand::List(Vec<Value>)` that
+                    // appending path it is an `Operand::List(Vec<Value>)` (or its
+                    // integer twin) that
                     // owns its elements outright, and on the general path it is
                     // whatever `accu_init` produced, built before the loop.
                     Value::List(_) => self.push(value),
@@ -2735,7 +2782,7 @@ mod tests {
         }
     }
 
-    /// `list_mut` finds the builder under the operand that was popped.
+    /// `append_to_list` finds the builder under the operand that was popped.
     ///
     /// The three `*_mut` accessors read the top of the stack, and every one of
     /// them is called AFTER the value it is about to store has been taken off
@@ -2757,7 +2804,7 @@ mod tests {
 
         // `NewList` then the element expression: the builder, then the value
         // that is about to be appended to it.
-        vm.push_operand(Operand::List(Vec::new()));
+        vm.push_operand(Operand::EmptyList(0));
         vm.push(Value::Int(2));
         assert_eq!(vm.depth(), 2);
         assert!(matches!(vm.top(), Some(Operand::Value(Value::Int(2)))));
@@ -2765,9 +2812,8 @@ mod tests {
         // `ListAppend`: pop, and only then reach for the builder.
         assert_eq!(vm.pop(), Ok(Value::Int(2)));
         assert_eq!(vm.depth(), 1);
-        vm.list_mut()
-            .expect("the builder is under the popped value")
-            .push(Value::Int(2));
+        vm.append_to_list(Value::Int(2))
+            .expect("the builder is under the popped value");
 
         // Truncating away an operand above it leaves an aggregate that still
         // closes, which is what the unwind path depends on.

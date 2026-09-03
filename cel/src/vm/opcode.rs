@@ -121,7 +121,8 @@ pub enum OpCode {
     // optional, because whether an element contributes is only known once it
     // has been evaluated. One shape that always works beats two shapes and a
     // rule for choosing between them.
-    /// Push an empty list.
+    /// Push an empty list with room for `a` elements, `BUILD_LIST n` with
+    /// the count spent on capacity rather than on popping.
     NewList,
     /// Push an empty list with room for as many elements as the list in slot
     /// `a` holds.
@@ -549,6 +550,7 @@ impl OpCode {
             | OpCode::OrMerge
             | OpCode::IncLocal
             | OpCode::IterLen
+            | OpCode::NewList
             | OpCode::NewListFromArg
             | OpCode::AddConst
             | OpCode::MulConst
@@ -600,7 +602,6 @@ impl OpCode {
 
             OpCode::Index
             | OpCode::OptIndex
-            | OpCode::NewList
             | OpCode::ListAppend
             | OpCode::ListAppendOptional
             | OpCode::NewMap

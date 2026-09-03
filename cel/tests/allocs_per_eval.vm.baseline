@@ -377,10 +377,10 @@ walker/variable_access/hashmap	0.000
 walker/variable_access/resolver	0.000
 walker/member_access	0.000
 walker/list_indexing	0.000
-walker/list_filter	6.000
-walker/list_map	5.000
-walker/all_comprehension	3.000
-walker/exists_comprehension	3.000
+walker/list_filter	4.000
+walker/list_map	4.000
+walker/all_comprehension	2.000
+walker/exists_comprehension	2.000
 walker/map_list_scaling/1	2.000
 walker/map_list_scaling/10	2.000
 walker/map_list_scaling/100	2.000

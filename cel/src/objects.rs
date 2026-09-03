@@ -747,6 +747,12 @@ impl TryIntoValue for Value {
 pub enum ListStorage {
     /// Boxed elements, owned by this list.
     Object(Vec<Value>),
+    /// Integers, owned by this list and boxed on the way out.
+    /// `IntegerListStrategy`: what a list literal or a comprehension whose
+    /// every element was an integer closes as. Unlike a [`ListStorage::Column`]
+    /// the buffer is the list's own, so closing one moves it rather than
+    /// copying it.
+    Ints(Vec<i64>),
     /// An unboxed column. The element is boxed on the way out, which for every
     /// bank but a string is a [`Value`] that owns nothing.
     Column(ValueColumn),
@@ -761,6 +767,7 @@ impl ListStorage {
     pub fn len(&self) -> usize {
         match self {
             ListStorage::Object(v) => v.len(),
+            ListStorage::Ints(v) => v.len(),
             ListStorage::Column(c) => c.len(),
             ListStorage::Record(s) => s.rows(),
         }
@@ -774,6 +781,7 @@ impl ListStorage {
     fn element_at(&self, index: usize) -> Value {
         match self {
             ListStorage::Object(v) => v[index].clone(),
+            ListStorage::Ints(v) => Value::Int(v[index]),
             ListStorage::Column(c) => c.value_at(index),
             ListStorage::Record(s) => Value::Map(Map::record(s.clone(), index)),
         }

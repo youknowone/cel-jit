@@ -347,7 +347,12 @@ impl Compiler {
     }
 
     fn list(&mut self, list: &ListExpr, id: u64) -> Result<(), CompileError> {
-        self.emit(OpCode::NewList, &[], id)?;
+        // The element count is the capacity the literal's list reserves,
+        // `BUILD_LIST n`; an optional element that turns out empty leaves one
+        // slot of it unused. A hint, so a count past the operand width
+        // saturates rather than failing the compile.
+        let count = u32::try_from(list.elements.len()).unwrap_or(u32::MAX);
+        self.emit(OpCode::NewList, &[count], id)?;
         for (index, element) in list.elements.iter().enumerate() {
             // An optional element is not the fused shape and keeps the pair:
             // whether it contributes at all is only known once its value has
