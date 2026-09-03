@@ -16,15 +16,21 @@
 //!       -- [shape] [secs] [rows]
 //!   sample <pid> 5 -file out.txt      # while it runs
 
-use std::hint::black_box;
-use std::mem::size_of;
-use std::time::Instant;
-
-use cel::majit::batch::{Batch, BatchProgram, BoundBatch, ColumnRef, ResolvedBatch};
-use cel::majit::bytecode::BatchRun;
-use cel::majit::lower::{LoweredF, Schema, ValType};
-
+#[cfg(not(feature = "jit"))]
 fn main() {
+    eprintln!("rca_encode needs a jit backend: --features jit-cranelift");
+}
+
+#[cfg(feature = "jit")]
+fn main() {
+    use std::hint::black_box;
+    use std::mem::size_of;
+    use std::time::Instant;
+
+    use cel::majit::batch::{Batch, BatchProgram, BoundBatch, ColumnRef, ResolvedBatch};
+    use cel::majit::bytecode::BatchRun;
+    use cel::majit::lower::{LoweredF, Schema, ValType};
+
     let args: Vec<String> = std::env::args().collect();
     let shape = args.get(1).map_or("x * 2 + 1", |s| s.as_str());
     let secs: f64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(5.0);
@@ -53,7 +59,10 @@ fn main() {
     // The first bind of a program builds its word stream; that one-off is not
     // what is being sampled.
     drop(program.bind_per_row_resolved(&resolved).expect("encodes"));
-    println!("pid={} sampling {shape:?} rows={rows} for {secs}s", std::process::id());
+    println!(
+        "pid={} sampling {shape:?} rows={rows} for {secs}s",
+        std::process::id()
+    );
     let start = Instant::now();
     let mut n = 0u64;
     while start.elapsed().as_secs_f64() < secs {
