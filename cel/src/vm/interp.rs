@@ -717,9 +717,11 @@ impl Drop for Vm<'_> {
         let Some(mut scratch) = self.pool.take() else {
             return;
         };
-        scratch.frame = std::mem::take(&mut self.frame);
-        scratch.logic = std::mem::take(&mut self.logic);
-        scratch.cold = std::mem::take(&mut self.cold);
+        // Swapped, not assigned: the box's buffers are the empty ones `new`
+        // left behind, and an assignment would still emit their drop.
+        std::mem::swap(&mut scratch.frame, &mut self.frame);
+        std::mem::swap(&mut scratch.logic, &mut self.logic);
+        std::mem::swap(&mut scratch.cold, &mut self.cold);
         scratch.release();
         // Dropped rather than pooled where the slot is already gone; see
         // `SCRATCH`.
@@ -742,11 +744,17 @@ impl<'a> Vm<'a> {
             .flatten()
             .unwrap_or_default();
         let stack_base = code.n_slots as usize;
-        scratch.frame.resize_with(stack_base, || Operand::NULL);
+        // Each sizing call is out of line and most programs need neither:
+        // a scalar expression has no locals and no `&&`/`||`.
+        if stack_base > 0 {
+            scratch.frame.resize_with(stack_base, || Operand::NULL);
+        }
         scratch.frame.reserve(code.max_stack as usize);
-        scratch
-            .logic
-            .resize(code.n_logic as usize, Err(CelErr::InternalError));
+        if code.n_logic > 0 {
+            scratch
+                .logic
+                .resize(code.n_logic as usize, Err(CelErr::InternalError));
+        }
         let frame = std::mem::take(&mut scratch.frame);
         let logic = std::mem::take(&mut scratch.logic);
         let cold = std::mem::take(&mut scratch.cold);
