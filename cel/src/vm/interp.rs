@@ -438,12 +438,13 @@ const _: () = {
 #[cfg(feature = "__drop-arm-probe")]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DropArm {
-    /// What the interpreter does without the probe: hand the operand to the
-    /// glue, whatever it holds.
+    /// Hand the operand to the glue, whatever it holds. What the interpreter
+    /// did without the probe until the probe priced it; see
+    /// [`discard_inline`].
     Baseline,
     /// Test the discriminant at the call site and reach the glue only for the
     /// variants that own something. Keeps the work; removes the call on the
-    /// trivial path.
+    /// trivial path. What the interpreter does without the probe.
     InlineDiscriminant,
     /// THIS ARM LEAKS. Forget the operand: no discriminant test, no call, and
     /// no release of anything it owned.
@@ -522,8 +523,14 @@ std::thread_local! {
         const { std::cell::Cell::new(ProbePolicy::STOCK) };
 }
 
-/// [`DropArm::InlineDiscriminant`]'s policy: test the discriminant here, and
-/// reach the out-of-line glue only for the variants that own something.
+/// Test the discriminant here, and reach the out-of-line glue only for the
+/// variants that own something.
+///
+/// What the shipping `discard` does, and [`DropArm::InlineDiscriminant`]'s
+/// policy under the probe. The probe priced one discard site at 1.1-1.3 ns,
+/// of which the call was 0.97-1.05 ns and the discriminant work inside it
+/// 0.13-0.24 ns: the glue for an integer is a handful of instructions that
+/// do nothing, reached through a call that costs more than they do.
 ///
 /// The trivial branch is spelled with [`std::mem::forget`] rather than as an
 /// empty match arm, and the difference is the whole arm. `match value { .. =>
@@ -539,7 +546,6 @@ std::thread_local! {
 /// immediately for every one of their discriminants. A variant added to
 /// [`Value`] that owns anything falls to the `else`, because the list is
 /// explicit rather than a wildcard.
-#[cfg(feature = "__drop-arm-probe")]
 #[inline(always)]
 fn discard_inline(value: Value) {
     #[cfg(feature = "chrono")]
@@ -983,7 +989,7 @@ impl<'a> Vm<'a> {
     #[cfg(not(feature = "__drop-arm-probe"))]
     #[inline(always)]
     fn discard(&self, value: Value) {
-        drop(value);
+        discard_inline(value);
     }
 
     /// Throw a popped operand away, under whichever policy the probe selected.
