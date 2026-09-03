@@ -2803,11 +2803,23 @@ pub mod float_bank {
         /// Both doors below want the pair, and asking for it in two steps walks
         /// the chain twice for the same cell: once to name it and once to read
         /// its token. The answer is the same either way.
+        ///
+        /// The walk answers the CELL-OWNED half of "runnable" -- the token, and
+        /// that the cell is not a `compile_tmp_callback` displacing a real loop.
+        /// The other half is the frontend's `compiled_loops` map, which the walk
+        /// leaves to its caller because a door that goes on to run reads that
+        /// map's value anyway; a door that only asks reads it once here.
         fn resolve_runnable(
             &self,
             driver: &majit_metainterp::JitDriver<VmStateF>,
         ) -> (u64, Option<std::sync::Arc<majit_metainterp::JitCellToken>>) {
-            driver.resolved_runnable_procedure_token(self.hash, || self.green_key())
+            let make_green_key = || self.green_key();
+            let (cell_key, token) = driver.resolved_entry_procedure_token(
+                self.hash,
+                Some(&make_green_key as &dyn Fn() -> majit_ir::GreenKey),
+            );
+            let token = token.filter(|_| driver.get_compiled_meta(cell_key).is_some());
+            (cell_key, token)
         }
     }
 
