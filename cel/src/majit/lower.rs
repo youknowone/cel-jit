@@ -757,6 +757,36 @@ impl BatchSeed {
         out_addr: i64,
         list_out: &[i64],
     ) -> Vec<i64> {
+        let mut regs = vec![0i64; self.num_int_regs];
+        self.seed_regs(&mut regs, bases, scalars, n, trap_addr, out_addr, list_out);
+        regs
+    }
+
+    /// [`BatchSeed::regs_list`] into a bank the caller holds, which must be
+    /// zeroed and exactly [`BatchSeed::num_int_regs`] wide.
+    ///
+    /// The seeding writes a handful of registers and leaves the rest at zero,
+    /// so a caller that already holds a zeroed block can carry the bank in it
+    /// rather than pay a heap block for it per batch. The returning forms
+    /// above are this over a fresh `Vec`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn seed_regs(
+        &self,
+        regs: &mut [i64],
+        bases: &[i64],
+        scalars: &[i64],
+        n: i64,
+        trap_addr: i64,
+        out_addr: i64,
+        list_out: &[i64],
+    ) {
+        assert_eq!(
+            regs.len(),
+            self.num_int_regs,
+            "batch seed: bank width {} != {} int registers",
+            regs.len(),
+            self.num_int_regs
+        );
         assert_eq!(
             bases.len(),
             self.base_regs.len(),
@@ -772,7 +802,6 @@ impl BatchSeed {
             self.scalar_regs.len()
         );
         assert!(n >= 1, "batch seed: n must be >= 1 (do-while back-edge)");
-        let mut regs = vec![0i64; self.num_int_regs];
         regs[self.r_n] = n;
         if let Some(reg) = self.r_trap {
             regs[reg] = trap_addr;
@@ -800,7 +829,6 @@ impl BatchSeed {
         for (&addr, &reg) in list_out.iter().zip(&self.list_out_regs) {
             regs[reg] = addr;
         }
-        regs
     }
 }
 

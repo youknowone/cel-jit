@@ -810,21 +810,50 @@ impl<'s> StrDict<'s> {
 /// a benchmark sweeping tiers, a cross-tier check — pays for it once.
 ///
 /// Holds raw base pointers into `columns`, so the borrow is carried in `'a`.
+///
+/// ONE heap block per run, `words`. A per-call activation binds a batch per
+/// record, and a sampling profile of that bind put more than half of it in the
+/// allocator: a seed vector, a second seed vector for the one-row program, a
+/// boxed trap word and a boxed output buffer -- four blocks for `x * 2 + 1` on
+/// one row. They are one block here, laid out as
+///
+/// ```text
+/// [ output rows | trap | loop seed bank | one-row seed bank ]
+///   PerRow only            num_int_regs    single_row only
+/// ```
+///
+/// Holding the seed banks in the run itself instead was tried first and
+/// measured: at sixteen inline words per bank the run grew from 320 to 584
+/// bytes, and the moves and drops of the wider struct gave back most of what
+/// the two allocations had cost. The block is the same one allocation either
+/// way; the banks ride in it for free.
 pub struct BatchRun<'a> {
     /// Shared with the [`super::lower::LoweredF`] that owns it, so the address
     /// the green key is taken over is the program's own and outlives this run.
     code: std::sync::Arc<[i64]>,
-    init_regs: Vec<i64>,
     num_float_regs: usize,
     /// The shape's [`check_code`] result, for the clean tier's unchecked run.
     check: CodeCheck,
-    /// The word the program publishes the overflow flag to. Boxed so its
-    /// address is stable, and never aliased by a reference while the program
-    /// writes it through the raw pointer seeded into `init_regs`.
-    trap: Box<i64>,
+    /// The block above. Heap-held so the trap word's and the output rows'
+    /// addresses, seeded into the banks, stay put when the run moves.
+    ///
+    /// The program writes the rows and the trap word through those raw
+    /// addresses while a tier holds a borrow of ITS BANK, so the borrow and
+    /// the writes must never cover the same word: every borrow taken across a
+    /// run is of a bank range, and the program addresses nothing in a bank.
+    words: Box<[i64]>,
+    /// Index of the trap word in `words`: the output length, or 0 under
+    /// [`BatchReduce::Sum`].
+    trap_at: usize,
+    /// One past the loop seed bank in `words`; the bank starts after the trap.
+    bank_end: usize,
+    /// Whether `words` carries output rows ahead of the trap word. Under
+    /// [`BatchReduce::PerRow`] there is one `i64` per row plus one spare so a
+    /// zero-row batch still has a non-null address to seed.
+    per_row: bool,
     rows: usize,
     /// Id columns materialized from the caller's [`Column::Str`] buffers.
-    /// `init_regs` holds raw pointers into these, so they are kept alive here
+    /// The seed bank holds raw pointers into these, so they are kept alive here
     /// for as long as the run is. Each is separately heap-allocated, so moving
     /// the `BatchRun` moves the box pointers and not the buffers they address.
     ///
@@ -835,12 +864,9 @@ pub struct BatchRun<'a> {
     /// bound [`BatchReduce::PerRow`]), whose output buffer
     /// [`prepare_batch_reduce`] has already filled.
     projection: bool,
-    /// One `i64` per row, under [`BatchReduce::PerRow`]: where the loop stores
-    /// each row's result. Boxed for the same reason `trap` is — `init_regs`
-    /// holds a raw pointer to it, which must survive the run moving.
-    out: Option<Box<[i64]>>,
     /// One buffer per output field, for a LIST-valued result: the flat element
-    /// stream the loop wrote, which `out` indexes into by running length.
+    /// stream the loop wrote, which the output rows index into by running
+    /// length.
     list_out: Vec<Box<[i64]>>,
     /// The batch's distinct strings in rank order, so a `string`-banked output
     /// id can be read back as the string it stands for. Kept only where the
@@ -859,7 +885,7 @@ pub struct BatchRun<'a> {
     banks: float_bank::Banks,
     /// The straight-line program for this run, when the batch has one row and
     /// the lowering has one ([`super::lower::LoweredF::single_row_shape`]).
-    /// Seeded from the same data as `init_regs`, under its own packing.
+    /// Seeded from the same data as the loop bank, under its own packing.
     single_row: Option<SingleRow>,
     columns: core::marker::PhantomData<&'a ()>,
 }
@@ -867,12 +893,19 @@ pub struct BatchRun<'a> {
 /// [`BatchRun::single_row`]: a program and the bank it starts from.
 struct SingleRow {
     code: std::sync::Arc<[i64]>,
-    init_regs: Vec<i64>,
+    /// The bank's range in [`BatchRun::words`].
+    bank: core::ops::Range<usize>,
     num_float_regs: usize,
     check: CodeCheck,
 }
 
 impl<'a> BatchRun<'a> {
+    /// Whether the last run published a trap.
+    #[inline]
+    fn trapped(&self) -> bool {
+        self.words[self.trap_at] != 0
+    }
+
     /// Run the prepared batch with `run`, which selects the tier. `None` means a
     /// row trapped (`int` overflow, division by zero), where the tree-walker
     /// raises and no sum is the right answer.
@@ -898,15 +931,15 @@ impl<'a> BatchRun<'a> {
         if self.rows == 0 {
             return Some(0);
         }
-        *self.trap = 0;
+        self.words[self.trap_at] = 0;
         let result = run(
             &self.code,
-            &self.init_regs,
+            &self.words[self.trap_at + 1..self.bank_end],
             self.num_float_regs,
             &mut self.banks,
             &self.check,
         );
-        if *self.trap != 0 {
+        if self.trapped() {
             return None;
         }
         Some(result)
@@ -929,15 +962,15 @@ impl<'a> BatchRun<'a> {
             .single_row
             .as_ref()
             .expect("run_single_row on a run without a one-row program");
-        *self.trap = 0;
+        self.words[self.trap_at] = 0;
         let result = run(
             &single.code,
-            &single.init_regs,
+            &self.words[single.bank.clone()],
             single.num_float_regs,
             &mut self.banks,
             &single.check,
         );
-        if *self.trap != 0 {
+        if self.trapped() {
             return None;
         }
         Some(result)
@@ -981,7 +1014,11 @@ impl<'a> BatchRun<'a> {
     /// zero-row batch still has a non-null address to seed, and that element is
     /// never a result.
     pub fn output(&self) -> &[i64] {
-        self.out.as_deref().map_or(&[], |b| &b[..self.rows])
+        if self.per_row {
+            &self.words[..self.rows]
+        } else {
+            &[]
+        }
     }
 
     /// The batch's distinct strings in rank order, indexed by an output id.
@@ -1058,7 +1095,8 @@ pub struct EncodeStageRepeats {
     /// Extra `bases` vectors: one `i64` per column, read back out of the
     /// caller's buffers and the materialized id columns.
     pub bases: u32,
-    /// Extra trap-word `Box`es.
+    /// Extra one-word `Box`es: what the trap word cost when it had a block of
+    /// its own, before it joined the run's one block.
     pub trap: u32,
     /// Extra per-row output buffers. Zero-trip under `BatchReduce::Sum`, which
     /// allocates none.
@@ -1289,15 +1327,31 @@ pub fn prepare_batch_reduce<'a>(
             ENCODE_STAGE_OUT_PASSES.with(|c| c.set(c.get() + 1));
         }
     }
-    let mut trap: Box<i64> = Box::new(0);
-    let trap_addr = (&mut *trap) as *mut i64 as i64;
-    // A zero-row batch never enters the loop, but the seed still asserts a
-    // non-null output address, so give the buffer one element to point at.
-    let mut out: Option<Box<[i64]>> = match reduce {
-        BatchReduce::Sum => None,
-        BatchReduce::PerRow => Some(vec![0i64; n.max(1)].into_boxed_slice()),
+    let shape = lowered.batch_shape(true, reduce);
+    let per_row = reduce == BatchReduce::PerRow;
+    // A projection's or a constant's rows are filled here rather than by a
+    // program, so neither has a one-row program to seed.
+    let projection =
+        per_row && (lowered.is_row_projection() || lowered.constant_result().is_some());
+    let single_shape = if per_row && n == 1 && !projection {
+        lowered.single_row_shape()
+    } else {
+        None
     };
-    let out_addr = out.as_mut().map_or(0, |b| b.as_mut_ptr() as i64);
+    // The one block (see [`BatchRun`]): rows, trap, loop bank, one-row bank. A
+    // zero-row batch never enters the loop, but the seed still asserts a
+    // non-null output address, so the rows get one element to point at.
+    let trap_at = if per_row { n.max(1) } else { 0 };
+    let bank_at = trap_at + 1;
+    let bank_end = bank_at + shape.seed.num_int_regs();
+    let single_bank = bank_end..bank_end + single_shape.map_or(0, |s| s.seed.num_int_regs());
+    let mut words: Box<[i64]> = vec![0i64; single_bank.end].into_boxed_slice();
+    let trap_addr = words[trap_at..].as_mut_ptr() as i64;
+    let out_addr = if per_row {
+        words.as_mut_ptr() as i64
+    } else {
+        0
+    };
     // A list-valued result writes at most as many elements as its SOURCE offers
     // across the whole batch — `map` writes exactly that many, `filter` fewer.
     // For a list column that is its flattened element count; for a literal list
@@ -1339,7 +1393,6 @@ pub fn prepare_batch_reduce<'a>(
     for b in list_out.iter_mut() {
         list_addrs.push(b.as_mut_ptr() as i64);
     }
-    let shape = lowered.batch_shape(true, reduce);
     // Column bases, the row count, the trap address and the string literals'
     // ids are all this batch's data, and all reach the program the same way:
     // through the seeded bank, never through the words.
@@ -1386,10 +1439,15 @@ pub fn prepare_batch_reduce<'a>(
             .collect(),
         _ => Vec::new(),
     };
-    let init_regs =
-        shape
-            .seed
-            .regs_list(&bases, &scalars, n as i64, trap_addr, out_addr, &list_addrs);
+    shape.seed.seed_regs(
+        &mut words[bank_at..bank_end],
+        &bases,
+        &scalars,
+        n as i64,
+        trap_addr,
+        out_addr,
+        &list_addrs,
+    );
     // What a projection's loop would have copied out, copied out HERE instead:
     // it is a property of the program and the columns, both of which are fixed
     // once the batch is prepared, so no later call has anything to recompute.
@@ -1401,10 +1459,9 @@ pub fn prepare_batch_reduce<'a>(
     // A constant program is the same shortcut with the column replaced by the
     // one word its prelude loads: every row the loop would have stored is that
     // word, so the buffer is filled with it here.
-    let projection = match reduce {
-        BatchReduce::PerRow if lowered.is_row_projection() => {
-            let buf = out.as_mut().expect("a per-row run owns an output buffer");
-            let buf = &mut buf[..n];
+    if projection {
+        let buf = &mut words[..n];
+        if lowered.is_row_projection() {
             match columns[0] {
                 Column::Int(c) => buf.copy_from_slice(&c[..n]),
                 Column::Float(c) => {
@@ -1419,48 +1476,48 @@ pub fn prepare_batch_reduce<'a>(
                 }
                 Column::Str(_) => buf.copy_from_slice(&str_ids[0][..n]),
             }
-            true
+        } else {
+            let word = lowered
+                .constant_result()
+                .expect("a projection is a column copy or a constant fill");
+            buf.fill(word);
         }
-        BatchReduce::PerRow => match lowered.constant_result() {
-            Some(word) => {
-                let buf = out.as_mut().expect("a per-row run owns an output buffer");
-                buf[..n].fill(word);
-                true
-            }
-            None => false,
-        },
-        _ => false,
-    };
+    }
     // A refcount bump on the words `lowered` owns, not a copy: every batch of
     // this expression runs the same allocation, so the JIT's green key — and
     // with it the compiled loop the driver holds — stays put between batches.
     // One row, and not already answered at bind: the clean tier runs the
     // straight-line form. Seeded from the same bases, scalars and addresses
     // under that shape's own register packing.
-    let single_row = match reduce {
-        BatchReduce::PerRow if n == 1 && !projection => {
-            lowered.single_row_shape().map(|s| SingleRow {
-                code: s.code.clone(),
-                init_regs: s
-                    .seed
-                    .regs_list(&bases, &scalars, 1, trap_addr, out_addr, &[]),
-                num_float_regs: s.num_float_regs,
-                check: s.check,
-            })
+    let single_row = single_shape.map(|s| {
+        s.seed.seed_regs(
+            &mut words[single_bank.clone()],
+            &bases,
+            &scalars,
+            1,
+            trap_addr,
+            out_addr,
+            &[],
+        );
+        SingleRow {
+            code: s.code.clone(),
+            bank: single_bank.clone(),
+            num_float_regs: s.num_float_regs,
+            check: s.check,
         }
-        _ => None,
-    };
+    });
     let code = shape.code.clone();
     BatchRun {
         code,
-        init_regs,
         num_float_regs: shape.num_float_regs,
         check: shape.check,
-        trap,
+        words,
+        trap_at,
+        bank_end,
+        per_row,
         rows: n,
         str_ids,
         projection,
-        out,
         list_out,
         distinct,
         banks: float_bank::Banks::default(),
