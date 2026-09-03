@@ -409,6 +409,12 @@ enum Operand {
     Struct(NameId, BTreeMap<String, Value>),
 }
 
+impl Operand {
+    /// What an entry holds before anything is stored in it and after its
+    /// operand is popped: the frame's `None`.
+    const NULL: Operand = Operand::Value(Value::Null);
+}
+
 /// The stack entry must stay narrow, because `Vm::new` sizes the operand stack
 /// at `max_stack` entries and almost every one of them holds a bare [`Value`].
 ///
@@ -574,8 +580,9 @@ fn discard_inline(value: Value) {
 /// the allocation, sized to the largest program this thread has evaluated.
 #[derive(Default)]
 struct Scratch {
-    stack: Vec<Operand>,
-    slots: Vec<Value>,
+    /// The activation record: `| locals | stack |`, one array, laid out as
+    /// `PyFrame.locals_cells_stack_w` is. See [`Vm::frame`].
+    frame: Vec<Operand>,
     logic: Vec<CelResult<bool>>,
     cold: Vec<ExecutionError>,
 }
@@ -588,8 +595,7 @@ impl Scratch {
     /// reached from [`Vm`]'s [`Drop`] — cannot leave a large list rooted until
     /// the next evaluation on this thread happens to overwrite it.
     fn release(&mut self) {
-        self.stack.clear();
-        self.slots.clear();
+        self.frame.clear();
         self.logic.clear();
         self.cold.clear();
     }
@@ -617,14 +623,41 @@ std::thread_local! {
     /// thread-local of the caller's runs an evaluation of its own from its own
     /// destructor. `with` would panic there, and a panic on the way out of
     /// [`Vm`] would be a panic in a destructor.
-    static SCRATCH: std::cell::Cell<Option<Scratch>> = const { std::cell::Cell::new(None) };
+    ///
+    /// Boxed, so that what moves in and out is one pointer. Measured before
+    /// the box: the hand-back copied four `Vec` headers onto the stack, then
+    /// into the cell, and dropped the cell's previous contents, and that was
+    /// a third of what a one-instruction program cost end to end.
+    static SCRATCH: std::cell::Cell<Option<Box<Scratch>>> = const { std::cell::Cell::new(None) };
 }
 
 struct Vm<'a> {
     code: &'a CelCode,
     ctx: &'a Context<'a>,
-    stack: Vec<Operand>,
-    slots: Vec<Value>,
+    /// The activation record, `| locals | stack |` in ONE array, the layout
+    /// `PyFrame.__init__` gives `locals_cells_stack_w`. A local is read at
+    /// its slot index; the operand stack is the tail from `stack_base` up,
+    /// and the vector's length is the absolute index of its next free entry,
+    /// `PyFrame.valuestackdepth`.
+    ///
+    /// The length is the depth rather than a field beside a presized array
+    /// because of what a `Vec` already keeps: everything below its length is
+    /// initialized and everything above it is not, which is exactly the
+    /// frame's invariant that no dead operand is held past its instruction.
+    /// `popvalue` restores that by writing `None`; a pop here moves the entry
+    /// out and shortens the length, so nothing is written back. Measured the
+    /// other way -- a presized array, a depth field, a null stored on every
+    /// pop and dropped on every push -- and it cost 2 ns per instruction.
+    ///
+    /// Sized once per run: the locals, then capacity for `max_stack` more,
+    /// the compiler's proof of how deep the stack goes.
+    frame: Vec<Operand>,
+    /// Where the operand stack begins in `frame`: `n_slots`.
+    stack_base: usize,
+    /// The pool's box, emptied, held so the hand-back at [`Drop`] moves the
+    /// buffers into an allocation that already exists. `None` only between
+    /// the hand-back and the end of the drop.
+    pool: Option<Box<Scratch>>,
     /// One entry per `&&`/`||`, holding the left operand's outcome: its bool,
     /// or the error the handler absorbed for it.
     logic: Vec<CelResult<bool>>,
@@ -678,14 +711,15 @@ impl Drop for Vm<'_> {
     fn drop(&mut self) {
         // `mem::take` on a `Vec` leaves a dangling-free empty one and allocates
         // nothing, which is the only way to move fields out of a type that
-        // implements `Drop`. The operand stack goes through its own method
-        // because it is the one buffer whose contents are not all in the `Vec`.
-        let mut scratch = Scratch {
-            stack: self.take_stack(),
-            slots: std::mem::take(&mut self.slots),
-            logic: std::mem::take(&mut self.logic),
-            cold: std::mem::take(&mut self.cold),
+        // implements `Drop`. The box is an `Option` for the same reason:
+        // `mem::take` on a `Box` would build a default one, and that is an
+        // allocation on every way out.
+        let Some(mut scratch) = self.pool.take() else {
+            return;
         };
+        scratch.frame = std::mem::take(&mut self.frame);
+        scratch.logic = std::mem::take(&mut self.logic);
+        scratch.cold = std::mem::take(&mut self.cold);
         scratch.release();
         // Dropped rather than pooled where the slot is already gone; see
         // `SCRATCH`.
@@ -697,28 +731,33 @@ impl<'a> Vm<'a> {
     /// Borrow this thread's buffers and size them for `code`.
     ///
     /// Every buffer arrives empty — [`Scratch::release`] is what put it back —
-    /// so this establishes the lengths the loop indexes into and asks the
-    /// operand stack for the depth the compiler proved it needs. On a thread
-    /// that has evaluated anything before, all four of those are already
-    /// satisfied and none of them allocates.
+    /// so this establishes the lengths the loop indexes into: the locals and
+    /// the operand stack the compiler proved it needs, as one array. On a
+    /// thread that has evaluated anything before, the capacity is already
+    /// there and none of this allocates.
     fn new(code: &'a CelCode, ctx: &'a Context<'a>) -> Self {
         let mut scratch = SCRATCH
             .try_with(std::cell::Cell::take)
             .ok()
             .flatten()
             .unwrap_or_default();
-        scratch.stack.reserve(code.max_stack as usize);
-        scratch.slots.resize(code.n_slots as usize, Value::Null);
+        let stack_base = code.n_slots as usize;
+        scratch.frame.resize_with(stack_base, || Operand::NULL);
+        scratch.frame.reserve(code.max_stack as usize);
         scratch
             .logic
             .resize(code.n_logic as usize, Err(CelErr::InternalError));
+        let frame = std::mem::take(&mut scratch.frame);
+        let logic = std::mem::take(&mut scratch.logic);
+        let cold = std::mem::take(&mut scratch.cold);
         Vm {
             code,
             ctx,
-            stack: scratch.stack,
-            slots: scratch.slots,
-            logic: scratch.logic,
-            cold: scratch.cold,
+            frame,
+            stack_base,
+            pool: Some(scratch),
+            logic,
+            cold,
             pending_args: None,
             #[cfg(feature = "__drop-arm-probe")]
             probe: ProbePolicy::default(),
@@ -833,8 +872,9 @@ impl<'a> Vm<'a> {
     // one place rather than at each of the sites that asks. `Scratch::release`
     // clears the pool's own buffer, which no `Vm` owns by then.
 
+    #[inline(always)]
     fn push_operand(&mut self, operand: Operand) {
-        self.stack.push(operand);
+        self.frame.push(operand);
     }
 
     /// Take the topmost operand, or `None` where there is none.
@@ -842,13 +882,17 @@ impl<'a> Vm<'a> {
     /// Distinct from [`Vm::pop`] because an aggregate that is still being
     /// built is an operand and not yet a [`Value`]; only the caller that wants
     /// a value pays for closing it.
+    #[inline(always)]
     fn pop_operand(&mut self) -> Option<Operand> {
-        self.stack.pop()
+        if self.frame.len() == self.stack_base {
+            return None;
+        }
+        self.frame.pop()
     }
 
     /// The topmost operand, left where it is.
     fn top(&self) -> Option<&Operand> {
-        self.stack.last()
+        (self.frame.len() > self.stack_base).then(|| &self.frame[self.frame.len() - 1])
     }
 
     /// The topmost operand, left where it is, open for mutation.
@@ -857,12 +901,16 @@ impl<'a> Vm<'a> {
     /// place. Every such caller runs AFTER the value it is about to store has
     /// been popped, so what this answers is the operand under that one.
     fn top_mut(&mut self) -> Option<&mut Operand> {
-        self.stack.last_mut()
+        if self.frame.len() > self.stack_base {
+            self.frame.last_mut()
+        } else {
+            None
+        }
     }
 
     /// How many operands are held.
     fn depth(&self) -> usize {
-        self.stack.len()
+        self.frame.len() - self.stack_base
     }
 
     /// Drop every operand above `depth`.
@@ -877,22 +925,36 @@ impl<'a> Vm<'a> {
             "unwinding to depth {depth} from {}",
             self.depth()
         );
-        self.stack.truncate(depth);
+        self.frame.truncate(self.stack_base + depth);
     }
 
-    /// Hand the operand stack to the scratch pool, leaving none behind.
-    ///
-    /// Reached from [`Vm`]'s [`Drop`], on every way out including a panic, so
-    /// what it returns is every operand this run still held.
-    fn take_stack(&mut self) -> Vec<Operand> {
-        std::mem::take(&mut self.stack)
+    /// The local in `slot`, or `None` for an index past the locals or an
+    /// entry that is not a value -- both states an instruction stream cannot
+    /// reach and the arms report as internal errors.
+    #[inline(always)]
+    fn local(&self, slot: u32) -> Option<&Value> {
+        match self.frame[..self.stack_base].get(slot as usize) {
+            Some(Operand::Value(value)) => Some(value),
+            _ => None,
+        }
     }
 
+    /// [`Vm::local`], open for mutation.
+    #[inline(always)]
+    fn local_mut(&mut self, slot: u32) -> Option<&mut Value> {
+        match self.frame[..self.stack_base].get_mut(slot as usize) {
+            Some(Operand::Value(value)) => Some(value),
+            _ => None,
+        }
+    }
+
+    #[inline(always)]
     fn push(&mut self, value: Value) {
         self.push_operand(Operand::Value(value));
     }
 
     /// Pop one operand, finishing an aggregate that was still being built.
+    #[inline(always)]
     fn pop(&mut self) -> CelResult<Value> {
         let operand = self.pop_operand().ok_or(CelErr::InternalError)?;
         self.finish(operand)
@@ -942,6 +1004,7 @@ impl<'a> Vm<'a> {
         }
     }
 
+    #[inline(always)]
     fn finish(&mut self, operand: Operand) -> CelResult<Value> {
         match operand {
             Operand::Value(value) => Ok(value),
@@ -1168,11 +1231,11 @@ impl<'a> Vm<'a> {
         }
 
         // -- the guard: `IterGuard index source done`
-        let index = match self.slots.get(shape.index as usize) {
+        let index = match self.local(shape.index) {
             Some(&Value::Int(index)) => index,
             _ => return Err(CelErr::InternalError),
         };
-        let len = match self.slots.get(shape.source as usize) {
+        let len = match self.local(shape.source) {
             Some(Value::List(list)) => list.len() as i64,
             _ => return Err(CelErr::InternalError),
         };
@@ -1180,7 +1243,7 @@ impl<'a> Vm<'a> {
             // Exactly what `LoadLocal source` used to do to this slot, and
             // nothing more: one increment on the way in, one decrement on the
             // way out, on the count the whole loop shares.
-            let Some(Value::List(list)) = self.slots.get(shape.source as usize) else {
+            let Some(Value::List(list)) = self.local(shape.source) else {
                 return Err(CelErr::InternalError);
             };
             let duplicate = list.clone();
@@ -1210,16 +1273,13 @@ impl<'a> Vm<'a> {
 
         // -- the bind: `IterBind source index var`
         let element = {
-            let Some(Value::List(sequence)) = self.slots.get(shape.source as usize) else {
+            let Some(Value::List(sequence)) = self.local(shape.source) else {
                 return Err(CelErr::InternalError);
             };
             sequence.get(index as usize)
         };
         let element = element.ok_or(CelErr::IndexOutOfBounds)?;
-        let slot = self
-            .slots
-            .get_mut(shape.var as usize)
-            .ok_or(CelErr::InternalError)?;
+        let slot = self.local_mut(shape.var).ok_or(CelErr::InternalError)?;
         let previous = std::mem::replace(slot, element);
         self.discard(previous);
         if arm == FuseArm::Bind {
@@ -1233,11 +1293,7 @@ impl<'a> Vm<'a> {
         }
 
         // -- the body and the append: `MulLocalConstAppend var k`
-        let lhs = self
-            .slots
-            .get(shape.var as usize)
-            .ok_or(CelErr::InternalError)?
-            .clone();
+        let lhs = self.local(shape.var).ok_or(CelErr::InternalError)?.clone();
         let rhs = self
             .code
             .konst(shape.konst)
@@ -1260,10 +1316,7 @@ impl<'a> Vm<'a> {
     #[cfg(feature = "__elem-attr-probe")]
     #[inline(always)]
     fn fused_advance(&mut self, shape: MapLoop) -> CelResult<u32> {
-        let slot = self
-            .slots
-            .get_mut(shape.index as usize)
-            .ok_or(CelErr::InternalError)?;
+        let slot = self.local_mut(shape.index).ok_or(CelErr::InternalError)?;
         let Value::Int(counter) = slot else {
             return Err(CelErr::InternalError);
         };
@@ -1290,11 +1343,7 @@ impl<'a> Vm<'a> {
                 self.push(value);
             }
             OpCode::LoadLocal => {
-                let value = self
-                    .slots
-                    .get(a as usize)
-                    .ok_or(CelErr::InternalError)?
-                    .clone();
+                let value = self.local(a).ok_or(CelErr::InternalError)?.clone();
                 self.push(value);
             }
             OpCode::StoreLocal => {
@@ -1328,7 +1377,7 @@ impl<'a> Vm<'a> {
                 // work of its own. On this path that copy was also an atomic
                 // pair on the container's `Arc`, per field read.
                 let read = {
-                    let operand = self.slots.get(a as usize).ok_or(CelErr::InternalError)?;
+                    let operand = self.local(a).ok_or(CelErr::InternalError)?;
                     let field = self.name(b)?;
                     if op == OpCode::HasFieldLocal {
                         has_field(operand, field)
@@ -1477,11 +1526,7 @@ impl<'a> Vm<'a> {
             OpCode::AddLocalConst | OpCode::MulLocalConst | OpCode::ModLocalConst => {
                 // Both still cloned, for the reason the `AddConst` arm gives:
                 // `binary_values` takes its operands by value.
-                let lhs = self
-                    .slots
-                    .get(a as usize)
-                    .ok_or(CelErr::InternalError)?
-                    .clone();
+                let lhs = self.local(a).ok_or(CelErr::InternalError)?.clone();
                 let rhs = self.code.konst(b).ok_or(CelErr::InternalError)?.clone();
                 let name = match op {
                     OpCode::AddLocalConst => "add",
@@ -1500,7 +1545,7 @@ impl<'a> Vm<'a> {
                 // `Arc` variants, and a string is what an equality predicate
                 // is written against.
                 let equal = {
-                    let lhs = self.slots.get(a as usize).ok_or(CelErr::InternalError)?;
+                    let lhs = self.local(a).ok_or(CelErr::InternalError)?;
                     let rhs = self.code.konst(b).ok_or(CelErr::InternalError)?;
                     lhs == rhs
                 };
@@ -1509,11 +1554,7 @@ impl<'a> Vm<'a> {
             OpCode::LessLocalConst
             | OpCode::GreaterLocalConst
             | OpCode::GreaterEqualsLocalConst => {
-                let lhs = self
-                    .slots
-                    .get(a as usize)
-                    .ok_or(CelErr::InternalError)?
-                    .clone();
+                let lhs = self.local(a).ok_or(CelErr::InternalError)?.clone();
                 let rhs = self.code.konst(b).ok_or(CelErr::InternalError)?.clone();
                 let accept: fn(Ordering) -> bool = match op {
                     OpCode::LessLocalConst => |o| o == Ordering::Less,
@@ -1541,16 +1582,12 @@ impl<'a> Vm<'a> {
             // top of the stack without popping it, which is what `ListAppend`
             // does too.
             OpCode::LoadLocalAppend => {
-                let value = self
-                    .slots
-                    .get(a as usize)
-                    .ok_or(CelErr::InternalError)?
-                    .clone();
+                let value = self.local(a).ok_or(CelErr::InternalError)?.clone();
                 self.list_mut()?.push(value);
             }
             OpCode::GetFieldLocalAppend | OpCode::HasFieldLocalAppend => {
                 let read = {
-                    let operand = self.slots.get(a as usize).ok_or(CelErr::InternalError)?;
+                    let operand = self.local(a).ok_or(CelErr::InternalError)?;
                     let field = self.name(b)?;
                     if op == OpCode::HasFieldLocalAppend {
                         has_field(operand, field)
@@ -1564,11 +1601,7 @@ impl<'a> Vm<'a> {
             OpCode::AddLocalConstAppend
             | OpCode::MulLocalConstAppend
             | OpCode::ModLocalConstAppend => {
-                let lhs = self
-                    .slots
-                    .get(a as usize)
-                    .ok_or(CelErr::InternalError)?
-                    .clone();
+                let lhs = self.local(a).ok_or(CelErr::InternalError)?.clone();
                 let rhs = self.code.konst(b).ok_or(CelErr::InternalError)?.clone();
                 let name = match op {
                     OpCode::AddLocalConstAppend => "add",
@@ -1580,7 +1613,7 @@ impl<'a> Vm<'a> {
             }
             OpCode::EqualsLocalConstAppend | OpCode::NotEqualsLocalConstAppend => {
                 let equal = {
-                    let lhs = self.slots.get(a as usize).ok_or(CelErr::InternalError)?;
+                    let lhs = self.local(a).ok_or(CelErr::InternalError)?;
                     let rhs = self.code.konst(b).ok_or(CelErr::InternalError)?;
                     lhs == rhs
                 };
@@ -1590,11 +1623,7 @@ impl<'a> Vm<'a> {
             OpCode::LessLocalConstAppend
             | OpCode::GreaterLocalConstAppend
             | OpCode::GreaterEqualsLocalConstAppend => {
-                let lhs = self
-                    .slots
-                    .get(a as usize)
-                    .ok_or(CelErr::InternalError)?
-                    .clone();
+                let lhs = self.local(a).ok_or(CelErr::InternalError)?.clone();
                 let rhs = self.code.konst(b).ok_or(CelErr::InternalError)?.clone();
                 let accept: fn(Ordering) -> bool = match op {
                     OpCode::LessLocalConstAppend => |o| o == Ordering::Less,
@@ -1720,7 +1749,7 @@ impl<'a> Vm<'a> {
                 // Read in the order the four instructions read them, so a
                 // stream that is malformed in both slots raises what it raised
                 // before.
-                let Some(&Value::Int(index)) = self.slots.get(a as usize) else {
+                let Some(&Value::Int(index)) = self.local(a) else {
                     return Err(CelErr::InternalError);
                 };
                 let len = self.sequence_len(b)?;
@@ -1742,7 +1771,7 @@ impl<'a> Vm<'a> {
                 // Read in place; see `Vm::sequence_len` for why the copy the
                 // `LoadLocal` made was the operand-stack round trip rather
                 // than work of its own.
-                let accu = self.slots.get(a as usize).ok_or(CelErr::InternalError)?;
+                let accu = self.local(a).ok_or(CelErr::InternalError)?;
                 let more = if op == OpCode::AccuLoopCondNot {
                     // The negation is inside the `@not_strictly_false`, so a
                     // non-bool fails at the `!` and never reaches the test
@@ -1762,7 +1791,7 @@ impl<'a> Vm<'a> {
                 // Read in place, as above: the `LoadLocal` this replaces
                 // copied the slot only so that the `And` could pop it again.
                 let outcome = {
-                    let accu = self.slots.get(a as usize).ok_or(CelErr::InternalError)?;
+                    let accu = self.local(a).ok_or(CelErr::InternalError)?;
                     as_bool(accu)
                 };
                 *self
@@ -1897,7 +1926,7 @@ impl<'a> Vm<'a> {
     /// atomic refcount pair for a list -- once per element of the loop.
     #[inline(always)]
     fn sequence_len(&self, slot: u32) -> CelResult<i64> {
-        match self.slots.get(slot as usize).ok_or(CelErr::InternalError)? {
+        match self.local(slot).ok_or(CelErr::InternalError)? {
             Value::List(list) => Ok(list.len() as i64),
             _ => Err(CelErr::InternalError),
         }
@@ -1936,23 +1965,17 @@ impl<'a> Vm<'a> {
         #[cfg(feature = "__drop-arm-probe")]
         if self.probe.iter_at == IterAtArm::ViaValueIndex {
             let element = {
-                let sequence = self
-                    .slots
-                    .get(sequence as usize)
-                    .ok_or(CelErr::InternalError)?;
-                let index = self
-                    .slots
-                    .get(index as usize)
-                    .ok_or(CelErr::InternalError)?;
+                let sequence = self.local(sequence).ok_or(CelErr::InternalError)?;
+                let index = self.local(index).ok_or(CelErr::InternalError)?;
                 value_index(sequence, index)
             };
             return element.map_err(|e| self.park(e));
         }
         let element = {
-            let Some(Value::List(sequence)) = self.slots.get(sequence as usize) else {
+            let Some(Value::List(sequence)) = self.local(sequence) else {
                 return Err(CelErr::InternalError);
             };
-            let Some(&Value::Int(index)) = self.slots.get(index as usize) else {
+            let Some(&Value::Int(index)) = self.local(index) else {
                 return Err(CelErr::InternalError);
             };
             // A negative index wraps to a very large `usize` and fails the
@@ -1965,10 +1988,7 @@ impl<'a> Vm<'a> {
     /// Write `value` into `slot`, dropping what was there.
     #[inline(always)]
     fn store_slot(&mut self, slot: u32, value: Value) -> CelResult<()> {
-        let slot = self
-            .slots
-            .get_mut(slot as usize)
-            .ok_or(CelErr::InternalError)?;
+        let slot = self.local_mut(slot).ok_or(CelErr::InternalError)?;
         let previous = std::mem::replace(slot, value);
         self.discard(previous);
         Ok(())
@@ -1983,10 +2003,7 @@ impl<'a> Vm<'a> {
     /// list.
     #[inline(always)]
     fn advance_counter(&mut self, slot: u32) -> CelResult<()> {
-        let slot = self
-            .slots
-            .get_mut(slot as usize)
-            .ok_or(CelErr::InternalError)?;
+        let slot = self.local_mut(slot).ok_or(CelErr::InternalError)?;
         let Value::Int(counter) = slot else {
             return Err(CelErr::InternalError);
         };
@@ -2734,11 +2751,10 @@ mod tests {
         assert_eq!(vm.pop(), Ok(Value::list(vec![Value::Int(2)])));
         assert_eq!(vm.depth(), 0);
 
-        // The handover empties the stack into the buffer the pool releases,
-        // so an operand still held at the end is not dropped anywhere else.
+        // An operand still held at the end goes back to the pool with the
+        // frame, where `Scratch::release` drops it; nothing else has to.
         vm.push(Value::Int(4));
-        assert_eq!(vm.take_stack().len(), 1);
-        assert_eq!(vm.depth(), 0);
+        assert_eq!(vm.depth(), 1);
     }
 
     /// A fused `&&`/`||` keeps CEL's asymmetry: the left operand short-circuits
@@ -2992,7 +3008,7 @@ mod tests {
             let &Insn { op, ops } = vm.code.insns.get(pc as usize).expect("`pc` is in range");
             let next = pc + 1;
             let step = vm.step(op, ops, pc, next).expect("the literal evaluates");
-            if let Some(Operand::Map(entries)) = vm.stack.last() {
+            if let Some(Operand::Map(entries)) = vm.top() {
                 let ptr = Arc::as_ptr(entries);
                 if !opened.contains(&ptr) {
                     opened.push(ptr);
@@ -3049,7 +3065,7 @@ mod tests {
         let code = compile(&parse(source)).expect("compiles");
         let mut vm = Vm::new(&code, &ctx);
         assert_eq!(vm.run(), Ok(Value::Bool(false)));
-        assert!(vm.stack.is_empty(), "the operand stack was left dirty");
+        assert_eq!(vm.depth(), 0, "the operand stack was left dirty");
     }
 
     /// A comprehension over a list that is neither boxed nor whole.
