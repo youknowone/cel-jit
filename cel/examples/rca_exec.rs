@@ -106,7 +106,9 @@ fn main() {
         k *= 2;
     }
     let mut batches: Vec<f64> = Vec::new();
-    while start.elapsed().as_secs_f64() < secs {
+    // At least one batch, however long the calibration above took on a
+    // loaded box; the budget bounds the count and not the minimum.
+    while batches.is_empty() || start.elapsed().as_secs_f64() < secs {
         let t0 = cpu_now();
         for _ in 0..k {
             black_box(one(&ctx));

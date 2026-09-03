@@ -783,6 +783,13 @@ impl<'a> Vm<'a> {
     // -- the error channel ------------------------------------------------
 
     /// Park a full error and return the [`CelErr`] that stands for it.
+    ///
+    /// Out of line and cold: every fallible arm of the dispatch loop ends in
+    /// a `map_err` onto this, and inlined it put a `Vec` push, its growth
+    /// call and an `ExecutionError` drop at each of those sites, in the one
+    /// function whose frame every instruction pays for.
+    #[cold]
+    #[inline(never)]
     fn park(&mut self, err: ExecutionError) -> CelErr {
         let id = u32::try_from(self.cold.len()).unwrap_or(u32::MAX);
         self.cold.push(err);
@@ -1334,6 +1341,7 @@ impl<'a> Vm<'a> {
         Ok(shape.top)
     }
 
+    #[inline(always)]
     fn step(&mut self, op: OpCode, operands: [u32; 3], pc: u32, next: u32) -> CelResult<Step> {
         let [a, b, c] = operands;
         match op {
