@@ -601,7 +601,14 @@ struct Scratch {
     /// The activation record: `| locals | stack |`, one array, laid out as
     /// `PyFrame.locals_cells_stack_w` is. See [`Vm::frame`].
     frame: Vec<Operand>,
+    /// One entry per `&&`/`||`, holding the left operand's outcome: its bool,
+    /// or the error the handler absorbed for it.
     logic: Vec<CelResult<bool>>,
+    /// Full errors for the cases [`CelErr`] cannot spell.
+    ///
+    /// Written only when an error is raised, and truncated again when one is
+    /// absorbed, so a comprehension whose body errors on every iteration does
+    /// not accumulate a table the size of the sequence.
     cold: Vec<ExecutionError>,
 }
 
@@ -669,22 +676,20 @@ struct Vm<'a> {
     ///
     /// Sized once per run: the locals, then capacity for `max_stack` more,
     /// the compiler's proof of how deep the stack goes.
+    ///
+    /// Taken out of the pool's box by `Vm::new` and put back by [`Drop`]:
+    /// the one buffer every instruction touches is a field of the record
+    /// the loop already holds, not a load away through the box.
     frame: Vec<Operand>,
+    /// The pool's box, holding the two buffers a run needs less often, and
+    /// the empty twin of `frame` until [`Drop`] returns it. `Vm::new` moves
+    /// one pointer in and [`Drop`] moves one pointer back out. Measured the
+    /// other way -- take all three buffers out, swap them back -- and the
+    /// moves plus the drops of the emptied twins were a third of the fixed
+    /// price of evaluating `1`.
+    scratch: std::mem::ManuallyDrop<Box<Scratch>>,
     /// Where the operand stack begins in `frame`: `n_slots`.
     stack_base: usize,
-    /// The pool's box, emptied, held so the hand-back at [`Drop`] moves the
-    /// buffers into an allocation that already exists. `None` only between
-    /// the hand-back and the end of the drop.
-    pool: Option<Box<Scratch>>,
-    /// One entry per `&&`/`||`, holding the left operand's outcome: its bool,
-    /// or the error the handler absorbed for it.
-    logic: Vec<CelResult<bool>>,
-    /// Full errors for the cases [`CelErr`] cannot spell.
-    ///
-    /// Written only when an error is raised, and truncated again when one is
-    /// absorbed, so a comprehension whose body errors on every iteration does
-    /// not accumulate a table the size of the sequence.
-    cold: Vec<ExecutionError>,
     /// Arguments a missed [`OpCode::CallQualified`] popped, held for the
     /// [`OpCode::CallMethod`] the compiler emitted right after it.
     ///
@@ -727,19 +732,12 @@ struct Vm<'a> {
 /// exactly as long as a run holds it.
 impl Drop for Vm<'_> {
     fn drop(&mut self) {
-        // `mem::take` on a `Vec` leaves a dangling-free empty one and allocates
-        // nothing, which is the only way to move fields out of a type that
-        // implements `Drop`. The box is an `Option` for the same reason:
-        // `mem::take` on a `Box` would build a default one, and that is an
-        // allocation on every way out.
-        let Some(mut scratch) = self.pool.take() else {
-            return;
-        };
-        // Swapped, not assigned: the box's buffers are the empty ones `new`
-        // left behind, and an assignment would still emit their drop.
-        std::mem::swap(&mut scratch.frame, &mut self.frame);
-        std::mem::swap(&mut scratch.logic, &mut self.logic);
-        std::mem::swap(&mut scratch.cold, &mut self.cold);
+        // SAFETY: taken exactly once, here, and nothing reads the field
+        // afterwards: this is the drop. `ManuallyDrop` is what lets the box
+        // leave a type that implements `Drop` without a placeholder that
+        // would itself have to be built or dropped.
+        let mut scratch = unsafe { std::mem::ManuallyDrop::take(&mut self.scratch) };
+        scratch.frame = std::mem::take(&mut self.frame);
         scratch.release();
         // Dropped rather than pooled where the slot is already gone; see
         // `SCRATCH`.
@@ -762,28 +760,24 @@ impl<'a> Vm<'a> {
             .flatten()
             .unwrap_or_default();
         let stack_base = code.n_slots as usize;
+        let mut frame = std::mem::take(&mut scratch.frame);
         // Each sizing call is out of line and most programs need neither:
         // a scalar expression has no locals and no `&&`/`||`.
         if stack_base > 0 {
-            scratch.frame.resize_with(stack_base, || Operand::NULL);
+            frame.resize_with(stack_base, || Operand::NULL);
         }
-        scratch.frame.reserve(code.max_stack as usize);
+        frame.reserve(code.max_stack as usize);
         if code.n_logic > 0 {
             scratch
                 .logic
                 .resize(code.n_logic as usize, Err(CelErr::InternalError));
         }
-        let frame = std::mem::take(&mut scratch.frame);
-        let logic = std::mem::take(&mut scratch.logic);
-        let cold = std::mem::take(&mut scratch.cold);
         Vm {
             code,
             ctx,
             frame,
+            scratch: std::mem::ManuallyDrop::new(scratch),
             stack_base,
-            pool: Some(scratch),
-            logic,
-            cold,
             pending_args: None,
             #[cfg(feature = "__drop-arm-probe")]
             probe: ProbePolicy::default(),
@@ -809,8 +803,8 @@ impl<'a> Vm<'a> {
     #[cold]
     #[inline(never)]
     fn park(&mut self, err: ExecutionError) -> CelErr {
-        let id = u32::try_from(self.cold.len()).unwrap_or(u32::MAX);
-        self.cold.push(err);
+        let id = u32::try_from(self.scratch.cold.len()).unwrap_or(u32::MAX);
+        self.scratch.cold.push(err);
         CelErr::Cold(ColdId(id))
     }
 
@@ -823,8 +817,8 @@ impl<'a> Vm<'a> {
     /// discarded `Cold` is always the last entry.
     fn unpark(&mut self, err: CelErr) {
         if let CelErr::Cold(ColdId(id)) = err {
-            if id as usize + 1 == self.cold.len() {
-                self.cold.pop();
+            if id as usize + 1 == self.scratch.cold.len() {
+                self.scratch.cold.pop();
             }
         }
     }
@@ -850,6 +844,7 @@ impl<'a> Vm<'a> {
         };
         match err {
             CelErr::Cold(ColdId(id)) => self
+                .scratch
                 .cold
                 .get(id as usize)
                 .cloned()
@@ -1259,6 +1254,7 @@ impl<'a> Vm<'a> {
             return Err(err);
         };
         *self
+            .scratch
             .logic
             .get_mut(logic as usize)
             .ok_or(CelErr::InternalError)? = Err(err);
@@ -1868,6 +1864,7 @@ impl<'a> Vm<'a> {
                     as_bool(accu)
                 };
                 *self
+                    .scratch
                     .logic
                     .get_mut(b as usize)
                     .ok_or(CelErr::InternalError)? = outcome;
@@ -1904,6 +1901,7 @@ impl<'a> Vm<'a> {
                 let outcome = as_bool(&value);
                 self.discard(value);
                 *self
+                    .scratch
                     .logic
                     .get_mut(a as usize)
                     .ok_or(CelErr::InternalError)? = outcome;
@@ -1914,7 +1912,11 @@ impl<'a> Vm<'a> {
             }
             OpCode::AndMerge | OpCode::OrMerge => {
                 let right = self.pop()?;
-                let left = *self.logic.get(a as usize).ok_or(CelErr::InternalError)?;
+                let left = *self
+                    .scratch
+                    .logic
+                    .get(a as usize)
+                    .ok_or(CelErr::InternalError)?;
                 let value = merge(left, &right, op == OpCode::OrMerge)?;
                 self.discard(right);
                 // The left-hand error survived only to be weighed here, and
@@ -2956,9 +2958,9 @@ mod tests {
             "the loop has to actually run 64 times"
         );
         assert!(
-            vm.cold.len() <= 1,
+            vm.scratch.cold.len() <= 1,
             "64 absorbed errors left {} parked",
-            vm.cold.len()
+            vm.scratch.cold.len()
         );
     }
 
