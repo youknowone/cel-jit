@@ -1667,6 +1667,10 @@ impl Value {
                         // the guard and the element cannot read it, and a
                         // nested comprehension binds its own in its own scope.
                         let mut list = list.into_vec();
+                        // Sized by the range up front, as the VM's
+                        // `NewListFromArg` does: `filter` may leave some of
+                        // it unused, `map` fills it exactly.
+                        list.reserve(items.len());
                         for item in items {
                             ctx.add_variable_from_value(&comprehension.iter_var, item);
                             if let Some(guard) = append.guard {

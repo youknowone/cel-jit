@@ -17,6 +17,7 @@
 //!   cargo run --release -p cel --example rca_exec -- [vm|walker] [expr] [secs] [sample|time]
 //!   sample <pid> 5 -file out.txt      # while it runs
 //!   RCA_EXEC_DUMP=1                    # print the instruction stream first
+//!   RCA_EXEC_LIST_N=10000              # size of the `list` variable (default 10)
 
 use std::hint::black_box;
 use std::time::{Duration, Instant};
@@ -43,7 +44,13 @@ fn main() {
     let program = Program::compile(expr).expect("compiles");
     let mut ctx = Context::default();
     ctx.add_variable_from_value("x", 15i64);
-    ctx.add_variable_from_value("list", (1..=10i64).collect::<Vec<_>>());
+    // `RCA_EXEC_LIST_N` sizes `list`; ten elements by default, so that a
+    // per-eval figure on the default context is still mostly the fixed cost.
+    let list_n: i64 = std::env::var("RCA_EXEC_LIST_N")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10);
+    ctx.add_variable_from_value("list", (1..=list_n).collect::<Vec<_>>());
     ctx.add_variable_from_value("apple", true);
     if std::env::var_os("RCA_EXEC_DUMP").is_some() {
         let code = cel::vm::compile(program.expression()).expect("lowers");

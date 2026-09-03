@@ -1237,7 +1237,14 @@ impl Compiler {
         self.emit(OpCode::StoreLocal, &[source], id)?;
 
         // Leaves the builder on the stack, where it stays for the whole loop.
-        self.expr(&comp.accu_init)?;
+        // The empty literal the macros produce opens it sized by the range
+        // instead; any other initialiser is evaluated as written.
+        match &comp.accu_init.expr {
+            Expr::List(list) if list.elements.is_empty() => {
+                self.emit(OpCode::NewListFromArg, &[source], id)?;
+            }
+            _ => self.expr(&comp.accu_init)?,
+        }
 
         let index = self.declare_hidden(id)?;
         let zero = self.add_const(Value::Int(0), id)?;
@@ -2082,9 +2089,15 @@ mod tests {
             // The accumulator lives on the operand stack, so nothing reads it
             // back per iteration; the one store is the finish after the loop.
             assert_eq!(
-                count(&code, OpCode::NewList),
+                count(&code, OpCode::NewListFromArg),
                 1,
-                "{source} should build one accumulator:\n{}",
+                "{source} should build one accumulator, sized by its range:\n{}",
+                code.disassemble()
+            );
+            assert_eq!(
+                count(&code, OpCode::NewList),
+                0,
+                "{source} should not open an unsized accumulator:\n{}",
                 code.disassemble()
             );
         }

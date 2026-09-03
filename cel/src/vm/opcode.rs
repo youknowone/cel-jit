@@ -123,6 +123,15 @@ pub enum OpCode {
     // rule for choosing between them.
     /// Push an empty list.
     NewList,
+    /// Push an empty list with room for as many elements as the list in slot
+    /// `a` holds.
+    ///
+    /// The comprehension accumulator's opener: `BUILD_LIST_FROM_ARG`, which
+    /// sizes the list by the `length_hint` of the range it is about to walk.
+    /// A `map` then fills it without regrowing, and a `filter` at worst
+    /// leaves some of the capacity unused. `NewList` plus one append per
+    /// element regrew the buffer three times for a ten-element range.
+    NewListFromArg,
     /// Pop a value and append it to the list beneath it.
     ListAppend,
     /// Pop an optional; append its value to the list beneath it, or leave the
@@ -540,6 +549,7 @@ impl OpCode {
             | OpCode::OrMerge
             | OpCode::IncLocal
             | OpCode::IterLen
+            | OpCode::NewListFromArg
             | OpCode::AddConst
             | OpCode::MulConst
             | OpCode::ModConst
@@ -649,7 +659,7 @@ impl OpCode {
             // operand stack, because the value the three instructions moved
             // through it never left the slot.
             OpCode::AccuLoopCond | OpCode::AccuLoopCondNot => (0, 0),
-            OpCode::NewList | OpCode::NewMap | OpCode::NewStruct => (0, 1),
+            OpCode::NewList | OpCode::NewListFromArg | OpCode::NewMap | OpCode::NewStruct => (0, 1),
 
             OpCode::StoreLocal | OpCode::Return => (1, 0),
             OpCode::ListAppend | OpCode::ListAppendOptional => (1, 0),

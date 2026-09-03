@@ -1402,6 +1402,10 @@ impl<'a> Vm<'a> {
 
             // -- aggregates ----------------------------------------------
             OpCode::NewList => self.push_operand(Operand::List(Vec::new())),
+            OpCode::NewListFromArg => {
+                let len = self.sequence_len(a)?;
+                self.push_operand(Operand::List(Vec::with_capacity(len as usize)));
+            }
             OpCode::ListAppend => {
                 let value = self.pop()?;
                 self.list_mut()?.push(value);
