@@ -562,6 +562,43 @@ fn same_expression_second_batch_reuses_the_loop() {
     assert_ne!(r1, r2, "the two batches must not answer the same question");
 }
 
+/// The public bind door is the same identity: two [`BatchProgram::bind_per_row`]s
+/// of one program share `shape.code`, so the second bind enters the loop the
+/// first compiled.
+#[test]
+fn a_second_bound_batch_reuses_the_compiled_loop() {
+    use cel::majit::batch::{Batch, BatchProgram, ColumnRef, Tier};
+    use cel::Value;
+    let _serial = serial();
+    reset_persistent_state();
+    reset_jit_stats();
+    let schema: Schema = [("x".to_string(), ValType::Int)].into_iter().collect();
+    let program = BatchProgram::compile("x * 2 + 1", &schema).unwrap();
+    let first = vec![7i64, 8, 9, 10];
+    let second = vec![1i64, 2, 3, 4];
+    let batch_a = Batch::new(first.len()).column("x", ColumnRef::Int(&first));
+    let batch_b = Batch::new(second.len()).column("x", ColumnRef::Int(&second));
+    let a = program.bind_per_row(&batch_a).unwrap();
+    let b = program.bind_per_row(&batch_b).unwrap();
+    a.eager_compile().expect("first bind compiles");
+    let compiled = jit_stats().loops_compiled;
+    let entries = jit_stats().compiled_entries;
+    assert!(compiled > 0, "first bind compiled nothing");
+    assert_eq!(
+        b.collect_on(Tier::Jit).unwrap(),
+        vec![Value::Int(3), Value::Int(5), Value::Int(7), Value::Int(9)]
+    );
+    assert_eq!(
+        jit_stats().loops_compiled,
+        compiled,
+        "second bind compiled a new loop; the green key did not survive the rebind"
+    );
+    assert!(
+        jit_stats().compiled_entries > entries,
+        "second bind did not enter the loop the first bind compiled"
+    );
+}
+
 /// Two expressions of different register shapes get their own pooled drivers,
 /// and both must keep answering correctly while they take turns.
 ///
@@ -1293,6 +1330,15 @@ fn a_host_call_loop_compiles_and_is_entered() {
         assert!(
             stats.compiled_entries >= 1,
             "{src}: compiled but never entered: {stats:?}"
+        );
+        let calls: usize = majit_metainterp::embed::Census::compiled_opcode_log()
+            .iter()
+            .flatten()
+            .filter(|op| format!("{op:?}").starts_with("Call"))
+            .count();
+        assert!(
+            calls > 0,
+            "{src}: host_call was not recorded as a residual call: {stats:?}"
         );
     }
 }

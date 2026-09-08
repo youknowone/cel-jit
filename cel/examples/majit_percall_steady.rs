@@ -525,7 +525,8 @@ struct Warm {
     /// This is what says WHICH of the two doors a case came in through, and it
     /// says it as data rather than as a claim about the expression's shape. The
     /// entry door counts calls, so a case whose only loop is the row loop first
-    /// enters at around the trace threshold — call 8 or 9. A case whose row BODY
+    /// enters at around the trace threshold — call `DEFAULT_JIT_THRESHOLD` or the
+    /// one after. A case whose row BODY
     /// contains its own loop over a list longer than the threshold crosses that
     /// loop's back edge enough times inside the FIRST call, so it enters at call
     /// 1 or 2 — and the entry door then declines for it permanently, by design:

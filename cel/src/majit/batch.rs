@@ -55,6 +55,10 @@
 //! Both compile the same loop over the same red-index column reads; only the
 //! last instruction of an iteration differs.
 //!
+//! [`BoundBatch::eager_compile`] traces on [`Tier::Jit`] until a compiled loop
+//! exists, so a later production call does not pay the compile. The default
+//! [`Tier::Jit`] door still traces on first use at [`DEFAULT_JIT_THRESHOLD`].
+//!
 //! **What it refuses.** Everything outside the traceable subset declines at
 //! [`BatchProgram::compile`], and a batch whose data would make the tree-walker
 //! raise (an `int` overflow, a division by zero) refuses at the run.
@@ -75,9 +79,16 @@ use crate::common::types::type_const_value;
 use crate::objects::{Key, ListRef, ListStorage, RecordSchema, ScalarBank, StrBank, ValueColumn};
 use crate::{Context, Program, Value};
 
-/// Trace threshold [`Tier::Jit`] runs at: the batch loop compiles after this
-/// many iterations. Matches the threshold the benchmarks and tests use.
-pub const DEFAULT_JIT_THRESHOLD: u32 = 8;
+/// Trace threshold [`Tier::Jit`] runs at. A 1-row batch compiles after this
+/// many calls (the function-entry door); a taller batch compiles once the row
+/// loop's back edges reach the same count. [`BoundBatch::eager_compile`] waits
+/// until that loop exists so a later production call does not pay it.
+pub const DEFAULT_JIT_THRESHOLD: u32 = 2;
+
+/// How many [`Tier::Jit`] runs [`BoundBatch::eager_compile`] will make before
+/// giving up. A 1-row batch compiles after [`DEFAULT_JIT_THRESHOLD`] calls and
+/// enters on the next; this is well past that.
+const EAGER_COMPILE_ATTEMPTS: u32 = 32;
 
 /// Whether the compiled tier is Cranelift's rather than dynasm's — the one
 /// thing the three routing constants below have to be told, because the two
@@ -218,11 +229,13 @@ pub fn compiled_saving_ps(lowered: &LoweredF, rows: usize, elems: usize) -> i64 
         )
 }
 
-/// Why a batch could not be answered. Every variant means the same thing to a
-/// caller — evaluate this expression with [`crate::Program::execute`] instead —
-/// but they are distinguished because they say different things about the
-/// expression: [`BatchError::Lower`] is permanent for this expression, the rest
-/// depend on the data.
+/// Why a batch could not be answered. Every variant except
+/// [`BatchError::DidNotCompile`] means the same thing to a caller — evaluate
+/// this expression with [`crate::Program::execute`] instead — but they are
+/// distinguished because they say different things about the expression:
+/// [`BatchError::Lower`] is permanent for this expression, the rest depend on
+/// the data. [`BatchError::DidNotCompile`] is only [`BoundBatch::eager_compile`]:
+/// the expression still has a batch answer, just no compiled loop yet.
 #[derive(Debug, Clone)]
 pub enum BatchError {
     /// The source is not a valid CEL expression.
@@ -275,6 +288,11 @@ pub enum BatchError {
         /// What the failed evaluation said.
         message: String,
     },
+    /// [`BoundBatch::eager_compile`] ran the batch on [`Tier::Jit`] and no
+    /// compiled loop was entered. The expression still has a value — take
+    /// [`BoundBatch::collect_on`] / [`BoundBatch::sum_on`] — but the compile
+    /// this door exists to wait for did not happen.
+    DidNotCompile,
 }
 
 impl std::fmt::Display for BatchError {
@@ -296,6 +314,10 @@ impl std::fmt::Display for BatchError {
             ),
             BatchError::Trapped => write!(f, "a row trapped (overflow or division by zero)"),
             BatchError::Row { row, message } => write!(f, "row {row}: {message}"),
+            BatchError::DidNotCompile => write!(
+                f,
+                "eager_compile did not enter a compiled loop after {EAGER_COMPILE_ATTEMPTS} runs"
+            ),
         }
     }
 }
@@ -1349,6 +1371,35 @@ impl BoundBatch<'_, '_> {
             dispatch(tier, threshold, code, regs, nf, banks, check)
         })
     }
+
+    /// Trace this batch on [`Tier::Jit`] until a compiled loop is entered, then
+    /// return. Subsequent [`Tier::Jit`] runs of this program reuse that loop —
+    /// the compile is paid here, not on the first production call.
+    ///
+    /// Uses the same [`DEFAULT_JIT_THRESHOLD`] later [`Tier::Jit`] runs use.
+    /// The persistent driver is keyed on the threshold, so compiling at a
+    /// different one would warm a driver production never consults.
+    ///
+    /// A 1-row batch compiles after that many calls and enters on the next. A
+    /// taller batch crosses the back-edge threshold inside the first call.
+    /// After 32 runs with no compiled entry, this is
+    /// [`BatchError::DidNotCompile`]. A row that traps is [`BatchError::Trapped`].
+    ///
+    /// [`Tier::Auto`] still routes by cost after this returns: a one-row
+    /// straight-line batch stays on [`Tier::Clean`] unless the caller names
+    /// [`Tier::Jit`].
+    pub fn eager_compile(&self) -> Result<(), BatchError> {
+        use super::bytecode::float_bank::jit_stats;
+        let before = jit_stats().compiled_entries;
+        for _ in 0..EAGER_COMPILE_ATTEMPTS {
+            self.execute(Tier::Jit, DEFAULT_JIT_THRESHOLD)
+                .ok_or(BatchError::Trapped)?;
+            if jit_stats().compiled_entries > before {
+                return Ok(());
+            }
+        }
+        Err(BatchError::DidNotCompile)
+    }
 }
 
 fn threshold_for(tier: Tier) -> u32 {
@@ -1884,6 +1935,13 @@ fn intern(distinct: &[String]) -> Arc<[Arc<String>]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Serializes tests that reset and then read the process-global JIT
+    /// census. Poison-tolerant so one failure does not cascade.
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
 
     fn schema(pairs: &[(&str, ValType)]) -> Schema {
         pairs.iter().map(|(p, t)| (p.to_string(), *t)).collect()
@@ -4569,6 +4627,87 @@ mod tests {
         let (v, who) = eval_per_row(&p, &s, &batch, &base).unwrap();
         assert_eq!(who, Answered::Batch);
         assert_eq!(v[0], Value::Int(5));
+    }
+
+    /// Two binds of one [`BatchProgram`] share the lowering's `Arc` — the
+    /// green key is that pointer plus pc, so the second batch must enter the
+    /// loop the first compiled and not mint another.
+    #[test]
+    fn a_second_bind_of_the_same_program_reuses_the_compiled_loop() {
+        let _serial = serial();
+        let s = schema(&[("x", ValType::Int)]);
+        let program = BatchProgram::compile("x * 2 + 1", &s).unwrap();
+        let first = vec![7i64, 8, 9, 10];
+        let second = vec![1i64, 2, 3, 4];
+        let batch_a = Batch::new(first.len()).column("x", ColumnRef::Int(&first));
+        let batch_b = Batch::new(second.len()).column("x", ColumnRef::Int(&second));
+        let a = program.bind_per_row(&batch_a).unwrap();
+        let b = program.bind_per_row(&batch_b).unwrap();
+        let code = &program
+            .lowered()
+            .batch_shape(true, BatchReduce::PerRow)
+            .code;
+        assert_eq!(
+            std::sync::Arc::as_ptr(code),
+            std::sync::Arc::as_ptr(
+                &program
+                    .lowered()
+                    .batch_shape(true, BatchReduce::PerRow)
+                    .code
+            ),
+            "batch_shape must keep one Arc for the program"
+        );
+        a.eager_compile().expect("first bind compiles");
+        assert_eq!(
+            b.collect_on(Tier::Jit).unwrap(),
+            vec![Value::Int(3), Value::Int(5), Value::Int(7), Value::Int(9)]
+        );
+    }
+
+    /// Two [`BatchProgram::compile`]s of the same source are two code objects,
+    /// like two `PyCode`s from compiling the same function twice. They must not
+    /// share a green key, so the second program compiles its own loop.
+    #[test]
+    fn two_compiles_of_the_same_source_do_not_share_a_loop() {
+        let s = schema(&[("x", ValType::Int)]);
+        let p1 = BatchProgram::compile("x * 2 + 1", &s).unwrap();
+        let p2 = BatchProgram::compile("x * 2 + 1", &s).unwrap();
+        assert_ne!(
+            std::sync::Arc::as_ptr(&p1.lowered().batch_shape(true, BatchReduce::PerRow).code),
+            std::sync::Arc::as_ptr(&p2.lowered().batch_shape(true, BatchReduce::PerRow).code),
+            "two compile()s must mint two Code allocations"
+        );
+    }
+
+    /// [`BoundBatch::eager_compile`] traces until compiled code is entered, and
+    /// a later [`Tier::Jit`] run stays on that loop and matches [`Tier::Clean`].
+    #[test]
+    fn eager_compile_waits_until_the_loop_is_entered() {
+        use crate::majit::bytecode::float_bank::{
+            jit_stats, reset_jit_stats, reset_persistent_state,
+        };
+        let _serial = serial();
+        reset_persistent_state();
+        reset_jit_stats();
+        let s = schema(&[("x", ValType::Int)]);
+        let program = BatchProgram::compile("x * 2 + 1", &s).unwrap();
+        let one = vec![7i64];
+        let batch = Batch::new(1).column("x", ColumnRef::Int(&one));
+        let bound = program.bind_per_row(&batch).unwrap();
+        bound.eager_compile().expect("1-row x*2+1 compiles");
+        let after = jit_stats().compiled_entries;
+        assert!(
+            after > 0,
+            "eager_compile returned without entering compiled code"
+        );
+        let jit = bound.collect_on(Tier::Jit).unwrap();
+        let clean = bound.collect_on(Tier::Clean).unwrap();
+        assert_eq!(jit, clean);
+        assert_eq!(jit, vec![Value::Int(15)]);
+        assert!(
+            jit_stats().compiled_entries > after,
+            "the warmed loop is entered again on the next Jit run"
+        );
     }
 
     /// A column the expression reads and the batch does not carry is the

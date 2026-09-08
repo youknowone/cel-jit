@@ -1650,10 +1650,16 @@ pub mod float_bank {
     // The four calling conventions of `magic::ScalarFn`, each reading its
     // entry word back as the `Box` that `ScalarFn::entry_word` took the
     // address of. Residual on purpose: a closure body is not something a
-    // trace can look inside, and the call is what the trace records — the
-    // mainloop's `calls = { .. }` names each one `residual_int_cannot_raise`,
-    // and a helper the attribute does not name lowers its arm to an abort
-    // stub, which is a JIT tier that quietly answers out of the interpreter
+    // trace can look inside, and the call is what the trace records.
+    //
+    // `getcalldescr` (`call.py`) picks `EF_CANNOT_RAISE` on the non-elidable
+    // else branch when `_canraise` is false. These helpers return an `i64`
+    // and do not raise into the JIT — a CEL error is out of band — so the
+    // sidecar is `dont_look_inside_cannot_raise` and `calls = { .. }` names
+    // each one `residual_int_cannot_raise`. A bare `dont_look_inside` would
+    // be `EF_CAN_RAISE` and leave a `GUARD_NO_EXCEPTION` on every call. A
+    // helper the attribute does not name lowers its arm to an abort stub,
+    // which is a JIT tier that quietly answers out of the interpreter
     // (`majit_trace_evidence.rs` `a_host_call_loop_compiles_and_is_entered`).
     //
     // The float pair passes `f64` as its bits in an `i64`, on both sides: the
@@ -1664,22 +1670,22 @@ pub mod float_bank {
     // the lowering emits each opcode only for that arm -- and the `ScalarFn`
     // is alive because `LoweredF::host_fns` holds the `Arc` for as long as the
     // program that names it exists.
-    #[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+    #[cfg_attr(feature = "jit", majit_macros::dont_look_inside_cannot_raise)]
     extern "C" fn host_call1_i(f: i64, a: i64) -> i64 {
         let f = unsafe { &*(f as usize as *const Box<dyn Fn(i64) -> i64 + Send + Sync>) };
         f(a)
     }
-    #[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+    #[cfg_attr(feature = "jit", majit_macros::dont_look_inside_cannot_raise)]
     extern "C" fn host_call2_i(f: i64, a: i64, b: i64) -> i64 {
         let f = unsafe { &*(f as usize as *const Box<dyn Fn(i64, i64) -> i64 + Send + Sync>) };
         f(a, b)
     }
-    #[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+    #[cfg_attr(feature = "jit", majit_macros::dont_look_inside_cannot_raise)]
     extern "C" fn host_call1_f(f: i64, a_bits: i64) -> i64 {
         let f = unsafe { &*(f as usize as *const Box<dyn Fn(f64) -> f64 + Send + Sync>) };
         f(f64::from_bits(a_bits as u64)).to_bits() as i64
     }
-    #[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+    #[cfg_attr(feature = "jit", majit_macros::dont_look_inside_cannot_raise)]
     extern "C" fn host_call2_f(f: i64, a_bits: i64, b_bits: i64) -> i64 {
         let f = unsafe { &*(f as usize as *const Box<dyn Fn(f64, f64) -> f64 + Send + Sync>) };
         f(f64::from_bits(a_bits as u64), f64::from_bits(b_bits as u64)).to_bits() as i64
@@ -1782,6 +1788,10 @@ pub mod float_bank {
         // aliasing the helper call to the opcode.
         native_int_binops = { majit_uint_mul_high => UintMulHigh },
         // A user function in scalar form: a call the trace keeps as a call.
+        // Sidecar `dont_look_inside_cannot_raise` is the same
+        // `EF_CANNOT_RAISE` pick `getcalldescr` makes when `_canraise`
+        // is false; `auto_calls` harvests it so the two cannot drift.
+        auto_calls = true,
         calls = {
             host_call1_i => residual_int_cannot_raise,
             host_call2_i => residual_int_cannot_raise,
@@ -1866,10 +1876,13 @@ pub mod float_bank {
                     let f = program[pc + 1] as usize;
                     let a = program[pc + 2] as usize;
                     let d = program[pc + 3] as usize;
-                    state.fregs[d] = f64::from_bits(host_call1_f(
+                    // Named bitcast, not `f64::{from,to}_bits`: an inherent
+                    // method the macro does not recognise degrades this arm
+                    // to an abort stub (`OP_RETURN_F` / #133).
+                    state.fregs[d] = majit_bits_to_f64(host_call1_f(
                         state.regs[f],
-                        state.fregs[a].to_bits() as i64,
-                    ) as u64);
+                        majit_f64_to_bits(state.fregs[a]),
+                    ));
                     pc += 4;
                 }
                 OP_HOST_CALL2_F => {
@@ -1877,11 +1890,11 @@ pub mod float_bank {
                     let a = program[pc + 2] as usize;
                     let b = program[pc + 3] as usize;
                     let d = program[pc + 4] as usize;
-                    state.fregs[d] = f64::from_bits(host_call2_f(
+                    state.fregs[d] = majit_bits_to_f64(host_call2_f(
                         state.regs[f],
-                        state.fregs[a].to_bits() as i64,
-                        state.fregs[b].to_bits() as i64,
-                    ) as u64);
+                        majit_f64_to_bits(state.fregs[a]),
+                        majit_f64_to_bits(state.fregs[b]),
+                    ));
                     pc += 5;
                 }
                 OP_ADD_OVF => {
