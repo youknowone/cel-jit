@@ -38,8 +38,8 @@ pub mod functions;
 mod magic;
 pub mod objects;
 mod resolvers;
-/// The class-based value universe, under construction and not yet reachable
-/// from [`Value`]. See its module documentation before adding to it.
+/// Internal class-based value universe. The public [`Value`] enum is the cel
+/// drop-in; cross the boundary through [`runtime::convert`].
 pub mod runtime;
 pub mod vm;
 

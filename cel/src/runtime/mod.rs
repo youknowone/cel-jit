@@ -1,13 +1,10 @@
 //! The class-based value universe.
 //!
-//! **Unstable and not yet reachable from [`crate::Value`].** This is the first
-//! slice of the re-lay that replaces the `Value` enum — and the `Arc`s inside
-//! it — with a header-first class family allocated through a tracing heap. It
-//! is additive: nothing here is wired into the evaluators yet, so the crate
-//! ships exactly as before and the slice is revertible by deleting the
-//! directory.
+//! **Internal.** [`crate::Value`] is the cel drop-in and does not change —
+//! callers still construct variants, match them, and bind `This<Arc<String>>`.
+//! What cel-jit added here may move. Cross the two at [`convert`].
 //!
-//! # Why the enum is being replaced
+//! # Why a class family at all
 //!
 //! Front-end B's only general enum-variant lowering is anchored to
 //! `core::result::Result`, so a `CelValue::Int(x)` arrives at the optimizer as
@@ -44,6 +41,7 @@
 //! cel objects and no walker able to see both.
 
 pub mod binop;
+pub mod convert;
 pub mod error;
 pub mod heap;
 pub mod lltype;
