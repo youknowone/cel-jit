@@ -4,22 +4,28 @@
 //! construct `Value::Int`, match variants, and bind `This<Arc<String>>`.
 //! Evaluators that want a header-first object cross here, and only here.
 //!
-//! Types this family has no leaf for — `map`, `struct`, and a non-optional
-//! `opaque` — stay on the public enum. That is a missing leaf, not a signal
-//! to widen [`crate::Value`].
+//! Types this family has no leaf for — a non-optional `opaque` — stay on the
+//! public enum. That is a missing leaf, not a signal to widen [`crate::Value`].
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::object::{
-    new_bool, new_bytes, new_double, new_int, new_list, new_null, new_optional, new_optional_none,
-    new_string, new_uint, w_kind, w_type, CelKind, CelRef, W_BoolObject, W_BytesObject,
-    W_DoubleObject, W_IntObject, W_ListObject, W_OptionalObject, W_StringObject, W_UIntObject,
-    CEL_BOOL_CLASS, CEL_BYTES_CLASS, CEL_DOUBLE_CLASS, CEL_INT_CLASS, CEL_LIST_CLASS,
-    CEL_NULL_CLASS, CEL_OPTIONAL_CLASS, CEL_STRING_CLASS, CEL_UINT_CLASS,
+    new_bool, new_bytes, new_double, new_int, new_list, new_map, new_null, new_optional,
+    new_optional_none, new_string, new_uint, w_kind, w_type, CelKind, CelRef, W_BoolObject,
+    W_BytesObject, W_DoubleObject, W_IntObject, W_ListObject, W_MapObject, W_OptionalObject,
+    W_StringObject, W_UIntObject, CEL_BOOL_CLASS, CEL_BYTES_CLASS, CEL_DOUBLE_CLASS, CEL_INT_CLASS,
+    CEL_LIST_CLASS, CEL_MAP_CLASS, CEL_NULL_CLASS, CEL_OPTIONAL_CLASS, CEL_STRING_CLASS,
+    CEL_UINT_CLASS,
 };
 use super::object_array::{bytes_base, items_block_items_base};
-use crate::objects::{ListRef, OptionalValue};
+use crate::objects::{Key, ListRef, Map, MapStorage, OptionalValue};
 use crate::Value;
+
+#[cfg(feature = "structs")]
+use super::object::{new_struct, W_StructObject, CEL_STRUCT_CLASS};
+#[cfg(feature = "structs")]
+use crate::common::types::CelStruct;
 
 #[cfg(feature = "chrono")]
 use super::object::{
@@ -53,9 +59,17 @@ pub fn value_to_ref(v: &Value) -> Result<CelRef, ConvertError> {
             }
             Ok(new_list(&items) as CelRef)
         }
-        Value::Map(_) => Err(ConvertError::Unsupported("map")),
+        Value::Map(map) => Ok(new_map(&map_pairs(map)?) as CelRef),
         #[cfg(feature = "structs")]
-        Value::Struct(_) => Err(ConvertError::Unsupported("struct")),
+        Value::Struct(s) => {
+            let name = new_string(s.name());
+            let fields = s.field_values();
+            let mut pairs = Vec::with_capacity(fields.len());
+            for (fname, fval) in fields.iter() {
+                pairs.push((new_string(fname) as CelRef, value_to_ref(fval)?));
+            }
+            Ok(new_struct(name, &pairs) as CelRef)
+        }
         Value::Opaque(opaque) => {
             let Some(opt) = opaque.downcast_ref::<OptionalValue>() else {
                 return Err(ConvertError::Unsupported("opaque"));
@@ -109,14 +123,7 @@ pub unsafe fn ref_to_value(w: CelRef) -> Result<Value, ConvertError> {
         CelKind::Null if class == &CEL_NULL_CLASS => Ok(Value::Null),
         CelKind::Str if class == &CEL_STRING_CLASS => {
             let leaf = unsafe { &*w.cast::<W_StringObject>() };
-            let n = leaf.byte_len as usize;
-            let base = unsafe { bytes_base(leaf.chars) };
-            if base.is_null() && n != 0 {
-                return Err(ConvertError::Corrupt("string"));
-            }
-            let bytes = unsafe { std::slice::from_raw_parts(base, n) };
-            let s = std::str::from_utf8(bytes).map_err(|_| ConvertError::Corrupt("string"))?;
-            Ok(Value::String(Arc::new(s.to_string())))
+            Ok(Value::String(string_from_leaf(leaf)?))
         }
         CelKind::Bytes if class == &CEL_BYTES_CLASS => {
             let leaf = unsafe { &*w.cast::<W_BytesObject>() };
@@ -141,6 +148,38 @@ pub unsafe fn ref_to_value(w: CelRef) -> Result<Value, ConvertError> {
             }
             Ok(Value::List(ListRef::from(items)))
         }
+        CelKind::Map if class == &CEL_MAP_CLASS => {
+            let leaf = unsafe { &*w.cast::<W_MapObject>() };
+            let n = leaf.length as usize;
+            let base = unsafe { items_block_items_base(leaf.items) };
+            if base.is_null() && n != 0 {
+                return Err(ConvertError::Corrupt("map"));
+            }
+            let mut entries = HashMap::with_capacity(n);
+            for i in 0..n {
+                let key = unsafe { ref_to_key(*base.add(2 * i))? };
+                let value = unsafe { ref_to_value(*base.add(2 * i + 1))? };
+                entries.insert(key, value);
+            }
+            Ok(Value::Map(Map::object(Arc::new(entries))))
+        }
+        #[cfg(feature = "structs")]
+        CelKind::Struct if class == &CEL_STRUCT_CLASS => {
+            let leaf = unsafe { &*w.cast::<W_StructObject>() };
+            let name = string_from_ref(leaf.name as CelRef)?;
+            let n = leaf.length as usize;
+            let base = unsafe { items_block_items_base(leaf.fields) };
+            if base.is_null() && n != 0 {
+                return Err(ConvertError::Corrupt("struct"));
+            }
+            let mut s = CelStruct::new((*name).clone());
+            for i in 0..n {
+                let fname = unsafe { string_from_ref(*base.add(2 * i))? };
+                let fval = unsafe { ref_to_value(*base.add(2 * i + 1))? };
+                s.add_field_value((*fname).clone(), fval);
+            }
+            Ok(Value::Struct(Arc::new(s)))
+        }
         CelKind::Optional if class == &CEL_OPTIONAL_CLASS => {
             let inner = unsafe { (*w.cast::<W_OptionalObject>()).w_value };
             let opt = if inner.is_null() {
@@ -164,6 +203,66 @@ pub unsafe fn ref_to_value(w: CelRef) -> Result<Value, ConvertError> {
             Ok(Value::Timestamp(utc.with_timezone(&off)))
         }
         _ => Err(ConvertError::Unsupported("class")),
+    }
+}
+
+fn key_to_ref(k: &Key) -> CelRef {
+    match k {
+        Key::Int(i) => new_int(*i) as CelRef,
+        Key::Uint(u) => new_uint(*u) as CelRef,
+        Key::Bool(b) => new_bool(*b) as CelRef,
+        Key::String(s) => new_string(s) as CelRef,
+    }
+}
+
+fn map_pairs(map: &Map) -> Result<Vec<(CelRef, CelRef)>, ConvertError> {
+    match map.storage() {
+        MapStorage::Object(entries) => {
+            let mut pairs = Vec::with_capacity(entries.len());
+            for (k, v) in entries.iter() {
+                pairs.push((key_to_ref(k), value_to_ref(v)?));
+            }
+            Ok(pairs)
+        }
+        // Record is a batch encoding, not a second class-family strategy:
+        // explode it at this boundary into the same interleaved pairs.
+        MapStorage::Record { .. } => {
+            let exploded = map.to_hashmap();
+            let mut pairs = Vec::with_capacity(exploded.len());
+            for (k, v) in exploded.iter() {
+                pairs.push((key_to_ref(k), value_to_ref(v)?));
+            }
+            Ok(pairs)
+        }
+    }
+}
+
+fn string_from_leaf(leaf: &W_StringObject) -> Result<Arc<String>, ConvertError> {
+    let n = leaf.byte_len as usize;
+    let base = unsafe { bytes_base(leaf.chars) };
+    if base.is_null() && n != 0 {
+        return Err(ConvertError::Corrupt("string"));
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(base, n) };
+    let s = std::str::from_utf8(bytes).map_err(|_| ConvertError::Corrupt("string"))?;
+    Ok(Arc::new(s.to_string()))
+}
+
+#[cfg(feature = "structs")]
+fn string_from_ref(w: CelRef) -> Result<Arc<String>, ConvertError> {
+    if w.is_null() || unsafe { w_type(w) } != &CEL_STRING_CLASS {
+        return Err(ConvertError::Corrupt("string"));
+    }
+    string_from_leaf(unsafe { &*w.cast::<W_StringObject>() })
+}
+
+fn ref_to_key(w: CelRef) -> Result<Key, ConvertError> {
+    match unsafe { ref_to_value(w) }? {
+        Value::Int(i) => Ok(Key::Int(i)),
+        Value::UInt(u) => Ok(Key::Uint(u)),
+        Value::Bool(b) => Ok(Key::Bool(b)),
+        Value::String(s) => Ok(Key::String(s)),
+        _ => Err(ConvertError::Corrupt("map key")),
     }
 }
 
@@ -203,10 +302,56 @@ mod tests {
     }
 
     #[test]
-    fn map_stays_on_the_public_enum() {
-        use crate::objects::Map;
-        let v = Value::Map(Map::object(Arc::new(std::collections::HashMap::new())));
-        assert_eq!(value_to_ref(&v), Err(ConvertError::Unsupported("map")));
+    fn public_map_roundtrip() {
+        use crate::objects::{RecordSchema, ScalarBank, ValueColumn};
+
+        let empty = Value::Map(Map::object(Arc::new(HashMap::new())));
+        assert_eq!(roundtrip(empty.clone()), empty);
+
+        let mut entries = HashMap::new();
+        entries.insert(Key::Int(1), Value::String(Arc::new("one".into())));
+        entries.insert(Key::Uint(2), Value::Int(2));
+        entries.insert(Key::Bool(true), Value::Bool(false));
+        entries.insert(Key::String(Arc::new("k".into())), Value::UInt(3));
+        let object = Value::Map(Map::object(Arc::new(entries)));
+        assert_eq!(roundtrip(object.clone()), object);
+
+        let schema = Arc::new(RecordSchema::new(
+            vec![Key::from("a"), Key::Int(7)],
+            vec![
+                ValueColumn::Scalar {
+                    bank: ScalarBank::Int,
+                    words: Arc::from([42i64]),
+                },
+                ValueColumn::Scalar {
+                    bank: ScalarBank::Bool,
+                    words: Arc::from([1i64]),
+                },
+            ],
+        ));
+        let record = Value::Map(Map::record(schema, 0));
+        assert_eq!(roundtrip(record.clone()), record);
+    }
+
+    #[cfg(feature = "structs")]
+    #[test]
+    fn public_struct_roundtrip() {
+        let mut s = CelStruct::new("cel.Problem".into());
+        s.add_field_value("answer".into(), Value::Int(42));
+        s.add_field_value("solved".into(), Value::Bool(true));
+        let v = Value::Struct(Arc::new(s));
+        let back = roundtrip(v.clone());
+        match (v, back) {
+            (Value::Struct(a), Value::Struct(b)) => assert_eq!(*a, *b),
+            _ => panic!("expected struct"),
+        }
+
+        let empty = Value::Struct(Arc::new(CelStruct::new("cel.Empty".into())));
+        let back = roundtrip(empty.clone());
+        match (empty, back) {
+            (Value::Struct(a), Value::Struct(b)) => assert_eq!(*a, *b),
+            _ => panic!("expected empty struct"),
+        }
     }
 
     #[cfg(feature = "chrono")]

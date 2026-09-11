@@ -1,6 +1,6 @@
 //! Separately allocated payload blocks for the variable-length leaves.
 //!
-//! A CEL `string`, `bytes` or `list` has a payload whose size is not known at
+//! A CEL `string`, `bytes`, `list`, `map` or `struct` has a payload whose size is not known at
 //! compile time. This module holds that payload; [`super::object`] holds the
 //! fixed-size leaf that points at it.
 //!

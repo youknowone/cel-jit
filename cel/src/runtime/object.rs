@@ -84,6 +84,9 @@ pub enum CelKind {
     Bytes = 9,
     Str = 10,
     List = 11,
+    Map = 12,
+    #[cfg(feature = "structs")]
+    Struct = 13,
 }
 
 /// One value class.
@@ -494,6 +497,112 @@ pub fn new_list(values: &[CelRef]) -> *mut W_ListObject {
     })
 }
 
+/// Flatten `[k, v]` pairs into one items block. Shared by map and struct so
+/// the two leaves cannot drift on how they pack an entry.
+fn interleaved_pair_block(pairs: &[(CelRef, CelRef)]) -> *mut CelItemsBlock {
+    let n = pairs.len();
+    let mut items = Vec::with_capacity(n * 2);
+    let mut i = 0;
+    while i < n {
+        items.push(pairs[i].0);
+        items.push(pairs[i].1);
+        i += 1;
+    }
+    object_array::new_items_block(&items)
+}
+
+/// A CEL `map`.
+///
+/// ⚠ §3 of the design gives this leaf a `strategy` tag beside the storage
+/// pointer. It is deliberately absent here: a discriminant is only meaningful
+/// once there is a second strategy to discriminate, and the design schedules
+/// those for the phase that lands the unboxed columns. Adding the field now
+/// would be a shape with one inhabitant and no reader. It is a scalar field, so
+/// adding it later does not change how this leaf fuses.
+///
+/// Entries live as interleaved `[k0, v0, k1, v1, …]` references in one
+/// [`CelItemsBlock`]. [`W_MapObject::length`] is the entry count, so the block
+/// holds `2 * length` items.
+#[cfg_attr(feature = "jit", majit_macros::jit_immutable_fields(items, length))]
+#[repr(C)]
+#[allow(non_camel_case_types)]
+pub struct W_MapObject {
+    pub ob_header: CelObject,
+    pub items: *mut CelItemsBlock,
+    /// Live entry count, not the number of references in [`Self::items`].
+    pub length: i64,
+}
+
+pub static CEL_MAP_CLASS: CelClass = CelClass::new("map", CelKind::Map);
+
+const _: () = {
+    assert!(offset_of!(W_MapObject, ob_header) == 0);
+};
+
+/// Box `pairs` as a CEL `map`.
+pub fn new_map(pairs: &[(CelRef, CelRef)]) -> *mut W_MapObject {
+    let items = interleaved_pair_block(pairs);
+    let length = pairs.len() as i64;
+    lltype::malloc_typed(W_MapObject {
+        ob_header: CelObject {
+            ob_type: &CEL_MAP_CLASS,
+        },
+        items,
+        length,
+    })
+}
+
+/// A CEL `struct`.
+///
+/// §3 of the design gives this leaf a `w_type: CelRef` pointing at a type
+/// value. That type value is not a leaf yet: [`W_TypeObject`] only holds a
+/// `*const CelClass` and cannot carry a per-instance struct name.
+/// [`CEL_STRUCT_CLASS`] is the class word; the instance name is an ordinary
+/// payload so convert can rebuild `CelStruct::new(name)`.
+///
+/// Fields live as interleaved `[name0, value0, …]` references, names as
+/// [`W_StringObject`]. [`W_StructObject::length`] is the field count.
+///
+/// ⚠ The strategy tag is absent for the same reason [`W_ListObject`] omits
+/// it: a discriminant is only meaningful once there is a second strategy.
+#[cfg(feature = "structs")]
+#[cfg_attr(
+    feature = "jit",
+    majit_macros::jit_immutable_fields(name, fields, length)
+)]
+#[repr(C)]
+#[allow(non_camel_case_types)]
+pub struct W_StructObject {
+    pub ob_header: CelObject,
+    pub name: *mut W_StringObject,
+    pub fields: *mut CelItemsBlock,
+    /// Live field count, not the number of references in [`Self::fields`].
+    pub length: i64,
+}
+
+#[cfg(feature = "structs")]
+pub static CEL_STRUCT_CLASS: CelClass = CelClass::new("struct", CelKind::Struct);
+
+#[cfg(feature = "structs")]
+const _: () = {
+    assert!(offset_of!(W_StructObject, ob_header) == 0);
+};
+
+/// Box a named struct with `fields` as name/value pairs.
+#[cfg(feature = "structs")]
+pub fn new_struct(name: *mut W_StringObject, fields: &[(CelRef, CelRef)]) -> *mut W_StructObject {
+    let items = interleaved_pair_block(fields);
+    let length = fields.len() as i64;
+    lltype::malloc_typed(W_StructObject {
+        ob_header: CelObject {
+            ob_type: &CEL_STRUCT_CLASS,
+        },
+        name,
+        fields: items,
+        length,
+    })
+}
+
 /// A CEL type value — what `type(x)` evaluates to.
 ///
 /// `cls` is the class of the type this value *denotes*, while the header's own
@@ -549,6 +658,13 @@ mod tests {
         assert_eq!(t as usize, t as CelRef as usize);
         let n = new_null();
         assert_eq!(n as usize, n as CelRef as usize);
+        let m = new_map(&[]);
+        assert_eq!(m as usize, m as CelRef as usize);
+        #[cfg(feature = "structs")]
+        {
+            let s = new_struct(new_string("T"), &[]);
+            assert_eq!(s as usize, s as CelRef as usize);
+        }
     }
 
     /// Condition 2's cel-side half: the one header store a constructor makes
@@ -585,6 +701,12 @@ mod tests {
         check(new_bytes(b"x") as CelRef, &CEL_BYTES_CLASS);
         check(new_string("x") as CelRef, &CEL_STRING_CLASS);
         check(new_list(&[]) as CelRef, &CEL_LIST_CLASS);
+        check(new_map(&[]) as CelRef, &CEL_MAP_CLASS);
+        #[cfg(feature = "structs")]
+        check(
+            new_struct(new_string("T"), &[]) as CelRef,
+            &CEL_STRUCT_CLASS,
+        );
     }
 
     /// The variable-length leaves keep their live length on the leaf and their
@@ -615,6 +737,34 @@ mod tests {
             assert_eq!(items_capacity((*l).items), 3);
             for (i, e) in elems.iter().enumerate() {
                 assert_eq!(*items_block_items_base((*l).items).add(i), *e);
+            }
+
+            let pairs = [
+                (new_int(1) as CelRef, new_string("a") as CelRef),
+                (new_string("b") as CelRef, new_bool(true) as CelRef),
+            ];
+            let m = new_map(&pairs);
+            assert_eq!((*m).length, 2);
+            assert_eq!(items_capacity((*m).items), 4);
+            let map_base = items_block_items_base((*m).items);
+            for (i, (k, v)) in pairs.iter().enumerate() {
+                assert_eq!(*map_base.add(2 * i), *k);
+                assert_eq!(*map_base.add(2 * i + 1), *v);
+            }
+
+            let empty = new_map(&[]);
+            assert_eq!((*empty).length, 0);
+            assert_eq!(items_capacity((*empty).items), 0);
+
+            #[cfg(feature = "structs")]
+            {
+                let fields = [(new_string("x") as CelRef, new_int(1) as CelRef)];
+                let s = new_struct(new_string("T"), &fields);
+                assert_eq!((*s).length, 1);
+                assert_eq!(items_capacity((*s).fields), 2);
+                let field_base = items_block_items_base((*s).fields);
+                assert_eq!(*field_base.add(0), fields[0].0);
+                assert_eq!(*field_base.add(1), fields[0].1);
             }
         }
     }

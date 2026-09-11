@@ -23,14 +23,17 @@
 //! # What is in this slice
 //!
 //! The scalar leaves — `int`, `uint`, `double`, `bool`, `null`, `duration`,
-//! `timestamp`, the type value and `optional` — plus `string`, `bytes` and
-//! `list`, whose payloads live in separately allocated blocks ([`object_array`])
-//! rather than as a varsize tail. Every leaf here is fixed-size, which is what
-//! the boxing fuse requires; [`object_array`] records why the tail encoding is
-//! not available and what would have to change for it to be.
+//! `timestamp`, the type value and `optional` — plus `string`, `bytes`,
+//! `list`, `map` and `struct`, whose payloads live in separately allocated
+//! blocks ([`object_array`]) rather than as a varsize tail. Every leaf here is
+//! fixed-size, which is what the boxing fuse requires; [`object_array`] records
+//! why the tail encoding is not available and what would have to change for it
+//! to be.
 //!
-//! `map` and `struct` are not here. Both want the strategy indirection the
-//! design gives them, and that is a later slice rather than a half-written one.
+//! `map` and `struct` store entries as interleaved key/value (or name/value)
+//! pairs in one block. The design's `strategy` tag is absent: a discriminant
+//! is only meaningful once there is a second strategy, and those arrive with
+//! the unboxed columns.
 //!
 //! Read [`object`] before adding a leaf: three separate conditions have to
 //! hold for an allocation to fuse, and all three fail silently.
