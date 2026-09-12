@@ -41,3 +41,18 @@ pub fn malloc_typed<T>(value: T) -> *mut T {
 pub fn malloc_typed_managed<T>(value: T) -> *mut T {
     heap::with_heap(|h| h.alloc(value))
 }
+
+/// Allocate a pointer-free leaf that lives for the process.
+///
+/// The boxing fuse does not match this path: a prebuilt is a constant
+/// address, not a `NewWithVtable`. The header word in front of the
+/// payload is what `guard_is_object` reads at `obj - 8`; a Rust
+/// `static` would put that load off the object.
+pub fn malloc_typed_immortal<T>(value: T) -> *mut T {
+    heap::alloc_immortal(value)
+}
+
+/// Whether `ptr` is a payload [`malloc_typed_immortal`] handed out.
+pub fn is_immortal(ptr: *const u8) -> bool {
+    heap::is_immortal(ptr)
+}

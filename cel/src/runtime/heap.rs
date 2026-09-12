@@ -235,6 +235,71 @@ pub fn with_heap<R>(f: impl FnOnce(&CelHeap) -> R) -> R {
     HEAP.with(f)
 }
 
+/// Bytes preceding an immortal payload. The backend reads
+/// `[obj - HEADER_SIZE]` for `guard_is_object`; a plain Rust `static`
+/// would put that load in rodata or unmapped memory.
+pub const IMMORTAL_HEADER_SIZE: usize = core::mem::size_of::<usize>();
+
+/// Non-zero so a header-relative load is not a null-page read.
+const IMMORTAL_MARK: usize = 0xC3_11_07_7A;
+
+/// Payloads handed out by [`alloc_immortal`]. The tripwire that a
+/// prebuilt is not a Rust `static` asserts against this list.
+static IMMORTAL_PAYLOADS: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+
+/// Allocate `value` for process lifetime, with a header word in front
+/// of the payload.
+///
+/// Pointer-free leaves only: a reference field written at construction
+/// has no write barrier, and the immortal flag would then let a major
+/// walk it into freed memory. `W_OptionalObject` and anything holding a
+/// [`super::object::CelRef`] stay on [`CelHeap::alloc`].
+pub fn alloc_immortal<T>(value: T) -> *mut T {
+    let () = AssertNoDrop::<T>::OK;
+    let align = align_of::<T>().max(align_of::<usize>());
+    let header = IMMORTAL_HEADER_SIZE;
+    let size = header
+        .checked_add(size_of::<T>())
+        .expect("immortal layout fits usize");
+    let layout = Layout::from_size_align(size, align).expect("immortal layout is valid");
+    // SAFETY: `size` is at least the header word.
+    let base = unsafe { std::alloc::alloc(layout) };
+    if base.is_null() {
+        std::alloc::handle_alloc_error(layout);
+    }
+    // SAFETY: `base` is aligned for `usize` and owned uniquely here.
+    unsafe {
+        (base as *mut usize).write(IMMORTAL_MARK);
+    }
+    let payload = unsafe { base.add(header) as *mut T };
+    unsafe {
+        payload.write(value);
+    }
+    IMMORTAL_PAYLOADS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .push(payload as usize);
+    payload
+}
+
+/// Whether `ptr` is a payload [`alloc_immortal`] handed out.
+pub fn is_immortal(ptr: *const u8) -> bool {
+    IMMORTAL_PAYLOADS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .any(|&p| p == ptr as usize)
+}
+
+/// The header word immediately before an immortal payload.
+///
+/// # Safety
+///
+/// `ptr` must have come from [`alloc_immortal`].
+pub unsafe fn immortal_header(ptr: *const u8) -> usize {
+    unsafe { *(ptr.sub(IMMORTAL_HEADER_SIZE) as *const usize) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

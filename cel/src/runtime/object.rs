@@ -218,8 +218,8 @@ scalar_leaf! {
     /// A CEL `int`: a signed 64-bit integer.
     W_IntObject { intval: i64 }
     CEL_INT_CLASS = ("int", CelKind::Int)
-    /// Box `value` as a CEL `int`.
-    new_int
+    /// Allocate a fresh `int`. The interned range goes through [`new_int`].
+    new_int_raw
 }
 
 scalar_leaf! {
@@ -289,9 +289,9 @@ scalar_leaf! {
 /// Allocate the absent CEL `optional`.
 ///
 /// Written out rather than delegating to [`new_optional`] so the null it stores
-/// is spelled at the allocation site. A fresh allocation per call, for the same
-/// reason [`new_null`] is: interning waits for an allocator that can mint
-/// immortal objects.
+/// is spelled at the allocation site. A fresh allocation per call: the none
+/// payload is a `CelRef`, so the immortal path — pointer-free leaves only —
+/// cannot hold it.
 pub fn new_optional_none() -> *mut W_OptionalObject {
     lltype::malloc_typed(W_OptionalObject {
         ob_header: CelObject {
@@ -322,17 +322,18 @@ const _: () = {
 
 /// Allocate a CEL `null`.
 ///
-/// A fresh allocation per call for now. `null` is the canonical singleton
-/// candidate, but a prebuilt has to carry a real GC header — a plain Rust
-/// `static` would put the class word in read-only memory where the backend's
-/// header-relative reads do not point — so interning it waits for the
-/// allocator that can mint immortal objects.
+/// The one process-wide null. A plain Rust `static` would put the class
+/// word in read-only memory, where a header-relative `guard_is_object`
+/// load does not point; the immortal allocator puts a header word in
+/// front of the payload.
 pub fn new_null() -> *mut W_NullObject {
-    lltype::malloc_typed(W_NullObject {
-        ob_header: CelObject {
-            ob_type: &CEL_NULL_CLASS,
-        },
-    })
+    *NULL.get_or_init(|| {
+        lltype::malloc_typed_immortal(W_NullObject {
+            ob_header: CelObject {
+                ob_type: &CEL_NULL_CLASS,
+            },
+        }) as usize
+    }) as *mut W_NullObject
 }
 
 /// A CEL `timestamp`.
@@ -637,10 +638,59 @@ pub fn new_type(cls: &'static CelClass) -> *mut W_TypeObject {
 
 /// Box `value` as a CEL `bool`.
 ///
-/// Thin wrapper over [`new_bool_raw`] so callers do not spell the `i64`
-/// payload convention at every site.
+/// Returns one of the two immortal singletons. [`new_bool_raw`] is the
+/// fuse-shaped allocation; the interned path does not go through it.
 pub fn new_bool(value: bool) -> *mut W_BoolObject {
-    new_bool_raw(i64::from(value))
+    let slot = if value { &TRUE } else { &FALSE };
+    *slot.get_or_init(|| {
+        lltype::malloc_typed_immortal(W_BoolObject {
+            ob_header: CelObject {
+                ob_type: &CEL_BOOL_CLASS,
+            },
+            boolval: i64::from(value),
+        }) as usize
+    }) as *mut W_BoolObject
+}
+
+/// Inclusive lower bound of the interned `int` table.
+///
+/// `intobject.py` `PREBUILTINTFROM`. Values outside the table still go
+/// through [`new_int_raw`] so the boxing fuse can see a `malloc_typed`.
+pub const PREBUILT_INT_FROM: i64 = -5;
+
+/// Exclusive upper bound of the interned `int` table (`PREBUILTINTTO`).
+pub const PREBUILT_INT_TO: i64 = 257;
+
+static TRUE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+static FALSE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+static NULL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+static SMALL_INTS: std::sync::OnceLock<Vec<usize>> = std::sync::OnceLock::new();
+
+fn small_ints() -> &'static [usize] {
+    SMALL_INTS.get_or_init(|| {
+        (PREBUILT_INT_FROM..PREBUILT_INT_TO)
+            .map(|v| {
+                lltype::malloc_typed_immortal(W_IntObject {
+                    ob_header: CelObject {
+                        ob_type: &CEL_INT_CLASS,
+                    },
+                    intval: v,
+                }) as usize
+            })
+            .collect()
+    })
+}
+
+/// Box `value` as a CEL `int`.
+///
+/// Values in [`PREBUILT_INT_FROM`]..[`PREBUILT_INT_TO`] are immortal
+/// singletons. Everything else is a fresh [`new_int_raw`].
+pub fn new_int(value: i64) -> *mut W_IntObject {
+    if (PREBUILT_INT_FROM..PREBUILT_INT_TO).contains(&value) {
+        let idx = (value - PREBUILT_INT_FROM) as usize;
+        return small_ints()[idx] as *mut W_IntObject;
+    }
+    new_int_raw(value)
 }
 
 #[cfg(test)]
@@ -851,5 +901,68 @@ mod tests {
             assert_eq!(w_kind(new_null() as CelRef), CelKind::Null);
             assert_eq!(w_kind(new_type(&CEL_INT_CLASS) as CelRef), CelKind::Type);
         }
+    }
+
+    /// TRUE, FALSE, NULL and the small-int table are one address each, and
+    /// that address came from the immortal allocator — not a Rust `static`
+    /// whose preceding word is rodata.
+    #[test]
+    fn prebuilts_are_immortal_singletons() {
+        assert_eq!(new_bool(true), new_bool(true));
+        assert_eq!(new_bool(false), new_bool(false));
+        assert_ne!(new_bool(true), new_bool(false));
+        assert_eq!(new_null(), new_null());
+        assert_eq!(new_int(0), new_int(0));
+        assert_eq!(new_int(-5), new_int(-5));
+        assert_eq!(new_int(256), new_int(256));
+        assert_ne!(new_int(0), new_int(1));
+
+        let outsides = [new_int(-6), new_int(257), new_int(1000)];
+        for w in outsides {
+            let value = unsafe { (*w).intval };
+            assert_ne!(w, new_int(value), "outside the table is not interned");
+            assert!(
+                !lltype::is_immortal(w as *const u8),
+                "a fresh int must not be registered as immortal"
+            );
+        }
+
+        let prebuilts: [*const u8; 6] = [
+            new_bool(true) as *const u8,
+            new_bool(false) as *const u8,
+            new_null() as *const u8,
+            new_int(-5) as *const u8,
+            new_int(0) as *const u8,
+            new_int(256) as *const u8,
+        ];
+        for p in prebuilts {
+            assert!(
+                lltype::is_immortal(p),
+                "prebuilt {p:?} must come from malloc_typed_immortal"
+            );
+            unsafe {
+                assert_ne!(
+                    crate::runtime::heap::immortal_header(p),
+                    0,
+                    "header-relative load at obj-8 must be a real word"
+                );
+            }
+        }
+    }
+
+    /// Interned ints do not increment this thread's heap counter.
+    #[test]
+    fn prebuilts_do_not_count_against_the_thread_heap() {
+        let before = crate::runtime::heap::with_heap(|h| h.allocated_objects());
+        let _ = new_bool(true);
+        let _ = new_bool(false);
+        let _ = new_null();
+        let _ = new_int(1);
+        let _ = new_int(2);
+        let after = crate::runtime::heap::with_heap(|h| h.allocated_objects());
+        assert_eq!(before, after);
+        let _ = new_int(1000);
+        let later = crate::runtime::heap::with_heap(|h| h.allocated_objects());
+        assert_eq!(later, after + 1);
     }
 }
