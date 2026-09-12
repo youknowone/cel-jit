@@ -42,6 +42,20 @@ pub enum ConvertError {
     Corrupt(&'static str),
 }
 
+/// Intern `v` when it is a leaf the prebuilt table or `new_int` can hold.
+///
+/// Bool, null and int only: those are the interned identities. Everything
+/// else stays on the public enum until its own leaf is the production
+/// representation.
+pub fn intern_leaf(v: &Value) -> Option<CelRef> {
+    match v {
+        Value::Int(i) => Some(new_int(*i) as CelRef),
+        Value::Bool(b) => Some(new_bool(*b) as CelRef),
+        Value::Null => Some(new_null() as CelRef),
+        _ => None,
+    }
+}
+
 /// Allocate the internal form of `v` on this thread's heap.
 pub fn value_to_ref(v: &Value) -> Result<CelRef, ConvertError> {
     match v {
@@ -289,6 +303,17 @@ mod tests {
         ] {
             assert_eq!(roundtrip(v.clone()), v, "{v:?}");
         }
+    }
+
+    #[test]
+    fn intern_leaf_is_the_prebuilt_for_bool_null_and_small_int() {
+        assert_eq!(
+            intern_leaf(&Value::Bool(true)),
+            Some(new_bool(true) as CelRef)
+        );
+        assert_eq!(intern_leaf(&Value::Null), Some(new_null() as CelRef));
+        assert_eq!(intern_leaf(&Value::Int(3)), Some(new_int(3) as CelRef));
+        assert_eq!(intern_leaf(&Value::String(Arc::new("x".into()))), None);
     }
 
     #[test]

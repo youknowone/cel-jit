@@ -36,6 +36,13 @@ use crate::objects::{
     as_optional, binary_values_ref, compare_values, optional_none, optional_of, value_contains,
     value_field, value_index, value_iter, value_key, value_negate, Key, ListStorage, Map,
 };
+use crate::runtime::binop::{
+    cel_add, cel_div, cel_equals, cel_greater, cel_greater_equals, cel_less, cel_less_equals,
+    cel_mul, cel_negate, cel_not_equals, cel_rem, cel_sub,
+};
+use crate::runtime::convert::{intern_leaf, ref_to_value};
+use crate::runtime::error::{take_error, CelErrCode, ERROR_SENTINEL};
+use crate::runtime::object::{w_kind, CelKind, CelRef};
 use crate::{ExecutionError, Value};
 
 use std::cmp::Ordering;
@@ -379,6 +386,10 @@ pub fn map_loop_is_fusable(code: &CelCode) -> bool {
 /// documentation.
 enum Operand {
     Value(Value),
+    /// A class-family leaf (`TRUE`/`FALSE`/`NULL`/small-int, or a heap
+    /// `int`). Arithmetic stays on [`crate::runtime::binop`] without
+    /// cloning a [`Value`].
+    Interned(crate::runtime::object::CelRef),
     /// A list being built, before its first element decides a strategy: the
     /// capacity that first append reserves. `EmptyListStrategy`.
     EmptyList(usize),
@@ -978,7 +989,71 @@ impl<'a> Vm<'a> {
 
     #[inline(always)]
     fn push(&mut self, value: Value) {
-        self.push_operand(Operand::Value(value));
+        if let Some(w) = intern_leaf(&value) {
+            self.push_operand(Operand::Interned(w));
+        } else {
+            self.push_operand(Operand::Value(value));
+        }
+    }
+
+    fn leaf_of(operand: &Operand) -> Option<CelRef> {
+        match operand {
+            Operand::Interned(w) => Some(*w),
+            Operand::Value(v) => intern_leaf(v),
+            _ => None,
+        }
+    }
+
+    fn push_interned(&mut self, w: CelRef, op: OpCode) -> CelResult<()> {
+        if w == ERROR_SENTINEL {
+            return Err(self.raised_as_cel_err(op));
+        }
+        self.push_operand(Operand::Interned(w));
+        Ok(())
+    }
+
+    fn raised_as_cel_err(&mut self, op: OpCode) -> CelErr {
+        let Some(err) = take_error() else {
+            return CelErr::InternalError;
+        };
+        let lhs = unsafe { ref_to_value(err.lhs) }.unwrap_or(Value::Null);
+        let rhs = if err.rhs == ERROR_SENTINEL {
+            Value::Int(0)
+        } else {
+            unsafe { ref_to_value(err.rhs) }.unwrap_or(Value::Null)
+        };
+        let exec = match err.code {
+            CelErrCode::Overflow => ExecutionError::Overflow(err.op, lhs, rhs),
+            CelErrCode::DivisionByZero => ExecutionError::DivisionByZero(lhs),
+            CelErrCode::RemainderByZero => ExecutionError::RemainderByZero(lhs),
+            CelErrCode::UnsupportedBinaryOperator => {
+                ExecutionError::UnsupportedBinaryOperator(err.op, lhs, rhs)
+            }
+            CelErrCode::NoSuchOverload => ExecutionError::NoSuchOverload,
+            CelErrCode::NoneDereference => ExecutionError::NoSuchOverload,
+        };
+        let _ = op;
+        self.park(exec)
+    }
+
+    fn apply_cel_binop(
+        &mut self,
+        op: OpCode,
+        name: &'static str,
+        lhs: CelRef,
+        rhs: CelRef,
+    ) -> CelResult<()> {
+        let w = unsafe {
+            match name {
+                "add" => cel_add(lhs, rhs),
+                "sub" => cel_sub(lhs, rhs),
+                "mul" => cel_mul(lhs, rhs),
+                "div" => cel_div(lhs, rhs),
+                "rem" => cel_rem(lhs, rhs),
+                _ => return Err(CelErr::InternalError),
+            }
+        };
+        self.push_interned(w, op)
     }
 
     /// Pop one operand, finishing an aggregate that was still being built.
@@ -1036,6 +1111,7 @@ impl<'a> Vm<'a> {
     fn finish(&mut self, operand: Operand) -> CelResult<Value> {
         match operand {
             Operand::Value(value) => Ok(value),
+            Operand::Interned(w) => unsafe { ref_to_value(w) }.map_err(|_| CelErr::InternalError),
             Operand::EmptyList(_) => Ok(Value::list(Vec::new())),
             Operand::Ints(words) => Ok(Value::list(ListStorage::Ints(words))),
             Operand::List(items) => Ok(Value::list(items)),
@@ -1517,8 +1593,8 @@ impl<'a> Vm<'a> {
 
             // -- binary operators -----------------------------------------
             OpCode::Add | OpCode::Sub | OpCode::Mul | OpCode::Div | OpCode::Mod => {
-                let rhs = self.pop()?;
-                let lhs = self.pop()?;
+                let rhs = self.pop_operand().ok_or(CelErr::InternalError)?;
+                let lhs = self.pop_operand().ok_or(CelErr::InternalError)?;
                 let name = match op {
                     OpCode::Add => "add",
                     OpCode::Sub => "sub",
@@ -1526,40 +1602,78 @@ impl<'a> Vm<'a> {
                     OpCode::Div => "div",
                     _ => "rem",
                 };
-                let value = binary_values_ref(name, &lhs, &rhs).map_err(|e| self.park(e))?;
-                self.push(value);
+                if let (Some(a), Some(b)) = (Self::leaf_of(&lhs), Self::leaf_of(&rhs)) {
+                    self.apply_cel_binop(op, name, a, b)?;
+                } else {
+                    let lhs = self.finish(lhs)?;
+                    let rhs = self.finish(rhs)?;
+                    let value = binary_values_ref(name, &lhs, &rhs).map_err(|e| self.park(e))?;
+                    self.push(value);
+                }
             }
             OpCode::Equals | OpCode::NotEquals => {
-                let rhs = self.pop()?;
-                let lhs = self.pop()?;
-                self.push(Value::Bool((lhs == rhs) == (op == OpCode::Equals)));
+                let rhs = self.pop_operand().ok_or(CelErr::InternalError)?;
+                let lhs = self.pop_operand().ok_or(CelErr::InternalError)?;
+                if let (Some(a), Some(b)) = (Self::leaf_of(&lhs), Self::leaf_of(&rhs)) {
+                    let w = unsafe {
+                        if op == OpCode::Equals {
+                            cel_equals(a, b)
+                        } else {
+                            cel_not_equals(a, b)
+                        }
+                    };
+                    self.push_interned(w, op)?;
+                } else {
+                    let lhs = self.finish(lhs)?;
+                    let rhs = self.finish(rhs)?;
+                    self.push(Value::Bool((lhs == rhs) == (op == OpCode::Equals)));
+                }
             }
             OpCode::Less | OpCode::LessEquals | OpCode::Greater | OpCode::GreaterEquals => {
-                let rhs = self.pop()?;
-                let lhs = self.pop()?;
-                let accept: fn(Ordering) -> bool = match op {
-                    OpCode::Less => |o| o == Ordering::Less,
-                    OpCode::LessEquals => |o| o != Ordering::Greater,
-                    OpCode::Greater => |o| o == Ordering::Greater,
-                    _ => |o| o != Ordering::Less,
-                };
-                let value = compare_values(&lhs, &rhs, accept).map_err(|e| self.park(e))?;
-                self.push(value);
+                let rhs = self.pop_operand().ok_or(CelErr::InternalError)?;
+                let lhs = self.pop_operand().ok_or(CelErr::InternalError)?;
+                if let (Some(a), Some(b)) = (Self::leaf_of(&lhs), Self::leaf_of(&rhs)) {
+                    let w = unsafe {
+                        match op {
+                            OpCode::Less => cel_less(a, b),
+                            OpCode::LessEquals => cel_less_equals(a, b),
+                            OpCode::Greater => cel_greater(a, b),
+                            _ => cel_greater_equals(a, b),
+                        }
+                    };
+                    self.push_interned(w, op)?;
+                } else {
+                    let lhs = self.finish(lhs)?;
+                    let rhs = self.finish(rhs)?;
+                    let accept: fn(Ordering) -> bool = match op {
+                        OpCode::Less => |o| o == Ordering::Less,
+                        OpCode::LessEquals => |o| o != Ordering::Greater,
+                        OpCode::Greater => |o| o == Ordering::Greater,
+                        _ => |o| o != Ordering::Less,
+                    };
+                    let value = compare_values(&lhs, &rhs, accept).map_err(|e| self.park(e))?;
+                    self.push(value);
+                }
             }
             // The three groups above with the right operand read out of the
             // constant pool. Each calls the same helper with the same
             // operands in the same order, so the error it raises carries the
             // same operator name the pair's did.
             OpCode::AddConst | OpCode::MulConst | OpCode::ModConst => {
-                let lhs = self.pop()?;
+                let lhs = self.pop_operand().ok_or(CelErr::InternalError)?;
                 let rhs = self.code.konst(a).ok_or(CelErr::InternalError)?;
                 let name = match op {
                     OpCode::AddConst => "add",
                     OpCode::MulConst => "mul",
                     _ => "rem",
                 };
-                let value = binary_values_ref(name, &lhs, rhs).map_err(|e| self.park(e))?;
-                self.push(value);
+                if let (Some(a_ref), Some(b_ref)) = (Self::leaf_of(&lhs), intern_leaf(rhs)) {
+                    self.apply_cel_binop(op, name, a_ref, b_ref)?;
+                } else {
+                    let lhs = self.finish(lhs)?;
+                    let value = binary_values_ref(name, &lhs, rhs).map_err(|e| self.park(e))?;
+                    self.push(value);
+                }
             }
             OpCode::EqualsConst | OpCode::NotEqualsConst => {
                 let lhs = self.pop()?;
@@ -1595,8 +1709,12 @@ impl<'a> Vm<'a> {
                     OpCode::MulLocalConst => "mul",
                     _ => "rem",
                 };
-                let value = binary_values_ref(name, lhs, rhs).map_err(|e| self.park(e))?;
-                self.push(value);
+                if let (Some(a_ref), Some(b_ref)) = (intern_leaf(lhs), intern_leaf(rhs)) {
+                    self.apply_cel_binop(op, name, a_ref, b_ref)?;
+                } else {
+                    let value = binary_values_ref(name, lhs, rhs).map_err(|e| self.park(e))?;
+                    self.push(value);
+                }
             }
             OpCode::EqualsLocalConst | OpCode::NotEqualsLocalConst => {
                 // BOTH sides read in place: `PartialEq` takes them by
@@ -1698,16 +1816,30 @@ impl<'a> Vm<'a> {
 
             // -- unary operators -------------------------------------------
             OpCode::Not => {
-                let value = self.pop()?;
-                match value {
-                    Value::Bool(b) => self.push(Value::Bool(!b)),
-                    _ => return Err(CelErr::NoSuchOverload),
+                let operand = self.pop_operand().ok_or(CelErr::InternalError)?;
+                if let Some(w) = Self::leaf_of(&operand) {
+                    if unsafe { w_kind(w) } != CelKind::Bool {
+                        return Err(CelErr::NoSuchOverload);
+                    }
+                    let out = unsafe { cel_negate(w) };
+                    self.push_interned(out, op)?;
+                } else {
+                    match self.finish(operand)? {
+                        Value::Bool(b) => self.push(Value::Bool(!b)),
+                        _ => return Err(CelErr::NoSuchOverload),
+                    }
                 }
             }
             OpCode::Negate => {
-                let value = self.pop()?;
-                let value = value_negate(value).map_err(|e| self.park(e))?;
-                self.push(value);
+                let operand = self.pop_operand().ok_or(CelErr::InternalError)?;
+                if let Some(w) = Self::leaf_of(&operand) {
+                    let out = unsafe { cel_negate(w) };
+                    self.push_interned(out, op)?;
+                } else {
+                    let value = self.finish(operand)?;
+                    let value = value_negate(value).map_err(|e| self.park(e))?;
+                    self.push(value);
+                }
             }
             OpCode::NotStrictlyFalse => {
                 let value = self.pop()?;
@@ -2803,7 +2935,8 @@ mod tests {
         vm.push_operand(Operand::EmptyList(0));
         vm.push(Value::Int(2));
         assert_eq!(vm.depth(), 2);
-        assert!(matches!(vm.top(), Some(Operand::Value(Value::Int(2)))));
+        assert_eq!(vm.pop(), Ok(Value::Int(2)));
+        vm.push(Value::Int(2));
 
         // `ListAppend`: pop, and only then reach for the builder.
         assert_eq!(vm.pop(), Ok(Value::Int(2)));
@@ -2823,6 +2956,20 @@ mod tests {
         // frame, where `Scratch::release` drops it; nothing else has to.
         vm.push(Value::Int(4));
         assert_eq!(vm.depth(), 1);
+    }
+
+    /// `1 + 2` stays on the interned `int` table through `cel_add`.
+    #[test]
+    fn interned_add_of_small_ints_is_the_prebuilt() {
+        let expr = parse("1 + 2");
+        let code = compile(&expr).expect("compile");
+        let ctx = Context::default();
+        let value = cel_eval_loop(&code, &ctx).expect("eval");
+        assert_eq!(value, Value::Int(3));
+        assert_eq!(
+            crate::runtime::convert::intern_leaf(&value),
+            Some(crate::runtime::object::new_int(3) as crate::runtime::object::CelRef)
+        );
     }
 
     /// A fused `&&`/`||` keeps CEL's asymmetry: the left operand short-circuits
