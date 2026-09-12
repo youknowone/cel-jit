@@ -42,7 +42,7 @@ use crate::runtime::binop::{
 };
 use crate::runtime::convert::{intern_leaf, ref_to_value};
 use crate::runtime::error::{take_error, CelErrCode, ERROR_SENTINEL};
-use crate::runtime::object::{w_kind, CelKind, CelRef};
+use crate::runtime::object::{new_int, w_kind, CelKind, CelRef, W_IntObject};
 use crate::{ExecutionError, Value};
 
 use std::cmp::Ordering;
@@ -978,11 +978,33 @@ impl<'a> Vm<'a> {
         }
     }
 
-    /// [`Vm::local`], open for mutation.
-    #[inline(always)]
-    fn local_mut(&mut self, slot: u32) -> Option<&mut Value> {
-        match self.frame[..self.stack_base].get_mut(slot as usize) {
-            Some(Operand::Value(value)) => Some(value),
+    fn local_operand(&self, slot: u32) -> Option<&Operand> {
+        self.frame[..self.stack_base].get(slot as usize)
+    }
+
+    fn local_operand_mut(&mut self, slot: u32) -> Option<&mut Operand> {
+        self.frame[..self.stack_base].get_mut(slot as usize)
+    }
+
+    /// The slot as a public [`Value`], converting an interned leaf.
+    fn local_as_value(&self, slot: u32) -> Option<Value> {
+        match self.local_operand(slot)? {
+            Operand::Value(value) => Some(value.clone()),
+            Operand::Interned(w) => unsafe { ref_to_value(*w) }.ok(),
+            _ => None,
+        }
+    }
+
+    fn local_leaf(&self, slot: u32) -> Option<CelRef> {
+        Self::leaf_of(self.local_operand(slot)?)
+    }
+
+    fn local_int(&self, slot: u32) -> Option<i64> {
+        match self.local_operand(slot)? {
+            Operand::Value(Value::Int(n)) => Some(*n),
+            Operand::Interned(w) if unsafe { w_kind(*w) } == CelKind::Int => {
+                Some(unsafe { (*(*w as *mut W_IntObject)).intval })
+            }
             _ => None,
         }
     }
@@ -1370,8 +1392,8 @@ impl<'a> Vm<'a> {
         }
 
         // -- the guard: `IterGuard index source done`
-        let index = match self.local(shape.index) {
-            Some(&Value::Int(index)) => index,
+        let index = match self.local_int(shape.index) {
+            Some(index) => index,
             _ => return Err(CelErr::InternalError),
         };
         let len = match self.local(shape.source) {
@@ -1418,9 +1440,7 @@ impl<'a> Vm<'a> {
             sequence.get(index as usize)
         };
         let element = element.ok_or(CelErr::IndexOutOfBounds)?;
-        let slot = self.local_mut(shape.var).ok_or(CelErr::InternalError)?;
-        let previous = std::mem::replace(slot, element);
-        self.discard(previous);
+        self.store_slot(shape.var, element)?;
         if arm == FuseArm::Bind {
             return Ok(shape.after_bind);
         }
@@ -1432,7 +1452,9 @@ impl<'a> Vm<'a> {
         }
 
         // -- the body and the append: `MulLocalConstAppend var k`
-        let lhs = self.local(shape.var).ok_or(CelErr::InternalError)?.clone();
+        let lhs = self
+            .local_as_value(shape.var)
+            .ok_or(CelErr::InternalError)?;
         let rhs = self
             .code
             .konst(shape.konst)
@@ -1455,13 +1477,7 @@ impl<'a> Vm<'a> {
     #[cfg(feature = "__elem-attr-probe")]
     #[inline(always)]
     fn fused_advance(&mut self, shape: MapLoop) -> CelResult<u32> {
-        let slot = self.local_mut(shape.index).ok_or(CelErr::InternalError)?;
-        let Value::Int(counter) = slot else {
-            return Err(CelErr::InternalError);
-        };
-        *counter = counter
-            .checked_add(1)
-            .ok_or(CelErr::Overflow(OpCode::Add))?;
+        self.advance_counter(shape.index)?;
         Ok(shape.top)
     }
 
@@ -1482,10 +1498,11 @@ impl<'a> Vm<'a> {
                     .ok_or(CelErr::UndeclaredReference(NameId(a)))?;
                 self.push(value);
             }
-            OpCode::LoadLocal => {
-                let value = self.local(a).ok_or(CelErr::InternalError)?.clone();
-                self.push(value);
-            }
+            OpCode::LoadLocal => match self.local_operand(a).ok_or(CelErr::InternalError)? {
+                Operand::Interned(w) => self.push_operand(Operand::Interned(*w)),
+                Operand::Value(value) => self.push(value.clone()),
+                _ => return Err(CelErr::InternalError),
+            },
             OpCode::StoreLocal => {
                 let value = self.pop()?;
                 self.store_slot(a, value)?;
@@ -1512,17 +1529,13 @@ impl<'a> Vm<'a> {
                 self.push(value);
             }
             OpCode::GetFieldLocal | OpCode::HasFieldLocal => {
-                // Read in place; see `Vm::sequence_len` for why the copy the
-                // `LoadLocal` made was the operand-stack round trip and not
-                // work of its own. On this path that copy was also an atomic
-                // pair on the container's `Arc`, per field read.
                 let read = {
-                    let operand = self.local(a).ok_or(CelErr::InternalError)?;
+                    let operand = self.local_as_value(a).ok_or(CelErr::InternalError)?;
                     let field = self.name(b)?;
                     if op == OpCode::HasFieldLocal {
-                        has_field(operand, field)
+                        has_field(&operand, field)
                     } else {
-                        value_field(operand, field)
+                        value_field(&operand, field)
                     }
                 };
                 let value = read.map_err(|e| self.park(e))?;
@@ -1702,47 +1715,61 @@ impl<'a> Vm<'a> {
             // The helpers, their operand order and their operator names are
             // unchanged, which is what keeps the error identical to the pair's.
             OpCode::AddLocalConst | OpCode::MulLocalConst | OpCode::ModLocalConst => {
-                let lhs = self.local(a).ok_or(CelErr::InternalError)?;
                 let rhs = self.code.konst(b).ok_or(CelErr::InternalError)?;
                 let name = match op {
                     OpCode::AddLocalConst => "add",
                     OpCode::MulLocalConst => "mul",
                     _ => "rem",
                 };
-                if let (Some(a_ref), Some(b_ref)) = (intern_leaf(lhs), intern_leaf(rhs)) {
+                if let (Some(a_ref), Some(b_ref)) = (self.local_leaf(a), intern_leaf(rhs)) {
                     self.apply_cel_binop(op, name, a_ref, b_ref)?;
                 } else {
-                    let value = binary_values_ref(name, lhs, rhs).map_err(|e| self.park(e))?;
+                    let lhs = self.local_as_value(a).ok_or(CelErr::InternalError)?;
+                    let value = binary_values_ref(name, &lhs, rhs).map_err(|e| self.park(e))?;
                     self.push(value);
                 }
             }
             OpCode::EqualsLocalConst | OpCode::NotEqualsLocalConst => {
-                // BOTH sides read in place: `PartialEq` takes them by
-                // reference, so this is the one fused form that copies
-                // nothing. `EqualsConst` already read its constant in place,
-                // so what the pair still spent and this does not is the slot's
-                // clone-and-release -- one atomic pair per evaluation on the
-                // `Arc` variants, and a string is what an equality predicate
-                // is written against.
-                let equal = {
-                    let lhs = self.local(a).ok_or(CelErr::InternalError)?;
-                    let rhs = self.code.konst(b).ok_or(CelErr::InternalError)?;
-                    lhs == rhs
-                };
-                self.push(Value::Bool(equal == (op == OpCode::EqualsLocalConst)));
+                let rhs = self.code.konst(b).ok_or(CelErr::InternalError)?;
+                if let (Some(a_ref), Some(b_ref)) = (self.local_leaf(a), intern_leaf(rhs)) {
+                    let w = unsafe {
+                        if op == OpCode::EqualsLocalConst {
+                            cel_equals(a_ref, b_ref)
+                        } else {
+                            cel_not_equals(a_ref, b_ref)
+                        }
+                    };
+                    self.push_interned(w, op)?;
+                } else {
+                    let lhs = self.local_as_value(a).ok_or(CelErr::InternalError)?;
+                    self.push(Value::Bool(
+                        (lhs == *rhs) == (op == OpCode::EqualsLocalConst),
+                    ));
+                }
             }
             OpCode::LessLocalConst
             | OpCode::GreaterLocalConst
             | OpCode::GreaterEqualsLocalConst => {
-                let lhs = self.local(a).ok_or(CelErr::InternalError)?;
                 let rhs = self.code.konst(b).ok_or(CelErr::InternalError)?;
-                let accept: fn(Ordering) -> bool = match op {
-                    OpCode::LessLocalConst => |o| o == Ordering::Less,
-                    OpCode::GreaterLocalConst => |o| o == Ordering::Greater,
-                    _ => |o| o != Ordering::Less,
-                };
-                let value = compare_values(lhs, rhs, accept).map_err(|e| self.park(e))?;
-                self.push(value);
+                if let (Some(a_ref), Some(b_ref)) = (self.local_leaf(a), intern_leaf(rhs)) {
+                    let w = unsafe {
+                        match op {
+                            OpCode::LessLocalConst => cel_less(a_ref, b_ref),
+                            OpCode::GreaterLocalConst => cel_greater(a_ref, b_ref),
+                            _ => cel_greater_equals(a_ref, b_ref),
+                        }
+                    };
+                    self.push_interned(w, op)?;
+                } else {
+                    let lhs = self.local_as_value(a).ok_or(CelErr::InternalError)?;
+                    let accept: fn(Ordering) -> bool = match op {
+                        OpCode::LessLocalConst => |o| o == Ordering::Less,
+                        OpCode::GreaterLocalConst => |o| o == Ordering::Greater,
+                        _ => |o| o != Ordering::Less,
+                    };
+                    let value = compare_values(&lhs, rhs, accept).map_err(|e| self.park(e))?;
+                    self.push(value);
+                }
             }
             OpCode::In => {
                 let rhs = self.pop()?;
@@ -1762,17 +1789,17 @@ impl<'a> Vm<'a> {
             // top of the stack without popping it, which is what `ListAppend`
             // does too.
             OpCode::LoadLocalAppend => {
-                let value = self.local(a).ok_or(CelErr::InternalError)?.clone();
+                let value = self.local_as_value(a).ok_or(CelErr::InternalError)?;
                 self.append_to_list(value)?;
             }
             OpCode::GetFieldLocalAppend | OpCode::HasFieldLocalAppend => {
                 let read = {
-                    let operand = self.local(a).ok_or(CelErr::InternalError)?;
+                    let operand = self.local_as_value(a).ok_or(CelErr::InternalError)?;
                     let field = self.name(b)?;
                     if op == OpCode::HasFieldLocalAppend {
-                        has_field(operand, field)
+                        has_field(&operand, field)
                     } else {
-                        value_field(operand, field)
+                        value_field(&operand, field)
                     }
                 };
                 let value = read.map_err(|e| self.park(e))?;
@@ -1781,36 +1808,70 @@ impl<'a> Vm<'a> {
             OpCode::AddLocalConstAppend
             | OpCode::MulLocalConstAppend
             | OpCode::ModLocalConstAppend => {
-                let lhs = self.local(a).ok_or(CelErr::InternalError)?;
                 let rhs = self.code.konst(b).ok_or(CelErr::InternalError)?;
                 let name = match op {
                     OpCode::AddLocalConstAppend => "add",
                     OpCode::MulLocalConstAppend => "mul",
                     _ => "rem",
                 };
-                let value = binary_values_ref(name, lhs, rhs).map_err(|e| self.park(e))?;
+                let value =
+                    if let (Some(a_ref), Some(b_ref)) = (self.local_leaf(a), intern_leaf(rhs)) {
+                        let w = unsafe {
+                            match name {
+                                "add" => cel_add(a_ref, b_ref),
+                                "mul" => cel_mul(a_ref, b_ref),
+                                _ => cel_rem(a_ref, b_ref),
+                            }
+                        };
+                        if w == ERROR_SENTINEL {
+                            return Err(self.raised_as_cel_err(op));
+                        }
+                        unsafe { ref_to_value(w) }.map_err(|_| CelErr::InternalError)?
+                    } else {
+                        let lhs = self.local_as_value(a).ok_or(CelErr::InternalError)?;
+                        binary_values_ref(name, &lhs, rhs).map_err(|e| self.park(e))?
+                    };
                 self.append_to_list(value)?;
             }
             OpCode::EqualsLocalConstAppend | OpCode::NotEqualsLocalConstAppend => {
-                let equal = {
-                    let lhs = self.local(a).ok_or(CelErr::InternalError)?;
-                    let rhs = self.code.konst(b).ok_or(CelErr::InternalError)?;
-                    lhs == rhs
-                };
+                let rhs = self.code.konst(b).ok_or(CelErr::InternalError)?;
+                let equal =
+                    if let (Some(a_ref), Some(b_ref)) = (self.local_leaf(a), intern_leaf(rhs)) {
+                        let w = unsafe { cel_equals(a_ref, b_ref) };
+                        unsafe { (*w.cast::<crate::runtime::object::W_BoolObject>()).boolval != 0 }
+                    } else {
+                        let lhs = self.local_as_value(a).ok_or(CelErr::InternalError)?;
+                        lhs == *rhs
+                    };
                 let value = Value::Bool(equal == (op == OpCode::EqualsLocalConstAppend));
                 self.append_to_list(value)?;
             }
             OpCode::LessLocalConstAppend
             | OpCode::GreaterLocalConstAppend
             | OpCode::GreaterEqualsLocalConstAppend => {
-                let lhs = self.local(a).ok_or(CelErr::InternalError)?;
                 let rhs = self.code.konst(b).ok_or(CelErr::InternalError)?;
-                let accept: fn(Ordering) -> bool = match op {
-                    OpCode::LessLocalConstAppend => |o| o == Ordering::Less,
-                    OpCode::GreaterLocalConstAppend => |o| o == Ordering::Greater,
-                    _ => |o| o != Ordering::Less,
-                };
-                let value = compare_values(lhs, rhs, accept).map_err(|e| self.park(e))?;
+                let value =
+                    if let (Some(a_ref), Some(b_ref)) = (self.local_leaf(a), intern_leaf(rhs)) {
+                        let w = unsafe {
+                            match op {
+                                OpCode::LessLocalConstAppend => cel_less(a_ref, b_ref),
+                                OpCode::GreaterLocalConstAppend => cel_greater(a_ref, b_ref),
+                                _ => cel_greater_equals(a_ref, b_ref),
+                            }
+                        };
+                        if w == ERROR_SENTINEL {
+                            return Err(self.raised_as_cel_err(op));
+                        }
+                        unsafe { ref_to_value(w) }.map_err(|_| CelErr::InternalError)?
+                    } else {
+                        let lhs = self.local_as_value(a).ok_or(CelErr::InternalError)?;
+                        let accept: fn(Ordering) -> bool = match op {
+                            OpCode::LessLocalConstAppend => |o| o == Ordering::Less,
+                            OpCode::GreaterLocalConstAppend => |o| o == Ordering::Greater,
+                            _ => |o| o != Ordering::Less,
+                        };
+                        compare_values(&lhs, rhs, accept).map_err(|e| self.park(e))?
+                    };
                 self.append_to_list(value)?;
             }
 
@@ -1944,7 +2005,7 @@ impl<'a> Vm<'a> {
                 // Read in the order the four instructions read them, so a
                 // stream that is malformed in both slots raises what it raised
                 // before.
-                let Some(&Value::Int(index)) = self.local(a) else {
+                let Some(index) = self.local_int(a) else {
                     return Err(CelErr::InternalError);
                 };
                 let len = self.sequence_len(b)?;
@@ -1963,19 +2024,11 @@ impl<'a> Vm<'a> {
 
             // -- the fused accumulator ------------------------------------
             OpCode::AccuLoopCond | OpCode::AccuLoopCondNot => {
-                // Read in place; see `Vm::sequence_len` for why the copy the
-                // `LoadLocal` made was the operand-stack round trip rather
-                // than work of its own.
-                let accu = self.local(a).ok_or(CelErr::InternalError)?;
+                let accu = self.local_as_value(a).ok_or(CelErr::InternalError)?;
                 let more = if op == OpCode::AccuLoopCondNot {
-                    // The negation is inside the `@not_strictly_false`, so a
-                    // non-bool fails at the `!` and never reaches the test
-                    // that would have answered `true` for it.
-                    !as_bool(accu)?
+                    !as_bool(&accu)?
                 } else {
-                    // Which is what the plain form does answer, and why it
-                    // cannot fail where its twin can.
-                    as_bool(accu).unwrap_or(true)
+                    as_bool(&accu).unwrap_or(true)
                 };
                 if !more {
                     return Ok(Step::Jump(b));
@@ -1983,11 +2036,9 @@ impl<'a> Vm<'a> {
             }
             OpCode::AndLocal | OpCode::OrLocal => {
                 let short = op == OpCode::OrLocal;
-                // Read in place, as above: the `LoadLocal` this replaces
-                // copied the slot only so that the `And` could pop it again.
                 let outcome = {
-                    let accu = self.local(a).ok_or(CelErr::InternalError)?;
-                    as_bool(accu)
+                    let accu = self.local_as_value(a).ok_or(CelErr::InternalError)?;
+                    as_bool(&accu)
                 };
                 *self
                     .scratch
@@ -2167,8 +2218,8 @@ impl<'a> Vm<'a> {
         if self.probe.iter_at == IterAtArm::ViaValueIndex {
             let element = {
                 let sequence = self.local(sequence).ok_or(CelErr::InternalError)?;
-                let index = self.local(index).ok_or(CelErr::InternalError)?;
-                value_index(sequence, index)
+                let index = self.local_as_value(index).ok_or(CelErr::InternalError)?;
+                value_index(sequence, &index)
             };
             return element.map_err(|e| self.park(e));
         }
@@ -2176,7 +2227,7 @@ impl<'a> Vm<'a> {
             let Some(Value::List(sequence)) = self.local(sequence) else {
                 return Err(CelErr::InternalError);
             };
-            let Some(&Value::Int(index)) = self.local(index) else {
+            let Some(index) = self.local_int(index) else {
                 return Err(CelErr::InternalError);
             };
             // A negative index wraps to a very large `usize` and fails the
@@ -2189,9 +2240,24 @@ impl<'a> Vm<'a> {
     /// Write `value` into `slot`, dropping what was there.
     #[inline(always)]
     fn store_slot(&mut self, slot: u32, value: Value) -> CelResult<()> {
-        let slot = self.local_mut(slot).ok_or(CelErr::InternalError)?;
-        let previous = std::mem::replace(slot, value);
-        self.discard(previous);
+        let operand = intern_leaf(&value)
+            .map(Operand::Interned)
+            .unwrap_or(Operand::Value(value));
+        self.store_operand(slot, operand)
+    }
+
+    fn store_operand(&mut self, slot: u32, operand: Operand) -> CelResult<()> {
+        let dest = self.local_operand_mut(slot).ok_or(CelErr::InternalError)?;
+        let stored = match operand {
+            Operand::Value(v) => intern_leaf(&v)
+                .map(Operand::Interned)
+                .unwrap_or(Operand::Value(v)),
+            other => other,
+        };
+        let previous = std::mem::replace(dest, stored);
+        if let Ok(value) = self.finish(previous) {
+            self.discard(value);
+        }
         Ok(())
     }
 
@@ -2204,15 +2270,20 @@ impl<'a> Vm<'a> {
     /// list.
     #[inline(always)]
     fn advance_counter(&mut self, slot: u32) -> CelResult<()> {
-        let slot = self.local_mut(slot).ok_or(CelErr::InternalError)?;
-        let Value::Int(counter) = slot else {
-            return Err(CelErr::InternalError);
-        };
-        // Named for the operator the increment replaced, so that the public
-        // error is the one the load/add/store form raised.
-        *counter = counter
-            .checked_add(1)
-            .ok_or(CelErr::Overflow(OpCode::Add))?;
+        let dest = self.local_operand_mut(slot).ok_or(CelErr::InternalError)?;
+        match dest {
+            Operand::Value(Value::Int(counter)) => {
+                *counter = counter
+                    .checked_add(1)
+                    .ok_or(CelErr::Overflow(OpCode::Add))?;
+            }
+            Operand::Interned(w) if unsafe { w_kind(*w) } == CelKind::Int => {
+                let n = unsafe { (*(*w as *mut W_IntObject)).intval };
+                let next = n.checked_add(1).ok_or(CelErr::Overflow(OpCode::Add))?;
+                *w = new_int(next) as CelRef;
+            }
+            _ => return Err(CelErr::InternalError),
+        }
         Ok(())
     }
 
@@ -2969,6 +3040,19 @@ mod tests {
         assert_eq!(
             crate::runtime::convert::intern_leaf(&value),
             Some(crate::runtime::object::new_int(3) as crate::runtime::object::CelRef)
+        );
+    }
+
+    /// A comprehension counter stored as an interned int stays on the table.
+    #[test]
+    fn interned_local_increment_stays_on_the_prebuilt() {
+        let expr = parse("[0, 1, 2].map(x, x + 1)");
+        let code = compile(&expr).expect("compile");
+        let ctx = Context::default();
+        let value = cel_eval_loop(&code, &ctx).expect("eval");
+        assert_eq!(
+            value,
+            Value::list(vec![Value::Int(1), Value::Int(2), Value::Int(3)])
         );
     }
 
