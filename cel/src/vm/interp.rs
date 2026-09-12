@@ -33,7 +33,7 @@ use super::error::{CelErr, CelResult, ColdId, NameId};
 use super::opcode::OpCode;
 use crate::context::Context;
 use crate::objects::{
-    as_optional, binary_values, compare_values, optional_none, optional_of, value_contains,
+    as_optional, binary_values_ref, compare_values, optional_none, optional_of, value_contains,
     value_field, value_index, value_iter, value_key, value_negate, Key, ListStorage, Map,
 };
 use crate::{ExecutionError, Value};
@@ -1318,7 +1318,7 @@ impl<'a> Vm<'a> {
             // arm RE-ADDS the helpers rather than keeping them; see
             // [`FuseArm::GuardKeepingCompare`].
             let accept: fn(Ordering) -> bool = |o| o == Ordering::Less;
-            let decided = compare_values(Value::Int(index), Value::Int(len), accept)
+            let decided = compare_values(&Value::Int(index), &Value::Int(len), accept)
                 .map_err(|e| self.park(e))?;
             let taken = as_bool(&decided)?;
             self.discard(decided);
@@ -1362,7 +1362,7 @@ impl<'a> Vm<'a> {
             .konst(shape.konst)
             .ok_or(CelErr::InternalError)?
             .clone();
-        let value = binary_values("mul", lhs, rhs).map_err(|e| self.park(e))?;
+        let value = binary_values_ref("mul", &lhs, &rhs).map_err(|e| self.park(e))?;
         self.append_to_list(value)?;
         if arm == FuseArm::Body {
             return Ok(shape.after_body);
@@ -1526,7 +1526,7 @@ impl<'a> Vm<'a> {
                     OpCode::Div => "div",
                     _ => "rem",
                 };
-                let value = binary_values(name, lhs, rhs).map_err(|e| self.park(e))?;
+                let value = binary_values_ref(name, &lhs, &rhs).map_err(|e| self.park(e))?;
                 self.push(value);
             }
             OpCode::Equals | OpCode::NotEquals => {
@@ -1543,7 +1543,7 @@ impl<'a> Vm<'a> {
                     OpCode::Greater => |o| o == Ordering::Greater,
                     _ => |o| o != Ordering::Less,
                 };
-                let value = compare_values(lhs, rhs, accept).map_err(|e| self.park(e))?;
+                let value = compare_values(&lhs, &rhs, accept).map_err(|e| self.park(e))?;
                 self.push(value);
             }
             // The three groups above with the right operand read out of the
@@ -1552,17 +1552,13 @@ impl<'a> Vm<'a> {
             // same operator name the pair's did.
             OpCode::AddConst | OpCode::MulConst | OpCode::ModConst => {
                 let lhs = self.pop()?;
-                // Still cloned: `binary_values` takes its operands by value,
-                // and giving it a by-reference twin for this path alone would
-                // be a second implementation of an answer the tree walker
-                // shares. What is gone is the dispatch and the round trip.
-                let rhs = self.code.konst(a).ok_or(CelErr::InternalError)?.clone();
+                let rhs = self.code.konst(a).ok_or(CelErr::InternalError)?;
                 let name = match op {
                     OpCode::AddConst => "add",
                     OpCode::MulConst => "mul",
                     _ => "rem",
                 };
-                let value = binary_values(name, lhs, rhs).map_err(|e| self.park(e))?;
+                let value = binary_values_ref(name, &lhs, rhs).map_err(|e| self.park(e))?;
                 self.push(value);
             }
             OpCode::EqualsConst | OpCode::NotEqualsConst => {
@@ -1578,13 +1574,13 @@ impl<'a> Vm<'a> {
             }
             OpCode::LessConst | OpCode::GreaterConst | OpCode::GreaterEqualsConst => {
                 let lhs = self.pop()?;
-                let rhs = self.code.konst(a).ok_or(CelErr::InternalError)?.clone();
+                let rhs = self.code.konst(a).ok_or(CelErr::InternalError)?;
                 let accept: fn(Ordering) -> bool = match op {
                     OpCode::LessConst => |o| o == Ordering::Less,
                     OpCode::GreaterConst => |o| o == Ordering::Greater,
                     _ => |o| o != Ordering::Less,
                 };
-                let value = compare_values(lhs, rhs, accept).map_err(|e| self.park(e))?;
+                let value = compare_values(&lhs, rhs, accept).map_err(|e| self.park(e))?;
                 self.push(value);
             }
             // The same three groups again with the LEFT operand read out of a
@@ -1592,16 +1588,14 @@ impl<'a> Vm<'a> {
             // The helpers, their operand order and their operator names are
             // unchanged, which is what keeps the error identical to the pair's.
             OpCode::AddLocalConst | OpCode::MulLocalConst | OpCode::ModLocalConst => {
-                // Both still cloned, for the reason the `AddConst` arm gives:
-                // `binary_values` takes its operands by value.
-                let lhs = self.local(a).ok_or(CelErr::InternalError)?.clone();
-                let rhs = self.code.konst(b).ok_or(CelErr::InternalError)?.clone();
+                let lhs = self.local(a).ok_or(CelErr::InternalError)?;
+                let rhs = self.code.konst(b).ok_or(CelErr::InternalError)?;
                 let name = match op {
                     OpCode::AddLocalConst => "add",
                     OpCode::MulLocalConst => "mul",
                     _ => "rem",
                 };
-                let value = binary_values(name, lhs, rhs).map_err(|e| self.park(e))?;
+                let value = binary_values_ref(name, lhs, rhs).map_err(|e| self.park(e))?;
                 self.push(value);
             }
             OpCode::EqualsLocalConst | OpCode::NotEqualsLocalConst => {
@@ -1622,8 +1616,8 @@ impl<'a> Vm<'a> {
             OpCode::LessLocalConst
             | OpCode::GreaterLocalConst
             | OpCode::GreaterEqualsLocalConst => {
-                let lhs = self.local(a).ok_or(CelErr::InternalError)?.clone();
-                let rhs = self.code.konst(b).ok_or(CelErr::InternalError)?.clone();
+                let lhs = self.local(a).ok_or(CelErr::InternalError)?;
+                let rhs = self.code.konst(b).ok_or(CelErr::InternalError)?;
                 let accept: fn(Ordering) -> bool = match op {
                     OpCode::LessLocalConst => |o| o == Ordering::Less,
                     OpCode::GreaterLocalConst => |o| o == Ordering::Greater,
@@ -1669,14 +1663,14 @@ impl<'a> Vm<'a> {
             OpCode::AddLocalConstAppend
             | OpCode::MulLocalConstAppend
             | OpCode::ModLocalConstAppend => {
-                let lhs = self.local(a).ok_or(CelErr::InternalError)?.clone();
-                let rhs = self.code.konst(b).ok_or(CelErr::InternalError)?.clone();
+                let lhs = self.local(a).ok_or(CelErr::InternalError)?;
+                let rhs = self.code.konst(b).ok_or(CelErr::InternalError)?;
                 let name = match op {
                     OpCode::AddLocalConstAppend => "add",
                     OpCode::MulLocalConstAppend => "mul",
                     _ => "rem",
                 };
-                let value = binary_values(name, lhs, rhs).map_err(|e| self.park(e))?;
+                let value = binary_values_ref(name, lhs, rhs).map_err(|e| self.park(e))?;
                 self.append_to_list(value)?;
             }
             OpCode::EqualsLocalConstAppend | OpCode::NotEqualsLocalConstAppend => {
@@ -1691,8 +1685,8 @@ impl<'a> Vm<'a> {
             OpCode::LessLocalConstAppend
             | OpCode::GreaterLocalConstAppend
             | OpCode::GreaterEqualsLocalConstAppend => {
-                let lhs = self.local(a).ok_or(CelErr::InternalError)?.clone();
-                let rhs = self.code.konst(b).ok_or(CelErr::InternalError)?.clone();
+                let lhs = self.local(a).ok_or(CelErr::InternalError)?;
+                let rhs = self.code.konst(b).ok_or(CelErr::InternalError)?;
                 let accept: fn(Ordering) -> bool = match op {
                     OpCode::LessLocalConstAppend => |o| o == Ordering::Less,
                     OpCode::GreaterLocalConstAppend => |o| o == Ordering::Greater,

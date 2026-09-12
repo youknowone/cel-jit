@@ -1268,7 +1268,7 @@ mod tests {
         got: CelRef,
         split: &mut Split,
     ) {
-        match compare_values(lhs.clone(), rhs.clone(), accept) {
+        match compare_values(lhs, rhs, accept) {
             Ok(Value::Bool(want)) => {
                 split.answered += 1;
                 if std::mem::discriminant(lhs) != std::mem::discriminant(rhs) {

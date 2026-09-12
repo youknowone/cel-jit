@@ -1817,20 +1817,181 @@ pub(crate) fn binary_values(
     lhs: Value,
     rhs: Value,
 ) -> Result<Value, ExecutionError> {
-    let rewrite = mismatch_is_no_such_overload(op, &lhs);
-    let result = match op {
-        "add" => lhs + rhs,
-        "sub" => lhs - rhs,
-        "div" => lhs / rhs,
-        "mul" => lhs * rhs,
-        "rem" => lhs % rhs,
-        _ => unreachable!("unknown binary operator {op}"),
+    binary_values_ref(op, &lhs, &rhs)
+}
+
+/// [`binary_values`] without taking ownership. The fused VM ops read a
+/// local and a pool entry in place; cloning them only to hand the same
+/// integers to [`ops::Add`] is the cost those ops were written to drop.
+pub(crate) fn binary_values_ref(
+    op: &'static str,
+    lhs: &Value,
+    rhs: &Value,
+) -> Result<Value, ExecutionError> {
+    let result = if let Some(result) = numeric_binop(op, lhs, rhs) {
+        result
+    } else {
+        match op {
+            "add" => lhs.clone() + rhs.clone(),
+            "sub" => lhs.clone() - rhs.clone(),
+            "div" => lhs.clone() / rhs.clone(),
+            "mul" => lhs.clone() * rhs.clone(),
+            "rem" => lhs.clone() % rhs.clone(),
+            _ => unreachable!("unknown binary operator {op}"),
+        }
     };
     match result {
-        Err(ExecutionError::UnsupportedBinaryOperator(..)) if rewrite => {
+        Err(ExecutionError::UnsupportedBinaryOperator(..))
+            if mismatch_is_no_such_overload(op, lhs) =>
+        {
             Err(ExecutionError::NoSuchOverload)
         }
         other => other,
+    }
+}
+
+/// Same-type numeric (and temporal) operators, with no allocation.
+///
+/// Cross-type and string/list/bytes stay on the owned [`ops`] impls, which
+/// are the walker's answers and the ones the oracle pins.
+fn numeric_binop(
+    op: &'static str,
+    lhs: &Value,
+    rhs: &Value,
+) -> Option<Result<Value, ExecutionError>> {
+    match (lhs, rhs) {
+        (Value::Int(l), Value::Int(r)) => Some(int_binop(op, *l, *r)),
+        (Value::UInt(l), Value::UInt(r)) => Some(uint_binop(op, *l, *r)),
+        (Value::Float(l), Value::Float(r)) => Some(float_binop(op, *l, *r)),
+        #[cfg(feature = "chrono")]
+        (Value::Duration(l), Value::Duration(r)) => Some(duration_binop(op, *l, *r)),
+        #[cfg(feature = "chrono")]
+        (Value::Timestamp(l), Value::Duration(r)) => Some(timestamp_duration_binop(op, l, r)),
+        #[cfg(feature = "chrono")]
+        (Value::Duration(l), Value::Timestamp(r)) if op == "add" => {
+            Some(checked_op(TsOp::Add, r, l))
+        }
+        #[cfg(feature = "chrono")]
+        (Value::Timestamp(l), Value::Timestamp(r)) if op == "sub" => {
+            Some(Ok(Value::Duration(l.signed_duration_since(*r))))
+        }
+        _ => None,
+    }
+}
+
+fn int_binop(op: &'static str, l: i64, r: i64) -> Result<Value, ExecutionError> {
+    match op {
+        "add" => l
+            .checked_add(r)
+            .ok_or_else(|| ExecutionError::Overflow("add", l.into(), r.into()))
+            .map(Value::Int),
+        "sub" => l
+            .checked_sub(r)
+            .ok_or_else(|| ExecutionError::Overflow("sub", l.into(), r.into()))
+            .map(Value::Int),
+        "mul" => l
+            .checked_mul(r)
+            .ok_or_else(|| ExecutionError::Overflow("mul", l.into(), r.into()))
+            .map(Value::Int),
+        "div" => {
+            if r == 0 {
+                Err(ExecutionError::DivisionByZero(l.into()))
+            } else {
+                l.checked_div(r)
+                    .ok_or_else(|| ExecutionError::Overflow("div", l.into(), r.into()))
+                    .map(Value::Int)
+            }
+        }
+        "rem" => {
+            if r == 0 {
+                Err(ExecutionError::RemainderByZero(l.into()))
+            } else {
+                l.checked_rem(r)
+                    .ok_or_else(|| ExecutionError::Overflow("rem", l.into(), r.into()))
+                    .map(Value::Int)
+            }
+        }
+        _ => unreachable!("unknown binary operator {op}"),
+    }
+}
+
+fn uint_binop(op: &'static str, l: u64, r: u64) -> Result<Value, ExecutionError> {
+    match op {
+        "add" => l
+            .checked_add(r)
+            .ok_or_else(|| ExecutionError::Overflow("add", l.into(), r.into()))
+            .map(Value::UInt),
+        "sub" => l
+            .checked_sub(r)
+            .ok_or_else(|| ExecutionError::Overflow("sub", l.into(), r.into()))
+            .map(Value::UInt),
+        "mul" => l
+            .checked_mul(r)
+            .ok_or_else(|| ExecutionError::Overflow("mul", l.into(), r.into()))
+            .map(Value::UInt),
+        "div" => l
+            .checked_div(r)
+            .ok_or_else(|| ExecutionError::DivisionByZero(l.into()))
+            .map(Value::UInt),
+        "rem" => l
+            .checked_rem(r)
+            .ok_or_else(|| ExecutionError::RemainderByZero(l.into()))
+            .map(Value::UInt),
+        _ => unreachable!("unknown binary operator {op}"),
+    }
+}
+
+fn float_binop(op: &'static str, l: f64, r: f64) -> Result<Value, ExecutionError> {
+    match op {
+        "add" => Ok(Value::Float(l + r)),
+        "sub" => Ok(Value::Float(l - r)),
+        "mul" => Ok(Value::Float(l * r)),
+        "div" => Ok(Value::Float(l / r)),
+        _ => Err(ExecutionError::UnsupportedBinaryOperator(
+            op,
+            Value::Float(l),
+            Value::Float(r),
+        )),
+    }
+}
+
+#[cfg(feature = "chrono")]
+fn duration_binop(
+    op: &'static str,
+    l: chrono::Duration,
+    r: chrono::Duration,
+) -> Result<Value, ExecutionError> {
+    match op {
+        "add" => l
+            .checked_add(&r)
+            .ok_or_else(|| ExecutionError::Overflow("add", l.into(), r.into()))
+            .map(Value::Duration),
+        "sub" => l
+            .checked_sub(&r)
+            .ok_or_else(|| ExecutionError::Overflow("sub", l.into(), r.into()))
+            .map(Value::Duration),
+        _ => Err(ExecutionError::UnsupportedBinaryOperator(
+            op,
+            l.into(),
+            r.into(),
+        )),
+    }
+}
+
+#[cfg(feature = "chrono")]
+fn timestamp_duration_binop(
+    op: &'static str,
+    l: &chrono::DateTime<chrono::FixedOffset>,
+    r: &chrono::Duration,
+) -> Result<Value, ExecutionError> {
+    match op {
+        "add" => checked_op(TsOp::Add, l, r),
+        "sub" => checked_op(TsOp::Sub, l, r),
+        _ => Err(ExecutionError::UnsupportedBinaryOperator(
+            op,
+            (*l).into(),
+            (*r).into(),
+        )),
     }
 }
 
@@ -1862,21 +2023,19 @@ fn compare_op(
 ) -> Result<Value, ExecutionError> {
     let lhs = Value::resolve_value(&call.args[0], ctx)?;
     let rhs = Value::resolve_value(&call.args[1], ctx)?;
-    compare_values(lhs, rhs, accept)
+    compare_values(&lhs, &rhs, accept)
 }
 
 /// The operand-level half of [`compare_op`], shared with the bytecode VM.
 pub(crate) fn compare_values(
-    lhs: Value,
-    rhs: Value,
+    lhs: &Value,
+    rhs: &Value,
     accept: impl FnOnce(Ordering) -> bool,
 ) -> Result<Value, ExecutionError> {
-    if !has_comparer(&lhs) {
+    if !has_comparer(lhs) {
         return Err(ExecutionError::NoSuchOverload);
     }
-    let ordering = lhs
-        .partial_cmp(&rhs)
-        .ok_or(ExecutionError::NoSuchOverload)?;
+    let ordering = lhs.partial_cmp(rhs).ok_or(ExecutionError::NoSuchOverload)?;
     Ok(Value::Bool(accept(ordering)))
 }
 
