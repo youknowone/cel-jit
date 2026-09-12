@@ -234,6 +234,12 @@ impl Map {
         &self.storage
     }
 
+    /// Whether this map can be copied into a class-family `W_MapObject`
+    /// without dropping a record-row schema window.
+    pub(crate) fn can_intern(&self) -> bool {
+        matches!(self.storage, MapStorage::Object(_))
+    }
+
     pub fn len(&self) -> usize {
         match &self.storage {
             MapStorage::Object(map) => map.len(),

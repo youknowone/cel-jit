@@ -58,10 +58,10 @@
 use super::error::{raise, CelErrCode, ERROR_SENTINEL};
 use super::object::{
     new_bool, new_bytes, new_double, new_duration, new_int, new_list, new_string, new_timestamp,
-    new_uint, CelClass, CelRef, W_BytesObject, W_ListObject, W_StringObject, CEL_BOOL_CLASS,
-    CEL_BYTES_CLASS, CEL_DOUBLE_CLASS, CEL_DURATION_CLASS, CEL_INT_CLASS, CEL_LIST_CLASS,
-    CEL_NULL_CLASS, CEL_OPTIONAL_CLASS, CEL_STRING_CLASS, CEL_TIMESTAMP_CLASS, CEL_TYPE_CLASS,
-    CEL_UINT_CLASS,
+    new_uint, CelClass, CelRef, W_BytesObject, W_ListObject, W_MapObject, W_StringObject,
+    CEL_BOOL_CLASS, CEL_BYTES_CLASS, CEL_DOUBLE_CLASS, CEL_DURATION_CLASS, CEL_INT_CLASS,
+    CEL_LIST_CLASS, CEL_MAP_CLASS, CEL_NULL_CLASS, CEL_OPTIONAL_CLASS, CEL_STRING_CLASS,
+    CEL_TIMESTAMP_CLASS, CEL_TYPE_CLASS, CEL_UINT_CLASS,
 };
 use super::object_array::{bytes_base, items_block_items_base};
 
@@ -247,6 +247,51 @@ pub unsafe fn w_string_eq(a: CelRef, b: CelRef) -> bool {
 /// Both operands are live bytes.
 pub unsafe fn w_bytes_eq(a: CelRef, b: CelRef) -> bool {
     bytes_payload(a) == bytes_payload(b)
+}
+
+/// # Safety
+///
+/// `w` is a live map.
+unsafe fn map_pairs(w: CelRef) -> &'static [CelRef] {
+    let leaf = &*w.cast::<W_MapObject>();
+    let n = (leaf.length as usize).saturating_mul(2);
+    let base = items_block_items_base(leaf.items);
+    if base.is_null() {
+        &[]
+    } else {
+        std::slice::from_raw_parts(base, n)
+    }
+}
+
+/// # Safety
+///
+/// Both operands are live maps.
+pub unsafe fn w_map_eq(a: CelRef, b: CelRef) -> bool {
+    let left = map_pairs(a);
+    let right = map_pairs(b);
+    if left.len() != right.len() {
+        return false;
+    }
+    let n = left.len() / 2;
+    let mut i = 0;
+    while i < n {
+        let lk = left[2 * i];
+        let lv = left[2 * i + 1];
+        let mut found = false;
+        let mut j = 0;
+        while j < n {
+            if values_equal(lk, right[2 * j]) && values_equal(lv, right[2 * j + 1]) {
+                found = true;
+                break;
+            }
+            j += 1;
+        }
+        if !found {
+            return false;
+        }
+        i += 1;
+    }
+    true
 }
 
 /// # Safety
@@ -874,6 +919,7 @@ pub unsafe fn values_equal(a: CelRef, b: CelRef) -> bool {
             CEL_STRING_CLASS => w_string_eq,
             CEL_BYTES_CLASS => w_bytes_eq,
             CEL_LIST_CLASS => w_list_eq,
+            CEL_MAP_CLASS => w_map_eq,
         );
     }
     values_equal_mixed(a, b, ta, tb)

@@ -49,11 +49,14 @@ pub enum ConvertError {
 pub fn intern_leaf(v: &Value) -> Option<CelRef> {
     match v {
         Value::Int(i) => Some(new_int(*i) as CelRef),
+        Value::UInt(u) => Some(new_uint(*u) as CelRef),
+        Value::Float(f) => Some(new_double(*f) as CelRef),
         Value::Bool(b) => Some(new_bool(*b) as CelRef),
         Value::Null => Some(new_null() as CelRef),
         Value::String(s) => Some(new_string(s) as CelRef),
         Value::Bytes(b) => Some(new_bytes(b) as CelRef),
         Value::List(list) if list.can_intern() => value_to_ref(v).ok(),
+        Value::Map(map) if map.can_intern() => value_to_ref(v).ok(),
         _ => None,
     }
 }
@@ -318,6 +321,26 @@ mod tests {
         assert!(intern_leaf(&Value::String(Arc::new("x".into()))).is_some());
         let list = Value::List(ListRef::from(vec![Value::Int(1)]));
         assert!(intern_leaf(&list).is_some());
+        assert!(intern_leaf(&Value::UInt(3)).is_some());
+        assert!(intern_leaf(&Value::Float(1.5)).is_some());
+        let object = Value::Map(Map::object(Arc::new(
+            [(Key::String(Arc::new("a".into())), Value::Int(1))]
+                .into_iter()
+                .collect(),
+        )));
+        assert!(intern_leaf(&object).is_some());
+        let schema = Arc::new(crate::objects::RecordSchema::new(
+            vec![Key::String(Arc::new("a".into()))],
+            vec![crate::objects::ValueColumn::Scalar {
+                bank: crate::objects::ScalarBank::Int,
+                words: Arc::from([1i64]),
+            }],
+        ));
+        let record = Value::Map(Map::record(schema, 0));
+        assert!(
+            intern_leaf(&record).is_none(),
+            "a record-row map must stay on the public enum"
+        );
     }
 
     #[test]
@@ -336,6 +359,32 @@ mod tests {
             unsafe { ref_to_value(cat) }.unwrap(),
             Value::List(ListRef::from(vec![Value::Int(1), Value::Int(2)]))
         );
+        let ua = intern_leaf(&Value::UInt(2)).unwrap();
+        let ub = intern_leaf(&Value::UInt(3)).unwrap();
+        assert_eq!(
+            unsafe { ref_to_value(crate::runtime::binop::cel_add(ua, ub)) }.unwrap(),
+            Value::UInt(5)
+        );
+        let fa = intern_leaf(&Value::Float(1.5)).unwrap();
+        let fb = intern_leaf(&Value::Float(2.25)).unwrap();
+        assert_eq!(
+            unsafe { ref_to_value(crate::runtime::binop::cel_add(fa, fb)) }.unwrap(),
+            Value::Float(3.75)
+        );
+        let ma = intern_leaf(&object_map()).unwrap();
+        let mb = intern_leaf(&object_map()).unwrap();
+        assert_eq!(
+            unsafe { ref_to_value(crate::runtime::binop::cel_equals(ma, mb)) }.unwrap(),
+            Value::Bool(true)
+        );
+    }
+
+    fn object_map() -> Value {
+        Value::Map(Map::object(Arc::new(
+            [(Key::String(Arc::new("k".into())), Value::Int(1))]
+                .into_iter()
+                .collect(),
+        )))
     }
 
     #[test]

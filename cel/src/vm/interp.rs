@@ -3053,6 +3053,35 @@ mod tests {
 
     /// A comprehension counter stored as an interned int stays on the table.
     #[test]
+    fn interned_uint_and_float_add_through_the_vm() {
+        let ctx = Context::default();
+        let uint = {
+            let expr = parse("1u + 2u");
+            let code = compile(&expr).expect("compile");
+            cel_eval_loop(&code, &ctx).expect("eval")
+        };
+        assert_eq!(uint, Value::UInt(3));
+        assert!(crate::runtime::convert::intern_leaf(&uint).is_some());
+        let float = {
+            let expr = parse("1.5 + 2.25");
+            let code = compile(&expr).expect("compile");
+            cel_eval_loop(&code, &ctx).expect("eval")
+        };
+        assert_eq!(float, Value::Float(3.75));
+        assert!(crate::runtime::convert::intern_leaf(&float).is_some());
+    }
+
+    #[test]
+    fn interned_object_map_equality_through_the_vm() {
+        let expr = parse("{'a': 1} == {'a': 1}");
+        let code = compile(&expr).expect("compile");
+        let ctx = Context::default();
+        let value = cel_eval_loop(&code, &ctx).expect("eval");
+        assert_eq!(value, Value::Bool(true));
+    }
+
+    /// A comprehension counter stored as an interned int stays on the table.
+    #[test]
     fn interned_string_concat_stays_on_the_class_family() {
         let expr = parse("'he' + 'llo'");
         let code = compile(&expr).expect("compile");
