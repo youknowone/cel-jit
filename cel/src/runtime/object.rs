@@ -486,6 +486,35 @@ const _: () = {
 /// The elements are the family's first MULTIPLE managed edges from one value,
 /// and they live in the block rather than in the leaf. Nothing traces them yet,
 /// for the same reason nothing traces [`W_OptionalObject`]'s single edge.
+/// Live length of a list leaf.
+///
+/// # Safety
+///
+/// `w` is a live [`W_ListObject`].
+pub unsafe fn list_len(w: CelRef) -> i64 {
+    (*w.cast::<W_ListObject>()).length
+}
+
+/// Item `index` of a list leaf, or null if out of range.
+///
+/// # Safety
+///
+/// `w` is a live [`W_ListObject`].
+pub unsafe fn list_get(w: CelRef, index: i64) -> Option<CelRef> {
+    if index < 0 {
+        return None;
+    }
+    let leaf = &*w.cast::<W_ListObject>();
+    if index >= leaf.length {
+        return None;
+    }
+    let base = crate::runtime::object_array::items_block_items_base(leaf.items);
+    if base.is_null() {
+        return None;
+    }
+    Some(*base.add(index as usize))
+}
+
 pub fn new_list(values: &[CelRef]) -> *mut W_ListObject {
     let items = object_array::new_items_block(values);
     let length = values.len() as i64;

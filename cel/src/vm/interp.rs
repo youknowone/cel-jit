@@ -1049,7 +1049,11 @@ impl<'a> Vm<'a> {
             CelErrCode::DivisionByZero => ExecutionError::DivisionByZero(lhs),
             CelErrCode::RemainderByZero => ExecutionError::RemainderByZero(lhs),
             CelErrCode::UnsupportedBinaryOperator => {
-                ExecutionError::UnsupportedBinaryOperator(err.op, lhs, rhs)
+                if crate::objects::mismatch_is_no_such_overload(err.op, &lhs) {
+                    ExecutionError::NoSuchOverload
+                } else {
+                    ExecutionError::UnsupportedBinaryOperator(err.op, lhs, rhs)
+                }
             }
             CelErrCode::NoSuchOverload => ExecutionError::NoSuchOverload,
             CelErrCode::NoneDereference => ExecutionError::NoSuchOverload,
@@ -1396,8 +1400,8 @@ impl<'a> Vm<'a> {
             Some(index) => index,
             _ => return Err(CelErr::InternalError),
         };
-        let len = match self.local(shape.source) {
-            Some(Value::List(list)) => list.len() as i64,
+        let len = match self.sequence_len(shape.source) {
+            Ok(len) => len,
             _ => return Err(CelErr::InternalError),
         };
         if arm == FuseArm::AdvancePlusArcRoundTrip {
@@ -1434,12 +1438,11 @@ impl<'a> Vm<'a> {
 
         // -- the bind: `IterBind source index var`
         let element = {
-            let Some(Value::List(sequence)) = self.local(shape.source) else {
-                return Err(CelErr::InternalError);
-            };
-            sequence.get(index as usize)
+            match self.element_at(shape.source, shape.index) {
+                Ok(element) => element,
+                Err(err) => return Err(err),
+            }
         };
-        let element = element.ok_or(CelErr::IndexOutOfBounds)?;
         self.store_slot(shape.var, element)?;
         if arm == FuseArm::Bind {
             return Ok(shape.after_bind);
@@ -2178,8 +2181,11 @@ impl<'a> Vm<'a> {
     /// atomic refcount pair for a list -- once per element of the loop.
     #[inline(always)]
     fn sequence_len(&self, slot: u32) -> CelResult<i64> {
-        match self.local(slot).ok_or(CelErr::InternalError)? {
-            Value::List(list) => Ok(list.len() as i64),
+        match self.local_operand(slot).ok_or(CelErr::InternalError)? {
+            Operand::Value(Value::List(list)) => Ok(list.len() as i64),
+            Operand::Interned(w) if unsafe { w_kind(*w) } == CelKind::List => {
+                Ok(unsafe { crate::runtime::object::list_len(*w) })
+            }
             _ => Err(CelErr::InternalError),
         }
     }
@@ -2223,18 +2229,20 @@ impl<'a> Vm<'a> {
             };
             return element.map_err(|e| self.park(e));
         }
-        let element = {
-            let Some(Value::List(sequence)) = self.local(sequence) else {
-                return Err(CelErr::InternalError);
-            };
-            let Some(index) = self.local_int(index) else {
-                return Err(CelErr::InternalError);
-            };
-            // A negative index wraps to a very large `usize` and fails the
-            // bound, which is the answer the general path gives it too.
-            sequence.get(index as usize)
+        let Some(index) = self.local_int(index) else {
+            return Err(CelErr::InternalError);
         };
-        element.ok_or(CelErr::IndexOutOfBounds)
+        match self.local_operand(sequence).ok_or(CelErr::InternalError)? {
+            Operand::Value(Value::List(seq)) => {
+                seq.get(index as usize).ok_or(CelErr::IndexOutOfBounds)
+            }
+            Operand::Interned(w) if unsafe { w_kind(*w) } == CelKind::List => {
+                let item = unsafe { crate::runtime::object::list_get(*w, index) }
+                    .ok_or(CelErr::IndexOutOfBounds)?;
+                unsafe { ref_to_value(item) }.map_err(|_| CelErr::InternalError)
+            }
+            _ => Err(CelErr::InternalError),
+        }
     }
 
     /// Write `value` into `slot`, dropping what was there.
@@ -3041,6 +3049,16 @@ mod tests {
             crate::runtime::convert::intern_leaf(&value),
             Some(crate::runtime::object::new_int(3) as crate::runtime::object::CelRef)
         );
+    }
+
+    /// A comprehension counter stored as an interned int stays on the table.
+    #[test]
+    fn interned_string_concat_stays_on_the_class_family() {
+        let expr = parse("'he' + 'llo'");
+        let code = compile(&expr).expect("compile");
+        let ctx = Context::default();
+        let value = cel_eval_loop(&code, &ctx).expect("eval");
+        assert_eq!(value, Value::String(std::sync::Arc::new("hello".into())));
     }
 
     /// A comprehension counter stored as an interned int stays on the table.

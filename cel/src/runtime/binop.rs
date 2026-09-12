@@ -57,10 +57,13 @@
 
 use super::error::{raise, CelErrCode, ERROR_SENTINEL};
 use super::object::{
-    new_bool, new_double, new_duration, new_int, new_timestamp, new_uint, CelClass, CelRef,
-    CEL_BOOL_CLASS, CEL_DOUBLE_CLASS, CEL_DURATION_CLASS, CEL_INT_CLASS, CEL_NULL_CLASS,
-    CEL_OPTIONAL_CLASS, CEL_TIMESTAMP_CLASS, CEL_TYPE_CLASS, CEL_UINT_CLASS,
+    new_bool, new_bytes, new_double, new_duration, new_int, new_list, new_string, new_timestamp,
+    new_uint, CelClass, CelRef, W_BytesObject, W_ListObject, W_StringObject, CEL_BOOL_CLASS,
+    CEL_BYTES_CLASS, CEL_DOUBLE_CLASS, CEL_DURATION_CLASS, CEL_INT_CLASS, CEL_LIST_CLASS,
+    CEL_NULL_CLASS, CEL_OPTIONAL_CLASS, CEL_STRING_CLASS, CEL_TIMESTAMP_CLASS, CEL_TYPE_CLASS,
+    CEL_UINT_CLASS,
 };
+use super::object_array::{bytes_base, items_block_items_base};
 
 /// The class word of `w`, as the chains read it.
 ///
@@ -146,6 +149,139 @@ macro_rules! float_arm {
 
 // `double` arithmetic does not raise: IEEE-754 answers every case, including
 // division by zero, which is why these arms have no error edge at all.
+/// # Safety
+///
+/// `w` is a live string.
+unsafe fn string_bytes(w: CelRef) -> &'static [u8] {
+    let leaf = &*w.cast::<W_StringObject>();
+    let n = leaf.byte_len as usize;
+    let base = bytes_base(leaf.chars);
+    if base.is_null() {
+        &[]
+    } else {
+        std::slice::from_raw_parts(base, n)
+    }
+}
+
+/// # Safety
+///
+/// `w` is a live bytes value.
+unsafe fn bytes_payload(w: CelRef) -> &'static [u8] {
+    let leaf = &*w.cast::<W_BytesObject>();
+    let n = leaf.length as usize;
+    let base = bytes_base(leaf.data);
+    if base.is_null() {
+        &[]
+    } else {
+        std::slice::from_raw_parts(base, n)
+    }
+}
+
+/// # Safety
+///
+/// `w` is a live list.
+unsafe fn list_items(w: CelRef) -> &'static [CelRef] {
+    let leaf = &*w.cast::<W_ListObject>();
+    let n = leaf.length as usize;
+    let base = items_block_items_base(leaf.items);
+    if base.is_null() {
+        &[]
+    } else {
+        std::slice::from_raw_parts(base, n)
+    }
+}
+
+fn cmp_bytes(l: &[u8], r: &[u8]) -> i64 {
+    match l.cmp(r) {
+        std::cmp::Ordering::Less => CMP_LESS,
+        std::cmp::Ordering::Equal => CMP_EQUAL,
+        std::cmp::Ordering::Greater => CMP_GREATER,
+    }
+}
+
+/// # Safety
+///
+/// Both operands are live strings.
+pub unsafe fn w_string_add(a: CelRef, b: CelRef) -> CelRef {
+    let left = string_bytes(a);
+    let right = string_bytes(b);
+    let mut out = String::with_capacity(left.len() + right.len());
+    out.push_str(std::str::from_utf8_unchecked(left));
+    out.push_str(std::str::from_utf8_unchecked(right));
+    new_string(&out) as CelRef
+}
+
+/// # Safety
+///
+/// Both operands are live bytes.
+pub unsafe fn w_bytes_add(a: CelRef, b: CelRef) -> CelRef {
+    let left = bytes_payload(a);
+    let right = bytes_payload(b);
+    let mut out = Vec::with_capacity(left.len() + right.len());
+    out.extend_from_slice(left);
+    out.extend_from_slice(right);
+    new_bytes(&out) as CelRef
+}
+
+/// # Safety
+///
+/// Both operands are live lists.
+pub unsafe fn w_list_add(a: CelRef, b: CelRef) -> CelRef {
+    let left = list_items(a);
+    let right = list_items(b);
+    let mut out = Vec::with_capacity(left.len() + right.len());
+    out.extend_from_slice(left);
+    out.extend_from_slice(right);
+    new_list(&out) as CelRef
+}
+
+/// # Safety
+///
+/// Both operands are live strings.
+pub unsafe fn w_string_eq(a: CelRef, b: CelRef) -> bool {
+    string_bytes(a) == string_bytes(b)
+}
+
+/// # Safety
+///
+/// Both operands are live bytes.
+pub unsafe fn w_bytes_eq(a: CelRef, b: CelRef) -> bool {
+    bytes_payload(a) == bytes_payload(b)
+}
+
+/// # Safety
+///
+/// Both operands are live lists.
+pub unsafe fn w_list_eq(a: CelRef, b: CelRef) -> bool {
+    let left = list_items(a);
+    let right = list_items(b);
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < left.len() {
+        if !values_equal(left[i], right[i]) {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// # Safety
+///
+/// Both operands are live strings.
+pub unsafe fn w_string_cmp(a: CelRef, b: CelRef) -> i64 {
+    cmp_bytes(string_bytes(a), string_bytes(b))
+}
+
+/// # Safety
+///
+/// Both operands are live bytes.
+pub unsafe fn w_bytes_cmp(a: CelRef, b: CelRef) -> i64 {
+    cmp_bytes(bytes_payload(a), bytes_payload(b))
+}
+
 float_arm!(w_double_add, |l: f64, r: f64| l + r);
 float_arm!(w_double_sub, |l: f64, r: f64| l - r);
 float_arm!(w_double_mul, |l: f64, r: f64| l * r);
@@ -298,6 +434,9 @@ pub unsafe fn cel_add(a: CelRef, b: CelRef) -> CelRef {
             CEL_UINT_CLASS => w_uint_add,
             CEL_DOUBLE_CLASS => w_double_add,
             CEL_DURATION_CLASS => w_duration_add,
+            CEL_STRING_CLASS => w_string_add,
+            CEL_BYTES_CLASS => w_bytes_add,
+            CEL_LIST_CLASS => w_list_add,
         );
     }
     cel_add_slow(a, b, ta, tb)
@@ -732,6 +871,9 @@ pub unsafe fn values_equal(a: CelRef, b: CelRef) -> bool {
             CEL_TIMESTAMP_CLASS => w_timestamp_eq,
             CEL_TYPE_CLASS => w_type_eq,
             CEL_OPTIONAL_CLASS => w_optional_eq,
+            CEL_STRING_CLASS => w_string_eq,
+            CEL_BYTES_CLASS => w_bytes_eq,
+            CEL_LIST_CLASS => w_list_eq,
         );
     }
     values_equal_mixed(a, b, ta, tb)
@@ -819,6 +961,8 @@ pub unsafe fn cel_compare(a: CelRef, b: CelRef) -> i64 {
             CEL_BOOL_CLASS => w_bool_cmp,
             CEL_DURATION_CLASS => w_duration_cmp,
             CEL_TIMESTAMP_CLASS => w_timestamp_cmp,
+            CEL_STRING_CLASS => w_string_cmp,
+            CEL_BYTES_CLASS => w_bytes_cmp,
         );
     }
     cel_compare_slow(a, b, ta, tb)

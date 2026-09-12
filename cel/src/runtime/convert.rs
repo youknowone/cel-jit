@@ -42,16 +42,18 @@ pub enum ConvertError {
     Corrupt(&'static str),
 }
 
-/// Intern `v` when it is a leaf the prebuilt table or `new_int` can hold.
+/// Intern `v` when this family has a leaf for it.
 ///
-/// Bool, null and int only: those are the interned identities. Everything
-/// else stays on the public enum until its own leaf is the production
-/// representation.
+/// Bool, null and small ints are process-wide identities. String, bytes
+/// and list allocate a class-family leaf so the VM can stay on [`CelRef`].
 pub fn intern_leaf(v: &Value) -> Option<CelRef> {
     match v {
         Value::Int(i) => Some(new_int(*i) as CelRef),
         Value::Bool(b) => Some(new_bool(*b) as CelRef),
         Value::Null => Some(new_null() as CelRef),
+        Value::String(s) => Some(new_string(s) as CelRef),
+        Value::Bytes(b) => Some(new_bytes(b) as CelRef),
+        Value::List(list) if list.can_intern() => value_to_ref(v).ok(),
         _ => None,
     }
 }
@@ -313,7 +315,27 @@ mod tests {
         );
         assert_eq!(intern_leaf(&Value::Null), Some(new_null() as CelRef));
         assert_eq!(intern_leaf(&Value::Int(3)), Some(new_int(3) as CelRef));
-        assert_eq!(intern_leaf(&Value::String(Arc::new("x".into()))), None);
+        assert!(intern_leaf(&Value::String(Arc::new("x".into()))).is_some());
+        let list = Value::List(ListRef::from(vec![Value::Int(1)]));
+        assert!(intern_leaf(&list).is_some());
+    }
+
+    #[test]
+    fn interned_string_and_list_add_roundtrip() {
+        let hello = intern_leaf(&Value::String(Arc::new("he".into()))).unwrap();
+        let lo = intern_leaf(&Value::String(Arc::new("llo".into()))).unwrap();
+        let joined = unsafe { crate::runtime::binop::cel_add(hello, lo) };
+        assert_eq!(
+            unsafe { ref_to_value(joined) }.unwrap(),
+            Value::String(Arc::new("hello".into()))
+        );
+        let a = intern_leaf(&Value::List(ListRef::from(vec![Value::Int(1)]))).unwrap();
+        let b = intern_leaf(&Value::List(ListRef::from(vec![Value::Int(2)]))).unwrap();
+        let cat = unsafe { crate::runtime::binop::cel_add(a, b) };
+        assert_eq!(
+            unsafe { ref_to_value(cat) }.unwrap(),
+            Value::List(ListRef::from(vec![Value::Int(1), Value::Int(2)]))
+        );
     }
 
     #[test]

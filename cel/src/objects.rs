@@ -830,6 +830,15 @@ pub struct ListRef {
 }
 
 impl ListRef {
+    /// Whether this list can be copied into a class-family `W_ListObject`
+    /// without dropping a column window or a record schema.
+    pub(crate) fn can_intern(&self) -> bool {
+        matches!(
+            &*self.storage,
+            ListStorage::Object(_) | ListStorage::Ints(_)
+        )
+    }
+
     /// The window `storage[start .. start + len]`.
     pub fn window(storage: Arc<ListStorage>, start: usize, len: usize) -> ListRef {
         assert!(
@@ -1793,7 +1802,7 @@ fn resolve_args(args: &[Expression], ctx: &Context) -> Result<Vec<Value>, Execut
 /// Derived by sweeping every (receiver, operator, argument) triple through both
 /// evaluators, not by reading the impls: a capability trait's terminal error is
 /// easy to misattribute to a neighbouring impl.
-fn mismatch_is_no_such_overload(op: &'static str, value: &Value) -> bool {
+pub(crate) fn mismatch_is_no_such_overload(op: &'static str, value: &Value) -> bool {
     #[cfg(feature = "chrono")]
     let duration_sub = matches!(value, Value::Duration(_)) && op == "sub";
     #[cfg(not(feature = "chrono"))]
