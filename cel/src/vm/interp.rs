@@ -2061,6 +2061,7 @@ impl<'a> Vm<'a> {
                     Some(Operand::Value(value)) => {
                         matches!(optional_inner(value), OptView::Empty)
                     }
+                    Some(Operand::Interned(w)) => interned_optional_is_none(*w),
                     _ => false,
                 };
                 if empty {
@@ -2424,6 +2425,15 @@ enum OptView {
     /// `optional.none`.
     Empty,
     Present(Value),
+}
+
+fn interned_optional_is_none(w: CelRef) -> bool {
+    unsafe {
+        w_kind(w) == CelKind::Optional
+            && (*w.cast::<crate::runtime::object::W_OptionalObject>())
+                .w_value
+                .is_null()
+    }
 }
 
 fn optional_inner(value: &Value) -> OptView {
@@ -3078,6 +3088,28 @@ mod tests {
         let ctx = Context::default();
         let value = cel_eval_loop(&code, &ctx).expect("eval");
         assert_eq!(value, Value::Bool(true));
+    }
+
+    /// A comprehension counter stored as an interned int stays on the table.
+    #[test]
+    fn interned_optional_and_duration_through_the_vm() {
+        let ctx = Context::default();
+        let opt = {
+            let expr = parse("optional.of(3) == optional.of(3)");
+            let code = compile(&expr).expect("compile");
+            cel_eval_loop(&code, &ctx).expect("eval")
+        };
+        assert_eq!(opt, Value::Bool(true));
+        #[cfg(feature = "chrono")]
+        {
+            let dur = {
+                let expr = parse("duration(\"1s\") + duration(\"2s\")");
+                let code = compile(&expr).expect("compile");
+                cel_eval_loop(&code, &ctx).expect("eval")
+            };
+            assert_eq!(dur, Value::Duration(chrono::Duration::seconds(3)));
+            assert!(crate::runtime::convert::intern_leaf(&dur).is_some());
+        }
     }
 
     /// A comprehension counter stored as an interned int stays on the table.

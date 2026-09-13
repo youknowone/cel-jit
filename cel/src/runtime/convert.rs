@@ -57,6 +57,13 @@ pub fn intern_leaf(v: &Value) -> Option<CelRef> {
         Value::Bytes(b) => Some(new_bytes(b) as CelRef),
         Value::List(list) if list.can_intern() => value_to_ref(v).ok(),
         Value::Map(map) if map.can_intern() => value_to_ref(v).ok(),
+        Value::Opaque(opaque) if opaque.downcast_ref::<OptionalValue>().is_some() => {
+            value_to_ref(v).ok()
+        }
+        #[cfg(feature = "chrono")]
+        Value::Duration(_) | Value::Timestamp(_) => value_to_ref(v).ok(),
+        #[cfg(feature = "structs")]
+        Value::Struct(_) => value_to_ref(v).ok(),
         _ => None,
     }
 }
@@ -341,6 +348,18 @@ mod tests {
             intern_leaf(&record).is_none(),
             "a record-row map must stay on the public enum"
         );
+        let none = Value::Opaque(Arc::new(OptionalValue::none()));
+        assert!(intern_leaf(&none).is_some());
+        let some = Value::Opaque(Arc::new(OptionalValue::of(Value::Int(4))));
+        assert!(intern_leaf(&some).is_some());
+        #[cfg(feature = "chrono")]
+        {
+            assert!(intern_leaf(&Value::Duration(chrono::Duration::seconds(1))).is_some());
+            assert!(intern_leaf(&Value::Timestamp(
+                chrono::DateTime::parse_from_rfc3339("2020-01-01T00:00:00Z").unwrap()
+            ))
+            .is_some());
+        }
     }
 
     #[test]
@@ -377,6 +396,21 @@ mod tests {
             unsafe { ref_to_value(crate::runtime::binop::cel_equals(ma, mb)) }.unwrap(),
             Value::Bool(true)
         );
+        let none = intern_leaf(&Value::Opaque(Arc::new(OptionalValue::none()))).unwrap();
+        let also_none = intern_leaf(&Value::Opaque(Arc::new(OptionalValue::none()))).unwrap();
+        assert_eq!(
+            unsafe { ref_to_value(crate::runtime::binop::cel_equals(none, also_none)) }.unwrap(),
+            Value::Bool(true)
+        );
+        #[cfg(feature = "chrono")]
+        {
+            let d1 = intern_leaf(&Value::Duration(chrono::Duration::seconds(1))).unwrap();
+            let d2 = intern_leaf(&Value::Duration(chrono::Duration::seconds(2))).unwrap();
+            assert_eq!(
+                unsafe { ref_to_value(crate::runtime::binop::cel_add(d1, d2)) }.unwrap(),
+                Value::Duration(chrono::Duration::seconds(3))
+            );
+        }
     }
 
     fn object_map() -> Value {
