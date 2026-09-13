@@ -44,8 +44,8 @@ use crate::runtime::binop::{
 use crate::runtime::convert::{intern_leaf, ref_to_value};
 use crate::runtime::error::{take_error, CelErrCode, ERROR_SENTINEL};
 use crate::runtime::object::{
-    list_get, list_len, map_len, new_int, new_list, new_optional, new_optional_none,
-    string_byte_len, w_kind, CelKind, CelRef, W_IntObject,
+    list_get, list_len, map_len, new_int, new_list, new_null, new_optional, new_optional_none,
+    string_byte_len, w_kind, CelKind, CelRef, W_BoolObject, W_IntObject,
 };
 use crate::{ExecutionError, Value};
 
@@ -2269,6 +2269,9 @@ impl<'a> Vm<'a> {
                 if b == 1 && self.try_interned_size_on_top(NameId(a))? {
                     return Ok(Step::Next);
                 }
+                if self.try_interned_extremum(NameId(a), b as usize)? {
+                    return Ok(Step::Next);
+                }
                 let args = self.pop_n(b as usize)?;
                 let value = self.call_global(NameId(a), args)?;
                 self.push(value);
@@ -2278,6 +2281,9 @@ impl<'a> Vm<'a> {
                 // the instruction that owns it.
                 let parked = self.pending_args.take();
                 if parked.is_none() && b == 0 && self.try_interned_size_on_top(NameId(a))? {
+                    return Ok(Step::Next);
+                }
+                if parked.is_none() && b == 1 && self.try_interned_string_method(NameId(a))? {
                     return Ok(Step::Next);
                 }
                 if parked.is_none() && b == 1 && self.try_interned_contains_method(NameId(a))? {
@@ -2776,12 +2782,18 @@ impl<'a> Vm<'a> {
         if self.depth() < 2 {
             return Ok(false);
         }
-        let needle = self.pop_operand().ok_or(CelErr::InternalError)?;
+        // Compile emits args then the receiver, so the receiver is on top.
         let container = self.pop_operand().ok_or(CelErr::InternalError)?;
+        let needle = self.pop_operand().ok_or(CelErr::InternalError)?;
         if let (Some(c), Some(n)) = (Self::leaf_of(&container), Self::leaf_of(&needle)) {
             let found = match unsafe { w_kind(c) } {
                 CelKind::List => Some(unsafe { list_contains(c, n) }),
                 CelKind::Map => Some(unsafe { map_contains_key(c, n) }),
+                CelKind::Str => match unsafe { crate::runtime::object::string_as_str(n) } {
+                    Some(needle) => unsafe { crate::runtime::object::string_as_str(c) }
+                        .map(|hay| hay.contains(needle)),
+                    None => Some(false),
+                },
                 _ => None,
             };
             if let Some(found) = found {
@@ -2789,9 +2801,77 @@ impl<'a> Vm<'a> {
                 return Ok(true);
             }
         }
-        self.push_operand(container);
         self.push_operand(needle);
+        self.push_operand(container);
         Ok(false)
+    }
+
+    /// `s.startsWith(p)` / `s.endsWith(p)` on interned strings.
+    fn try_interned_string_method(&mut self, name: NameId) -> CelResult<bool> {
+        let pred: fn(&str, &str) -> bool = match self.name(name.0)? {
+            "startsWith" => |hay, needle| hay.starts_with(needle),
+            "endsWith" => |hay, needle| hay.ends_with(needle),
+            _ => return Ok(false),
+        };
+        if self.depth() < 2 {
+            return Ok(false);
+        }
+        // Compile emits args then the receiver, so the receiver is on top.
+        let receiver = self.pop_operand().ok_or(CelErr::InternalError)?;
+        let needle = self.pop_operand().ok_or(CelErr::InternalError)?;
+        if let (Some(r), Some(n)) = (Self::leaf_of(&receiver), Self::leaf_of(&needle)) {
+            if let (Some(rs), Some(ns)) = (
+                unsafe { crate::runtime::object::string_as_str(r) },
+                unsafe { crate::runtime::object::string_as_str(n) },
+            ) {
+                self.push(Value::Bool(pred(rs, ns)));
+                return Ok(true);
+            }
+        }
+        self.push_operand(needle);
+        self.push_operand(receiver);
+        Ok(false)
+    }
+
+    /// `max` / `min` over interned scalars or one interned list.
+    fn try_interned_extremum(&mut self, name: NameId, n: usize) -> CelResult<bool> {
+        let keep_greater = match self.name(name.0)? {
+            "max" => true,
+            "min" => false,
+            _ => return Ok(false),
+        };
+        if n == 0 || self.depth() < n {
+            return Ok(false);
+        }
+        let args: Vec<Operand> = self.frame[self.frame.len() - n..].to_vec();
+        let refs: Option<Vec<CelRef>> = args.iter().map(Self::leaf_of).collect();
+        let Some(refs) = refs else {
+            return Ok(false);
+        };
+        let items = if refs.len() == 1 && unsafe { w_kind(refs[0]) } == CelKind::List {
+            let w = refs[0];
+            let len = unsafe { list_len(w) };
+            if len == 0 {
+                self.frame.truncate(self.frame.len() - n);
+                self.push_operand(Operand::Interned(new_null() as CelRef));
+                return Ok(true);
+            }
+            let mut items = Vec::with_capacity(len as usize);
+            let mut i = 0i64;
+            while i < len {
+                items.push(unsafe { list_get(w, i) }.ok_or(CelErr::InternalError)?);
+                i += 1;
+            }
+            items
+        } else {
+            refs
+        };
+        let Some(best) = interned_extremum(&items, keep_greater) else {
+            return Ok(false);
+        };
+        self.frame.truncate(self.frame.len() - n);
+        self.push_operand(Operand::Interned(best));
+        Ok(true)
     }
 
     fn call_global(&mut self, name: NameId, args: Vec<Value>) -> CelResult<Value> {
@@ -2888,6 +2968,28 @@ unsafe fn interned_list_indices(w: CelRef) -> CelRef {
         i += 1;
     }
     new_list(&keys) as CelRef
+}
+
+fn interned_extremum(items: &[CelRef], keep_greater: bool) -> Option<CelRef> {
+    let mut best = *items.first()?;
+    for &item in &items[1..] {
+        let cmp = unsafe {
+            if keep_greater {
+                cel_greater(best, item)
+            } else {
+                cel_less(best, item)
+            }
+        };
+        if cmp == ERROR_SENTINEL {
+            return None;
+        }
+        let keep =
+            unsafe { w_kind(cmp) == CelKind::Bool && (*cmp.cast::<W_BoolObject>()).boolval != 0 };
+        if !keep {
+            best = item;
+        }
+    }
+    Some(best)
 }
 
 fn interned_is_map_key(w: CelRef) -> bool {
@@ -3641,6 +3743,23 @@ mod tests {
             cel_eval_loop(&code, &ctx).expect("eval")
         };
         assert_eq!(sized_bytes, Value::Int(3));
+        assert_eq!(
+            cel_eval_loop(
+                &compile(&parse("'foobar'.startsWith('foo')")).expect("compile"),
+                &ctx
+            )
+            .expect("eval"),
+            Value::Bool(true)
+        );
+        let mut max_ctx = Context::default();
+        max_ctx.add_function("max", crate::functions::max);
+        let maxed = cel_eval_loop(&compile(&parse("max(1, 3, 2)")).expect("compile"), &max_ctx)
+            .expect("eval");
+        assert_eq!(maxed, Value::Int(3));
+        assert_eq!(
+            crate::runtime::convert::intern_leaf(&maxed),
+            Some(crate::runtime::object::new_int(3) as crate::runtime::object::CelRef)
+        );
     }
 
     /// A comprehension counter stored as an interned int stays on the table.
