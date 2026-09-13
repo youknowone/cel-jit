@@ -569,6 +569,53 @@ const _: () = {
     assert!(offset_of!(W_MapObject, ob_header) == 0);
 };
 
+/// Look up a string key on a map leaf.
+///
+/// # Safety
+///
+/// `w` is a live [`W_MapObject`].
+pub unsafe fn map_lookup_string(w: CelRef, field: &str) -> Option<CelRef> {
+    lookup_string_pairs(
+        (*w.cast::<W_MapObject>()).items,
+        (*w.cast::<W_MapObject>()).length,
+        field,
+    )
+}
+
+unsafe fn lookup_string_pairs(
+    items: *mut crate::runtime::object_array::CelItemsBlock,
+    length: i64,
+    field: &str,
+) -> Option<CelRef> {
+    let n = length as usize;
+    let base = crate::runtime::object_array::items_block_items_base(items);
+    if base.is_null() {
+        return None;
+    }
+    let mut i = 0;
+    while i < n {
+        let key = *base.add(2 * i);
+        if string_eq_str(key, field) {
+            return Some(*base.add(2 * i + 1));
+        }
+        i += 1;
+    }
+    None
+}
+
+unsafe fn string_eq_str(w: CelRef, field: &str) -> bool {
+    if w.is_null() || w_kind(w) != CelKind::Str {
+        return false;
+    }
+    let leaf = &*w.cast::<W_StringObject>();
+    let n = leaf.byte_len as usize;
+    let base = crate::runtime::object_array::bytes_base(leaf.chars);
+    if base.is_null() {
+        return field.is_empty();
+    }
+    std::slice::from_raw_parts(base, n) == field.as_bytes()
+}
+
 /// Box `pairs` as a CEL `map`.
 pub fn new_map(pairs: &[(CelRef, CelRef)]) -> *mut W_MapObject {
     let items = interleaved_pair_block(pairs);
@@ -617,6 +664,20 @@ pub static CEL_STRUCT_CLASS: CelClass = CelClass::new("struct", CelKind::Struct)
 const _: () = {
     assert!(offset_of!(W_StructObject, ob_header) == 0);
 };
+
+/// Look up a field on a struct leaf.
+///
+/// # Safety
+///
+/// `w` is a live [`W_StructObject`].
+#[cfg(feature = "structs")]
+pub unsafe fn struct_lookup_field(w: CelRef, field: &str) -> Option<CelRef> {
+    lookup_string_pairs(
+        (*w.cast::<W_StructObject>()).fields,
+        (*w.cast::<W_StructObject>()).length,
+        field,
+    )
+}
 
 /// Box a named struct with `fields` as name/value pairs.
 #[cfg(feature = "structs")]

@@ -1062,6 +1062,74 @@ impl<'a> Vm<'a> {
         self.park(exec)
     }
 
+    /// `true` if `w` is a map/struct and the field op was handled.
+    fn push_interned_field(&mut self, w: CelRef, field: &str, has: bool) -> CelResult<bool> {
+        match unsafe { w_kind(w) } {
+            CelKind::Map => {
+                let found = unsafe { crate::runtime::object::map_lookup_string(w, field) };
+                if has {
+                    self.push(Value::Bool(found.is_some()));
+                    return Ok(true);
+                }
+                match found {
+                    Some(v) => {
+                        self.push_operand(Operand::Interned(v));
+                        Ok(true)
+                    }
+                    None => Err(self.park(ExecutionError::NoSuchKey(std::sync::Arc::new(
+                        field.to_string(),
+                    )))),
+                }
+            }
+            #[cfg(feature = "structs")]
+            CelKind::Struct => {
+                let found = unsafe { crate::runtime::object::struct_lookup_field(w, field) };
+                if has {
+                    self.push(Value::Bool(found.is_some()));
+                    return Ok(true);
+                }
+                match found {
+                    Some(v) => {
+                        self.push_operand(Operand::Interned(v));
+                        Ok(true)
+                    }
+                    None => Err(self.park(ExecutionError::NoSuchKey(std::sync::Arc::new(
+                        field.to_string(),
+                    )))),
+                }
+            }
+            _ => Ok(false),
+        }
+    }
+
+    fn try_interned_index(&mut self, operand: &Operand, key: &Operand) -> CelResult<Option<Value>> {
+        let Some(w) = Self::leaf_of(operand) else {
+            return Ok(None);
+        };
+        if unsafe { w_kind(w) } != CelKind::List {
+            return Ok(None);
+        }
+        let index = match key {
+            Operand::Interned(k) if unsafe { w_kind(*k) } == CelKind::Int => unsafe {
+                (*(*k as *mut crate::runtime::object::W_IntObject)).intval
+            },
+            Operand::Value(Value::Int(i)) => *i,
+            Operand::Value(v) => match intern_leaf(v) {
+                Some(k) if unsafe { w_kind(k) } == CelKind::Int => unsafe {
+                    (*k.cast::<crate::runtime::object::W_IntObject>()).intval
+                },
+                _ => return Ok(None),
+            },
+            _ => return Ok(None),
+        };
+        match unsafe { crate::runtime::object::list_get(w, index) } {
+            Some(item) => unsafe { ref_to_value(item) }
+                .map(Some)
+                .map_err(|_| CelErr::InternalError),
+            None => Err(self.park(ExecutionError::IndexOutOfBounds(Value::Int(index)))),
+        }
+    }
+
     fn apply_cel_binop(
         &mut self,
         op: OpCode,
@@ -1514,35 +1582,76 @@ impl<'a> Vm<'a> {
 
             // -- selection ----------------------------------------------
             OpCode::GetField => {
-                let operand = self.pop()?;
+                let operand = self.pop_operand().ok_or(CelErr::InternalError)?;
                 let field = self.name(a)?;
-                let value = value_field(&operand, field).map_err(|e| self.park(e))?;
-                self.push(value);
+                if let Some(w) = Self::leaf_of(&operand) {
+                    if self.push_interned_field(w, field, false)? {
+                        // already pushed
+                    } else {
+                        let operand = self.finish(operand)?;
+                        let value = value_field(&operand, field).map_err(|e| self.park(e))?;
+                        self.push(value);
+                    }
+                } else {
+                    let operand = self.finish(operand)?;
+                    let value = value_field(&operand, field).map_err(|e| self.park(e))?;
+                    self.push(value);
+                }
             }
             OpCode::HasField => {
-                let operand = self.pop()?;
+                let operand = self.pop_operand().ok_or(CelErr::InternalError)?;
                 let field = self.name(a)?;
-                let value = has_field(&operand, field).map_err(|e| self.park(e))?;
-                self.push(value);
+                if let Some(w) = Self::leaf_of(&operand) {
+                    if self.push_interned_field(w, field, true)? {
+                        // already pushed
+                    } else {
+                        let operand = self.finish(operand)?;
+                        let value = has_field(&operand, field).map_err(|e| self.park(e))?;
+                        self.push(value);
+                    }
+                } else {
+                    let operand = self.finish(operand)?;
+                    let value = has_field(&operand, field).map_err(|e| self.park(e))?;
+                    self.push(value);
+                }
             }
             OpCode::Index | OpCode::OptIndex => {
-                let key = self.pop()?;
-                let operand = self.pop()?;
-                let value = self.index(operand, key, op == OpCode::OptIndex)?;
-                self.push(value);
+                let key = self.pop_operand().ok_or(CelErr::InternalError)?;
+                let operand = self.pop_operand().ok_or(CelErr::InternalError)?;
+                if let Some(value) = self.try_interned_index(&operand, &key)? {
+                    self.push(value);
+                } else {
+                    let key = self.finish(key)?;
+                    let operand = self.finish(operand)?;
+                    let value = self.index(operand, key, op == OpCode::OptIndex)?;
+                    self.push(value);
+                }
             }
             OpCode::GetFieldLocal | OpCode::HasFieldLocal => {
-                let read = {
+                let field = self.name(b)?;
+                if let Some(w) = self.local_leaf(a) {
+                    if self.push_interned_field(w, field, op == OpCode::HasFieldLocal)? {
+                        // already pushed
+                    } else {
+                        let operand = self.local_as_value(a).ok_or(CelErr::InternalError)?;
+                        let read = if op == OpCode::HasFieldLocal {
+                            has_field(&operand, field)
+                        } else {
+                            value_field(&operand, field)
+                        };
+                        let value = read.map_err(|e| self.park(e))?;
+                        self.push(value);
+                    }
+                } else {
                     let operand = self.local_as_value(a).ok_or(CelErr::InternalError)?;
-                    let field = self.name(b)?;
-                    if op == OpCode::HasFieldLocal {
+                    let read = if op == OpCode::HasFieldLocal {
                         has_field(&operand, field)
                     } else {
                         value_field(&operand, field)
-                    }
-                };
-                let value = read.map_err(|e| self.park(e))?;
-                self.push(value);
+                    };
+                    let value = read.map_err(|e| self.park(e))?;
+                    self.push(value);
+                }
             }
             // Held out of the dispatch loop's own body; see
             // `Vm::opt_select_arm`.
@@ -1796,16 +1905,28 @@ impl<'a> Vm<'a> {
                 self.append_to_list(value)?;
             }
             OpCode::GetFieldLocalAppend | OpCode::HasFieldLocalAppend => {
-                let read = {
+                let field = self.name(b)?;
+                let value = if let Some(w) = self.local_leaf(a) {
+                    if self.push_interned_field(w, field, op == OpCode::HasFieldLocalAppend)? {
+                        self.pop()?
+                    } else {
+                        let operand = self.local_as_value(a).ok_or(CelErr::InternalError)?;
+                        let read = if op == OpCode::HasFieldLocalAppend {
+                            has_field(&operand, field)
+                        } else {
+                            value_field(&operand, field)
+                        };
+                        read.map_err(|e| self.park(e))?
+                    }
+                } else {
                     let operand = self.local_as_value(a).ok_or(CelErr::InternalError)?;
-                    let field = self.name(b)?;
-                    if op == OpCode::HasFieldLocalAppend {
+                    let read = if op == OpCode::HasFieldLocalAppend {
                         has_field(&operand, field)
                     } else {
                         value_field(&operand, field)
-                    }
+                    };
+                    read.map_err(|e| self.park(e))?
                 };
-                let value = read.map_err(|e| self.park(e))?;
                 self.append_to_list(value)?;
             }
             OpCode::AddLocalConstAppend
@@ -3088,6 +3209,30 @@ mod tests {
         let ctx = Context::default();
         let value = cel_eval_loop(&code, &ctx).expect("eval");
         assert_eq!(value, Value::Bool(true));
+    }
+
+    /// A comprehension counter stored as an interned int stays on the table.
+    #[test]
+    fn interned_map_field_and_list_index_through_the_vm() {
+        let ctx = Context::default();
+        let field = {
+            let expr = parse("{'a': 7}.a");
+            let code = compile(&expr).expect("compile");
+            cel_eval_loop(&code, &ctx).expect("eval")
+        };
+        assert_eq!(field, Value::Int(7));
+        let missing = {
+            let expr = parse("has({'a': 7}.b)");
+            let code = compile(&expr).expect("compile");
+            cel_eval_loop(&code, &ctx).expect("eval")
+        };
+        assert_eq!(missing, Value::Bool(false));
+        let item = {
+            let expr = parse("[10, 20, 30][1]");
+            let code = compile(&expr).expect("compile");
+            cel_eval_loop(&code, &ctx).expect("eval")
+        };
+        assert_eq!(item, Value::Int(20));
     }
 
     /// A comprehension counter stored as an interned int stays on the table.
