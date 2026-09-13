@@ -44,8 +44,13 @@ use crate::runtime::binop::{
 use crate::runtime::convert::{intern_leaf, ref_to_value};
 use crate::runtime::error::{take_error, CelErrCode, ERROR_SENTINEL};
 use crate::runtime::object::{
-    list_get, list_len, map_len, new_int, new_list, new_null, new_optional, new_optional_none,
-    string_byte_len, w_kind, CelKind, CelRef, W_BoolObject, W_IntObject,
+    list_get, list_len, map_len, new_bytes, new_double, new_int, new_list, new_null, new_optional,
+    new_optional_none, new_string, new_type, new_uint, string_as_str, string_byte_len, w_kind,
+    w_type, CelKind, CelRef, W_BoolObject, W_DoubleObject, W_IntObject, W_UIntObject,
+};
+use crate::runtime::optional::{
+    cel_optional_has_value, cel_optional_none, cel_optional_of, cel_optional_of_non_zero_value,
+    cel_optional_or, cel_optional_or_value, cel_optional_value,
 };
 use crate::{ExecutionError, Value};
 
@@ -1068,7 +1073,9 @@ impl<'a> Vm<'a> {
                 }
             }
             CelErrCode::NoSuchOverload => ExecutionError::NoSuchOverload,
-            CelErrCode::NoneDereference => ExecutionError::NoSuchOverload,
+            CelErrCode::NoneDereference => {
+                ExecutionError::function_error(err.op, "optional.none() dereference")
+            }
         };
         let _ = op;
         self.park(exec)
@@ -2272,6 +2279,9 @@ impl<'a> Vm<'a> {
                 if self.try_interned_extremum(NameId(a), b as usize)? {
                     return Ok(Step::Next);
                 }
+                if b == 1 && self.try_interned_unary_host(NameId(a), op)? {
+                    return Ok(Step::Next);
+                }
                 let args = self.pop_n(b as usize)?;
                 let value = self.call_global(NameId(a), args)?;
                 self.push(value);
@@ -2283,10 +2293,18 @@ impl<'a> Vm<'a> {
                 if parked.is_none() && b == 0 && self.try_interned_size_on_top(NameId(a))? {
                     return Ok(Step::Next);
                 }
+                if parked.is_none() && b == 0 && self.try_interned_unary_host(NameId(a), op)? {
+                    return Ok(Step::Next);
+                }
                 if parked.is_none() && b == 1 && self.try_interned_string_method(NameId(a))? {
                     return Ok(Step::Next);
                 }
                 if parked.is_none() && b == 1 && self.try_interned_contains_method(NameId(a))? {
+                    return Ok(Step::Next);
+                }
+                if parked.is_none()
+                    && self.try_interned_optional_method(NameId(a), b as usize, op)?
+                {
                     return Ok(Step::Next);
                 }
                 let target = self.pop()?;
@@ -2301,6 +2319,9 @@ impl<'a> Vm<'a> {
                 self.push(value);
             }
             OpCode::CallQualified => {
+                if let Some(step) = self.try_interned_qualified(NameId(a), b as usize, c, op)? {
+                    return Ok(step);
+                }
                 let args = self.pop_n_for_member(b as usize)?;
                 // A miss parks the arguments instead of re-pushing them, so
                 // the stack the receiver path falls through to holds the
@@ -2874,6 +2895,128 @@ impl<'a> Vm<'a> {
         Ok(true)
     }
 
+    /// `type` / `int` / `uint` / `double` / `string` / `bytes` / `dyn` on one
+    /// interned operand, and the chrono constructors when the feature is on.
+    ///
+    /// Hosted as both [`OpCode::CallHost`] (`int(1.5)`) and
+    /// [`OpCode::CallMethod`] (`(1.5).int()`): the receiver sits on top in
+    /// both spellings, so the same pop works.
+    fn try_interned_unary_host(&mut self, name: NameId, op: OpCode) -> CelResult<bool> {
+        let Some(operand) = self.top() else {
+            return Ok(false);
+        };
+        let Some(w) = Self::leaf_of(operand) else {
+            return Ok(false);
+        };
+        match interned_unary_host(self.name(name.0)?, w) {
+            Ok(Some(out)) => {
+                let _ = self.pop_operand();
+                self.push_interned(out, op)?;
+                Ok(true)
+            }
+            Ok(None) => Ok(false),
+            Err(e) => Err(self.park(e)),
+        }
+    }
+
+    /// `optional.of` / `optional.none` / `optional.ofNonZeroValue`, and a
+    /// namespaced `math.max` / `math.min` over interned scalars.
+    ///
+    /// A hit jumps past the [`OpCode::CallMethod`] the compiler emitted for
+    /// the receiver fallback.
+    fn try_interned_qualified(
+        &mut self,
+        name: NameId,
+        n: usize,
+        skip: u32,
+        op: OpCode,
+    ) -> CelResult<Option<Step>> {
+        match self.name(name.0)? {
+            "optional.none" if n == 0 => {
+                self.push_operand(Operand::Interned(cel_optional_none()));
+                Ok(Some(Step::Jump(skip)))
+            }
+            "optional.of" if n == 1 => self.try_interned_optional_ctor(cel_optional_of, skip, op),
+            "optional.ofNonZeroValue" if n == 1 => {
+                self.try_interned_optional_ctor(cel_optional_of_non_zero_value, skip, op)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn try_interned_optional_ctor(
+        &mut self,
+        ctor: unsafe fn(CelRef) -> CelRef,
+        skip: u32,
+        op: OpCode,
+    ) -> CelResult<Option<Step>> {
+        let Some(operand) = self.top() else {
+            return Ok(None);
+        };
+        let Some(w) = Self::leaf_of(operand) else {
+            return Ok(None);
+        };
+        let _ = self.pop_operand();
+        self.push_interned(unsafe { ctor(w) }, op)?;
+        Ok(Some(Step::Jump(skip)))
+    }
+
+    /// `opt.value()` / `hasValue()` / `or` / `orValue` on interned optionals.
+    fn try_interned_optional_method(
+        &mut self,
+        name: NameId,
+        n: usize,
+        op: OpCode,
+    ) -> CelResult<bool> {
+        match self.name(name.0)? {
+            "value" if n == 0 => self.try_interned_optional_unary(cel_optional_value, op),
+            "hasValue" if n == 0 => self.try_interned_optional_unary(cel_optional_has_value, op),
+            "or" if n == 1 => self.try_interned_optional_binary(cel_optional_or, op),
+            "orValue" if n == 1 => self.try_interned_optional_binary(cel_optional_or_value, op),
+            _ => Ok(false),
+        }
+    }
+
+    fn try_interned_optional_unary(
+        &mut self,
+        call: unsafe fn(CelRef) -> CelRef,
+        op: OpCode,
+    ) -> CelResult<bool> {
+        let Some(operand) = self.top() else {
+            return Ok(false);
+        };
+        let Some(w) = Self::leaf_of(operand) else {
+            return Ok(false);
+        };
+        if unsafe { w_kind(w) } != CelKind::Optional {
+            return Ok(false);
+        }
+        let _ = self.pop_operand();
+        self.push_interned(unsafe { call(w) }, op)?;
+        Ok(true)
+    }
+
+    fn try_interned_optional_binary(
+        &mut self,
+        call: unsafe fn(CelRef, CelRef) -> CelRef,
+        op: OpCode,
+    ) -> CelResult<bool> {
+        if self.depth() < 2 {
+            return Ok(false);
+        }
+        let receiver = self.pop_operand().ok_or(CelErr::InternalError)?;
+        let other = self.pop_operand().ok_or(CelErr::InternalError)?;
+        if let (Some(r), Some(o)) = (Self::leaf_of(&receiver), Self::leaf_of(&other)) {
+            if unsafe { w_kind(r) } == CelKind::Optional {
+                self.push_interned(unsafe { call(r, o) }, op)?;
+                return Ok(true);
+            }
+        }
+        self.push_operand(other);
+        self.push_operand(receiver);
+        Ok(false)
+    }
+
     fn call_global(&mut self, name: NameId, args: Vec<Value>) -> CelResult<Value> {
         let func_name = self.name(name.0)?;
         if let Some(op) = self.ctx.env().find_overload(func_name, &args) {
@@ -2937,6 +3080,188 @@ enum OptView {
     /// `optional.none`.
     Empty,
     Present(Value),
+}
+
+fn interned_unary_host(name: &str, w: CelRef) -> Result<Option<CelRef>, ExecutionError> {
+    match name {
+        "dyn" => Ok(Some(w)),
+        "type" => Ok(Some(unsafe { new_type(&*w_type(w)) as CelRef })),
+        "int" => interned_to_int(w),
+        "uint" => interned_to_uint(w),
+        "double" => interned_to_double(w),
+        "string" => interned_to_string(w),
+        "bytes" => interned_to_bytes(w),
+        #[cfg(feature = "chrono")]
+        "duration" => interned_to_duration(w),
+        #[cfg(feature = "chrono")]
+        "timestamp" => interned_to_timestamp(w),
+        _ => Ok(None),
+    }
+}
+
+fn interned_to_int(w: CelRef) -> Result<Option<CelRef>, ExecutionError> {
+    match unsafe { w_kind(w) } {
+        CelKind::Int => Ok(Some(w)),
+        CelKind::UInt => Ok(Some(
+            new_int(unsafe { (*w.cast::<W_UIntObject>()).uintval } as i64) as CelRef,
+        )),
+        CelKind::Double => Ok(Some(
+            new_int(unsafe { (*w.cast::<W_DoubleObject>()).floatval } as i64) as CelRef,
+        )),
+        CelKind::Str => match unsafe { string_as_str(w) } {
+            Some(s) => match s.parse::<i64>() {
+                Ok(i) => Ok(Some(new_int(i) as CelRef)),
+                Err(e) => Err(ExecutionError::FunctionError {
+                    function: "int".to_owned(),
+                    message: format!("string parse error: {e}"),
+                }),
+            },
+            None => Ok(None),
+        },
+        _ => Ok(None),
+    }
+}
+
+fn interned_to_uint(w: CelRef) -> Result<Option<CelRef>, ExecutionError> {
+    match unsafe { w_kind(w) } {
+        CelKind::UInt => Ok(Some(w)),
+        CelKind::Int => Ok(Some(
+            new_uint(unsafe { (*w.cast::<W_IntObject>()).intval } as u64) as CelRef,
+        )),
+        CelKind::Double => Ok(Some(
+            new_uint(unsafe { (*w.cast::<W_DoubleObject>()).floatval } as u64) as CelRef,
+        )),
+        CelKind::Str => match unsafe { string_as_str(w) } {
+            Some(s) => match s.parse::<u64>() {
+                Ok(u) => Ok(Some(new_uint(u) as CelRef)),
+                Err(e) => Err(ExecutionError::FunctionError {
+                    function: "int".to_owned(),
+                    message: format!("string parse error: {e}"),
+                }),
+            },
+            None => Ok(None),
+        },
+        _ => Ok(None),
+    }
+}
+
+fn interned_to_double(w: CelRef) -> Result<Option<CelRef>, ExecutionError> {
+    match unsafe { w_kind(w) } {
+        CelKind::Double => Ok(Some(w)),
+        CelKind::Int => Ok(Some(
+            new_double(unsafe { (*w.cast::<W_IntObject>()).intval } as f64) as CelRef,
+        )),
+        CelKind::UInt => Ok(Some(
+            new_double(unsafe { (*w.cast::<W_UIntObject>()).uintval } as f64) as CelRef,
+        )),
+        CelKind::Str => match unsafe { string_as_str(w) } {
+            Some(s) => match s.parse::<f64>() {
+                Ok(f) => Ok(Some(new_double(f) as CelRef)),
+                Err(e) => Err(ExecutionError::FunctionError {
+                    function: "double".to_owned(),
+                    message: format!("string parse error: {e}"),
+                }),
+            },
+            None => Ok(None),
+        },
+        _ => Ok(None),
+    }
+}
+
+fn interned_to_string(w: CelRef) -> Result<Option<CelRef>, ExecutionError> {
+    match unsafe { w_kind(w) } {
+        CelKind::Str => Ok(Some(w)),
+        CelKind::Int => Ok(Some(new_string(
+            &unsafe { (*w.cast::<W_IntObject>()).intval }.to_string(),
+        ) as CelRef)),
+        CelKind::UInt => Ok(Some(new_string(
+            &unsafe { (*w.cast::<W_UIntObject>()).uintval }.to_string(),
+        ) as CelRef)),
+        CelKind::Double => Ok(Some(new_string(
+            &unsafe { (*w.cast::<W_DoubleObject>()).floatval }.to_string(),
+        ) as CelRef)),
+        CelKind::Bytes => {
+            let n = unsafe { crate::runtime::object::bytes_len(w) } as usize;
+            let leaf = unsafe { &*w.cast::<crate::runtime::object::W_BytesObject>() };
+            let base = unsafe { crate::runtime::object_array::bytes_base(leaf.data) };
+            if base.is_null() && n != 0 {
+                return Ok(None);
+            }
+            let bytes = unsafe { std::slice::from_raw_parts(base, n) };
+            Ok(Some(
+                new_string(&String::from_utf8_lossy(bytes).into_owned()) as CelRef,
+            ))
+        }
+        #[cfg(feature = "chrono")]
+        CelKind::Timestamp => match unsafe { ref_to_value(w) } {
+            Ok(Value::Timestamp(ts)) => Ok(Some(new_string(&ts.to_rfc3339()) as CelRef)),
+            _ => Ok(None),
+        },
+        #[cfg(feature = "chrono")]
+        CelKind::Duration => match unsafe { ref_to_value(w) } {
+            Ok(Value::Duration(d)) => Ok(Some(
+                new_string(&crate::duration::format_duration(&d)) as CelRef
+            )),
+            _ => Ok(None),
+        },
+        _ => Ok(None),
+    }
+}
+
+fn interned_to_bytes(w: CelRef) -> Result<Option<CelRef>, ExecutionError> {
+    match unsafe { w_kind(w) } {
+        CelKind::Bytes => Ok(Some(w)),
+        CelKind::Str => match unsafe { string_as_str(w) } {
+            Some(s) => Ok(Some(new_bytes(s.as_bytes()) as CelRef)),
+            None => Ok(None),
+        },
+        _ => Ok(None),
+    }
+}
+
+#[cfg(feature = "chrono")]
+fn interned_to_duration(w: CelRef) -> Result<Option<CelRef>, ExecutionError> {
+    match unsafe { w_kind(w) } {
+        CelKind::Duration => Ok(Some(w)),
+        CelKind::Str => {
+            let Some(s) = (unsafe { string_as_str(w) }) else {
+                return Ok(None);
+            };
+            match crate::duration::parse_duration(s) {
+                Ok((_, parsed)) => match parsed.num_nanoseconds() {
+                    Some(nanos) => Ok(Some(crate::runtime::object::new_duration(nanos) as CelRef)),
+                    None => Ok(None),
+                },
+                Err(e) => Err(ExecutionError::function_error("duration", e.to_string())),
+            }
+        }
+        _ => Ok(None),
+    }
+}
+
+#[cfg(feature = "chrono")]
+fn interned_to_timestamp(w: CelRef) -> Result<Option<CelRef>, ExecutionError> {
+    match unsafe { w_kind(w) } {
+        CelKind::Timestamp => Ok(Some(w)),
+        CelKind::Str => {
+            let Some(s) = (unsafe { string_as_str(w) }) else {
+                return Ok(None);
+            };
+            match chrono::DateTime::parse_from_rfc3339(s) {
+                Ok(parsed) => match parsed.timestamp_nanos_opt() {
+                    // A date outside the i64-nanos window still has a public
+                    // `Value::Timestamp`; the class-family leaf cannot hold it.
+                    Some(nanos) => Ok(Some(crate::runtime::object::new_timestamp(
+                        nanos,
+                        i64::from(parsed.offset().local_minus_utc()),
+                    ) as CelRef)),
+                    None => Ok(None),
+                },
+                Err(e) => Err(ExecutionError::function_error("timestamp", e.to_string())),
+            }
+        }
+        _ => Ok(None),
+    }
 }
 
 fn interned_int(operand: &Operand) -> Option<i64> {
@@ -3772,6 +4097,40 @@ mod tests {
             cel_eval_loop(&code, &ctx).expect("eval")
         };
         assert_eq!(opt, Value::Bool(true));
+        let unwrapped = cel_eval_loop(
+            &compile(&parse("optional.of(3).value()")).expect("compile"),
+            &ctx,
+        )
+        .expect("eval");
+        assert_eq!(unwrapped, Value::Int(3));
+        assert_eq!(
+            crate::runtime::convert::intern_leaf(&unwrapped),
+            Some(crate::runtime::object::new_int(3) as crate::runtime::object::CelRef)
+        );
+        assert_eq!(
+            cel_eval_loop(
+                &compile(&parse("optional.none().hasValue()")).expect("compile"),
+                &ctx
+            )
+            .expect("eval"),
+            Value::Bool(false)
+        );
+        assert_eq!(
+            cel_eval_loop(
+                &compile(&parse("optional.ofNonZeroValue(0).hasValue()")).expect("compile"),
+                &ctx
+            )
+            .expect("eval"),
+            Value::Bool(false)
+        );
+        assert_eq!(
+            cel_eval_loop(
+                &compile(&parse("optional.none().orValue(9)")).expect("compile"),
+                &ctx
+            )
+            .expect("eval"),
+            Value::Int(9)
+        );
         #[cfg(feature = "chrono")]
         {
             let dur = {
@@ -3782,6 +4141,39 @@ mod tests {
             assert_eq!(dur, Value::Duration(chrono::Duration::seconds(3)));
             assert!(crate::runtime::convert::intern_leaf(&dur).is_some());
         }
+    }
+
+    #[test]
+    fn interned_type_and_conversions_through_the_vm() {
+        let ctx = Context::default();
+        let ty = cel_eval_loop(&compile(&parse("type(1)")).expect("compile"), &ctx).expect("eval");
+        assert_eq!(
+            ty,
+            cel_eval_loop(&compile(&parse("type(2)")).expect("compile"), &ctx).expect("eval")
+        );
+        assert!(crate::runtime::convert::intern_leaf(&ty).is_some());
+        assert_eq!(
+            cel_eval_loop(
+                &compile(&parse("type(type(1)) == type(string)")).expect("compile"),
+                &ctx
+            )
+            .expect("eval"),
+            Value::Bool(true)
+        );
+        let as_int =
+            cel_eval_loop(&compile(&parse("int(1.9)")).expect("compile"), &ctx).expect("eval");
+        assert_eq!(as_int, Value::Int(1));
+        assert_eq!(
+            crate::runtime::convert::intern_leaf(&as_int),
+            Some(crate::runtime::object::new_int(1) as crate::runtime::object::CelRef)
+        );
+        let as_string =
+            cel_eval_loop(&compile(&parse("string(7)")).expect("compile"), &ctx).expect("eval");
+        assert_eq!(as_string, Value::String(Arc::new("7".into())));
+        assert!(crate::runtime::convert::intern_leaf(&as_string).is_some());
+        let as_bytes =
+            cel_eval_loop(&compile(&parse("bytes('ab')")).expect("compile"), &ctx).expect("eval");
+        assert_eq!(as_bytes, Value::Bytes(Arc::new(b"ab".to_vec())));
     }
 
     /// A comprehension counter stored as an interned int stays on the table.

@@ -28,6 +28,11 @@ use crate::ExecutionError;
 pub struct TypeValue(Type);
 
 impl TypeValue {
+    /// Wrap a CEL type so it can sit on the public value boundary.
+    pub(crate) fn new(denoted: Type) -> Self {
+        TypeValue(denoted)
+    }
+
     /// The type this value denotes.
     pub fn cel_type(&self) -> &Type {
         &self.0

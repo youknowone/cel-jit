@@ -29,9 +29,11 @@
 
 use super::error::{raise, CelErrCode, ERROR_SENTINEL};
 use super::object::{
-    new_bool, new_optional, new_optional_none, payload, w_type, CelClass, CelRef, W_BoolObject,
-    W_DoubleObject, W_DurationObject, W_IntObject, W_OptionalObject, W_UIntObject, CEL_BOOL_CLASS,
-    CEL_DOUBLE_CLASS, CEL_DURATION_CLASS, CEL_INT_CLASS, CEL_NULL_CLASS, CEL_OPTIONAL_CLASS,
+    bytes_len, list_len, map_len, new_bool, new_optional, new_optional_none, payload,
+    string_byte_len, w_type, CelClass, CelRef, W_BoolObject, W_DoubleObject, W_DurationObject,
+    W_IntObject, W_OptionalObject, W_TimestampObject, W_UIntObject, CEL_BOOL_CLASS,
+    CEL_BYTES_CLASS, CEL_DOUBLE_CLASS, CEL_DURATION_CLASS, CEL_INT_CLASS, CEL_LIST_CLASS,
+    CEL_MAP_CLASS, CEL_NULL_CLASS, CEL_OPTIONAL_CLASS, CEL_STRING_CLASS, CEL_TIMESTAMP_CLASS,
     CEL_UINT_CLASS,
 };
 
@@ -80,12 +82,9 @@ pub unsafe fn cel_optional_of_non_zero_value(v: CelRef) -> CelRef {
 
 /// CEL's zero test, as `optional.ofNonZeroValue` reads it.
 ///
-/// Mirrors `Value::is_zero` for every leaf the family has. The cases that file
-/// answers on emptiness — string, bytes, list, map — are not reachable here
-/// because those leaves do not exist yet; when they land they belong in this
-/// chain, not in a caller.
-///
-/// `timestamp` and `type` fall through to false, as they do there.
+/// Mirrors `common/types/optional.rs` `is_zero_value`, not [`Value::is_zero`]:
+/// an empty string/bytes/list/map is zero, and a timestamp at the epoch is
+/// zero. A type value has no zero and falls through to false.
 ///
 /// # Safety
 ///
@@ -106,6 +105,25 @@ unsafe fn is_zero(v: CelRef) -> bool {
     }
     if t == (&CEL_DURATION_CLASS as *const CelClass) {
         return payload!(v, W_DurationObject, nanos) == 0;
+    }
+    if t == (&CEL_TIMESTAMP_CLASS as *const CelClass) {
+        return payload!(v, W_TimestampObject, nanos) == 0;
+    }
+    if t == (&CEL_STRING_CLASS as *const CelClass) {
+        return string_byte_len(v) == 0;
+    }
+    if t == (&CEL_BYTES_CLASS as *const CelClass) {
+        return bytes_len(v) == 0;
+    }
+    if t == (&CEL_LIST_CLASS as *const CelClass) {
+        return list_len(v) == 0;
+    }
+    if t == (&CEL_MAP_CLASS as *const CelClass) {
+        return map_len(v) == 0;
+    }
+    #[cfg(feature = "structs")]
+    if t == (&super::object::CEL_STRUCT_CLASS as *const CelClass) {
+        return (*v.cast::<super::object::W_StructObject>()).length == 0;
     }
     t == (&CEL_NULL_CLASS as *const CelClass)
 }
@@ -223,13 +241,17 @@ mod tests {
     fn of_non_zero_value_folds_the_zero_of_each_leaf() {
         unsafe {
             assert_clean();
-            let zeros: [CelRef; 6] = [
+            let zeros: [CelRef; 10] = [
                 new_int(0) as CelRef,
                 new_uint(0) as CelRef,
                 new_double(0.0) as CelRef,
                 new_bool(false) as CelRef,
                 new_duration(0) as CelRef,
+                new_timestamp(0, 0) as CelRef,
                 new_null() as CelRef,
+                crate::runtime::object::new_string("") as CelRef,
+                crate::runtime::object::new_bytes(b"") as CelRef,
+                crate::runtime::object::new_list(&[]) as CelRef,
             ];
             for z in zeros {
                 let opt = cel_optional_of_non_zero_value(z);
@@ -239,15 +261,12 @@ mod tests {
                 );
             }
 
-            let nonzeros: [CelRef; 6] = [
+            let nonzeros: [CelRef; 5] = [
                 new_int(1) as CelRef,
                 new_uint(1) as CelRef,
                 new_double(0.5) as CelRef,
                 new_bool(true) as CelRef,
                 new_duration(1) as CelRef,
-                // A timestamp at the epoch is NOT zero-valued, matching the
-                // walker's fall-through.
-                new_timestamp(0, 0) as CelRef,
             ];
             for v in nonzeros {
                 let opt = cel_optional_of_non_zero_value(v);

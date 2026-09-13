@@ -12,13 +12,17 @@ use std::sync::Arc;
 
 use super::object::{
     new_bool, new_bytes, new_double, new_int, new_list, new_map, new_null, new_optional,
-    new_optional_none, new_string, new_uint, w_kind, w_type, CelKind, CelRef, W_BoolObject,
-    W_BytesObject, W_DoubleObject, W_IntObject, W_ListObject, W_MapObject, W_OptionalObject,
-    W_StringObject, W_UIntObject, CEL_BOOL_CLASS, CEL_BYTES_CLASS, CEL_DOUBLE_CLASS, CEL_INT_CLASS,
-    CEL_LIST_CLASS, CEL_MAP_CLASS, CEL_NULL_CLASS, CEL_OPTIONAL_CLASS, CEL_STRING_CLASS,
-    CEL_UINT_CLASS,
+    new_optional_none, new_string, new_type, new_uint, w_kind, w_type, CelClass, CelKind, CelRef,
+    W_BoolObject, W_BytesObject, W_DoubleObject, W_IntObject, W_ListObject, W_MapObject,
+    W_OptionalObject, W_StringObject, W_TypeObject, W_UIntObject, CEL_BOOL_CLASS, CEL_BYTES_CLASS,
+    CEL_DOUBLE_CLASS, CEL_INT_CLASS, CEL_LIST_CLASS, CEL_MAP_CLASS, CEL_NULL_CLASS,
+    CEL_OPTIONAL_CLASS, CEL_STRING_CLASS, CEL_TYPE_CLASS, CEL_UINT_CLASS,
 };
 use super::object_array::{bytes_base, items_block_items_base};
+use crate::common::types::{
+    Kind, Type, TypeValue, BOOL_TYPE, BYTES_TYPE, DOUBLE_TYPE, INT_TYPE, LIST_TYPE, MAP_TYPE,
+    NULL_TYPE, OPTIONAL_TYPE, STRING_TYPE, TYPE_TYPE, UINT_TYPE,
+};
 use crate::objects::{Key, ListRef, Map, MapStorage, OptionalValue};
 use crate::Value;
 
@@ -32,6 +36,8 @@ use super::object::{
     new_duration, new_timestamp, W_DurationObject, W_TimestampObject, CEL_DURATION_CLASS,
     CEL_TIMESTAMP_CLASS,
 };
+#[cfg(feature = "chrono")]
+use crate::common::types::{DURATION_TYPE, TIMESTAMP_TYPE};
 
 /// Why a value could not cross the boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,6 +66,10 @@ pub fn intern_leaf(v: &Value) -> Option<CelRef> {
         Value::Opaque(opaque) if opaque.downcast_ref::<OptionalValue>().is_some() => {
             value_to_ref(v).ok()
         }
+        Value::Opaque(opaque) => opaque
+            .downcast_ref::<TypeValue>()
+            .and_then(type_class)
+            .map(|cls| new_type(cls) as CelRef),
         #[cfg(feature = "chrono")]
         Value::Duration(_) | Value::Timestamp(_) => value_to_ref(v).ok(),
         #[cfg(feature = "structs")]
@@ -97,13 +107,18 @@ pub fn value_to_ref(v: &Value) -> Result<CelRef, ConvertError> {
             Ok(new_struct(name, &pairs) as CelRef)
         }
         Value::Opaque(opaque) => {
-            let Some(opt) = opaque.downcast_ref::<OptionalValue>() else {
-                return Err(ConvertError::Unsupported("opaque"));
-            };
-            match opt.value() {
-                None => Ok(new_optional_none() as CelRef),
-                Some(inner) => Ok(new_optional(value_to_ref(inner)?) as CelRef),
+            if let Some(opt) = opaque.downcast_ref::<OptionalValue>() {
+                return match opt.value() {
+                    None => Ok(new_optional_none() as CelRef),
+                    Some(inner) => Ok(new_optional(value_to_ref(inner)?) as CelRef),
+                };
             }
+            if let Some(tv) = opaque.downcast_ref::<TypeValue>() {
+                return type_class(tv)
+                    .map(|cls| new_type(cls) as CelRef)
+                    .ok_or(ConvertError::Unsupported("type"));
+            }
+            Err(ConvertError::Unsupported("opaque"))
         }
         #[cfg(feature = "chrono")]
         Value::Duration(d) => {
@@ -215,6 +230,11 @@ pub unsafe fn ref_to_value(w: CelRef) -> Result<Value, ConvertError> {
             };
             Ok(Value::Opaque(Arc::new(opt)))
         }
+        CelKind::Type if class == &CEL_TYPE_CLASS => {
+            let denoted = unsafe { (*w.cast::<W_TypeObject>()).cls };
+            let ty = type_from_class(denoted).ok_or(ConvertError::Unsupported("type"))?;
+            Ok(Value::Opaque(Arc::new(TypeValue::new(ty))))
+        }
         #[cfg(feature = "chrono")]
         CelKind::Duration if class == &CEL_DURATION_CLASS => {
             let nanos = unsafe { (*w.cast::<W_DurationObject>()).nanos };
@@ -230,6 +250,72 @@ pub unsafe fn ref_to_value(w: CelRef) -> Result<Value, ConvertError> {
         }
         _ => Err(ConvertError::Unsupported("class")),
     }
+}
+
+fn type_class(tv: &TypeValue) -> Option<&'static CelClass> {
+    match tv.cel_type().kind() {
+        Kind::Int => Some(&CEL_INT_CLASS),
+        Kind::UInt => Some(&CEL_UINT_CLASS),
+        Kind::Double => Some(&CEL_DOUBLE_CLASS),
+        Kind::Boolean => Some(&CEL_BOOL_CLASS),
+        Kind::String => Some(&CEL_STRING_CLASS),
+        Kind::Bytes => Some(&CEL_BYTES_CLASS),
+        Kind::NullType => Some(&CEL_NULL_CLASS),
+        Kind::List => Some(&CEL_LIST_CLASS),
+        Kind::Map => Some(&CEL_MAP_CLASS),
+        Kind::Type => Some(&CEL_TYPE_CLASS),
+        Kind::Opaque if tv.name() == "optional_type" => Some(&CEL_OPTIONAL_CLASS),
+        #[cfg(feature = "chrono")]
+        Kind::Duration => Some(&CEL_DURATION_CLASS),
+        #[cfg(feature = "chrono")]
+        Kind::Timestamp => Some(&CEL_TIMESTAMP_CLASS),
+        _ => None,
+    }
+}
+
+fn type_from_class(cls: *const CelClass) -> Option<Type> {
+    if cls == (&CEL_INT_CLASS as *const CelClass) {
+        return Some(INT_TYPE.to_owned());
+    }
+    if cls == (&CEL_UINT_CLASS as *const CelClass) {
+        return Some(UINT_TYPE.to_owned());
+    }
+    if cls == (&CEL_DOUBLE_CLASS as *const CelClass) {
+        return Some(DOUBLE_TYPE.to_owned());
+    }
+    if cls == (&CEL_BOOL_CLASS as *const CelClass) {
+        return Some(BOOL_TYPE.to_owned());
+    }
+    if cls == (&CEL_STRING_CLASS as *const CelClass) {
+        return Some(STRING_TYPE.to_owned());
+    }
+    if cls == (&CEL_BYTES_CLASS as *const CelClass) {
+        return Some(BYTES_TYPE.to_owned());
+    }
+    if cls == (&CEL_NULL_CLASS as *const CelClass) {
+        return Some(NULL_TYPE.to_owned());
+    }
+    if cls == (&CEL_LIST_CLASS as *const CelClass) {
+        return Some(LIST_TYPE.to_owned());
+    }
+    if cls == (&CEL_MAP_CLASS as *const CelClass) {
+        return Some(MAP_TYPE.to_owned());
+    }
+    if cls == (&CEL_TYPE_CLASS as *const CelClass) {
+        return Some(TYPE_TYPE.to_owned());
+    }
+    if cls == (&CEL_OPTIONAL_CLASS as *const CelClass) {
+        return Some(OPTIONAL_TYPE.to_owned());
+    }
+    #[cfg(feature = "chrono")]
+    if cls == (&CEL_DURATION_CLASS as *const CelClass) {
+        return Some(DURATION_TYPE.to_owned());
+    }
+    #[cfg(feature = "chrono")]
+    if cls == (&CEL_TIMESTAMP_CLASS as *const CelClass) {
+        return Some(TIMESTAMP_TYPE.to_owned());
+    }
+    None
 }
 
 fn key_to_ref(k: &Key) -> CelRef {
@@ -350,6 +436,10 @@ mod tests {
         );
         let none = Value::Opaque(Arc::new(OptionalValue::none()));
         assert!(intern_leaf(&none).is_some());
+        let int_ty = Value::Opaque(Arc::new(TypeValue::new(INT_TYPE.to_owned())));
+        let interned_ty = intern_leaf(&int_ty).expect("type intern");
+        assert_eq!(unsafe { w_kind(interned_ty) }, CelKind::Type);
+        assert_eq!(roundtrip(int_ty.clone()), int_ty);
         let some = Value::Opaque(Arc::new(OptionalValue::of(Value::Int(4))));
         assert!(intern_leaf(&some).is_some());
         #[cfg(feature = "chrono")]
