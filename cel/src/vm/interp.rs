@@ -429,6 +429,8 @@ enum Operand {
     /// reference until `finish` gives it away -- so `Arc::get_mut` answers
     /// every insert; see [`Vm::map_mut`].
     Map(Arc<HashMap<Key, Value>>),
+    /// A map being built of interned keys and values. Closed as `new_map`.
+    MapRefs(Vec<(CelRef, CelRef)>),
     /// The `names` index of the message type, and the fields set so far. The
     /// type is checked when the struct is opened, so that a bad type name
     /// fails before the field expressions run, as it does in the walker.
@@ -1270,6 +1272,10 @@ impl<'a> Vm<'a> {
             Operand::Refs(items) => unsafe { ref_to_value(new_list(&items) as CelRef) }
                 .map_err(|_| CelErr::InternalError),
             Operand::Map(entries) => Ok(Value::Map(Map::object(entries))),
+            Operand::MapRefs(pairs) => {
+                unsafe { ref_to_value(crate::runtime::object::new_map(&pairs) as CelRef) }
+                    .map_err(|_| CelErr::InternalError)
+            }
             Operand::Struct(name, fields) => self.close_struct(name, fields),
         }
     }
@@ -1470,10 +1476,98 @@ impl<'a> Vm<'a> {
     /// the same internal-consistency failure as a non-map on top of the stack,
     /// so it takes the same answer.
     fn map_mut(&mut self) -> CelResult<&mut HashMap<Key, Value>> {
+        self.ensure_boxed_map()?;
         match self.top_mut() {
             Some(Operand::Map(entries)) => Arc::get_mut(entries).ok_or(CelErr::InternalError),
             _ => Err(CelErr::InternalError),
         }
+    }
+
+    fn ensure_boxed_map(&mut self) -> CelResult<()> {
+        let top = self.top_mut().ok_or(CelErr::InternalError)?;
+        let Operand::MapRefs(pairs) = top else {
+            return Ok(());
+        };
+        let pairs = std::mem::take(pairs);
+        let mut entries = HashMap::with_capacity(pairs.len());
+        for (k, v) in pairs {
+            let key = unsafe { ref_to_value(k) }.map_err(|_| CelErr::InternalError)?;
+            let value = unsafe { ref_to_value(v) }.map_err(|_| CelErr::InternalError)?;
+            entries.insert(value_key(key).map_err(|e| self.park(e))?, value);
+        }
+        *self.top_mut().ok_or(CelErr::InternalError)? = Operand::Map(Arc::new(entries));
+        Ok(())
+    }
+
+    fn close_builder_operand(&mut self, operand: Operand) -> CelResult<Operand> {
+        match operand {
+            Operand::MapRefs(pairs) => Ok(Operand::Interned(
+                crate::runtime::object::new_map(&pairs) as CelRef,
+            )),
+            Operand::Refs(items) => Ok(Operand::Interned(new_list(&items) as CelRef)),
+            Operand::Ints(words) => {
+                let refs: Vec<CelRef> = words.iter().map(|&n| new_int(n) as CelRef).collect();
+                Ok(Operand::Interned(new_list(&refs) as CelRef))
+            }
+            Operand::EmptyList(_) => Ok(Operand::Interned(new_list(&[]) as CelRef)),
+            Operand::List(items) => {
+                let value = Value::list(items);
+                Ok(intern_leaf(&value)
+                    .map(Operand::Interned)
+                    .unwrap_or(Operand::Value(value)))
+            }
+            Operand::Map(entries) => {
+                let value = Value::Map(Map::object(entries));
+                Ok(intern_leaf(&value)
+                    .map(Operand::Interned)
+                    .unwrap_or(Operand::Value(value)))
+            }
+            other => Ok(other),
+        }
+    }
+
+    fn insert_map_operand(
+        &mut self,
+        key: Operand,
+        value: Operand,
+        optional: bool,
+    ) -> CelResult<()> {
+        let key = self.close_builder_operand(key)?;
+        let value = self.close_builder_operand(value)?;
+        let value = if optional {
+            match &value {
+                Operand::Interned(w) if interned_optional_is_none(*w) => return Ok(()),
+                Operand::Interned(w) if unsafe { w_kind(*w) } == CelKind::Optional => {
+                    let inner =
+                        unsafe { (*w.cast::<crate::runtime::object::W_OptionalObject>()).w_value };
+                    if inner.is_null() {
+                        return Ok(());
+                    }
+                    Operand::Interned(inner)
+                }
+                Operand::Value(v) => match optional_inner(v) {
+                    OptView::Empty => return Ok(()),
+                    OptView::Present(inner) => Operand::Value(inner),
+                    OptView::Plain => value,
+                },
+                _ => value,
+            }
+        } else {
+            value
+        };
+        if let (Some(k), Some(v)) = (Self::leaf_of(&key), Self::leaf_of(&value)) {
+            if interned_is_map_key(k) {
+                if let Some(Operand::MapRefs(pairs)) = self.top_mut() {
+                    pairs.push((k, v));
+                    return Ok(());
+                }
+            }
+        }
+        let key = self.finish(key)?;
+        let value = self.finish(value)?;
+        let key = value_key(key).map_err(|e| self.park(e))?;
+        self.map_mut()?.insert(key, value);
+        Ok(())
     }
 
     fn struct_mut(&mut self) -> CelResult<&mut BTreeMap<String, Value>> {
@@ -1817,22 +1911,9 @@ impl<'a> Vm<'a> {
             // Held out too, and for the same reason; see `Vm::new_map_arm`.
             OpCode::NewMap => self.new_map_arm(),
             OpCode::MapInsert | OpCode::MapInsertOptional => {
-                let value = self.pop()?;
-                let key = self.pop()?;
-                let key = value_key(key).map_err(|e| self.park(e))?;
-                if op == OpCode::MapInsert {
-                    self.map_mut()?.insert(key, value);
-                } else {
-                    match optional_inner(&value) {
-                        OptView::Empty => {}
-                        OptView::Present(inner) => {
-                            self.map_mut()?.insert(key, inner);
-                        }
-                        OptView::Plain => {
-                            self.map_mut()?.insert(key, value);
-                        }
-                    }
-                }
+                let value = self.pop_operand().ok_or(CelErr::InternalError)?;
+                let key = self.pop_operand().ok_or(CelErr::InternalError)?;
+                self.insert_map_operand(key, value, op == OpCode::MapInsertOptional)?;
             }
             OpCode::NewStruct => {
                 self.open_struct(NameId(a))?;
@@ -2460,7 +2541,7 @@ impl<'a> Vm<'a> {
     /// [`Operand::Map`] documents; the allocation is the whole arm.
     #[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
     fn new_map_arm(&mut self) {
-        self.push_operand(Operand::Map(Arc::default()));
+        self.push_operand(Operand::MapRefs(Vec::new()));
     }
 
     fn name(&self, id: u32) -> CelResult<&'a str> {
@@ -2809,11 +2890,19 @@ unsafe fn interned_list_indices(w: CelRef) -> CelRef {
     new_list(&keys) as CelRef
 }
 
+fn interned_is_map_key(w: CelRef) -> bool {
+    matches!(
+        unsafe { w_kind(w) },
+        CelKind::Int | CelKind::UInt | CelKind::Bool | CelKind::Str
+    )
+}
+
 fn interned_size(w: CelRef) -> Option<i64> {
     match unsafe { w_kind(w) } {
         CelKind::List => Some(unsafe { list_len(w) }),
         CelKind::Map => Some(unsafe { map_len(w) }),
         CelKind::Str => Some(unsafe { string_byte_len(w) }),
+        CelKind::Bytes => Some(unsafe { crate::runtime::object::bytes_len(w) }),
         _ => None,
     }
 }
@@ -3546,6 +3635,12 @@ mod tests {
             crate::runtime::convert::intern_leaf(&keyed),
             Some(crate::runtime::object::new_int(7) as crate::runtime::object::CelRef)
         );
+        let sized_bytes = {
+            let expr = parse("size(b'foo')");
+            let code = compile(&expr).expect("compile");
+            cel_eval_loop(&code, &ctx).expect("eval")
+        };
+        assert_eq!(sized_bytes, Value::Int(3));
     }
 
     /// A comprehension counter stored as an interned int stays on the table.
@@ -3828,8 +3923,6 @@ mod tests {
     /// `Arc::get_mut` answer `None`.
     #[test]
     fn a_map_literal_is_built_in_the_arc_it_is_handed_over_in() {
-        use crate::objects::MapStorage;
-
         let ctx = Context::default();
         let code = compile(&parse(r#"{"x": {"y": 3}}"#)).expect("compiles");
         let mut vm = Vm::new(&code, &ctx);
@@ -3838,17 +3931,17 @@ mod tests {
         // first time it is seen on top of the stack. Neither table is freed
         // before the answer is read -- the inner one moves into the outer --
         // so no recorded address can be reused by the other.
-        let mut opened: Vec<*const HashMap<Key, Value>> = Vec::new();
+        let mut opened_hash = 0usize;
+        let mut opened_refs = 0usize;
         let mut pc = 0u32;
         let answer = loop {
             let &Insn { op, ops } = vm.code.insns.get(pc as usize).expect("`pc` is in range");
             let next = pc + 1;
             let step = vm.step(op, ops, pc, next).expect("the literal evaluates");
-            if let Some(Operand::Map(entries)) = vm.top() {
-                let ptr = Arc::as_ptr(entries);
-                if !opened.contains(&ptr) {
-                    opened.push(ptr);
-                }
+            match vm.top() {
+                Some(Operand::Map(_)) => opened_hash += 1,
+                Some(Operand::MapRefs(_)) => opened_refs += 1,
+                _ => {}
             }
             match step {
                 Step::Next => pc = next,
@@ -3857,25 +3950,29 @@ mod tests {
             }
         };
 
-        let Value::Map(outer) = answer else {
-            panic!("a map literal evaluates to a map")
-        };
-        let MapStorage::Object(outer_entries) = outer.storage() else {
-            panic!("a map LITERAL is an owned table, not a record row")
-        };
-        let inner = match outer_entries.values().next() {
-            Some(Value::Map(inner)) => inner,
-            other => panic!("the outer table holds the inner map, got {other:?}"),
-        };
-        let MapStorage::Object(inner_entries) = inner.storage() else {
-            panic!("a map LITERAL is an owned table, not a record row")
-        };
-
         assert_eq!(
-            opened,
-            vec![Arc::as_ptr(outer_entries), Arc::as_ptr(inner_entries)],
-            "the two tables this program built are not the two it answered with, \
-             so closing a map literal copied it instead of handing it over"
+            opened_hash, 0,
+            "an internable literal must not box a HashMap"
+        );
+        assert!(opened_refs > 0, "the builder must stay on interned pairs");
+        assert_eq!(answer, {
+            let inner = Value::Map(crate::objects::Map::object(Arc::new(
+                [(
+                    crate::objects::Key::String(Arc::new("y".into())),
+                    Value::Int(3),
+                )]
+                .into_iter()
+                .collect(),
+            )));
+            Value::Map(crate::objects::Map::object(Arc::new(
+                [(crate::objects::Key::String(Arc::new("x".into())), inner)]
+                    .into_iter()
+                    .collect(),
+            )))
+        });
+        assert!(
+            crate::runtime::convert::intern_leaf(&answer).is_some(),
+            "the closed literal must be an interned map"
         );
     }
 
