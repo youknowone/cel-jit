@@ -38,11 +38,15 @@ use crate::objects::{
 };
 use crate::runtime::binop::{
     cel_add, cel_div, cel_equals, cel_greater, cel_greater_equals, cel_less, cel_less_equals,
-    cel_mul, cel_negate, cel_not_equals, cel_rem, cel_sub,
+    cel_mul, cel_negate, cel_not_equals, cel_rem, cel_sub, list_contains, map_contains_key,
+    map_key_refs, map_lookup,
 };
 use crate::runtime::convert::{intern_leaf, ref_to_value};
 use crate::runtime::error::{take_error, CelErrCode, ERROR_SENTINEL};
-use crate::runtime::object::{new_int, w_kind, CelKind, CelRef, W_IntObject};
+use crate::runtime::object::{
+    list_get, list_len, map_len, new_int, new_list, new_optional, new_optional_none,
+    string_byte_len, w_kind, CelKind, CelRef, W_IntObject,
+};
 use crate::{ExecutionError, Value};
 
 use std::cmp::Ordering;
@@ -384,6 +388,7 @@ pub fn map_loop_is_fusable(code: &CelCode) -> bool {
 ///
 /// Only the aggregate literals need anything but a [`Value`]; see the module
 /// documentation.
+#[derive(Clone)]
 enum Operand {
     Value(Value),
     /// A class-family leaf (`TRUE`/`FALSE`/`NULL`/small-int, or a heap
@@ -403,6 +408,10 @@ enum Operand {
     Ints(Vec<i64>),
     /// A list being built, boxed. `ObjectListStrategy`.
     List(Vec<Value>),
+    /// A list being built of interned leaves. `ObjectListStrategy` holding
+    /// `W_Root` pointers, the same shape `listobject.py` keeps after
+    /// `switch_to_object_strategy` when every item is already a boxed object.
+    Refs(Vec<CelRef>),
     /// Behind a pointer because an inline [`HashMap`] is 48 bytes and would
     /// set the width of every entry on the stack, including the
     /// [`Operand::Value`] that almost all of them are; the indirection takes
@@ -971,6 +980,7 @@ impl<'a> Vm<'a> {
     /// entry that is not a value -- both states an instruction stream cannot
     /// reach and the arms report as internal errors.
     #[inline(always)]
+    #[allow(dead_code)]
     fn local(&self, slot: u32) -> Option<&Value> {
         match self.frame[..self.stack_base].get(slot as usize) {
             Some(Operand::Value(value)) => Some(value),
@@ -1102,32 +1112,80 @@ impl<'a> Vm<'a> {
         }
     }
 
-    fn try_interned_index(&mut self, operand: &Operand, key: &Operand) -> CelResult<Option<Value>> {
-        let Some(w) = Self::leaf_of(operand) else {
-            return Ok(None);
+    fn try_interned_index(
+        &mut self,
+        operand: &Operand,
+        key: &Operand,
+        mut is_optional: bool,
+    ) -> CelResult<bool> {
+        let Some(mut w) = Self::leaf_of(operand) else {
+            return Ok(false);
         };
-        if unsafe { w_kind(w) } != CelKind::List {
-            return Ok(None);
+        if unsafe { w_kind(w) } == CelKind::Optional {
+            let inner = unsafe { (*w.cast::<crate::runtime::object::W_OptionalObject>()).w_value };
+            if inner.is_null() {
+                self.push_operand(Operand::Interned(new_optional_none() as CelRef));
+                return Ok(true);
+            }
+            w = inner;
+            is_optional = true;
         }
-        let index = match key {
-            Operand::Interned(k) if unsafe { w_kind(*k) } == CelKind::Int => unsafe {
-                (*(*k as *mut crate::runtime::object::W_IntObject)).intval
-            },
-            Operand::Value(Value::Int(i)) => *i,
-            Operand::Value(v) => match intern_leaf(v) {
-                Some(k) if unsafe { w_kind(k) } == CelKind::Int => unsafe {
-                    (*k.cast::<crate::runtime::object::W_IntObject>()).intval
-                },
-                _ => return Ok(None),
-            },
-            _ => return Ok(None),
+        let item = match unsafe { w_kind(w) } {
+            CelKind::List => {
+                let Some(index) = interned_int(key) else {
+                    return Ok(false);
+                };
+                match unsafe { list_get(w, index) } {
+                    Some(item) => item,
+                    None if is_optional => {
+                        self.push_operand(Operand::Interned(new_optional_none() as CelRef));
+                        return Ok(true);
+                    }
+                    None => {
+                        return Err(self.park(ExecutionError::IndexOutOfBounds(Value::Int(index))))
+                    }
+                }
+            }
+            CelKind::Map => {
+                let Some(k) = Self::leaf_of(key) else {
+                    return Ok(false);
+                };
+                match unsafe { map_lookup(w, k) } {
+                    Some(item) => item,
+                    None if is_optional => {
+                        self.push_operand(Operand::Interned(new_optional_none() as CelRef));
+                        return Ok(true);
+                    }
+                    None => return Ok(false),
+                }
+            }
+            #[cfg(feature = "structs")]
+            CelKind::Struct => {
+                let field = match key {
+                    Operand::Value(Value::String(s)) => Some(s.as_str()),
+                    Operand::Interned(k) => unsafe { crate::runtime::object::string_as_str(*k) },
+                    _ => None,
+                };
+                let Some(field) = field else {
+                    return Ok(false);
+                };
+                match unsafe { crate::runtime::object::struct_lookup_field(w, field) } {
+                    Some(item) => item,
+                    None if is_optional => {
+                        self.push_operand(Operand::Interned(new_optional_none() as CelRef));
+                        return Ok(true);
+                    }
+                    None => return Ok(false),
+                }
+            }
+            _ => return Ok(false),
         };
-        match unsafe { crate::runtime::object::list_get(w, index) } {
-            Some(item) => unsafe { ref_to_value(item) }
-                .map(Some)
-                .map_err(|_| CelErr::InternalError),
-            None => Err(self.park(ExecutionError::IndexOutOfBounds(Value::Int(index)))),
+        if is_optional {
+            self.push_operand(Operand::Interned(new_optional(item) as CelRef));
+        } else {
+            self.push_operand(Operand::Interned(item));
         }
+        Ok(true)
     }
 
     fn apply_cel_binop(
@@ -1209,6 +1267,8 @@ impl<'a> Vm<'a> {
             Operand::EmptyList(_) => Ok(Value::list(Vec::new())),
             Operand::Ints(words) => Ok(Value::list(ListStorage::Ints(words))),
             Operand::List(items) => Ok(Value::list(items)),
+            Operand::Refs(items) => unsafe { ref_to_value(new_list(&items) as CelRef) }
+                .map_err(|_| CelErr::InternalError),
             Operand::Map(entries) => Ok(Value::Map(Map::object(entries))),
             Operand::Struct(name, fields) => self.close_struct(name, fields),
         }
@@ -1305,32 +1365,97 @@ impl<'a> Vm<'a> {
     /// switch boxes once and never switches back.
     #[inline(always)]
     fn append_to_list(&mut self, value: Value) -> CelResult<()> {
+        self.append_operand(Operand::Value(value))
+    }
+
+    /// Append without forcing an interned item through [`Value`].
+    ///
+    /// Integers stay on [`Operand::Ints`]. Other interned leaves stay
+    /// `W_Root` pointers on [`Operand::Refs`], the object-strategy list.
+    fn append_operand(&mut self, operand: Operand) -> CelResult<()> {
+        match operand {
+            Operand::Interned(w) if unsafe { w_kind(w) } == CelKind::Int => {
+                let word = unsafe { (*w.cast::<W_IntObject>()).intval };
+                self.append_int(word)
+            }
+            Operand::Interned(w) => self.append_ref(w),
+            Operand::Value(Value::Int(word)) => self.append_int(word),
+            Operand::Value(value) => {
+                if let Some(w) = intern_leaf(&value) {
+                    self.append_operand(Operand::Interned(w))
+                } else {
+                    self.append_boxed(value)
+                }
+            }
+            other => {
+                let value = self.finish(other)?;
+                self.append_to_list(value)
+            }
+        }
+    }
+
+    fn append_int(&mut self, word: i64) -> CelResult<()> {
+        let top = self.top_mut().ok_or(CelErr::InternalError)?;
+        match top {
+            Operand::Ints(words) => words.push(word),
+            Operand::EmptyList(hint) => {
+                let mut words = Vec::with_capacity((*hint).max(1));
+                words.push(word);
+                *top = Operand::Ints(words);
+            }
+            Operand::Refs(items) => items.push(new_int(word) as CelRef),
+            Operand::List(items) => items.push(Value::Int(word)),
+            _ => return Err(CelErr::InternalError),
+        }
+        Ok(())
+    }
+
+    fn append_ref(&mut self, w: CelRef) -> CelResult<()> {
+        let top = self.top_mut().ok_or(CelErr::InternalError)?;
+        match top {
+            Operand::Refs(items) => items.push(w),
+            Operand::EmptyList(hint) => {
+                let mut items = Vec::with_capacity((*hint).max(1));
+                items.push(w);
+                *top = Operand::Refs(items);
+            }
+            Operand::Ints(words) => {
+                let mut items = Vec::with_capacity(words.capacity().max(words.len() + 1));
+                items.extend(words.iter().map(|&n| new_int(n) as CelRef));
+                items.push(w);
+                *top = Operand::Refs(items);
+            }
+            Operand::List(items) => {
+                items.push(unsafe { ref_to_value(w) }.map_err(|_| CelErr::InternalError)?);
+            }
+            _ => return Err(CelErr::InternalError),
+        }
+        Ok(())
+    }
+
+    fn append_boxed(&mut self, value: Value) -> CelResult<()> {
         let top = self.top_mut().ok_or(CelErr::InternalError)?;
         match top {
             Operand::List(items) => items.push(value),
-            Operand::Ints(words) => match value {
-                Value::Int(word) => words.push(word),
-                other => {
-                    let mut items = Vec::with_capacity(words.capacity().max(words.len() + 1));
-                    items.extend(words.iter().map(|&w| Value::Int(w)));
-                    items.push(other);
-                    *top = Operand::List(items);
+            Operand::Ints(words) => {
+                let mut items = Vec::with_capacity(words.capacity().max(words.len() + 1));
+                items.extend(words.iter().map(|&w| Value::Int(w)));
+                items.push(value);
+                *top = Operand::List(items);
+            }
+            Operand::Refs(items) => {
+                let refs = std::mem::take(items);
+                let mut boxed = Vec::with_capacity(refs.capacity().max(refs.len() + 1));
+                for w in refs {
+                    boxed.push(unsafe { ref_to_value(w) }.map_err(|_| CelErr::InternalError)?);
                 }
-            },
+                boxed.push(value);
+                *top = Operand::List(boxed);
+            }
             Operand::EmptyList(hint) => {
-                let hint = (*hint).max(1);
-                *top = match value {
-                    Value::Int(word) => {
-                        let mut words = Vec::with_capacity(hint);
-                        words.push(word);
-                        Operand::Ints(words)
-                    }
-                    other => {
-                        let mut items = Vec::with_capacity(hint);
-                        items.push(other);
-                        Operand::List(items)
-                    }
-                };
+                let mut items = Vec::with_capacity((*hint).max(1));
+                items.push(value);
+                *top = Operand::List(items);
             }
             _ => return Err(CelErr::InternalError),
         }
@@ -1575,8 +1700,8 @@ impl<'a> Vm<'a> {
                 _ => return Err(CelErr::InternalError),
             },
             OpCode::StoreLocal => {
-                let value = self.pop()?;
-                self.store_slot(a, value)?;
+                let operand = self.pop_operand().ok_or(CelErr::InternalError)?;
+                self.store_operand(a, operand)?;
             }
             OpCode::IncLocal => self.advance_counter(a)?,
 
@@ -1618,8 +1743,8 @@ impl<'a> Vm<'a> {
             OpCode::Index | OpCode::OptIndex => {
                 let key = self.pop_operand().ok_or(CelErr::InternalError)?;
                 let operand = self.pop_operand().ok_or(CelErr::InternalError)?;
-                if let Some(value) = self.try_interned_index(&operand, &key)? {
-                    self.push(value);
+                if self.try_interned_index(&operand, &key, op == OpCode::OptIndex)? {
+                    // interned item already pushed
                 } else {
                     let key = self.finish(key)?;
                     let operand = self.finish(operand)?;
@@ -1664,15 +1789,29 @@ impl<'a> Vm<'a> {
                 self.push_operand(Operand::EmptyList(len as usize));
             }
             OpCode::ListAppend => {
-                let value = self.pop()?;
-                self.append_to_list(value)?;
+                let operand = self.pop_operand().ok_or(CelErr::InternalError)?;
+                self.append_operand(operand)?;
             }
             OpCode::ListAppendOptional => {
-                let value = self.pop()?;
-                match optional_inner(&value) {
-                    OptView::Empty => {}
-                    OptView::Present(inner) => self.append_to_list(inner)?,
-                    OptView::Plain => self.append_to_list(value)?,
+                let operand = self.pop_operand().ok_or(CelErr::InternalError)?;
+                match &operand {
+                    Operand::Interned(w) if interned_optional_is_none(*w) => {}
+                    Operand::Interned(w) if unsafe { w_kind(*w) } == CelKind::Optional => {
+                        let inner = unsafe {
+                            (*w.cast::<crate::runtime::object::W_OptionalObject>()).w_value
+                        };
+                        if !inner.is_null() {
+                            self.append_operand(Operand::Interned(inner))?;
+                        }
+                    }
+                    _ => {
+                        let value = self.finish(operand)?;
+                        match optional_inner(&value) {
+                            OptView::Empty => {}
+                            OptView::Present(inner) => self.append_to_list(inner)?,
+                            OptView::Plain => self.append_to_list(value)?,
+                        }
+                    }
                 }
             }
             // Held out too, and for the same reason; see `Vm::new_map_arm`.
@@ -1884,8 +2023,21 @@ impl<'a> Vm<'a> {
                 }
             }
             OpCode::In => {
-                let rhs = self.pop()?;
-                let lhs = self.pop()?;
+                let container = self.pop_operand().ok_or(CelErr::InternalError)?;
+                let needle = self.pop_operand().ok_or(CelErr::InternalError)?;
+                if let (Some(c), Some(n)) = (Self::leaf_of(&container), Self::leaf_of(&needle)) {
+                    let found = match unsafe { w_kind(c) } {
+                        CelKind::List => Some(unsafe { list_contains(c, n) }),
+                        CelKind::Map => Some(unsafe { map_contains_key(c, n) }),
+                        _ => None,
+                    };
+                    if let Some(found) = found {
+                        self.push(Value::Bool(found));
+                        return Ok(Step::Next);
+                    }
+                }
+                let rhs = self.finish(container)?;
+                let lhs = self.finish(needle)?;
                 let value = value_contains(&rhs, &lhs).map_err(|e| self.park(e))?;
                 self.push(Value::Bool(value));
             }
@@ -1901,14 +2053,16 @@ impl<'a> Vm<'a> {
             // top of the stack without popping it, which is what `ListAppend`
             // does too.
             OpCode::LoadLocalAppend => {
-                let value = self.local_as_value(a).ok_or(CelErr::InternalError)?;
-                self.append_to_list(value)?;
+                let operand = self.local_operand(a).ok_or(CelErr::InternalError)?.clone();
+                self.append_operand(operand)?;
             }
             OpCode::GetFieldLocalAppend | OpCode::HasFieldLocalAppend => {
                 let field = self.name(b)?;
                 let value = if let Some(w) = self.local_leaf(a) {
                     if self.push_interned_field(w, field, op == OpCode::HasFieldLocalAppend)? {
-                        self.pop()?
+                        let operand = self.pop_operand().ok_or(CelErr::InternalError)?;
+                        self.append_operand(operand)?;
+                        return Ok(Step::Next);
                     } else {
                         let operand = self.local_as_value(a).ok_or(CelErr::InternalError)?;
                         let read = if op == OpCode::HasFieldLocalAppend {
@@ -1938,24 +2092,23 @@ impl<'a> Vm<'a> {
                     OpCode::MulLocalConstAppend => "mul",
                     _ => "rem",
                 };
-                let value =
-                    if let (Some(a_ref), Some(b_ref)) = (self.local_leaf(a), intern_leaf(rhs)) {
-                        let w = unsafe {
-                            match name {
-                                "add" => cel_add(a_ref, b_ref),
-                                "mul" => cel_mul(a_ref, b_ref),
-                                _ => cel_rem(a_ref, b_ref),
-                            }
-                        };
-                        if w == ERROR_SENTINEL {
-                            return Err(self.raised_as_cel_err(op));
+                if let (Some(a_ref), Some(b_ref)) = (self.local_leaf(a), intern_leaf(rhs)) {
+                    let w = unsafe {
+                        match name {
+                            "add" => cel_add(a_ref, b_ref),
+                            "mul" => cel_mul(a_ref, b_ref),
+                            _ => cel_rem(a_ref, b_ref),
                         }
-                        unsafe { ref_to_value(w) }.map_err(|_| CelErr::InternalError)?
-                    } else {
-                        let lhs = self.local_as_value(a).ok_or(CelErr::InternalError)?;
-                        binary_values_ref(name, &lhs, rhs).map_err(|e| self.park(e))?
                     };
-                self.append_to_list(value)?;
+                    if w == ERROR_SENTINEL {
+                        return Err(self.raised_as_cel_err(op));
+                    }
+                    self.append_operand(Operand::Interned(w))?;
+                } else {
+                    let lhs = self.local_as_value(a).ok_or(CelErr::InternalError)?;
+                    let value = binary_values_ref(name, &lhs, rhs).map_err(|e| self.park(e))?;
+                    self.append_to_list(value)?;
+                }
             }
             OpCode::EqualsLocalConstAppend | OpCode::NotEqualsLocalConstAppend => {
                 let rhs = self.code.konst(b).ok_or(CelErr::InternalError)?;
@@ -1974,29 +2127,28 @@ impl<'a> Vm<'a> {
             | OpCode::GreaterLocalConstAppend
             | OpCode::GreaterEqualsLocalConstAppend => {
                 let rhs = self.code.konst(b).ok_or(CelErr::InternalError)?;
-                let value =
-                    if let (Some(a_ref), Some(b_ref)) = (self.local_leaf(a), intern_leaf(rhs)) {
-                        let w = unsafe {
-                            match op {
-                                OpCode::LessLocalConstAppend => cel_less(a_ref, b_ref),
-                                OpCode::GreaterLocalConstAppend => cel_greater(a_ref, b_ref),
-                                _ => cel_greater_equals(a_ref, b_ref),
-                            }
-                        };
-                        if w == ERROR_SENTINEL {
-                            return Err(self.raised_as_cel_err(op));
+                if let (Some(a_ref), Some(b_ref)) = (self.local_leaf(a), intern_leaf(rhs)) {
+                    let w = unsafe {
+                        match op {
+                            OpCode::LessLocalConstAppend => cel_less(a_ref, b_ref),
+                            OpCode::GreaterLocalConstAppend => cel_greater(a_ref, b_ref),
+                            _ => cel_greater_equals(a_ref, b_ref),
                         }
-                        unsafe { ref_to_value(w) }.map_err(|_| CelErr::InternalError)?
-                    } else {
-                        let lhs = self.local_as_value(a).ok_or(CelErr::InternalError)?;
-                        let accept: fn(Ordering) -> bool = match op {
-                            OpCode::LessLocalConstAppend => |o| o == Ordering::Less,
-                            OpCode::GreaterLocalConstAppend => |o| o == Ordering::Greater,
-                            _ => |o| o != Ordering::Less,
-                        };
-                        compare_values(&lhs, rhs, accept).map_err(|e| self.park(e))?
                     };
-                self.append_to_list(value)?;
+                    if w == ERROR_SENTINEL {
+                        return Err(self.raised_as_cel_err(op));
+                    }
+                    self.append_operand(Operand::Interned(w))?;
+                } else {
+                    let lhs = self.local_as_value(a).ok_or(CelErr::InternalError)?;
+                    let accept: fn(Ordering) -> bool = match op {
+                        OpCode::LessLocalConstAppend => |o| o == Ordering::Less,
+                        OpCode::GreaterLocalConstAppend => |o| o == Ordering::Greater,
+                        _ => |o| o != Ordering::Less,
+                    };
+                    let value = compare_values(&lhs, rhs, accept).map_err(|e| self.park(e))?;
+                    self.append_to_list(value)?;
+                }
             }
 
             // -- unary operators -------------------------------------------
@@ -2033,6 +2185,9 @@ impl<'a> Vm<'a> {
 
             // -- calls -------------------------------------------------------
             OpCode::CallHost => {
+                if b == 1 && self.try_interned_size_on_top(NameId(a))? {
+                    return Ok(Step::Next);
+                }
                 let args = self.pop_n(b as usize)?;
                 let value = self.call_global(NameId(a), args)?;
                 self.push(value);
@@ -2041,6 +2196,12 @@ impl<'a> Vm<'a> {
                 // Taken before anything can fail, so the park cannot outlive
                 // the instruction that owns it.
                 let parked = self.pending_args.take();
+                if parked.is_none() && b == 0 && self.try_interned_size_on_top(NameId(a))? {
+                    return Ok(Step::Next);
+                }
+                if parked.is_none() && b == 1 && self.try_interned_contains_method(NameId(a))? {
+                    return Ok(Step::Next);
+                }
                 let target = self.pop()?;
                 let args = match parked {
                     // A `CallQualified` miss already popped them, and only the
@@ -2065,7 +2226,21 @@ impl<'a> Vm<'a> {
 
             // -- iteration ----------------------------------------------------
             OpCode::IterElems => {
-                let value = self.pop()?;
+                let operand = self.pop_operand().ok_or(CelErr::InternalError)?;
+                if let Some(w) = Self::leaf_of(&operand) {
+                    match unsafe { w_kind(w) } {
+                        CelKind::List => {
+                            self.push_operand(Operand::Interned(w));
+                            return Ok(Step::Next);
+                        }
+                        CelKind::Map => {
+                            self.push_operand(Operand::Interned(unsafe { interned_map_keys(w) }));
+                            return Ok(Step::Next);
+                        }
+                        _ => {}
+                    }
+                }
+                let value = self.finish(operand)?;
                 match value {
                     // A list already IS the sequence this iterates, so the
                     // popped value is pushed straight back. Materializing it
@@ -2075,19 +2250,6 @@ impl<'a> Vm<'a> {
                     // instructions that read the slot, [`OpCode::IterLen`] and
                     // [`OpCode::IterAt`], are both window-relative and neither
                     // cares which buffer answers them.
-                    //
-                    // The slot now SHARES the caller's buffer instead of owning
-                    // a private snapshot of it, and nothing can change that
-                    // buffer while the loop runs. A `Value` has no interior
-                    // mutability, so the only writes are the two that rewrite a
-                    // list in place -- `ListRef::into_vec` and `ListRef::concat`
-                    // -- and both go through `Arc::get_mut`, which cannot answer
-                    // for as long as this slot holds a reference of its own. The
-                    // accumulator cannot be that other reference either: on the
-                    // appending path it is an `Operand::List(Vec<Value>)` (or its
-                    // integer twin) that
-                    // owns its elements outright, and on the general path it is
-                    // whatever `accu_init` produced, built before the loop.
                     Value::List(_) => self.push(value),
                     _ => {
                         let items = value_iter(&value).map_err(|e| self.park(e))?;
@@ -2096,17 +2258,33 @@ impl<'a> Vm<'a> {
                 }
             }
             OpCode::IterKeys => {
-                let value = self.pop()?;
+                let operand = self.pop_operand().ok_or(CelErr::InternalError)?;
+                if let Some(w) = Self::leaf_of(&operand) {
+                    match unsafe { w_kind(w) } {
+                        CelKind::List => {
+                            self.push_operand(Operand::Interned(unsafe {
+                                interned_list_indices(w)
+                            }));
+                            return Ok(Step::Next);
+                        }
+                        CelKind::Map => {
+                            self.push_operand(Operand::Interned(unsafe { interned_map_keys(w) }));
+                            return Ok(Step::Next);
+                        }
+                        _ => {}
+                    }
+                }
+                let value = self.finish(operand)?;
                 let items = iter_keys(&value).map_err(|e| self.park(e))?;
                 self.push(Value::list(items));
             }
             OpCode::IterLen => {
                 let len = self.sequence_len(a)?;
-                self.push(Value::Int(len));
+                self.push_operand(Operand::Interned(new_int(len) as CelRef));
             }
             OpCode::IterAt => {
                 let element = self.element_at(a, b)?;
-                self.push(element);
+                self.push_operand(element);
             }
 
             // -- the fused loop -------------------------------------------
@@ -2139,7 +2317,7 @@ impl<'a> Vm<'a> {
             }
             OpCode::IterBind => {
                 let element = self.element_at(a, b)?;
-                self.store_slot(c, element)?;
+                self.store_operand(c, element)?;
             }
             OpCode::IterAdvance => {
                 self.advance_counter(a)?;
@@ -2335,7 +2513,7 @@ impl<'a> Vm<'a> {
     /// index past the end is a panic for a boxed or columnar list and a record
     /// pointing past its own columns for a record one.
     #[inline(always)]
-    fn element_at(&mut self, sequence: u32, index: u32) -> CelResult<Value> {
+    fn element_at(&mut self, sequence: u32, index: u32) -> CelResult<Operand> {
         // The probe's other half: the lowering this replaced, reachable at run
         // time so that what the replacement bought is a difference measured
         // inside one binary rather than between two builds. `value_index`
@@ -2349,19 +2527,19 @@ impl<'a> Vm<'a> {
                 let index = self.local_as_value(index).ok_or(CelErr::InternalError)?;
                 value_index(sequence, &index)
             };
-            return element.map_err(|e| self.park(e));
+            return element.map(Operand::Value).map_err(|e| self.park(e));
         }
         let Some(index) = self.local_int(index) else {
             return Err(CelErr::InternalError);
         };
         match self.local_operand(sequence).ok_or(CelErr::InternalError)? {
-            Operand::Value(Value::List(seq)) => {
-                seq.get(index as usize).ok_or(CelErr::IndexOutOfBounds)
-            }
+            Operand::Value(Value::List(seq)) => seq
+                .get(index as usize)
+                .map(Operand::Value)
+                .ok_or(CelErr::IndexOutOfBounds),
             Operand::Interned(w) if unsafe { w_kind(*w) } == CelKind::List => {
-                let item = unsafe { crate::runtime::object::list_get(*w, index) }
-                    .ok_or(CelErr::IndexOutOfBounds)?;
-                unsafe { ref_to_value(item) }.map_err(|_| CelErr::InternalError)
+                let item = unsafe { list_get(*w, index) }.ok_or(CelErr::IndexOutOfBounds)?;
+                Ok(Operand::Interned(item))
             }
             _ => Err(CelErr::InternalError),
         }
@@ -2369,21 +2547,25 @@ impl<'a> Vm<'a> {
 
     /// Write `value` into `slot`, dropping what was there.
     #[inline(always)]
+    #[allow(dead_code)]
     fn store_slot(&mut self, slot: u32, value: Value) -> CelResult<()> {
-        let operand = intern_leaf(&value)
-            .map(Operand::Interned)
-            .unwrap_or(Operand::Value(value));
-        self.store_operand(slot, operand)
+        self.store_operand(slot, Operand::Value(value))
     }
 
     fn store_operand(&mut self, slot: u32, operand: Operand) -> CelResult<()> {
-        let dest = self.local_operand_mut(slot).ok_or(CelErr::InternalError)?;
         let stored = match operand {
+            Operand::Interned(w) => Operand::Interned(w),
             Operand::Value(v) => intern_leaf(&v)
                 .map(Operand::Interned)
                 .unwrap_or(Operand::Value(v)),
-            other => other,
+            builder => {
+                let v = self.finish(builder)?;
+                intern_leaf(&v)
+                    .map(Operand::Interned)
+                    .unwrap_or(Operand::Value(v))
+            }
         };
+        let dest = self.local_operand_mut(slot).ok_or(CelErr::InternalError)?;
         let previous = std::mem::replace(dest, stored);
         if let Ok(value) = self.finish(previous) {
             self.discard(value);
@@ -2483,6 +2665,54 @@ impl<'a> Vm<'a> {
         Err(self.no_structs_feature(name))
     }
 
+    /// `size(x)` / `x.size()` on an interned list, map, or string.
+    ///
+    /// PyPy's `descr_len` reads the object in place. The host overload
+    /// table takes a public [`Value`], which would rebuild the container.
+    fn try_interned_size_on_top(&mut self, name: NameId) -> CelResult<bool> {
+        if self.name(name.0)? != "size" {
+            return Ok(false);
+        }
+        let Some(operand) = self.top() else {
+            return Ok(false);
+        };
+        let Some(w) = Self::leaf_of(operand) else {
+            return Ok(false);
+        };
+        let Some(n) = interned_size(w) else {
+            return Ok(false);
+        };
+        let _ = self.pop_operand();
+        self.push_operand(Operand::Interned(new_int(n) as CelRef));
+        Ok(true)
+    }
+
+    /// `x.contains(y)` when both sides are interned.
+    fn try_interned_contains_method(&mut self, name: NameId) -> CelResult<bool> {
+        if self.name(name.0)? != "contains" {
+            return Ok(false);
+        }
+        if self.depth() < 2 {
+            return Ok(false);
+        }
+        let needle = self.pop_operand().ok_or(CelErr::InternalError)?;
+        let container = self.pop_operand().ok_or(CelErr::InternalError)?;
+        if let (Some(c), Some(n)) = (Self::leaf_of(&container), Self::leaf_of(&needle)) {
+            let found = match unsafe { w_kind(c) } {
+                CelKind::List => Some(unsafe { list_contains(c, n) }),
+                CelKind::Map => Some(unsafe { map_contains_key(c, n) }),
+                _ => None,
+            };
+            if let Some(found) = found {
+                self.push(Value::Bool(found));
+                return Ok(true);
+            }
+        }
+        self.push_operand(container);
+        self.push_operand(needle);
+        Ok(false)
+    }
+
     fn call_global(&mut self, name: NameId, args: Vec<Value>) -> CelResult<Value> {
         let func_name = self.name(name.0)?;
         if let Some(op) = self.ctx.env().find_overload(func_name, &args) {
@@ -2546,6 +2776,46 @@ enum OptView {
     /// `optional.none`.
     Empty,
     Present(Value),
+}
+
+fn interned_int(operand: &Operand) -> Option<i64> {
+    match operand {
+        Operand::Interned(k) if unsafe { w_kind(*k) } == CelKind::Int => {
+            Some(unsafe { (*k.cast::<W_IntObject>()).intval })
+        }
+        Operand::Value(Value::Int(i)) => Some(*i),
+        Operand::Value(v) => match intern_leaf(v) {
+            Some(k) if unsafe { w_kind(k) } == CelKind::Int => {
+                Some(unsafe { (*k.cast::<W_IntObject>()).intval })
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+unsafe fn interned_map_keys(w: CelRef) -> CelRef {
+    new_list(&map_key_refs(w)) as CelRef
+}
+
+unsafe fn interned_list_indices(w: CelRef) -> CelRef {
+    let n = list_len(w);
+    let mut keys = Vec::with_capacity(n as usize);
+    let mut i = 0i64;
+    while i < n {
+        keys.push(new_int(i) as CelRef);
+        i += 1;
+    }
+    new_list(&keys) as CelRef
+}
+
+fn interned_size(w: CelRef) -> Option<i64> {
+    match unsafe { w_kind(w) } {
+        CelKind::List => Some(unsafe { list_len(w) }),
+        CelKind::Map => Some(unsafe { map_len(w) }),
+        CelKind::Str => Some(unsafe { string_byte_len(w) }),
+        _ => None,
+    }
 }
 
 fn interned_optional_is_none(w: CelRef) -> bool {
@@ -3233,6 +3503,49 @@ mod tests {
             cel_eval_loop(&code, &ctx).expect("eval")
         };
         assert_eq!(item, Value::Int(20));
+        assert_eq!(
+            crate::runtime::convert::intern_leaf(&item),
+            Some(crate::runtime::object::new_int(20) as crate::runtime::object::CelRef)
+        );
+    }
+
+    #[test]
+    fn interned_in_size_and_map_index_through_the_vm() {
+        let ctx = Context::default();
+        let contained = {
+            let expr = parse("2 in [1, 2, 3]");
+            let code = compile(&expr).expect("compile");
+            cel_eval_loop(&code, &ctx).expect("eval")
+        };
+        assert_eq!(contained, Value::Bool(true));
+        let missing = {
+            let expr = parse("9 in [1, 2, 3]");
+            let code = compile(&expr).expect("compile");
+            cel_eval_loop(&code, &ctx).expect("eval")
+        };
+        assert_eq!(missing, Value::Bool(false));
+        let sized = {
+            let expr = parse("size([1, 2, 3])");
+            let code = compile(&expr).expect("compile");
+            cel_eval_loop(&code, &ctx).expect("eval")
+        };
+        assert_eq!(sized, Value::Int(3));
+        let method = {
+            let expr = parse("[1, 2, 3].size()");
+            let code = compile(&expr).expect("compile");
+            cel_eval_loop(&code, &ctx).expect("eval")
+        };
+        assert_eq!(method, Value::Int(3));
+        let keyed = {
+            let expr = parse("{'a': 7}['a']");
+            let code = compile(&expr).expect("compile");
+            cel_eval_loop(&code, &ctx).expect("eval")
+        };
+        assert_eq!(keyed, Value::Int(7));
+        assert_eq!(
+            crate::runtime::convert::intern_leaf(&keyed),
+            Some(crate::runtime::object::new_int(7) as crate::runtime::object::CelRef)
+        );
     }
 
     /// A comprehension counter stored as an interned int stays on the table.

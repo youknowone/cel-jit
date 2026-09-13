@@ -495,6 +495,51 @@ pub unsafe fn list_len(w: CelRef) -> i64 {
     (*w.cast::<W_ListObject>()).length
 }
 
+/// Live entry count of a map leaf.
+///
+/// # Safety
+///
+/// `w` is a live [`W_MapObject`].
+pub unsafe fn map_len(w: CelRef) -> i64 {
+    (*w.cast::<W_MapObject>()).length
+}
+
+/// UTF-8 byte length of a string leaf. Matches `Arc<String>::len`.
+///
+/// # Safety
+///
+/// `w` is a live [`W_StringObject`].
+pub unsafe fn string_byte_len(w: CelRef) -> i64 {
+    (*w.cast::<W_StringObject>()).byte_len
+}
+
+/// Borrow the UTF-8 payload of a string leaf.
+///
+/// # Safety
+///
+/// `w` is a live [`W_StringObject`] that outlives the returned slice.
+pub unsafe fn string_as_str<'a>(w: CelRef) -> Option<&'a str> {
+    if w_kind(w) != CelKind::Str {
+        return None;
+    }
+    let leaf = &*w.cast::<W_StringObject>();
+    let n = leaf.byte_len as usize;
+    let base = crate::runtime::object_array::bytes_base(leaf.chars);
+    if base.is_null() {
+        return Some("");
+    }
+    std::str::from_utf8(std::slice::from_raw_parts(base, n)).ok()
+}
+
+/// Live length of a bytes leaf.
+///
+/// # Safety
+///
+/// `w` is a live [`W_BytesObject`].
+pub unsafe fn bytes_len(w: CelRef) -> i64 {
+    (*w.cast::<W_BytesObject>()).length
+}
+
 /// Item `index` of a list leaf, or null if out of range.
 ///
 /// # Safety

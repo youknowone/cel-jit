@@ -294,6 +294,67 @@ pub unsafe fn w_map_eq(a: CelRef, b: CelRef) -> bool {
     true
 }
 
+/// `descr_contains` over a list leaf: `space.eq_w` on each item.
+///
+/// # Safety
+///
+/// Both operands are live values; `w` is a list.
+pub unsafe fn list_contains(w: CelRef, needle: CelRef) -> bool {
+    let items = list_items(w);
+    let mut i = 0;
+    while i < items.len() {
+        if values_equal(items[i], needle) {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Look up `key` on a map leaf. Keys compare with [`values_equal`].
+///
+/// # Safety
+///
+/// `w` is a live map; `key` is a live value.
+pub unsafe fn map_lookup(w: CelRef, key: CelRef) -> Option<CelRef> {
+    let pairs = map_pairs(w);
+    let n = pairs.len() / 2;
+    let mut i = 0;
+    while i < n {
+        if values_equal(pairs[2 * i], key) {
+            return Some(pairs[2 * i + 1]);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// `key in map`.
+///
+/// # Safety
+///
+/// As [`map_lookup`].
+pub unsafe fn map_contains_key(w: CelRef, key: CelRef) -> bool {
+    map_lookup(w, key).is_some()
+}
+
+/// The keys of a map leaf, in storage order.
+///
+/// # Safety
+///
+/// `w` is a live map.
+pub unsafe fn map_key_refs(w: CelRef) -> Vec<CelRef> {
+    let pairs = map_pairs(w);
+    let n = pairs.len() / 2;
+    let mut keys = Vec::with_capacity(n);
+    let mut i = 0;
+    while i < n {
+        keys.push(pairs[2 * i]);
+        i += 1;
+    }
+    keys
+}
+
 /// # Safety
 ///
 /// Both operands are live lists.
