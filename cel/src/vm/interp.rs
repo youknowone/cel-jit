@@ -41,12 +41,13 @@ use crate::runtime::binop::{
     cel_mul, cel_negate, cel_not_equals, cel_rem, cel_sub, list_contains, map_contains_key,
     map_key_refs, map_lookup,
 };
-use crate::runtime::convert::{intern_leaf, ref_to_value};
+use crate::runtime::convert::{intern_leaf, interned_list_get, ref_to_value};
 use crate::runtime::error::{take_error, CelErrCode, ERROR_SENTINEL};
 use crate::runtime::object::{
-    list_get, list_len, map_len, new_bytes, new_double, new_int, new_list, new_null, new_optional,
-    new_optional_none, new_string, new_type, new_uint, string_as_str, string_byte_len, w_kind,
-    w_type, CelKind, CelRef, W_BoolObject, W_DoubleObject, W_IntObject, W_UIntObject,
+    list_len, map_len, new_bytes, new_double, new_int, new_list, new_null, new_optional,
+    new_optional_none, new_string, new_type, new_uint, opaque_host_index, string_as_str,
+    string_byte_len, w_kind, w_type, CelKind, CelRef, W_BoolObject, W_DoubleObject, W_IntObject,
+    W_UIntObject, CEL_OPAQUE_CLASS, CEL_TYPE_CLASS,
 };
 use crate::runtime::optional::{
     cel_optional_has_value, cel_optional_none, cel_optional_of, cel_optional_of_non_zero_value,
@@ -1085,7 +1086,8 @@ impl<'a> Vm<'a> {
     fn push_interned_field(&mut self, w: CelRef, field: &str, has: bool) -> CelResult<bool> {
         match unsafe { w_kind(w) } {
             CelKind::Map => {
-                let found = unsafe { crate::runtime::object::map_lookup_string(w, field) };
+                let found =
+                    unsafe { crate::runtime::convert::interned_map_lookup_string(w, field) };
                 if has {
                     self.push(Value::Bool(found.is_some()));
                     return Ok(true);
@@ -1144,7 +1146,7 @@ impl<'a> Vm<'a> {
                 let Some(index) = interned_int(key) else {
                     return Ok(false);
                 };
-                match unsafe { list_get(w, index) } {
+                match unsafe { interned_list_get(w, index) } {
                     Some(item) => item,
                     None if is_optional => {
                         self.push_operand(Operand::Interned(new_optional_none() as CelRef));
@@ -2652,7 +2654,8 @@ impl<'a> Vm<'a> {
                 .map(Operand::Value)
                 .ok_or(CelErr::IndexOutOfBounds),
             Operand::Interned(w) if unsafe { w_kind(*w) } == CelKind::List => {
-                let item = unsafe { list_get(*w, index) }.ok_or(CelErr::IndexOutOfBounds)?;
+                let item =
+                    unsafe { interned_list_get(*w, index) }.ok_or(CelErr::IndexOutOfBounds)?;
                 Ok(Operand::Interned(item))
             }
             _ => Err(CelErr::InternalError),
@@ -2942,7 +2945,7 @@ impl<'a> Vm<'a> {
             let mut items = Vec::with_capacity(len as usize);
             let mut i = 0i64;
             while i < len {
-                items.push(unsafe { list_get(w, i) }.ok_or(CelErr::InternalError)?);
+                items.push(unsafe { interned_list_get(w, i) }.ok_or(CelErr::InternalError)?);
                 i += 1;
             }
             items
@@ -3195,10 +3198,33 @@ fn interned_timestamp_accessor(name: &str, w: CelRef) -> Option<i64> {
     }
 }
 
+fn interned_type_of(w: CelRef) -> CelRef {
+    unsafe {
+        if w_kind(w) == CelKind::Opaque {
+            if let Some(host) = crate::runtime::convert::host_opaque(opaque_host_index(w)) {
+                if host
+                    .downcast_ref::<crate::common::types::TypeValue>()
+                    .is_some()
+                {
+                    return new_type(&CEL_TYPE_CLASS) as CelRef;
+                }
+                let tv = crate::common::types::TypeValue::new(
+                    crate::common::types::Type::new_opaque_type(
+                        host.runtime_type_name().to_owned(),
+                    ),
+                );
+                return intern_leaf(&Value::Opaque(Arc::new(tv)))
+                    .unwrap_or(new_type(&CEL_OPAQUE_CLASS) as CelRef);
+            }
+        }
+        new_type(&*w_type(w)) as CelRef
+    }
+}
+
 fn interned_unary_host(name: &str, w: CelRef) -> Result<Option<CelRef>, ExecutionError> {
     match name {
         "dyn" => Ok(Some(w)),
-        "type" => Ok(Some(unsafe { new_type(&*w_type(w)) as CelRef })),
+        "type" => Ok(Some(interned_type_of(w))),
         "int" => interned_to_int(w),
         "uint" => interned_to_uint(w),
         "double" => interned_to_double(w),

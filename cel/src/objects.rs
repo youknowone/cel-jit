@@ -235,12 +235,6 @@ impl Map {
         &self.storage
     }
 
-    /// Whether this map can be copied into a class-family `W_MapObject`
-    /// without dropping a record-row schema window.
-    pub(crate) fn can_intern(&self) -> bool {
-        matches!(self.storage, MapStorage::Object(_))
-    }
-
     pub fn len(&self) -> usize {
         match &self.storage {
             MapStorage::Object(map) => map.len(),
@@ -837,13 +831,12 @@ pub struct ListRef {
 }
 
 impl ListRef {
-    /// Whether this list can be copied into a class-family `W_ListObject`
-    /// without dropping a column window or a record schema.
-    pub(crate) fn can_intern(&self) -> bool {
-        matches!(
-            &*self.storage,
-            ListStorage::Object(_) | ListStorage::Ints(_)
-        )
+    pub(crate) fn storage(&self) -> &ListStorage {
+        &self.storage
+    }
+
+    pub(crate) fn window_start(&self) -> usize {
+        self.start as usize
     }
 
     /// The window `storage[start .. start + len]`.
@@ -1093,6 +1086,27 @@ impl Value {
     /// Wrap a live class-family leaf as the public value.
     pub(crate) fn from_interned(w: CelRef) -> Self {
         Value::Interned(w)
+    }
+
+    /// The P5 handle: a prebuilt `int`.
+    pub fn int(i: i64) -> Self {
+        Value::from_interned(crate::runtime::object::new_int(i) as CelRef)
+    }
+
+    /// The P5 handle: a prebuilt `bool`.
+    pub fn bool(b: bool) -> Self {
+        Value::from_interned(crate::runtime::object::new_bool(b) as CelRef)
+    }
+
+    /// The P5 handle: the immortal `null`.
+    pub fn null() -> Self {
+        Value::from_interned(crate::runtime::object::new_null() as CelRef)
+    }
+
+    /// The class-family kind. Every public value now has a leaf.
+    pub fn kind(&self) -> crate::runtime::object::CelKind {
+        let w = crate::runtime::convert::intern_leaf(self).expect("intern_leaf is total");
+        unsafe { crate::runtime::object::w_kind(w) }
     }
 
     /// Restore the typed variants. An interned leaf that convert cannot

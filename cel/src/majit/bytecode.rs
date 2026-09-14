@@ -1710,9 +1710,9 @@ pub mod float_bank {
     // through outlives the run; `OP_UDIV`/`OP_UMOD` guard `b != 0` before they
     // call.
     use majit_metainterp::intrinsics::{
-        majit_bits_to_f64, majit_f64_to_bits, majit_raw_load_f, majit_raw_load_i64,
-        majit_raw_load_u8, majit_raw_store_i64, majit_uint_div, majit_uint_le, majit_uint_lt,
-        majit_uint_mod, majit_uint_mul_high,
+        majit_bits_to_f64, majit_f64_to_bits, majit_int_py_div, majit_int_py_mod, majit_raw_load_f,
+        majit_raw_load_i64, majit_raw_load_u8, majit_raw_store_i64, majit_uint_div, majit_uint_le,
+        majit_uint_lt, majit_uint_mod, majit_uint_mul_high,
     };
 
     struct VmStateF {
@@ -1980,7 +1980,7 @@ pub mod float_bank {
                     let uq = if ua < 0 {
                         majit_uint_div(ua, ub)
                     } else {
-                        ua / ub
+                        majit_int_py_div(ua, ub)
                     };
                     let s = ma ^ mb;
                     state.regs[d] = (uq ^ s).wrapping_sub(s);
@@ -2002,7 +2002,7 @@ pub mod float_bank {
                     let ur = if ua < 0 {
                         majit_uint_mod(ua, ub)
                     } else {
-                        ua % ub
+                        majit_int_py_mod(ua, ub)
                     };
                     state.regs[d] = (ur ^ ma).wrapping_sub(ma);
                     pc += 4;
@@ -2154,7 +2154,7 @@ pub mod float_bank {
                         // dividend in 2^64 keeps the residual call.
                         majit_uint_div(ua, ub)
                     } else {
-                        ua / ub
+                        majit_int_py_div(ua, ub)
                     };
                     if ua < 0 && ub == 1 && s == 0 {
                         // The `INT_MIN / -1` corner `OP_DIV_CHK` guards.
@@ -2181,7 +2181,7 @@ pub mod float_bank {
                     } else {
                         // Off the mask `|k|` is at least 3 and below 2^63, so it
                         // reads non-negative and the expansion applies.
-                        ua % ub
+                        majit_int_py_mod(ua, ub)
                     };
                     if ua < 0 && ub == 1 && (ma ^ mk) == 0 {
                         state.regs[t] = 1;
@@ -2198,7 +2198,7 @@ pub mod float_bank {
                     // answers it. Below that the signed division agrees, and it
                     // is the one carrying the constant.
                     state.regs[d] = if k >= 0 && a >= 0 {
-                        a / k
+                        majit_int_py_div(a, k)
                     } else {
                         majit_uint_div(a, k)
                     };
@@ -2213,7 +2213,7 @@ pub mod float_bank {
                         // patterns at or above 2^63 included.
                         a & k.wrapping_sub(1)
                     } else if k >= 0 && a >= 0 {
-                        a % k
+                        majit_int_py_mod(a, k)
                     } else {
                         majit_uint_mod(a, k)
                     };
@@ -2239,7 +2239,7 @@ pub mod float_bank {
                     let uq = if ua < 0 {
                         majit_uint_div(ua, ub)
                     } else {
-                        ua / ub
+                        majit_int_py_div(ua, ub)
                     };
                     let s = ma ^ mk;
                     state.regs[d] = (uq ^ s).wrapping_sub(s);
@@ -2256,7 +2256,7 @@ pub mod float_bank {
                     let ur = if ua < 0 {
                         majit_uint_mod(ua, ub)
                     } else {
-                        ua % ub
+                        majit_int_py_mod(ua, ub)
                     };
                     state.regs[d] = (ur ^ ma).wrapping_sub(ma);
                     pc += 4;
@@ -2270,7 +2270,7 @@ pub mod float_bank {
                     // guard OFF the division's critical path where the five
                     // magnitude ops it replaces were on it.
                     state.regs[d] = if a >= 0 && k > 0 {
-                        a / k
+                        majit_int_py_div(a, k)
                     } else {
                         // `OP_DIV_K`'s arm verbatim, `|i64::MIN|` corner
                         // included: a wrong non-negativity claim must cost a
@@ -2282,7 +2282,7 @@ pub mod float_bank {
                         let uq = if ua < 0 {
                             majit_uint_div(ua, ub)
                         } else {
-                            ua / ub
+                            majit_int_py_div(ua, ub)
                         };
                         let s = ma ^ mk;
                         (uq ^ s).wrapping_sub(s)
@@ -2294,7 +2294,7 @@ pub mod float_bank {
                     let k = program[pc + 2];
                     let d = program[pc + 3] as usize;
                     state.regs[d] = if a >= 0 && k > 0 {
-                        a % k
+                        majit_int_py_mod(a, k)
                     } else {
                         // `OP_MOD_K`'s arm verbatim -- see `OP_DIVN_K`.
                         let ma = a >> 63;
@@ -2304,7 +2304,7 @@ pub mod float_bank {
                         let ur = if ua < 0 {
                             majit_uint_mod(ua, ub)
                         } else {
-                            ua % ub
+                            majit_int_py_mod(ua, ub)
                         };
                         (ur ^ ma).wrapping_sub(ma)
                     };

@@ -50,6 +50,7 @@
 //! parameter.
 
 use core::alloc::Layout;
+use core::any::Any;
 use core::cell::{Cell, RefCell};
 use core::marker::PhantomData;
 
@@ -136,6 +137,12 @@ pub struct CelHeap {
     /// count.
     objects: Cell<u64>,
     bytes: Cell<u64>,
+    /// Host objects behind [`super::object::W_OpaqueObject::host_index`].
+    ///
+    /// D12: they live as long as this heap. A side table, not a `Drop` payload
+    /// on the leaf — `alloc` refuses types that need dropping, and a finalizer
+    /// is the other contract the design left open.
+    hosts: RefCell<Vec<Box<dyn Any>>>,
 }
 
 impl CelHeap {
@@ -144,6 +151,7 @@ impl CelHeap {
             segments: RefCell::new(Vec::new()),
             objects: Cell::new(0),
             bytes: Cell::new(0),
+            hosts: RefCell::new(Vec::new()),
         }
     }
 
@@ -211,6 +219,26 @@ impl CelHeap {
     /// "took a new one", which is what the growth tests need.
     pub fn segments(&self) -> usize {
         self.segments.borrow().len()
+    }
+
+    /// Park `host` for the life of this heap and return its index.
+    pub fn push_host(&self, host: Box<dyn Any>) -> i64 {
+        let mut hosts = self.hosts.borrow_mut();
+        let idx = hosts.len() as i64;
+        hosts.push(host);
+        idx
+    }
+
+    /// Borrow host `idx` for the duration of `f`.
+    pub fn with_host<R>(&self, idx: i64, f: impl FnOnce(&dyn Any) -> R) -> Option<R> {
+        let hosts = self.hosts.borrow();
+        let slot = hosts.get(idx as usize)?;
+        Some(f(slot.as_ref()))
+    }
+
+    /// How many host objects this heap is holding.
+    pub fn host_count(&self) -> usize {
+        self.hosts.borrow().len()
     }
 }
 
@@ -361,6 +389,26 @@ mod tests {
             let p = heap.alloc_raw(8, 8);
             assert_eq!(p as usize % 8, 0);
         }
+    }
+
+    /// Host objects live as long as the heap and come back by index.
+    #[test]
+    fn host_slots_round_trip_until_the_heap_drops() {
+        let heap = CelHeap::new();
+        let a = heap.push_host(Box::new(7u64));
+        let b = heap.push_host(Box::new(8u64));
+        assert_eq!(a, 0);
+        assert_eq!(b, 1);
+        assert_eq!(heap.host_count(), 2);
+        assert_eq!(
+            heap.with_host(a, |h| *h.downcast_ref::<u64>().unwrap()),
+            Some(7)
+        );
+        assert_eq!(
+            heap.with_host(b, |h| *h.downcast_ref::<u64>().unwrap()),
+            Some(8)
+        );
+        assert!(heap.with_host(2, |_| ()).is_none());
     }
 
     /// The thread-local heap is the same heap across calls, which is what

@@ -56,7 +56,7 @@
 //! argument out of, and with that call the module that carried pyre's name so
 //! the three-segment path suffix would match.
 
-use core::mem::offset_of;
+use core::mem::{align_of, offset_of};
 
 use super::lltype;
 use super::object_array::{self, CelBytesBlock, CelItemsBlock};
@@ -87,6 +87,9 @@ pub enum CelKind {
     Map = 12,
     #[cfg(feature = "structs")]
     Struct = 13,
+    /// A foreign host object. The leaf is [`W_OpaqueObject`]; the host itself
+    /// lives in the heap's side table (D12).
+    Opaque = 14,
 }
 
 /// One value class.
@@ -455,21 +458,79 @@ pub fn new_string(s: &str) -> *mut W_StringObject {
     })
 }
 
+/// How a [`W_ListObject`] holds its elements.
+///
+/// An inline tag, not a strategy object: a discriminant read plus a
+/// narrowing chain, the same guard-then-fold as a typeptr and one fewer
+/// object. D4.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListStrategy {
+    /// Boxed [`CelRef`]s in [`W_ListObject::items`].
+    Object = 0,
+    /// Unboxed `i64`s in a [`W_IntColumn`] at [`W_ListObject::storage`].
+    Ints = 1,
+    /// A column or record window parked in the heap host table. The
+    /// schema/buffer stays shared; `start`/`length` are the window.
+    Window = 2,
+}
+
+/// An unboxed integer column. Not pointer-traced; the payload is raw `i64`s.
+#[cfg_attr(feature = "jit", majit_macros::jit_immutable_fields(data, length))]
+#[repr(C)]
+#[allow(non_camel_case_types)]
+pub struct W_IntColumn {
+    pub ob_header: CelObject,
+    pub data: *mut i64,
+    pub length: i64,
+}
+
+pub static CEL_INT_COLUMN_CLASS: CelClass = CelClass::new("int_column", CelKind::List);
+
+const _: () = {
+    assert!(offset_of!(W_IntColumn, ob_header) == 0);
+};
+
+/// Box `values` as an unboxed int column.
+pub fn new_int_column(values: &[i64]) -> *mut W_IntColumn {
+    let length = values.len() as i64;
+    let data = if values.is_empty() {
+        core::ptr::null_mut()
+    } else {
+        let bytes = values.len() * core::mem::size_of::<i64>();
+        let ptr = super::heap::with_heap(|h| h.alloc_raw(bytes, align_of::<i64>())) as *mut i64;
+        unsafe {
+            core::ptr::copy_nonoverlapping(values.as_ptr(), ptr, values.len());
+        }
+        ptr
+    };
+    lltype::malloc_typed(W_IntColumn {
+        ob_header: CelObject {
+            ob_type: &CEL_INT_COLUMN_CLASS,
+        },
+        data,
+        length,
+    })
+}
+
 /// A CEL `list`.
 ///
-/// ⚠ §3 of the design gives this leaf a `strategy` tag beside the storage
-/// pointer. It is deliberately absent here: a discriminant is only meaningful
-/// once there is a second strategy to discriminate, and the design schedules
-/// those for the phase that lands the unboxed columns. Adding the field now
-/// would be a shape with one inhabitant and no reader. It is a scalar field, so
-/// adding it later does not change how this leaf fuses.
-#[cfg_attr(feature = "jit", majit_macros::jit_immutable_fields(items, length))]
+/// Strategy tag + storage + window, the `listobject.py` shape. Object
+/// lists keep their items block on the leaf (the block is not a
+/// class-family value); int columns and host windows live at `storage`.
+#[cfg_attr(
+    feature = "jit",
+    majit_macros::jit_immutable_fields(strategy, storage, items, start, length)
+)]
 #[repr(C)]
 #[allow(non_camel_case_types)]
 pub struct W_ListObject {
     pub ob_header: CelObject,
+    pub strategy: ListStrategy,
+    /// [`W_IntColumn`] or a [`W_OpaqueObject`] holding a window host.
+    pub storage: CelRef,
     pub items: *mut CelItemsBlock,
-    /// Live element count.
+    pub start: i64,
     pub length: i64,
 }
 
@@ -553,11 +614,27 @@ pub unsafe fn list_get(w: CelRef, index: i64) -> Option<CelRef> {
     if index >= leaf.length {
         return None;
     }
-    let base = crate::runtime::object_array::items_block_items_base(leaf.items);
-    if base.is_null() {
-        return None;
+    let at = leaf.start + index;
+    match leaf.strategy {
+        ListStrategy::Object => {
+            let base = crate::runtime::object_array::items_block_items_base(leaf.items);
+            if base.is_null() {
+                return None;
+            }
+            Some(*base.add(at as usize))
+        }
+        ListStrategy::Ints => {
+            if leaf.storage.is_null() {
+                return None;
+            }
+            let col = &*leaf.storage.cast::<W_IntColumn>();
+            if col.data.is_null() || at < 0 || at >= col.length {
+                return None;
+            }
+            Some(new_int(*col.data.add(at as usize)) as CelRef)
+        }
+        ListStrategy::Window => None,
     }
-    Some(*base.add(index as usize))
 }
 
 pub fn new_list(values: &[CelRef]) -> *mut W_ListObject {
@@ -567,7 +644,40 @@ pub fn new_list(values: &[CelRef]) -> *mut W_ListObject {
         ob_header: CelObject {
             ob_type: &CEL_LIST_CLASS,
         },
+        strategy: ListStrategy::Object,
+        storage: core::ptr::null_mut(),
         items,
+        start: 0,
+        length,
+    })
+}
+
+/// Box unboxed integers as a CEL list.
+pub fn new_list_ints(values: &[i64]) -> *mut W_ListObject {
+    let storage = new_int_column(values) as CelRef;
+    let length = values.len() as i64;
+    lltype::malloc_typed(W_ListObject {
+        ob_header: CelObject {
+            ob_type: &CEL_LIST_CLASS,
+        },
+        strategy: ListStrategy::Ints,
+        storage,
+        items: core::ptr::null_mut(),
+        start: 0,
+        length,
+    })
+}
+
+/// Box a host-table window as a CEL list.
+pub fn new_list_window(storage: CelRef, start: i64, length: i64) -> *mut W_ListObject {
+    lltype::malloc_typed(W_ListObject {
+        ob_header: CelObject {
+            ob_type: &CEL_LIST_CLASS,
+        },
+        strategy: ListStrategy::Window,
+        storage,
+        items: core::ptr::null_mut(),
+        start,
         length,
     })
 }
@@ -586,23 +696,30 @@ fn interleaved_pair_block(pairs: &[(CelRef, CelRef)]) -> *mut CelItemsBlock {
     object_array::new_items_block(&items)
 }
 
+/// How a [`W_MapObject`] holds its entries. D4, same as [`ListStrategy`].
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MapStrategy {
+    Object = 0,
+    /// One record row. The schema lives in the heap host table at `storage`.
+    Record = 1,
+}
+
 /// A CEL `map`.
 ///
-/// ⚠ §3 of the design gives this leaf a `strategy` tag beside the storage
-/// pointer. It is deliberately absent here: a discriminant is only meaningful
-/// once there is a second strategy to discriminate, and the design schedules
-/// those for the phase that lands the unboxed columns. Adding the field now
-/// would be a shape with one inhabitant and no reader. It is a scalar field, so
-/// adding it later does not change how this leaf fuses.
-///
-/// Entries live as interleaved `[k0, v0, k1, v1, …]` references in one
-/// [`CelItemsBlock`]. [`W_MapObject::length`] is the entry count, so the block
-/// holds `2 * length` items.
-#[cfg_attr(feature = "jit", majit_macros::jit_immutable_fields(items, length))]
+/// Entries of an object map live as interleaved `[k0, v0, …]` references.
+/// A record row parks its schema in the host table so intern does not
+/// explode the window.
+#[cfg_attr(
+    feature = "jit",
+    majit_macros::jit_immutable_fields(strategy, storage, items, length)
+)]
 #[repr(C)]
 #[allow(non_camel_case_types)]
 pub struct W_MapObject {
     pub ob_header: CelObject,
+    pub strategy: MapStrategy,
+    pub storage: CelRef,
     pub items: *mut CelItemsBlock,
     /// Live entry count, not the number of references in [`Self::items`].
     pub length: i64,
@@ -669,7 +786,22 @@ pub fn new_map(pairs: &[(CelRef, CelRef)]) -> *mut W_MapObject {
         ob_header: CelObject {
             ob_type: &CEL_MAP_CLASS,
         },
+        strategy: MapStrategy::Object,
+        storage: core::ptr::null_mut(),
         items,
+        length,
+    })
+}
+
+/// Box a host-table record row as a CEL map.
+pub fn new_map_record(storage: CelRef, length: i64) -> *mut W_MapObject {
+    lltype::malloc_typed(W_MapObject {
+        ob_header: CelObject {
+            ob_type: &CEL_MAP_CLASS,
+        },
+        strategy: MapStrategy::Record,
+        storage,
+        items: core::ptr::null_mut(),
         length,
     })
 }
@@ -769,6 +901,50 @@ pub fn new_type(cls: &'static CelClass) -> *mut W_TypeObject {
         },
         cls,
     })
+}
+
+/// A foreign host object.
+///
+/// `w_type` is a type value ([`W_TypeObject`]); `host_index` is a slot in
+/// this thread's heap table. D12: the host lives as long as the heap — no
+/// finalizer, no `Drop` on the leaf.
+#[cfg_attr(
+    feature = "jit",
+    majit_macros::jit_immutable_fields(w_type, host_index)
+)]
+#[repr(C)]
+#[allow(non_camel_case_types)]
+pub struct W_OpaqueObject {
+    pub ob_header: CelObject,
+    pub w_type: CelRef,
+    pub host_index: i64,
+}
+
+/// The class of [`W_OpaqueObject`].
+pub static CEL_OPAQUE_CLASS: CelClass = CelClass::new("opaque", CelKind::Opaque);
+
+const _: () = {
+    assert!(offset_of!(W_OpaqueObject, ob_header) == 0);
+};
+
+/// Box a host-table slot as a CEL opaque.
+pub fn new_opaque(w_type: CelRef, host_index: i64) -> *mut W_OpaqueObject {
+    lltype::malloc_typed(W_OpaqueObject {
+        ob_header: CelObject {
+            ob_type: &CEL_OPAQUE_CLASS,
+        },
+        w_type,
+        host_index,
+    })
+}
+
+/// The host-table index of an opaque leaf.
+///
+/// # Safety
+///
+/// `w` is a live [`W_OpaqueObject`].
+pub unsafe fn opaque_host_index(w: CelRef) -> i64 {
+    (*w.cast::<W_OpaqueObject>()).host_index
 }
 
 /// Box `value` as a CEL `bool`.
@@ -887,6 +1063,10 @@ mod tests {
         check(new_string("x") as CelRef, &CEL_STRING_CLASS);
         check(new_list(&[]) as CelRef, &CEL_LIST_CLASS);
         check(new_map(&[]) as CelRef, &CEL_MAP_CLASS);
+        check(
+            new_opaque(new_type(&CEL_OPAQUE_CLASS) as CelRef, 0) as CelRef,
+            &CEL_OPAQUE_CLASS,
+        );
         #[cfg(feature = "structs")]
         check(
             new_struct(new_string("T"), &[]) as CelRef,

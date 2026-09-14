@@ -57,11 +57,11 @@
 
 use super::error::{raise, CelErrCode, ERROR_SENTINEL};
 use super::object::{
-    new_bool, new_bytes, new_double, new_duration, new_int, new_list, new_string, new_timestamp,
-    new_uint, CelClass, CelRef, W_BytesObject, W_ListObject, W_MapObject, W_StringObject,
+    new_bool, new_bytes, new_double, new_duration, new_int, new_list, new_null, new_string,
+    new_timestamp, new_uint, CelClass, CelRef, W_BytesObject, W_MapObject, W_StringObject,
     CEL_BOOL_CLASS, CEL_BYTES_CLASS, CEL_DOUBLE_CLASS, CEL_DURATION_CLASS, CEL_INT_CLASS,
-    CEL_LIST_CLASS, CEL_MAP_CLASS, CEL_NULL_CLASS, CEL_OPTIONAL_CLASS, CEL_STRING_CLASS,
-    CEL_TIMESTAMP_CLASS, CEL_TYPE_CLASS, CEL_UINT_CLASS,
+    CEL_LIST_CLASS, CEL_MAP_CLASS, CEL_NULL_CLASS, CEL_OPAQUE_CLASS, CEL_OPTIONAL_CLASS,
+    CEL_STRING_CLASS, CEL_TIMESTAMP_CLASS, CEL_TYPE_CLASS, CEL_UINT_CLASS,
 };
 use super::object_array::{bytes_base, items_block_items_base};
 
@@ -76,6 +76,7 @@ unsafe fn class_of(w: CelRef) -> *const CelClass {
 }
 
 use super::object::payload;
+use crate::Value;
 
 use super::object::{
     W_BoolObject, W_DoubleObject, W_DurationObject, W_IntObject, W_OptionalObject,
@@ -180,15 +181,17 @@ unsafe fn bytes_payload(w: CelRef) -> &'static [u8] {
 /// # Safety
 ///
 /// `w` is a live list.
-unsafe fn list_items(w: CelRef) -> &'static [CelRef] {
-    let leaf = &*w.cast::<W_ListObject>();
-    let n = leaf.length as usize;
-    let base = items_block_items_base(leaf.items);
-    if base.is_null() {
-        &[]
-    } else {
-        std::slice::from_raw_parts(base, n)
+unsafe fn list_items(w: CelRef) -> Vec<CelRef> {
+    let n = super::object::list_len(w);
+    let mut out = Vec::with_capacity(n as usize);
+    let mut i = 0;
+    while i < n {
+        if let Some(item) = super::convert::interned_list_get(w, i) {
+            out.push(item);
+        }
+        i += 1;
     }
+    out
 }
 
 fn cmp_bytes(l: &[u8], r: &[u8]) -> i64 {
@@ -230,8 +233,8 @@ pub unsafe fn w_list_add(a: CelRef, b: CelRef) -> CelRef {
     let left = list_items(a);
     let right = list_items(b);
     let mut out = Vec::with_capacity(left.len() + right.len());
-    out.extend_from_slice(left);
-    out.extend_from_slice(right);
+    out.extend_from_slice(&left);
+    out.extend_from_slice(&right);
     new_list(&out) as CelRef
 }
 
@@ -252,14 +255,32 @@ pub unsafe fn w_bytes_eq(a: CelRef, b: CelRef) -> bool {
 /// # Safety
 ///
 /// `w` is a live map.
-unsafe fn map_pairs(w: CelRef) -> &'static [CelRef] {
+unsafe fn map_pairs(w: CelRef) -> Vec<CelRef> {
     let leaf = &*w.cast::<W_MapObject>();
-    let n = (leaf.length as usize).saturating_mul(2);
-    let base = items_block_items_base(leaf.items);
-    if base.is_null() {
-        &[]
-    } else {
-        std::slice::from_raw_parts(base, n)
+    match leaf.strategy {
+        super::object::MapStrategy::Object => {
+            let n = (leaf.length as usize).saturating_mul(2);
+            let base = items_block_items_base(leaf.items);
+            if base.is_null() {
+                Vec::new()
+            } else {
+                std::slice::from_raw_parts(base, n).to_vec()
+            }
+        }
+        super::object::MapStrategy::Record => {
+            let Ok(Value::Map(map)) = super::convert::ref_to_value(w) else {
+                return Vec::new();
+            };
+            let mut pairs = Vec::with_capacity(map.len() * 2);
+            for (k, v) in map.iter() {
+                pairs.push(
+                    super::convert::intern_leaf(&Value::from(k.clone()))
+                        .unwrap_or(new_null() as CelRef),
+                );
+                pairs.push(super::convert::intern_leaf(v.as_ref()).unwrap_or(new_null() as CelRef));
+            }
+            pairs
+        }
     }
 }
 
@@ -884,6 +905,18 @@ pub unsafe fn w_optional_eq(a: CelRef, b: CelRef) -> bool {
     unsafe { values_equal(va, vb) }
 }
 
+/// `opaque == opaque` through the heap host table (D12).
+///
+/// # Safety
+///
+/// Both operands must be live [`super::object::W_OpaqueObject`] values.
+pub unsafe fn w_opaque_eq(a: CelRef, b: CelRef) -> bool {
+    super::convert::opaque_hosts_equal(
+        super::object::opaque_host_index(a),
+        super::object::opaque_host_index(b),
+    )
+}
+
 // The cross-type numeric helpers. Three, not six: `==` is symmetric, and each
 // reversed ordering is the forward one under `cmp_reverse`.
 //
@@ -981,6 +1014,7 @@ pub unsafe fn values_equal(a: CelRef, b: CelRef) -> bool {
             CEL_BYTES_CLASS => w_bytes_eq,
             CEL_LIST_CLASS => w_list_eq,
             CEL_MAP_CLASS => w_map_eq,
+            CEL_OPAQUE_CLASS => w_opaque_eq,
         );
     }
     values_equal_mixed(a, b, ta, tb)
