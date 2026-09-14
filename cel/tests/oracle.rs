@@ -125,6 +125,8 @@ const EVALUATORS: &[Evaluator] = &[
 /// this test knows anything about the value universe, so a phase that changes
 /// that universe changes exactly one function here and the corpus stays put.
 fn render(value: &Value) -> String {
+    let unpacked = value.unpack();
+    let value = &unpacked;
     match value {
         Value::Int(i) => format!("int({i})"),
         Value::UInt(u) => format!("uint({u})"),
@@ -169,6 +171,7 @@ fn render(value: &Value) -> String {
         },
         #[cfg(feature = "chrono")]
         Value::Timestamp(t) => format!("timestamp({})", t.to_rfc3339()),
+        Value::Interned(_) => render(&value.unpack()),
         // Rendered so the arm exists under `--features structs`; the corpus
         // carries no struct case (see this file's header).
         #[cfg(feature = "structs")]

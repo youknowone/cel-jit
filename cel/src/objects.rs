@@ -2,6 +2,7 @@ use crate::common::ast::{operators, CallExpr, ComprehensionExpr, EntryExpr, Expr
 #[cfg(feature = "structs")]
 use crate::common::types::CelStruct;
 use crate::context::Context;
+use crate::runtime::object::CelRef;
 use crate::ExecutionError::NoSuchOverload;
 use crate::{ExecutionError, Expression, FunctionContext};
 #[cfg(feature = "chrono")]
@@ -637,7 +638,7 @@ where
 /// let b = Value::Opaque(Arc::new(MyId(7)));
 /// assert_eq!(a, b);
 /// ```
-pub trait Opaque: Any + OpaqueEq + AsDebug + Send + Sync {
+pub trait Opaque: Any + OpaqueEq + AsDebug {
     /// Returns a stable, fully-qualified type name for this value's runtime type.
     ///
     /// This name is used to check type compatibility before attempting downcasts
@@ -1019,6 +1020,10 @@ pub enum Value {
     #[cfg(feature = "structs")]
     Struct(Arc<CelStruct>),
     Null,
+    /// A class-family leaf. The VM keeps values in this form so the public
+    /// result is a `W_Root` pointer, not a rebuilt enum. `unpack` restores
+    /// the typed variants for match sites that have not moved yet.
+    Interned(CelRef),
 }
 
 impl Debug for Value {
@@ -1040,6 +1045,7 @@ impl Debug for Value {
             Value::Null => write!(f, "Null"),
             #[cfg(feature = "structs")]
             Value::Struct(s) => write!(f, "{} {{}}", s.name()),
+            Value::Interned(w) => write!(f, "{:?}", self.unpack_interned(*w)),
         }
     }
 }
@@ -1084,6 +1090,28 @@ impl Display for ValueType {
 }
 
 impl Value {
+    /// Wrap a live class-family leaf as the public value.
+    pub(crate) fn from_interned(w: CelRef) -> Self {
+        Value::Interned(w)
+    }
+
+    /// Restore the typed variants. An interned leaf that convert cannot
+    /// read back is `Null`.
+    pub fn unpack(&self) -> Value {
+        match self {
+            Value::Interned(w) => self.unpack_interned(*w),
+            other => other.clone(),
+        }
+    }
+
+    fn unpack_interned(&self, w: CelRef) -> Value {
+        match unsafe { crate::runtime::convert::ref_to_value(w) } {
+            Ok(Value::Interned(_)) => Value::Null,
+            Ok(v) => v,
+            Err(_) => Value::Null,
+        }
+    }
+
     pub fn type_of(&self) -> ValueType {
         match self {
             Value::List(_) => ValueType::List,
@@ -1102,6 +1130,7 @@ impl Value {
             Value::Null => ValueType::Null,
             #[cfg(feature = "structs")]
             Value::Struct(_) => ValueType::Struct,
+            Value::Interned(_) => self.unpack().type_of(),
         }
     }
 
@@ -1118,6 +1147,7 @@ impl Value {
             #[cfg(feature = "chrono")]
             Value::Duration(v) => v.is_zero(),
             Value::Null => true,
+            Value::Interned(_) => self.unpack().is_zero(),
             _ => false,
         }
     }
@@ -1139,6 +1169,10 @@ impl From<&Value> for Value {
 impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
+            (Value::Interned(a), Value::Interned(b)) => unsafe {
+                crate::runtime::binop::values_equal(*a, *b)
+            },
+            (Value::Interned(_), _) | (_, Value::Interned(_)) => self.unpack() == other.unpack(),
             (Value::Map(a), Value::Map(b)) => a == b,
             (Value::List(a), Value::List(b)) => a == b,
             (Value::Int(a), Value::Int(b)) => a == b,
@@ -1177,6 +1211,9 @@ impl Eq for Value {}
 
 impl PartialOrd for Value {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        if matches!(self, Value::Interned(_)) || matches!(other, Value::Interned(_)) {
+            return self.unpack().partial_cmp(&other.unpack());
+        }
         match (self, other) {
             (Value::Int(a), Value::Int(b)) => Some(a.cmp(b)),
             (Value::UInt(a), Value::UInt(b)) => Some(a.cmp(b)),
@@ -1780,8 +1817,10 @@ pub(crate) fn as_optional(value: &Value) -> Option<&OptionalValue> {
 
 fn try_bool_value(val: Result<Value, ExecutionError>) -> Result<bool, ExecutionError> {
     match val {
-        Ok(Value::Bool(b)) => Ok(b),
-        Ok(_) => Err(ExecutionError::NoSuchOverload),
+        Ok(v) => match v.unpack() {
+            Value::Bool(b) => Ok(b),
+            _ => Err(ExecutionError::NoSuchOverload),
+        },
         Err(err) => Err(err),
     }
 }
@@ -1809,6 +1848,7 @@ fn resolve_args(args: &[Expression], ctx: &Context) -> Result<Vec<Value>, Execut
 /// evaluators, not by reading the impls: a capability trait's terminal error is
 /// easy to misattribute to a neighbouring impl.
 pub(crate) fn mismatch_is_no_such_overload(op: &'static str, value: &Value) -> bool {
+    let value = value.unpack();
     #[cfg(feature = "chrono")]
     let duration_sub = matches!(value, Value::Duration(_)) && op == "sub";
     #[cfg(not(feature = "chrono"))]
@@ -2016,6 +2056,9 @@ fn timestamp_duration_binop(
 /// or a map by falling through, where `common/types` gives those no `Comparer`,
 /// so ordering them is `NoSuchOverload`.
 fn has_comparer(value: &Value) -> bool {
+    if matches!(value, Value::Interned(_)) {
+        return has_comparer(&value.unpack());
+    }
     #[cfg(feature = "chrono")]
     if matches!(value, Value::Duration(_) | Value::Timestamp(_)) {
         return true;
@@ -2055,7 +2098,7 @@ pub(crate) fn compare_values(
 }
 
 pub(crate) fn value_negate(value: Value) -> Result<Value, ExecutionError> {
-    match value {
+    match value.unpack() {
         Value::Int(i) => i
             .checked_neg()
             .ok_or_else(|| ExecutionError::Overflow("negate", Value::Int(i), Value::Int(0)))
@@ -2070,7 +2113,7 @@ pub(crate) fn value_negate(value: Value) -> Result<Value, ExecutionError> {
 
 /// Converts `value` into a map key.
 pub(crate) fn value_key(value: Value) -> Result<Key, ExecutionError> {
-    match value {
+    match value.unpack() {
         Value::Int(i) => Ok(Key::Int(i)),
         Value::UInt(u) => Ok(Key::Uint(u)),
         Value::Bool(b) => Ok(Key::Bool(b)),
@@ -2084,7 +2127,8 @@ pub(crate) fn value_key(value: Value) -> Result<Key, ExecutionError> {
 /// `KeyRef::String` borrows, so a map field select costs no allocation. Going
 /// through [`value_index`] would build an `Arc<String>` per access.
 pub(crate) fn value_field(container: &Value, field: &str) -> Result<Value, ExecutionError> {
-    match container {
+    let container = container.unpack();
+    match &container {
         Value::Map(map) => map
             .get(&KeyRef::String(field))
             .map(|v| v.into_owned())
@@ -2094,16 +2138,18 @@ pub(crate) fn value_field(container: &Value, field: &str) -> Result<Value, Execu
             want: format!("{}|{}", ValueType::Int, ValueType::UInt),
         }),
         #[cfg(feature = "structs")]
-        Value::Struct(_) => value_index(container, &Value::String(Arc::new(field.to_string()))),
+        Value::Struct(_) => value_index(&container, &Value::String(Arc::new(field.to_string()))),
         _ => Err(ExecutionError::NoSuchOverload),
     }
 }
 
 /// `container[key]`, for every container the walker can index.
 pub(crate) fn value_index(container: &Value, key: &Value) -> Result<Value, ExecutionError> {
-    match container {
+    let container = container.unpack();
+    let key = key.unpack();
+    match &container {
         Value::List(list) => {
-            let idx = match key {
+            let idx = match &key {
                 Value::Int(i) => *i as usize,
                 Value::UInt(u) => *u as usize,
                 other => {
@@ -2123,7 +2169,7 @@ pub(crate) fn value_index(container: &Value, key: &Value) -> Result<Value, Execu
                 .ok_or_else(|| ExecutionError::NoSuchKey(Arc::new(key_display(&k))))
         }
         #[cfg(feature = "structs")]
-        Value::Struct(s) => match key {
+        Value::Struct(s) => match &key {
             Value::String(field) => s
                 .field_value(field)
                 .cloned()
@@ -2168,16 +2214,18 @@ fn key_display(key: &Key) -> String {
 /// A needle that cannot be a map key is an error rather than a miss, which is
 /// why the conversion is propagated instead of folded into `false`.
 pub(crate) fn value_contains(container: &Value, needle: &Value) -> Result<bool, ExecutionError> {
-    match container {
-        Value::List(list) => Ok(list.contains(needle)),
-        Value::Map(map) => Ok(map.contains_key(&value_key(needle.clone())?)),
+    let container = container.unpack();
+    let needle = needle.unpack();
+    match &container {
+        Value::List(list) => Ok(list.contains(&needle)),
+        Value::Map(map) => Ok(map.contains_key(&value_key(needle)?)),
         _ => Err(ExecutionError::NoSuchOverload),
     }
 }
 
 /// The elements a comprehension iterates over.
 pub(crate) fn value_iter(value: &Value) -> Result<Vec<Value>, ExecutionError> {
-    match value {
+    match &value.unpack() {
         Value::List(list) => Ok(list.to_vec()),
         Value::Map(map) => Ok(map_keys(map)),
         _ => Err(ExecutionError::NoSuchOverload),
@@ -2189,6 +2237,9 @@ impl ops::Add<Value> for Value {
 
     #[inline(always)]
     fn add(self, rhs: Value) -> Self::Output {
+        if matches!(self, Value::Interned(_)) || matches!(rhs, Value::Interned(_)) {
+            return self.unpack().add(rhs.unpack());
+        }
         match (self, rhs) {
             (Value::Int(l), Value::Int(r)) => l
                 .checked_add(r)
@@ -2237,6 +2288,9 @@ impl ops::Sub<Value> for Value {
 
     #[inline(always)]
     fn sub(self, rhs: Value) -> Self::Output {
+        if matches!(self, Value::Interned(_)) || matches!(rhs, Value::Interned(_)) {
+            return self.unpack().sub(rhs.unpack());
+        }
         match (self, rhs) {
             (Value::Int(l), Value::Int(r)) => l
                 .checked_sub(r)
@@ -2273,6 +2327,9 @@ impl ops::Div<Value> for Value {
 
     #[inline(always)]
     fn div(self, rhs: Value) -> Self::Output {
+        if matches!(self, Value::Interned(_)) || matches!(rhs, Value::Interned(_)) {
+            return self.unpack().div(rhs.unpack());
+        }
         match (self, rhs) {
             (Value::Int(l), Value::Int(r)) => {
                 if r == 0 {
@@ -2303,6 +2360,9 @@ impl ops::Mul<Value> for Value {
 
     #[inline(always)]
     fn mul(self, rhs: Value) -> Self::Output {
+        if matches!(self, Value::Interned(_)) || matches!(rhs, Value::Interned(_)) {
+            return self.unpack().mul(rhs.unpack());
+        }
         match (self, rhs) {
             (Value::Int(l), Value::Int(r)) => l
                 .checked_mul(r)
@@ -2328,6 +2388,9 @@ impl ops::Rem<Value> for Value {
 
     #[inline(always)]
     fn rem(self, rhs: Value) -> Self::Output {
+        if matches!(self, Value::Interned(_)) || matches!(rhs, Value::Interned(_)) {
+            return self.unpack().rem(rhs.unpack());
+        }
         match (self, rhs) {
             (Value::Int(l), Value::Int(r)) => {
                 if r == 0 {

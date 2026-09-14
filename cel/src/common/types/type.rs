@@ -198,7 +198,7 @@ mod tests {
     /// The denoted type's name, so a test can say what `type(x)` answered
     /// without reaching through `Opaque` at every call site.
     fn type_name_of(expr: &str) -> String {
-        match eval(expr).unwrap() {
+        match eval(expr).unwrap().unpack() {
             Value::Opaque(o) => o
                 .downcast_ref::<TypeValue>()
                 .unwrap_or_else(|| panic!("`{expr}` is not a type value"))
@@ -246,7 +246,7 @@ mod tests {
     #[test]
     fn name_agrees_with_type_type() {
         // The literal in `runtime_type_name` and the constant cannot drift.
-        let value = eval("type(1)").unwrap();
+        let value = eval("type(1)").unwrap().unpack();
         let Value::Opaque(o) = value else {
             panic!("not opaque");
         };

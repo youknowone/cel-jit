@@ -286,7 +286,7 @@ pub struct FunctionRegistry {
 impl FunctionRegistry {
     pub(crate) fn add<F, T>(&mut self, name: &str, function: F)
     where
-        F: IntoFunction<T> + 'static + Send + Sync,
+        F: IntoFunction<T> + 'static,
         T: 'static,
     {
         self.functions
@@ -307,7 +307,7 @@ impl FunctionRegistry {
 
 /// A registered function in the form every evaluator calls it: arguments and
 /// receiver arrive through the [`FunctionContext`], the answer is a [`Value`].
-pub type ErasedFunction = Box<dyn Fn(&mut FunctionContext) -> ResolveResult + Send + Sync>;
+pub type ErasedFunction = Box<dyn Fn(&mut FunctionContext) -> ResolveResult>;
 
 /// A registered function.
 ///
@@ -331,7 +331,7 @@ impl Function {
 
     /// A function whose typed closure is also offered, boxed as `Any`: it is
     /// kept if it has one of [`ScalarFn`]'s signatures and dropped otherwise.
-    pub(crate) fn with_typed(erased: ErasedFunction, typed: Box<dyn Any + Send + Sync>) -> Self {
+    pub(crate) fn with_typed(erased: ErasedFunction, typed: Box<dyn Any>) -> Self {
         Function {
             erased,
             scalar: ScalarFn::from_any(typed).map(Arc::new),
@@ -345,7 +345,7 @@ impl Function {
 }
 
 impl std::ops::Deref for Function {
-    type Target = dyn Fn(&mut FunctionContext) -> ResolveResult + Send + Sync;
+    type Target = dyn Fn(&mut FunctionContext) -> ResolveResult;
 
     fn deref(&self) -> &Self::Target {
         &*self.erased
@@ -366,13 +366,13 @@ impl From<ErasedFunction> for Function {
 /// form, and an expression that calls it is evaluated by the tree-walker.
 pub enum ScalarFn {
     /// `fn(i64) -> i64`.
-    Int1(Box<dyn Fn(i64) -> i64 + Send + Sync>),
+    Int1(Box<dyn Fn(i64) -> i64>),
     /// `fn(i64, i64) -> i64`.
-    Int2(Box<dyn Fn(i64, i64) -> i64 + Send + Sync>),
+    Int2(Box<dyn Fn(i64, i64) -> i64>),
     /// `fn(f64) -> f64`.
-    Float1(Box<dyn Fn(f64) -> f64 + Send + Sync>),
+    Float1(Box<dyn Fn(f64) -> f64>),
     /// `fn(f64, f64) -> f64`.
-    Float2(Box<dyn Fn(f64, f64) -> f64 + Send + Sync>),
+    Float2(Box<dyn Fn(f64, f64) -> f64>),
 }
 
 impl ScalarFn {
@@ -382,20 +382,20 @@ impl ScalarFn {
     /// per `(A, B, R)`, so downcasting it is an exact test of the signature:
     /// no specialization, no `unsafe`, and a closure with any other signature
     /// fails every arm and is reported as having no scalar form.
-    fn from_any(typed: Box<dyn Any + Send + Sync>) -> Option<Self> {
-        let typed = match typed.downcast::<Box<dyn Fn(i64, i64) -> i64 + Send + Sync>>() {
+    fn from_any(typed: Box<dyn Any>) -> Option<Self> {
+        let typed = match typed.downcast::<Box<dyn Fn(i64, i64) -> i64>>() {
             Ok(f) => return Some(ScalarFn::Int2(*f)),
             Err(t) => t,
         };
-        let typed = match typed.downcast::<Box<dyn Fn(i64) -> i64 + Send + Sync>>() {
+        let typed = match typed.downcast::<Box<dyn Fn(i64) -> i64>>() {
             Ok(f) => return Some(ScalarFn::Int1(*f)),
             Err(t) => t,
         };
-        let typed = match typed.downcast::<Box<dyn Fn(f64, f64) -> f64 + Send + Sync>>() {
+        let typed = match typed.downcast::<Box<dyn Fn(f64, f64) -> f64>>() {
             Ok(f) => return Some(ScalarFn::Float2(*f)),
             Err(t) => t,
         };
-        match typed.downcast::<Box<dyn Fn(f64) -> f64 + Send + Sync>>() {
+        match typed.downcast::<Box<dyn Fn(f64) -> f64>>() {
             Ok(f) => Some(ScalarFn::Float1(*f)),
             Err(_) => None,
         }

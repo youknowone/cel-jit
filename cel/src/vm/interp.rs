@@ -1272,17 +1272,20 @@ impl<'a> Vm<'a> {
     fn finish(&mut self, operand: Operand) -> CelResult<Value> {
         match operand {
             Operand::Value(value) => Ok(value),
-            Operand::Interned(w) => unsafe { ref_to_value(w) }.map_err(|_| CelErr::InternalError),
-            Operand::EmptyList(_) => Ok(Value::list(Vec::new())),
-            Operand::Ints(words) => Ok(Value::list(ListStorage::Ints(words))),
-            Operand::List(items) => Ok(Value::list(items)),
-            Operand::Refs(items) => unsafe { ref_to_value(new_list(&items) as CelRef) }
-                .map_err(|_| CelErr::InternalError),
-            Operand::Map(entries) => Ok(Value::Map(Map::object(entries))),
-            Operand::MapRefs(pairs) => {
-                unsafe { ref_to_value(crate::runtime::object::new_map(&pairs) as CelRef) }
-                    .map_err(|_| CelErr::InternalError)
+            Operand::Interned(w) => Ok(Value::from_interned(w)),
+            Operand::EmptyList(_) => Ok(Value::from_interned(
+                crate::runtime::object::new_list(&[]) as CelRef,
+            )),
+            Operand::Ints(words) => {
+                let items: Vec<CelRef> = words.iter().map(|&n| new_int(n) as CelRef).collect();
+                Ok(Value::from_interned(new_list(&items) as CelRef))
             }
+            Operand::List(items) => Ok(Value::list(items)),
+            Operand::Refs(items) => Ok(Value::from_interned(new_list(&items) as CelRef)),
+            Operand::Map(entries) => Ok(Value::Map(Map::object(entries))),
+            Operand::MapRefs(pairs) => Ok(Value::from_interned(crate::runtime::object::new_map(
+                &pairs,
+            ) as CelRef)),
             Operand::Struct(name, fields) => self.close_struct(name, fields),
         }
     }
@@ -2787,11 +2790,22 @@ impl<'a> Vm<'a> {
         let Some(operand) = self.top() else {
             return Ok(false);
         };
-        let Some(w) = Self::leaf_of(operand) else {
-            return Ok(false);
-        };
-        let Some(n) = interned_size(w) else {
-            return Ok(false);
+        let n = match operand {
+            Operand::EmptyList(_) => 0,
+            Operand::Ints(words) => words.len() as i64,
+            Operand::Refs(items) => items.len() as i64,
+            Operand::List(items) => items.len() as i64,
+            Operand::MapRefs(pairs) => pairs.len() as i64,
+            Operand::Map(entries) => entries.len() as i64,
+            other => {
+                let Some(w) = Self::leaf_of(other) else {
+                    return Ok(false);
+                };
+                let Some(n) = interned_size(w) else {
+                    return Ok(false);
+                };
+                n
+            }
         };
         let _ = self.pop_operand();
         self.push_operand(Operand::Interned(new_int(n) as CelRef));
@@ -3067,6 +3081,7 @@ impl<'a> Vm<'a> {
 
     fn call_global(&mut self, name: NameId, args: Vec<Value>) -> CelResult<Value> {
         let func_name = self.name(name.0)?;
+        let args = unpack_host_args(args);
         if let Some(op) = self.ctx.env().find_overload(func_name, &args) {
             return op(args).map_err(|e| self.park(e));
         }
@@ -3086,6 +3101,7 @@ impl<'a> Vm<'a> {
     /// where the `CallMethod` after it takes them from.
     fn call_qualified(&mut self, joined: NameId, args: Vec<Value>) -> CelResult<Option<Value>> {
         let name = self.name(joined.0)?;
+        let args = unpack_host_args(args);
         if let Some(op) = self.ctx.env().find_overload(name, &args) {
             return op(args).map(Some).map_err(|e| self.park(e));
         }
@@ -3099,8 +3115,8 @@ impl<'a> Vm<'a> {
 
     fn call_member(&mut self, name: NameId, target: Value, args: Vec<Value>) -> CelResult<Value> {
         let func_name = self.name(name.0)?;
-        let mut with_target = args;
-        with_target.insert(0, target);
+        let mut with_target = unpack_host_args(args);
+        with_target.insert(0, target.unpack());
         if let Some(op) = self.ctx.env().find_member_overload(func_name, &with_target) {
             return op(with_target).map_err(|e| self.park(e));
         }
@@ -3361,6 +3377,10 @@ fn interned_to_timestamp(w: CelRef) -> Result<Option<CelRef>, ExecutionError> {
     }
 }
 
+fn unpack_host_args(args: Vec<Value>) -> Vec<Value> {
+    args.into_iter().map(|v| v.unpack()).collect()
+}
+
 fn interned_int(operand: &Operand) -> Option<i64> {
     match operand {
         Operand::Interned(k) if unsafe { w_kind(*k) } == CelKind::Int => {
@@ -3441,7 +3461,8 @@ fn interned_optional_is_none(w: CelRef) -> bool {
 }
 
 fn optional_inner(value: &Value) -> OptView {
-    match as_optional(value) {
+    let unpacked = value.unpack();
+    match as_optional(&unpacked) {
         None => OptView::Plain,
         Some(opt) => match opt.value() {
             None => OptView::Empty,
@@ -3455,15 +3476,15 @@ fn optional_inner(value: &Value) -> OptView {
 /// A non-bool is an overload failure rather than a coercion, which is what
 /// makes `1 && false` an *absorbed* error and not a truthiness test.
 fn as_bool(value: &Value) -> CelResult<bool> {
-    match value {
-        Value::Bool(b) => Ok(*b),
+    match value.unpack() {
+        Value::Bool(b) => Ok(b),
         _ => Err(CelErr::NoSuchOverload),
     }
 }
 
 /// `has(x.y)`.
 fn has_field(operand: &Value, field: &str) -> Result<Value, ExecutionError> {
-    match operand {
+    match &operand.unpack() {
         Value::Map(map) => Ok(Value::Bool(
             map.contains_key(&crate::objects::KeyRef::String(field)),
         )),
@@ -3488,8 +3509,8 @@ fn iter_keys(value: &Value) -> Result<Vec<Value>, ExecutionError> {
 /// error a handler absorbed for it. The asymmetry is CEL's: a *recorded* error
 /// is discarded when the right side decides the result, and raised otherwise.
 fn merge(left: CelResult<bool>, right: &Value, is_or: bool) -> CelResult<bool> {
-    let right = match right {
-        Value::Bool(b) => Some(*b),
+    let right = match right.unpack() {
+        Value::Bool(b) => Some(b),
         _ => None,
     };
     match (left, right) {

@@ -17,6 +17,8 @@ fn expect_optional(value: &Value) -> Result<&OptionalValue, ExecutionError> {
 /// Deliberately not [`Value::is_zero`], which answers `false` for the epoch
 /// timestamp and for a field-less struct where this answers `true`.
 fn is_zero_value(value: &Value) -> bool {
+    let unpacked = value.unpack();
+    let value = &unpacked;
     match value {
         Value::Bool(b) => !b,
         Value::Int(i) => *i == 0,
@@ -35,6 +37,7 @@ fn is_zero_value(value: &Value) -> bool {
         Value::Struct(s) => s.is_empty(),
         // An optional, and any host handle, declares no zero value.
         Value::Opaque(_) => false,
+        Value::Interned(_) => is_zero_value(&value.unpack()),
     }
 }
 

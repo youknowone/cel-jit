@@ -56,7 +56,8 @@ pub(crate) mod adapter {
     use crate::ExecutionError;
 
     pub fn sizer_size(args: Vec<Value>) -> Result<Value, ExecutionError> {
-        let size = match &args[0] {
+        let unpacked = args[0].unpack();
+        let size = match &unpacked {
             // Byte length, not the character count the spec asks for. Preserved
             // from the trait implementation this replaces.
             Value::String(s) => s.len(),

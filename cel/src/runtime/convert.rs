@@ -54,6 +54,7 @@ pub enum ConvertError {
 /// and list allocate a class-family leaf so the VM can stay on [`CelRef`].
 pub fn intern_leaf(v: &Value) -> Option<CelRef> {
     match v {
+        Value::Interned(w) => Some(*w),
         Value::Int(i) => Some(new_int(*i) as CelRef),
         Value::UInt(u) => Some(new_uint(*u) as CelRef),
         Value::Float(f) => Some(new_double(*f) as CelRef),
@@ -81,6 +82,7 @@ pub fn intern_leaf(v: &Value) -> Option<CelRef> {
 /// Allocate the internal form of `v` on this thread's heap.
 pub fn value_to_ref(v: &Value) -> Result<CelRef, ConvertError> {
     match v {
+        Value::Interned(w) => Ok(*w),
         Value::Int(i) => Ok(new_int(*i) as CelRef),
         Value::UInt(u) => Ok(new_uint(*u) as CelRef),
         Value::Float(f) => Ok(new_double(*f) as CelRef),

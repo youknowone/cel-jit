@@ -97,6 +97,8 @@ impl Type {
     /// Every family reports a shared constant except the two that carry a name:
     /// an opaque handle names its host type, and a struct names itself.
     fn matches(&self, val: &Value) -> bool {
+        let unpacked = val.unpack();
+        let val = &unpacked;
         let constant = match val {
             Value::Bool(_) => &BOOL_TYPE,
             Value::Int(_) => &INT_TYPE,
@@ -129,6 +131,7 @@ impl Type {
                         && self.runtime_type_name == o.runtime_type_name()
                 };
             }
+            Value::Interned(_) => return self.matches(&val.unpack()),
         };
         self == constant
     }
@@ -386,6 +389,8 @@ impl Type {
 /// [`ValueType`](crate::objects::ValueType)'s `Display`, which spells the same
 /// families `float`, `duration` and `null`.
 pub(crate) fn type_name(value: &Value) -> String {
+    let unpacked = value.unpack();
+    let value = &unpacked;
     match value {
         Value::Bool(_) => BOOL_TYPE.name().to_owned(),
         Value::Int(_) => INT_TYPE.name().to_owned(),
@@ -408,6 +413,7 @@ pub(crate) fn type_name(value: &Value) -> String {
             Some(_) => OPTIONAL_TYPE.name().to_owned(),
             None => o.runtime_type_name().to_owned(),
         },
+        Value::Interned(_) => type_name(&value.unpack()),
     }
 }
 
@@ -416,6 +422,8 @@ pub(crate) fn type_name(value: &Value) -> String {
 /// Returns it owned because the two named families build theirs per instance;
 /// overload matching uses [`Type::is_assignable`], which needs no allocation.
 pub(crate) fn type_of(value: &Value) -> Type {
+    let unpacked = value.unpack();
+    let value = &unpacked;
     match value {
         Value::Bool(_) => BOOL_TYPE.to_owned(),
         Value::Int(_) => INT_TYPE.to_owned(),
@@ -440,6 +448,7 @@ pub(crate) fn type_of(value: &Value) -> Type {
             None if o.downcast_ref::<TypeValue>().is_some() => TYPE_TYPE.to_owned(),
             None => Type::new_opaque_type(o.runtime_type_name().to_owned()),
         },
+        Value::Interned(_) => type_of(&value.unpack()),
     }
 }
 

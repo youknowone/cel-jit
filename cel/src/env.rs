@@ -11,7 +11,7 @@ use std::{
         btree_map::Entry::{Occupied, Vacant},
         BTreeMap,
     },
-    sync::{Arc, OnceLock},
+    sync::Arc,
 };
 
 /// An environment for the CEL execution.
@@ -70,8 +70,10 @@ impl Env {
     /// overloads, so building one per context is the dominant cost of
     /// `Context::default()`.
     pub fn shared_stdlib() -> Arc<Env> {
-        static SHARED: OnceLock<Arc<Env>> = OnceLock::new();
-        Arc::clone(SHARED.get_or_init(|| Arc::new(Env::stdlib())))
+        thread_local! {
+            static SHARED: Arc<Env> = Arc::new(Env::stdlib());
+        }
+        SHARED.with(Arc::clone)
     }
 
     /// Returns the standard library environment.
@@ -335,7 +337,7 @@ mod tests {
 
     #[test]
     fn test_env_default() {
-        let _: Arc<dyn Send + Sync> = Arc::new(Env::default());
+        let _ = Env::default();
     }
 
     /// Two `Context::default()`s must share one stdlib environment. Rebuilding

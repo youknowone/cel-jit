@@ -212,7 +212,7 @@ impl<'a> Context<'a> {
 
     pub fn add_function<T: 'static, F>(&mut self, name: &str, value: F)
     where
-        F: IntoFunction<T> + 'static + Send + Sync,
+        F: IntoFunction<T> + 'static,
     {
         if let Context::Root { functions, .. } = self {
             functions.add(name, value);
@@ -297,7 +297,7 @@ impl Default for Context<'_> {
 ///     }
 /// }
 /// ```
-pub trait VariableResolver: Send + Sync {
+pub trait VariableResolver {
     fn resolve(&self, variable: &str) -> Option<Value>;
 }
 
@@ -316,17 +316,5 @@ impl<T: VariableResolver> VariableResolver for Arc<T> {
 impl<T: VariableResolver> VariableResolver for &T {
     fn resolve(&self, variable: &str) -> Option<Value> {
         (**self).resolve(variable)
-    }
-}
-
-#[cfg(test)]
-mod test {
-    // A helper function that requires T to implement some traits
-    fn assert_send<T: Send>() {}
-
-    #[test]
-    fn test_context_is_send() {
-        // This line will only compile if assertion passes
-        assert_send::<super::Context>();
     }
 }
