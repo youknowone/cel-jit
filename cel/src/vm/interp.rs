@@ -2296,6 +2296,9 @@ impl<'a> Vm<'a> {
                 if parked.is_none() && b == 0 && self.try_interned_unary_host(NameId(a), op)? {
                     return Ok(Step::Next);
                 }
+                if parked.is_none() && b == 0 && self.try_interned_temporal_accessor(NameId(a))? {
+                    return Ok(Step::Next);
+                }
                 if parked.is_none() && b == 1 && self.try_interned_string_method(NameId(a))? {
                     return Ok(Step::Next);
                 }
@@ -2827,13 +2830,20 @@ impl<'a> Vm<'a> {
         Ok(false)
     }
 
-    /// `s.startsWith(p)` / `s.endsWith(p)` on interned strings.
+    /// `s.startsWith(p)` / `s.endsWith(p)` / `s.matches(p)` on interned strings.
+    ///
+    /// `matches` still compiles the regex here — the walker does the same
+    /// (`common/types/string.rs` `matches`). The result stays an interned
+    /// bool; the compile is residual, not a traced loop body.
     fn try_interned_string_method(&mut self, name: NameId) -> CelResult<bool> {
-        let pred: fn(&str, &str) -> bool = match self.name(name.0)? {
-            "startsWith" => |hay, needle| hay.starts_with(needle),
-            "endsWith" => |hay, needle| hay.ends_with(needle),
-            _ => return Ok(false),
-        };
+        let method = self.name(name.0)?;
+        if !matches!(method, "startsWith" | "endsWith" | "matches") {
+            return Ok(false);
+        }
+        #[cfg(not(feature = "regex"))]
+        if method == "matches" {
+            return Ok(false);
+        }
         if self.depth() < 2 {
             return Ok(false);
         }
@@ -2845,13 +2855,51 @@ impl<'a> Vm<'a> {
                 unsafe { crate::runtime::object::string_as_str(r) },
                 unsafe { crate::runtime::object::string_as_str(n) },
             ) {
-                self.push(Value::Bool(pred(rs, ns)));
-                return Ok(true);
+                match method {
+                    "startsWith" => {
+                        self.push(Value::Bool(rs.starts_with(ns)));
+                        return Ok(true);
+                    }
+                    "endsWith" => {
+                        self.push(Value::Bool(rs.ends_with(ns)));
+                        return Ok(true);
+                    }
+                    #[cfg(feature = "regex")]
+                    "matches" => match regex::Regex::new(ns) {
+                        Ok(re) => {
+                            self.push(Value::Bool(re.is_match(rs)));
+                            return Ok(true);
+                        }
+                        Err(err) => {
+                            return Err(self.park(ExecutionError::FunctionError {
+                                function: "matches".to_string(),
+                                message: format!("'{ns}' not a valid regex:\n{err}"),
+                            }));
+                        }
+                    },
+                    _ => {}
+                }
             }
         }
         self.push_operand(needle);
         self.push_operand(receiver);
         Ok(false)
+    }
+
+    /// `getHours` / `getFullYear` / … on an interned duration or timestamp.
+    fn try_interned_temporal_accessor(&mut self, name: NameId) -> CelResult<bool> {
+        let Some(operand) = self.top() else {
+            return Ok(false);
+        };
+        let Some(w) = Self::leaf_of(operand) else {
+            return Ok(false);
+        };
+        let Some(n) = interned_temporal_accessor(self.name(name.0)?, w) else {
+            return Ok(false);
+        };
+        let _ = self.pop_operand();
+        self.push_operand(Operand::Interned(new_int(n) as CelRef));
+        Ok(true)
     }
 
     /// `max` / `min` over interned scalars or one interned list.
@@ -3080,6 +3128,55 @@ enum OptView {
     /// `optional.none`.
     Empty,
     Present(Value),
+}
+
+/// Duration / timestamp accessors, matching `common/types/{duration,timestamp}.rs`.
+///
+/// A name that is not an accessor, or a receiver that is not the matching
+/// leaf, returns `None` so the host overload can raise.
+fn interned_temporal_accessor(name: &str, w: CelRef) -> Option<i64> {
+    match unsafe { w_kind(w) } {
+        CelKind::Duration => {
+            let nanos = unsafe { (*w.cast::<crate::runtime::object::W_DurationObject>()).nanos };
+            match name {
+                "getHours" => Some(nanos / 1_000_000_000 / 3600),
+                "getMinutes" => Some(nanos / 1_000_000_000 / 60),
+                "getSeconds" => Some(nanos / 1_000_000_000),
+                "getMilliseconds" => Some(nanos / 1_000_000),
+                _ => None,
+            }
+        }
+        #[cfg(feature = "chrono")]
+        CelKind::Timestamp => interned_timestamp_accessor(name, w),
+        _ => None,
+    }
+}
+
+#[cfg(feature = "chrono")]
+fn interned_timestamp_accessor(name: &str, w: CelRef) -> Option<i64> {
+    use chrono::{Datelike, Timelike};
+    let leaf = unsafe { &*w.cast::<crate::runtime::object::W_TimestampObject>() };
+    let off = chrono::FixedOffset::east_opt(leaf.off_s as i32)?;
+    let utc = chrono::DateTime::from_timestamp_nanos(leaf.nanos);
+    let ts = utc.with_timezone(&off);
+    match name {
+        "getMilliseconds" => Some(i64::from(ts.timestamp_subsec_millis())),
+        "getSeconds" => Some(i64::from(ts.second())),
+        "getMinutes" => Some(i64::from(ts.minute())),
+        "getHours" => Some(i64::from(ts.hour())),
+        "getDayOfWeek" => Some(i64::from(ts.weekday().num_days_from_sunday())),
+        "getDate" => Some(i64::from(ts.day())),
+        "getDayOfMonth" => Some(i64::from(ts.day0())),
+        "getMonth" => Some(i64::from(ts.month0())),
+        "getFullYear" => Some(i64::from(ts.year())),
+        "getDayOfYear" => {
+            let year = ts
+                .checked_sub_days(chrono::Days::new(u64::from(ts.day0())))?
+                .checked_sub_months(chrono::Months::new(ts.month0()))?;
+            Some(ts.signed_duration_since(year).num_days())
+        }
+        _ => None,
+    }
 }
 
 fn interned_unary_host(name: &str, w: CelRef) -> Result<Option<CelRef>, ExecutionError> {
@@ -4174,6 +4271,99 @@ mod tests {
         let as_bytes =
             cel_eval_loop(&compile(&parse("bytes('ab')")).expect("compile"), &ctx).expect("eval");
         assert_eq!(as_bytes, Value::Bytes(Arc::new(b"ab".to_vec())));
+    }
+
+    #[test]
+    fn interned_temporal_accessors_and_matches_through_the_vm() {
+        let ctx = Context::default();
+        let hours = cel_eval_loop(
+            &compile(&parse("duration('3661s').getHours()")).expect("compile"),
+            &ctx,
+        )
+        .expect("eval");
+        assert_eq!(hours, Value::Int(1));
+        assert_eq!(
+            crate::runtime::convert::intern_leaf(&hours),
+            Some(crate::runtime::object::new_int(1) as crate::runtime::object::CelRef)
+        );
+        assert_eq!(
+            cel_eval_loop(
+                &compile(&parse("duration('3661s').getMinutes()")).expect("compile"),
+                &ctx
+            )
+            .expect("eval"),
+            Value::Int(61)
+        );
+        assert_eq!(
+            cel_eval_loop(
+                &compile(&parse("duration('1s').getMilliseconds()")).expect("compile"),
+                &ctx
+            )
+            .expect("eval"),
+            Value::Int(1000)
+        );
+        #[cfg(feature = "chrono")]
+        {
+            let ts = "timestamp('2020-01-02T03:04:05.006Z')";
+            assert_eq!(
+                cel_eval_loop(
+                    &compile(&parse(&format!("{ts}.getFullYear()"))).expect("compile"),
+                    &ctx
+                )
+                .expect("eval"),
+                Value::Int(2020)
+            );
+            assert_eq!(
+                cel_eval_loop(
+                    &compile(&parse(&format!("{ts}.getMonth()"))).expect("compile"),
+                    &ctx
+                )
+                .expect("eval"),
+                Value::Int(0)
+            );
+            assert_eq!(
+                cel_eval_loop(
+                    &compile(&parse(&format!("{ts}.getDate()"))).expect("compile"),
+                    &ctx
+                )
+                .expect("eval"),
+                Value::Int(2)
+            );
+            assert_eq!(
+                cel_eval_loop(
+                    &compile(&parse(&format!("{ts}.getHours()"))).expect("compile"),
+                    &ctx
+                )
+                .expect("eval"),
+                Value::Int(3)
+            );
+            assert_eq!(
+                cel_eval_loop(
+                    &compile(&parse(&format!("{ts}.getDayOfYear()"))).expect("compile"),
+                    &ctx
+                )
+                .expect("eval"),
+                Value::Int(1)
+            );
+        }
+        #[cfg(feature = "regex")]
+        {
+            let matched = cel_eval_loop(
+                &compile(&parse("'abc'.matches('a.*')")).expect("compile"),
+                &ctx,
+            )
+            .expect("eval");
+            assert_eq!(matched, Value::Bool(true));
+            assert!(crate::runtime::convert::intern_leaf(&matched).is_some());
+            assert_eq!(
+                cel_eval_loop(
+                    &compile(&parse("'abc'.matches('z+')")).expect("compile"),
+                    &ctx
+                )
+                .expect("eval"),
+                Value::Bool(false)
+            );
+        }
     }
 
     /// A comprehension counter stored as an interned int stays on the table.
