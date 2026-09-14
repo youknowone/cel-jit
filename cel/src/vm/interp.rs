@@ -2849,9 +2849,8 @@ impl<'a> Vm<'a> {
 
     /// `s.startsWith(p)` / `s.endsWith(p)` / `s.matches(p)` on interned strings.
     ///
-    /// `matches` still compiles the regex here — the walker does the same
-    /// (`common/types/string.rs` `matches`). The result stays an interned
-    /// bool; the compile is residual, not a traced loop body.
+    /// `matches` uses the interned compiled pattern (`regex_intern`). The
+    /// compile is residual (`dont_look_inside`), not a traced loop body.
     fn try_interned_string_method(&mut self, name: NameId) -> CelResult<bool> {
         let method = self.name(name.0)?;
         if !matches!(method, "startsWith" | "endsWith" | "matches") {
@@ -2874,23 +2873,23 @@ impl<'a> Vm<'a> {
             ) {
                 match method {
                     "startsWith" => {
-                        self.push(Value::Bool(rs.starts_with(ns)));
+                        self.push(Value::bool(rs.starts_with(ns)));
                         return Ok(true);
                     }
                     "endsWith" => {
-                        self.push(Value::Bool(rs.ends_with(ns)));
+                        self.push(Value::bool(rs.ends_with(ns)));
                         return Ok(true);
                     }
                     #[cfg(feature = "regex")]
-                    "matches" => match regex::Regex::new(ns) {
+                    "matches" => match crate::runtime::regex_intern::intern_regex(ns) {
                         Ok(re) => {
-                            self.push(Value::Bool(re.is_match(rs)));
+                            self.push(Value::bool(re.is_match(rs)));
                             return Ok(true);
                         }
-                        Err(err) => {
+                        Err(message) => {
                             return Err(self.park(ExecutionError::FunctionError {
                                 function: "matches".to_string(),
-                                message: format!("'{ns}' not a valid regex:\n{err}"),
+                                message,
                             }));
                         }
                     },

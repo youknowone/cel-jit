@@ -279,9 +279,9 @@ pub fn matches(
     This(this): This<Arc<String>>,
     regex: Arc<String>,
 ) -> Result<bool> {
-    match regex::Regex::new(&regex) {
+    match crate::runtime::regex_intern::intern_regex(&regex) {
         Ok(re) => Ok(re.is_match(&this)),
-        Err(err) => Err(ftx.error(format!("'{regex}' not a valid regex:\n{err}"))),
+        Err(message) => Err(ftx.error(message)),
     }
 }
 

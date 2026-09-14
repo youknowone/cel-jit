@@ -34,11 +34,11 @@ fn starts_with_string(args: Vec<Value>) -> Result<Value, ExecutionError> {
 fn matches(args: Vec<Value>) -> Result<Value, ExecutionError> {
     let this = expect_string(&args[0])?;
     let pattern = expect_string(&args[1])?;
-    match regex::Regex::new(pattern) {
-        Ok(re) => Ok(Value::Bool(re.is_match(this))),
-        Err(err) => Err(ExecutionError::FunctionError {
+    match crate::runtime::regex_intern::intern_regex(pattern) {
+        Ok(re) => Ok(Value::bool(re.is_match(this))),
+        Err(message) => Err(ExecutionError::FunctionError {
             function: "matches".to_string(),
-            message: format!("'{pattern}' not a valid regex:\n{err}"),
+            message,
         }),
     }
 }

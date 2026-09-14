@@ -839,6 +839,10 @@ const CEL_CLASS_ADDRS: &[(&str, i64)] = &[
     ("CEL_BYTES_CLASS", 0x0001_0900),
     ("CEL_STRING_CLASS", 0x0001_0a00),
     ("CEL_LIST_CLASS", 0x0001_0b00),
+    ("CEL_MAP_CLASS", 0x0001_0c00),
+    ("CEL_STRUCT_CLASS", 0x0001_0d00),
+    ("CEL_OPAQUE_CLASS", 0x0001_0e00),
+    ("CEL_INT_COLUMN_CLASS", 0x0001_0f00),
 ];
 
 /// Per-symbol lowering-wall table for the `cel::vm` evaluator.
