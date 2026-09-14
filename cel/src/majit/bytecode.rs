@@ -2853,8 +2853,8 @@ pub mod float_bank {
         fn resolve(&self, driver: &majit_metainterp::JitDriver<VmStateF>) -> u64 {
             driver.resolve_cell_key(self.hash, || {
                 majit_ir::GreenKey::with_types(
-                    self.slots.iter().map(|slot| slot.0).collect(),
-                    self.slots.iter().map(|slot| slot.1).collect(),
+                    self.slots.iter().map(|slot| slot.0).collect::<Vec<_>>(),
+                    self.slots.iter().map(|slot| slot.1).collect::<Vec<_>>(),
                 )
             })
         }
@@ -2862,8 +2862,8 @@ pub mod float_bank {
         /// The typed key these greens build, for the bucket walk that needs it.
         fn green_key(&self) -> majit_ir::GreenKey {
             majit_ir::GreenKey::with_types(
-                self.slots.iter().map(|slot| slot.0).collect(),
-                self.slots.iter().map(|slot| slot.1).collect(),
+                self.slots.iter().map(|slot| slot.0).collect::<Vec<_>>(),
+                self.slots.iter().map(|slot| slot.1).collect::<Vec<_>>(),
             )
         }
 
@@ -3063,9 +3063,9 @@ pub mod float_bank {
     /// and an add.
     fn try_function_entry_jit_f(
         driver: &mut majit_metainterp::JitDriver<VmStateF>,
-        program: &Code,
+        _program: &Code,
         pooled: &PooledProgram,
-        state: &mut VmStateF,
+        _state: &mut VmStateF,
         pc: &mut usize,
     ) -> Option<i64> {
         // A program whose own loop is compiled already has a door, at that
@@ -3152,85 +3152,16 @@ pub mod float_bank {
                 }
             }
         };
+        // The door itself is generated in `run_mainloop_f` (`ll_portal_runner`
+        // prefix). This wrapper only yields when a sibling loop-header artifact
+        // can already serve the call — two artifacts for one program do not
+        // yet coexist, and entering the entry key would steal the batch from
+        // the loop. `warmspot.py` has no equivalent; remove this when majit
+        // can hold both.
         if sibling_runnable {
-            return None;
+            driver.suppress_function_entry();
         }
-        // Read, not recomputed: the key is `green_key_at(program, ENTRY_PC)`,
-        // and both of its inputs are fixed for as long as the pool pins this
-        // address. See [`PooledProgram`].
-        //
-        // Resolved once, then carried. `entry_key` holds a bucket hash, and a
-        // bucket can hold more than one cell; the typed key settles which one
-        // this door's greens own, and every step below — the entry decision,
-        // the token it decides on, and the run that token is handed to — uses
-        // that one answer. The door used to ask on the bare hash and then hand
-        // the bare hash on, which was two resolutions per warm call and, on a
-        // chained bucket, a decision about one cell followed by a run keyed
-        // through another.
-        //
-        // Resolved together with the token below, from one walk: the cell the
-        // greens own and the code that cell holds are one question asked in two
-        // halves, and each half used to walk the bucket for itself.
-        let (entry_key, entry_token) = pooled.entry_key.resolve_runnable(driver);
-        // The token IS the decision — `Some` is the runnable-compiled-loop
-        // answer this branch used to ask for as a predicate, and it is the same
-        // object the run below enters, so nothing between the two can make them
-        // disagree.
-        //
-        // It is the runnable form, not the weaker code-present one:
-        // code-present is true as soon as the cell's token has a body, which
-        // includes a `compile_tmp_callback` stub that has NO frontend
-        // `compiled_loops` meta; the dispatch inside the entry path unwraps
-        // that meta unconditionally, so entering on the weaker answer panics
-        // instead of falling through to interpretation. Upstream's
-        // `maybe_compile_and_run` treats a temporary token by continuing to
-        // count, which is what declining here does. cel mints no
-        // CALL_ASSEMBLER token today — tmp callbacks come from recursive calls
-        // this VM has no opcode for — so this is defense, not a live crash
-        // being fixed.
-        if let Some(procedure_token) = entry_token {
-            // The same run the row loop's back edge reaches, so entry, guard
-            // failure, blackhole resume and bridge start are all handled the one
-            // way — only reached with the cell and its token already in hand
-            // instead of re-derived from the hash.
-            let resume = driver.back_edge_resolved(
-                entry_key,
-                procedure_token,
-                ENTRY_PC,
-                state,
-                program,
-                || {},
-            );
-            // Drained before `resume` is read, and for the same reason the back
-            // edge's expansion drains it first: a run that FINISHed did not stop
-            // at a resume point, and the pc offered alongside the finish is the
-            // door's own arming position, so taking it would run the call a
-            // second time.
-            if let Some(value) = driver.take_back_edge_finish_int() {
-                return Some(value);
-            }
-            *pc = resume.unwrap_or(ENTRY_PC);
-            return None;
-        }
-        // A trace left live by an earlier call is the row loop's, recording from
-        // wherever it started; arming a second one here would abandon it.
-        if driver.is_tracing() {
-            return None;
-        }
-        // On the resolved key as well, so the counter that decides to trace, the
-        // trace that starts, and the entry decision above are all about the one
-        // cell this door's greens own. Identical to the raw hash on every bucket
-        // that holds a single cell, which includes every bucket that holds none
-        // — so a cold program's first calls count exactly where they did.
-        if driver
-            .meta_interp_mut()
-            .warm_state_mut()
-            .should_trace_function_entry(entry_key)
-        {
-            // The counter above is the whole threshold decision, so the start
-            // has to be the one that does not consult a counter of its own.
-            driver.force_start_tracing(entry_key, ENTRY_PC, state, program);
-        }
+        let _ = pc;
         None
     }
 
