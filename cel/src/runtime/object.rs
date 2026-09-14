@@ -90,6 +90,8 @@ pub enum CelKind {
     /// A foreign host object. The leaf is [`W_OpaqueObject`]; the host itself
     /// lives in the heap's side table (D12).
     Opaque = 14,
+    /// The activation record. Not a CEL value; `type()` never answers this.
+    Frame = 15,
 }
 
 /// One value class.
@@ -893,6 +895,77 @@ const _: () = {
     assert!(offset_of!(W_TypeObject, ob_header) == 0);
 };
 
+/// The activation record, `pyframe.py` `PyFrame` virtualizable subset.
+///
+/// `_virtualizable_ = ['last_instr', 'valuestackdepth', 'locals_stack_w[*]']`
+/// (`interp_jit.py`). The JIT driver names this object `virtualizables =
+/// ['frame']`. Slots are a fixed [`CelItemsBlock`] — `make_sure_not_resized`.
+#[repr(C)]
+#[allow(non_camel_case_types)]
+pub struct W_CelFrame {
+    pub ob_header: CelObject,
+    /// `virtualizable.py` token. 0 = not virtualized.
+    pub vable_token: usize,
+    pub last_instr: i64,
+    pub valuestackdepth: i64,
+    pub locals_stack_w: *mut crate::runtime::object_array::CelItemsBlock,
+    pub n_slots: i64,
+}
+
+pub static CEL_FRAME_CLASS: CelClass = CelClass::new("frame", CelKind::Frame);
+
+const _: () = {
+    assert!(offset_of!(W_CelFrame, ob_header) == 0);
+};
+
+pub const CELFRAME_VABLE_TOKEN_OFFSET: usize = offset_of!(W_CelFrame, vable_token);
+pub const CELFRAME_LAST_INSTR_OFFSET: usize = offset_of!(W_CelFrame, last_instr);
+pub const CELFRAME_VALUESTACKDEPTH_OFFSET: usize = offset_of!(W_CelFrame, valuestackdepth);
+pub const CELFRAME_LOCALS_STACK_OFFSET: usize = offset_of!(W_CelFrame, locals_stack_w);
+
+/// Allocate a frame whose array is `n_slots + max_stack` and never resized.
+pub fn new_cel_frame(n_slots: i64, max_stack: i64) -> *mut W_CelFrame {
+    let cap = (n_slots + max_stack).max(0) as usize;
+    let nulls = vec![core::ptr::null_mut::<CelObject>(); cap];
+    let items = object_array::new_items_block(&nulls);
+    lltype::malloc_typed(W_CelFrame {
+        ob_header: CelObject {
+            ob_type: &CEL_FRAME_CLASS,
+        },
+        vable_token: 0,
+        last_instr: -1,
+        valuestackdepth: n_slots,
+        locals_stack_w: items,
+        n_slots,
+    })
+}
+
+/// Slot `i` of a live frame.
+///
+/// # Safety
+///
+/// `frame` is a live [`W_CelFrame`] and `i` is in range.
+pub unsafe fn cel_frame_slot(frame: *mut W_CelFrame, i: i64) -> *mut CelRef {
+    crate::runtime::object_array::items_block_items_base((*frame).locals_stack_w).add(i as usize)
+}
+
+/// `virtualizable.py` `force_virtualizable_if_necessary`.
+///
+/// The token is 0 until a compiled loop owns the frame, so this is a
+/// no-op in the interpreter. `jtransform` rewrites a residual force
+/// into a call when the token is live.
+///
+/// # Safety
+///
+/// `frame` is a live [`W_CelFrame`].
+#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+pub unsafe fn force_virtualizable_if_necessary(frame: *mut W_CelFrame) {
+    if (*frame).vable_token != 0 {
+        // Residual: the compiled loop owns the boxes. The interpreter
+        // never sets the token, so this arm is not taken here.
+    }
+}
+
 /// The type value denoting `cls`.
 pub fn new_type(cls: &'static CelClass) -> *mut W_TypeObject {
     lltype::malloc_typed(W_TypeObject {
@@ -1062,6 +1135,7 @@ mod tests {
         check(new_bytes(b"x") as CelRef, &CEL_BYTES_CLASS);
         check(new_string("x") as CelRef, &CEL_STRING_CLASS);
         check(new_list(&[]) as CelRef, &CEL_LIST_CLASS);
+        check(new_cel_frame(0, 0) as CelRef, &CEL_FRAME_CLASS);
         check(new_map(&[]) as CelRef, &CEL_MAP_CLASS);
         check(
             new_opaque(new_type(&CEL_OPAQUE_CLASS) as CelRef, 0) as CelRef,
@@ -1131,6 +1205,46 @@ mod tests {
                 assert_eq!(*field_base.add(0), fields[0].0);
                 assert_eq!(*field_base.add(1), fields[0].1);
             }
+        }
+    }
+
+    /// The virtualizable subset matches `interp_jit.py` `_virtualizable_`:
+    /// `last_instr`, `valuestackdepth`, `locals_stack_w[*]`, and a token.
+    #[test]
+    fn a_cel_frame_is_the_virtualizable_activation_record() {
+        unsafe {
+            let f = new_cel_frame(2, 3);
+            assert_eq!((*f).ob_header.ob_type, &CEL_FRAME_CLASS as *const CelClass);
+            assert_eq!(w_kind(f as CelRef), CelKind::Frame);
+            assert_eq!((*f).vable_token, 0);
+            assert_eq!((*f).last_instr, -1);
+            assert_eq!((*f).valuestackdepth, 2);
+            assert_eq!((*f).n_slots, 2);
+            assert_eq!(
+                crate::runtime::object_array::items_capacity((*f).locals_stack_w),
+                5
+            );
+            let a = new_int(1) as CelRef;
+            *cel_frame_slot(f, 0) = a;
+            assert_eq!(*cel_frame_slot(f, 0), a);
+            force_virtualizable_if_necessary(f);
+            assert_eq!((*f).vable_token, 0);
+            assert_eq!(
+                CELFRAME_VABLE_TOKEN_OFFSET,
+                offset_of!(W_CelFrame, vable_token)
+            );
+            assert_eq!(
+                CELFRAME_LAST_INSTR_OFFSET,
+                offset_of!(W_CelFrame, last_instr)
+            );
+            assert_eq!(
+                CELFRAME_VALUESTACKDEPTH_OFFSET,
+                offset_of!(W_CelFrame, valuestackdepth)
+            );
+            assert_eq!(
+                CELFRAME_LOCALS_STACK_OFFSET,
+                offset_of!(W_CelFrame, locals_stack_w)
+            );
         }
     }
 

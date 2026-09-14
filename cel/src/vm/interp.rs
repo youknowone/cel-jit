@@ -44,10 +44,11 @@ use crate::runtime::binop::{
 use crate::runtime::convert::{intern_leaf, interned_list_get, ref_to_value};
 use crate::runtime::error::{take_error, CelErrCode, ERROR_SENTINEL};
 use crate::runtime::object::{
-    list_len, map_len, new_bytes, new_double, new_int, new_list, new_null, new_optional,
-    new_optional_none, new_string, new_type, new_uint, opaque_host_index, string_as_str,
-    string_byte_len, w_kind, w_type, CelKind, CelRef, W_BoolObject, W_DoubleObject, W_IntObject,
-    W_UIntObject, CEL_OPAQUE_CLASS, CEL_TYPE_CLASS,
+    cel_frame_slot, force_virtualizable_if_necessary, list_len, map_len, new_bytes, new_cel_frame,
+    new_double, new_int, new_list, new_null, new_optional, new_optional_none, new_string, new_type,
+    new_uint, opaque_host_index, string_as_str, string_byte_len, w_kind, w_type, CelKind, CelRef,
+    W_BoolObject, W_CelFrame, W_DoubleObject, W_IntObject, W_UIntObject, CEL_OPAQUE_CLASS,
+    CEL_TYPE_CLASS,
 };
 use crate::runtime::optional::{
     cel_optional_has_value, cel_optional_none, cel_optional_of, cel_optional_of_non_zero_value,
@@ -718,6 +719,9 @@ struct Vm<'a> {
     scratch: std::mem::ManuallyDrop<Box<Scratch>>,
     /// Where the operand stack begins in `frame`: `n_slots`.
     stack_base: usize,
+    /// `PyFrame` virtualizable: `last_instr`, `valuestackdepth`,
+    /// `locals_stack_w[*]`. Interned slots are written through here.
+    cel_frame: *mut W_CelFrame,
     /// Arguments a missed [`OpCode::CallQualified`] popped, held for the
     /// [`OpCode::CallMethod`] the compiler emitted right after it.
     ///
@@ -800,12 +804,14 @@ impl<'a> Vm<'a> {
                 .logic
                 .resize(code.n_logic as usize, Err(CelErr::InternalError));
         }
+        let cel_frame = new_cel_frame(code.n_slots as i64, code.max_stack as i64);
         Vm {
             code,
             ctx,
             frame,
             scratch: std::mem::ManuallyDrop::new(scratch),
             stack_base,
+            cel_frame,
             pending_args: None,
             #[cfg(feature = "__drop-arm-probe")]
             probe: ProbePolicy::default(),
@@ -928,9 +934,31 @@ impl<'a> Vm<'a> {
     // one place rather than at each of the sites that asks. `Scratch::release`
     // clears the pool's own buffer, which no `Vm` owns by then.
 
+    fn vable_cell(operand: &Operand) -> CelRef {
+        match operand {
+            Operand::Interned(w) => *w,
+            Operand::Value(v) => intern_leaf(v).unwrap_or(core::ptr::null_mut()),
+            _ => core::ptr::null_mut(),
+        }
+    }
+
+    fn write_vable_cell(&mut self, index: usize, w: CelRef) {
+        unsafe {
+            let cap =
+                crate::runtime::object_array::items_capacity((*self.cel_frame).locals_stack_w);
+            if index < cap {
+                *cel_frame_slot(self.cel_frame, index as i64) = w;
+            }
+            (*self.cel_frame).valuestackdepth = self.frame.len() as i64;
+        }
+    }
+
     #[inline(always)]
     fn push_operand(&mut self, operand: Operand) {
+        let index = self.frame.len();
+        let w = Self::vable_cell(&operand);
         self.frame.push(operand);
+        self.write_vable_cell(index, w);
     }
 
     /// Take the topmost operand, or `None` where there is none.
@@ -943,7 +971,11 @@ impl<'a> Vm<'a> {
         if self.frame.len() == self.stack_base {
             return None;
         }
-        self.frame.pop()
+        let popped = self.frame.pop();
+        unsafe {
+            (*self.cel_frame).valuestackdepth = self.frame.len() as i64;
+        }
+        popped
     }
 
     /// The topmost operand, left where it is.
@@ -982,6 +1014,9 @@ impl<'a> Vm<'a> {
             self.depth()
         );
         self.frame.truncate(self.stack_base + depth);
+        unsafe {
+            (*self.cel_frame).valuestackdepth = self.frame.len() as i64;
+        }
     }
 
     /// The local in `slot`, or `None` for an index past the locals or an
@@ -1592,6 +1627,9 @@ impl<'a> Vm<'a> {
     // -- the loop -----------------------------------------------------------
 
     fn run(&mut self) -> CelResult<Value> {
+        unsafe {
+            force_virtualizable_if_necessary(self.cel_frame);
+        }
         let mut pc = 0u32;
         loop {
             // One comparison against a field, executed by every arm on every
@@ -1625,6 +1663,11 @@ impl<'a> Vm<'a> {
             let Some(&Insn { op, ops }) = self.code.insns.get(pc as usize) else {
                 return Err(CelErr::InternalError);
             };
+            // `pyopcode.py` `self.last_instr = intmask(next_instr)` at the
+            // top of every dispatch iteration.
+            unsafe {
+                (*self.cel_frame).last_instr = i64::from(pc);
+            }
             let next = pc + 1;
 
             match self.step(op, ops, pc, next) {
@@ -2682,8 +2725,10 @@ impl<'a> Vm<'a> {
                     .unwrap_or(Operand::Value(v))
             }
         };
+        let w = Self::vable_cell(&stored);
         let dest = self.local_operand_mut(slot).ok_or(CelErr::InternalError)?;
         let previous = std::mem::replace(dest, stored);
+        self.write_vable_cell(slot as usize, w);
         if let Ok(value) = self.finish(previous) {
             self.discard(value);
         }
@@ -2713,6 +2758,8 @@ impl<'a> Vm<'a> {
             }
             _ => return Err(CelErr::InternalError),
         }
+        let w = Self::vable_cell(self.local_operand(slot).ok_or(CelErr::InternalError)?);
+        self.write_vable_cell(slot as usize, w);
         Ok(())
     }
 
@@ -4095,6 +4142,36 @@ mod tests {
         // frame, where `Scratch::release` drops it; nothing else has to.
         vm.push(Value::Int(4));
         assert_eq!(vm.depth(), 1);
+    }
+
+    /// Interned stack slots are written through the virtualizable array.
+    #[test]
+    fn interned_slots_land_on_the_cel_frame() {
+        let code = CelCode {
+            n_slots: 1,
+            max_stack: 2,
+            ..CelCode::default()
+        };
+        let ctx = Context::default();
+        let mut vm = Vm::new(&code, &ctx);
+        unsafe {
+            assert_eq!((*vm.cel_frame).last_instr, -1);
+            assert_eq!((*vm.cel_frame).valuestackdepth, 1);
+            assert_eq!((*vm.cel_frame).vable_token, 0);
+        }
+        let w = crate::runtime::object::new_int(7) as CelRef;
+        vm.push_operand(Operand::Interned(w));
+        unsafe {
+            assert_eq!((*vm.cel_frame).valuestackdepth, 2);
+            assert_eq!(*cel_frame_slot(vm.cel_frame, 1), w);
+        }
+        match vm.pop_operand() {
+            Some(Operand::Interned(got)) => assert_eq!(got, w),
+            _ => panic!("expected interned"),
+        }
+        unsafe {
+            assert_eq!((*vm.cel_frame).valuestackdepth, 1);
+        }
     }
 
     /// `1 + 2` stays on the interned `int` table through `cel_add`.
