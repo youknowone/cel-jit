@@ -4,25 +4,26 @@
 //! red virtualizable is `frame`. `jit_merge_point` is the first statement
 //! of the loop; `can_enter_jit` is only on a backward jump.
 //!
-//! Interned arithmetic, comparison, local load/store and return run
-//! on `frame.locals_stack_w[i]` — the `getarrayitem_vable_*` shape —
-//! and call `cel_add` / `cel_equals` with no `Result`. Everything
-//! else is residual [`Vm::dispatch_one`].
+//! Interned arithmetic, comparison, local load/store, context load,
+//! field/index and return run on `frame.locals_stack_w[i]` — the
+//! `getarrayitem_vable_*` shape — and call `cel_add` / `cel_equals`
+//! with no `Result`. Everything else is residual [`Vm::dispatch_one`].
 
 use majit_metainterp::JitDriver;
 
 use super::code::CelCode;
+use super::error::NameId;
 use super::interp::{Step, Vm};
 use super::opcode::OpCode;
 use crate::runtime::binop::{
     cel_add, cel_div, cel_equals, cel_greater, cel_greater_equals, cel_less, cel_less_equals,
-    cel_mul, cel_not_equals, cel_rem, cel_sub,
+    cel_mul, cel_not_equals, cel_rem, cel_sub, map_lookup,
 };
-use crate::runtime::convert::{intern_leaf, interned_list_get};
+use crate::runtime::convert::{intern_leaf, interned_list_get, interned_map_lookup_string};
 use crate::runtime::error::ERROR_SENTINEL;
 use crate::runtime::object::{
-    list_len, list_try_append, new_int, new_list_with_capacity, w_kind, CelKind, CelRef,
-    W_BoolObject, W_IntObject,
+    list_len, list_try_append, new_bool, new_int, new_list_with_capacity, string_as_str, w_kind,
+    CelKind, CelRef, W_BoolObject, W_IntObject,
 };
 #[allow(unused_imports)] // named in `virtualizable_fields`
 use crate::runtime::object::{
@@ -79,6 +80,14 @@ const OP_ITER_LEN: i64 = OpCode::IterLen as i64;
 const OP_ITER_AT: i64 = OpCode::IterAt as i64;
 const OP_ITER_GUARD: i64 = OpCode::IterGuard as i64;
 const OP_ITER_BIND: i64 = OpCode::IterBind as i64;
+const OP_LOAD_VAR: i64 = OpCode::LoadVar as i64;
+const OP_GET_FIELD: i64 = OpCode::GetField as i64;
+const OP_HAS_FIELD: i64 = OpCode::HasField as i64;
+const OP_GET_FIELD_LOCAL: i64 = OpCode::GetFieldLocal as i64;
+const OP_HAS_FIELD_LOCAL: i64 = OpCode::HasFieldLocal as i64;
+const OP_GET_FIELD_LOCAL_APPEND: i64 = OpCode::GetFieldLocalAppend as i64;
+const OP_HAS_FIELD_LOCAL_APPEND: i64 = OpCode::HasFieldLocalAppend as i64;
+const OP_INDEX: i64 = OpCode::Index as i64;
 
 macro_rules! interned_binop {
     ($frame:ident, $vm:ident, $here:ident, $op:expr) => {{
@@ -213,8 +222,101 @@ fn intern_const(program: &CelCode, idx: i64) -> i64 {
     intern_leaf(value).map(|w| w as usize as i64).unwrap_or(0)
 }
 
+/// Field `names[name_idx]` of interned map/struct `w`. 0 means residual.
+#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+fn interned_field(w: i64, program: &CelCode, name_idx: i64) -> i64 {
+    let w = w as usize as CelRef;
+    if w.is_null() {
+        return 0;
+    }
+    let Some(field) = program.name(NameId(name_idx as u32)) else {
+        return 0;
+    };
+    let found = match unsafe { w_kind(w) } {
+        CelKind::Map => unsafe { interned_map_lookup_string(w, field) },
+        #[cfg(feature = "structs")]
+        CelKind::Struct => unsafe { crate::runtime::object::struct_lookup_field(w, field) },
+        _ => None,
+    };
+    found.map(|r| r as usize as i64).unwrap_or(0)
+}
+
+/// Whether interned map/struct `w` has `names[name_idx]`.
+///
+/// `0` residual, `1` false, `2` true.
+#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+fn interned_has_field(w: i64, program: &CelCode, name_idx: i64) -> i64 {
+    let w = w as usize as CelRef;
+    if w.is_null() {
+        return 0;
+    }
+    let Some(field) = program.name(NameId(name_idx as u32)) else {
+        return 0;
+    };
+    match unsafe { w_kind(w) } {
+        CelKind::Map => {
+            if unsafe { interned_map_lookup_string(w, field) }.is_some() {
+                2
+            } else {
+                1
+            }
+        }
+        #[cfg(feature = "structs")]
+        CelKind::Struct => {
+            if unsafe { crate::runtime::object::struct_lookup_field(w, field) }.is_some() {
+                2
+            } else {
+                1
+            }
+        }
+        _ => 0,
+    }
+}
+
+/// Interned `container[key]`. 0 means residual (including a miss).
+#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+fn interned_index(container: i64, key: i64) -> i64 {
+    let w = container as usize as CelRef;
+    let k = key as usize as CelRef;
+    if w.is_null() || k.is_null() {
+        return 0;
+    }
+    let found = match unsafe { w_kind(w) } {
+        CelKind::List => {
+            if unsafe { w_kind(k) } != CelKind::Int {
+                return 0;
+            }
+            let index = unsafe { (*k.cast::<W_IntObject>()).intval };
+            unsafe { interned_list_get(w, index) }
+        }
+        CelKind::Map => match unsafe { string_as_str(k) } {
+            Some(field) => unsafe { interned_map_lookup_string(w, field) },
+            None => unsafe { map_lookup(w, k) },
+        },
+        #[cfg(feature = "structs")]
+        CelKind::Struct => match unsafe { string_as_str(k) } {
+            Some(field) => unsafe { crate::runtime::object::struct_lookup_field(w, field) },
+            None => None,
+        },
+        _ => None,
+    };
+    found.map(|r| r as usize as i64).unwrap_or(0)
+}
+
 fn vm_of<'a>(vm_bits: i64) -> &'a mut Vm<'a> {
     unsafe { &mut *(vm_bits as usize as *mut Vm<'a>) }
+}
+
+/// Intern the context variable named `names[idx]`. 0 means miss or residual.
+#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+fn intern_var(vm_bits: i64, program: &CelCode, idx: i64) -> i64 {
+    let Some(name) = program.name(NameId(idx as u32)) else {
+        return 0;
+    };
+    vm_of(vm_bits)
+        .intern_context_var(name)
+        .map(|w| w as usize as i64)
+        .unwrap_or(0)
 }
 
 #[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
@@ -342,6 +444,10 @@ pub(crate) fn eval_through_portal(
         insn_b => residual_int,
         insn_c => residual_int,
         intern_const => residual_int,
+        intern_var => residual_int,
+        interned_field => residual_int,
+        interned_has_field => residual_int,
+        interned_index => residual_int,
         interned_item => residual_int,
         try_append => residual_int,
         new_list_with_capacity => inline_ref,
@@ -354,6 +460,7 @@ pub(crate) fn eval_through_portal(
         vm_sync_pop => residual_int,
         vm_park_return => residual_int,
         new_int => inline_ref,
+        new_bool => inline_ref,
         cel_add => inline_ref,
         cel_sub => inline_ref,
         cel_mul => inline_ref,
@@ -381,6 +488,119 @@ fn run_cel_portal(
         let vm = state.vm;
         let here = pc as i64;
         let next = match opcode {
+            OP_LOAD_VAR => {
+                let w = intern_var(vm, program, insn_a(program, pc));
+                if w == 0 {
+                    residual_dispatch(vm, here)
+                } else {
+                    let r = w as usize as CelRef;
+                    let depth = frame.valuestackdepth;
+                    frame.locals_stack_w[depth] = r;
+                    frame.valuestackdepth = depth + 1;
+                    vm_sync_push(vm, w);
+                    here + 1
+                }
+            }
+            OP_GET_FIELD => {
+                let depth = frame.valuestackdepth;
+                let recv = frame.locals_stack_w[depth - 1];
+                let found = interned_field(recv as i64, program, insn_a(program, pc));
+                if recv.is_null() || found == 0 {
+                    residual_dispatch(vm, here)
+                } else {
+                    let r = found as usize as CelRef;
+                    frame.locals_stack_w[depth - 1] = r;
+                    vm_sync_replace(vm, found);
+                    here + 1
+                }
+            }
+            OP_HAS_FIELD => {
+                let depth = frame.valuestackdepth;
+                let recv = frame.locals_stack_w[depth - 1];
+                let found = interned_has_field(recv as i64, program, insn_a(program, pc));
+                if recv.is_null() || found == 0 {
+                    residual_dispatch(vm, here)
+                } else {
+                    let r = new_bool(found == 2) as CelRef;
+                    frame.locals_stack_w[depth - 1] = r;
+                    vm_sync_replace(vm, r as i64);
+                    here + 1
+                }
+            }
+            OP_GET_FIELD_LOCAL => {
+                let recv = frame.locals_stack_w[insn_a(program, pc)];
+                let found = interned_field(recv as i64, program, insn_b(program, pc));
+                if recv.is_null() || found == 0 {
+                    residual_dispatch(vm, here)
+                } else {
+                    let r = found as usize as CelRef;
+                    let depth = frame.valuestackdepth;
+                    frame.locals_stack_w[depth] = r;
+                    frame.valuestackdepth = depth + 1;
+                    vm_sync_push(vm, found);
+                    here + 1
+                }
+            }
+            OP_HAS_FIELD_LOCAL => {
+                let recv = frame.locals_stack_w[insn_a(program, pc)];
+                let found = interned_has_field(recv as i64, program, insn_b(program, pc));
+                if recv.is_null() || found == 0 {
+                    residual_dispatch(vm, here)
+                } else {
+                    let r = new_bool(found == 2) as CelRef;
+                    let depth = frame.valuestackdepth;
+                    frame.locals_stack_w[depth] = r;
+                    frame.valuestackdepth = depth + 1;
+                    vm_sync_push(vm, r as i64);
+                    here + 1
+                }
+            }
+            OP_GET_FIELD_LOCAL_APPEND => {
+                let recv = frame.locals_stack_w[insn_a(program, pc)];
+                let found = interned_field(recv as i64, program, insn_b(program, pc));
+                let depth = frame.valuestackdepth;
+                let list = frame.locals_stack_w[depth - 1];
+                if recv.is_null()
+                    || found == 0
+                    || list.is_null()
+                    || try_append(list as i64, found) == 0
+                {
+                    residual_dispatch(vm, here)
+                } else {
+                    here + 1
+                }
+            }
+            OP_HAS_FIELD_LOCAL_APPEND => {
+                let recv = frame.locals_stack_w[insn_a(program, pc)];
+                let found = interned_has_field(recv as i64, program, insn_b(program, pc));
+                let depth = frame.valuestackdepth;
+                let list = frame.locals_stack_w[depth - 1];
+                if recv.is_null() || found == 0 || list.is_null() {
+                    residual_dispatch(vm, here)
+                } else {
+                    let r = new_bool(found == 2) as CelRef;
+                    if try_append(list as i64, r as i64) == 0 {
+                        residual_dispatch(vm, here)
+                    } else {
+                        here + 1
+                    }
+                }
+            }
+            OP_INDEX => {
+                let depth = frame.valuestackdepth;
+                let key = frame.locals_stack_w[depth - 1];
+                let container = frame.locals_stack_w[depth - 2];
+                let item = interned_index(container as i64, key as i64);
+                if container.is_null() || key.is_null() || item == 0 {
+                    residual_dispatch(vm, here)
+                } else {
+                    let r = item as usize as CelRef;
+                    frame.locals_stack_w[depth - 2] = r;
+                    frame.valuestackdepth = depth - 1;
+                    vm_sync_binop(vm, item);
+                    here + 1
+                }
+            }
             OP_LOAD_LOCAL => {
                 let slot = insn_a(program, pc);
                 let w = frame.locals_stack_w[slot];
@@ -692,6 +912,87 @@ mod tests {
             .unwrap(),
             Value::list(vec![Value::Int(2), Value::Int(3), Value::Int(4)])
         );
+        let record = Value::Map(crate::objects::Map::from(
+            [("price", Value::Int(7)), ("qty", Value::Int(2))]
+                .into_iter()
+                .collect::<std::collections::HashMap<_, _>>(),
+        ));
+        let mut with_map = Context::default();
+        with_map.add_variable_from_value("m", record.clone());
+        with_map.add_variable_from_value("items", Value::list(vec![record.clone(), record]));
+        with_map.add_variable_from_value("xs", vec![10i64, 20, 30]);
+        assert_eq!(
+            cel_eval_loop(
+                &compile(&Parser::default().parse("m.price").unwrap()).unwrap(),
+                &with_map
+            )
+            .unwrap(),
+            Value::Int(7)
+        );
+        assert_eq!(
+            cel_eval_loop(
+                &compile(&Parser::default().parse("has(m.qty)").unwrap()).unwrap(),
+                &with_map
+            )
+            .unwrap(),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            cel_eval_loop(
+                &compile(&Parser::default().parse("has(m.missing)").unwrap()).unwrap(),
+                &with_map
+            )
+            .unwrap(),
+            Value::Bool(false)
+        );
+        assert_eq!(
+            cel_eval_loop(
+                &compile(&Parser::default().parse("m['price']").unwrap()).unwrap(),
+                &with_map
+            )
+            .unwrap(),
+            Value::Int(7)
+        );
+        assert_eq!(
+            cel_eval_loop(
+                &compile(&Parser::default().parse("xs[1]").unwrap()).unwrap(),
+                &with_map
+            )
+            .unwrap(),
+            Value::Int(20)
+        );
+        assert_eq!(
+            cel_eval_loop(
+                &compile(&Parser::default().parse("items.map(i, i.price)").unwrap()).unwrap(),
+                &with_map
+            )
+            .unwrap(),
+            Value::list(vec![Value::Int(7), Value::Int(7)])
+        );
+        assert_eq!(
+            cel_eval_loop(
+                &compile(
+                    &Parser::default()
+                        .parse("items.filter(i, has(i.qty))")
+                        .unwrap()
+                )
+                .unwrap(),
+                &with_map
+            )
+            .unwrap(),
+            Value::list(vec![
+                Value::Map(crate::objects::Map::from(
+                    [("price", Value::Int(7)), ("qty", Value::Int(2))]
+                        .into_iter()
+                        .collect::<std::collections::HashMap<_, _>>(),
+                )),
+                Value::Map(crate::objects::Map::from(
+                    [("price", Value::Int(7)), ("qty", Value::Int(2))]
+                        .into_iter()
+                        .collect::<std::collections::HashMap<_, _>>(),
+                )),
+            ])
+        );
     }
 
     #[test]
@@ -703,5 +1004,10 @@ mod tests {
         assert_eq!(OP_ITER_ADVANCE, OpCode::IterAdvance as i64);
         assert_eq!(OP_EQ, OpCode::Equals as i64);
         assert_eq!(OP_RETURN, OpCode::Return as i64);
+        assert_eq!(OP_LOAD_VAR, OpCode::LoadVar as i64);
+        assert_eq!(OP_GET_FIELD, OpCode::GetField as i64);
+        assert_eq!(OP_HAS_FIELD, OpCode::HasField as i64);
+        assert_eq!(OP_GET_FIELD_LOCAL, OpCode::GetFieldLocal as i64);
+        assert_eq!(OP_INDEX, OpCode::Index as i64);
     }
 }

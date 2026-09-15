@@ -885,6 +885,10 @@ impl<'a> Vm<'a> {
         self.push_operand(Operand::Interned(w));
     }
 
+    pub(crate) fn intern_context_var(&self, name: &str) -> Option<CelRef> {
+        intern_leaf(&self.ctx.get_variable(name)?)
+    }
+
     pub(crate) fn sync_store_interned(&mut self, slot: u32, w: CelRef) {
         let _ = self.pop_operand();
         let _ = self.store_operand(slot, Operand::Interned(w));
