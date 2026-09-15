@@ -4,15 +4,22 @@
 //! red virtualizable is `frame`. `jit_merge_point` is the first statement
 //! of the loop; `can_enter_jit` is only on a backward jump.
 //!
-//! Opcode bodies stay in [`super::interp::Vm::dispatch_one`] as a residual
-//! call so the portal can attach without inlining `Result` into the
-//! traced graph. Inlining interned arms is the next step, not a
-//! prerequisite for the doors.
+//! Interned arithmetic, comparison, local load/store and return run
+//! on `frame.locals_stack_w[i]` — the `getarrayitem_vable_*` shape —
+//! and call `cel_add` / `cel_equals` with no `Result`. Everything
+//! else is residual [`Vm::dispatch_one`].
 
 use majit_metainterp::JitDriver;
 
 use super::code::CelCode;
 use super::interp::{Step, Vm};
+use super::opcode::OpCode;
+use crate::runtime::binop::{
+    cel_add, cel_div, cel_equals, cel_greater, cel_greater_equals, cel_less, cel_less_equals,
+    cel_mul, cel_not_equals, cel_rem, cel_sub,
+};
+use crate::runtime::error::ERROR_SENTINEL;
+use crate::runtime::object::CelRef;
 #[allow(unused_imports)] // named in `virtualizable_fields`
 use crate::runtime::object::{
     W_CelFrame, CELFRAME_LAST_INSTR_OFFSET, CELFRAME_LOCALS_STACK_OFFSET,
@@ -26,6 +33,42 @@ use crate::{ExecutionError, Value};
 const PORTAL_DONE: i64 = -1;
 /// `dispatch_one` failed with no handler.
 const PORTAL_FAIL: i64 = -2;
+
+const OP_LOAD_LOCAL: i64 = OpCode::LoadLocal as i64;
+const OP_STORE_LOCAL: i64 = OpCode::StoreLocal as i64;
+const OP_ADD: i64 = OpCode::Add as i64;
+const OP_SUB: i64 = OpCode::Sub as i64;
+const OP_MUL: i64 = OpCode::Mul as i64;
+const OP_DIV: i64 = OpCode::Div as i64;
+const OP_MOD: i64 = OpCode::Mod as i64;
+const OP_EQ: i64 = OpCode::Equals as i64;
+const OP_NE: i64 = OpCode::NotEquals as i64;
+const OP_LT: i64 = OpCode::Less as i64;
+const OP_LE: i64 = OpCode::LessEquals as i64;
+const OP_GT: i64 = OpCode::Greater as i64;
+const OP_GE: i64 = OpCode::GreaterEquals as i64;
+const OP_RETURN: i64 = OpCode::Return as i64;
+
+macro_rules! interned_binop {
+    ($frame:ident, $vm:ident, $here:ident, $op:expr) => {{
+        let depth = $frame.valuestackdepth;
+        let b = $frame.locals_stack_w[depth - 1];
+        let a = $frame.locals_stack_w[depth - 2];
+        if a.is_null() || b.is_null() {
+            residual_dispatch($vm, $here)
+        } else {
+            let r = unsafe { $op(a, b) };
+            if r == ERROR_SENTINEL {
+                residual_dispatch($vm, $here)
+            } else {
+                $frame.locals_stack_w[depth - 2] = r;
+                $frame.valuestackdepth = depth - 1;
+                vm_sync_binop($vm, r as i64);
+                $here + 1
+            }
+        }
+    }};
+}
 
 struct PortalState {
     frame: usize,
@@ -41,6 +84,40 @@ fn insn_op(program: &CelCode, pc: usize) -> i64 {
         .get(pc)
         .map(|insn| insn.op as u8 as i64)
         .unwrap_or(-1)
+}
+
+/// Operand `a` of the instruction at `pc`.
+#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+fn insn_a(program: &CelCode, pc: usize) -> i64 {
+    program
+        .insns
+        .get(pc)
+        .map(|insn| i64::from(insn.ops[0]))
+        .unwrap_or(0)
+}
+
+fn vm_of<'a>(vm_bits: i64) -> &'a mut Vm<'a> {
+    unsafe { &mut *(vm_bits as usize as *mut Vm<'a>) }
+}
+
+#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+fn vm_sync_binop(vm_bits: i64, w: i64) {
+    vm_of(vm_bits).sync_pop_push_interned(2, w as usize as CelRef);
+}
+
+#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+fn vm_sync_push(vm_bits: i64, w: i64) {
+    vm_of(vm_bits).sync_push_interned(w as usize as CelRef);
+}
+
+#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+fn vm_sync_store(vm_bits: i64, slot: i64, w: i64) {
+    vm_of(vm_bits).sync_store_interned(slot as u32, w as usize as CelRef);
+}
+
+#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+fn vm_park_return(vm_bits: i64, w: i64) {
+    vm_of(vm_bits).park_return(w as usize as CelRef);
 }
 
 /// One instruction of the existing evaluator, residual.
@@ -129,7 +206,23 @@ pub(crate) fn eval_through_portal(
     auto_calls = true,
     calls = {
         insn_op => residual_int,
+        insn_a => residual_int,
         residual_dispatch => residual_int,
+        vm_sync_binop => residual_int,
+        vm_sync_push => residual_int,
+        vm_sync_store => residual_int,
+        vm_park_return => residual_int,
+        cel_add => inline_ref,
+        cel_sub => inline_ref,
+        cel_mul => inline_ref,
+        cel_div => inline_ref,
+        cel_rem => inline_ref,
+        cel_equals => inline_ref,
+        cel_not_equals => inline_ref,
+        cel_less => inline_ref,
+        cel_less_equals => inline_ref,
+        cel_greater => inline_ref,
+        cel_greater_equals => inline_ref,
     },
 )]
 fn run_cel_portal(
@@ -140,100 +233,59 @@ fn run_cel_portal(
 ) -> i64 {
     loop {
         jit_merge_point!(driver, program, pc; *state);
+        let frame = unsafe { &mut *(state.frame as *mut W_CelFrame) };
+        frame.last_instr = pc as i64;
         let opcode = insn_op(program, pc);
-        let vm = state.vm as i64;
+        let vm = state.vm;
         let here = pc as i64;
         let next = match opcode {
-            0 => residual_dispatch(vm, here),
-            1 => residual_dispatch(vm, here),
-            2 => residual_dispatch(vm, here),
-            3 => residual_dispatch(vm, here),
-            4 => residual_dispatch(vm, here),
-            5 => residual_dispatch(vm, here),
-            6 => residual_dispatch(vm, here),
-            7 => residual_dispatch(vm, here),
-            8 => residual_dispatch(vm, here),
-            9 => residual_dispatch(vm, here),
-            10 => residual_dispatch(vm, here),
-            11 => residual_dispatch(vm, here),
-            12 => residual_dispatch(vm, here),
-            13 => residual_dispatch(vm, here),
-            14 => residual_dispatch(vm, here),
-            15 => residual_dispatch(vm, here),
-            16 => residual_dispatch(vm, here),
-            17 => residual_dispatch(vm, here),
-            18 => residual_dispatch(vm, here),
-            19 => residual_dispatch(vm, here),
-            20 => residual_dispatch(vm, here),
-            21 => residual_dispatch(vm, here),
-            22 => residual_dispatch(vm, here),
-            23 => residual_dispatch(vm, here),
-            24 => residual_dispatch(vm, here),
-            25 => residual_dispatch(vm, here),
-            26 => residual_dispatch(vm, here),
-            27 => residual_dispatch(vm, here),
-            28 => residual_dispatch(vm, here),
-            29 => residual_dispatch(vm, here),
-            30 => residual_dispatch(vm, here),
-            31 => residual_dispatch(vm, here),
-            32 => residual_dispatch(vm, here),
-            33 => residual_dispatch(vm, here),
-            34 => residual_dispatch(vm, here),
-            35 => residual_dispatch(vm, here),
-            36 => residual_dispatch(vm, here),
-            37 => residual_dispatch(vm, here),
-            38 => residual_dispatch(vm, here),
-            39 => residual_dispatch(vm, here),
-            40 => residual_dispatch(vm, here),
-            41 => residual_dispatch(vm, here),
-            42 => residual_dispatch(vm, here),
-            43 => residual_dispatch(vm, here),
-            44 => residual_dispatch(vm, here),
-            45 => residual_dispatch(vm, here),
-            46 => residual_dispatch(vm, here),
-            47 => residual_dispatch(vm, here),
-            48 => residual_dispatch(vm, here),
-            49 => residual_dispatch(vm, here),
-            50 => residual_dispatch(vm, here),
-            51 => residual_dispatch(vm, here),
-            52 => residual_dispatch(vm, here),
-            53 => residual_dispatch(vm, here),
-            54 => residual_dispatch(vm, here),
-            55 => residual_dispatch(vm, here),
-            56 => residual_dispatch(vm, here),
-            57 => residual_dispatch(vm, here),
-            58 => residual_dispatch(vm, here),
-            59 => residual_dispatch(vm, here),
-            60 => residual_dispatch(vm, here),
-            61 => residual_dispatch(vm, here),
-            62 => residual_dispatch(vm, here),
-            63 => residual_dispatch(vm, here),
-            64 => residual_dispatch(vm, here),
-            65 => residual_dispatch(vm, here),
-            66 => residual_dispatch(vm, here),
-            67 => residual_dispatch(vm, here),
-            68 => residual_dispatch(vm, here),
-            69 => residual_dispatch(vm, here),
-            70 => residual_dispatch(vm, here),
-            71 => residual_dispatch(vm, here),
-            72 => residual_dispatch(vm, here),
-            73 => residual_dispatch(vm, here),
-            74 => residual_dispatch(vm, here),
-            75 => residual_dispatch(vm, here),
-            76 => residual_dispatch(vm, here),
-            77 => residual_dispatch(vm, here),
-            78 => residual_dispatch(vm, here),
-            79 => residual_dispatch(vm, here),
-            80 => residual_dispatch(vm, here),
-            81 => residual_dispatch(vm, here),
-            82 => residual_dispatch(vm, here),
-            83 => residual_dispatch(vm, here),
-            84 => residual_dispatch(vm, here),
-            85 => residual_dispatch(vm, here),
-            86 => residual_dispatch(vm, here),
-            87 => residual_dispatch(vm, here),
-            88 => residual_dispatch(vm, here),
-            89 => residual_dispatch(vm, here),
+            OP_LOAD_LOCAL => {
+                let slot = insn_a(program, pc);
+                let w = frame.locals_stack_w[slot];
+                if w.is_null() {
+                    residual_dispatch(vm, here)
+                } else {
+                    let depth = frame.valuestackdepth;
+                    frame.locals_stack_w[depth] = w;
+                    frame.valuestackdepth = depth + 1;
+                    vm_sync_push(vm, w as i64);
+                    here + 1
+                }
+            }
+            OP_STORE_LOCAL => {
+                let depth = frame.valuestackdepth;
+                let w = frame.locals_stack_w[depth - 1];
+                if w.is_null() {
+                    residual_dispatch(vm, here)
+                } else {
+                    let slot = insn_a(program, pc);
+                    frame.locals_stack_w[slot] = w;
+                    frame.valuestackdepth = depth - 1;
+                    vm_sync_store(vm, slot, w as i64);
+                    here + 1
+                }
+            }
+            OP_ADD => interned_binop!(frame, vm, here, cel_add),
+            OP_SUB => interned_binop!(frame, vm, here, cel_sub),
+            OP_MUL => interned_binop!(frame, vm, here, cel_mul),
+            OP_DIV => interned_binop!(frame, vm, here, cel_div),
+            OP_MOD => interned_binop!(frame, vm, here, cel_rem),
+            OP_EQ => interned_binop!(frame, vm, here, cel_equals),
+            OP_NE => interned_binop!(frame, vm, here, cel_not_equals),
+            OP_LT => interned_binop!(frame, vm, here, cel_less),
+            OP_LE => interned_binop!(frame, vm, here, cel_less_equals),
+            OP_GT => interned_binop!(frame, vm, here, cel_greater),
+            OP_GE => interned_binop!(frame, vm, here, cel_greater_equals),
+            OP_RETURN => {
+                let depth = frame.valuestackdepth;
+                let w = frame.locals_stack_w[depth - 1];
+                if w.is_null() {
+                    residual_dispatch(vm, here)
+                } else {
+                    vm_park_return(vm, w as i64);
+                    PORTAL_DONE
+                }
+            }
             _ => residual_dispatch(vm, here),
         };
         if next < 0 {
@@ -264,5 +316,29 @@ mod tests {
         let ctx = Context::default();
         let via_loop = cel_eval_loop(&code, &ctx).expect("eval");
         assert_eq!(via_loop, Value::Int(3));
+        assert_eq!(
+            cel_eval_loop(
+                &compile(&Parser::default().parse("1 == 1").unwrap()).unwrap(),
+                &ctx
+            )
+            .unwrap(),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            cel_eval_loop(
+                &compile(&Parser::default().parse("3 * 4 - 2").unwrap()).unwrap(),
+                &ctx
+            )
+            .unwrap(),
+            Value::Int(10)
+        );
+    }
+
+    #[test]
+    fn interned_opcode_numbers_match_the_enum() {
+        assert_eq!(OP_LOAD_LOCAL, OpCode::LoadLocal as i64);
+        assert_eq!(OP_ADD, OpCode::Add as i64);
+        assert_eq!(OP_EQ, OpCode::Equals as i64);
+        assert_eq!(OP_RETURN, OpCode::Return as i64);
     }
 }

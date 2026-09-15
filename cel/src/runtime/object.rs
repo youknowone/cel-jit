@@ -908,8 +908,46 @@ pub struct W_CelFrame {
     pub vable_token: usize,
     pub last_instr: i64,
     pub valuestackdepth: i64,
-    pub locals_stack_w: *mut crate::runtime::object_array::CelItemsBlock,
+    /// Indexed as `frame.locals_stack_w[i]`, the shape `jtransform`
+    /// `getarrayitem_vable_*` matches.
+    pub locals_stack_w: VableStack,
     pub n_slots: i64,
+}
+
+/// The `locals_cells_stack_w[*]` array: a pointer that indexes as a slice.
+///
+/// `#[repr(transparent)]` so the field is still one pointer in the frame.
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+pub struct VableStack {
+    pub(crate) block: *mut crate::runtime::object_array::CelItemsBlock,
+}
+
+impl VableStack {
+    fn from_block(block: *mut crate::runtime::object_array::CelItemsBlock) -> Self {
+        VableStack { block }
+    }
+
+    pub fn capacity(self) -> usize {
+        unsafe { crate::runtime::object_array::items_capacity(self.block) }
+    }
+}
+
+impl core::ops::Index<i64> for VableStack {
+    type Output = CelRef;
+    fn index(&self, i: i64) -> &CelRef {
+        unsafe {
+            &*crate::runtime::object_array::items_block_items_base(self.block).add(i as usize)
+        }
+    }
+}
+
+impl core::ops::IndexMut<i64> for VableStack {
+    fn index_mut(&mut self, i: i64) -> &mut CelRef {
+        unsafe {
+            &mut *crate::runtime::object_array::items_block_items_base(self.block).add(i as usize)
+        }
+    }
 }
 
 pub static CEL_FRAME_CLASS: CelClass = CelClass::new("frame", CelKind::Frame);
@@ -935,7 +973,7 @@ pub fn new_cel_frame(n_slots: i64, max_stack: i64) -> *mut W_CelFrame {
         vable_token: 0,
         last_instr: -1,
         valuestackdepth: n_slots,
-        locals_stack_w: items,
+        locals_stack_w: VableStack::from_block(items),
         n_slots,
     })
 }
@@ -946,7 +984,8 @@ pub fn new_cel_frame(n_slots: i64, max_stack: i64) -> *mut W_CelFrame {
 ///
 /// `frame` is a live [`W_CelFrame`] and `i` is in range.
 pub unsafe fn cel_frame_slot(frame: *mut W_CelFrame, i: i64) -> *mut CelRef {
-    crate::runtime::object_array::items_block_items_base((*frame).locals_stack_w).add(i as usize)
+    crate::runtime::object_array::items_block_items_base((*frame).locals_stack_w.block)
+        .add(i as usize)
 }
 
 /// `virtualizable.py` `force_virtualizable_if_necessary`.
@@ -1220,10 +1259,7 @@ mod tests {
             assert_eq!((*f).last_instr, -1);
             assert_eq!((*f).valuestackdepth, 2);
             assert_eq!((*f).n_slots, 2);
-            assert_eq!(
-                crate::runtime::object_array::items_capacity((*f).locals_stack_w),
-                5
-            );
+            assert_eq!((*f).locals_stack_w.capacity(), 5);
             let a = new_int(1) as CelRef;
             *cel_frame_slot(f, 0) = a;
             assert_eq!(*cel_frame_slot(f, 0), a);

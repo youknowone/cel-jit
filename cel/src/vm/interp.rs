@@ -872,7 +872,28 @@ impl<'a> Vm<'a> {
     /// Exhaustive over [`CelErr`], so a variant added without a public
     /// counterpart is a compile error here rather than a silent
     /// `InternalError` at run time.
-    #[allow(deprecated)]
+    pub(crate) fn sync_pop_push_interned(&mut self, n_pop: usize, w: CelRef) {
+        let mut i = 0;
+        while i < n_pop {
+            let _ = self.pop_operand();
+            i += 1;
+        }
+        self.push_operand(Operand::Interned(w));
+    }
+
+    pub(crate) fn sync_push_interned(&mut self, w: CelRef) {
+        self.push_operand(Operand::Interned(w));
+    }
+
+    pub(crate) fn sync_store_interned(&mut self, slot: u32, w: CelRef) {
+        let _ = self.pop_operand();
+        let _ = self.store_operand(slot, Operand::Interned(w));
+    }
+
+    pub(crate) fn park_return(&mut self, w: CelRef) {
+        self.portal_ret = Some(Ok(crate::Value::from_interned(w)));
+    }
+
     pub(crate) fn public_error(&self, err: CelErr) -> ExecutionError {
         let name = |id: NameId| self.code.name(id).unwrap_or("?").to_string();
         // The operator name the public error carries is a property of the
@@ -954,8 +975,7 @@ impl<'a> Vm<'a> {
 
     fn write_vable_cell(&mut self, index: usize, w: CelRef) {
         unsafe {
-            let cap =
-                crate::runtime::object_array::items_capacity((*self.cel_frame).locals_stack_w);
+            let cap = (*self.cel_frame).locals_stack_w.capacity();
             if index < cap {
                 *cel_frame_slot(self.cel_frame, index as i64) = w;
             }
