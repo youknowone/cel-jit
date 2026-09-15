@@ -23,8 +23,8 @@ use crate::runtime::binop::{
 use crate::runtime::convert::{intern_leaf, interned_list_get, interned_map_lookup_string};
 use crate::runtime::error::ERROR_SENTINEL;
 use crate::runtime::object::{
-    list_len, list_try_append, new_bool, new_int, new_list_with_capacity, string_as_str, w_kind,
-    CelKind, CelRef, W_BoolObject, W_IntObject,
+    bytes_len, list_len, list_try_append, map_len, new_bool, new_int, new_list_with_capacity,
+    string_as_str, string_byte_len, w_kind, CelKind, CelRef, W_BoolObject, W_IntObject,
 };
 #[allow(unused_imports)] // named in `virtualizable_fields`
 use crate::runtime::object::{
@@ -92,6 +92,9 @@ const OP_INDEX: i64 = OpCode::Index as i64;
 const OP_NOT: i64 = OpCode::Not as i64;
 const OP_NEGATE: i64 = OpCode::Negate as i64;
 const OP_IN: i64 = OpCode::In as i64;
+const OP_LOAD_LOCAL_APPEND: i64 = OpCode::LoadLocalAppend as i64;
+const OP_CALL_HOST: i64 = OpCode::CallHost as i64;
+const OP_CALL_METHOD: i64 = OpCode::CallMethod as i64;
 
 macro_rules! interned_binop {
     ($frame:ident, $vm:ident, $here:ident, $op:expr) => {{
@@ -334,6 +337,28 @@ fn interned_contains(container: i64, needle: i64) -> i64 {
     }
 }
 
+/// Length of an interned list/map/string/bytes. `-1` means residual.
+#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+fn interned_len(w: i64) -> i64 {
+    let w = w as usize as CelRef;
+    if w.is_null() {
+        return -1;
+    }
+    match unsafe { w_kind(w) } {
+        CelKind::List => unsafe { list_len(w) },
+        CelKind::Map => unsafe { map_len(w) },
+        CelKind::Str => unsafe { string_byte_len(w) },
+        CelKind::Bytes => unsafe { bytes_len(w) },
+        _ => -1,
+    }
+}
+
+/// `1` if `names[idx]` is `size`.
+#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+fn interned_is_size(program: &CelCode, idx: i64) -> i64 {
+    i64::from(program.name(NameId(idx as u32)) == Some("size"))
+}
+
 fn vm_of<'a>(vm_bits: i64) -> &'a mut Vm<'a> {
     unsafe { &mut *(vm_bits as usize as *mut Vm<'a>) }
 }
@@ -480,6 +505,8 @@ pub(crate) fn eval_through_portal(
         interned_has_field => residual_int,
         interned_index => residual_int,
         interned_contains => residual_int,
+        interned_len => residual_int,
+        interned_is_size => residual_int,
         interned_item => residual_int,
         try_append => residual_int,
         new_list_with_capacity => inline_ref,
@@ -679,6 +706,36 @@ fn run_cel_portal(
                     frame.valuestackdepth = depth - 1;
                     vm_sync_binop(vm, r as i64);
                     here + 1
+                }
+            }
+            OP_LOAD_LOCAL_APPEND => {
+                let w = frame.locals_stack_w[insn_a(program, pc)];
+                let depth = frame.valuestackdepth;
+                let list = frame.locals_stack_w[depth - 1];
+                if w.is_null() || list.is_null() || try_append(list as i64, w as i64) == 0 {
+                    residual_dispatch(vm, here)
+                } else {
+                    here + 1
+                }
+            }
+            OP_CALL_HOST | OP_CALL_METHOD => {
+                let want_arity = if opcode == OP_CALL_HOST { 1 } else { 0 };
+                if insn_b(program, pc) == want_arity
+                    && interned_is_size(program, insn_a(program, pc)) != 0
+                {
+                    let depth = frame.valuestackdepth;
+                    let w = frame.locals_stack_w[depth - 1];
+                    let n = interned_len(w as i64);
+                    if w.is_null() || n < 0 {
+                        residual_dispatch(vm, here)
+                    } else {
+                        let r = new_int(n) as CelRef;
+                        frame.locals_stack_w[depth - 1] = r;
+                        vm_sync_replace(vm, r as i64);
+                        here + 1
+                    }
+                } else {
+                    residual_dispatch(vm, here)
                 }
             }
             OP_LOAD_LOCAL => {
@@ -1105,6 +1162,30 @@ mod tests {
             .unwrap(),
             Value::Bool(false)
         );
+        assert_eq!(
+            cel_eval_loop(
+                &compile(&Parser::default().parse("xs.size()").unwrap()).unwrap(),
+                &with_map
+            )
+            .unwrap(),
+            Value::Int(3)
+        );
+        assert_eq!(
+            cel_eval_loop(
+                &compile(&Parser::default().parse("size(xs)").unwrap()).unwrap(),
+                &with_map
+            )
+            .unwrap(),
+            Value::Int(3)
+        );
+        assert_eq!(
+            cel_eval_loop(
+                &compile(&Parser::default().parse("xs.map(x, x)").unwrap()).unwrap(),
+                &with_map
+            )
+            .unwrap(),
+            Value::list(vec![Value::Int(10), Value::Int(20), Value::Int(30)])
+        );
     }
 
     #[test]
@@ -1124,5 +1205,8 @@ mod tests {
         assert_eq!(OP_NOT, OpCode::Not as i64);
         assert_eq!(OP_NEGATE, OpCode::Negate as i64);
         assert_eq!(OP_IN, OpCode::In as i64);
+        assert_eq!(OP_LOAD_LOCAL_APPEND, OpCode::LoadLocalAppend as i64);
+        assert_eq!(OP_CALL_HOST, OpCode::CallHost as i64);
+        assert_eq!(OP_CALL_METHOD, OpCode::CallMethod as i64);
     }
 }
