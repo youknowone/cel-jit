@@ -18,9 +18,12 @@ use crate::runtime::binop::{
     cel_add, cel_div, cel_equals, cel_greater, cel_greater_equals, cel_less, cel_less_equals,
     cel_mul, cel_not_equals, cel_rem, cel_sub,
 };
-use crate::runtime::convert::intern_leaf;
+use crate::runtime::convert::{intern_leaf, interned_list_get};
 use crate::runtime::error::ERROR_SENTINEL;
-use crate::runtime::object::{new_int, w_kind, CelKind, CelRef, W_BoolObject, W_IntObject};
+use crate::runtime::object::{
+    list_len, list_try_append, new_int, new_list_with_capacity, w_kind, CelKind, CelRef,
+    W_BoolObject, W_IntObject,
+};
 #[allow(unused_imports)] // named in `virtualizable_fields`
 use crate::runtime::object::{
     W_CelFrame, CELFRAME_LAST_INSTR_OFFSET, CELFRAME_LOCALS_STACK_OFFSET,
@@ -68,6 +71,14 @@ const OP_JUMP: i64 = OpCode::Jump as i64;
 const OP_JUMP_IF_FALSE: i64 = OpCode::JumpIfFalse as i64;
 const OP_JUMP_IF_TRUE: i64 = OpCode::JumpIfTrue as i64;
 const OP_ITER_ADVANCE: i64 = OpCode::IterAdvance as i64;
+const OP_NEW_LIST: i64 = OpCode::NewList as i64;
+const OP_NEW_LIST_FROM_ARG: i64 = OpCode::NewListFromArg as i64;
+const OP_LIST_APPEND: i64 = OpCode::ListAppend as i64;
+const OP_ITER_ELEMS: i64 = OpCode::IterElems as i64;
+const OP_ITER_LEN: i64 = OpCode::IterLen as i64;
+const OP_ITER_AT: i64 = OpCode::IterAt as i64;
+const OP_ITER_GUARD: i64 = OpCode::IterGuard as i64;
+const OP_ITER_BIND: i64 = OpCode::IterBind as i64;
 
 macro_rules! interned_binop {
     ($frame:ident, $vm:ident, $here:ident, $op:expr) => {{
@@ -167,8 +178,34 @@ fn insn_b(program: &CelCode, pc: usize) -> i64 {
         .unwrap_or(0)
 }
 
+#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+fn insn_c(program: &CelCode, pc: usize) -> i64 {
+    program
+        .insns
+        .get(pc)
+        .map(|insn| i64::from(insn.ops[2]))
+        .unwrap_or(0)
+}
+
 /// Intern `consts[idx]`. 0 means the constant is not a class-family leaf.
 #[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+fn interned_item(list: i64, index: i64) -> i64 {
+    match unsafe { interned_list_get(list as usize as CelRef, index) } {
+        Some(w) => w as usize as i64,
+        None => 0,
+    }
+}
+
+#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+fn try_append(list: i64, item: i64) -> i64 {
+    unsafe {
+        i64::from(list_try_append(
+            list as usize as CelRef,
+            item as usize as CelRef,
+        ))
+    }
+}
+
 fn intern_const(program: &CelCode, idx: i64) -> i64 {
     let Some(value) = program.konst(idx as u32) else {
         return 0;
@@ -303,7 +340,11 @@ pub(crate) fn eval_through_portal(
         insn_op => residual_int,
         insn_a => residual_int,
         insn_b => residual_int,
+        insn_c => residual_int,
         intern_const => residual_int,
+        interned_item => residual_int,
+        try_append => residual_int,
+        new_list_with_capacity => inline_ref,
         residual_dispatch => residual_int,
         vm_sync_binop => residual_int,
         vm_sync_replace => residual_int,
@@ -434,6 +475,127 @@ fn run_cel_portal(
                     if truthy == want {
                         insn_a(program, pc)
                     } else {
+                        here + 1
+                    }
+                }
+            }
+            OP_NEW_LIST => {
+                let w = new_list_with_capacity(insn_a(program, pc)) as CelRef;
+                let depth = frame.valuestackdepth;
+                frame.locals_stack_w[depth] = w;
+                frame.valuestackdepth = depth + 1;
+                vm_sync_push(vm, w as i64);
+                here + 1
+            }
+            OP_NEW_LIST_FROM_ARG => {
+                let src = frame.locals_stack_w[insn_a(program, pc)];
+                if src.is_null() || unsafe { w_kind(src) } != CelKind::List {
+                    residual_dispatch(vm, here)
+                } else {
+                    let w = new_list_with_capacity(unsafe { list_len(src) }) as CelRef;
+                    let depth = frame.valuestackdepth;
+                    frame.locals_stack_w[depth] = w;
+                    frame.valuestackdepth = depth + 1;
+                    vm_sync_push(vm, w as i64);
+                    here + 1
+                }
+            }
+            OP_LIST_APPEND => {
+                let depth = frame.valuestackdepth;
+                let item = frame.locals_stack_w[depth - 1];
+                let list = frame.locals_stack_w[depth - 2];
+                if item.is_null() || list.is_null() || try_append(list as i64, item as i64) == 0 {
+                    residual_dispatch(vm, here)
+                } else {
+                    frame.valuestackdepth = depth - 1;
+                    vm_sync_pop(vm);
+                    here + 1
+                }
+            }
+            OP_ITER_ELEMS => {
+                let depth = frame.valuestackdepth;
+                let w = frame.locals_stack_w[depth - 1];
+                if w.is_null() || unsafe { w_kind(w) } != CelKind::List {
+                    residual_dispatch(vm, here)
+                } else {
+                    here + 1
+                }
+            }
+            OP_ITER_LEN => {
+                let src = frame.locals_stack_w[insn_a(program, pc)];
+                if src.is_null() || unsafe { w_kind(src) } != CelKind::List {
+                    residual_dispatch(vm, here)
+                } else {
+                    let w = new_int(unsafe { list_len(src) }) as CelRef;
+                    let depth = frame.valuestackdepth;
+                    frame.locals_stack_w[depth] = w;
+                    frame.valuestackdepth = depth + 1;
+                    vm_sync_push(vm, w as i64);
+                    here + 1
+                }
+            }
+            OP_ITER_GUARD => {
+                let idx_w = frame.locals_stack_w[insn_a(program, pc)];
+                let src = frame.locals_stack_w[insn_b(program, pc)];
+                if idx_w.is_null()
+                    || src.is_null()
+                    || unsafe { w_kind(idx_w) } != CelKind::Int
+                    || unsafe { w_kind(src) } != CelKind::List
+                {
+                    residual_dispatch(vm, here)
+                } else {
+                    let index = unsafe { (*idx_w.cast::<W_IntObject>()).intval };
+                    let len = unsafe { list_len(src) };
+                    if index >= len {
+                        insn_c(program, pc)
+                    } else {
+                        here + 1
+                    }
+                }
+            }
+            OP_ITER_AT => {
+                let src = frame.locals_stack_w[insn_a(program, pc)];
+                let idx_w = frame.locals_stack_w[insn_b(program, pc)];
+                if src.is_null()
+                    || idx_w.is_null()
+                    || unsafe { w_kind(src) } != CelKind::List
+                    || unsafe { w_kind(idx_w) } != CelKind::Int
+                {
+                    residual_dispatch(vm, here)
+                } else {
+                    let index = unsafe { (*idx_w.cast::<W_IntObject>()).intval };
+                    let item = interned_item(src as i64, index);
+                    if item == 0 {
+                        residual_dispatch(vm, here)
+                    } else {
+                        let w = item as usize as CelRef;
+                        let depth = frame.valuestackdepth;
+                        frame.locals_stack_w[depth] = w;
+                        frame.valuestackdepth = depth + 1;
+                        vm_sync_push(vm, item);
+                        here + 1
+                    }
+                }
+            }
+            OP_ITER_BIND => {
+                let src = frame.locals_stack_w[insn_a(program, pc)];
+                let idx_w = frame.locals_stack_w[insn_b(program, pc)];
+                if src.is_null()
+                    || idx_w.is_null()
+                    || unsafe { w_kind(src) } != CelKind::List
+                    || unsafe { w_kind(idx_w) } != CelKind::Int
+                {
+                    residual_dispatch(vm, here)
+                } else {
+                    let index = unsafe { (*idx_w.cast::<W_IntObject>()).intval };
+                    let item = interned_item(src as i64, index);
+                    if item == 0 {
+                        residual_dispatch(vm, here)
+                    } else {
+                        let slot = insn_c(program, pc);
+                        let w = item as usize as CelRef;
+                        frame.locals_stack_w[slot] = w;
+                        vm_sync_write_local(vm, slot, item);
                         here + 1
                     }
                 }

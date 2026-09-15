@@ -639,6 +639,51 @@ pub unsafe fn list_get(w: CelRef, index: i64) -> Option<CelRef> {
     }
 }
 
+/// An empty list whose items block has room for `cap` appends.
+pub fn new_list_with_capacity(cap: i64) -> *mut W_ListObject {
+    let n = cap.max(0) as usize;
+    let nulls = vec![core::ptr::null_mut::<CelObject>(); n];
+    let items = object_array::new_items_block(&nulls);
+    lltype::malloc_typed(W_ListObject {
+        ob_header: CelObject {
+            ob_type: &CEL_LIST_CLASS,
+        },
+        strategy: ListStrategy::Object,
+        storage: core::ptr::null_mut(),
+        items,
+        start: 0,
+        length: 0,
+    })
+}
+
+/// Append `item` to an object-strategy list if the block still has room.
+///
+/// Used while a comprehension fills a list opened by [`new_list_with_capacity`].
+///
+/// # Safety
+///
+/// `w` is a live [`W_ListObject`].
+pub unsafe fn list_try_append(w: CelRef, item: CelRef) -> bool {
+    if w_kind(w) != CelKind::List {
+        return false;
+    }
+    let leaf = &mut *w.cast::<W_ListObject>();
+    if leaf.strategy != ListStrategy::Object {
+        return false;
+    }
+    let cap = crate::runtime::object_array::items_capacity(leaf.items);
+    if leaf.length < 0 || (leaf.length as usize) >= cap {
+        return false;
+    }
+    let base = crate::runtime::object_array::items_block_items_base(leaf.items);
+    if base.is_null() {
+        return false;
+    }
+    *base.add(leaf.length as usize) = item;
+    leaf.length += 1;
+    true
+}
+
 pub fn new_list(values: &[CelRef]) -> *mut W_ListObject {
     let items = object_array::new_items_block(values);
     let length = values.len() as i64;

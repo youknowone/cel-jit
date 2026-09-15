@@ -1496,6 +1496,10 @@ impl<'a> Vm<'a> {
             }
             Operand::Refs(items) => items.push(new_int(word) as CelRef),
             Operand::List(items) => items.push(Value::Int(word)),
+            Operand::Interned(list)
+                if unsafe {
+                    crate::runtime::object::list_try_append(*list, new_int(word) as CelRef)
+                } => {}
             _ => return Err(CelErr::InternalError),
         }
         Ok(())
@@ -1519,6 +1523,8 @@ impl<'a> Vm<'a> {
             Operand::List(items) => {
                 items.push(unsafe { ref_to_value(w) }.map_err(|_| CelErr::InternalError)?);
             }
+            Operand::Interned(list)
+                if unsafe { crate::runtime::object::list_try_append(*list, w) } => {}
             _ => return Err(CelErr::InternalError),
         }
         Ok(())
