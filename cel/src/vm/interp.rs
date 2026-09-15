@@ -88,9 +88,16 @@ pub fn cel_eval_loop(code: &CelCode, ctx: &Context) -> Result<Value, ExecutionEr
             vm.shape.top
         };
     }
-    match vm.run() {
-        Ok(value) => Ok(value),
-        Err(err) => Err(vm.public_error(err)),
+    #[cfg(feature = "jit")]
+    {
+        crate::vm::portal::eval_through_portal(&mut vm, code)
+    }
+    #[cfg(not(feature = "jit"))]
+    {
+        match vm.run() {
+            Ok(value) => Ok(value),
+            Err(err) => Err(vm.public_error(err)),
+        }
     }
 }
 
@@ -685,7 +692,7 @@ std::thread_local! {
     static SCRATCH: std::cell::Cell<Option<Box<Scratch>>> = const { std::cell::Cell::new(None) };
 }
 
-struct Vm<'a> {
+pub(crate) struct Vm<'a> {
     code: &'a CelCode,
     ctx: &'a Context<'a>,
     /// The activation record, `| locals | stack |` in ONE array, the layout
@@ -721,7 +728,9 @@ struct Vm<'a> {
     stack_base: usize,
     /// `PyFrame` virtualizable: `last_instr`, `valuestackdepth`,
     /// `locals_stack_w[*]`. Interned slots are written through here.
-    cel_frame: *mut W_CelFrame,
+    pub(crate) cel_frame: *mut W_CelFrame,
+    /// Result parked by the JIT portal when `dispatch_one` returns.
+    pub(crate) portal_ret: Option<CelResult<Value>>,
     /// Arguments a missed [`OpCode::CallQualified`] popped, held for the
     /// [`OpCode::CallMethod`] the compiler emitted right after it.
     ///
@@ -812,6 +821,7 @@ impl<'a> Vm<'a> {
             scratch: std::mem::ManuallyDrop::new(scratch),
             stack_base,
             cel_frame,
+            portal_ret: None,
             pending_args: None,
             #[cfg(feature = "__drop-arm-probe")]
             probe: ProbePolicy::default(),
@@ -863,7 +873,7 @@ impl<'a> Vm<'a> {
     /// counterpart is a compile error here rather than a silent
     /// `InternalError` at run time.
     #[allow(deprecated)]
-    fn public_error(&self, err: CelErr) -> ExecutionError {
+    pub(crate) fn public_error(&self, err: CelErr) -> ExecutionError {
         let name = |id: NameId| self.code.name(id).unwrap_or("?").to_string();
         // The operator name the public error carries is a property of the
         // opcode, which is why the compact form stores the opcode.
@@ -1626,56 +1636,43 @@ impl<'a> Vm<'a> {
 
     // -- the loop -----------------------------------------------------------
 
-    fn run(&mut self) -> CelResult<Value> {
+    pub(crate) fn run(&mut self) -> CelResult<Value> {
         unsafe {
             force_virtualizable_if_necessary(self.cel_frame);
         }
         let mut pc = 0u32;
         loop {
-            // One comparison against a field, executed by every arm on every
-            // dispatch. An arm that fuses nothing holds `u32::MAX` here and
-            // never takes it; an arm that fuses takes it once per element. The
-            // branch is perfectly predicted either way, and it is the probe's
-            // own overhead: an arm that removes k dispatches also removes k
-            // executions of this test, which inflates that arm's measured
-            // saving by k times the cost of one predicted compare.
-            #[cfg(feature = "__elem-attr-probe")]
-            if pc == self.anchor {
-                pc = self.fused_element(pc)?;
-                continue;
+            match self.dispatch_one(pc)? {
+                Step::Next => pc += 1,
+                Step::Jump(target) => pc = target,
+                Step::Return(value) => return Ok(value),
             }
-            // `max_stack` is `Compiler::emit`'s sum over `stack_effect`, so
-            // this is the declared effect of every opcode checked against
-            // what the arms below actually push. A fused opcode whose
-            // declared net is short by one drifts past this bound and past
-            // nothing else -- every other check in this file is about WHAT is
-            // on top, not how many.
-            debug_assert!(
-                self.depth() <= self.code.max_stack as usize,
-                "depth {} past the compiler's {} at pc {pc}",
-                self.depth(),
-                self.code.max_stack
-            );
-            // Range is the only thing left to check: in a vector of decoded
-            // records a word that is not an opcode, and an instruction the
-            // stream stops short of the operands of, are states that cannot be
-            // built. What a bad jump target can still be is off the end.
-            let Some(&Insn { op, ops }) = self.code.insns.get(pc as usize) else {
-                return Err(CelErr::InternalError);
-            };
-            // `pyopcode.py` `self.last_instr = intmask(next_instr)` at the
-            // top of every dispatch iteration.
-            unsafe {
-                (*self.cel_frame).last_instr = i64::from(pc);
-            }
-            let next = pc + 1;
+        }
+    }
 
-            match self.step(op, ops, pc, next) {
-                Ok(Step::Next) => pc = next,
-                Ok(Step::Jump(target)) => pc = target,
-                Ok(Step::Return(value)) => return Ok(value),
-                Err(err) => pc = self.unwind(err, pc)?,
-            }
+    /// One instruction, for both the interpreter loop and the JIT portal.
+    pub(crate) fn dispatch_one(&mut self, pc: u32) -> CelResult<Step> {
+        #[cfg(feature = "__elem-attr-probe")]
+        if pc == self.anchor {
+            let next = self.fused_element(pc)?;
+            return Ok(Step::Jump(next));
+        }
+        debug_assert!(
+            self.depth() <= self.code.max_stack as usize,
+            "depth {} past the compiler's {} at pc {pc}",
+            self.depth(),
+            self.code.max_stack
+        );
+        let Some(&Insn { op, ops }) = self.code.insns.get(pc as usize) else {
+            return Err(CelErr::InternalError);
+        };
+        unsafe {
+            (*self.cel_frame).last_instr = i64::from(pc);
+        }
+        let next = pc + 1;
+        match self.step(op, ops, pc, next) {
+            Ok(step) => Ok(step),
+            Err(err) => Ok(Step::Jump(self.unwind(err, pc)?)),
         }
     }
 
@@ -3180,7 +3177,7 @@ impl<'a> Vm<'a> {
 }
 
 /// What one instruction decided.
-enum Step {
+pub(crate) enum Step {
     Next,
     Jump(u32),
     Return(Value),

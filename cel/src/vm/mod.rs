@@ -44,6 +44,8 @@ pub mod compile;
 pub mod error;
 pub mod interp;
 pub mod opcode;
+#[cfg(feature = "jit")]
+pub mod portal;
 
 pub use code::{CelCode, Handler, Insn};
 pub use compile::{compile, CompileError, CompileErrorKind};
