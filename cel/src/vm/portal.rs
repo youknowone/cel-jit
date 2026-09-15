@@ -18,8 +18,9 @@ use crate::runtime::binop::{
     cel_add, cel_div, cel_equals, cel_greater, cel_greater_equals, cel_less, cel_less_equals,
     cel_mul, cel_not_equals, cel_rem, cel_sub,
 };
+use crate::runtime::convert::intern_leaf;
 use crate::runtime::error::ERROR_SENTINEL;
-use crate::runtime::object::CelRef;
+use crate::runtime::object::{new_int, w_kind, CelKind, CelRef, W_BoolObject, W_IntObject};
 #[allow(unused_imports)] // named in `virtualizable_fields`
 use crate::runtime::object::{
     W_CelFrame, CELFRAME_LAST_INSTR_OFFSET, CELFRAME_LOCALS_STACK_OFFSET,
@@ -48,6 +49,25 @@ const OP_LE: i64 = OpCode::LessEquals as i64;
 const OP_GT: i64 = OpCode::Greater as i64;
 const OP_GE: i64 = OpCode::GreaterEquals as i64;
 const OP_RETURN: i64 = OpCode::Return as i64;
+const OP_LOAD_CONST: i64 = OpCode::LoadConst as i64;
+const OP_INC_LOCAL: i64 = OpCode::IncLocal as i64;
+const OP_ADD_K: i64 = OpCode::AddConst as i64;
+const OP_MUL_K: i64 = OpCode::MulConst as i64;
+const OP_MOD_K: i64 = OpCode::ModConst as i64;
+const OP_EQ_K: i64 = OpCode::EqualsConst as i64;
+const OP_NE_K: i64 = OpCode::NotEqualsConst as i64;
+const OP_LT_K: i64 = OpCode::LessConst as i64;
+const OP_GT_K: i64 = OpCode::GreaterConst as i64;
+const OP_GE_K: i64 = OpCode::GreaterEqualsConst as i64;
+const OP_ADD_LOCAL_K: i64 = OpCode::AddLocalConst as i64;
+const OP_MUL_LOCAL_K: i64 = OpCode::MulLocalConst as i64;
+const OP_MOD_LOCAL_K: i64 = OpCode::ModLocalConst as i64;
+const OP_EQ_LOCAL_K: i64 = OpCode::EqualsLocalConst as i64;
+const OP_NE_LOCAL_K: i64 = OpCode::NotEqualsLocalConst as i64;
+const OP_JUMP: i64 = OpCode::Jump as i64;
+const OP_JUMP_IF_FALSE: i64 = OpCode::JumpIfFalse as i64;
+const OP_JUMP_IF_TRUE: i64 = OpCode::JumpIfTrue as i64;
+const OP_ITER_ADVANCE: i64 = OpCode::IterAdvance as i64;
 
 macro_rules! interned_binop {
     ($frame:ident, $vm:ident, $here:ident, $op:expr) => {{
@@ -64,6 +84,48 @@ macro_rules! interned_binop {
                 $frame.locals_stack_w[depth - 2] = r;
                 $frame.valuestackdepth = depth - 1;
                 vm_sync_binop($vm, r as i64);
+                $here + 1
+            }
+        }
+    }};
+}
+
+macro_rules! interned_binop_k {
+    ($frame:ident, $vm:ident, $program:ident, $pc:ident, $here:ident, $op:expr) => {{
+        let depth = $frame.valuestackdepth;
+        let a = $frame.locals_stack_w[depth - 1];
+        let k = intern_const($program, insn_a($program, $pc));
+        if a.is_null() || k == 0 {
+            residual_dispatch($vm, $here)
+        } else {
+            let r = unsafe { $op(a, k as usize as CelRef) };
+            if r == ERROR_SENTINEL {
+                residual_dispatch($vm, $here)
+            } else {
+                $frame.locals_stack_w[depth - 1] = r;
+                vm_sync_replace($vm, r as i64);
+                $here + 1
+            }
+        }
+    }};
+}
+
+macro_rules! interned_local_k {
+    ($frame:ident, $vm:ident, $program:ident, $pc:ident, $here:ident, $op:expr) => {{
+        let slot = insn_a($program, $pc);
+        let a = $frame.locals_stack_w[slot];
+        let k = intern_const($program, insn_b($program, $pc));
+        if a.is_null() || k == 0 {
+            residual_dispatch($vm, $here)
+        } else {
+            let r = unsafe { $op(a, k as usize as CelRef) };
+            if r == ERROR_SENTINEL {
+                residual_dispatch($vm, $here)
+            } else {
+                let depth = $frame.valuestackdepth;
+                $frame.locals_stack_w[depth] = r;
+                $frame.valuestackdepth = depth + 1;
+                vm_sync_push($vm, r as i64);
                 $here + 1
             }
         }
@@ -96,6 +158,24 @@ fn insn_a(program: &CelCode, pc: usize) -> i64 {
         .unwrap_or(0)
 }
 
+#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+fn insn_b(program: &CelCode, pc: usize) -> i64 {
+    program
+        .insns
+        .get(pc)
+        .map(|insn| i64::from(insn.ops[1]))
+        .unwrap_or(0)
+}
+
+/// Intern `consts[idx]`. 0 means the constant is not a class-family leaf.
+#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+fn intern_const(program: &CelCode, idx: i64) -> i64 {
+    let Some(value) = program.konst(idx as u32) else {
+        return 0;
+    };
+    intern_leaf(value).map(|w| w as usize as i64).unwrap_or(0)
+}
+
 fn vm_of<'a>(vm_bits: i64) -> &'a mut Vm<'a> {
     unsafe { &mut *(vm_bits as usize as *mut Vm<'a>) }
 }
@@ -103,6 +183,11 @@ fn vm_of<'a>(vm_bits: i64) -> &'a mut Vm<'a> {
 #[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
 fn vm_sync_binop(vm_bits: i64, w: i64) {
     vm_of(vm_bits).sync_pop_push_interned(2, w as usize as CelRef);
+}
+
+#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+fn vm_sync_replace(vm_bits: i64, w: i64) {
+    vm_of(vm_bits).sync_pop_push_interned(1, w as usize as CelRef);
 }
 
 #[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
@@ -118,6 +203,16 @@ fn vm_sync_store(vm_bits: i64, slot: i64, w: i64) {
 #[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
 fn vm_park_return(vm_bits: i64, w: i64) {
     vm_of(vm_bits).park_return(w as usize as CelRef);
+}
+
+#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+fn vm_sync_write_local(vm_bits: i64, slot: i64, w: i64) {
+    vm_of(vm_bits).sync_write_local(slot as u32, w as usize as CelRef);
+}
+
+#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+fn vm_sync_pop(vm_bits: i64) {
+    vm_of(vm_bits).sync_pop();
 }
 
 /// One instruction of the existing evaluator, residual.
@@ -207,11 +302,17 @@ pub(crate) fn eval_through_portal(
     calls = {
         insn_op => residual_int,
         insn_a => residual_int,
+        insn_b => residual_int,
+        intern_const => residual_int,
         residual_dispatch => residual_int,
         vm_sync_binop => residual_int,
+        vm_sync_replace => residual_int,
         vm_sync_push => residual_int,
         vm_sync_store => residual_int,
+        vm_sync_write_local => residual_int,
+        vm_sync_pop => residual_int,
         vm_park_return => residual_int,
+        new_int => inline_ref,
         cel_add => inline_ref,
         cel_sub => inline_ref,
         cel_mul => inline_ref,
@@ -276,6 +377,85 @@ fn run_cel_portal(
             OP_LE => interned_binop!(frame, vm, here, cel_less_equals),
             OP_GT => interned_binop!(frame, vm, here, cel_greater),
             OP_GE => interned_binop!(frame, vm, here, cel_greater_equals),
+            OP_LOAD_CONST => {
+                let w = intern_const(program, insn_a(program, pc));
+                if w == 0 {
+                    residual_dispatch(vm, here)
+                } else {
+                    let depth = frame.valuestackdepth;
+                    frame.locals_stack_w[depth] = w as usize as CelRef;
+                    frame.valuestackdepth = depth + 1;
+                    vm_sync_push(vm, w);
+                    here + 1
+                }
+            }
+            OP_ADD_K => interned_binop_k!(frame, vm, program, pc, here, cel_add),
+            OP_MUL_K => interned_binop_k!(frame, vm, program, pc, here, cel_mul),
+            OP_MOD_K => interned_binop_k!(frame, vm, program, pc, here, cel_rem),
+            OP_EQ_K => interned_binop_k!(frame, vm, program, pc, here, cel_equals),
+            OP_NE_K => interned_binop_k!(frame, vm, program, pc, here, cel_not_equals),
+            OP_LT_K => interned_binop_k!(frame, vm, program, pc, here, cel_less),
+            OP_GT_K => interned_binop_k!(frame, vm, program, pc, here, cel_greater),
+            OP_GE_K => interned_binop_k!(frame, vm, program, pc, here, cel_greater_equals),
+            OP_ADD_LOCAL_K => interned_local_k!(frame, vm, program, pc, here, cel_add),
+            OP_MUL_LOCAL_K => interned_local_k!(frame, vm, program, pc, here, cel_mul),
+            OP_MOD_LOCAL_K => interned_local_k!(frame, vm, program, pc, here, cel_rem),
+            OP_EQ_LOCAL_K => interned_local_k!(frame, vm, program, pc, here, cel_equals),
+            OP_NE_LOCAL_K => interned_local_k!(frame, vm, program, pc, here, cel_not_equals),
+            OP_INC_LOCAL => {
+                let slot = insn_a(program, pc);
+                let w = frame.locals_stack_w[slot];
+                if w.is_null() || unsafe { w_kind(w) } != CelKind::Int {
+                    residual_dispatch(vm, here)
+                } else {
+                    let n = unsafe { (*w.cast::<W_IntObject>()).intval };
+                    match n.checked_add(1) {
+                        None => residual_dispatch(vm, here),
+                        Some(next) => {
+                            let r = new_int(next) as CelRef;
+                            frame.locals_stack_w[slot] = r;
+                            vm_sync_write_local(vm, slot, r as i64);
+                            here + 1
+                        }
+                    }
+                }
+            }
+            OP_JUMP => insn_a(program, pc),
+            OP_JUMP_IF_FALSE | OP_JUMP_IF_TRUE => {
+                let depth = frame.valuestackdepth;
+                let w = frame.locals_stack_w[depth - 1];
+                if w.is_null() || unsafe { w_kind(w) } != CelKind::Bool {
+                    residual_dispatch(vm, here)
+                } else {
+                    let truthy = unsafe { (*w.cast::<W_BoolObject>()).boolval } != 0;
+                    frame.valuestackdepth = depth - 1;
+                    vm_sync_pop(vm);
+                    let want = opcode == OP_JUMP_IF_TRUE;
+                    if truthy == want {
+                        insn_a(program, pc)
+                    } else {
+                        here + 1
+                    }
+                }
+            }
+            OP_ITER_ADVANCE => {
+                let slot = insn_a(program, pc);
+                let w = frame.locals_stack_w[slot];
+                if w.is_null() || unsafe { w_kind(w) } != CelKind::Int {
+                    residual_dispatch(vm, here)
+                } else {
+                    let n = unsafe { (*w.cast::<W_IntObject>()).intval };
+                    match n.checked_add(1) {
+                        None => residual_dispatch(vm, here),
+                        Some(next) => {
+                            let r = new_int(next) as CelRef;
+                            frame.locals_stack_w[slot] = r;
+                            vm_sync_write_local(vm, slot, r as i64);
+                            insn_b(program, pc)
+                        }
+                    }
+                }
+            }
             OP_RETURN => {
                 let depth = frame.valuestackdepth;
                 let w = frame.locals_stack_w[depth - 1];
@@ -332,12 +512,33 @@ mod tests {
             .unwrap(),
             Value::Int(10)
         );
+        assert_eq!(
+            cel_eval_loop(
+                &compile(&Parser::default().parse("2 > 1 ? 4 : 5").unwrap()).unwrap(),
+                &ctx
+            )
+            .unwrap(),
+            Value::Int(4)
+        );
+        let mut with_xs = Context::default();
+        with_xs.add_variable_from_value("xs", vec![1i64, 2, 3]);
+        assert_eq!(
+            cel_eval_loop(
+                &compile(&Parser::default().parse("xs.map(x, x + 1)").unwrap()).unwrap(),
+                &with_xs
+            )
+            .unwrap(),
+            Value::list(vec![Value::Int(2), Value::Int(3), Value::Int(4)])
+        );
     }
 
     #[test]
     fn interned_opcode_numbers_match_the_enum() {
         assert_eq!(OP_LOAD_LOCAL, OpCode::LoadLocal as i64);
         assert_eq!(OP_ADD, OpCode::Add as i64);
+        assert_eq!(OP_ADD_K, OpCode::AddConst as i64);
+        assert_eq!(OP_JUMP, OpCode::Jump as i64);
+        assert_eq!(OP_ITER_ADVANCE, OpCode::IterAdvance as i64);
         assert_eq!(OP_EQ, OpCode::Equals as i64);
         assert_eq!(OP_RETURN, OpCode::Return as i64);
     }

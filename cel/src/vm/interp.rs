@@ -890,6 +890,14 @@ impl<'a> Vm<'a> {
         let _ = self.store_operand(slot, Operand::Interned(w));
     }
 
+    pub(crate) fn sync_write_local(&mut self, slot: u32, w: CelRef) {
+        let _ = self.store_operand(slot, Operand::Interned(w));
+    }
+
+    pub(crate) fn sync_pop(&mut self) {
+        let _ = self.pop_operand();
+    }
+
     pub(crate) fn park_return(&mut self, w: CelRef) {
         self.portal_ret = Some(Ok(crate::Value::from_interned(w)));
     }
