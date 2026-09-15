@@ -2,7 +2,7 @@
 name = "cel"
 description = "A parser and interpreter for the Common Expression Language (CEL)"
 repository = "https://github.com/cel-rust/cel-rust"
-version = "0.14.0"
+version = "0.14.2"
 authors = ["Clark McCauley <me@clarkmccauley.com>", "Alex Snaps <alex@wcgw.dev>"]
 edition = "2021"
 rust-version = "1.86.0"
@@ -23,20 +23,435 @@ bytes = { version = "1", optional = true }
 thiserror = "2"
 pastey = "0.2.1"
 
+# PoC meta-tracing JIT tier (feature `jit`). The `majit` crates live in the
+# pyre repository, pinned by revision.
+#
+# They are `optional`, but cargo resolves a dependency's SOURCE while parsing
+# this manifest, before it knows which features are on. As path deps into a
+# sibling checkout that made every cargo command — `fmt --check` included —
+# fail on a clean clone. A git revision resolves for anyone.
+#
+# `rev` is pyre's `cel` branch as of 2026-08-09, NOT `main`. It has to be:
+# `run_mainloop_f`'s `jit_merge_point!(driver, program, pc; state)` needs two
+# majit fixes that are on `cel` and not yet on `main` —
+# `VirtualizableTracker::identity_input_ref` (`optimizeopt/virtualize.rs`),
+# without which `VmStateF`'s two virtual arrays beside the `ret` scalar make
+# every trace abort with `VirtualStatesCantMatch`, and the label-entered deopt
+# resuming at the blackhole's green pc rather than the loop header
+# (`back_edge_internal`, `jitdriver.rs`). The last `main` rev,
+# `eba36d13ed9`, has neither. Move this back to a `main` commit once they land
+# there.
+#
+# Bump it deliberately: it is the only thing pinning the JIT tier's behaviour —
+# and a stale pin is silent. Two measured instances of that silence, both found
+# long after the fact:
+#
+#   - `c05bccff72` (PR 834) sat 95 majit commits behind, and the first commit
+#     past it was the one that made the retrace path work, so every measurement
+#     taken against it described machinery that had since been fixed: sweeping
+#     `retrace_limit` on a shape-changing batch aborted every retrace at 834 and
+#     none at 960.
+#   - `2c86af5168` (PR 960) sat 107 commits behind `main`, 49 of them touching
+#     `majit/`.
+#
+# Neither the distance nor what it covers is observable from inside this repo:
+# a cohabiting checkout carries a `[patch]` in `.cargo/config.toml` that
+# redirects these four crates to the enclosing worktree, which is what every
+# local measurement then runs against. So the pin's own effect is only ever
+# tested where that file is absent — a clean clone, and CI.
+# The revision is a commit on pyre's `cel` branch rather than `main`:
+# `majit_trace_evidence.rs` and the two `rca_*` examples read
+# `Census::compiled_opcode_log`, which that branch carries and `main` does not.
+# `jit-audits`: majit-ir gates `opref_audit`/`reg_write_audit` out of production
+# builds (#1215); `majit_trace_evidence.rs` consumes both, and an integration
+# test does not see majit-ir's own `cfg(test)`.
+majit-ir = { git = "https://github.com/youknowone/pyre.git", rev = "b8b6f6d3817b330e012fbfae1c8343233ed3ab4a", optional = true, features = ["jit-audits"] }
+# Direct, not through `majit-metainterp`: it depends on `majit-gc` but re-exports
+# none of it, and `MiniMarkGC` / `TypeInfo` / the `GcAllocator` trait are what
+# class registration is spelled in. Same revision as its siblings — a different
+# one would give `set_gc_allocator` a `Box<dyn GcAllocator>` from a second copy
+# of the trait, which does not typecheck.
+majit-gc = { git = "https://github.com/youknowone/pyre.git", rev = "b8b6f6d3817b330e012fbfae1c8343233ed3ab4a", optional = true }
+majit-macros = { git = "https://github.com/youknowone/pyre.git", rev = "b8b6f6d3817b330e012fbfae1c8343233ed3ab4a", optional = true }
+majit-metainterp = { git = "https://github.com/youknowone/pyre.git", rev = "b8b6f6d3817b330e012fbfae1c8343233ed3ab4a", default-features = false, optional = true }
+
 [dev-dependencies]
 criterion = { version = "0.5.1", features = ["html_reports"] }
 serde_bytes = "0.11.14"
 dhat = { version = "0.3.3" }
+# `majit_vs_cometkim_percall` times its batches in user CPU rather than wall
+# clock, which needs `clock_gettime(CLOCK_THREAD_CPUTIME_ID)`. Taking it from
+# `libc` rather than hand-writing the `extern "C"` block costs nothing: the
+# lockfile already resolves `libc` transitively, so this pulls in no new
+# package and no new fetch, and the clock id is one constant that differs per
+# platform and is exactly what a hand-rolled declaration would get wrong.
+libc = "0.2"
 
 [[bench]]
 name = "runtime"
 harness = false
 
+# The P0.a allocation instrument. `harness = false` is load-bearing, not style:
+# it installs a `#[global_allocator]`, and the default libtest runner is
+# multi-threaded, so a process-global counter would race across concurrently
+# running tests. `--test-threads=1` cannot be spelled in a manifest, so owning
+# `main` is the only way a plain `cargo test` is correct by construction. The
+# counter it reports is thread-local as well; see the file header.
+[[test]]
+name = "allocs_per_eval"
+harness = false
+
+# Declared with no `required-features`, unlike every block below it, because it
+# genuinely needs none: the timing machinery is plain `std`, and the probe arms
+# it can select are behind `#[cfg(feature = "__drop-arm-probe")]` inside the file.
+# The block still has to exist. `scripts/feature-matrix.sh` checks the manifest
+# and `examples/` for set equality by NAME, so an undeclared example is a
+# failure there whether or not it compiles -- it would otherwise be built in
+# every configuration the matrix runs, which is exactly how a manifest omission
+# once broke nine rows at once.
+[[example]]
+name = "paired_ab"
+
+# `jit` and not the bare timing machinery, unlike `paired_ab` above: this file
+# names `majit_ir` and `majit_metainterp` at module scope, so it does not build
+# without them. The loop-key census inside it needs `__loop-key-arm-probe` as
+# well, but that arm is behind a `#[cfg]` and the file builds without it, so it
+# is not required here -- a required-feature would force the probe into every
+# row that runs this example.
+[[example]]
+name = "loopkey_ab"
+required-features = ["jit"]
+
+[[example]]
+name = "majit_ab"
+required-features = ["jit"]
+
+[[example]]
+name = "majit_vs_cometkim"
+required-features = ["jit"]
+
+[[example]]
+name = "majit_vs_cometkim_percall"
+required-features = ["jit"]
+
+[[example]]
+name = "host_fn_percall"
+required-features = ["jit"]
+
+[[example]]
+name = "tierprobe"
+required-features = ["jit"]
+
+[[example]]
+name = "routeprobe"
+required-features = ["jit"]
+
+# `jit` only, like `loopkey_ab` above and for the same reason: the stage arms
+# are behind `#[cfg(feature = "__entry-stage-probe")]` inside the file, and the
+# file builds and runs without them -- it reports the entry whole and says which
+# feature the split needs. Requiring the probe feature here would instead force
+# it into every matrix row that builds this example.
+[[example]]
+name = "entryprobe"
+required-features = ["jit"]
+
+# `jit` and nothing more. The two allocation arms it selects are run-time
+# selectable inside `majit-backend`, not behind a cargo feature here, so there
+# is no probe feature to require -- which is also what lets a build that carries
+# no probe feature at all price the frame.
+[[example]]
+name = "jfpoolprobe"
+required-features = ["jit"]
+
+[[example]]
+name = "varprobe"
+required-features = ["jit"]
+
+[[example]]
+name = "cleanfixprobe"
+required-features = ["jit"]
+
+[[example]]
+name = "majit_columnar_batch"
+required-features = ["jit"]
+
+[[example]]
+name = "majit_columnar_batch_float"
+required-features = ["jit"]
+
+[[example]]
+name = "majit_columnar_batch_uint"
+required-features = ["jit"]
+
+[[example]]
+name = "majit_columnar_batch_string"
+required-features = ["jit"]
+
+[[example]]
+name = "majit_columnar_batch_per_row"
+required-features = ["jit"]
+
+[[example]]
+name = "majit_nested_bench"
+required-features = ["jit"]
+
+[[example]]
+name = "jitstats"
+required-features = ["jit"]
+
+[[example]]
+name = "mpprobe"
+required-features = ["jit"]
+
+[[example]]
+name = "allocs"
+required-features = ["jit"]
+
+# The per-bind allocation census for the columnar encode path (#59). `jit`, for
+# the reason every block above it names: it opens `cel::majit`, which
+# `src/lib.rs` gates on that feature. Like `allocs` it installs a
+# `#[global_allocator]`, which is why it is an example rather than a test — the
+# default libtest runner is multi-threaded and a process-global counter would
+# race across concurrently running tests.
+[[example]]
+name = "bindallocs"
+required-features = ["jit"]
+
+[[example]]
+name = "livescale"
+required-features = ["jit"]
+
+[[example]]
+name = "poison"
+required-features = ["jit"]
+
+# The RCA probes. Declared for the same reason as everything above: a file under
+# `examples/` with no `[[example]]` block is still auto-discovered, just with no
+# `required-features`, so `cargo check --all-targets` builds it in EVERY feature
+# configuration. All three open `use cel::majit`, which `src/lib.rs:23` gates on
+# `jit`, so undeclared they broke 9 of the 13 rows of `scripts/feature-matrix.sh`
+# with `E0433: cannot find majit in cel`. Nothing pointed at them: the only CI
+# step that builds `examples/` is `cargo clippy --all-features --all-targets`,
+# and `--all-features` is the one configuration in which a missing
+# `required-features` cannot manifest.
+[[example]]
+name = "rca88"
+required-features = ["jit"]
+
+[[example]]
+name = "rca88b"
+required-features = ["jit"]
+
+[[example]]
+name = "rca91"
+required-features = ["jit"]
+
+[[example]]
+name = "rca116"
+required-features = ["jit"]
+
+[[example]]
+name = "rca128"
+required-features = ["jit"]
+
+[[example]]
+name = "rca125s"
+required-features = ["jit"]
+
+[[example]]
+name = "rca125p"
+required-features = ["jit"]
+
+[[example]]
+name = "rca156"
+required-features = ["jit"]
+
+[[example]]
+name = "rca111"
+required-features = ["jit"]
+
+[[example]]
+name = "rca_backend_gap"
+required-features = ["jit"]
+
+[[example]]
+name = "regprobe"
+required-features = ["jit"]
+
+[[example]]
+name = "rca_filtercost"
+required-features = ["jit"]
+
+[[example]]
+name = "rca_callcensus"
+required-features = ["jit"]
+
+[[example]]
+name = "rca_indexcost"
+required-features = ["jit"]
+
+[[example]]
+name = "rca_divcost"
+required-features = ["jit"]
+
+[[example]]
+name = "rca_listmap"
+required-features = ["jit"]
+
+[[example]]
+name = "majit_percall_steady"
+required-features = ["jit"]
+
 [features]
-default = ["regex", "chrono"]
+default = ["regex", "chrono", "vm"]
 structs = []
 bytes = ["dep:bytes"]
 json = ["dep:serde_json", "dep:base64"]
 regex = ["dep:regex"]
 chrono = ["dep:chrono"]
 dhat-heap = [ ] # if you are doing heap profiling
+
+# A measurement probe, never a shipping feature. It adds run-time selectable
+# lowerings at two places in the dispatch loop -- the sites that discard a
+# popped operand, and the element read `Vm::element_at`, which is what `IterAt`
+# is and what `IterBind` does before it stores -- so that what one lowering
+# costs against another is a difference taken inside ONE binary. Two `cargo build`
+# invocations cannot answer that: they admit compile drift and stale binaries,
+# and neither is visible in the numbers they produce.
+#
+# Off by default, and nothing but `examples/paired_ab.rs` selects it. One of
+# the drop policies LEAKS by design; see `DropArm::ForgetUnsound`, which is
+# sound only for an integer body over a list of integers and is guarded by an
+# allocation witness before any timing runs.
+__drop-arm-probe = []
+
+# The third measurement probe, and never a shipping feature either. It lets the
+# dispatch loop FUSE the per-element instruction block of an appending
+# comprehension -- `list.map(x, x * k)` -- into one step, in named groups, so
+# that what the VM's dispatch and operand-stack traffic cost per element is a
+# difference taken inside ONE binary rather than between two builds.
+#
+# Every arm computes the same answer from the same helpers; what an arm removes
+# is dispatches and operand-stack round trips, never work the tree walker also
+# does. The harness asserts each arm's result against the stock arm's before
+# any timing, so an arm that removed work it should not have is a failure and
+# not a faster number. Off by default; only `examples/paired_ab.rs` selects it.
+__elem-attr-probe = []
+
+# The second measurement probe, and never a shipping feature either. It makes
+# the function-entry door's yield probe choose its key form at run time --
+# the resolved cell key it uses now, or the bare bucket hash it used before --
+# so what that resolution costs per call is a difference taken inside ONE
+# binary rather than between two builds.
+#
+# Off by default, and selected only by measurement examples under `examples/`,
+# never by a shipping code path -- naming them individually here goes stale the
+# moment another one reads the arm. Both arms DECIDE the same thing on every
+# bucket holding one cell or none, which is every bucket a program here has
+# produced; see `float_bank::LoopKeyArm`.
+__loop-key-arm-probe = []
+
+# The fourth measurement probe, and never a shipping feature either. It gives
+# `float_bank::run_jit_persistent_f` a per-stage repeat count, read once per
+# call out of a thread-local, so what one named stage of the JIT entry costs is
+# a difference taken inside ONE binary -- the same call against itself, once
+# with every count at zero and once with one stage repeated k extra times.
+#
+# Repetition and not a clock: the entry is ~100 ns whole (`batch::JIT_ENTRY_PS`)
+# across five stages, and `Instant::now()` costs 20-25 ns here, so a clock per
+# stage would report itself. Not every stage repeats, either -- `check_out`
+# takes the driver OUT of its slot, so it is amplified together with `check_in`
+# as one round trip, and the run that follows cannot be repeated at all and is
+# reported as a residual rather than measured. See `float_bank::EntryStageRepeats`.
+#
+# The residual that leaves is the compiled entry itself, and it is four fifths
+# of the whole -- so this feature also arms majit's own split of it,
+# `back-edge-stage-probe`, which amplifies three stages inside the warm arm of
+# `JitDriver::back_edge_internal` under the same discipline. A weak dependency
+# feature (`?/`): it must not be what pulls the optional `majit-metainterp` in,
+# since a non-JIT build has no entry to split.
+#
+# Off by default, and selected only by measurement examples under `examples/`.
+# A build carrying it pays one thread-local read and five zero-trip loop tests
+# per JIT call that a default build does not, plus one relaxed atomic load and
+# four more zero-trip tests per compiled entry on the majit side, so an absolute
+# figure taken from such a build is not what the shipping door costs; only
+# differences are claims.
+__entry-stage-probe = [
+    "majit-metainterp?/__back-edge-stage-probe",
+    "majit-metainterp?/__execute-stage-probe",
+    "majit-metainterp?/__yield-stage-probe",
+]
+
+# The fifth measurement probe, and never a shipping feature either. It gives
+# `prepare_batch_reduce` a per-stage repeat count, read once per bind out of a
+# thread-local, so what one named stage of the columnar ENCODE costs is a
+# difference taken inside ONE binary -- the same bind against itself, once with
+# every count at zero and once with one stage repeated k extra times.
+#
+# Repetition and not a clock, for the reason `__entry-stage-probe` gives: `bind`
+# is 44-770 ns across the shapes that matter and `Instant::now()` costs 20-25 ns
+# here, so a clock per stage would report itself.
+#
+# Encode is where the cost is. `bind` splits into a resolution (one map lookup
+# per declared path) and this encoding, and the encoding is 62-97% of it --
+# 94-97% on the CHEAPEST expressions, which carry no list and no string and so
+# should have the least to encode. That is the question this feature exists to
+# answer.
+#
+# Off by default, and selected only by measurement examples under `examples/`.
+# A build carrying it pays one thread-local read and seven zero-trip loop tests
+# per bind that a default build does not, so an absolute figure taken from such
+# a build is not what the shipping door costs; only differences are claims.
+__encode-stage-probe = []
+
+# Route `Program::execute` through the bytecode VM instead of the tree walker.
+#
+# On by default, so the VM is what a caller gets. The tree walker is not
+# deleted and is still the differential oracle: `cel/tests/oracle.rs` and
+# `cel/tests/vm_walker_sweep.rs` call `Value::resolve` / `Value::resolve_value`
+# directly, so both evaluators run under either setting of this flag and
+# turning the flag on did not turn the VM's gate off. What the flag decides is
+# which evaluator a *caller* gets.
+#
+# Turning it OFF -- `--no-default-features --features regex,chrono` -- is now
+# the non-default configuration, and it is the only way `Program::execute`
+# reaches the walker. `.github/workflows/rust.yml` runs a test leg for it.
+vm = []
+
+# PoC: meta-tracing JIT tier built on the in-repo `majit` framework (cell-majit,
+# issue #357). Additive and off by default. Applies majit's RPython-style
+# meta-tracer to a traceable CEL evaluation mainloop.
+#
+# `jit` deliberately names NO backend. Cargo features are additive, so a `jit`
+# that named one could never un-name it, and every measurement would silently
+# describe that one backend. `majit-metainterp` is taken with
+# `default-features = false` above, so selecting the backend is the caller's
+# job — the same split pyre uses (`--no-default-features --features dynasm`).
+#
+# Building with a bare `--features jit` is a hard error, not a silent no-JIT
+# build: `majit-metainterp/src/pyjitpl.rs:40-41` has
+# `#[cfg(not(any(feature = "cranelift", feature = "dynasm", target_arch =
+# "wasm32")))] compile_error!(...)`. That matters here — the JIT tier failing
+# open is exactly how a whole backend went unmeasured before.
+jit = [
+    "dep:majit-ir",
+    "dep:majit-gc",
+    # The scalar tier's only managed value is a thread-confined JITFRAME, so
+    # each execution thread owns a tiny collector instead of joining a
+    # process-global language heap and its GIL.
+    "majit-gc/gc_box",
+    "dep:majit-macros",
+    "dep:majit-metainterp",
+    # The temporal columnar subset (timestamp/duration) lowers to i64-nanos
+    # columns and constructs `Value::Timestamp`/`Value::Duration` oracles, both
+    # of which require chrono.
+    "chrono",
+]
+# Backend selectors. Use one of these, not bare `jit`:
+#   cargo test  -p cel --features jit-dynasm
+#   cargo test  -p cel --features jit-cranelift
+# They are mutually exclusive in intent but additive in Cargo; enabling both
+# lets `majit-metainterp` pick, which is not a configuration to measure from.
+jit-dynasm = ["jit", "majit-metainterp/dynasm"]
+jit-cranelift = ["jit", "majit-metainterp/cranelift"]

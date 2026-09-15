@@ -1,180 +1,85 @@
-use crate::common::traits::Zeroer;
-use crate::common::types::{self, CelBool, Type, OPTIONAL_TYPE};
-use crate::common::value::Val;
+use crate::common::types::{self, OPTIONAL_TYPE};
+use crate::objects::{OptionalValue, Value};
 use crate::ExecutionError;
-use std::borrow::Cow;
 use std::sync::Arc;
 
-#[derive(Debug)]
-pub struct Optional(Option<OptionalInternal>);
-
-#[derive(Debug)]
-enum OptionalInternal {
-    Box(Box<dyn Val>),
-    Arc(Arc<dyn Val>),
+/// Reads the receiver an overload declared as `optional_type`.
+fn expect_optional(value: &Value) -> Result<&OptionalValue, ExecutionError> {
+    match value {
+        Value::Opaque(o) => o.downcast_ref::<OptionalValue>(),
+        _ => None,
+    }
+    .ok_or_else(|| super::type_error(value, &OPTIONAL_TYPE))
 }
 
-impl OptionalInternal {
-    fn clone_as_boxed(&self) -> Box<dyn Val> {
-        match self {
-            OptionalInternal::Box(val) => val.clone_as_boxed(),
-            OptionalInternal::Arc(val) => val.clone_as_boxed(),
-        }
-    }
-}
-
-impl Val for Optional {
-    fn get_type(&self) -> &Type {
-        &super::OPTIONAL_TYPE
-    }
-
-    fn clone_as_boxed(&self) -> Box<dyn Val> {
-        match &self.0 {
-            None => Box::new(Optional(None)),
-            Some(val) => val.clone_as_boxed(),
-        }
-    }
-}
-
-impl Optional {
-    pub fn none() -> Self {
-        Optional(None)
-    }
-
-    pub fn of(val: Box<dyn Val>) -> Self {
-        Optional(Some(OptionalInternal::Box(val)))
-    }
-
-    pub fn map(&self, f: impl FnOnce(&dyn Val) -> Box<dyn Val>) -> Self {
-        self.0
-            .as_ref()
-            .map(|val| {
-                let m = match val {
-                    OptionalInternal::Box(b) => f(b.as_ref()),
-                    OptionalInternal::Arc(a) => f(a.as_ref()),
-                };
-                Optional(Some(OptionalInternal::Box(m)))
-            })
-            .unwrap_or(Optional(None))
-    }
-
-    pub fn option(&self) -> Option<&dyn Val> {
-        self.0.as_ref().map(|val| match val {
-            OptionalInternal::Box(b) => b.as_ref(),
-            OptionalInternal::Arc(a) => a.as_ref(),
-        })
-    }
-
-    pub fn inner(&self) -> Option<&dyn Val> {
-        self.0.as_ref().map(|val| match val {
-            OptionalInternal::Box(b) => b.as_ref(),
-            OptionalInternal::Arc(a) => a.as_ref(),
-        })
+/// Whether a value is its type's zero, as `optional.ofNonZeroValue` tests it.
+///
+/// Deliberately not [`Value::is_zero`], which answers `false` for the epoch
+/// timestamp and for a field-less struct where this answers `true`.
+fn is_zero_value(value: &Value) -> bool {
+    let unpacked = value.unpack();
+    let value = &unpacked;
+    match value {
+        Value::Bool(b) => !b,
+        Value::Int(i) => *i == 0,
+        Value::UInt(u) => *u == 0,
+        Value::Float(f) => *f == 0.0,
+        Value::String(s) => s.is_empty(),
+        Value::Bytes(b) => b.is_empty(),
+        Value::Null => true,
+        Value::List(l) => l.is_empty(),
+        Value::Map(m) => m.is_empty(),
+        #[cfg(feature = "chrono")]
+        Value::Duration(d) => d.is_zero(),
+        #[cfg(feature = "chrono")]
+        Value::Timestamp(ts) => ts.timestamp_nanos_opt().is_some_and(|ns| ns == 0),
+        #[cfg(feature = "structs")]
+        Value::Struct(s) => s.is_empty(),
+        // An optional, and any host handle, declares no zero value.
+        Value::Opaque(_) => false,
+        Value::Interned(_) => is_zero_value(&value.unpack()),
     }
 }
 
-impl From<Option<Box<dyn Val>>> for Optional {
-    fn from(val: Option<Box<dyn Val>>) -> Self {
-        Optional(val.map(OptionalInternal::Box))
-    }
+fn optional_none(_args: Vec<Value>) -> Result<Value, ExecutionError> {
+    Ok(Value::Opaque(Arc::new(OptionalValue::none())))
 }
 
-impl From<Box<dyn Val>> for Optional {
-    fn from(val: Box<dyn Val>) -> Self {
-        Optional(Some(OptionalInternal::Box(val)))
-    }
+fn optional_of(mut args: Vec<Value>) -> Result<Value, ExecutionError> {
+    Ok(Value::Opaque(Arc::new(OptionalValue::of(args.remove(0)))))
 }
 
-impl From<Option<Arc<dyn Val>>> for Optional {
-    fn from(val: Option<Arc<dyn Val>>) -> Self {
-        Optional(val.map(OptionalInternal::Arc))
-    }
-}
-
-impl From<Optional> for Option<Box<dyn Val>> {
-    fn from(val: Optional) -> Option<Box<dyn Val>> {
-        val.0.map(|val| val.clone_as_boxed())
-    }
-}
-
-impl From<Optional> for Option<Arc<dyn Val>> {
-    fn from(val: Optional) -> Option<Arc<dyn Val>> {
-        val.0.map(|i| match i {
-            OptionalInternal::Arc(a) => a,
-            OptionalInternal::Box(b) => Arc::from(b),
-        })
-    }
-}
-
-fn optional_none<'a>(_args: Vec<Cow<'a, dyn Val>>) -> Result<Cow<'a, dyn Val>, ExecutionError> {
-    Ok(Cow::<dyn Val>::Owned(Box::new(Optional::none())))
-}
-
-fn optional_of<'a>(args: Vec<Cow<'a, dyn Val>>) -> Result<Cow<'a, dyn Val>, ExecutionError> {
-    let mut args = args;
-    let value = args.remove(0);
-    Ok(Cow::<dyn Val>::Owned(Box::new(Optional::of(
-        value.into_owned(),
-    ))))
-}
-
-fn optional_of_non_zero_value<'a>(
-    args: Vec<Cow<'a, dyn Val>>,
-) -> Result<Cow<'a, dyn Val>, ExecutionError> {
-    match args[0].as_zeroer().is_some_and(Zeroer::is_zero_value) {
+fn optional_of_non_zero_value(args: Vec<Value>) -> Result<Value, ExecutionError> {
+    match is_zero_value(&args[0]) {
         true => optional_none(args),
         false => optional_of(args),
     }
 }
 
-fn optional_value<'a>(args: Vec<Cow<'a, dyn Val>>) -> Result<Cow<'a, dyn Val>, ExecutionError> {
-    // TODO: This can be optimized to avoid cloning and "just" pass the `Cow`
-    // but we either need to deal with the `Arc` case or wait until that's all ripped out!
-    let mut args = args;
-    args.remove(0)
-        .downcast_ref::<Optional>()
-        .expect("must be `CelOptional`")
-        .option()
-        .map(|v| Cow::Owned(v.to_owned()))
+fn optional_value(mut args: Vec<Value>) -> Result<Value, ExecutionError> {
+    expect_optional(&args.remove(0))?
+        .inner()
+        .cloned()
         .ok_or_else(|| ExecutionError::function_error("value", "optional.none() dereference"))
 }
 
-fn optional_has_value<'a>(args: Vec<Cow<'a, dyn Val>>) -> Result<Cow<'a, dyn Val>, ExecutionError> {
-    super::unary_fn(args, OPTIONAL_TYPE, |opt: &Optional| {
-        Ok(Box::new(CelBool::from(opt.option().is_some())))
-    })
+fn optional_has_value(args: Vec<Value>) -> Result<Value, ExecutionError> {
+    Ok(Value::Bool(expect_optional(&args[0])?.inner().is_some()))
 }
 
-fn optional_or_optional<'a>(
-    args: Vec<Cow<'a, dyn Val>>,
-) -> Result<Cow<'a, dyn Val>, ExecutionError> {
-    let mut args = args;
+fn optional_or_optional(mut args: Vec<Value>) -> Result<Value, ExecutionError> {
     let other = args.remove(1);
     let this = args.remove(0);
-    if this
-        .downcast_ref::<Optional>()
-        .expect("Must be an `Optional`")
-        .option()
-        .is_some()
-    {
-        Ok(this)
-    } else {
-        Ok(other)
+    match expect_optional(&this)?.inner().is_some() {
+        true => Ok(this),
+        false => Ok(other),
     }
 }
 
-fn optional_or_value<'a>(args: Vec<Cow<'a, dyn Val>>) -> Result<Cow<'a, dyn Val>, ExecutionError> {
-    // TODO: This can be optimized to avoid cloning and "just" pass the `Cow`
-    // but we either need to deal with the `Arc` case or wait until that's all ripped out!
-    let mut args = args;
+fn optional_or_value(mut args: Vec<Value>) -> Result<Value, ExecutionError> {
     let other = args.remove(1);
-    Ok(args
-        .remove(0)
-        .downcast_ref::<Optional>()
-        .expect("must be `CelOptional`")
-        .option()
-        .map(|v| Cow::Owned(v.to_owned()))
-        .unwrap_or(other))
+    let this = args.remove(0);
+    Ok(expect_optional(&this)?.inner().cloned().unwrap_or(other))
 }
 
 pub(crate) fn stdlib(env: &mut crate::Env) {
@@ -230,13 +135,14 @@ pub(crate) fn stdlib(env: &mut crate::Env) {
 
 #[cfg(test)]
 mod tests {
-    use crate::common::types::{self, CelInt, CelString};
+    use crate::common::types;
+    use crate::objects::Value;
 
+    /// `OPTIONAL_TYPE` is parameterised on `dyn`, so it accepts every value and
+    /// the optional overloads are selected on name and arity alone.
     #[test]
     fn is_assignable() {
-        let s = CelString::from("foo");
-        assert!(types::OPTIONAL_TYPE.is_assignable(&s));
-        let i = CelInt::from(42);
-        assert!(types::OPTIONAL_TYPE.is_assignable(&i));
+        assert!(types::OPTIONAL_TYPE.is_assignable(&Value::String("foo".to_owned().into())));
+        assert!(types::OPTIONAL_TYPE.is_assignable(&Value::Int(42)));
     }
 }

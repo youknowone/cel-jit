@@ -1,0 +1,2319 @@
+//! The compiler: an expression tree in, a [`CelCode`] out.
+//!
+//! The match over [`Expr`] is exhaustive and has no `_` arm, so an AST node
+//! added later is a compile error here rather than a case that silently
+//! reaches a runtime fallback.
+
+use std::collections::HashMap;
+
+use super::code::{CelCode, Handler, Insn};
+use super::error::NameId;
+use super::opcode::OpCode;
+use crate::common::ast::{
+    operators, CallExpr, ComprehensionExpr, EntryExpr, Expr, IdedExpr, ListExpr, LiteralValue,
+    MapExpr, SelectExpr, StructExpr,
+};
+use crate::Value;
+
+/// Why an expression could not be compiled.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum CompileErrorKind {
+    /// An `Expr::Unspecified` node. The walker reaches this and panics; here
+    /// it is refused before anything runs.
+    #[error("expression is unspecified")]
+    UnspecifiedExpr,
+    /// A struct field appeared among a map literal's entries, or a map entry
+    /// among a struct literal's. The walker panics on the first and silently
+    /// mishandles the second.
+    #[error("{found} entry in a {container} literal")]
+    MismatchedEntry {
+        container: &'static str,
+        found: &'static str,
+    },
+    /// An operator was applied to the wrong number of arguments. The parser
+    /// does not produce these, so reaching one means the AST was built by
+    /// hand or by a future macro.
+    #[error("operator '{operator}' expects {expected} argument(s), got {actual}")]
+    OperatorArity {
+        operator: String,
+        expected: usize,
+        actual: usize,
+    },
+    /// `_?._` requires a literal field name.
+    #[error("optional select requires a literal field name")]
+    OptSelectFieldNotLiteral,
+    /// More constants, names or slots than the operand encoding can address.
+    #[error("program exceeds the {0} limit")]
+    TooLarge(&'static str),
+    /// The compiler's own stack accounting went negative, which means an
+    /// opcode's declared stack effect disagrees with how it is emitted.
+    #[error("internal: operand stack underflow while compiling")]
+    StackUnderflow,
+}
+
+/// A [`CompileErrorKind`] together with the AST node that produced it.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("{kind} (node {id})")]
+pub struct CompileError {
+    pub kind: CompileErrorKind,
+    /// The `IdedExpr::id` of the offending node, which `SourceInfo` maps back
+    /// to a source offset.
+    pub id: u64,
+}
+
+/// Compile an expression into a code object.
+pub fn compile(expr: &IdedExpr) -> Result<CelCode, CompileError> {
+    let mut compiler = Compiler::default();
+    compiler.expr(expr)?;
+    compiler.emit(OpCode::Return, &[], expr.id)?;
+    compiler.finish()
+}
+
+/// A jump operand whose target is not known yet: the instruction holding it,
+/// and which of that instruction's operands it is. The slot is carried rather
+/// than folded into the index because three different operand positions are
+/// patched -- a plain jump's only operand, a short-circuit operator's second,
+/// and the third of both the qualified call and the loop guard.
+#[derive(Clone, Copy)]
+struct PatchSite {
+    at: u32,
+    slot: usize,
+}
+
+/// An instruction that has been decided but not yet emitted: its opcode and
+/// the operand words it can carry.
+///
+/// A value rather than an emission because two different sites want the same
+/// decision. `x * 2` as an expression pushes its answer; `x * 2` as the
+/// element of a list hands the answer to the builder instead. Which of the two
+/// it is belongs to the *consumer*, and what the instruction is does not, so
+/// the recogniser answers with this and the caller says where the answer goes.
+/// [`Compiler::emit`] is still the only writer.
+#[derive(Clone, Copy)]
+struct Decided {
+    op: OpCode,
+    /// Two words because no producer recognised here declares three; the
+    /// opcode says how many of them are its own.
+    words: [u32; 2],
+}
+
+impl Decided {
+    /// The operand words this opcode declares, which is the slice
+    /// [`Compiler::emit`] checks its arity against.
+    fn operands(&self) -> &[u32] {
+        &self.words[..self.op.operands() as usize]
+    }
+
+    /// The same instruction with its answer appended to the list beneath it
+    /// instead of pushed, if this producer has such a form.
+    fn appending(self) -> Option<Decided> {
+        Some(Decided {
+            op: appending_producer(self.op)?,
+            words: self.words,
+        })
+    }
+}
+
+#[derive(Default)]
+struct Compiler {
+    insns: Vec<Insn>,
+    consts: Vec<Value>,
+    names: Vec<Box<str>>,
+    name_index: HashMap<Box<str>, u32>,
+    /// Innermost last. Each scope maps a comprehension variable to its slot.
+    scopes: Vec<Vec<(Box<str>, u32)>>,
+    /// Next free slot; restored to the enclosing mark when a scope closes, so
+    /// sibling comprehensions reuse slots and only nested ones stack.
+    next_slot: u32,
+    /// High-water mark of `next_slot`, which is the activation record's size.
+    n_slots: u32,
+    /// Next free logic slot, restored when a short-circuit operator's merge
+    /// has read it, so siblings share one slot and only nested ones stack.
+    next_logic: u32,
+    /// High-water mark of `next_logic`.
+    n_logic: u32,
+    handlers: Vec<Handler>,
+    depth: i64,
+    max_stack: i64,
+}
+
+impl Compiler {
+    fn finish(self) -> Result<CelCode, CompileError> {
+        Ok(CelCode {
+            insns: self.insns,
+            consts: self.consts,
+            names: self.names,
+            n_slots: self.n_slots,
+            max_stack: u32::try_from(self.max_stack).unwrap_or(u32::MAX),
+            n_logic: self.n_logic,
+            handlers: self.handlers,
+        })
+    }
+
+    // -- emission ---------------------------------------------------------
+
+    fn emit(&mut self, op: OpCode, operands: &[u32], id: u64) -> Result<u32, CompileError> {
+        debug_assert_eq!(op.operands() as usize, operands.len(), "{op:?} arity");
+        let at = self.here();
+        let mut ops = [0u32; 3];
+        ops[..operands.len()].copy_from_slice(operands);
+        self.insns.push(Insn { op, ops });
+
+        let (pops, pushes) = op.stack_effect(operands);
+        self.depth -= i64::from(pops);
+        if self.depth < 0 {
+            return Err(CompileError {
+                kind: CompileErrorKind::StackUnderflow,
+                id,
+            });
+        }
+        self.depth += i64::from(pushes);
+        self.max_stack = self.max_stack.max(self.depth);
+        Ok(at)
+    }
+
+    /// [`Compiler::emit`] for an instruction a recogniser already decided.
+    fn emit_decided(&mut self, decided: Decided, id: u64) -> Result<u32, CompileError> {
+        self.emit(decided.op, decided.operands(), id)
+    }
+
+    fn here(&self) -> u32 {
+        self.insns.len() as u32
+    }
+
+    /// Emit a jump whose target is not known yet, returning the site to patch
+    /// once the target is. Every opcode reached this way carries its target in
+    /// its only operand.
+    fn emit_forward(&mut self, op: OpCode, id: u64) -> Result<PatchSite, CompileError> {
+        self.emit_forward_in(op, &[u32::MAX], 0, id)
+    }
+
+    /// The same, for an instruction whose forward target is one operand among
+    /// several: `operands[slot]` is the placeholder and the rest are already
+    /// known.
+    ///
+    /// A sibling of [`Compiler::emit_forward`] rather than a second patching
+    /// device, and `emit_forward` is written in terms of it, so a target's
+    /// position is the only thing that varies between them.
+    fn emit_forward_in(
+        &mut self,
+        op: OpCode,
+        operands: &[u32],
+        slot: usize,
+        id: u64,
+    ) -> Result<PatchSite, CompileError> {
+        debug_assert_eq!(
+            operands[slot],
+            u32::MAX,
+            "{op:?} operand {slot} is a target"
+        );
+        let at = self.emit(op, operands, id)?;
+        Ok(PatchSite { at, slot })
+    }
+
+    fn patch_to_here(&mut self, site: PatchSite) {
+        self.insns[site.at as usize].ops[site.slot] = self.here();
+    }
+
+    // -- pools ------------------------------------------------------------
+
+    fn add_const(&mut self, value: Value, id: u64) -> Result<u32, CompileError> {
+        let index = u32::try_from(self.consts.len()).map_err(|_| CompileError {
+            kind: CompileErrorKind::TooLarge("constant pool"),
+            id,
+        })?;
+        self.consts.push(value);
+        Ok(index)
+    }
+
+    fn add_name(&mut self, name: &str, id: u64) -> Result<NameId, CompileError> {
+        if let Some(&index) = self.name_index.get(name) {
+            return Ok(NameId(index));
+        }
+        let index = u32::try_from(self.names.len()).map_err(|_| CompileError {
+            kind: CompileErrorKind::TooLarge("name table"),
+            id,
+        })?;
+        let name: Box<str> = name.into();
+        self.names.push(name.clone());
+        self.name_index.insert(name, index);
+        Ok(NameId(index))
+    }
+
+    // -- scopes -----------------------------------------------------------
+
+    fn open_scope(&mut self) -> u32 {
+        self.scopes.push(Vec::new());
+        self.next_slot
+    }
+
+    fn close_scope(&mut self, mark: u32) {
+        self.scopes.pop();
+        self.next_slot = mark;
+    }
+
+    fn declare(&mut self, name: &str, id: u64) -> Result<u32, CompileError> {
+        let slot = self.next_slot;
+        self.next_slot = slot.checked_add(1).ok_or(CompileError {
+            kind: CompileErrorKind::TooLarge("slot count"),
+            id,
+        })?;
+        self.n_slots = self.n_slots.max(self.next_slot);
+        if let Some(scope) = self.scopes.last_mut() {
+            scope.push((name.into(), slot));
+        }
+        Ok(slot)
+    }
+
+    /// A slot the program needs but the expression does not name -- the
+    /// iteration sequence, its index, and the two-variable range.
+    fn declare_hidden(&mut self, id: u64) -> Result<u32, CompileError> {
+        self.declare("", id)
+    }
+
+    fn lookup(&self, name: &str) -> Option<u32> {
+        self.scopes
+            .iter()
+            .rev()
+            .find_map(|scope| scope.iter().rev().find(|(n, _)| &**n == name))
+            .map(|(_, slot)| *slot)
+    }
+
+    // -- the exhaustive match ---------------------------------------------
+
+    fn expr(&mut self, e: &IdedExpr) -> Result<(), CompileError> {
+        match &e.expr {
+            Expr::Unspecified => Err(CompileError {
+                kind: CompileErrorKind::UnspecifiedExpr,
+                id: e.id,
+            }),
+            Expr::Literal(literal) => self.literal(literal, e.id),
+            Expr::Ident(name) => self.ident(name, e.id),
+            Expr::Select(select) => self.select(select, e.id),
+            Expr::List(list) => self.list(list, e.id),
+            Expr::Map(map) => self.map(map, e.id),
+            Expr::Struct(structure) => self.structure(structure, e.id),
+            Expr::Call(call) => self.call(call, e.id),
+            Expr::Comprehension(comprehension) => self.comprehension(comprehension, e.id),
+        }
+    }
+
+    fn literal(&mut self, literal: &LiteralValue, id: u64) -> Result<(), CompileError> {
+        // `to_value` is a refcount bump for the owning variants and a copy for
+        // the rest, so the pool holds no more than the AST already did.
+        let index = self.add_const(literal.to_value(), id)?;
+        self.emit(OpCode::LoadConst, &[index], id)?;
+        Ok(())
+    }
+
+    /// The compile-time split the walker makes at run time: a comprehension
+    /// variable is a slot, anything else is a context lookup.
+    fn ident(&mut self, name: &str, id: u64) -> Result<(), CompileError> {
+        match self.local_load(name) {
+            Some(decided) => self.emit_decided(decided, id)?,
+            None => {
+                let name = self.add_name(name, id)?;
+                self.emit(OpCode::LoadVar, &[name.0], id)?
+            }
+        };
+        Ok(())
+    }
+
+    /// `SelectExpr::test` is set only by the `has` macro expander, so it is a
+    /// compile-time constant and picks the opcode rather than a branch.
+    fn select(&mut self, select: &SelectExpr, id: u64) -> Result<(), CompileError> {
+        // An operand already in a slot is one `LoadLocal` whose only consumer
+        // is the read below it, so the two are emitted as one instruction.
+        // Decided before the operand is compiled, because the alternative --
+        // folding the pair back out of the emitted stream -- would renumber
+        // every `pc` after it; see `Compiler::comprehension`.
+        //
+        // A comprehension variable is a slot, so this is the shape of every
+        // field read in a loop body.
+        if let Some(decided) = self.field_local(select, id)? {
+            self.emit_decided(decided, id)?;
+            return Ok(());
+        }
+
+        self.expr(&select.operand)?;
+        let field = self.add_name(&select.field, id)?;
+        let op = if select.test {
+            OpCode::HasField
+        } else {
+            OpCode::GetField
+        };
+        self.emit(op, &[field.0], id)?;
+        Ok(())
+    }
+
+    fn list(&mut self, list: &ListExpr, id: u64) -> Result<(), CompileError> {
+        // The element count is the capacity the literal's list reserves,
+        // `BUILD_LIST n`; an optional element that turns out empty leaves one
+        // slot of it unused. A hint, so a count past the operand width
+        // saturates rather than failing the compile.
+        let count = u32::try_from(list.elements.len()).unwrap_or(u32::MAX);
+        self.emit(OpCode::NewList, &[count], id)?;
+        for (index, element) in list.elements.iter().enumerate() {
+            // An optional element is not the fused shape and keeps the pair:
+            // whether it contributes at all is only known once its value has
+            // been evaluated, so what the append does with the value is the
+            // instruction's whole job and cannot be folded into producing it.
+            if list.optional_indices.contains(&index) {
+                self.expr(element)?;
+                self.emit(OpCode::ListAppendOptional, &[], element.id)?;
+                continue;
+            }
+            self.append_element(element)?;
+        }
+        Ok(())
+    }
+
+    fn map(&mut self, map: &MapExpr, id: u64) -> Result<(), CompileError> {
+        self.emit(OpCode::NewMap, &[], id)?;
+        for entry in &map.entries {
+            let EntryExpr::MapEntry(kv) = &entry.expr else {
+                return Err(CompileError {
+                    kind: CompileErrorKind::MismatchedEntry {
+                        container: "map",
+                        found: "struct field",
+                    },
+                    id: entry.id,
+                });
+            };
+            self.expr(&kv.key)?;
+            self.expr(&kv.value)?;
+            let op = if kv.optional {
+                OpCode::MapInsertOptional
+            } else {
+                OpCode::MapInsert
+            };
+            self.emit(op, &[], entry.id)?;
+        }
+        Ok(())
+    }
+
+    fn structure(&mut self, structure: &StructExpr, id: u64) -> Result<(), CompileError> {
+        let type_name = self.add_name(&structure.type_name, id)?;
+        self.emit(OpCode::NewStruct, &[type_name.0], id)?;
+        for entry in &structure.entries {
+            let EntryExpr::StructField(field) = &entry.expr else {
+                return Err(CompileError {
+                    kind: CompileErrorKind::MismatchedEntry {
+                        container: "struct",
+                        found: "map",
+                    },
+                    id: entry.id,
+                });
+            };
+            self.expr(&field.value)?;
+            let name = self.add_name(&field.field, entry.id)?;
+            let op = if field.optional {
+                OpCode::StructSetOptional
+            } else {
+                OpCode::StructSet
+            };
+            self.emit(op, &[name.0], entry.id)?;
+        }
+        Ok(())
+    }
+}
+
+/// The operators that map to exactly one opcode over their operands.
+///
+/// Everything with control flow -- the conditional and the two short-circuit
+/// operators -- is handled separately, and everything absent from both is an
+/// ordinary function call.
+fn simple_operator(name: &str) -> Option<(OpCode, usize)> {
+    let entry = match name {
+        operators::ADD => (OpCode::Add, 2),
+        operators::SUBSTRACT => (OpCode::Sub, 2),
+        operators::MULTIPLY => (OpCode::Mul, 2),
+        operators::DIVIDE => (OpCode::Div, 2),
+        operators::MODULO => (OpCode::Mod, 2),
+        operators::EQUALS => (OpCode::Equals, 2),
+        operators::NOT_EQUALS => (OpCode::NotEquals, 2),
+        operators::LESS => (OpCode::Less, 2),
+        operators::LESS_EQUALS => (OpCode::LessEquals, 2),
+        operators::GREATER => (OpCode::Greater, 2),
+        operators::GREATER_EQUALS => (OpCode::GreaterEquals, 2),
+        operators::IN => (OpCode::In, 2),
+        operators::LOGICAL_NOT => (OpCode::Not, 1),
+        operators::NEGATE => (OpCode::Negate, 1),
+        operators::NOT_STRICTLY_FALSE => (OpCode::NotStrictlyFalse, 1),
+        _ => return None,
+    };
+    Some(entry)
+}
+
+/// The fused form of a binary operator whose right operand is a literal, if
+/// this operator has one.
+///
+/// Deliberately not every operator [`simple_operator`] maps. The ones here are
+/// what a predicate is written against a constant -- an arithmetic step, an
+/// equality, an ordering bound -- and an operator absent from this list keeps
+/// the `LoadConst` and the pair, which is unfused rather than wrong. Adding
+/// one is an opcode and a dispatch arm, both of which the reader can see.
+fn const_operator(op: OpCode) -> Option<OpCode> {
+    let fused = match op {
+        OpCode::Add => OpCode::AddConst,
+        OpCode::Mul => OpCode::MulConst,
+        OpCode::Mod => OpCode::ModConst,
+        OpCode::Equals => OpCode::EqualsConst,
+        OpCode::NotEquals => OpCode::NotEqualsConst,
+        OpCode::Less => OpCode::LessConst,
+        OpCode::Greater => OpCode::GreaterConst,
+        OpCode::GreaterEquals => OpCode::GreaterEqualsConst,
+        _ => return None,
+    };
+    Some(fused)
+}
+
+/// The form of a folded operator that also names its LEFT operand by slot.
+///
+/// Keyed on the folded form rather than the base operator, so it is only
+/// reachable once [`const_operator`] has answered: an operator with no folded
+/// twin has no fused-local one either, and the two lists cannot drift apart
+/// into a shape with a left operand named and a right one still on the stack.
+fn local_const_operator(op: OpCode) -> Option<OpCode> {
+    let fused = match op {
+        OpCode::AddConst => OpCode::AddLocalConst,
+        OpCode::MulConst => OpCode::MulLocalConst,
+        OpCode::ModConst => OpCode::ModLocalConst,
+        OpCode::EqualsConst => OpCode::EqualsLocalConst,
+        OpCode::NotEqualsConst => OpCode::NotEqualsLocalConst,
+        OpCode::LessConst => OpCode::LessLocalConst,
+        OpCode::GreaterConst => OpCode::GreaterLocalConst,
+        OpCode::GreaterEqualsConst => OpCode::GreaterEqualsLocalConst,
+        _ => return None,
+    };
+    Some(fused)
+}
+
+/// The form of a producer that appends its answer to the list beneath it
+/// rather than pushing it, if this producer has one.
+///
+/// The set is the producers that name a SLOT: [`OpCode::LoadLocal`], the two
+/// field reads over a slot, and the eight operators over a slot and a literal.
+/// Naming a slot is the criterion because it is what makes the answer a
+/// function of the element the loop just bound, which is what an append inside
+/// a comprehension consumes once per iteration. A producer that names no slot
+/// -- a `LoadConst`, a `LoadVar` -- appends the same value on every iteration,
+/// so what such a program wants is a hoist and not an opcode, and it keeps the
+/// pair.
+///
+/// Keyed on the producer's opcode rather than on the AST, so the three
+/// recognisers that decide a producer -- [`Compiler::local_load`],
+/// [`Compiler::field_local`] and [`Compiler::binary_local_const`] -- reach
+/// their appending twin through one table and none of them can grow a shape
+/// the others lack.
+fn appending_producer(op: OpCode) -> Option<OpCode> {
+    let fused = match op {
+        OpCode::LoadLocal => OpCode::LoadLocalAppend,
+        OpCode::GetFieldLocal => OpCode::GetFieldLocalAppend,
+        OpCode::HasFieldLocal => OpCode::HasFieldLocalAppend,
+        OpCode::AddLocalConst => OpCode::AddLocalConstAppend,
+        OpCode::MulLocalConst => OpCode::MulLocalConstAppend,
+        OpCode::ModLocalConst => OpCode::ModLocalConstAppend,
+        OpCode::EqualsLocalConst => OpCode::EqualsLocalConstAppend,
+        OpCode::NotEqualsLocalConst => OpCode::NotEqualsLocalConstAppend,
+        OpCode::LessLocalConst => OpCode::LessLocalConstAppend,
+        OpCode::GreaterLocalConst => OpCode::GreaterLocalConstAppend,
+        OpCode::GreaterEqualsLocalConst => OpCode::GreaterEqualsLocalConstAppend,
+        _ => return None,
+    };
+    Some(fused)
+}
+
+/// The producer recognisers.
+///
+/// Each one is the whole decision for its shape, and both of the sites that
+/// want that decision go through it: the site that pushes the answer, and
+/// [`Compiler::append_element`], which hands the answer to a list builder
+/// instead. A recogniser that DECLINES has added nothing to a pool, so a
+/// caller is free to compile the expression by the ordinary path afterwards.
+impl Compiler {
+    /// A name that resolves to a slot, as the one instruction it lowers to.
+    fn local_load(&self, name: &str) -> Option<Decided> {
+        self.lookup(name).map(|slot| Decided {
+            op: OpCode::LoadLocal,
+            words: [slot, 0],
+        })
+    }
+
+    /// A field read whose operand is a slot, as the one instruction it lowers
+    /// to.
+    ///
+    /// `SelectExpr::test` is set only by the `has` macro expander, so it is a
+    /// compile-time constant and picks the opcode rather than a branch.
+    fn field_local(
+        &mut self,
+        select: &SelectExpr,
+        id: u64,
+    ) -> Result<Option<Decided>, CompileError> {
+        let Expr::Ident(name) = &select.operand.expr else {
+            return Ok(None);
+        };
+        let Some(slot) = self.lookup(name) else {
+            return Ok(None);
+        };
+        let field = self.add_name(&select.field, id)?;
+        let op = if select.test {
+            OpCode::HasFieldLocal
+        } else {
+            OpCode::GetFieldLocal
+        };
+        Ok(Some(Decided {
+            op,
+            words: [slot, field.0],
+        }))
+    }
+
+    /// A binary operator whose left operand is a slot and whose right operand
+    /// is a literal, as the one instruction it lowers to.
+    ///
+    /// Only the RIGHT operand may be the literal: the fused form keeps the
+    /// operand order the helpers are called with, and `1 - x` is not `x - 1`.
+    /// `args` is the operator's two arguments, which the caller has already
+    /// checked the arity of.
+    fn binary_local_const(
+        &mut self,
+        op: OpCode,
+        args: &[IdedExpr],
+        id: u64,
+    ) -> Result<Option<Decided>, CompileError> {
+        // Reached through the folded form rather than from the base operator,
+        // so an operator with no folded twin has no fused-local one either.
+        let Some(fused) = const_operator(op).and_then(local_const_operator) else {
+            return Ok(None);
+        };
+        let Expr::Literal(literal) = &args[1].expr else {
+            return Ok(None);
+        };
+        // A free variable is a `LoadVar` context lookup rather than a slot, so
+        // it keeps the pair.
+        let Expr::Ident(name) = &args[0].expr else {
+            return Ok(None);
+        };
+        let Some(slot) = self.lookup(name) else {
+            return Ok(None);
+        };
+        let konst = self.add_const(literal.to_value(), id)?;
+        Ok(Some(Decided {
+            op: fused,
+            words: [slot, konst],
+        }))
+    }
+
+    /// The one instruction an expression lowers to when it names a slot and
+    /// pushes a finished value, or `None` when it is anything else.
+    ///
+    /// The union of the three recognisers above, over the AST shapes that
+    /// reach them. Anything else -- a computation whose operands come off the
+    /// stack, a load of something that is not a slot -- is not one
+    /// instruction, or is one that does not name what it reads, and either
+    /// way there is nothing here to fuse.
+    fn slot_producer(&mut self, e: &IdedExpr) -> Result<Option<Decided>, CompileError> {
+        match &e.expr {
+            Expr::Ident(name) => Ok(self.local_load(name)),
+            Expr::Select(select) => self.field_local(select, e.id),
+            // An operator name can only be an operator, and a receiver means
+            // a method call rather than one; both are `Compiler::call`'s test.
+            Expr::Call(call) if call.target.is_none() => {
+                let Some((op, 2)) = simple_operator(&call.func_name) else {
+                    return Ok(None);
+                };
+                if call.args.len() != 2 {
+                    return Ok(None);
+                }
+                self.binary_local_const(op, &call.args, e.id)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Emit one element of a list and the append that puts it there.
+    ///
+    /// One instruction when the element is a slot-naming producer, and the
+    /// pair otherwise -- which is unfused rather than wrong, the way an
+    /// operator absent from [`const_operator`] keeps its `LoadConst`.
+    ///
+    /// Decided from the AST before anything is emitted, for the reason
+    /// [`Compiler::comprehension`] gives: folding two emitted instructions
+    /// into one after the fact renumbers every `pc` after the fold, and a `pc`
+    /// is what a jump operand and a [`Handler`] bound both are.
+    fn append_element(&mut self, element: &IdedExpr) -> Result<(), CompileError> {
+        let id = element.id;
+        let Some(decided) = self.slot_producer(element)? else {
+            self.expr(element)?;
+            self.emit(OpCode::ListAppend, &[], id)?;
+            return Ok(());
+        };
+        match decided.appending() {
+            Some(fused) => {
+                self.emit_decided(fused, id)?;
+            }
+            // A recognised producer with no appending twin emits what it
+            // decided rather than falling back to `Compiler::expr`, which
+            // would compile the element a second time and add its name or its
+            // constant to the pool twice. Nothing in `appending_producer`
+            // declines today; this arm is what makes that a property of the
+            // table rather than of this call site.
+            None => {
+                self.emit_decided(decided, id)?;
+                self.emit(OpCode::ListAppend, &[], id)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Compiler {
+    fn call(&mut self, call: &CallExpr, id: u64) -> Result<(), CompileError> {
+        // An operator name can only be an operator: the parser mints these
+        // and they are not valid identifiers.
+        if call.target.is_none() {
+            if let Some((op, arity)) = simple_operator(&call.func_name) {
+                self.check_arity(call, arity, id)?;
+                // A literal right operand is one `LoadConst` whose only
+                // consumer is the operator below it, so the two are emitted as
+                // one instruction. Decided before the arguments are compiled,
+                // for the reason `Compiler::comprehension` gives.
+                //
+                // Only the RIGHT operand: the fused form keeps the operand
+                // order the helpers are called with, and `1 - x` is not
+                // `x - 1`.
+                if arity == 2 {
+                    // The LEFT operand folds in as well when it is a slot,
+                    // leaving the whole binary in one instruction.
+                    if let Some(decided) = self.binary_local_const(op, &call.args, id)? {
+                        self.emit_decided(decided, id)?;
+                        return Ok(());
+                    }
+                    if let (Some(fused), Expr::Literal(literal)) =
+                        (const_operator(op), &call.args[1].expr)
+                    {
+                        self.expr(&call.args[0])?;
+                        let konst = self.add_const(literal.to_value(), id)?;
+                        self.emit(fused, &[konst], id)?;
+                        return Ok(());
+                    }
+                }
+                for arg in &call.args {
+                    self.expr(arg)?;
+                }
+                self.emit(op, &[], id)?;
+                return Ok(());
+            }
+            match call.func_name.as_str() {
+                operators::CONDITIONAL => return self.conditional(call, id),
+                operators::LOGICAL_AND => return self.short_circuit(call, OpCode::And, id),
+                operators::LOGICAL_OR => return self.short_circuit(call, OpCode::Or, id),
+                operators::OPT_SELECT => return self.opt_select(call, id),
+                operators::INDEX => return self.index(call, OpCode::Index, id),
+                operators::OPT_INDEX => return self.index(call, OpCode::OptIndex, id),
+                _ => {}
+            }
+        }
+        self.function_call(call, id)
+    }
+
+    fn check_arity(&self, call: &CallExpr, expected: usize, id: u64) -> Result<(), CompileError> {
+        if call.args.len() == expected {
+            return Ok(());
+        }
+        Err(CompileError {
+            kind: CompileErrorKind::OperatorArity {
+                operator: call.func_name.clone(),
+                expected,
+                actual: call.args.len(),
+            },
+            id,
+        })
+    }
+
+    fn conditional(&mut self, call: &CallExpr, id: u64) -> Result<(), CompileError> {
+        self.check_arity(call, 3, id)?;
+        self.expr(&call.args[0])?;
+        let to_else = self.emit_forward(OpCode::JumpIfFalse, id)?;
+
+        // Both arms leave exactly one operand, so the depth after the merge
+        // must not count them twice.
+        let before_arms = self.depth;
+        self.expr(&call.args[1])?;
+        let to_end = self.emit_forward(OpCode::Jump, id)?;
+
+        self.patch_to_here(to_else);
+        self.depth = before_arms;
+        self.expr(&call.args[2])?;
+        self.patch_to_here(to_end);
+        Ok(())
+    }
+
+    /// `a && b` and `a || b`.
+    ///
+    /// Both operands are evaluated unless the left one decides the result on
+    /// its own, and an error in the left operand is *recorded* rather than
+    /// raised, because the right operand may still discard it:
+    /// `undefined_name && false` is `false`.
+    ///
+    /// So the left operand runs under a handler covering exactly its own
+    /// instructions, landing on the right operand with the error already in
+    /// the logic slot. The right operand is deliberately outside that range:
+    /// an error there propagates, matching the walker's `?`.
+    ///
+    /// ```text
+    /// [handler start]
+    ///   <a>
+    /// [handler end]   And   logic, L_short   ; a -> logic; false short-circuits
+    /// [handler land]  <b>
+    ///                 AndMerge logic          ; combine, or raise
+    /// L_short:
+    /// ```
+    ///
+    /// Each operator gets its own logic slot, because a nested `&&` in the
+    /// right operand writes its own between this one's write and read.
+    fn short_circuit(&mut self, call: &CallExpr, op: OpCode, id: u64) -> Result<(), CompileError> {
+        self.check_arity(call, 2, id)?;
+
+        let logic = self.next_logic;
+        self.next_logic = logic.checked_add(1).ok_or(CompileError {
+            kind: CompileErrorKind::TooLarge("logic slot count"),
+            id,
+        })?;
+        self.n_logic = self.n_logic.max(self.next_logic);
+
+        let depth = u32::try_from(self.depth).unwrap_or(0);
+        // A left operand that is already in a slot is one `LoadLocal` whose
+        // only consumer is the operator below it, so the two are emitted as
+        // one instruction. That is `all`'s and `exists`'s step on every
+        // element -- their accumulator is a slot -- but nothing here is
+        // special to them: any `&&` or `||` over a comprehension variable has
+        // the same shape and gets the same form.
+        let local = match &call.args[0].expr {
+            Expr::Ident(name) => self.lookup(name),
+            _ => None,
+        };
+        // The handler covers the left operand's instructions, and the fused
+        // form IS the left operand's instruction, so it covers that one. The
+        // range stays one wide either way, which is what keeps a nested
+        // operator's handler the innermost one.
+        let (at, target, start, end) = match local {
+            Some(local) => {
+                let fused = match op {
+                    OpCode::And => OpCode::AndLocal,
+                    _ => OpCode::OrLocal,
+                };
+                let at = self.emit(fused, &[local, logic, u32::MAX], id)?;
+                (at, 2, at, at + 1)
+            }
+            None => {
+                let start = self.here();
+                self.expr(&call.args[0])?;
+                let end = self.here();
+                let at = self.emit(op, &[logic, u32::MAX], id)?;
+                (at, 1, start, end)
+            }
+        };
+        let land = self.here();
+        self.handlers.push(Handler {
+            start,
+            end,
+            land,
+            logic,
+            depth,
+        });
+
+        self.expr(&call.args[1])?;
+        let merge = match op {
+            OpCode::And => OpCode::AndMerge,
+            _ => OpCode::OrMerge,
+        };
+        self.emit(merge, &[logic], id)?;
+        self.patch_to_here(PatchSite { at, slot: target });
+
+        // The slot is dead once the merge has read it, so a sibling operator
+        // reuses it rather than growing the record.
+        self.next_logic = logic;
+        Ok(())
+    }
+
+    /// `a[b]` and `a[?b]`.
+    ///
+    /// Not a plain two-operand operator, because an optional container decides
+    /// the whole expression by itself and does so *before* the key runs:
+    /// `opt_none[1 / 0]` is `optional.none`, not a division error. The guard
+    /// is what puts that order into a stream that would otherwise evaluate
+    /// both operands and only then look at either.
+    fn index(&mut self, call: &CallExpr, op: OpCode, id: u64) -> Result<(), CompileError> {
+        self.check_arity(call, 2, id)?;
+        self.expr(&call.args[0])?;
+        let none = self.emit_forward(OpCode::JumpIfOptNone, id)?;
+        self.expr(&call.args[1])?;
+        self.emit(op, &[], id)?;
+        self.patch_to_here(none);
+        Ok(())
+    }
+
+    /// `a?.b`, whose field name the parser always supplies as a string
+    /// literal.
+    fn opt_select(&mut self, call: &CallExpr, id: u64) -> Result<(), CompileError> {
+        self.check_arity(call, 2, id)?;
+        let Expr::Literal(LiteralValue::String(field)) = &call.args[1].expr else {
+            return Err(CompileError {
+                kind: CompileErrorKind::OptSelectFieldNotLiteral,
+                id: call.args[1].id,
+            });
+        };
+        self.expr(&call.args[0])?;
+        let field = self.add_name(field, id)?;
+        self.emit(OpCode::OptSelect, &[field.0], id)?;
+        Ok(())
+    }
+
+    /// A call that is not an operator.
+    ///
+    /// The receiver form is the delicate one. `math.max(1, 2)` and
+    /// `s.startsWith("h")` parse identically, and which one an expression is
+    /// depends on the environment, which the compiler does not have. The
+    /// walker resolves it by trying the namespaced function *first* and only
+    /// evaluating the receiver if that misses -- an order that matters,
+    /// because `optional.of(1)` must not fail on `optional` being an
+    /// undeclared variable.
+    ///
+    /// So the emitted program keeps both paths and lets the run-time lookup
+    /// pick, with the joined name already in the name table. That is what
+    /// makes the probe free: joining it per evaluation is the allocation the
+    /// walker used to pay on every member call with an identifier receiver.
+    fn function_call(&mut self, call: &CallExpr, id: u64) -> Result<(), CompileError> {
+        let arity = u32::try_from(call.args.len()).map_err(|_| CompileError {
+            kind: CompileErrorKind::TooLarge("argument count"),
+            id,
+        })?;
+
+        let Some(target) = &call.target else {
+            let name = self.add_name(&call.func_name, id)?;
+            for arg in &call.args {
+                self.expr(arg)?;
+            }
+            self.emit(OpCode::CallHost, &[name.0, arity], id)?;
+            return Ok(());
+        };
+
+        let name = self.add_name(&call.func_name, id)?;
+        let namespace = match &target.expr {
+            Expr::Ident(prefix) if self.lookup(prefix).is_none() => {
+                Some(self.add_name(&format!("{prefix}.{}", call.func_name), id)?)
+            }
+            // A receiver that is anything else -- a literal, a call, a
+            // comprehension variable -- cannot name a namespace.
+            _ => None,
+        };
+
+        for arg in &call.args {
+            self.expr(arg)?;
+        }
+
+        let Some(namespace) = namespace else {
+            self.expr(target)?;
+            self.emit(OpCode::CallMethod, &[name.0, arity], id)?;
+            return Ok(());
+        };
+
+        let with_args = self.depth;
+        let at = self.emit(OpCode::CallQualified, &[namespace.0, arity, u32::MAX], id)?;
+        // The emitted effect is the jumping path's, so the depth now models
+        // the merge. The falling-through path still has the arguments.
+        let merged = self.depth;
+        self.depth = with_args;
+
+        self.expr(target)?;
+        self.emit(OpCode::CallMethod, &[name.0, arity], id)?;
+        debug_assert_eq!(
+            self.depth, merged,
+            "the two call paths must meet at one depth"
+        );
+        self.patch_to_here(PatchSite { at, slot: 2 });
+        Ok(())
+    }
+}
+
+/// A comprehension whose step only ever appends one element to its own
+/// accumulator -- what `map` and `filter` expand to.
+///
+/// This is the compile-time twin of the walker's `AccuAppend` (`objects.rs`),
+/// and it exists for the same reason: the general lowering rebuilds the
+/// accumulator once per element, because `@result + [x]` is a list
+/// concatenation. That is a fresh buffer and a full copy per iteration, so an
+/// *n*-element `map` costs O(n^2) copying where the shape only ever needed a
+/// push. The walker has recognised it since before the VM existed; without the
+/// same recognition here the VM is asymptotically slower than the evaluator it
+/// replaces, which no amount of dispatch tuning can make up.
+///
+/// The preconditions are the walker's, restated:
+///
+/// * the loop condition is the literal `true`, so nothing can break early and
+///   observe a partial accumulator (`exists` and `all` do break, and are not
+///   this shape);
+/// * the step is `@result + [elem]`, optionally wrapped in
+///   `guard ? @result + [elem] : @result`, which is `filter`;
+/// * the appended literal holds exactly one element and no optional index,
+///   because `[?x]` appends zero or one depending on the value.
+struct AccuAppend<'a> {
+    /// `filter`'s condition, when the step is the conditional form.
+    guard: Option<&'a IdedExpr>,
+    /// The single element the step appends.
+    element: &'a IdedExpr,
+}
+
+impl<'a> AccuAppend<'a> {
+    fn of(comp: &'a ComprehensionExpr) -> Option<Self> {
+        // A second variable is bound from the range per iteration; the parser
+        // never emits one, and this shape has never been measured with it.
+        if comp.iter_var2.is_some() {
+            return None;
+        }
+        match &comp.loop_cond.expr {
+            Expr::Literal(LiteralValue::Boolean(b)) if *b => {}
+            _ => return None,
+        }
+        // The accumulator has to start as a list, and it has to be a list the
+        // compiler can see: the emitted program builds it on the operand stack
+        // rather than storing it, so `[]` must be a literal and not a value
+        // that merely turns out to be a list at run time.
+        if !matches!(&comp.accu_init.expr, Expr::List(_)) {
+            return None;
+        }
+
+        let accu_var = comp.accu_var.as_str();
+        let is_accu = |e: &IdedExpr| matches!(&e.expr, Expr::Ident(n) if n == accu_var);
+
+        let (guard, step) = match &comp.loop_step.expr {
+            Expr::Call(call)
+                if call.func_name == operators::CONDITIONAL
+                    && call.args.len() == 3
+                    && is_accu(&call.args[2]) =>
+            {
+                (Some(&call.args[0]), &call.args[1])
+            }
+            _ => (None, &comp.loop_step),
+        };
+
+        let Expr::Call(call) = &step.expr else {
+            return None;
+        };
+        if call.func_name != operators::ADD || call.args.len() != 2 || !is_accu(&call.args[0]) {
+            return None;
+        }
+        match &call.args[1].expr {
+            Expr::List(list) if list.elements.len() == 1 && list.optional_indices.is_empty() => {
+                Some(AccuAppend {
+                    guard,
+                    element: &list.elements[0],
+                })
+            }
+            _ => None,
+        }
+    }
+}
+
+/// The loop condition a comprehension carries, recognised so that the three
+/// instructions the common ones lower to become one.
+///
+/// `parser::macros` synthesises these: `all` tests the accumulator itself,
+/// `exists` tests its negation, and both wrap the test in
+/// `@not_strictly_false`, which is what makes a non-bool accumulator keep the
+/// loop running rather than end it. `exists_one`'s condition is the literal
+/// `true`, which ends the loop on nothing at all -- a third case here rather
+/// than a fourth instruction.
+///
+/// A device of its own for the reason [`AccuAppend`] is one: the decision is
+/// made by inspecting the comprehension, before anything is emitted, so the
+/// stream never holds the unfused form and no `pc` has to move.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LoopCond {
+    /// The literal `true`. Nothing can end the loop early, so nothing is
+    /// emitted to ask.
+    Always,
+    /// `@not_strictly_false(@result)`, which is `all`'s.
+    Accu,
+    /// `@not_strictly_false(!@result)`, which is `exists`'s.
+    NotAccu,
+    /// Anything else, compiled as the expression it is.
+    General,
+}
+
+impl LoopCond {
+    fn of(comp: &ComprehensionExpr) -> LoopCond {
+        if matches!(
+            &comp.loop_cond.expr,
+            Expr::Literal(LiteralValue::Boolean(true))
+        ) {
+            return LoopCond::Always;
+        }
+        // An operator with a target is a method call to `Compiler::call`, not
+        // an operator at all, so a receiver disqualifies both halves here.
+        let operator = |call: &CallExpr, name: &str, arity: usize| {
+            call.target.is_none() && call.func_name == name && call.args.len() == arity
+        };
+        let Expr::Call(outer) = &comp.loop_cond.expr else {
+            return LoopCond::General;
+        };
+        if !operator(outer, operators::NOT_STRICTLY_FALSE, 1) {
+            return LoopCond::General;
+        }
+
+        let accu_var = comp.accu_var.as_str();
+        let is_accu = |e: &IdedExpr| matches!(&e.expr, Expr::Ident(n) if n == accu_var);
+        if is_accu(&outer.args[0]) {
+            return LoopCond::Accu;
+        }
+        match &outer.args[0].expr {
+            Expr::Call(inner)
+                if operator(inner, operators::LOGICAL_NOT, 1) && is_accu(&inner.args[0]) =>
+            {
+                LoopCond::NotAccu
+            }
+            _ => LoopCond::General,
+        }
+    }
+}
+
+impl Compiler {
+    /// A comprehension, which is the only construct that emits a back edge.
+    ///
+    /// `iter_range` and `accu_init` are evaluated outside the new scope --
+    /// neither can refer to the variables the comprehension binds -- and
+    /// `result` inside it, because it refers to the accumulator.
+    ///
+    /// # The per-element block is emitted already fused
+    ///
+    /// The guard, the bind and the back edge are three groups that each put a
+    /// value on the operand stack and take it off again before the group ends,
+    /// so each is emitted as the one instruction that names what was
+    /// travelling: [`OpCode::IterGuard`], [`OpCode::IterBind`] and
+    /// [`OpCode::IterAdvance`].
+    ///
+    /// Fused HERE rather than by a peephole pass over the finished `Vec<Insn>`,
+    /// and that is the whole reason nothing else in this file changed. A `pc`
+    /// is an index into that vector, so folding *n* instructions into one after
+    /// the fact renumbers every instruction after the fold -- which means
+    /// rewriting every jump operand that points past it, in both directions,
+    /// and every [`Handler`] bound as well. Emitting the fused form in the
+    /// first place means no index ever moves, and [`Compiler::patch_to_here`]
+    /// is untouched.
+    fn comprehension(&mut self, comp: &ComprehensionExpr, id: u64) -> Result<(), CompileError> {
+        if let Some(append) = AccuAppend::of(comp) {
+            return self.appending_comprehension(comp, &append, id);
+        }
+        let two_variable = comp.iter_var2.is_some();
+
+        self.expr(&comp.iter_range)?;
+
+        let mark = self.open_scope();
+
+        // The second variable is the element at the first variable's key, so
+        // the range has to outlive the sequence derived from it.
+        let range = if two_variable {
+            let slot = self.declare_hidden(id)?;
+            self.emit(OpCode::StoreLocal, &[slot], id)?;
+            self.emit(OpCode::LoadLocal, &[slot], id)?;
+            Some(slot)
+        } else {
+            None
+        };
+
+        let source_op = if two_variable {
+            OpCode::IterKeys
+        } else {
+            OpCode::IterElems
+        };
+        self.emit(source_op, &[], id)?;
+        let source = self.declare_hidden(id)?;
+        self.emit(OpCode::StoreLocal, &[source], id)?;
+
+        // `accu_init` is outside the scope in CEL, but the accumulator slot
+        // has to exist before the store. Declaring the name after evaluating
+        // the initialiser is what keeps `accu_init` from seeing it.
+        self.expr(&comp.accu_init)?;
+        let accu = self.declare(&comp.accu_var, id)?;
+        self.emit(OpCode::StoreLocal, &[accu], id)?;
+
+        let index = self.declare_hidden(id)?;
+        let zero = self.add_const(Value::Int(0), id)?;
+        self.emit(OpCode::LoadConst, &[zero], id)?;
+        self.emit(OpCode::StoreLocal, &[index], id)?;
+
+        let iter_var = self.declare(&comp.iter_var, id)?;
+        let iter_var2 = match &comp.iter_var2 {
+            Some(name) => Some(self.declare(name, id)?),
+            None => None,
+        };
+
+        let top = self.here();
+        let exhausted =
+            self.emit_forward_in(OpCode::IterGuard, &[index, source, u32::MAX], 2, id)?;
+
+        self.emit(OpCode::IterBind, &[source, index, iter_var], id)?;
+
+        if let (Some(range), Some(iter_var2)) = (range, iter_var2) {
+            self.emit(OpCode::LoadLocal, &[range], id)?;
+            self.emit(OpCode::LoadLocal, &[iter_var], id)?;
+            self.emit(OpCode::Index, &[], id)?;
+            self.emit(OpCode::StoreLocal, &[iter_var2], id)?;
+        }
+
+        // A hand-built comprehension can bind the iteration variable to the
+        // accumulator's name, in which case `@result` inside the condition
+        // reaches the iteration variable's slot and not this one. Asking
+        // `lookup` is what `Compiler::ident` would have done, so the fused
+        // form names the slot the three instructions would have read.
+        let names_accu = self.lookup(&comp.accu_var) == Some(accu);
+        let broke = match LoopCond::of(comp) {
+            LoopCond::Always => None,
+            LoopCond::Accu if names_accu => {
+                Some(self.emit_forward_in(OpCode::AccuLoopCond, &[accu, u32::MAX], 1, id)?)
+            }
+            LoopCond::NotAccu if names_accu => {
+                Some(self.emit_forward_in(OpCode::AccuLoopCondNot, &[accu, u32::MAX], 1, id)?)
+            }
+            _ => {
+                self.expr(&comp.loop_cond)?;
+                Some(self.emit_forward(OpCode::JumpIfFalse, id)?)
+            }
+        };
+
+        self.expr(&comp.loop_step)?;
+        self.emit(OpCode::StoreLocal, &[accu], id)?;
+
+        self.emit(OpCode::IterAdvance, &[index, top], id)?;
+
+        self.patch_to_here(exhausted);
+        if let Some(broke) = broke {
+            self.patch_to_here(broke);
+        }
+        self.expr(&comp.result)?;
+
+        self.close_scope(mark);
+        Ok(())
+    }
+
+    /// The [`AccuAppend`] shape: the accumulator is a builder on the operand
+    /// stack, and each iteration pushes one element into it.
+    ///
+    /// This is the same device a list *literal* already uses -- `NewList` plus
+    /// one `ListAppend` per element, with the in-progress aggregate living on
+    /// the stack as an `Operand::List` the append mutates in place. The only
+    /// new thing is a loop around the appends, so no opcode is added and the
+    /// dispatch loop is untouched.
+    ///
+    /// ```text
+    ///   <iter_range>  IterElems  StoreLocal source
+    ///   <accu_init>                       ; a list literal: leaves the builder
+    ///   LoadConst 0   StoreLocal index
+    /// top:
+    ///   IterGuard index source done
+    ///   IterBind source index iter_var
+    ///   [<guard> JumpIfFalse skip]
+    ///   <element+append>                 ; straight into the builder
+    /// skip:
+    ///   IterAdvance index top
+    /// done:
+    ///   StoreLocal accu                  ; finishes the builder into a Value
+    ///   <result>
+    /// ```
+    ///
+    /// The accumulator's name is declared only *after* the loop. That is not
+    /// tidiness: it is what makes `@result` unreadable from the element and the
+    /// guard, which is this shape's precondition. A read compiles to `LoadVar`
+    /// and fails as an undeclared reference -- the same answer the walker gives,
+    /// which holds its accumulator outside the context on this path.
+    fn appending_comprehension(
+        &mut self,
+        comp: &ComprehensionExpr,
+        append: &AccuAppend<'_>,
+        id: u64,
+    ) -> Result<(), CompileError> {
+        self.expr(&comp.iter_range)?;
+
+        let mark = self.open_scope();
+
+        self.emit(OpCode::IterElems, &[], id)?;
+        let source = self.declare_hidden(id)?;
+        self.emit(OpCode::StoreLocal, &[source], id)?;
+
+        // Leaves the builder on the stack, where it stays for the whole loop.
+        // The empty literal the macros produce opens it sized by the range
+        // instead; any other initialiser is evaluated as written.
+        match &comp.accu_init.expr {
+            Expr::List(list) if list.elements.is_empty() => {
+                self.emit(OpCode::NewListFromArg, &[source], id)?;
+            }
+            _ => self.expr(&comp.accu_init)?,
+        }
+
+        let index = self.declare_hidden(id)?;
+        let zero = self.add_const(Value::Int(0), id)?;
+        self.emit(OpCode::LoadConst, &[zero], id)?;
+        self.emit(OpCode::StoreLocal, &[index], id)?;
+
+        let iter_var = self.declare(&comp.iter_var, id)?;
+
+        let top = self.here();
+        let exhausted =
+            self.emit_forward_in(OpCode::IterGuard, &[index, source, u32::MAX], 2, id)?;
+
+        self.emit(OpCode::IterBind, &[source, index, iter_var], id)?;
+
+        let skipped = match append.guard {
+            Some(guard) => {
+                self.expr(guard)?;
+                Some(self.emit_forward(OpCode::JumpIfFalse, id)?)
+            }
+            None => None,
+        };
+
+        self.append_element(append.element)?;
+
+        if let Some(skipped) = skipped {
+            self.patch_to_here(skipped);
+        }
+
+        self.emit(OpCode::IterAdvance, &[index, top], id)?;
+
+        self.patch_to_here(exhausted);
+        let accu = self.declare(&comp.accu_var, id)?;
+        self.emit(OpCode::StoreLocal, &[accu], id)?;
+        self.expr(&comp.result)?;
+
+        self.close_scope(mark);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::ast::IdedExpr;
+    use crate::parser::Parser;
+    use crate::vm::OPCODE_COUNT;
+
+    fn code_of(source: &str) -> CelCode {
+        let expr = Parser::default()
+            .parse(source)
+            .unwrap_or_else(|e| panic!("parse {source}: {e:?}"));
+        compile(&expr).unwrap_or_else(|e| panic!("compile {source}: {e}"))
+    }
+
+    fn opcodes(code: &CelCode) -> Vec<OpCode> {
+        code.instructions().map(|(_, op, _)| op).collect()
+    }
+
+    /// The walker reaches `Expr::Unspecified` and panics. Compiling refuses
+    /// it, which is the whole point of the match being exhaustive.
+    #[test]
+    fn unspecified_is_refused_rather_than_panicking() {
+        let err = compile(&IdedExpr {
+            id: 7,
+            expr: Expr::Unspecified,
+        })
+        .expect_err("an unspecified expression has no value");
+        assert_eq!(err.kind, CompileErrorKind::UnspecifiedExpr);
+        assert_eq!(err.id, 7);
+    }
+
+    /// `has(m.x)` is a flag on a `Select` node, not a call, so it has to
+    /// reach its own opcode rather than a branch inside the field read.
+    #[test]
+    fn has_is_its_own_opcode_and_a_plain_select_is_not() {
+        assert!(opcodes(&code_of("has(m.x)")).contains(&OpCode::HasField));
+        let plain = opcodes(&code_of("m.x"));
+        assert!(plain.contains(&OpCode::GetField));
+        assert!(!plain.contains(&OpCode::HasField));
+    }
+
+    /// A field read off a slot is one instruction, and the `LoadLocal` that
+    /// used to carry the container is gone with it.
+    ///
+    /// Stated against the slot rather than against a sequence, for the reason
+    /// `the_comprehension_loop_never_loads_its_source_onto_the_stack` gives:
+    /// what matters is that the container never reaches the operand stack,
+    /// because reaching it is what cost an atomic pair on the container's
+    /// `Arc` per read.
+    #[test]
+    fn a_field_read_off_a_comprehension_variable_never_loads_its_container() {
+        for (source, fused) in [
+            // `map`'s body IS the element, so the read appends its answer
+            // rather than pushing it; `all`'s feeds the loop condition.
+            ("items.map(i, i.price)", OpCode::GetFieldLocalAppend),
+            ("items.filter(i, i.price > 10)", OpCode::GetFieldLocal),
+            ("items.all(i, has(i.price))", OpCode::HasFieldLocal),
+        ] {
+            let code = code_of(source);
+            let slot = code
+                .instructions()
+                .find(|(_, op, _)| *op == fused)
+                .map(|(_, _, operands)| operands[0])
+                .unwrap_or_else(|| {
+                    panic!("{source} reads a field off a slot:\n{}", code.disassemble())
+                });
+            // The iteration variable's slot is the one `IterBind` writes.
+            assert_eq!(
+                code.instructions()
+                    .find(|(_, op, _)| *op == OpCode::IterBind)
+                    .map(|(_, _, operands)| operands[2]),
+                Some(slot),
+                "{source} reads a field off something other than the element:\n{}",
+                code.disassemble()
+            );
+
+            let loaded: Vec<u32> = code
+                .instructions()
+                .filter(|(_, op, _)| *op == OpCode::LoadLocal)
+                .map(|(_, _, operands)| operands[0])
+                .collect();
+            assert!(
+                !loaded.contains(&slot),
+                "{source} still copies slot {slot} onto the stack:\n{}",
+                code.disassemble()
+            );
+        }
+    }
+
+    /// A field read off a free variable keeps the unfused pair.
+    ///
+    /// The fusion is licensed by the operand being one `LoadLocal` of a slot;
+    /// a free variable is a context lookup, which is a different instruction
+    /// over a different thing and can raise where a slot read cannot.
+    #[test]
+    fn a_field_read_off_a_free_variable_is_not_fused() {
+        for (source, unfused) in [("m.x", OpCode::GetField), ("has(m.x)", OpCode::HasField)] {
+            let code = code_of(source);
+            assert_eq!(
+                count(&code, unfused),
+                1,
+                "{source}:\n{}",
+                code.disassemble()
+            );
+            assert_eq!(
+                count(&code, OpCode::GetFieldLocal) + count(&code, OpCode::HasFieldLocal),
+                0,
+                "{source}:\n{}",
+                code.disassemble()
+            );
+        }
+    }
+
+    /// Only the OUTERMOST read of a chain reaches the stack, because only the
+    /// innermost operand is a slot.
+    ///
+    /// `i.a.b` is a select whose operand is another select, so the inner one
+    /// fuses and the outer one reads what the inner one pushed. This is what
+    /// says the recogniser looks at the operand it actually has rather than at
+    /// the expression it is part of.
+    #[test]
+    fn only_the_innermost_read_of_a_chain_is_fused() {
+        let code = code_of("items.map(i, i.a.b)");
+        assert_eq!(
+            count(&code, OpCode::GetFieldLocal),
+            1,
+            "{}",
+            code.disassemble()
+        );
+        assert_eq!(count(&code, OpCode::GetField), 1, "{}", code.disassemble());
+    }
+
+    /// A literal right operand becomes part of the operator, and the
+    /// `LoadConst` that used to carry it is gone with it.
+    ///
+    /// The operand the fused instruction keeps is the constant's index, so
+    /// the assertion is that it still names the same value the pair pushed --
+    /// and WHICH word holds it says how much the operator absorbed. `x % 2`
+    /// has a slot for its left operand, so that folds in too and the constant
+    /// is the second word; the equality's left operand is the modulo itself,
+    /// which is a computation on the stack, so it keeps only the constant.
+    #[test]
+    fn a_literal_right_operand_is_folded_into_the_operator() {
+        let code = code_of("xs.filter(x, x % 2 == 0)");
+        for (fused, word, want) in [
+            (OpCode::ModLocalConst, 1, Value::Int(2)),
+            (OpCode::EqualsConst, 0, Value::Int(0)),
+        ] {
+            let index = code
+                .instructions()
+                .find(|(_, op, _)| *op == fused)
+                .map(|(_, _, operands)| operands[word])
+                .unwrap_or_else(|| panic!("{fused:?} is missing:\n{}", code.disassemble()));
+            assert_eq!(code.konst(index), Some(&want), "{fused:?}");
+        }
+        // `ModConst` among them: a slot left operand takes the fold one step
+        // further, so the half-fused form is gone from this program as well.
+        for gone in [OpCode::Mod, OpCode::ModConst, OpCode::Equals] {
+            assert_eq!(count(&code, gone), 0, "{gone:?}:\n{}", code.disassemble());
+        }
+        // Both literals are gone from the stack, leaving only the one the
+        // scaffolding pushes for the loop counter's seed.
+        assert_eq!(
+            count(&code, OpCode::LoadConst),
+            count(&code_of("xs.filter(x, x)"), OpCode::LoadConst),
+            "{}",
+            code.disassemble()
+        );
+    }
+
+    /// A binary over a free variable folds only the constant.
+    ///
+    /// The left half of the fusion is licensed by the operand being one
+    /// `LoadLocal` of a slot; a free variable is a context lookup over the
+    /// activation record's surroundings, so fusing it would read a slot that
+    /// holds something else entirely. The unfused-operator test below does not
+    /// cover this -- each of its cases declines for a different reason.
+    #[test]
+    fn a_free_variable_left_operand_is_not_fused_into_the_operator() {
+        for (source, folded, fused) in [
+            (
+                "xs.map(x, lim * 2)",
+                OpCode::MulConst,
+                OpCode::MulLocalConst,
+            ),
+            (
+                "xs.filter(x, lim >= 3)",
+                OpCode::GreaterEqualsConst,
+                OpCode::GreaterEqualsLocalConst,
+            ),
+            (
+                "xs.map(x, lim == 'hi')",
+                OpCode::EqualsConst,
+                OpCode::EqualsLocalConst,
+            ),
+        ] {
+            let code = code_of(source);
+            assert_eq!(count(&code, folded), 1, "{source}:\n{}", code.disassemble());
+            assert_eq!(count(&code, fused), 0, "{source}:\n{}", code.disassemble());
+            // The left operand still reaches the stack, under the instruction
+            // that can raise where a slot read cannot.
+            let loaded: Vec<&str> = code
+                .instructions()
+                .filter(|(_, op, _)| *op == OpCode::LoadVar)
+                .map(|(_, _, operands)| code.name(NameId(operands[0])).unwrap())
+                .collect();
+            assert!(loaded.contains(&"lim"), "{source}: {loaded:?}");
+        }
+    }
+
+    /// Only the RIGHT operand folds, and only for the operators that have a
+    /// fused twin.
+    ///
+    /// The left operand is evaluated first, so a literal there is not the
+    /// instruction immediately below the operator and folding it would
+    /// reorder the two. `Sub` and `LessEquals` have no fused twin, so they
+    /// keep the pair whichever side the literal is on.
+    #[test]
+    fn a_literal_left_operand_and_an_unfused_operator_keep_the_pair() {
+        for (source, control, kept) in [
+            ("xs.map(x, 1 * x)", "xs.map(x, x)", OpCode::Mul),
+            ("xs.map(x, x - 1)", "xs.map(x, x)", OpCode::Sub),
+            (
+                "xs.filter(x, x <= 3)",
+                "xs.filter(x, x)",
+                OpCode::LessEquals,
+            ),
+        ] {
+            let code = code_of(source);
+            assert_eq!(count(&code, kept), 1, "{source}:\n{}", code.disassemble());
+            // One more than the literal-free body compiles to: the literal
+            // still reaches the stack under its own instruction.
+            assert_eq!(
+                count(&code, OpCode::LoadConst),
+                count(&code_of(control), OpCode::LoadConst) + 1,
+                "{source}:\n{}",
+                code.disassemble()
+            );
+        }
+    }
+
+    /// The comprehension variable becomes a slot; only the free variable
+    /// stays a context lookup.
+    #[test]
+    fn a_comprehension_variable_is_a_slot_and_a_free_variable_is_not() {
+        let code = code_of("xs.all(x, x > lim)");
+        assert!(opcodes(&code).contains(&OpCode::LoadLocal));
+
+        let loaded_names: Vec<&str> = code
+            .instructions()
+            .filter(|(_, op, _)| *op == OpCode::LoadVar)
+            .map(|(_, _, operands)| code.name(NameId(operands[0])).unwrap())
+            .collect();
+        assert!(loaded_names.contains(&"xs"), "{loaded_names:?}");
+        assert!(loaded_names.contains(&"lim"), "{loaded_names:?}");
+        assert!(!loaded_names.contains(&"x"), "{loaded_names:?}");
+    }
+
+    /// The activation-record claim: one record, siblings reusing slots and
+    /// only nesting occupying distinct ranges.
+    #[test]
+    fn sibling_comprehensions_share_slots_and_nested_ones_do_not() {
+        let single = code_of("xs.all(x, x > 0)").n_slots;
+        let siblings = code_of("xs.all(x, x > 0) && ys.all(y, y > 0)").n_slots;
+        let nested = code_of("xs.all(x, ys.all(y, y > x))").n_slots;
+
+        assert_eq!(
+            siblings, single,
+            "two comprehensions that cannot be live at once should reuse the range"
+        );
+        assert!(
+            nested > single,
+            "a nested comprehension needs its own range: nested={nested} single={single}"
+        );
+    }
+
+    /// The order that `optional.of(1)` depends on: the namespaced lookup is
+    /// tried before anything evaluates `optional` as a variable.
+    #[test]
+    fn a_namespaced_call_probes_before_the_receiver_is_evaluated() {
+        let code = code_of("optional.of(1)");
+        let ops = opcodes(&code);
+
+        let qualified = ops
+            .iter()
+            .position(|op| *op == OpCode::CallQualified)
+            .expect("a receiver that is a bare identifier must probe the joined name");
+        let receiver = ops
+            .iter()
+            .position(|op| *op == OpCode::LoadVar)
+            .expect("the fallback path still loads the receiver");
+        assert!(
+            qualified < receiver,
+            "the probe must precede the receiver load: {ops:?}"
+        );
+
+        // The joined name is built once, here, rather than per evaluation.
+        assert!(
+            code.names.iter().any(|n| &**n == "optional.of"),
+            "{:?}",
+            code.names
+        );
+    }
+
+    /// Every `CallQualified` is followed by a `CallMethod` of the SAME arity.
+    ///
+    /// That pairing is what lets `Vm::call_qualified`'s miss hand its popped
+    /// arguments straight to `Vm::call_member`, and it is why the probe pops
+    /// with the receiver's slot already reserved: on a miss that vector is the
+    /// one the receiver gets prepended to, and on a hit the spare slot is not
+    /// an allocation. A probe emitted without its member call would make both
+    /// claims false, so the pairing is asserted rather than assumed.
+    #[test]
+    fn a_probe_and_its_member_call_agree_on_arity() {
+        for source in [
+            "optional.of(1)",
+            "s.startsWith(\"h\")",
+            "s.noArgs()",
+            "s.three(1, 2, 3)",
+        ] {
+            let code = code_of(source);
+            let ops: Vec<_> = code
+                .instructions()
+                .map(|(_, op, args)| (op, args))
+                .collect();
+            let probes: Vec<_> = ops
+                .iter()
+                .filter(|(op, _)| *op == OpCode::CallQualified)
+                .collect();
+            assert_eq!(probes.len(), 1, "{source}: {ops:?}");
+            let members: Vec<_> = ops
+                .iter()
+                .filter(|(op, _)| *op == OpCode::CallMethod)
+                .collect();
+            assert_eq!(members.len(), 1, "{source}: {ops:?}");
+            // Operand 1 is the arity for both opcodes.
+            assert_eq!(probes[0].1[1], members[0].1[1], "{source}: {ops:?}");
+        }
+    }
+
+    /// A receiver that cannot name a namespace skips the probe entirely.
+    #[test]
+    fn a_non_identifier_receiver_is_only_a_method_call() {
+        let ops = opcodes(&code_of(r#""hello".startsWith("h")"#));
+        assert!(ops.contains(&OpCode::CallMethod));
+        assert!(!ops.contains(&OpCode::CallQualified));
+    }
+
+    /// A comprehension variable shadowing a namespace is a receiver again,
+    /// because the slot proves it is a value.
+    #[test]
+    fn a_receiver_bound_as_a_slot_is_never_a_namespace() {
+        let ops = opcodes(&code_of("xs.all(optional, optional.of(1))"));
+        assert!(!ops.contains(&OpCode::CallQualified), "{ops:?}");
+    }
+
+    #[test]
+    fn max_stack_covers_the_deeper_conditional_arm() {
+        let shallow = code_of("c ? a : b").max_stack;
+        let deep = code_of("c ? [a, b, x, y] : b").max_stack;
+        assert!(deep > shallow, "deep={deep} shallow={shallow}");
+    }
+
+    /// The parser never produces a two-variable comprehension -- every macro
+    /// sets `iter_var2: None` -- so this is the only way to reach the arm.
+    /// The second variable is the element at the first variable's key, which
+    /// is why the range outlives the sequence derived from it.
+    #[test]
+    fn a_two_variable_comprehension_binds_both_names() {
+        let Expr::Comprehension(base) = code_source("xs.all(k, k > 0)") else {
+            panic!("the macro expands to a comprehension");
+        };
+        let mut comp = *base;
+        comp.iter_var2 = Some("v".to_string());
+        comp.loop_step = parse_expr("v");
+
+        let code = compile(&IdedExpr {
+            id: 0,
+            expr: Expr::Comprehension(Box::new(comp)),
+        })
+        .expect("a two-variable comprehension compiles");
+
+        let ops = opcodes(&code);
+        assert!(ops.contains(&OpCode::IterKeys), "{ops:?}");
+        assert!(!ops.contains(&OpCode::IterElems), "{ops:?}");
+        // `v` resolves to a slot, not to a context lookup.
+        let loaded: Vec<&str> = code
+            .instructions()
+            .filter(|(_, op, _)| *op == OpCode::LoadVar)
+            .map(|(_, _, operands)| code.name(NameId(operands[0])).unwrap())
+            .collect();
+        assert!(!loaded.contains(&"v"), "{loaded:?}");
+    }
+
+    /// One variable iterates elements, so the two forms differ exactly where
+    /// the opcode documentation says they do.
+    #[test]
+    fn a_one_variable_comprehension_iterates_elements() {
+        let ops = opcodes(&code_of("xs.all(x, x > 0)"));
+        assert!(ops.contains(&OpCode::IterElems), "{ops:?}");
+        assert!(!ops.contains(&OpCode::IterKeys), "{ops:?}");
+    }
+
+    /// The loop reaches its source through slot operands and never puts it on
+    /// the operand stack. What that replaced was two `LoadLocal`s of the
+    /// source per element, and each of those copied the whole `Value` -- for a
+    /// list, a `ListRef` clone whose `Arc` refcount is an atomic increment,
+    /// matched by a decrement when the instruction that consumed it dropped
+    /// the copy again.
+    ///
+    /// Stated as a property rather than as an expected instruction sequence:
+    /// the sequence is what a later change to the loop is entitled to move,
+    /// and the invariant is that the source stays out of the stack traffic.
+    #[test]
+    fn the_comprehension_loop_never_loads_its_source_onto_the_stack() {
+        for source in [
+            "xs.map(x, x * 2)",
+            "xs.filter(x, x > 0)",
+            "xs.all(x, x > 0)",
+        ] {
+            let code = code_of(source);
+            let slot_of = |wanted: OpCode, operand: usize| {
+                code.instructions()
+                    .filter(|(_, op, _)| *op == wanted)
+                    .map(|(_, _, operands)| operands[operand])
+                    .next()
+            };
+            let slot = slot_of(OpCode::IterBind, 0)
+                .unwrap_or_else(|| panic!("{source} iterates, so it names a source slot"));
+
+            let loaded: Vec<u32> = code
+                .instructions()
+                .filter(|(_, op, _)| *op == OpCode::LoadLocal)
+                .map(|(_, _, operands)| operands[0])
+                .collect();
+            assert!(
+                !loaded.contains(&slot),
+                "{source} loads its source slot {slot}:\n{}",
+                code.disassemble()
+            );
+            // Both instructions must agree on which slot holds the sequence,
+            // or the bound is being read off something other than what is
+            // being indexed.
+            assert_eq!(
+                slot_of(OpCode::IterGuard, 1),
+                Some(slot),
+                "{source}:\n{}",
+                code.disassemble()
+            );
+        }
+    }
+
+    /// The loop counter is advanced in place, without operand-stack traffic.
+    ///
+    /// The counter's slot is named by `IterBind`'s second operand, the way the
+    /// source slot is named by its first, so this asks about the slot the loop
+    /// actually indexes with rather than about a position in an emitted
+    /// sequence. What it pins is that the counter is written once -- before
+    /// the loop, with a zero -- and thereafter advanced by an instruction that
+    /// neither pushes nor pops. A second `StoreLocal` of that slot is the
+    /// load/add/store form coming back.
+    ///
+    /// That single write is also what makes the counter an integer for the
+    /// whole loop, which is the precondition `IterGuard` compares on rather
+    /// than going through `compare_values`; so the guard has to be reading the
+    /// same slot, and that is asserted here too.
+    ///
+    /// Stated as a property for the reason
+    /// `the_comprehension_loop_never_loads_its_source_onto_the_stack` is: the
+    /// sequence is what a later change to this loop is entitled to move.
+    #[test]
+    fn the_comprehension_counter_is_advanced_without_operand_stack_traffic() {
+        for source in [
+            "xs.map(x, x * 2)",
+            "xs.filter(x, x > 0)",
+            "xs.all(x, x > 0)",
+            "xs.exists(x, x > 0)",
+        ] {
+            let code = code_of(source);
+            let counter = code
+                .instructions()
+                .find(|(_, op, _)| *op == OpCode::IterBind)
+                .map(|(_, _, operands)| operands[1])
+                .unwrap_or_else(|| panic!("{source} iterates, so it names a counter slot"));
+
+            let stores = code
+                .instructions()
+                .filter(|(_, op, operands)| *op == OpCode::StoreLocal && operands[0] == counter)
+                .count();
+            assert_eq!(
+                stores,
+                1,
+                "{source} writes counter slot {counter} through the operand stack:\n{}",
+                code.disassemble()
+            );
+
+            let advanced = code
+                .instructions()
+                .any(|(_, op, operands)| op == OpCode::IterAdvance && operands[0] == counter);
+            assert!(
+                advanced,
+                "{source} must advance counter slot {counter} in place:\n{}",
+                code.disassemble()
+            );
+
+            let guarded = code
+                .instructions()
+                .any(|(_, op, operands)| op == OpCode::IterGuard && operands[0] == counter);
+            assert!(
+                guarded,
+                "{source} guards on a slot other than counter {counter}:\n{}",
+                code.disassemble()
+            );
+        }
+    }
+
+    /// `all` and `exists` carry their loop condition as ONE instruction, and
+    /// `exists_one` carries none at all.
+    ///
+    /// The three lowerings the macros produce, asserted as an opcode census
+    /// rather than a sequence, for the reason
+    /// `the_comprehension_loop_never_loads_its_source_onto_the_stack` gives.
+    /// `NotStrictlyFalse` is the discriminator: it is emitted by nothing else
+    /// a comprehension contains, so none at all is exactly the claim that the
+    /// condition is fused.
+    #[test]
+    fn the_macro_loop_conditions_are_emitted_fused() {
+        for (source, want) in [
+            ("xs.all(x, x > 0)", Some(OpCode::AccuLoopCond)),
+            ("xs.exists(x, x > 0)", Some(OpCode::AccuLoopCondNot)),
+            // A literal-`true` condition ends the loop on nothing, so there is
+            // nothing to emit and nothing to jump over.
+            ("xs.exists_one(x, x > 0)", None),
+        ] {
+            let code = code_of(source);
+            assert_eq!(
+                count(&code, OpCode::NotStrictlyFalse),
+                0,
+                "{source} still tests its accumulator through the stack:\n{}",
+                code.disassemble()
+            );
+            for fused in [OpCode::AccuLoopCond, OpCode::AccuLoopCondNot] {
+                let expected = usize::from(want == Some(fused));
+                assert_eq!(
+                    count(&code, fused),
+                    expected,
+                    "{source} / {fused:?}:\n{}",
+                    code.disassemble()
+                );
+            }
+        }
+    }
+
+    /// The step's `&&`/`||` is fused too, and its accumulator operand is the
+    /// slot the loop stores back into.
+    ///
+    /// Stated against `StoreLocal`, which is the instruction that closes the
+    /// step, so this asks about the slot the accumulator actually lives in
+    /// rather than about a position in the emitted sequence.
+    #[test]
+    fn the_macro_steps_read_their_accumulator_from_its_slot() {
+        for (source, fused) in [
+            ("xs.all(x, x > 0)", OpCode::AndLocal),
+            ("xs.exists(x, x > 0)", OpCode::OrLocal),
+        ] {
+            let code = code_of(source);
+            let accu = code
+                .instructions()
+                .find(|(_, op, _)| *op == fused)
+                .map(|(_, _, operands)| operands[0])
+                .unwrap_or_else(|| {
+                    panic!("{source} steps through {fused:?}:\n{}", code.disassemble())
+                });
+
+            // The unfused pair began with a `LoadLocal` of that same slot, so
+            // a surviving one is the pair coming back.
+            let loaded: Vec<u32> = code
+                .instructions()
+                .filter(|(_, op, _)| *op == OpCode::LoadLocal)
+                .map(|(_, _, operands)| operands[0])
+                .collect();
+            assert_eq!(
+                loaded.iter().filter(|slot| **slot == accu).count(),
+                1,
+                "{source} reads accumulator slot {accu} through the stack more \
+                 than the one time the result does:\n{}",
+                code.disassemble()
+            );
+        }
+    }
+
+    /// A `&&` whose left operand is not a slot keeps the unfused form.
+    ///
+    /// The fusion is licensed by the left operand being one `LoadLocal`; a
+    /// free variable is a context lookup that can raise, and its handler has
+    /// to cover the instruction that does.
+    #[test]
+    fn a_short_circuit_over_a_free_variable_is_not_fused() {
+        let code = code_of("a && b");
+        assert_eq!(count(&code, OpCode::AndLocal), 0, "{}", code.disassemble());
+        assert_eq!(count(&code, OpCode::And), 1, "{}", code.disassemble());
+    }
+
+    /// The fused operator's handler covers the fused instruction and nothing
+    /// else, at the depth the operand stack had before it.
+    ///
+    /// This is the clause that fails silently. `Vm::unwind` restores the
+    /// operand stack with `truncate(handler.depth)`, and nothing checks that
+    /// the depth an absorbing handler carries is the depth the fused form
+    /// actually leaves. An empty range would be worse still: `handler_for`
+    /// asks `start <= pc && pc < end`, so a handler whose range collapsed
+    /// would absorb nothing and the `&&` would stop being commutative over
+    /// errors.
+    #[test]
+    fn a_fused_short_circuit_handler_covers_the_fused_instruction() {
+        let code = code_of("xs.all(x, x > 0)");
+        let (at, operands) = code
+            .instructions()
+            .find(|(_, op, _)| *op == OpCode::AndLocal)
+            .map(|(pc, _, operands)| (pc, operands.to_vec()))
+            .expect("`all` steps through AndLocal");
+
+        let handler = code.handler_for(at).copied().unwrap_or_else(|| {
+            panic!(
+                "the fused operator must be covered:\n{}",
+                code.disassemble()
+            )
+        });
+        assert_eq!(handler.start, at, "{}", code.disassemble());
+        assert_eq!(handler.end, at + 1, "the range is one instruction wide");
+        assert_eq!(handler.land, at + 1, "the right operand is next");
+        assert_eq!(
+            handler.logic, operands[1],
+            "the operator writes the slot it covers"
+        );
+        // The accumulator lives in a slot and the loop's own scaffolding is
+        // stack-neutral, so the step starts on an empty operand stack.
+        assert_eq!(handler.depth, 0, "{}", code.disassemble());
+        // The short-circuit target is past the merge, so both paths arrive at
+        // the same depth -- the same property `a_short_circuit_handler_covers_\
+        // the_left_operand_only` states for the unfused form.
+        let merge = code
+            .instructions()
+            .find(|(pc, op, _)| *op == OpCode::AndMerge && *pc > at)
+            .map(|(pc, _, _)| pc)
+            .expect("`&&` merges");
+        assert_eq!(operands[2], merge + 1, "{}", code.disassemble());
+    }
+
+    /// The handler covers the left operand and stops short of the right one,
+    /// which is the whole of CEL's asymmetry: an error on the left is absorbed
+    /// and an error on the right is raised.
+    #[test]
+    fn a_short_circuit_handler_covers_the_left_operand_only() {
+        let code = code_of("a && b");
+        assert_eq!(code.handlers.len(), 1, "{}", code.disassemble());
+        let handler = code.handlers[0];
+
+        let and = code
+            .instructions()
+            .find(|(_, op, _)| *op == OpCode::And)
+            .map(|(pc, _, operands)| (pc, operands.to_vec()))
+            .expect("`&&` emits an And");
+        let merge = code
+            .instructions()
+            .find(|(_, op, _)| *op == OpCode::AndMerge)
+            .map(|(pc, _, _)| pc)
+            .expect("`&&` emits an AndMerge");
+
+        assert_eq!(handler.start, 0, "the left operand starts the program");
+        assert_eq!(handler.end, and.0, "the handler ends where the left does");
+        assert_eq!(handler.land, and.0 + 1, "the right operand is next");
+        assert_eq!(handler.depth, 0);
+        assert_eq!(handler.logic, and.1[0], "the And writes the slot it covers");
+
+        assert!(code.handler_for(0).is_some(), "the left operand is covered");
+        assert!(
+            code.handler_for(handler.land).is_none(),
+            "the right operand is not: its errors propagate"
+        );
+        assert!(code.handler_for(merge).is_none());
+        // The short-circuit target is past the merge, so both paths arrive at
+        // the same depth.
+        assert_eq!(and.1[1], merge + 1);
+    }
+
+    /// Nested operators need distinct slots, because the outer one writes its
+    /// slot before the inner one has finished with its own.
+    #[test]
+    fn nested_short_circuits_do_not_share_a_logic_slot() {
+        let code = code_of("(a && b) && c");
+        assert_eq!(code.n_logic, 2, "{}", code.disassemble());
+
+        let slots: Vec<u32> = code
+            .instructions()
+            .filter(|(_, op, _)| *op == OpCode::And)
+            .map(|(_, _, operands)| operands[0])
+            .collect();
+        assert_eq!(slots.len(), 2);
+        assert_ne!(slots[0], slots[1], "{}", code.disassemble());
+
+        // The inner operator's own left operand is covered by the inner
+        // handler, which is the shorter of the two covering it.
+        let inner = code.handler_for(0).expect("instruction 0 is covered");
+        assert_eq!(inner.end - inner.start, 1, "{}", code.disassemble());
+    }
+
+    /// Two operators that cannot be live at once share a slot, for the same
+    /// reason sibling comprehensions share activation-record slots.
+    #[test]
+    fn sibling_short_circuits_share_a_logic_slot() {
+        assert_eq!(code_of("a && b").n_logic, 1);
+        assert_eq!(code_of("(a && b) || (c && d)").n_logic, 2);
+    }
+
+    /// An error raised by the inner operator's *merge* is still the outer
+    /// operator's left operand, so it has to be absorbed by the outer one.
+    /// This is the `(1 && true) && false` shape.
+    #[test]
+    fn an_inner_merge_is_inside_the_outer_handler() {
+        let code = code_of("(a && b) && c");
+        let inner_merge = code
+            .instructions()
+            .find(|(_, op, _)| *op == OpCode::AndMerge)
+            .map(|(pc, _, _)| pc)
+            .expect("the inner `&&` merges first");
+        let handler = code
+            .handler_for(inner_merge)
+            .expect("the inner merge is covered");
+        assert_eq!(handler.start, 0, "{}", code.disassemble());
+    }
+
+    fn count(code: &CelCode, op: OpCode) -> usize {
+        opcodes(code).iter().filter(|o| **o == op).count()
+    }
+
+    /// Whether `op` puts a value into a list: `ListAppend`, or one of the
+    /// producers that appends its own answer.
+    ///
+    /// Derived from [`appending_producer`] rather than listed, so an appending
+    /// form added to that table is counted here without anyone remembering to
+    /// say so -- and a census that silently stopped seeing one would let a
+    /// program that appends the wrong number of times pass.
+    fn is_append(op: OpCode) -> bool {
+        op == OpCode::ListAppend
+            || (0..OPCODE_COUNT)
+                .filter_map(OpCode::from_word)
+                .any(|producer| appending_producer(producer) == Some(op))
+    }
+
+    /// How many times a program appends to a list, in whatever form.
+    fn appends(code: &CelCode) -> usize {
+        opcodes(code).iter().filter(|op| is_append(**op)).count()
+    }
+
+    /// `map` and `filter` push into the accumulator instead of rebuilding it.
+    ///
+    /// The property is stated as an opcode census rather than a timing, because
+    /// the cost being removed is a *copy* and the shape is what decides whether
+    /// it happens. `Add` is the discriminator: the general lowering emits one
+    /// for the step's `@result + [x]`, and the loop counter advances through
+    /// `IncLocal` rather than through an addition, so no `Add` at all is
+    /// exactly the claim that the concatenation is gone. The bodies here are
+    /// chosen not to contain a `+` of their own, which is what keeps the
+    /// census a statement about the accumulator.
+    #[test]
+    fn map_and_filter_append_rather_than_concatenate() {
+        // The element decides which append the loop carries, so each source
+        // names the one it must reach: the count alone would be satisfied by
+        // the unfused pair, which appends exactly once too.
+        for (source, appender) in [
+            ("xs.map(x, x * 2)", OpCode::MulLocalConstAppend),
+            ("xs.filter(x, x > 1)", OpCode::LoadLocalAppend),
+            ("xs.map(x, x > 1, x * 10)", OpCode::MulLocalConstAppend),
+        ] {
+            let code = code_of(source);
+            assert_eq!(
+                count(&code, OpCode::Add),
+                0,
+                "{source} still concatenates:\n{}",
+                code.disassemble()
+            );
+            assert_eq!(
+                count(&code, appender),
+                1,
+                "{source} should append through {appender:?}:\n{}",
+                code.disassemble()
+            );
+            assert_eq!(
+                appends(&code),
+                1,
+                "{source} should append exactly once per iteration:\n{}",
+                code.disassemble()
+            );
+            // The producer's pushing form is gone with the round trip it fed.
+            assert_eq!(
+                count(&code, OpCode::ListAppend),
+                0,
+                "{source} still routes its element through the operand stack:\n{}",
+                code.disassemble()
+            );
+            // The accumulator lives on the operand stack, so nothing reads it
+            // back per iteration; the one store is the finish after the loop.
+            assert_eq!(
+                count(&code, OpCode::NewListFromArg),
+                1,
+                "{source} should build one accumulator, sized by its range:\n{}",
+                code.disassemble()
+            );
+            assert_eq!(
+                count(&code, OpCode::NewList),
+                0,
+                "{source} should not open an unsized accumulator:\n{}",
+                code.disassemble()
+            );
+        }
+    }
+
+    /// [`appending_producer`] holds exactly the producers that name a slot.
+    ///
+    /// The criterion is stated here as a predicate over the instruction set
+    /// rather than as a second copy of the table, so it is the TABLE that has
+    /// to satisfy it. Two things make it checkable: a producer that names a
+    /// slot is spelled `*Local*` -- that is what the suffix means throughout
+    /// [`OpCode`] -- and a producer that pushes a finished value declares
+    /// `(0, 1)`. Everything `Local` that is not `(0, 1)` writes a slot, reads
+    /// one without pushing, or branches, and none of those has an answer to
+    /// append.
+    ///
+    /// So an opcode added to the `Local` family without an appending twin
+    /// fails here, and so does a twin whose width or stack effect drifts from
+    /// its producer's.
+    #[test]
+    fn the_appending_forms_are_exactly_the_slot_naming_producers() {
+        let mut twins = 0;
+        for word in 0..OPCODE_COUNT {
+            let op = OpCode::from_word(word).expect("word below the count decodes");
+            let names_a_slot = format!("{op:?}").contains("Local");
+            let pushes_a_value = op.stack_effect(&[0, 0, 0]) == (0, 1);
+            let Some(twin) = appending_producer(op) else {
+                assert!(
+                    !(names_a_slot && pushes_a_value),
+                    "{op:?} names a slot and pushes a value, so an element \
+                     that is one has no reason to reach the operand stack. \
+                     Give it an appending twin, or say here why it is not one."
+                );
+                continue;
+            };
+            twins += 1;
+            assert!(
+                names_a_slot && pushes_a_value,
+                "{op:?} has an appending twin but is not a slot-naming \
+                 producer: it declares {:?}",
+                op.stack_effect(&[0, 0, 0])
+            );
+            assert_eq!(
+                twin.operands(),
+                op.operands(),
+                "{twin:?} must carry exactly {op:?}'s operands: `ListAppend` \
+                 names nothing of its own"
+            );
+            assert_eq!(
+                twin.stack_effect(&[0, 0, 0]),
+                (0, 0),
+                "{twin:?} is {op:?}'s `(0, 1)` composed with `ListAppend`'s \
+                 `(1, 0)`, so it must touch the operand stack not at all"
+            );
+        }
+        // A table that had emptied would satisfy every assertion above by
+        // reaching none of them.
+        assert_eq!(
+            twins, 11,
+            "the appending forms are `LoadLocal`, the two field reads over a \
+             slot, and the eight operators over a slot and a literal"
+        );
+    }
+
+    /// A list literal appends through the same fused forms a comprehension
+    /// does, and an optional element does not.
+    ///
+    /// The elements are inside a comprehension because a slot is what a
+    /// comprehension variable IS -- there is nothing else for a producer to
+    /// name -- but the appends being fused here are the literal's, emitted by
+    /// `Compiler::list` and not by the appending-comprehension lowering.
+    ///
+    /// The optional row is the discriminator: the SAME element `x` fuses at
+    /// one index and keeps the pair at the other, because at the optional
+    /// index the append is the instruction that decides whether the element
+    /// contributes at all, which is only knowable once the value exists.
+    #[test]
+    fn a_list_literal_fuses_its_elements_but_never_an_optional_one() {
+        let code = code_of("xs.map(x, [x, x * 2, 3])");
+        for (want, times) in [
+            (OpCode::LoadLocalAppend, 1),
+            (OpCode::MulLocalConstAppend, 1),
+            // The literal element and the outer element, neither of which
+            // names a slot.
+            (OpCode::ListAppend, 2),
+        ] {
+            assert_eq!(
+                count(&code, want),
+                times,
+                "{want:?}:\n{}",
+                code.disassemble()
+            );
+        }
+
+        // `?` is off by default, so the optional half of this case has to ask
+        // for it; a parse failure here would otherwise read as the shape being
+        // absent from the lowering.
+        let expr = Parser::default()
+            .enable_optional_syntax(true)
+            .parse("xs.map(x, [?x, x])")
+            .expect("optional list elements parse when the syntax is enabled");
+        let code = compile(&expr).expect("compiles");
+        let var = code
+            .instructions()
+            .find(|(_, op, _)| *op == OpCode::IterBind)
+            .map(|(_, _, operands)| operands[2])
+            .expect("the comprehension binds an iteration variable");
+
+        let optional = code
+            .instructions()
+            .find(|(_, op, _)| *op == OpCode::ListAppendOptional)
+            .map(|(pc, _, _)| pc)
+            .unwrap_or_else(|| {
+                panic!(
+                    "the optional element keeps its own append:\n{}",
+                    code.disassemble()
+                )
+            });
+        // The instruction it appends is the one immediately above it, and for
+        // this element that is the slot load the fusion would have absorbed.
+        assert_eq!(
+            (
+                code.insns[optional as usize - 1].op,
+                code.insns[optional as usize - 1].ops[0]
+            ),
+            (OpCode::LoadLocal, var),
+            "the optional element's value still reaches the stack:\n{}",
+            code.disassemble()
+        );
+        // The same element at the plain index absorbs its load instead.
+        assert_eq!(
+            count(&code, OpCode::LoadLocalAppend),
+            1,
+            "the plain element beside it still fuses:\n{}",
+            code.disassemble()
+        );
+    }
+
+    /// The macros that are NOT this shape keep the general lowering, so the
+    /// recogniser cannot be quietly widened into something that breaks them.
+    ///
+    /// `all` and `exists` break early on the accumulator, and `exists_one`
+    /// counts into an int; none of the three may reach the append path.
+    #[test]
+    fn breaking_and_counting_macros_keep_the_general_lowering() {
+        for source in [
+            "xs.all(x, x > 0)",
+            "xs.exists(x, x > 0)",
+            "xs.exists_one(x, x > 0)",
+        ] {
+            let code = code_of(source);
+            assert_eq!(
+                appends(&code),
+                0,
+                "{source} is not an appending comprehension:\n{}",
+                code.disassemble()
+            );
+        }
+    }
+
+    /// The accumulator's name is not in scope inside the loop.
+    ///
+    /// That is the precondition the whole shape rests on -- the accumulator is
+    /// a builder on the operand stack, so a per-iteration read could not see
+    /// it. `@result` is not parseable, so the only way to state this is to
+    /// build the tree; the check is that the name compiles to a context lookup
+    /// (`LoadVar`) and not to a slot, which is the walker's behaviour too.
+    #[test]
+    fn the_accumulator_is_not_readable_from_the_loop_body() {
+        let Expr::Comprehension(base) = code_source("xs.map(x, x)") else {
+            panic!("the macro expands to a comprehension");
+        };
+        let mut comp = *base;
+        let accu = comp.accu_var.clone();
+
+        // `@result + [@result]`: the element reads the accumulator.
+        let Expr::Call(step) = &mut comp.loop_step.expr else {
+            panic!("`map` steps through `+`");
+        };
+        let Expr::List(appended) = &mut step.args[1].expr else {
+            panic!("`map` appends a one element literal");
+        };
+        appended.elements[0] = IdedExpr {
+            id: 99,
+            expr: Expr::Ident(accu.clone()),
+        };
+
+        let code = compile(&IdedExpr {
+            id: 0,
+            expr: Expr::Comprehension(Box::new(comp)),
+        })
+        .expect("compiles");
+
+        let looked_up: Vec<&str> = code
+            .instructions()
+            .filter(|(_, op, _)| *op == OpCode::LoadVar)
+            .map(|(_, _, operands)| code.name(NameId(operands[0])).unwrap())
+            .collect();
+        assert!(
+            looked_up.contains(&accu.as_str()),
+            "the accumulator must resolve as a free variable inside the loop, \
+             not as the slot it only occupies after it: {looked_up:?}\n{}",
+            code.disassemble()
+        );
+    }
+
+    fn parse_expr(source: &str) -> IdedExpr {
+        Parser::default().parse(source).expect("parses")
+    }
+
+    fn code_source(source: &str) -> Expr {
+        parse_expr(source).expr
+    }
+}

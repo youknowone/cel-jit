@@ -1,5 +1,10 @@
 [workspace]
-members = ["cel", "example", "fuzz"]
+members = ["cel", "census", "example", "fuzz"]
+# `census` is a member but not a default one: it pulls `majit-translate`,
+# which none of the other three need, and a bare `cargo build`/`cargo test`
+# at the root would then compile the whole translator. Run it with
+# `-p cel-census`.
+default-members = ["cel", "example", "fuzz"]
 resolver = "2"
 
 [profile.dev]

@@ -1,7 +1,6 @@
 use crate::common::traits::TraitSet;
-use crate::common::value::Val;
+use crate::objects::Value;
 use crate::ExecutionError;
-use std::borrow::Cow;
 
 #[allow(dead_code)]
 pub struct Overload {
@@ -10,4 +9,4 @@ pub struct Overload {
     op: Function,
 }
 
-pub type Function = for<'a> fn(Vec<Cow<'a, dyn Val>>) -> Result<Cow<'a, dyn Val>, ExecutionError>;
+pub type Function = fn(Vec<Value>) -> Result<Value, ExecutionError>;

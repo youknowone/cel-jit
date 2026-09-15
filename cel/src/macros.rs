@@ -5,8 +5,9 @@ macro_rules! impl_conversions {
         $(
             impl FromValue for $target_type {
                 fn from_value(expr: &Value) -> Result<Self, ExecutionError> {
-                    if let $value_variant(v) = expr {
-                        Ok(v.clone())
+                    let unpacked = expr.unpack();
+                    if let $value_variant(v) = unpacked {
+                        Ok(v)
                     } else {
                         Err(ExecutionError::UnexpectedType {
                             got: format!("{:?}", expr),
@@ -18,9 +19,10 @@ macro_rules! impl_conversions {
 
             impl FromValue for Option<$target_type> {
                 fn from_value(expr: &Value) -> Result<Self, ExecutionError> {
-                    match expr {
+                    let unpacked = expr.unpack();
+                    match unpacked {
                         Value::Null => Ok(None),
-                        $value_variant(v) => Ok(Some(v.clone())),
+                        $value_variant(v) => Ok(Some(v)),
                         _ => Err(ExecutionError::UnexpectedType {
                             got: format!("{:?}", expr),
                             want: stringify!($target_type).to_string(),
@@ -65,33 +67,43 @@ macro_rules! impl_handler {
         pastey::paste! {
             impl<F, $($t,)* R> IntoFunction<($($t,)*)> for F
             where
-                F: Fn($($t,)*) -> R + Send + Sync + 'static,
-                $($t: for<'a, 'context, 'call> $crate::FromContext<'a, 'context, 'call>,)*
-                R: IntoResolveResult,
+                F: Fn($($t,)*) -> R + 'static,
+                $($t: for<'a, 'context, 'call> $crate::FromContext<'a, 'context, 'call> + 'static,)*
+                R: IntoResolveResult + 'static,
             {
                 fn into_function(self) -> Function {
-                    Box::new(move |_ftx| {
-                        $(
-                            let [<arg_ $t:lower>] = $t::from_context(_ftx)?;
-                        )*
-                        self($([<arg_ $t:lower>],)*).into_resolve_result()
-                    })
+                    let f = ::std::sync::Arc::new(self);
+                    let erased: $crate::magic::ErasedFunction = Box::new({
+                        let f = f.clone();
+                        move |_ftx| {
+                            $(
+                                let [<arg_ $t:lower>] = $t::from_context(_ftx)?;
+                            )*
+                            f($([<arg_ $t:lower>],)*).into_resolve_result()
+                        }
+                    });
+                    // The same closure in its own signature, offered for the
+                    // scalar form; `Function::with_typed` keeps it only if the
+                    // signature is one the batch machine calls directly.
+                    let typed: Box<dyn Fn($($t,)*) -> R> =
+                        Box::new(move |$([<arg_ $t:lower>],)*| f($([<arg_ $t:lower>],)*));
+                    Function::with_typed(erased, Box::new(typed))
                 }
             }
 
             impl<F, $($t,)* R> IntoFunction<(WithFunctionContext, $($t,)*)> for F
             where
-                F: Fn(&FunctionContext, $($t,)*) -> R + Send + Sync + 'static,
+                F: Fn(&FunctionContext, $($t,)*) -> R + 'static,
                 $($t: for<'a, 'context, 'call> $crate::FromContext<'a, 'context, 'call>,)*
                 R: IntoResolveResult,
             {
                 fn into_function(self) -> Function {
-                    Box::new(move |_ftx| {
+                    Function::erased(Box::new(move |_ftx| {
                         $(
                             let [<arg_ $t:lower>] = $t::from_context(_ftx)?;
                         )*
                         self(_ftx, $([<arg_ $t:lower>],)*).into_resolve_result()
-                    })
+                    }))
                 }
             }
         }

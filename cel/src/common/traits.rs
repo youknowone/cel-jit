@@ -1,11 +1,3 @@
-use crate::common::types::CelInt;
-use crate::common::value::Val;
-use crate::ExecutionError;
-use std::any::Any;
-use std::borrow::Cow;
-use std::cmp::Ordering;
-use std::fmt::Debug;
-
 pub type TraitSet = u16;
 
 /// ADDER_TYPE types provide a '+' operator overload.
@@ -56,77 +48,29 @@ pub const SUBTRACTOR_TYPE: TraitSet = SIZER_TYPE << 1;
 /// FOLDABLE_TYPE types support comprehensions v2 macros which iterate over (key, value) pairs.
 pub const FOLDABLE_TYPE: TraitSet = SUBTRACTOR_TYPE << 1;
 
-pub trait Adder {
-    fn add<'a>(&'a self, _rhs: &dyn Val) -> Result<Cow<'a, dyn Val>, ExecutionError>;
-}
-
-pub trait Comparer {
-    fn compare(&self, _rhs: &dyn Val) -> Result<Ordering, ExecutionError>;
-}
-
-pub trait Container {
-    fn contains(&self, _value: &dyn Val) -> Result<bool, ExecutionError>;
-}
-
-pub trait Divider {
-    fn div<'a>(&self, _rhs: &'a dyn Val) -> Result<Cow<'a, dyn Val>, ExecutionError>;
-}
-
-pub trait Iterable {
-    fn iter<'a>(&'a self) -> Box<dyn Iterator<'a> + 'a>;
-}
-
-pub trait Iterator<'a> {
-    fn next(&mut self) -> Option<&'a dyn Val>;
-}
-
-pub trait Modder {
-    fn modulo<'a>(&self, _rhs: &'a dyn Val) -> Result<Cow<'a, dyn Val>, ExecutionError>;
-}
-
-pub trait Multiplier {
-    fn mul<'a>(&self, _rhs: &'a dyn Val) -> Result<Cow<'a, dyn Val>, ExecutionError>;
-}
-
-pub trait Negator {
-    fn negate(&self) -> Result<Box<dyn Val>, ExecutionError>;
-}
-
-pub trait Sizer {
-    fn size(&self) -> CelInt;
-}
-
-pub trait Subtractor {
-    fn sub<'a>(&'a self, _rhs: &'_ dyn Val) -> Result<Cow<'a, dyn Val>, ExecutionError>;
-}
-
-pub trait Zeroer {
-    fn is_zero_value(&self) -> bool;
-}
-
-pub trait Indexer {
-    fn get<'a>(&'a self, _idx: &dyn Val) -> Result<Cow<'a, dyn Val>, ExecutionError>;
-
-    fn steal(self: Box<Self>, _idx: &dyn Val) -> Result<Box<dyn Val>, ExecutionError>;
-}
-
-pub trait Lister: Debug + Any {
-    fn as_indexer(&self) -> &dyn Indexer;
-}
-
+/// Backs every `size` overload: `size(x)` and `x.size()` for the four families
+/// whose type carries [`SIZER_TYPE`].
 pub(crate) mod adapter {
-    use std::borrow::Cow;
+    use crate::common::types::type_name;
+    use crate::objects::Value;
+    use crate::ExecutionError;
 
-    use crate::{common::value::Val, ExecutionError};
-
-    pub fn sizer_size<'a>(args: Vec<Cow<'a, dyn Val>>) -> Result<Cow<'a, dyn Val>, ExecutionError> {
-        let target = &args[0];
-        match target.as_sizer() {
-            None => Err(ExecutionError::UnexpectedType {
-                got: target.get_type().name().to_owned(),
-                want: "missing trait Sizer".to_owned(),
-            }),
-            Some(sizer) => Ok(Cow::<dyn Val>::Owned(Box::new(sizer.size()))),
-        }
+    pub fn sizer_size(args: Vec<Value>) -> Result<Value, ExecutionError> {
+        let unpacked = args[0].unpack();
+        let size = match &unpacked {
+            // Byte length, not the character count the spec asks for. Preserved
+            // from the trait implementation this replaces.
+            Value::String(s) => s.len(),
+            Value::Bytes(b) => b.len(),
+            Value::List(l) => l.len(),
+            Value::Map(m) => m.len(),
+            other => {
+                return Err(ExecutionError::UnexpectedType {
+                    got: type_name(other),
+                    want: "missing trait Sizer".to_owned(),
+                })
+            }
+        };
+        Ok(Value::Int(size as i64))
     }
 }
