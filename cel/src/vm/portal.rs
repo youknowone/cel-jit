@@ -25,6 +25,7 @@ use crate::runtime::error::ERROR_SENTINEL;
 use crate::runtime::object::{
     bytes_len, list_len, list_try_append, map_len, new_bool, new_int, new_list_with_capacity,
     string_as_str, string_byte_len, w_kind, CelKind, CelRef, W_BoolObject, W_IntObject,
+    W_OptionalObject,
 };
 #[allow(unused_imports)] // named in `virtualizable_fields`
 use crate::runtime::object::{
@@ -33,6 +34,10 @@ use crate::runtime::object::{
 };
 #[allow(unused_imports)]
 use crate::runtime::object_array::{CEL_ITEMS_BLOCK_ITEMS_OFFSET, CEL_ITEMS_BLOCK_LEN_OFFSET};
+use crate::runtime::optional::{
+    cel_optional_has_value, cel_optional_none, cel_optional_of, cel_optional_of_non_zero_value,
+    cel_optional_or, cel_optional_or_value, cel_optional_value,
+};
 use crate::{ExecutionError, Value};
 
 /// `dispatch_one` finished the program.
@@ -95,6 +100,23 @@ const OP_IN: i64 = OpCode::In as i64;
 const OP_LOAD_LOCAL_APPEND: i64 = OpCode::LoadLocalAppend as i64;
 const OP_CALL_HOST: i64 = OpCode::CallHost as i64;
 const OP_CALL_METHOD: i64 = OpCode::CallMethod as i64;
+const OP_CALL_QUALIFIED: i64 = OpCode::CallQualified as i64;
+const OP_OPT_INDEX: i64 = OpCode::OptIndex as i64;
+const OP_OPT_SELECT: i64 = OpCode::OptSelect as i64;
+const OP_ITER_KEYS: i64 = OpCode::IterKeys as i64;
+const OP_JUMP_IF_OPT_NONE: i64 = OpCode::JumpIfOptNone as i64;
+const OP_LIST_APPEND_OPTIONAL: i64 = OpCode::ListAppendOptional as i64;
+const OP_NOT_STRICTLY_FALSE: i64 = OpCode::NotStrictlyFalse as i64;
+const OP_ACCU_LOOP_COND: i64 = OpCode::AccuLoopCond as i64;
+const OP_ACCU_LOOP_COND_NOT: i64 = OpCode::AccuLoopCondNot as i64;
+const OP_ADD_LOCAL_K_APPEND: i64 = OpCode::AddLocalConstAppend as i64;
+const OP_MUL_LOCAL_K_APPEND: i64 = OpCode::MulLocalConstAppend as i64;
+const OP_MOD_LOCAL_K_APPEND: i64 = OpCode::ModLocalConstAppend as i64;
+const OP_EQ_LOCAL_K_APPEND: i64 = OpCode::EqualsLocalConstAppend as i64;
+const OP_NE_LOCAL_K_APPEND: i64 = OpCode::NotEqualsLocalConstAppend as i64;
+const OP_LT_LOCAL_K_APPEND: i64 = OpCode::LessLocalConstAppend as i64;
+const OP_GT_LOCAL_K_APPEND: i64 = OpCode::GreaterLocalConstAppend as i64;
+const OP_GE_LOCAL_K_APPEND: i64 = OpCode::GreaterEqualsLocalConstAppend as i64;
 
 macro_rules! interned_binop {
     ($frame:ident, $vm:ident, $here:ident, $op:expr) => {{
@@ -153,6 +175,25 @@ macro_rules! interned_local_k {
                 $frame.locals_stack_w[depth] = r;
                 $frame.valuestackdepth = depth + 1;
                 vm_sync_push($vm, r as i64);
+                $here + 1
+            }
+        }
+    }};
+}
+
+macro_rules! interned_local_k_append {
+    ($frame:ident, $vm:ident, $program:ident, $pc:ident, $here:ident, $op:expr) => {{
+        let a = $frame.locals_stack_w[insn_a($program, $pc)];
+        let k = intern_const($program, insn_b($program, $pc));
+        let depth = $frame.valuestackdepth;
+        let list = $frame.locals_stack_w[depth - 1];
+        if a.is_null() || k == 0 || list.is_null() {
+            residual_dispatch($vm, $here)
+        } else {
+            let r = unsafe { $op(a, k as usize as CelRef) };
+            if r == ERROR_SENTINEL || try_append(list as i64, r as i64) == 0 {
+                residual_dispatch($vm, $here)
+            } else {
                 $here + 1
             }
         }
@@ -333,6 +374,19 @@ fn interned_contains(container: i64, needle: i64) -> i64 {
                 1
             }
         }
+        CelKind::Str => match unsafe { string_as_str(c) } {
+            Some(hay) => match unsafe { string_as_str(n) } {
+                Some(needle) => {
+                    if hay.contains(needle) {
+                        2
+                    } else {
+                        1
+                    }
+                }
+                None => 1,
+            },
+            None => 0,
+        },
         _ => 0,
     }
 }
@@ -359,6 +413,186 @@ fn interned_is_size(program: &CelCode, idx: i64) -> i64 {
     i64::from(program.name(NameId(idx as u32)) == Some("size"))
 }
 
+/// Unary optional method. 0 residual, else the result (may be `ERROR_SENTINEL`).
+#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+fn interned_optional_unary(program: &CelCode, name_idx: i64, w: i64) -> i64 {
+    let w = w as usize as CelRef;
+    if w.is_null() {
+        return 0;
+    }
+    match program.name(NameId(name_idx as u32)) {
+        Some("value") => unsafe { cel_optional_value(w) as i64 },
+        Some("hasValue") => unsafe { cel_optional_has_value(w) as i64 },
+        _ => 0,
+    }
+}
+
+/// Method with one argument. 0 residual.
+#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+fn interned_method1(program: &CelCode, name_idx: i64, recv: i64, arg: i64) -> i64 {
+    let Some(name) = program.name(NameId(name_idx as u32)) else {
+        return 0;
+    };
+    let r = recv as usize as CelRef;
+    let a = arg as usize as CelRef;
+    if r.is_null() || a.is_null() {
+        return 0;
+    }
+    match name {
+        "contains" => {
+            let found = interned_contains(recv, arg);
+            if found == 0 {
+                0
+            } else {
+                new_bool(found == 2) as i64
+            }
+        }
+        "startsWith" => match (unsafe { string_as_str(r) }, unsafe { string_as_str(a) }) {
+            (Some(rs), Some(ns)) => new_bool(rs.starts_with(ns)) as i64,
+            _ => 0,
+        },
+        "endsWith" => match (unsafe { string_as_str(r) }, unsafe { string_as_str(a) }) {
+            (Some(rs), Some(ns)) => new_bool(rs.ends_with(ns)) as i64,
+            _ => 0,
+        },
+        #[cfg(feature = "regex")]
+        "matches" => match (unsafe { string_as_str(r) }, unsafe { string_as_str(a) }) {
+            (Some(rs), Some(ns)) => match crate::runtime::regex_intern::intern_regex(ns) {
+                Ok(re) => new_bool(re.is_match(rs)) as i64,
+                Err(_) => 0,
+            },
+            _ => 0,
+        },
+        "or" => unsafe { cel_optional_or(r, a) as i64 },
+        "orValue" => unsafe { cel_optional_or_value(r, a) as i64 },
+        _ => 0,
+    }
+}
+
+/// `0` unknown, `1` optional.none, `2` optional.of, `3` optional.ofNonZeroValue.
+#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+fn interned_qualified_kind(program: &CelCode, name_idx: i64) -> i64 {
+    match program.name(NameId(name_idx as u32)) {
+        Some("optional.none") => 1,
+        Some("optional.of") => 2,
+        Some("optional.ofNonZeroValue") => 3,
+        _ => 0,
+    }
+}
+
+/// `0` not optional, `1` some, `2` none.
+#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+fn interned_optional_state(w: i64) -> i64 {
+    let w = w as usize as CelRef;
+    if w.is_null() || unsafe { w_kind(w) } != CelKind::Optional {
+        return 0;
+    }
+    if unsafe { (*w.cast::<W_OptionalObject>()).w_value }.is_null() {
+        2
+    } else {
+        1
+    }
+}
+
+#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+fn interned_optional_inner(w: i64) -> i64 {
+    let w = w as usize as CelRef;
+    if w.is_null() || unsafe { w_kind(w) } != CelKind::Optional {
+        return 0;
+    }
+    let inner = unsafe { (*w.cast::<W_OptionalObject>()).w_value };
+    if inner.is_null() {
+        0
+    } else {
+        inner as i64
+    }
+}
+
+/// `0` residual, `1` false, `2` true, `3` non-bool.
+#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+fn interned_as_bool(w: i64) -> i64 {
+    let w = w as usize as CelRef;
+    if w.is_null() {
+        return 0;
+    }
+    if unsafe { w_kind(w) } != CelKind::Bool {
+        return 3;
+    }
+    if unsafe { (*w.cast::<W_BoolObject>()).boolval } != 0 {
+        2
+    } else {
+        1
+    }
+}
+
+/// Optional index. `0` residual, else an optional leaf.
+#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+fn interned_opt_index(container: i64, key: i64) -> i64 {
+    let mut w = container as usize as CelRef;
+    let k = key as usize as CelRef;
+    if w.is_null() || k.is_null() {
+        return 0;
+    }
+    if unsafe { w_kind(w) } == CelKind::Optional {
+        let inner = unsafe { (*w.cast::<W_OptionalObject>()).w_value };
+        if inner.is_null() {
+            return cel_optional_none() as i64;
+        }
+        w = inner;
+    }
+    let found = match unsafe { w_kind(w) } {
+        CelKind::List => {
+            if unsafe { w_kind(k) } != CelKind::Int {
+                return 0;
+            }
+            let index = unsafe { (*k.cast::<W_IntObject>()).intval };
+            unsafe { interned_list_get(w, index) }
+        }
+        CelKind::Map => match unsafe { string_as_str(k) } {
+            Some(field) => unsafe { interned_map_lookup_string(w, field) },
+            None => unsafe { map_lookup(w, k) },
+        },
+        #[cfg(feature = "structs")]
+        CelKind::Struct => match unsafe { string_as_str(k) } {
+            Some(field) => unsafe { crate::runtime::object::struct_lookup_field(w, field) },
+            None => None,
+        },
+        _ => return 0,
+    };
+    match found {
+        Some(item) => unsafe { cel_optional_of(item) as i64 },
+        None => cel_optional_none() as i64,
+    }
+}
+
+/// Optional field. `0` residual, else an optional leaf.
+#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+fn interned_opt_select(w: i64, program: &CelCode, name_idx: i64) -> i64 {
+    let mut w = w as usize as CelRef;
+    if w.is_null() {
+        return 0;
+    }
+    if unsafe { w_kind(w) } == CelKind::Optional {
+        let inner = unsafe { (*w.cast::<W_OptionalObject>()).w_value };
+        if inner.is_null() {
+            return cel_optional_none() as i64;
+        }
+        w = inner;
+    }
+    match unsafe { w_kind(w) } {
+        CelKind::Map => {}
+        #[cfg(feature = "structs")]
+        CelKind::Struct => {}
+        _ => return 0,
+    }
+    let found = interned_field(w as i64, program, name_idx);
+    if found == 0 {
+        cel_optional_none() as i64
+    } else {
+        unsafe { cel_optional_of(found as usize as CelRef) as i64 }
+    }
+}
+
 fn vm_of<'a>(vm_bits: i64) -> &'a mut Vm<'a> {
     unsafe { &mut *(vm_bits as usize as *mut Vm<'a>) }
 }
@@ -373,6 +607,43 @@ fn intern_var(vm_bits: i64, program: &CelCode, idx: i64) -> i64 {
         .intern_context_var(name)
         .map(|w| w as usize as i64)
         .unwrap_or(0)
+}
+
+#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+fn interned_unary(vm_bits: i64, program: &CelCode, name_idx: i64, w: i64) -> i64 {
+    let Some(name) = program.name(NameId(name_idx as u32)) else {
+        return 0;
+    };
+    vm_of(vm_bits).interned_unary_bits(name, w as usize as CelRef)
+}
+
+#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+fn interned_temporal(vm_bits: i64, program: &CelCode, name_idx: i64, w: i64) -> i64 {
+    let Some(name) = program.name(NameId(name_idx as u32)) else {
+        return 0;
+    };
+    match vm_of(vm_bits).interned_temporal_int(name, w as usize as CelRef) {
+        Some(n) => new_int(n) as i64,
+        None => 0,
+    }
+}
+
+#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+fn interned_map_keys(vm_bits: i64, w: i64) -> i64 {
+    let w = w as usize as CelRef;
+    if w.is_null() || unsafe { w_kind(w) } != CelKind::Map {
+        return 0;
+    }
+    vm_of(vm_bits).interned_map_key_list(w) as i64
+}
+
+#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+fn interned_list_indices(vm_bits: i64, w: i64) -> i64 {
+    let w = w as usize as CelRef;
+    if w.is_null() || unsafe { w_kind(w) } != CelKind::List {
+        return 0;
+    }
+    vm_of(vm_bits).interned_list_index_list(w) as i64
 }
 
 #[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
@@ -507,6 +778,18 @@ pub(crate) fn eval_through_portal(
         interned_contains => residual_int,
         interned_len => residual_int,
         interned_is_size => residual_int,
+        interned_unary => residual_int,
+        interned_temporal => residual_int,
+        interned_optional_unary => residual_int,
+        interned_method1 => residual_int,
+        interned_qualified_kind => residual_int,
+        interned_optional_state => residual_int,
+        interned_optional_inner => residual_int,
+        interned_as_bool => residual_int,
+        interned_map_keys => residual_int,
+        interned_list_indices => residual_int,
+        interned_opt_index => residual_int,
+        interned_opt_select => residual_int,
         interned_item => residual_int,
         try_append => residual_int,
         new_list_with_capacity => inline_ref,
@@ -532,6 +815,9 @@ pub(crate) fn eval_through_portal(
         cel_greater => inline_ref,
         cel_greater_equals => inline_ref,
         cel_negate => inline_ref,
+        cel_optional_none => inline_ref,
+        cel_optional_of => inline_ref,
+        cel_optional_of_non_zero_value => inline_ref,
     },
 )]
 fn run_cel_portal(
@@ -661,6 +947,118 @@ fn run_cel_portal(
                     here + 1
                 }
             }
+            OP_OPT_INDEX => {
+                let depth = frame.valuestackdepth;
+                let key = frame.locals_stack_w[depth - 1];
+                let container = frame.locals_stack_w[depth - 2];
+                let item = interned_opt_index(container as i64, key as i64);
+                if container.is_null() || key.is_null() || item == 0 {
+                    residual_dispatch(vm, here)
+                } else {
+                    let r = item as usize as CelRef;
+                    frame.locals_stack_w[depth - 2] = r;
+                    frame.valuestackdepth = depth - 1;
+                    vm_sync_binop(vm, item);
+                    here + 1
+                }
+            }
+            OP_OPT_SELECT => {
+                let depth = frame.valuestackdepth;
+                let recv = frame.locals_stack_w[depth - 1];
+                let found = interned_opt_select(recv as i64, program, insn_a(program, pc));
+                if recv.is_null() || found == 0 {
+                    residual_dispatch(vm, here)
+                } else {
+                    let r = found as usize as CelRef;
+                    frame.locals_stack_w[depth - 1] = r;
+                    vm_sync_replace(vm, found);
+                    here + 1
+                }
+            }
+            OP_JUMP_IF_OPT_NONE => {
+                let depth = frame.valuestackdepth;
+                let w = frame.locals_stack_w[depth - 1];
+                match interned_optional_state(w as i64) {
+                    2 => insn_a(program, pc),
+                    1 => here + 1,
+                    _ => residual_dispatch(vm, here),
+                }
+            }
+            OP_LIST_APPEND_OPTIONAL => {
+                let depth = frame.valuestackdepth;
+                let item = frame.locals_stack_w[depth - 1];
+                let list = frame.locals_stack_w[depth - 2];
+                let state = interned_optional_state(item as i64);
+                if list.is_null() || state == 0 {
+                    residual_dispatch(vm, here)
+                } else if state == 2 {
+                    frame.valuestackdepth = depth - 1;
+                    vm_sync_pop(vm);
+                    here + 1
+                } else {
+                    let inner = interned_optional_inner(item as i64);
+                    if inner == 0 || try_append(list as i64, inner) == 0 {
+                        residual_dispatch(vm, here)
+                    } else {
+                        frame.valuestackdepth = depth - 1;
+                        vm_sync_pop(vm);
+                        here + 1
+                    }
+                }
+            }
+            OP_NOT_STRICTLY_FALSE => {
+                let depth = frame.valuestackdepth;
+                let w = frame.locals_stack_w[depth - 1];
+                match interned_as_bool(w as i64) {
+                    0 => residual_dispatch(vm, here),
+                    found => {
+                        let r = new_bool(found != 1) as CelRef;
+                        frame.locals_stack_w[depth - 1] = r;
+                        vm_sync_replace(vm, r as i64);
+                        here + 1
+                    }
+                }
+            }
+            OP_ACCU_LOOP_COND => {
+                let w = frame.locals_stack_w[insn_a(program, pc)];
+                match interned_as_bool(w as i64) {
+                    1 => insn_b(program, pc),
+                    2 | 3 => here + 1,
+                    _ => residual_dispatch(vm, here),
+                }
+            }
+            OP_ACCU_LOOP_COND_NOT => {
+                let w = frame.locals_stack_w[insn_a(program, pc)];
+                match interned_as_bool(w as i64) {
+                    1 => here + 1,
+                    2 => insn_b(program, pc),
+                    _ => residual_dispatch(vm, here),
+                }
+            }
+            OP_ADD_LOCAL_K_APPEND => {
+                interned_local_k_append!(frame, vm, program, pc, here, cel_add)
+            }
+            OP_MUL_LOCAL_K_APPEND => {
+                interned_local_k_append!(frame, vm, program, pc, here, cel_mul)
+            }
+            OP_MOD_LOCAL_K_APPEND => {
+                interned_local_k_append!(frame, vm, program, pc, here, cel_rem)
+            }
+            OP_EQ_LOCAL_K_APPEND => {
+                interned_local_k_append!(frame, vm, program, pc, here, cel_equals)
+            }
+            OP_NE_LOCAL_K_APPEND => {
+                interned_local_k_append!(frame, vm, program, pc, here, cel_not_equals)
+            }
+            OP_LT_LOCAL_K_APPEND => {
+                interned_local_k_append!(frame, vm, program, pc, here, cel_less)
+            }
+            OP_GT_LOCAL_K_APPEND => {
+                interned_local_k_append!(frame, vm, program, pc, here, cel_greater)
+            }
+            OP_GE_LOCAL_K_APPEND => {
+                interned_local_k_append!(frame, vm, program, pc, here, cel_greater_equals)
+            }
             OP_NOT => {
                 let depth = frame.valuestackdepth;
                 let w = frame.locals_stack_w[depth - 1];
@@ -719,10 +1117,10 @@ fn run_cel_portal(
                 }
             }
             OP_CALL_HOST | OP_CALL_METHOD => {
-                let want_arity = if opcode == OP_CALL_HOST { 1 } else { 0 };
-                if insn_b(program, pc) == want_arity
-                    && interned_is_size(program, insn_a(program, pc)) != 0
-                {
+                let arity = insn_b(program, pc);
+                let name = insn_a(program, pc);
+                let unary_arity = if opcode == OP_CALL_HOST { 1 } else { 0 };
+                if arity == unary_arity && interned_is_size(program, name) != 0 {
                     let depth = frame.valuestackdepth;
                     let w = frame.locals_stack_w[depth - 1];
                     let n = interned_len(w as i64);
@@ -733,6 +1131,72 @@ fn run_cel_portal(
                         frame.locals_stack_w[depth - 1] = r;
                         vm_sync_replace(vm, r as i64);
                         here + 1
+                    }
+                } else if arity == unary_arity {
+                    let depth = frame.valuestackdepth;
+                    let w = frame.locals_stack_w[depth - 1];
+                    let mut out = interned_unary(vm, program, name, w as i64);
+                    if out == 0 && opcode == OP_CALL_METHOD {
+                        out = interned_temporal(vm, program, name, w as i64);
+                    }
+                    if out == 0 && opcode == OP_CALL_METHOD {
+                        out = interned_optional_unary(program, name, w as i64);
+                    }
+                    if w.is_null() || out == 0 || out == ERROR_SENTINEL as i64 {
+                        residual_dispatch(vm, here)
+                    } else {
+                        let r = out as usize as CelRef;
+                        frame.locals_stack_w[depth - 1] = r;
+                        vm_sync_replace(vm, out);
+                        here + 1
+                    }
+                } else if opcode == OP_CALL_METHOD && arity == 1 {
+                    let depth = frame.valuestackdepth;
+                    let recv = frame.locals_stack_w[depth - 1];
+                    let arg = frame.locals_stack_w[depth - 2];
+                    let out = interned_method1(program, name, recv as i64, arg as i64);
+                    if recv.is_null() || arg.is_null() || out == 0 || out == ERROR_SENTINEL as i64 {
+                        residual_dispatch(vm, here)
+                    } else {
+                        let r = out as usize as CelRef;
+                        frame.locals_stack_w[depth - 2] = r;
+                        frame.valuestackdepth = depth - 1;
+                        vm_sync_binop(vm, out);
+                        here + 1
+                    }
+                } else {
+                    residual_dispatch(vm, here)
+                }
+            }
+            OP_CALL_QUALIFIED => {
+                let kind = interned_qualified_kind(program, insn_a(program, pc));
+                let arity = insn_b(program, pc);
+                let skip = insn_c(program, pc);
+                if kind == 1 && arity == 0 {
+                    let w = cel_optional_none();
+                    let depth = frame.valuestackdepth;
+                    frame.locals_stack_w[depth] = w;
+                    frame.valuestackdepth = depth + 1;
+                    vm_sync_push(vm, w as i64);
+                    skip
+                } else if (kind == 2 || kind == 3) && arity == 1 {
+                    let depth = frame.valuestackdepth;
+                    let w = frame.locals_stack_w[depth - 1];
+                    if w.is_null() {
+                        residual_dispatch(vm, here)
+                    } else {
+                        let r = if kind == 2 {
+                            unsafe { cel_optional_of(w) }
+                        } else {
+                            unsafe { cel_optional_of_non_zero_value(w) }
+                        };
+                        if r == ERROR_SENTINEL {
+                            residual_dispatch(vm, here)
+                        } else {
+                            frame.locals_stack_w[depth - 1] = r;
+                            vm_sync_replace(vm, r as i64);
+                            skip
+                        }
                     }
                 } else {
                     residual_dispatch(vm, here)
@@ -872,9 +1336,38 @@ fn run_cel_portal(
             OP_ITER_ELEMS => {
                 let depth = frame.valuestackdepth;
                 let w = frame.locals_stack_w[depth - 1];
-                if w.is_null() || unsafe { w_kind(w) } != CelKind::List {
+                if w.is_null() {
+                    residual_dispatch(vm, here)
+                } else if unsafe { w_kind(w) } == CelKind::List {
+                    here + 1
+                } else {
+                    let keys = interned_map_keys(vm, w as i64);
+                    if keys == 0 {
+                        residual_dispatch(vm, here)
+                    } else {
+                        let r = keys as usize as CelRef;
+                        frame.locals_stack_w[depth - 1] = r;
+                        vm_sync_replace(vm, keys);
+                        here + 1
+                    }
+                }
+            }
+            OP_ITER_KEYS => {
+                let depth = frame.valuestackdepth;
+                let w = frame.locals_stack_w[depth - 1];
+                let keys = if w.is_null() {
+                    0
+                } else if unsafe { w_kind(w) } == CelKind::List {
+                    interned_list_indices(vm, w as i64)
+                } else {
+                    interned_map_keys(vm, w as i64)
+                };
+                if keys == 0 {
                     residual_dispatch(vm, here)
                 } else {
+                    let r = keys as usize as CelRef;
+                    frame.locals_stack_w[depth - 1] = r;
+                    vm_sync_replace(vm, keys);
                     here + 1
                 }
             }
@@ -1186,6 +1679,78 @@ mod tests {
             .unwrap(),
             Value::list(vec![Value::Int(10), Value::Int(20), Value::Int(30)])
         );
+        assert_eq!(
+            cel_eval_loop(
+                &compile(&Parser::default().parse("int('3') + 1").unwrap()).unwrap(),
+                &ctx
+            )
+            .unwrap(),
+            Value::Int(4)
+        );
+        assert_eq!(
+            cel_eval_loop(
+                &compile(&Parser::default().parse("optional.of(7).value()").unwrap()).unwrap(),
+                &ctx
+            )
+            .unwrap(),
+            Value::Int(7)
+        );
+        assert_eq!(
+            cel_eval_loop(
+                &compile(
+                    &Parser::default()
+                        .parse("optional.none().hasValue()")
+                        .unwrap()
+                )
+                .unwrap(),
+                &ctx
+            )
+            .unwrap(),
+            Value::Bool(false)
+        );
+        assert_eq!(
+            cel_eval_loop(
+                &compile(&Parser::default().parse("'hello'.startsWith('he')").unwrap()).unwrap(),
+                &ctx
+            )
+            .unwrap(),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            cel_eval_loop(
+                &compile(
+                    &Parser::default()
+                        .enable_optional_syntax(true)
+                        .parse("xs[?1].hasValue()")
+                        .unwrap()
+                )
+                .unwrap(),
+                &with_map
+            )
+            .unwrap(),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            cel_eval_loop(
+                &compile(&Parser::default().parse("xs.all(x, x > 0)").unwrap()).unwrap(),
+                &with_map
+            )
+            .unwrap(),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            cel_eval_loop(
+                &compile(
+                    &Parser::default()
+                        .parse("m.exists(k, k == 'price')")
+                        .unwrap()
+                )
+                .unwrap(),
+                &with_map
+            )
+            .unwrap(),
+            Value::Bool(true)
+        );
     }
 
     #[test]
@@ -1208,5 +1773,9 @@ mod tests {
         assert_eq!(OP_LOAD_LOCAL_APPEND, OpCode::LoadLocalAppend as i64);
         assert_eq!(OP_CALL_HOST, OpCode::CallHost as i64);
         assert_eq!(OP_CALL_METHOD, OpCode::CallMethod as i64);
+        assert_eq!(OP_CALL_QUALIFIED, OpCode::CallQualified as i64);
+        assert_eq!(OP_OPT_INDEX, OpCode::OptIndex as i64);
+        assert_eq!(OP_ITER_KEYS, OpCode::IterKeys as i64);
+        assert_eq!(OP_ACCU_LOOP_COND, OpCode::AccuLoopCond as i64);
     }
 }

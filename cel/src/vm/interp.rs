@@ -889,6 +889,25 @@ impl<'a> Vm<'a> {
         intern_leaf(&self.ctx.get_variable(name)?)
     }
 
+    pub(crate) fn interned_unary_bits(&self, name: &str, w: CelRef) -> i64 {
+        match interned_unary_host(name, w) {
+            Ok(Some(out)) if out != ERROR_SENTINEL => out as i64,
+            _ => 0,
+        }
+    }
+
+    pub(crate) fn interned_temporal_int(&self, name: &str, w: CelRef) -> Option<i64> {
+        interned_temporal_accessor(name, w)
+    }
+
+    pub(crate) fn interned_map_key_list(&self, w: CelRef) -> CelRef {
+        unsafe { interned_map_keys(w) }
+    }
+
+    pub(crate) fn interned_list_index_list(&self, w: CelRef) -> CelRef {
+        unsafe { interned_list_indices(w) }
+    }
+
     pub(crate) fn sync_store_interned(&mut self, slot: u32, w: CelRef) {
         let _ = self.pop_operand();
         let _ = self.store_operand(slot, Operand::Interned(w));
