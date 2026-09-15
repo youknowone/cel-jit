@@ -17,7 +17,8 @@ use super::interp::{Step, Vm};
 use super::opcode::OpCode;
 use crate::runtime::binop::{
     cel_add, cel_div, cel_equals, cel_greater, cel_greater_equals, cel_less, cel_less_equals,
-    cel_mul, cel_not_equals, cel_rem, cel_sub, map_lookup,
+    cel_mul, cel_negate, cel_not_equals, cel_rem, cel_sub, list_contains, map_contains_key,
+    map_lookup,
 };
 use crate::runtime::convert::{intern_leaf, interned_list_get, interned_map_lookup_string};
 use crate::runtime::error::ERROR_SENTINEL;
@@ -88,6 +89,9 @@ const OP_HAS_FIELD_LOCAL: i64 = OpCode::HasFieldLocal as i64;
 const OP_GET_FIELD_LOCAL_APPEND: i64 = OpCode::GetFieldLocalAppend as i64;
 const OP_HAS_FIELD_LOCAL_APPEND: i64 = OpCode::HasFieldLocalAppend as i64;
 const OP_INDEX: i64 = OpCode::Index as i64;
+const OP_NOT: i64 = OpCode::Not as i64;
+const OP_NEGATE: i64 = OpCode::Negate as i64;
+const OP_IN: i64 = OpCode::In as i64;
 
 macro_rules! interned_binop {
     ($frame:ident, $vm:ident, $here:ident, $op:expr) => {{
@@ -303,6 +307,33 @@ fn interned_index(container: i64, key: i64) -> i64 {
     found.map(|r| r as usize as i64).unwrap_or(0)
 }
 
+/// Interned `needle in container`. `0` residual, `1` false, `2` true.
+#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+fn interned_contains(container: i64, needle: i64) -> i64 {
+    let c = container as usize as CelRef;
+    let n = needle as usize as CelRef;
+    if c.is_null() || n.is_null() {
+        return 0;
+    }
+    match unsafe { w_kind(c) } {
+        CelKind::List => {
+            if unsafe { list_contains(c, n) } {
+                2
+            } else {
+                1
+            }
+        }
+        CelKind::Map => {
+            if unsafe { map_contains_key(c, n) } {
+                2
+            } else {
+                1
+            }
+        }
+        _ => 0,
+    }
+}
+
 fn vm_of<'a>(vm_bits: i64) -> &'a mut Vm<'a> {
     unsafe { &mut *(vm_bits as usize as *mut Vm<'a>) }
 }
@@ -448,6 +479,7 @@ pub(crate) fn eval_through_portal(
         interned_field => residual_int,
         interned_has_field => residual_int,
         interned_index => residual_int,
+        interned_contains => residual_int,
         interned_item => residual_int,
         try_append => residual_int,
         new_list_with_capacity => inline_ref,
@@ -472,6 +504,7 @@ pub(crate) fn eval_through_portal(
         cel_less_equals => inline_ref,
         cel_greater => inline_ref,
         cel_greater_equals => inline_ref,
+        cel_negate => inline_ref,
     },
 )]
 fn run_cel_portal(
@@ -598,6 +631,53 @@ fn run_cel_portal(
                     frame.locals_stack_w[depth - 2] = r;
                     frame.valuestackdepth = depth - 1;
                     vm_sync_binop(vm, item);
+                    here + 1
+                }
+            }
+            OP_NOT => {
+                let depth = frame.valuestackdepth;
+                let w = frame.locals_stack_w[depth - 1];
+                if w.is_null() || unsafe { w_kind(w) } != CelKind::Bool {
+                    residual_dispatch(vm, here)
+                } else {
+                    let r = unsafe { cel_negate(w) };
+                    if r == ERROR_SENTINEL {
+                        residual_dispatch(vm, here)
+                    } else {
+                        frame.locals_stack_w[depth - 1] = r;
+                        vm_sync_replace(vm, r as i64);
+                        here + 1
+                    }
+                }
+            }
+            OP_NEGATE => {
+                let depth = frame.valuestackdepth;
+                let w = frame.locals_stack_w[depth - 1];
+                if w.is_null() {
+                    residual_dispatch(vm, here)
+                } else {
+                    let r = unsafe { cel_negate(w) };
+                    if r == ERROR_SENTINEL {
+                        residual_dispatch(vm, here)
+                    } else {
+                        frame.locals_stack_w[depth - 1] = r;
+                        vm_sync_replace(vm, r as i64);
+                        here + 1
+                    }
+                }
+            }
+            OP_IN => {
+                let depth = frame.valuestackdepth;
+                let container = frame.locals_stack_w[depth - 1];
+                let needle = frame.locals_stack_w[depth - 2];
+                let found = interned_contains(container as i64, needle as i64);
+                if container.is_null() || needle.is_null() || found == 0 {
+                    residual_dispatch(vm, here)
+                } else {
+                    let r = new_bool(found == 2) as CelRef;
+                    frame.locals_stack_w[depth - 2] = r;
+                    frame.valuestackdepth = depth - 1;
+                    vm_sync_binop(vm, r as i64);
                     here + 1
                 }
             }
@@ -993,6 +1073,38 @@ mod tests {
                 )),
             ])
         );
+        assert_eq!(
+            cel_eval_loop(
+                &compile(&Parser::default().parse("!(1 == 2)").unwrap()).unwrap(),
+                &ctx
+            )
+            .unwrap(),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            cel_eval_loop(
+                &compile(&Parser::default().parse("-3 + 1").unwrap()).unwrap(),
+                &ctx
+            )
+            .unwrap(),
+            Value::Int(-2)
+        );
+        assert_eq!(
+            cel_eval_loop(
+                &compile(&Parser::default().parse("20 in xs").unwrap()).unwrap(),
+                &with_map
+            )
+            .unwrap(),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            cel_eval_loop(
+                &compile(&Parser::default().parse("99 in xs").unwrap()).unwrap(),
+                &with_map
+            )
+            .unwrap(),
+            Value::Bool(false)
+        );
     }
 
     #[test]
@@ -1009,5 +1121,8 @@ mod tests {
         assert_eq!(OP_HAS_FIELD, OpCode::HasField as i64);
         assert_eq!(OP_GET_FIELD_LOCAL, OpCode::GetFieldLocal as i64);
         assert_eq!(OP_INDEX, OpCode::Index as i64);
+        assert_eq!(OP_NOT, OpCode::Not as i64);
+        assert_eq!(OP_NEGATE, OpCode::Negate as i64);
+        assert_eq!(OP_IN, OpCode::In as i64);
     }
 }
