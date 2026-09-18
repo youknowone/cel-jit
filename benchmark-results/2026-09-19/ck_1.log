@@ -1,0 +1,31 @@
+cometkim PR-233 checkout (cel 0.11.6 walker + his Cranelift AOT), ONE harness: best batch of >= 20 ms thread CPU, 1s per cell
+case                           ck-walk ns    ck-jit ns   walk/jit   note
+simple_arithmetic                    42.1          6.8      6.23x   
+comparison                           33.1          6.9      4.81x   
+conditional                          32.9         22.9      1.44x   
+nested_expression                   143.7        138.1      1.04x   
+variable_access/hashmap               5.6         12.9      0.43x   
+variable_access/resolver              4.3         12.6      0.34x   
+member_access                       129.3        162.4      0.80x   
+list_indexing                        55.8         73.6      0.76x   
+list_filter                        1441.4        948.3      1.52x   
+list_map                            880.3        763.0      1.15x   
+all_comprehension                   476.1        171.5      2.78x   
+exists_comprehension                369.9        147.1      2.51x   
+map_list_scaling/1                  201.2        177.1      1.14x   
+map_list_scaling/10                1685.5       1503.4      1.12x   
+map_list_scaling/100              28391.5      26628.2      1.07x   
+map_list_scaling/1000           1456895.1    1441028.8      1.01x   
+map_list_scaling/10000        123977548.3  121396167.5      1.02x   
+filter_list_scaling/1               238.3        195.5      1.22x   
+filter_list_scaling/10             1527.6       1096.4      1.39x   
+filter_list_scaling/100           18845.2      13117.6      1.44x   
+filter_list_scaling/1000         519199.0     451140.3      1.15x   
+filter_list_scaling/10000      33917666.2   31247167.7      1.09x   
+comprehension_scaling/10           2197.4            -          -   not-answered: Undeclared reference to '@result'
+comprehension_scaling/50          12176.3            -          -   not-answered: Undeclared reference to '@result'
+comprehension_scaling/100         27761.8            -          -   not-answered: Undeclared reference to '@result'
+comprehension_scaling/500        262957.5            -          -   not-answered: Undeclared reference to '@result'
+string_operations                   227.9        225.8      1.01x   
+custom_function                      70.6        440.6      0.16x   
+real_world_policy                   432.7        496.0      0.87x   

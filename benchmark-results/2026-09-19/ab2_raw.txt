@@ -1,0 +1,20 @@
+vm|1 + 2 * 3 - 4 / 2|old=69.2|new-nojit=90.3|new-jit=74.7
+walker|1 + 2 * 3 - 4 / 2|old=43.1|new-nojit=46.9|new-jit=46.3
+vm|x|old=23.6|new-nojit=39.7|new-jit=49.2
+walker|x|old=9.8|new-nojit=9.5|new-jit=9.3
+vm|list[3]|old=39.9|new-nojit=122.2|new-jit=124.2
+walker|list[3]|old=17.0|new-nojit=18.1|new-jit=17.6
+vm|[1, 2, 3, 4, 5][2]|old=83.6|new-nojit=250.2|new-jit=105.8
+walker|[1, 2, 3, 4, 5][2]|old=53.8|new-nojit=54.9|new-jit=53.9
+vm|size(list)|old=57.5|new-nojit=109.1|new-jit=108.5
+walker|size(list)|old=46.8|new-nojit=45.2|new-jit=45.3
+vm|{'a': 1, 'b': 2}['a']|old=124.5|new-nojit=424.5|new-jit=426.8
+walker|{'a': 1, 'b': 2}['a']|old=92.1|new-nojit=94.0|new-jit=95.3
+vm|list.map(e, e * 2)|old=279.7|new-nojit=500.9|new-jit=455.2
+walker|list.map(e, e * 2)|old=355.8|new-nojit=329.9|new-jit=330.5
+vm|list.filter(e, e % 2 == 0)|old=372.5|new-nojit=733.6|new-jit=562.2
+walker|list.filter(e, e % 2 == 0)|old=441.8|new-nojit=446.5|new-jit=426.2
+vm|list.exists(e, e > 5)|old=231.4|new-nojit=557.2|new-jit=531.2
+walker|list.exists(e, e > 5)|old=414.1|new-nojit=432.0|new-jit=431.0
+vm|list.all(e, e > 0)|old=317.4|new-nojit=795.8|new-jit=742.7
+walker|list.all(e, e > 0)|old=535.8|new-nojit=556.3|new-jit=557.6
