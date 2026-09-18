@@ -699,6 +699,31 @@ fn residual_dispatch(vm_bits: i64, pc: i64) -> i64 {
     }
 }
 
+/// Back-edge / function-entry threshold for this process.
+///
+/// Default `1_000_000` keeps unit tests on the native portal loop.
+/// `CEL_PORTAL_THRESHOLD` overrides both counters, the same single-knob
+/// shape `new_driver_f` uses.
+fn portal_threshold() -> u32 {
+    std::env::var("CEL_PORTAL_THRESHOLD")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1_000_000)
+}
+
+thread_local! {
+    /// One driver per live `CelCode` identity on this thread.
+    ///
+    /// PyPy keeps the jitdriver on the code object. `CelCode` is `Clone` +
+    /// `PartialEq`, so the driver lives here keyed by the code pointer.
+    /// A new `JitDriver` per `execute` zeroed the counters and never
+    /// compiled. Heat is necessary but not sufficient: traces still
+    /// abort with `AbortPermanent` until `lower_dispatch_body` produces
+    /// a dispatch JitCode for `run_cel_portal`.
+    static PORTAL_DRIVER: std::cell::RefCell<Option<(usize, JitDriver<PortalState>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Evaluate `code` through the portal loop.
 pub(crate) fn eval_through_portal(
     vm: &mut Vm<'_>,
@@ -709,17 +734,26 @@ pub(crate) fn eval_through_portal(
         vm: vm as *mut Vm<'_> as i64,
         ret: 0,
     };
-    // High threshold: the doors are attached; a compile is not required
-    // for the native portal loop to answer. Census is not installed here
-    // — that hook is process-global and would clobber other machines.
-    let mut driver: JitDriver<PortalState> = JitDriver::new(1_000_000);
-    {
-        use majit_metainterp::JitState as _;
-        state
-            .build_meta(0, code)
-            .install_canonical_liveness(&mut driver);
-    }
-    let bits = run_cel_portal(&mut driver, code, &mut state, 0);
+    // Census is not installed here — that hook is process-global and
+    // would clobber the columnar machine.
+    let key = code as *const CelCode as usize;
+    let bits = PORTAL_DRIVER.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.as_ref().is_none_or(|(k, _)| *k != key) {
+            let threshold = portal_threshold();
+            let mut driver = JitDriver::new(threshold);
+            driver.set_param("function_threshold", i64::from(threshold));
+            {
+                use majit_metainterp::JitState as _;
+                state
+                    .build_meta(0, code)
+                    .install_canonical_liveness(&mut driver);
+            }
+            *slot = Some((key, driver));
+        }
+        let driver = &mut slot.as_mut().expect("just installed").1;
+        run_cel_portal(driver, code, &mut state, 0)
+    });
     match bits {
         PORTAL_DONE => match vm.portal_ret.take() {
             Some(Ok(value)) => Ok(value),
