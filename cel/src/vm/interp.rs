@@ -38,8 +38,7 @@ use crate::objects::{
 };
 use crate::runtime::binop::{
     cel_add, cel_div, cel_equals, cel_greater, cel_greater_equals, cel_less, cel_less_equals,
-    cel_mul, cel_negate, cel_not_equals, cel_rem, cel_sub, list_contains, map_contains_key,
-    map_key_refs, map_lookup,
+    cel_mul, cel_negate, cel_not_equals, cel_rem, cel_sub, map_key_refs, map_lookup,
 };
 use crate::runtime::convert::{intern_leaf, interned_list_get, ref_to_value};
 use crate::runtime::error::{take_error, CelErrCode, ERROR_SENTINEL};
@@ -2323,14 +2322,12 @@ impl<'a> Vm<'a> {
                 let container = self.pop_operand().ok_or(CelErr::InternalError)?;
                 let needle = self.pop_operand().ok_or(CelErr::InternalError)?;
                 if let (Some(c), Some(n)) = (Self::leaf_of(&container), Self::leaf_of(&needle)) {
-                    let found = match unsafe { w_kind(c) } {
-                        CelKind::List => Some(unsafe { list_contains(c, n) }),
-                        CelKind::Map => Some(unsafe { map_contains_key(c, n) }),
-                        _ => None,
-                    };
-                    if let Some(found) = found {
-                        self.push(Value::Bool(found));
-                        return Ok(Step::Next);
+                    match crate::objects::interned_contains(c, n) {
+                        Ok(found) => {
+                            self.push(Value::Bool(found));
+                            return Ok(Step::Next);
+                        }
+                        Err(e) => return Err(self.park(e)),
                     }
                 }
                 let rhs = self.finish(container)?;
@@ -3056,8 +3053,10 @@ impl<'a> Vm<'a> {
         let needle = self.pop_operand().ok_or(CelErr::InternalError)?;
         if let (Some(c), Some(n)) = (Self::leaf_of(&container), Self::leaf_of(&needle)) {
             let found = match unsafe { w_kind(c) } {
-                CelKind::List => Some(unsafe { list_contains(c, n) }),
-                CelKind::Map => Some(unsafe { map_contains_key(c, n) }),
+                CelKind::List | CelKind::Map => match crate::objects::interned_contains(c, n) {
+                    Ok(found) => Some(found),
+                    Err(e) => return Err(self.park(e)),
+                },
                 CelKind::Str => match unsafe { crate::runtime::object::string_as_str(n) } {
                     Some(needle) => unsafe { crate::runtime::object::string_as_str(c) }
                         .map(|hay| hay.contains(needle)),

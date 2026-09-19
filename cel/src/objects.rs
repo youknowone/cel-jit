@@ -6,9 +6,10 @@ use crate::runtime::binop::{cel_add, map_contains_key, map_key_refs, map_lookup,
 use crate::runtime::convert::{intern_leaf, interned_list_get, interned_map_lookup_string};
 use crate::runtime::error::{take_error, CelErrCode, ERROR_SENTINEL};
 use crate::runtime::object::{
-    bytes_len, list_int_at, list_len, map_len, string_as_str, string_byte_len, w_kind, CelKind,
-    CelRef, ListStrategy, MapStrategy, W_BoolObject, W_DoubleObject, W_IntColumn, W_IntObject,
-    W_ListObject, W_MapObject, W_OptionalObject, W_UIntObject,
+    bytes_len, list_int_at, list_len, map_len, new_optional, new_optional_none, string_as_str,
+    string_byte_len, w_kind, CelKind, CelRef, ListStrategy, MapStrategy, W_BoolObject,
+    W_DoubleObject, W_IntColumn, W_IntObject, W_ListObject, W_MapObject, W_OptionalObject,
+    W_UIntObject,
 };
 use crate::runtime::object_array::{items_block_items_base, items_capacity};
 use crate::ExecutionError::NoSuchOverload;
@@ -1736,13 +1737,10 @@ fn resolve_inner(expr: &Expression, ctx: &Context) -> Result<Value, ExecutionErr
             for (idx, element) in list_expr.elements.iter().enumerate() {
                 let value = resolve_inner(element, ctx)?;
                 if list_expr.optional_indices.contains(&idx) {
-                    match as_optional(&value) {
-                        Some(opt) => {
-                            if let Some(inner) = opt.value() {
-                                list.push(inner.unpack());
-                            }
-                        }
-                        None => list.push(value.unpack()),
+                    match optional_view(&value) {
+                        OptView::Empty => {}
+                        OptView::Present(inner) => list.push(inner.unpack()),
+                        OptView::Plain => list.push(value.unpack()),
                     }
                 } else {
                     list.push(value.unpack());
@@ -1761,12 +1759,14 @@ fn resolve_inner(expr: &Expression, ctx: &Context) -> Result<Value, ExecutionErr
                 let value = resolve_inner(v, ctx)?;
 
                 if is_optional {
-                    if let Some(opt) = as_optional(&value) {
-                        if let Some(inner) = opt.value() {
+                    match optional_view(&value) {
+                        OptView::Empty => {}
+                        OptView::Present(inner) => {
                             map.insert(key, inner.unpack());
                         }
-                    } else {
-                        map.insert(key, value.unpack());
+                        OptView::Plain => {
+                            map.insert(key, value.unpack());
+                        }
                     }
                 } else {
                     map.insert(key, value.unpack());
@@ -2596,7 +2596,11 @@ fn key_display(key: &Key) -> String {
 /// why the conversion is propagated instead of folded into `false`.
 pub(crate) fn value_contains(container: &Value, needle: &Value) -> Result<bool, ExecutionError> {
     if let Value::Interned(w) = container {
-        return interned_contains(*w, needle);
+        let n = match needle {
+            Value::Interned(n) => *n,
+            other => intern_leaf(other).ok_or(ExecutionError::NoSuchOverload)?,
+        };
+        return interned_contains(*w, n);
     }
     let needle = needle.unpack();
     match container {
@@ -2606,21 +2610,61 @@ pub(crate) fn value_contains(container: &Value, needle: &Value) -> Result<bool, 
     }
 }
 
-fn interned_contains(w: CelRef, needle: &Value) -> Result<bool, ExecutionError> {
-    match unsafe { w_kind(w) } {
+/// `needle in container` on interned operands.
+///
+/// A string container is `NoSuchOverload`: CEL has no `x in "string"`. A
+/// needle that cannot be a map key is `UnsupportedKeyType`, not a miss. An
+/// ints-list answers only for an int needle; any other kind is a miss.
+#[inline]
+pub(crate) fn interned_contains(container: CelRef, needle: CelRef) -> Result<bool, ExecutionError> {
+    match unsafe { w_kind(container) } {
         CelKind::List => {
-            if let Some(ints) = interned_ints_slice(w) {
-                return Ok(interned_or_public_int(needle).is_some_and(|n| ints.contains(&n)));
+            if let Some(ints) = interned_ints_slice(container) {
+                if unsafe { w_kind(needle) } != CelKind::Int {
+                    return Ok(false);
+                }
+                let n = unsafe { (*needle.cast::<W_IntObject>()).intval };
+                return Ok(ints.contains(&n));
             }
-            let n = intern_leaf(needle).ok_or(ExecutionError::NoSuchOverload)?;
-            Ok(interned_list_contains_in_place(w, n))
+            Ok(interned_list_contains_in_place(container, needle))
         }
-        CelKind::Map => {
-            interned_map_key(needle)?;
-            let k = intern_leaf(needle).ok_or(ExecutionError::NoSuchOverload)?;
-            Ok(unsafe { map_contains_key(w, k) })
-        }
+        CelKind::Map => match unsafe { w_kind(needle) } {
+            CelKind::Int | CelKind::UInt | CelKind::Bool | CelKind::Str => {
+                Ok(unsafe { map_contains_key(container, needle) })
+            }
+            _ => Err(ExecutionError::unsupported_key_type(
+                Value::from_interned(needle).unpack(),
+            )),
+        },
         _ => Err(ExecutionError::NoSuchOverload),
+    }
+}
+
+/// `a?.b` on an interned receiver.
+///
+/// A miss on a plain map/struct is `NoSuchKey`. A miss on an optional
+/// receiver folds to `optional.of(optional.none)`. Anything else is
+/// `NoSuchOverload` so the caller can decline.
+pub(crate) fn interned_opt_select(w: CelRef, field: &str) -> Result<CelRef, ExecutionError> {
+    let (inner, optional) = if unsafe { w_kind(w) } == CelKind::Optional {
+        let inner = unsafe { (*w.cast::<W_OptionalObject>()).w_value };
+        if inner.is_null() {
+            return Ok(new_optional_none() as CelRef);
+        }
+        (inner, true)
+    } else {
+        (w, false)
+    };
+    let found = match unsafe { w_kind(inner) } {
+        CelKind::Map => unsafe { interned_map_lookup_string(inner, field) },
+        #[cfg(feature = "structs")]
+        CelKind::Struct => unsafe { crate::runtime::object::struct_lookup_field(inner, field) },
+        _ => return Err(ExecutionError::NoSuchOverload),
+    };
+    match found {
+        Some(item) => Ok(new_optional(item) as CelRef),
+        None if optional => Ok(new_optional(new_optional_none() as CelRef) as CelRef),
+        None => Err(ExecutionError::NoSuchKey(Arc::new(field.to_string()))),
     }
 }
 

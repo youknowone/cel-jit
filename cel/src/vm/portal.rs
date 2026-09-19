@@ -17,8 +17,7 @@ use super::interp::{Step, Vm};
 use super::opcode::OpCode;
 use crate::runtime::binop::{
     cel_add, cel_div, cel_equals, cel_greater, cel_greater_equals, cel_less, cel_less_equals,
-    cel_mul, cel_negate, cel_not_equals, cel_rem, cel_sub, list_contains, map_contains_key,
-    map_lookup,
+    cel_mul, cel_negate, cel_not_equals, cel_rem, cel_sub, map_lookup,
 };
 use crate::runtime::convert::{intern_leaf, interned_list_get, interned_map_lookup_string};
 use crate::runtime::error::ERROR_SENTINEL;
@@ -525,42 +524,10 @@ fn interned_contains(container: i64, needle: i64) -> i64 {
     let Some(n) = slot_leaf(needle) else {
         return 0;
     };
-    match unsafe { w_kind(c) } {
-        CelKind::List => {
-            if let Some(ints) = unsafe { list_ints_slice(c) } {
-                if unsafe { w_kind(n) } != CelKind::Int {
-                    return 1;
-                }
-                let needle = unsafe { (*n.cast::<W_IntObject>()).intval };
-                return if ints.contains(&needle) { 2 } else { 1 };
-            }
-            if unsafe { list_contains(c, n) } {
-                2
-            } else {
-                1
-            }
-        }
-        CelKind::Map => {
-            if unsafe { map_contains_key(c, n) } {
-                2
-            } else {
-                1
-            }
-        }
-        CelKind::Str => match unsafe { string_as_str(c) } {
-            Some(hay) => match unsafe { string_as_str(n) } {
-                Some(needle) => {
-                    if hay.contains(needle) {
-                        2
-                    } else {
-                        1
-                    }
-                }
-                None => 1,
-            },
-            None => 0,
-        },
-        _ => 0,
+    match crate::objects::interned_contains(c, n) {
+        Ok(true) => 2,
+        Ok(false) => 1,
+        Err(_) => 0,
     }
 }
 
@@ -750,27 +717,15 @@ fn interned_opt_index(container: i64, key: i64) -> i64 {
 /// Optional field. `0` residual, else an optional leaf.
 #[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
 fn interned_opt_select(w: i64, program: &CelCode, name_idx: i64) -> i64 {
-    let Some(mut w) = slot_leaf(w) else {
+    let Some(w) = slot_leaf(w) else {
         return 0;
     };
-    if unsafe { w_kind(w) } == CelKind::Optional {
-        let inner = unsafe { (*w.cast::<W_OptionalObject>()).w_value };
-        if inner.is_null() {
-            return cel_optional_none() as i64;
-        }
-        w = inner;
-    }
-    match unsafe { w_kind(w) } {
-        CelKind::Map => {}
-        #[cfg(feature = "structs")]
-        CelKind::Struct => {}
-        _ => return 0,
-    }
-    let found = interned_field(w as i64, program, name_idx);
-    if found == 0 {
-        cel_optional_none() as i64
-    } else {
-        unsafe { cel_optional_of(found as usize as CelRef) as i64 }
+    let Some(field) = program.name(NameId(name_idx as u32)) else {
+        return 0;
+    };
+    match crate::objects::interned_opt_select(w, field) {
+        Ok(r) => r as usize as i64,
+        Err(_) => 0,
     }
 }
 
