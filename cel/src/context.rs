@@ -44,18 +44,27 @@ pub enum Context<'a> {
     },
 }
 
-/// Binds `name`, reusing the key the map already owns when the name is bound.
+/// Stores `value` under `name`, reusing the key the map already owns.
 ///
 /// Re-binding is the loop case — a comprehension rebinds its iteration
 /// variable once per element — and `BTreeMap::insert` takes an owned key, so
 /// it allocates a fresh `String` on every pass over a name it already holds.
-fn bind(variables: &mut BTreeMap<Box<str>, Value>, name: impl AsRef<str>, value: Value) {
+fn store(variables: &mut BTreeMap<Box<str>, Value>, name: impl AsRef<str>, value: Value) {
     match variables.get_mut(name.as_ref()) {
         Some(slot) => *slot = value,
         None => {
             variables.insert(name.as_ref().into(), value);
         }
     }
+}
+
+/// Wrap a value as it enters the system: a class-family leaf is stored as
+/// [`Value::Interned`], so a later load is a pointer copy. Already-interned
+/// values are left as they are.
+fn wrap_entry(value: Value) -> Value {
+    crate::runtime::convert::intern_leaf(&value)
+        .map(Value::from_interned)
+        .unwrap_or(value)
 }
 
 impl<'a> Context<'a> {
@@ -68,7 +77,7 @@ impl<'a> Context<'a> {
         S: AsRef<str>,
         V: TryIntoValue,
     {
-        self.bind_value(name, value.try_into_value()?);
+        self.bind_value(name, wrap_entry(value.try_into_value()?));
         Ok(())
     }
 
@@ -77,7 +86,7 @@ impl<'a> Context<'a> {
         S: AsRef<str>,
         V: Into<Value>,
     {
-        self.bind_value(name, value.into());
+        self.bind_value(name, wrap_entry(value.into()));
     }
 
     /// Binds an application type that CEL treats as an opaque handle.
@@ -93,7 +102,7 @@ impl<'a> Context<'a> {
     where
         S: AsRef<str>,
     {
-        self.bind_value(name, Value::Opaque(value));
+        self.bind_value(name, wrap_entry(Value::Opaque(value)));
     }
 
     fn bind_value<S>(&mut self, name: S, value: Value)
@@ -104,7 +113,17 @@ impl<'a> Context<'a> {
             Context::Root { variables, .. } => variables,
             Context::Child { variables, .. } => variables,
         };
-        bind(variables, name, value);
+        store(variables, name, value);
+    }
+
+    /// Store `value` as given. A comprehension rebinding is an internal move,
+    /// not an entry: an interned element stays a pointer, an unboxed scalar
+    /// stays unboxed.
+    pub(crate) fn rebind<S>(&mut self, name: S, value: Value)
+    where
+        S: AsRef<str>,
+    {
+        self.bind_value(name, value);
     }
 
     pub fn set_variable_resolver(&mut self, r: &'a dyn VariableResolver) {

@@ -1,7 +1,7 @@
 use crate::{ExecutionError, Value};
 
 fn uint(mut args: Vec<Value>) -> Result<Value, ExecutionError> {
-    let arg = args.remove(0);
+    let arg = args.remove(0).unpack();
     match arg {
         Value::UInt(_) => Ok(arg),
         Value::Int(i) => Ok(Value::UInt(i as u64)),

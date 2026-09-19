@@ -8,6 +8,8 @@ use std::sync::Arc;
 fn expect_string(value: &Value) -> Result<&str, ExecutionError> {
     match value {
         Value::String(s) => Ok(s.as_str()),
+        Value::Interned(w) => unsafe { crate::runtime::object::string_as_str(*w) }
+            .ok_or_else(|| super::type_error(value, &super::STRING_TYPE)),
         other => Err(super::type_error(other, &super::STRING_TYPE)),
     }
 }
@@ -44,7 +46,7 @@ fn matches(args: Vec<Value>) -> Result<Value, ExecutionError> {
 }
 
 fn string(mut args: Vec<Value>) -> Result<Value, ExecutionError> {
-    let arg = args.remove(0);
+    let arg = args.remove(0).unpack();
     let converted = match &arg {
         Value::String(_) => return Ok(arg),
         Value::Int(i) => i.to_string(),

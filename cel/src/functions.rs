@@ -73,13 +73,19 @@ impl<'context, 'call: 'context> FunctionContext<'context, 'call> {
 /// 'foobar'.size() == 6
 /// ```
 pub fn size(ftx: &FunctionContext, This(this): This<Value>) -> Result<i64> {
-    let size = match this {
-        Value::List(l) => l.len(),
-        Value::Map(m) => m.len(),
-        Value::String(s) => s.len(),
-        value => return Err(ftx.error(format!("cannot determine the size of {value:?}"))),
-    };
-    Ok(size as i64)
+    match &this {
+        Value::List(l) => Ok(l.len() as i64),
+        Value::Map(m) => Ok(m.len() as i64),
+        Value::String(s) => Ok(s.len() as i64),
+        Value::Interned(w) => match unsafe { crate::runtime::object::w_kind(*w) } {
+            crate::runtime::object::CelKind::List
+            | crate::runtime::object::CelKind::Map
+            | crate::runtime::object::CelKind::Str => crate::objects::value_len(&this)
+                .ok_or_else(|| ftx.error(format!("cannot determine the size of {this:?}"))),
+            _ => Err(ftx.error(format!("cannot determine the size of {this:?}"))),
+        },
+        value => Err(ftx.error(format!("cannot determine the size of {value:?}"))),
+    }
 }
 
 /// Returns true if the target contains the provided argument. The actual behavior
@@ -113,6 +119,30 @@ pub fn size(ftx: &FunctionContext, This(this): This<Value>) -> Result<i64> {
 /// b"abc".contains(b"c") == true
 /// ```
 pub fn contains(This(this): This<Value>, arg: Value) -> Result<Value> {
+    if let Value::Interned(w) = &this {
+        match unsafe { crate::runtime::object::w_kind(*w) } {
+            crate::runtime::object::CelKind::List | crate::runtime::object::CelKind::Map => {
+                return Ok(crate::objects::value_contains(&this, &arg)?.into());
+            }
+            crate::runtime::object::CelKind::Str => {
+                let hay = unsafe { crate::runtime::object::string_as_str(*w) }.unwrap_or("");
+                let found = match &arg {
+                    Value::String(s) => hay.contains(s.as_str()),
+                    Value::Interned(n)
+                        if unsafe { crate::runtime::object::w_kind(*n) }
+                            == crate::runtime::object::CelKind::Str =>
+                    {
+                        hay.contains(
+                            unsafe { crate::runtime::object::string_as_str(*n) }.unwrap_or(""),
+                        )
+                    }
+                    _ => false,
+                };
+                return Ok(found.into());
+            }
+            _ => return Ok(false.into()),
+        }
+    }
     Ok(match this {
         Value::List(v) => v.contains(&arg),
         Value::Map(v) => {

@@ -44,11 +44,11 @@ use crate::runtime::binop::{
 use crate::runtime::convert::{intern_leaf, interned_list_get, ref_to_value};
 use crate::runtime::error::{take_error, CelErrCode, ERROR_SENTINEL};
 use crate::runtime::object::{
-    cel_frame_slot, force_virtualizable_if_necessary, list_len, map_len, new_bytes, new_cel_frame,
-    new_double, new_int, new_list, new_null, new_optional, new_optional_none, new_string, new_type,
-    new_uint, opaque_host_index, string_as_str, string_byte_len, w_kind, w_type, CelKind, CelRef,
-    W_BoolObject, W_CelFrame, W_DoubleObject, W_IntObject, W_UIntObject, CEL_OPAQUE_CLASS,
-    CEL_TYPE_CLASS,
+    cel_frame_slot, force_virtualizable_if_necessary, interned_list_eq, list_int_at, list_len,
+    map_len, new_bytes, new_cel_frame, new_double, new_int, new_list, new_list_ints, new_null,
+    new_optional, new_optional_none, new_string, new_type, new_uint, opaque_host_index,
+    string_as_str, string_byte_len, w_kind, w_type, CelKind, CelRef, W_BoolObject, W_CelFrame,
+    W_DoubleObject, W_IntObject, W_UIntObject, CEL_OPAQUE_CLASS, CEL_TYPE_CLASS,
 };
 use crate::runtime::optional::{
     cel_optional_has_value, cel_optional_none, cel_optional_of, cel_optional_of_non_zero_value,
@@ -999,6 +999,7 @@ impl<'a> Vm<'a> {
     fn vable_cell(operand: &Operand) -> CelRef {
         match operand {
             Operand::Interned(w) => *w,
+            Operand::Value(Value::Int(_)) => core::ptr::null_mut(),
             Operand::Value(v) => intern_leaf(v).unwrap_or(core::ptr::null_mut()),
             _ => core::ptr::null_mut(),
         }
@@ -1149,6 +1150,7 @@ impl<'a> Vm<'a> {
     fn leaf_of(operand: &Operand) -> Option<CelRef> {
         match operand {
             Operand::Interned(w) => Some(*w),
+            Operand::Value(Value::Int(_)) => None,
             Operand::Value(v) => intern_leaf(v),
             _ => None,
         }
@@ -1256,6 +1258,15 @@ impl<'a> Vm<'a> {
                 let Some(index) = interned_int(key) else {
                     return Ok(false);
                 };
+                if let Some(n) = unsafe { list_int_at(w, index) } {
+                    if is_optional {
+                        let item = new_int(n) as CelRef;
+                        self.push_operand(Operand::Interned(unsafe { cel_optional_of(item) }));
+                        return Ok(true);
+                    }
+                    self.push_operand(Operand::Value(Value::Int(n)));
+                    return Ok(true);
+                }
                 match unsafe { interned_list_get(w, index) } {
                     Some(item) => item,
                     None if is_optional => {
@@ -1630,10 +1641,7 @@ impl<'a> Vm<'a> {
                 crate::runtime::object::new_map(&pairs) as CelRef,
             )),
             Operand::Refs(items) => Ok(Operand::Interned(new_list(&items) as CelRef)),
-            Operand::Ints(words) => {
-                let refs: Vec<CelRef> = words.iter().map(|&n| new_int(n) as CelRef).collect();
-                Ok(Operand::Interned(new_list(&refs) as CelRef))
-            }
+            Operand::Ints(words) => Ok(Operand::Interned(new_list_ints(&words) as CelRef)),
             Operand::EmptyList(_) => Ok(Operand::Interned(new_list(&[]) as CelRef)),
             Operand::List(items) => {
                 let value = Value::list(items);
@@ -2087,14 +2095,18 @@ impl<'a> Vm<'a> {
                 let rhs = self.pop_operand().ok_or(CelErr::InternalError)?;
                 let lhs = self.pop_operand().ok_or(CelErr::InternalError)?;
                 if let (Some(a), Some(b)) = (Self::leaf_of(&lhs), Self::leaf_of(&rhs)) {
-                    let w = unsafe {
-                        if op == OpCode::Equals {
-                            cel_equals(a, b)
-                        } else {
-                            cel_not_equals(a, b)
-                        }
-                    };
-                    self.push_interned(w, op)?;
+                    if let Some(eq) = unsafe { interned_list_eq(a, b) } {
+                        self.push(Value::Bool(eq == (op == OpCode::Equals)));
+                    } else {
+                        let w = unsafe {
+                            if op == OpCode::Equals {
+                                cel_equals(a, b)
+                            } else {
+                                cel_not_equals(a, b)
+                            }
+                        };
+                        self.push_interned(w, op)?;
+                    }
                 } else {
                     let lhs = self.finish(lhs)?;
                     let rhs = self.finish(rhs)?;
@@ -2769,6 +2781,9 @@ impl<'a> Vm<'a> {
                 .map(Operand::Value)
                 .ok_or(CelErr::IndexOutOfBounds),
             Operand::Interned(w) if unsafe { w_kind(*w) } == CelKind::List => {
+                if let Some(n) = unsafe { list_int_at(*w, index) } {
+                    return Ok(Operand::Value(Value::Int(n)));
+                }
                 let item =
                     unsafe { interned_list_get(*w, index) }.ok_or(CelErr::IndexOutOfBounds)?;
                 Ok(Operand::Interned(item))
@@ -2787,6 +2802,7 @@ impl<'a> Vm<'a> {
     fn store_operand(&mut self, slot: u32, operand: Operand) -> CelResult<()> {
         let stored = match operand {
             Operand::Interned(w) => Operand::Interned(w),
+            Operand::Value(Value::Int(i)) => Operand::Value(Value::Int(i)),
             Operand::Value(v) => intern_leaf(&v)
                 .map(Operand::Interned)
                 .unwrap_or(Operand::Value(v)),
@@ -3659,6 +3675,10 @@ fn has_field(operand: &Value, field: &str) -> Result<Value, ExecutionError> {
 fn iter_keys(value: &Value) -> Result<Vec<Value>, ExecutionError> {
     match value {
         Value::List(list) => Ok((0..list.len()).map(|i| Value::Int(i as i64)).collect()),
+        Value::Interned(w) if unsafe { w_kind(*w) } == CelKind::List => {
+            let n = unsafe { list_len(*w) };
+            Ok((0..n).map(Value::Int).collect())
+        }
         _ => value_iter(value),
     }
 }

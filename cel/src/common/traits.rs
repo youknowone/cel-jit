@@ -56,21 +56,12 @@ pub(crate) mod adapter {
     use crate::ExecutionError;
 
     pub fn sizer_size(args: Vec<Value>) -> Result<Value, ExecutionError> {
-        let unpacked = args[0].unpack();
-        let size = match &unpacked {
-            // Byte length, not the character count the spec asks for. Preserved
-            // from the trait implementation this replaces.
-            Value::String(s) => s.len(),
-            Value::Bytes(b) => b.len(),
-            Value::List(l) => l.len(),
-            Value::Map(m) => m.len(),
-            other => {
-                return Err(ExecutionError::UnexpectedType {
-                    got: type_name(other),
-                    want: "missing trait Sizer".to_owned(),
-                })
-            }
-        };
-        Ok(Value::Int(size as i64))
+        match crate::objects::value_len(&args[0]) {
+            Some(size) => Ok(Value::Int(size)),
+            None => Err(ExecutionError::UnexpectedType {
+                got: type_name(&args[0]),
+                want: "missing trait Sizer".to_owned(),
+            }),
+        }
     }
 }

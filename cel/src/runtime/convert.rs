@@ -309,6 +309,9 @@ fn intern_list(list: &ListRef) -> CelRef {
         ListStorage::Object(_)
             if list.window_start() == 0 && list.len() == list.storage().len() =>
         {
+            if let Some(ints) = object_list_as_ints(list) {
+                return new_list_ints(&ints) as CelRef;
+            }
             let mut items = Vec::with_capacity(list.len());
             for elt in list.iter() {
                 items.push(value_to_ref(&elt).unwrap_or_else(|_| new_null() as CelRef));
@@ -319,6 +322,29 @@ fn intern_list(list: &ListRef) -> CelRef {
             let host = intern_host_any(Box::new(list.clone()));
             new_list_window(host, 0, list.len() as i64) as CelRef
         }
+    }
+}
+
+/// All-int object lists become an int column. Empty lists and the first
+/// non-int stop the scan and keep object storage.
+fn object_list_as_ints(list: &ListRef) -> Option<Vec<i64>> {
+    if list.is_empty() {
+        return None;
+    }
+    let mut ints = Vec::with_capacity(list.len());
+    for elt in list.iter() {
+        ints.push(value_as_int(&elt)?);
+    }
+    Some(ints)
+}
+
+fn value_as_int(v: &Value) -> Option<i64> {
+    match v {
+        Value::Int(i) => Some(*i),
+        Value::Interned(w) if unsafe { w_kind(*w) } == CelKind::Int => {
+            Some(unsafe { (*w.cast::<W_IntObject>()).intval })
+        }
+        _ => None,
     }
 }
 

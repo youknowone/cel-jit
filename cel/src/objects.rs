@@ -2,12 +2,15 @@ use crate::common::ast::{operators, CallExpr, ComprehensionExpr, EntryExpr, Expr
 #[cfg(feature = "structs")]
 use crate::common::types::CelStruct;
 use crate::context::Context;
-use crate::runtime::binop::map_lookup;
+use crate::runtime::binop::{cel_add, map_contains_key, map_key_refs, map_lookup, values_equal};
 use crate::runtime::convert::{intern_leaf, interned_list_get, interned_map_lookup_string};
+use crate::runtime::error::{take_error, CelErrCode, ERROR_SENTINEL};
 use crate::runtime::object::{
-    string_as_str, w_kind, CelKind, CelRef, MapStrategy, W_BoolObject, W_IntObject, W_MapObject,
-    W_UIntObject,
+    bytes_len, list_int_at, list_len, map_len, string_as_str, string_byte_len, w_kind, CelKind,
+    CelRef, ListStrategy, MapStrategy, W_BoolObject, W_DoubleObject, W_IntColumn, W_IntObject,
+    W_ListObject, W_MapObject, W_OptionalObject, W_UIntObject,
 };
+use crate::runtime::object_array::{items_block_items_base, items_capacity};
 use crate::ExecutionError::NoSuchOverload;
 use crate::{ExecutionError, Expression, FunctionContext};
 #[cfg(feature = "chrono")]
@@ -1149,7 +1152,7 @@ impl Value {
             Value::Null => ValueType::Null,
             #[cfg(feature = "structs")]
             Value::Struct(_) => ValueType::Struct,
-            Value::Interned(_) => self.unpack().type_of(),
+            Value::Interned(w) => interned_value_type(*w),
         }
     }
 
@@ -1166,7 +1169,7 @@ impl Value {
             #[cfg(feature = "chrono")]
             Value::Duration(v) => v.is_zero(),
             Value::Null => true,
-            Value::Interned(_) => self.unpack().is_zero(),
+            Value::Interned(w) => interned_is_zero(*w),
             _ => false,
         }
     }
@@ -1188,10 +1191,9 @@ impl From<&Value> for Value {
 impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
-            (Value::Interned(a), Value::Interned(b)) => unsafe {
-                crate::runtime::binop::values_equal(*a, *b)
-            },
-            (Value::Interned(_), _) | (_, Value::Interned(_)) => self.unpack() == other.unpack(),
+            (Value::Interned(a), Value::Interned(b)) => interned_eq(*a, *b),
+            (Value::Interned(a), other) => interned_eq_public(*a, other),
+            (other, Value::Interned(b)) => interned_eq_public(*b, other),
             (Value::Map(a), Value::Map(b)) => a == b,
             (Value::List(a), Value::List(b)) => a == b,
             (Value::Int(a), Value::Int(b)) => a == b,
@@ -1469,10 +1471,8 @@ impl Value {
                             return if Ok(true) == left {
                                 Ok(Value::Bool(true))
                             } else {
-                                let right = match Value::resolve_value(&call.args[1], ctx)? {
-                                    Value::Bool(b) => Some(b),
-                                    _ => None,
-                                };
+                                let right =
+                                    interned_as_bool(&Value::resolve_value(&call.args[1], ctx)?);
                                 match (left, right) {
                                     (Ok(false), Some(right)) => Ok(Value::Bool(right)),
                                     (Err(_), Some(true)) => Ok(Value::Bool(true)),
@@ -1485,10 +1485,8 @@ impl Value {
                             return if Ok(false) == left {
                                 Ok(Value::Bool(false))
                             } else {
-                                let right = match Value::resolve_value(&call.args[1], ctx)? {
-                                    Value::Bool(b) => Some(b),
-                                    _ => None,
-                                };
+                                let right =
+                                    interned_as_bool(&Value::resolve_value(&call.args[1], ctx)?);
                                 match (left, right) {
                                     (Ok(true), Some(right)) => Ok(Value::Bool(right)),
                                     (Err(_), Some(false)) => Ok(Value::Bool(false)),
@@ -1509,15 +1507,13 @@ impl Value {
                         operators::INDEX | operators::OPT_INDEX => {
                             let mut is_optional = call.func_name == operators::OPT_INDEX;
                             let value = Value::resolve_value(&call.args[0], ctx)?;
-                            let value = match as_optional(&value) {
-                                Some(opt) => {
+                            let value = match optional_view(&value) {
+                                OptView::Present(inner) => {
                                     is_optional = true;
-                                    match opt.value() {
-                                        Some(v) => v.clone(),
-                                        None => return Ok(optional_none()),
-                                    }
+                                    inner
                                 }
-                                None => value,
+                                OptView::Empty => return Ok(optional_none()),
+                                OptView::Plain => value,
                             };
                             let key = Value::resolve_value(&call.args[1], ctx)?;
                             let result = value_index(&value, &key);
@@ -1541,19 +1537,16 @@ impl Value {
                                     ))
                                 }
                             };
-                            return Ok(match as_optional(&operand) {
+                            return Ok(match optional_view(&operand) {
                                 // `Optional::map` keeps the outer `Some` and
                                 // substitutes `optional.none` for a missing
                                 // field, so a miss nests one optional inside
                                 // another. Mirrored, not corrected, here.
-                                Some(opt) => match opt.value() {
-                                    None => optional_none(),
-                                    Some(inner) => optional_of(
-                                        value_index(inner, &field)
-                                            .unwrap_or_else(|_| optional_none()),
-                                    ),
-                                },
-                                None => optional_of(value_index(&operand, &field)?),
+                                OptView::Empty => optional_none(),
+                                OptView::Present(inner) => optional_of(
+                                    value_index(&inner, &field).unwrap_or_else(|_| optional_none()),
+                                ),
+                                OptView::Plain => optional_of(value_index(&operand, &field)?),
                             });
                         }
                         operators::ADD => return binary_op("add", call, ctx),
@@ -1584,9 +1577,12 @@ impl Value {
                 if call.args.len() == 1 {
                     match call.func_name.as_str() {
                         operators::LOGICAL_NOT => {
-                            return match Value::resolve_value(&call.args[0], ctx)? {
-                                Value::Bool(b) => Ok(Value::Bool(!b)),
-                                _ => Err(ExecutionError::NoSuchOverload),
+                            return match interned_as_bool(&Value::resolve_value(
+                                &call.args[0],
+                                ctx,
+                            )?) {
+                                Some(b) => Ok(Value::Bool(!b)),
+                                None => Err(ExecutionError::NoSuchOverload),
                             };
                         }
                         operators::NEGATE => {
@@ -1608,6 +1604,7 @@ impl Value {
                         if let Some(op) = ctx.env().find_overload(&call.func_name, &args) {
                             return op(args);
                         }
+                        let args: Vec<Value> = args.into_iter().map(|v| v.unpack()).collect();
                         let func = ctx.get_function(call.func_name.as_str()).ok_or_else(|| {
                             ExecutionError::UndeclaredReference(call.func_name.clone().into())
                         })?;
@@ -1654,7 +1651,9 @@ impl Value {
                                 {
                                     return op(args);
                                 }
-                                let target = args.remove(0);
+                                let target = args.remove(0).unpack();
+                                let args: Vec<Value> =
+                                    args.into_iter().map(|v| v.unpack()).collect();
                                 let func =
                                     ctx.get_function(call.func_name.as_str()).ok_or_else(|| {
                                         ExecutionError::UndeclaredReference(
@@ -1682,6 +1681,9 @@ impl Value {
                         Value::Map(map) => {
                             Ok(Value::Bool(map.contains_key(&KeyRef::String(field))))
                         }
+                        Value::Interned(w) if unsafe { w_kind(*w) } == CelKind::Map => Ok(
+                            Value::Bool(unsafe { interned_map_lookup_string(*w, field) }.is_some()),
+                        ),
                         #[cfg(feature = "structs")]
                         Value::Struct(_) => Ok(Value::Bool(value_field(&left, field).is_ok())),
                         _ => value_field(&left, field),
@@ -1737,7 +1739,7 @@ impl Value {
                 let accu_init = Value::resolve_value(&comprehension.accu_init, ctx)?;
                 let iter = Value::resolve_value(&comprehension.iter_range, ctx)?;
                 let mut ctx = ctx.new_inner_scope();
-                let mut items = value_iter(&iter)?.into_iter();
+                let mut items = iter_items(&iter)?;
 
                 if let Some(append) = AccuAppend::of(comprehension) {
                     if let Value::List(list) = accu_init {
@@ -1750,8 +1752,8 @@ impl Value {
                         // `NewListFromArg` does: `filter` may leave some of
                         // it unused, `map` fills it exactly.
                         list.reserve(items.len());
-                        for item in items {
-                            ctx.add_variable_from_value(&comprehension.iter_var, item);
+                        while let Some(item) = items.next() {
+                            ctx.rebind(&comprehension.iter_var, item);
                             if let Some(guard) = append.guard {
                                 if !try_bool_value(Value::resolve_value(guard, &ctx))? {
                                     continue;
@@ -1759,20 +1761,20 @@ impl Value {
                             }
                             list.push(Value::resolve_value(append.element, &ctx)?);
                         }
-                        ctx.add_variable_from_value(&comprehension.accu_var, Value::list(list));
+                        ctx.rebind(&comprehension.accu_var, Value::list(list));
                         return Value::resolve_value(&comprehension.result, &ctx);
                     }
                     unreachable!("AccuAppend::of implies a list accumulator");
                 }
 
-                ctx.add_variable_from_value(&comprehension.accu_var, accu_init);
-                for item in items.by_ref() {
+                ctx.rebind(&comprehension.accu_var, accu_init);
+                while let Some(item) = items.next() {
                     if !try_bool_value(Value::resolve_value(&comprehension.loop_cond, &ctx))? {
                         break;
                     }
-                    ctx.add_variable_from_value(&comprehension.iter_var, item);
+                    ctx.rebind(&comprehension.iter_var, item);
                     let accu = Value::resolve_value(&comprehension.loop_step, &ctx)?;
-                    ctx.add_variable_from_value(&comprehension.accu_var, accu);
+                    ctx.rebind(&comprehension.accu_var, accu);
                 }
                 Value::resolve_value(&comprehension.result, &ctx)
             }
@@ -1834,13 +1836,50 @@ pub(crate) fn as_optional(value: &Value) -> Option<&OptionalValue> {
     }
 }
 
+enum OptView {
+    Plain,
+    Empty,
+    Present(Value),
+}
+
+/// An optional in either public or interned form, without rebuilding the inner
+/// value as a public container.
+fn optional_view(value: &Value) -> OptView {
+    if let Value::Interned(w) = value {
+        if unsafe { w_kind(*w) } != CelKind::Optional {
+            return OptView::Plain;
+        }
+        let inner = unsafe { (*w.cast::<W_OptionalObject>()).w_value };
+        return if inner.is_null() {
+            OptView::Empty
+        } else {
+            OptView::Present(Value::from_interned(inner))
+        };
+    }
+    match as_optional(value) {
+        None => OptView::Plain,
+        Some(opt) => match opt.value() {
+            None => OptView::Empty,
+            Some(inner) => OptView::Present(inner.clone()),
+        },
+    }
+}
+
 fn try_bool_value(val: Result<Value, ExecutionError>) -> Result<bool, ExecutionError> {
     match val {
-        Ok(v) => match v.unpack() {
-            Value::Bool(b) => Ok(b),
-            _ => Err(ExecutionError::NoSuchOverload),
-        },
+        Ok(v) => interned_as_bool(&v).ok_or(ExecutionError::NoSuchOverload),
         Err(err) => Err(err),
+    }
+}
+
+/// A bool in either public or interned form.
+fn interned_as_bool(value: &Value) -> Option<bool> {
+    match value {
+        Value::Bool(b) => Some(*b),
+        Value::Interned(w) if unsafe { w_kind(*w) } == CelKind::Bool => {
+            Some(unsafe { (*w.cast::<W_BoolObject>()).boolval } != 0)
+        }
+        _ => None,
     }
 }
 
@@ -1867,7 +1906,15 @@ fn resolve_args(args: &[Expression], ctx: &Context) -> Result<Vec<Value>, Execut
 /// evaluators, not by reading the impls: a capability trait's terminal error is
 /// easy to misattribute to a neighbouring impl.
 pub(crate) fn mismatch_is_no_such_overload(op: &'static str, value: &Value) -> bool {
-    let value = value.unpack();
+    if let Value::Interned(w) = value {
+        return match unsafe { w_kind(*w) } {
+            CelKind::Int => true,
+            CelKind::List if op == "add" => true,
+            #[cfg(feature = "chrono")]
+            CelKind::Duration if op == "sub" => true,
+            _ => false,
+        };
+    }
     #[cfg(feature = "chrono")]
     let duration_sub = matches!(value, Value::Duration(_)) && op == "sub";
     #[cfg(not(feature = "chrono"))]
@@ -1928,15 +1975,51 @@ pub(crate) fn binary_values_ref(
 ///
 /// Cross-type and string/list/bytes stay on the owned [`ops`] impls, which
 /// are the walker's answers and the ones the oracle pins.
+fn interned_or_public_int(value: &Value) -> Option<i64> {
+    match value {
+        Value::Int(i) => Some(*i),
+        Value::Interned(w) if unsafe { w_kind(*w) } == CelKind::Int => {
+            Some(unsafe { (*w.cast::<W_IntObject>()).intval })
+        }
+        _ => None,
+    }
+}
+
+fn interned_or_public_uint(value: &Value) -> Option<u64> {
+    match value {
+        Value::UInt(u) => Some(*u),
+        Value::Interned(w) if unsafe { w_kind(*w) } == CelKind::UInt => {
+            Some(unsafe { (*w.cast::<W_UIntObject>()).uintval })
+        }
+        _ => None,
+    }
+}
+
+fn interned_or_public_float(value: &Value) -> Option<f64> {
+    match value {
+        Value::Float(f) => Some(*f),
+        Value::Interned(w) if unsafe { w_kind(*w) } == CelKind::Double => {
+            Some(unsafe { (*w.cast::<W_DoubleObject>()).floatval })
+        }
+        _ => None,
+    }
+}
+
 fn numeric_binop(
     op: &'static str,
     lhs: &Value,
     rhs: &Value,
 ) -> Option<Result<Value, ExecutionError>> {
+    if let (Some(l), Some(r)) = (interned_or_public_int(lhs), interned_or_public_int(rhs)) {
+        return Some(int_binop(op, l, r));
+    }
+    if let (Some(l), Some(r)) = (interned_or_public_uint(lhs), interned_or_public_uint(rhs)) {
+        return Some(uint_binop(op, l, r));
+    }
+    if let (Some(l), Some(r)) = (interned_or_public_float(lhs), interned_or_public_float(rhs)) {
+        return Some(float_binop(op, l, r));
+    }
     match (lhs, rhs) {
-        (Value::Int(l), Value::Int(r)) => Some(int_binop(op, *l, *r)),
-        (Value::UInt(l), Value::UInt(r)) => Some(uint_binop(op, *l, *r)),
-        (Value::Float(l), Value::Float(r)) => Some(float_binop(op, *l, *r)),
         #[cfg(feature = "chrono")]
         (Value::Duration(l), Value::Duration(r)) => Some(duration_binop(op, *l, *r)),
         #[cfg(feature = "chrono")]
@@ -2075,8 +2158,18 @@ fn timestamp_duration_binop(
 /// or a map by falling through, where `common/types` gives those no `Comparer`,
 /// so ordering them is `NoSuchOverload`.
 fn has_comparer(value: &Value) -> bool {
-    if matches!(value, Value::Interned(_)) {
-        return has_comparer(&value.unpack());
+    if let Value::Interned(w) = value {
+        return matches!(
+            unsafe { w_kind(*w) },
+            CelKind::Int
+                | CelKind::UInt
+                | CelKind::Double
+                | CelKind::Str
+                | CelKind::Bytes
+                | CelKind::Bool
+                | CelKind::Duration
+                | CelKind::Timestamp
+        );
     }
     #[cfg(feature = "chrono")]
     if matches!(value, Value::Duration(_) | Value::Timestamp(_)) {
@@ -2162,10 +2255,8 @@ fn try_interned_value_index(
 
 fn interned_list_index(w: CelRef, key: &Value) -> Result<Value, ExecutionError> {
     let index = interned_or_public_list_index(key)?;
-    match unsafe { interned_list_get(w, index) } {
-        Some(item) => Ok(Value::from_interned(item)),
-        None => Err(ExecutionError::IndexOutOfBounds(list_index_error_key(key))),
-    }
+    interned_list_item(w, index)
+        .ok_or_else(|| ExecutionError::IndexOutOfBounds(list_index_error_key(key)))
 }
 
 fn interned_or_public_list_index(key: &Value) -> Result<i64, ExecutionError> {
@@ -2265,13 +2356,117 @@ fn interned_map_index(w: CelRef, key: &Value) -> Option<Result<Value, ExecutionE
     })
 }
 
+fn interned_value_type(w: CelRef) -> ValueType {
+    match unsafe { w_kind(w) } {
+        CelKind::List => ValueType::List,
+        CelKind::Map => ValueType::Map,
+        CelKind::Int => ValueType::Int,
+        CelKind::UInt => ValueType::UInt,
+        CelKind::Double => ValueType::Float,
+        CelKind::Str => ValueType::String,
+        CelKind::Bytes => ValueType::Bytes,
+        CelKind::Bool => ValueType::Bool,
+        CelKind::Null => ValueType::Null,
+        CelKind::Duration => ValueType::Duration,
+        CelKind::Timestamp => ValueType::Timestamp,
+        CelKind::Optional | CelKind::Type | CelKind::Opaque => ValueType::Opaque,
+        #[cfg(feature = "structs")]
+        CelKind::Struct => ValueType::Struct,
+        CelKind::Frame => ValueType::Null,
+    }
+}
+
+fn interned_is_zero(w: CelRef) -> bool {
+    match unsafe { w_kind(w) } {
+        CelKind::List => unsafe { list_len(w) == 0 },
+        CelKind::Map => unsafe { map_len(w) == 0 },
+        CelKind::Int => unsafe { (*w.cast::<W_IntObject>()).intval == 0 },
+        CelKind::UInt => unsafe { (*w.cast::<W_UIntObject>()).uintval == 0 },
+        CelKind::Double => unsafe { (*w.cast::<W_DoubleObject>()).floatval == 0.0 },
+        CelKind::Str => unsafe { string_byte_len(w) == 0 },
+        CelKind::Bytes => unsafe { bytes_len(w) == 0 },
+        CelKind::Bool => unsafe { (*w.cast::<W_BoolObject>()).boolval == 0 },
+        CelKind::Null => true,
+        CelKind::Duration => Value::from_interned(w).unpack().is_zero(),
+        _ => false,
+    }
+}
+
+/// Length of a sizer: list, map, string, or bytes, interned or public.
+pub(crate) fn value_len(value: &Value) -> Option<i64> {
+    match value {
+        Value::List(l) => Some(l.len() as i64),
+        Value::Map(m) => Some(m.len() as i64),
+        Value::String(s) => Some(s.len() as i64),
+        Value::Bytes(b) => Some(b.len() as i64),
+        Value::Interned(w) => match unsafe { w_kind(*w) } {
+            CelKind::List => Some(unsafe { list_len(*w) }),
+            CelKind::Map => Some(unsafe { map_len(*w) }),
+            CelKind::Str => Some(unsafe { string_byte_len(*w) }),
+            CelKind::Bytes => Some(unsafe { bytes_len(*w) }),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn interned_binop_result(w: CelRef) -> ResolveResult {
+    if w == ERROR_SENTINEL {
+        Err(raised_execution_error())
+    } else {
+        Ok(Value::from_interned(w))
+    }
+}
+
+fn raised_execution_error() -> ExecutionError {
+    let Some(err) = take_error() else {
+        return ExecutionError::InternalError("raised without an error".to_owned());
+    };
+    let lhs = unsafe { crate::runtime::convert::ref_to_value(err.lhs) }.unwrap_or(Value::Null);
+    let rhs = if err.rhs == ERROR_SENTINEL {
+        Value::Int(0)
+    } else {
+        unsafe { crate::runtime::convert::ref_to_value(err.rhs) }.unwrap_or(Value::Null)
+    };
+    match err.code {
+        CelErrCode::Overflow => ExecutionError::Overflow(err.op, lhs, rhs),
+        CelErrCode::DivisionByZero => ExecutionError::DivisionByZero(lhs),
+        CelErrCode::RemainderByZero => ExecutionError::RemainderByZero(lhs),
+        CelErrCode::UnsupportedBinaryOperator => {
+            if mismatch_is_no_such_overload(err.op, &lhs) {
+                ExecutionError::NoSuchOverload
+            } else {
+                ExecutionError::UnsupportedBinaryOperator(err.op, lhs, rhs)
+            }
+        }
+        CelErrCode::NoSuchOverload => ExecutionError::NoSuchOverload,
+        CelErrCode::NoneDereference => {
+            ExecutionError::function_error(err.op, "optional.none() dereference")
+        }
+    }
+}
+
 /// `container.field`, looked up without materializing the field name.
 ///
 /// `KeyRef::String` borrows, so a map field select costs no allocation. Going
 /// through [`value_index`] would build an `Arc<String>` per access.
 pub(crate) fn value_field(container: &Value, field: &str) -> Result<Value, ExecutionError> {
-    let container = container.unpack();
-    match &container {
+    if let Value::Interned(w) = container {
+        return match unsafe { w_kind(*w) } {
+            CelKind::Map => match unsafe { interned_map_lookup_string(*w, field) } {
+                Some(item) => Ok(Value::from_interned(item)),
+                None => Err(ExecutionError::NoSuchKey(Arc::new(field.to_string()))),
+            },
+            CelKind::List => Err(ExecutionError::UnexpectedType {
+                got: ValueType::String.to_string(),
+                want: format!("{}|{}", ValueType::Int, ValueType::UInt),
+            }),
+            #[cfg(feature = "structs")]
+            CelKind::Struct => value_index(container, &Value::String(Arc::new(field.to_string()))),
+            _ => Err(ExecutionError::NoSuchOverload),
+        };
+    }
+    match container {
         Value::Map(map) => map
             .get(&KeyRef::String(field))
             .map(|v| v.into_owned())
@@ -2281,7 +2476,7 @@ pub(crate) fn value_field(container: &Value, field: &str) -> Result<Value, Execu
             want: format!("{}|{}", ValueType::Int, ValueType::UInt),
         }),
         #[cfg(feature = "structs")]
-        Value::Struct(_) => value_index(&container, &Value::String(Arc::new(field.to_string()))),
+        Value::Struct(_) => value_index(container, &Value::String(Arc::new(field.to_string()))),
         _ => Err(ExecutionError::NoSuchOverload),
     }
 }
@@ -2364,21 +2559,206 @@ fn key_display(key: &Key) -> String {
 /// A needle that cannot be a map key is an error rather than a miss, which is
 /// why the conversion is propagated instead of folded into `false`.
 pub(crate) fn value_contains(container: &Value, needle: &Value) -> Result<bool, ExecutionError> {
-    let container = container.unpack();
+    if let Value::Interned(w) = container {
+        return interned_contains(*w, needle);
+    }
     let needle = needle.unpack();
-    match &container {
+    match container {
         Value::List(list) => Ok(list.contains(&needle)),
         Value::Map(map) => Ok(map.contains_key(&value_key(needle)?)),
         _ => Err(ExecutionError::NoSuchOverload),
     }
 }
 
+fn interned_contains(w: CelRef, needle: &Value) -> Result<bool, ExecutionError> {
+    match unsafe { w_kind(w) } {
+        CelKind::List => {
+            if let Some(ints) = interned_ints_slice(w) {
+                return Ok(interned_or_public_int(needle).is_some_and(|n| ints.contains(&n)));
+            }
+            let n = intern_leaf(needle).ok_or(ExecutionError::NoSuchOverload)?;
+            Ok(interned_list_contains_in_place(w, n))
+        }
+        CelKind::Map => {
+            interned_map_key(needle)?;
+            let k = intern_leaf(needle).ok_or(ExecutionError::NoSuchOverload)?;
+            Ok(unsafe { map_contains_key(w, k) })
+        }
+        _ => Err(ExecutionError::NoSuchOverload),
+    }
+}
+
+/// Scan without copying the list into a buffer. A hit at index *k* costs *k*
+/// equality tests, not a traversal of the tail.
+fn interned_list_contains_in_place(w: CelRef, needle: CelRef) -> bool {
+    let n = unsafe { list_len(w) };
+    let mut i = 0i64;
+    while i < n {
+        if let Some(item) = unsafe { interned_list_get(w, i) } {
+            if unsafe { values_equal(item, needle) } {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+fn interned_eq(a: CelRef, b: CelRef) -> bool {
+    if let Some(eq) = unsafe { crate::runtime::object::interned_list_eq(a, b) } {
+        return eq;
+    }
+    unsafe { values_equal(a, b) }
+}
+
+fn interned_eq_public(w: CelRef, other: &Value) -> bool {
+    if let Some(ints) = interned_ints_slice(w) {
+        if let Value::List(list) = other {
+            return public_list_eq_ints(list, ints);
+        }
+    }
+    intern_leaf(other)
+        .map(|b| interned_eq(w, b))
+        .unwrap_or(false)
+}
+
+fn public_list_eq_ints(list: &ListRef, ints: &[i64]) -> bool {
+    if list.len() != ints.len() {
+        return false;
+    }
+    match list.storage() {
+        ListStorage::Ints(v) => {
+            let start = list.window_start();
+            v.get(start..start + ints.len()) == Some(ints)
+        }
+        _ => (0..ints.len()).all(|i| list.get(i) == Some(Value::Int(ints[i]))),
+    }
+}
+
+fn interned_ints_slice<'a>(w: CelRef) -> Option<&'a [i64]> {
+    unsafe { crate::runtime::object::list_ints_slice(w) }
+}
+
 /// The elements a comprehension iterates over.
 pub(crate) fn value_iter(value: &Value) -> Result<Vec<Value>, ExecutionError> {
-    match &value.unpack() {
-        Value::List(list) => Ok(list.to_vec()),
-        Value::Map(map) => Ok(map_keys(map)),
+    let mut items = iter_items(value)?;
+    let mut out = Vec::with_capacity(items.len());
+    while let Some(item) = items.next() {
+        out.push(item);
+    }
+    Ok(out)
+}
+
+/// One pass over a list or map. An interned Ints list is read in place as
+/// unboxed ints; an interned object list yields the stored refs from a
+/// slice resolved once before the loop.
+enum IterItems {
+    Vec(std::vec::IntoIter<Value>),
+    InternedInts { ints: &'static [i64], i: usize },
+    InternedRefs { refs: &'static [CelRef], i: usize },
+    InternedList { w: CelRef, i: i64, n: i64 },
+}
+
+impl IterItems {
+    fn len(&self) -> usize {
+        match self {
+            IterItems::Vec(it) => it.len(),
+            IterItems::InternedInts { ints, i } => ints.len().saturating_sub(*i),
+            IterItems::InternedRefs { refs, i } => refs.len().saturating_sub(*i),
+            IterItems::InternedList { i, n, .. } => (*n - *i).max(0) as usize,
+        }
+    }
+
+    fn next(&mut self) -> Option<Value> {
+        match self {
+            IterItems::Vec(it) => it.next(),
+            IterItems::InternedInts { ints, i } => {
+                let v = ints.get(*i)?;
+                *i += 1;
+                Some(Value::Int(*v))
+            }
+            IterItems::InternedRefs { refs, i } => {
+                let w = refs.get(*i)?;
+                *i += 1;
+                Some(Value::from_interned(*w))
+            }
+            IterItems::InternedList { w, i, n } => {
+                if *i >= *n {
+                    return None;
+                }
+                let item = interned_list_item(*w, *i)?;
+                *i += 1;
+                Some(item)
+            }
+        }
+    }
+}
+
+fn iter_items(value: &Value) -> Result<IterItems, ExecutionError> {
+    if let Value::Interned(w) = value {
+        return match unsafe { w_kind(*w) } {
+            CelKind::List => interned_list_items(*w),
+            CelKind::Map => Ok(IterItems::Vec(
+                unsafe { map_key_refs(*w) }
+                    .into_iter()
+                    .map(Value::from_interned)
+                    .collect::<Vec<_>>()
+                    .into_iter(),
+            )),
+            _ => Err(ExecutionError::NoSuchOverload),
+        };
+    }
+    match value {
+        Value::List(list) => Ok(IterItems::Vec(list.to_vec().into_iter())),
+        Value::Map(map) => Ok(IterItems::Vec(map_keys(map).into_iter())),
         _ => Err(ExecutionError::NoSuchOverload),
+    }
+}
+
+fn interned_list_items(w: CelRef) -> Result<IterItems, ExecutionError> {
+    unsafe {
+        let leaf = &*w.cast::<W_ListObject>();
+        let start = leaf.start as usize;
+        let n = leaf.length as usize;
+        if leaf.strategy == ListStrategy::Ints && !leaf.storage.is_null() {
+            let col = &*leaf.storage.cast::<W_IntColumn>();
+            if !col.data.is_null() && start.saturating_add(n) <= col.length as usize {
+                let ints = std::slice::from_raw_parts(col.data.add(start), n);
+                return Ok(IterItems::InternedInts { ints, i: 0 });
+            }
+        }
+        if leaf.strategy == ListStrategy::Object {
+            if n == 0 {
+                return Ok(IterItems::InternedRefs { refs: &[], i: 0 });
+            }
+            let base = items_block_items_base(leaf.items);
+            if !base.is_null() && start.saturating_add(n) <= items_capacity(leaf.items) {
+                let refs = std::slice::from_raw_parts(base.add(start), n);
+                return Ok(IterItems::InternedRefs { refs, i: 0 });
+            }
+        }
+        Ok(IterItems::InternedList {
+            w,
+            i: 0,
+            n: leaf.length,
+        })
+    }
+}
+
+/// One element of an interned list. Ints stay unboxed; object/window items
+/// stay the stored ref.
+fn interned_list_item(w: CelRef, index: i64) -> Option<Value> {
+    unsafe {
+        let leaf = &*w.cast::<W_ListObject>();
+        if index < 0 || index >= leaf.length {
+            return None;
+        }
+        match leaf.strategy {
+            ListStrategy::Ints => list_int_at(w, index).map(Value::Int),
+            ListStrategy::Object | ListStrategy::Window => {
+                interned_list_get(w, index).map(Value::from_interned)
+            }
+        }
     }
 }
 
@@ -2388,6 +2768,10 @@ impl ops::Add<Value> for Value {
     #[inline(always)]
     fn add(self, rhs: Value) -> Self::Output {
         if matches!(self, Value::Interned(_)) || matches!(rhs, Value::Interned(_)) {
+            if let (Some(a), Some(b)) = (intern_leaf(&self), intern_leaf(&rhs)) {
+                let w = unsafe { cel_add(a, b) };
+                return interned_binop_result(w);
+            }
             return self.unpack().add(rhs.unpack());
         }
         match (self, rhs) {

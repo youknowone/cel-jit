@@ -97,8 +97,9 @@ impl Type {
     /// Every family reports a shared constant except the two that carry a name:
     /// an opaque handle names its host type, and a struct names itself.
     fn matches(&self, val: &Value) -> bool {
-        let unpacked = val.unpack();
-        let val = &unpacked;
+        if let Value::Interned(w) = val {
+            return interned_matches(self, *w);
+        }
         let constant = match val {
             Value::Bool(_) => &BOOL_TYPE,
             Value::Int(_) => &INT_TYPE,
@@ -131,7 +132,7 @@ impl Type {
                         && self.runtime_type_name == o.runtime_type_name()
                 };
             }
-            Value::Interned(_) => return self.matches(&val.unpack()),
+            Value::Interned(_) => return false,
         };
         self == constant
     }
@@ -389,8 +390,12 @@ impl Type {
 /// [`ValueType`](crate::objects::ValueType)'s `Display`, which spells the same
 /// families `float`, `duration` and `null`.
 pub(crate) fn type_name(value: &Value) -> String {
-    let unpacked = value.unpack();
-    let value = &unpacked;
+    if let Value::Interned(w) = value {
+        if let Some(name) = interned_type_name(*w) {
+            return name;
+        }
+        return type_name(&value.unpack());
+    }
     match value {
         Value::Bool(_) => BOOL_TYPE.name().to_owned(),
         Value::Int(_) => INT_TYPE.name().to_owned(),
@@ -422,8 +427,12 @@ pub(crate) fn type_name(value: &Value) -> String {
 /// Returns it owned because the two named families build theirs per instance;
 /// overload matching uses [`Type::is_assignable`], which needs no allocation.
 pub(crate) fn type_of(value: &Value) -> Type {
-    let unpacked = value.unpack();
-    let value = &unpacked;
+    if let Value::Interned(w) = value {
+        if let Some(ty) = interned_type(*w) {
+            return ty.to_owned();
+        }
+        return type_of(&value.unpack());
+    }
     match value {
         Value::Bool(_) => BOOL_TYPE.to_owned(),
         Value::Int(_) => INT_TYPE.to_owned(),
@@ -450,6 +459,43 @@ pub(crate) fn type_of(value: &Value) -> Type {
         },
         Value::Interned(_) => type_of(&value.unpack()),
     }
+}
+
+fn interned_type(w: crate::runtime::object::CelRef) -> Option<&'static Type> {
+    use crate::runtime::object::{w_kind, CelKind};
+    match unsafe { w_kind(w) } {
+        CelKind::Bool => Some(&BOOL_TYPE),
+        CelKind::Int => Some(&INT_TYPE),
+        CelKind::UInt => Some(&UINT_TYPE),
+        CelKind::Double => Some(&DOUBLE_TYPE),
+        CelKind::Str => Some(&STRING_TYPE),
+        CelKind::Bytes => Some(&BYTES_TYPE),
+        CelKind::Null => Some(&NULL_TYPE),
+        CelKind::List => Some(&LIST_TYPE),
+        CelKind::Map => Some(&MAP_TYPE),
+        CelKind::Duration => Some(&DURATION_TYPE),
+        CelKind::Timestamp => Some(&TIMESTAMP_TYPE),
+        CelKind::Optional => Some(&OPTIONAL_TYPE),
+        CelKind::Type => None,
+        _ => None,
+    }
+}
+
+fn interned_matches(ty: &Type, w: crate::runtime::object::CelRef) -> bool {
+    if unsafe { crate::runtime::object::w_kind(w) } == crate::runtime::object::CelKind::Type {
+        return ty.kind() == Kind::Type;
+    }
+    match interned_type(w) {
+        Some(constant) => ty == constant,
+        None => ty.matches(&Value::from_interned(w).unpack()),
+    }
+}
+
+fn interned_type_name(w: crate::runtime::object::CelRef) -> Option<String> {
+    if unsafe { crate::runtime::object::w_kind(w) } == crate::runtime::object::CelKind::Type {
+        return Some(TYPE_TYPE.name().to_owned());
+    }
+    interned_type(w).map(|t| t.name().to_owned())
 }
 
 /// The mismatch an overload reports when its argument is not the declared type.

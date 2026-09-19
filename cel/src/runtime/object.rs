@@ -639,6 +639,90 @@ pub unsafe fn list_get(w: CelRef, index: i64) -> Option<CelRef> {
     }
 }
 
+/// The unboxed integer at `index` of an Ints-strategy list, with no allocation.
+///
+/// `None` if `w` is not an Ints list or `index` is out of range.
+///
+/// # Safety
+///
+/// `w` is a live [`W_ListObject`].
+pub unsafe fn list_int_at(w: CelRef, index: i64) -> Option<i64> {
+    if index < 0 {
+        return None;
+    }
+    let leaf = &*w.cast::<W_ListObject>();
+    if leaf.strategy != ListStrategy::Ints || index >= leaf.length {
+        return None;
+    }
+    if leaf.storage.is_null() {
+        return None;
+    }
+    let col = &*leaf.storage.cast::<W_IntColumn>();
+    let at = leaf.start + index;
+    if col.data.is_null() || at < 0 || at >= col.length {
+        return None;
+    }
+    Some(*col.data.add(at as usize))
+}
+
+/// The int column of an Ints-strategy list, or `None` if `w` is not one.
+///
+/// # Safety
+///
+/// `w` is a live value.
+pub unsafe fn list_ints_slice<'a>(w: CelRef) -> Option<&'a [i64]> {
+    if w_kind(w) != CelKind::List {
+        return None;
+    }
+    let leaf = &*w.cast::<W_ListObject>();
+    if leaf.strategy != ListStrategy::Ints || leaf.storage.is_null() {
+        return None;
+    }
+    let col = &*leaf.storage.cast::<W_IntColumn>();
+    let start = leaf.start as usize;
+    let n = leaf.length as usize;
+    if col.data.is_null() || start.saturating_add(n) > col.length as usize {
+        return None;
+    }
+    Some(std::slice::from_raw_parts(col.data.add(start), n))
+}
+
+/// Equality of two interned lists when at least one is an Ints column.
+///
+/// `None` if neither side is Ints; the caller then uses the generic path.
+///
+/// # Safety
+///
+/// Both operands are live values.
+pub unsafe fn interned_list_eq(a: CelRef, b: CelRef) -> Option<bool> {
+    match (list_ints_slice(a), list_ints_slice(b)) {
+        (Some(la), Some(lb)) => Some(la == lb),
+        (Some(ints), None) if w_kind(b) == CelKind::List => Some(object_list_eq_ints(b, ints)),
+        (None, Some(ints)) if w_kind(a) == CelKind::List => Some(object_list_eq_ints(a, ints)),
+        _ => None,
+    }
+}
+
+unsafe fn object_list_eq_ints(w: CelRef, ints: &[i64]) -> bool {
+    if list_len(w) as usize != ints.len() {
+        return false;
+    }
+    let mut i = 0i64;
+    while i < ints.len() as i64 {
+        let Some(item) = list_get(w, i) else {
+            return false;
+        };
+        if w_kind(item) != CelKind::Int {
+            return false;
+        }
+        if (*item.cast::<W_IntObject>()).intval != ints[i as usize] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
 /// An empty list whose items block has room for `cap` appends.
 pub fn new_list_with_capacity(cap: i64) -> *mut W_ListObject {
     let n = cap.max(0) as usize;

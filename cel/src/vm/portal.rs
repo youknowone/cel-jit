@@ -23,9 +23,9 @@ use crate::runtime::binop::{
 use crate::runtime::convert::{intern_leaf, interned_list_get, interned_map_lookup_string};
 use crate::runtime::error::ERROR_SENTINEL;
 use crate::runtime::object::{
-    bytes_len, list_len, list_try_append, map_len, new_bool, new_int, new_list_with_capacity,
-    string_as_str, string_byte_len, w_kind, CelKind, CelRef, W_BoolObject, W_IntObject,
-    W_OptionalObject,
+    bytes_len, interned_list_eq, list_int_at, list_ints_slice, list_len, list_try_append, map_len,
+    new_bool, new_int, new_list_with_capacity, string_as_str, string_byte_len, w_kind, CelKind,
+    CelRef, W_BoolObject, W_IntObject, W_OptionalObject,
 };
 #[allow(unused_imports)] // named in `virtualizable_fields`
 use crate::runtime::object::{
@@ -275,13 +275,35 @@ fn insn_c(program: &CelCode, pc: usize) -> i64 {
         .unwrap_or(0)
 }
 
-/// Intern `consts[idx]`. 0 means the constant is not a class-family leaf.
+#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+unsafe fn interned_equals(a: CelRef, b: CelRef) -> CelRef {
+    if let Some(eq) = interned_list_eq(a, b) {
+        new_bool(eq) as CelRef
+    } else {
+        cel_equals(a, b)
+    }
+}
+
+#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+unsafe fn interned_not_equals(a: CelRef, b: CelRef) -> CelRef {
+    if let Some(eq) = interned_list_eq(a, b) {
+        new_bool(!eq) as CelRef
+    } else {
+        cel_not_equals(a, b)
+    }
+}
+
+/// Item of an interned object-strategy list. 0 residual, including Ints
+/// lists, which have no per-element leaf.
 #[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
 fn interned_item(list: i64, index: i64) -> i64 {
     let Some(list) = slot_leaf(list) else {
         return 0;
     };
     if unsafe { w_kind(list) } != CelKind::List {
+        return 0;
+    }
+    if unsafe { list_int_at(list, index) }.is_some() {
         return 0;
     }
     match unsafe { interned_list_get(list, index) } {
@@ -371,6 +393,9 @@ fn interned_index(container: i64, key: i64) -> i64 {
             if unsafe { w_kind(k) } != CelKind::Int {
                 return 0;
             }
+            if unsafe { list_ints_slice(w) }.is_some() {
+                return 0;
+            }
             let index = unsafe { (*k.cast::<W_IntObject>()).intval };
             unsafe { interned_list_get(w, index) }
         }
@@ -399,6 +424,13 @@ fn interned_contains(container: i64, needle: i64) -> i64 {
     };
     match unsafe { w_kind(c) } {
         CelKind::List => {
+            if let Some(ints) = unsafe { list_ints_slice(c) } {
+                if unsafe { w_kind(n) } != CelKind::Int {
+                    return 1;
+                }
+                let needle = unsafe { (*n.cast::<W_IntObject>()).intval };
+                return if ints.contains(&needle) { 2 } else { 1 };
+            }
             if unsafe { list_contains(c, n) } {
                 2
             } else {
@@ -587,6 +619,12 @@ fn interned_opt_index(container: i64, key: i64) -> i64 {
                 return 0;
             }
             let index = unsafe { (*k.cast::<W_IntObject>()).intval };
+            if let Some(n) = unsafe { list_int_at(w, index) } {
+                return unsafe { cel_optional_of(new_int(n) as CelRef) as i64 };
+            }
+            if unsafe { list_ints_slice(w) }.is_some() {
+                return cel_optional_none() as i64;
+            }
             unsafe { interned_list_get(w, index) }
         }
         CelKind::Map => match unsafe { string_as_str(k) } {
@@ -875,6 +913,8 @@ pub(crate) fn eval_through_portal(
         interned_opt_index => residual_int,
         interned_opt_select => residual_int,
         interned_item => residual_int,
+        interned_equals => residual_int,
+        interned_not_equals => residual_int,
         try_append => residual_int,
         new_list_with_capacity => inline_ref,
         residual_dispatch => residual_int,
@@ -1339,8 +1379,8 @@ fn run_cel_portal(
             OP_MUL => interned_binop!(frame, vm, here, cel_mul),
             OP_DIV => interned_binop!(frame, vm, here, cel_div),
             OP_MOD => interned_binop!(frame, vm, here, cel_rem),
-            OP_EQ => interned_binop!(frame, vm, here, cel_equals),
-            OP_NE => interned_binop!(frame, vm, here, cel_not_equals),
+            OP_EQ => interned_binop!(frame, vm, here, interned_equals),
+            OP_NE => interned_binop!(frame, vm, here, interned_not_equals),
             OP_LT => interned_binop!(frame, vm, here, cel_less),
             OP_LE => interned_binop!(frame, vm, here, cel_less_equals),
             OP_GT => interned_binop!(frame, vm, here, cel_greater),

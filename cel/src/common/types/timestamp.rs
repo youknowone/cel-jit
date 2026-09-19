@@ -4,10 +4,10 @@ use chrono::{DateTime, FixedOffset};
 use chrono::{Datelike, Days, Months};
 
 /// Reads the receiver an accessor overload declared as `google.protobuf.Timestamp`.
-fn expect_timestamp(value: &Value) -> Result<&DateTime<FixedOffset>, ExecutionError> {
-    match value {
+fn expect_timestamp(value: &Value) -> Result<DateTime<FixedOffset>, ExecutionError> {
+    match value.unpack() {
         Value::Timestamp(ts) => Ok(ts),
-        other => Err(super::type_error(other, &super::TIMESTAMP_TYPE)),
+        other => Err(super::type_error(&other, &super::TIMESTAMP_TYPE)),
     }
 }
 
@@ -42,7 +42,8 @@ fn day_of_year(args: Vec<Value>) -> Result<Value, ExecutionError> {
 }
 
 fn timestamp(args: Vec<Value>) -> Result<Value, ExecutionError> {
-    let text = match &args[0] {
+    let unpacked = args[0].unpack();
+    let text = match &unpacked {
         Value::String(s) => s.as_str(),
         other => return Err(super::type_error(other, &super::STRING_TYPE)),
     };

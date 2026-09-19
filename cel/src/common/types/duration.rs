@@ -1,10 +1,10 @@
 use crate::{ExecutionError, Value};
 
 /// Reads the receiver an accessor overload declared as `google.protobuf.Duration`.
-fn expect_duration(value: &Value) -> Result<&chrono::Duration, ExecutionError> {
-    match value {
+fn expect_duration(value: &Value) -> Result<chrono::Duration, ExecutionError> {
+    match value.unpack() {
         Value::Duration(d) => Ok(d),
-        other => Err(super::type_error(other, &super::DURATION_TYPE)),
+        other => Err(super::type_error(&other, &super::DURATION_TYPE)),
     }
 }
 
@@ -23,7 +23,8 @@ duration_accessor!(minutes, num_minutes);
 duration_accessor!(hours, num_hours);
 
 fn duration(args: Vec<Value>) -> Result<Value, ExecutionError> {
-    let text = match &args[0] {
+    let unpacked = args[0].unpack();
+    let text = match &unpacked {
         Value::String(s) => s.as_str(),
         other => return Err(super::type_error(other, &super::STRING_TYPE)),
     };

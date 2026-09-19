@@ -7,7 +7,7 @@ fn bytes_to_bytes(mut args: Vec<Value>) -> Result<Value, ExecutionError> {
 }
 
 fn string_to_bytes(mut args: Vec<Value>) -> Result<Value, ExecutionError> {
-    match args.remove(0) {
+    match args.remove(0).unpack() {
         Value::String(s) => {
             let value = Arc::try_unwrap(s).unwrap_or_else(|s| s.as_str().to_owned());
             Ok(Value::Bytes(Arc::new(value.into_bytes())))

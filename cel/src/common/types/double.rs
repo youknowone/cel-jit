@@ -1,7 +1,7 @@
 use crate::{ExecutionError, Value};
 
 fn double(mut args: Vec<Value>) -> Result<Value, ExecutionError> {
-    let arg = args.remove(0);
+    let arg = args.remove(0).unpack();
     match arg {
         Value::Float(_) => Ok(arg),
         Value::Int(i) => Ok(Value::Float(i as f64)),

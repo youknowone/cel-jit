@@ -17,8 +17,15 @@ fn expect_optional(value: &Value) -> Result<&OptionalValue, ExecutionError> {
 /// Deliberately not [`Value::is_zero`], which answers `false` for the epoch
 /// timestamp and for a field-less struct where this answers `true`.
 fn is_zero_value(value: &Value) -> bool {
-    let unpacked = value.unpack();
-    let value = &unpacked;
+    if let Value::Interned(w) = value {
+        use crate::runtime::object::{w_kind, CelKind};
+        return match unsafe { w_kind(*w) } {
+            CelKind::Timestamp => is_zero_value(&value.unpack()),
+            #[cfg(feature = "structs")]
+            CelKind::Struct => is_zero_value(&value.unpack()),
+            _ => value.is_zero(),
+        };
+    }
     match value {
         Value::Bool(b) => !b,
         Value::Int(i) => *i == 0,
@@ -56,21 +63,35 @@ fn optional_of_non_zero_value(args: Vec<Value>) -> Result<Value, ExecutionError>
     }
 }
 
+fn optional_inner(value: &Value) -> Result<Option<Value>, ExecutionError> {
+    if let Value::Interned(w) = value {
+        use crate::runtime::object::{w_kind, CelKind, W_OptionalObject};
+        if unsafe { w_kind(*w) } != CelKind::Optional {
+            return Err(super::type_error(value, &OPTIONAL_TYPE));
+        }
+        let inner = unsafe { (*w.cast::<W_OptionalObject>()).w_value };
+        return Ok(if inner.is_null() {
+            None
+        } else {
+            Some(Value::from_interned(inner))
+        });
+    }
+    Ok(expect_optional(value)?.inner().cloned())
+}
+
 fn optional_value(mut args: Vec<Value>) -> Result<Value, ExecutionError> {
-    expect_optional(&args.remove(0))?
-        .inner()
-        .cloned()
+    optional_inner(&args.remove(0))?
         .ok_or_else(|| ExecutionError::function_error("value", "optional.none() dereference"))
 }
 
 fn optional_has_value(args: Vec<Value>) -> Result<Value, ExecutionError> {
-    Ok(Value::Bool(expect_optional(&args[0])?.inner().is_some()))
+    Ok(Value::Bool(optional_inner(&args[0])?.is_some()))
 }
 
 fn optional_or_optional(mut args: Vec<Value>) -> Result<Value, ExecutionError> {
     let other = args.remove(1);
     let this = args.remove(0);
-    match expect_optional(&this)?.inner().is_some() {
+    match optional_inner(&this)?.is_some() {
         true => Ok(this),
         false => Ok(other),
     }
@@ -79,7 +100,7 @@ fn optional_or_optional(mut args: Vec<Value>) -> Result<Value, ExecutionError> {
 fn optional_or_value(mut args: Vec<Value>) -> Result<Value, ExecutionError> {
     let other = args.remove(1);
     let this = args.remove(0);
-    Ok(expect_optional(&this)?.inner().cloned().unwrap_or(other))
+    Ok(optional_inner(&this)?.unwrap_or(other))
 }
 
 pub(crate) fn stdlib(env: &mut crate::Env) {

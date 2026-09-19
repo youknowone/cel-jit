@@ -2,7 +2,7 @@ use crate::objects::Value;
 use crate::ExecutionError;
 
 fn int(mut args: Vec<Value>) -> Result<Value, ExecutionError> {
-    let arg = args.remove(0);
+    let arg = args.remove(0).unpack();
     match arg {
         Value::Int(_) => Ok(arg),
         Value::UInt(u) => Ok(Value::Int(u as i64)),
