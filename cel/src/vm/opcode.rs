@@ -552,6 +552,7 @@ impl OpCode {
             | OpCode::IterLen
             | OpCode::NewList
             | OpCode::NewListFromArg
+            | OpCode::NewMap
             | OpCode::AddConst
             | OpCode::MulConst
             | OpCode::ModConst
@@ -604,7 +605,6 @@ impl OpCode {
             | OpCode::OptIndex
             | OpCode::ListAppend
             | OpCode::ListAppendOptional
-            | OpCode::NewMap
             | OpCode::MapInsert
             | OpCode::MapInsertOptional
             | OpCode::Add

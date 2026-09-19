@@ -938,6 +938,60 @@ unsafe fn string_eq_str(w: CelRef, field: &str) -> bool {
     std::slice::from_raw_parts(base, n) == field.as_bytes()
 }
 
+/// An empty map whose items block has room for `cap` entries.
+pub fn new_map_with_capacity(cap: i64) -> *mut W_MapObject {
+    super::heap::with_heap(|h| new_map_with_capacity_in(h, cap))
+}
+
+/// An empty map on `heap` with room for `cap` entries.
+#[inline]
+pub fn new_map_with_capacity_in(heap: &super::heap::CelHeap, cap: i64) -> *mut W_MapObject {
+    let n = cap.max(0) as usize;
+    let items = crate::runtime::object_array::new_items_block_zeroed_in(heap, n.saturating_mul(2));
+    heap.alloc(W_MapObject {
+        ob_header: CelObject {
+            ob_type: &CEL_MAP_CLASS,
+        },
+        strategy: MapStrategy::Object,
+        storage: core::ptr::null_mut(),
+        items,
+        length: 0,
+        public: core::ptr::null(),
+    })
+}
+
+/// Append `(key, value)` to an object-strategy map if the block still has room.
+///
+/// # Safety
+///
+/// `w` is a live [`W_MapObject`].
+#[inline]
+pub unsafe fn map_try_insert(w: CelRef, key: CelRef, value: CelRef) -> bool {
+    if w_kind(w) != CelKind::Map {
+        return false;
+    }
+    let leaf = &mut *w.cast::<W_MapObject>();
+    if leaf.strategy != MapStrategy::Object {
+        return false;
+    }
+    let cap = crate::runtime::object_array::items_capacity(leaf.items);
+    if leaf.length < 0 {
+        return false;
+    }
+    let used = (leaf.length as usize).saturating_mul(2);
+    if used.saturating_add(2) > cap {
+        return false;
+    }
+    let base = crate::runtime::object_array::items_block_items_base(leaf.items);
+    if base.is_null() {
+        return false;
+    }
+    *base.add(used) = key;
+    *base.add(used + 1) = value;
+    leaf.length += 1;
+    true
+}
+
 /// Box `pairs` as a CEL `map`.
 pub fn new_map(pairs: &[(CelRef, CelRef)]) -> *mut W_MapObject {
     let items = interleaved_pair_block(pairs);
@@ -1127,6 +1181,7 @@ pub fn new_cel_frame(n_slots: i64, max_stack: i64) -> *mut W_CelFrame {
 }
 
 /// Allocate a frame on `heap`.
+#[inline(always)]
 pub fn new_cel_frame_in(
     heap: &crate::runtime::heap::CelHeap,
     n_slots: i64,

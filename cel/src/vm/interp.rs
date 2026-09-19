@@ -45,11 +45,11 @@ use crate::runtime::convert::{intern_leaf, interned_list_get, ref_to_value};
 use crate::runtime::error::{take_error, CelErrCode, ERROR_SENTINEL};
 use crate::runtime::object::{
     cel_frame_slot, force_virtualizable_if_necessary, interned_list_eq, list_int_at, list_len,
-    map_len, new_bytes, new_cel_frame_in, new_double, new_int, new_int_in, new_list, new_list_ints,
-    new_list_with_capacity, new_null, new_optional, new_optional_none, new_string, new_type,
-    new_uint, opaque_host_index, string_as_str, string_byte_len, w_kind, w_type, CelKind, CelRef,
-    W_BoolObject, W_CelFrame, W_DoubleObject, W_IntObject, W_UIntObject, CEL_OPAQUE_CLASS,
-    CEL_TYPE_CLASS,
+    map_len, map_try_insert, new_bytes, new_cel_frame_in, new_double, new_int, new_int_in,
+    new_list, new_list_ints, new_list_with_capacity, new_map_with_capacity_in, new_null,
+    new_optional, new_optional_none, new_string, new_type, new_uint, opaque_host_index,
+    string_as_str, string_byte_len, w_kind, w_type, CelKind, CelRef, W_BoolObject, W_CelFrame,
+    W_DoubleObject, W_IntObject, W_UIntObject, CEL_OPAQUE_CLASS, CEL_TYPE_CLASS,
 };
 use crate::runtime::optional::{
     cel_optional_has_value, cel_optional_none, cel_optional_of, cel_optional_of_non_zero_value,
@@ -64,6 +64,7 @@ use std::cmp::Ordering;
 /// The `Result` is reconstructed here, at the boundary: inside the loop an
 /// error is a [`CelErr`], which is [`Copy`] and carries no allocation, because
 /// `&&` and `||` absorb errors and so raise them on ordinary control flow.
+#[inline(always)]
 pub fn cel_eval_loop(code: &CelCode, ctx: &Context) -> Result<Value, ExecutionError> {
     let scope = crate::runtime::heap::enter_eval();
     let mut vm = Vm::new(code, ctx, scope.heap());
@@ -1010,6 +1011,11 @@ impl<'a> Vm<'a> {
     }
 
     #[inline]
+    pub(crate) fn logic_copy(&self, slot: u32) -> Option<CelResult<bool>> {
+        self.scratch.logic.get(slot as usize).copied()
+    }
+
+    #[inline]
     fn box_int(&self, n: i64) -> CelRef {
         new_int_in(self.heap(), n) as CelRef
     }
@@ -1748,6 +1754,15 @@ impl<'a> Vm<'a> {
         };
         if let (Some(k), Some(v)) = (Self::leaf_of(&key), Self::leaf_of(&value)) {
             if interned_is_map_key(k) {
+                let map = match self.top() {
+                    Some(Operand::Interned(w)) if unsafe { w_kind(*w) } == CelKind::Map => Some(*w),
+                    _ => None,
+                };
+                if let Some(map) = map {
+                    if unsafe { map_try_insert(map, k, v) } {
+                        return Ok(());
+                    }
+                }
                 if let Some(Operand::MapRefs(pairs)) = self.top_mut() {
                     pairs.push((k, v));
                     return Ok(());
@@ -2106,7 +2121,7 @@ impl<'a> Vm<'a> {
                 }
             }
             // Held out too, and for the same reason; see `Vm::new_map_arm`.
-            OpCode::NewMap => self.new_map_arm(),
+            OpCode::NewMap => self.new_map_arm(a),
             OpCode::MapInsert | OpCode::MapInsertOptional => {
                 let value = self.pop_operand().ok_or(CelErr::InternalError)?;
                 let key = self.pop_operand().ok_or(CelErr::InternalError)?;
@@ -2759,13 +2774,11 @@ impl<'a> Vm<'a> {
         Ok(())
     }
 
-    /// [`OpCode::NewMap`]: open a map literal.
-    ///
-    /// The table is built in the [`Arc`] it is handed over in, which is what
-    /// [`Operand::Map`] documents; the allocation is the whole arm.
+    /// [`OpCode::NewMap`]: open a young map with room for `n` entries.
     #[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
-    fn new_map_arm(&mut self) {
-        self.push_operand(Operand::MapRefs(Vec::new()));
+    fn new_map_arm(&mut self, n: u32) {
+        let w = new_map_with_capacity_in(self.heap(), n as i64);
+        self.push_operand(Operand::Interned(w as CelRef));
     }
 
     fn name(&self, id: u32) -> CelResult<&'a str> {
@@ -4914,37 +4927,16 @@ mod tests {
         }
     }
 
-    /// The table a map literal is built in is the table the finished [`Map`]
-    /// holds, not a copy of it.
-    ///
-    /// [`OpCode::NewMap`] opens the operand in the [`Arc`] [`Map::object`]
-    /// will take, so closing the literal hands the pointer over. A `Box`
-    /// builder is the same 8 bytes on the operand stack but a different
-    /// allocation, so `finish` had to allocate the `Arc` as well and move the
-    /// 48-byte table into it -- one allocation per map literal on top of the
-    /// one that was going to happen anyway. That is `walker/map_literal` in
-    /// `tests/allocs_per_eval.rs`; this is the mechanism under that row, and a
-    /// pointer identity is a much colder trail to follow from a baseline that
-    /// drifted up by one.
-    ///
-    /// Driven through [`Vm::step`] rather than by pushing an operand by hand,
-    /// so the `NewMap`/`MapInsert` pair the compiler emits is what runs. The
-    /// literal is NESTED because that is the only shape that reaches
-    /// [`Vm::map_mut`] with an outer map already open -- the one place a
-    /// builder could come to be shared, which is what would make
-    /// `Arc::get_mut` answer `None`.
+    /// A nested map literal opens a young map leaf per `{...}`, not a
+    /// boxed table that is later interned.
     #[test]
     fn a_map_literal_is_built_in_the_arc_it_is_handed_over_in() {
         let ctx = Context::default();
         let code = compile(&parse(r#"{"x": {"y": 3}}"#)).expect("compiles");
         let mut vm = crate::runtime::heap::with_heap(|h| Vm::new(&code, &ctx, h));
 
-        // `Vm::run`'s loop with one line added: each builder is recorded the
-        // first time it is seen on top of the stack. Neither table is freed
-        // before the answer is read -- the inner one moves into the outer --
-        // so no recorded address can be reused by the other.
         let mut opened_hash = 0usize;
-        let mut opened_refs = 0usize;
+        let mut opened_maps = 0usize;
         let mut pc = 0u32;
         let answer = loop {
             let &Insn { op, ops } = vm.code.insns.get(pc as usize).expect("`pc` is in range");
@@ -4952,7 +4944,12 @@ mod tests {
             let step = vm.step(op, ops, pc, next).expect("the literal evaluates");
             match vm.top() {
                 Some(Operand::Map(_)) => opened_hash += 1,
-                Some(Operand::MapRefs(_)) => opened_refs += 1,
+                Some(Operand::Interned(w))
+                    if unsafe { crate::runtime::object::w_kind(*w) }
+                        == crate::runtime::object::CelKind::Map =>
+                {
+                    opened_maps += 1;
+                }
                 _ => {}
             }
             match step {
@@ -4966,7 +4963,7 @@ mod tests {
             opened_hash, 0,
             "an internable literal must not box a HashMap"
         );
-        assert!(opened_refs > 0, "the builder must stay on interned pairs");
+        assert!(opened_maps > 0, "the builder must stay a young map leaf");
         assert_eq!(answer, {
             let inner = Value::Map(crate::objects::Map::object(Arc::new(
                 [(

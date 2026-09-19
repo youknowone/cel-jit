@@ -370,7 +370,8 @@ impl Compiler {
     }
 
     fn map(&mut self, map: &MapExpr, id: u64) -> Result<(), CompileError> {
-        self.emit(OpCode::NewMap, &[], id)?;
+        let count = u32::try_from(map.entries.len()).unwrap_or(u32::MAX);
+        self.emit(OpCode::NewMap, &[count], id)?;
         for entry in &map.entries {
             let EntryExpr::MapEntry(kv) = &entry.expr else {
                 return Err(CompileError {
