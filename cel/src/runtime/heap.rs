@@ -240,6 +240,15 @@ impl CelHeap {
     pub fn host_count(&self) -> usize {
         self.hosts.borrow().len()
     }
+
+    /// Whether `ptr` lies in a segment this heap has handed out.
+    pub fn contains(&self, ptr: *const u8) -> bool {
+        let p = ptr as usize;
+        self.segments.borrow().iter().any(|seg| {
+            let base = seg.base as usize;
+            p >= base && p < base.saturating_add(seg.used)
+        })
+    }
 }
 
 impl Default for CelHeap {
@@ -310,6 +319,15 @@ pub fn alloc_immortal<T>(value: T) -> *mut T {
     payload
 }
 
+/// A frame cell: null, an immortal singleton, or a leaf on this thread's heap.
+#[cfg(debug_assertions)]
+pub fn assert_frame_cell(w: crate::runtime::object::CelRef) {
+    debug_assert!(
+        w.is_null() || is_immortal(w as *const u8) || with_heap(|h| h.contains(w as *const u8)),
+        "frame cell is not a live leaf"
+    );
+}
+
 /// Whether `ptr` is a payload [`alloc_immortal`] handed out.
 pub fn is_immortal(ptr: *const u8) -> bool {
     IMMORTAL_PAYLOADS
@@ -331,6 +349,17 @@ pub unsafe fn immortal_header(ptr: *const u8) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `contains` is true only for addresses this heap handed out.
+    #[test]
+    fn contains_reports_this_heaps_payloads() {
+        let heap = CelHeap::new();
+        let a = heap.alloc(1u64) as *const u8;
+        assert!(heap.contains(a));
+        assert!(!heap.contains(core::ptr::null()));
+        let other = CelHeap::new();
+        assert!(!other.contains(a));
+    }
 
     /// Two allocations from one heap are distinct addresses, and the second
     /// does not overlap the first.

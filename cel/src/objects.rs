@@ -2,7 +2,12 @@ use crate::common::ast::{operators, CallExpr, ComprehensionExpr, EntryExpr, Expr
 #[cfg(feature = "structs")]
 use crate::common::types::CelStruct;
 use crate::context::Context;
-use crate::runtime::object::CelRef;
+use crate::runtime::binop::map_lookup;
+use crate::runtime::convert::{intern_leaf, interned_list_get, interned_map_lookup_string};
+use crate::runtime::object::{
+    string_as_str, w_kind, CelKind, CelRef, MapStrategy, W_BoolObject, W_IntObject, W_MapObject,
+    W_UIntObject,
+};
 use crate::ExecutionError::NoSuchOverload;
 use crate::{ExecutionError, Expression, FunctionContext};
 #[cfg(feature = "chrono")]
@@ -2136,6 +2141,130 @@ pub(crate) fn value_key(value: Value) -> Result<Key, ExecutionError> {
     }
 }
 
+/// Index an interned list or map without rebuilding the container.
+///
+/// `None` means this pair is not a cheap in-place read; the caller falls
+/// through to the public-enum path. A `Some` is the finished answer,
+/// including the same errors that path would raise.
+fn try_interned_value_index(
+    container: &Value,
+    key: &Value,
+) -> Option<Result<Value, ExecutionError>> {
+    let Value::Interned(w) = container else {
+        return None;
+    };
+    match unsafe { w_kind(*w) } {
+        CelKind::List => Some(interned_list_index(*w, key)),
+        CelKind::Map => interned_map_index(*w, key),
+        _ => None,
+    }
+}
+
+fn interned_list_index(w: CelRef, key: &Value) -> Result<Value, ExecutionError> {
+    let index = interned_or_public_list_index(key)?;
+    match unsafe { interned_list_get(w, index) } {
+        Some(item) => Ok(Value::from_interned(item)),
+        None => Err(ExecutionError::IndexOutOfBounds(list_index_error_key(key))),
+    }
+}
+
+fn interned_or_public_list_index(key: &Value) -> Result<i64, ExecutionError> {
+    match key {
+        Value::Int(i) => Ok(*i),
+        Value::UInt(u) => Ok(*u as i64),
+        Value::Interned(k) => match unsafe { w_kind(*k) } {
+            CelKind::Int => Ok(unsafe { (*k.cast::<W_IntObject>()).intval }),
+            CelKind::UInt => Ok(unsafe { (*k.cast::<W_UIntObject>()).uintval as i64 }),
+            _ => Err(unexpected_list_index_type(key)),
+        },
+        _ => Err(unexpected_list_index_type(key)),
+    }
+}
+
+fn unexpected_list_index_type(key: &Value) -> ExecutionError {
+    ExecutionError::UnexpectedType {
+        got: key.type_of().to_string(),
+        want: format!("{}|{}", ValueType::Int, ValueType::UInt),
+    }
+}
+
+/// The key the public list path puts in [`ExecutionError::IndexOutOfBounds`].
+fn list_index_error_key(key: &Value) -> Value {
+    match key {
+        Value::Interned(_) => key.unpack(),
+        other => other.clone(),
+    }
+}
+
+/// A map key that can be read without rebuilding the map.
+enum InternedMapKey<'a> {
+    Int(i64),
+    Uint(u64),
+    Bool(bool),
+    Str(&'a str),
+}
+
+fn interned_map_key(key: &Value) -> Result<InternedMapKey<'_>, ExecutionError> {
+    match key {
+        Value::Int(i) => Ok(InternedMapKey::Int(*i)),
+        Value::UInt(u) => Ok(InternedMapKey::Uint(*u)),
+        Value::Bool(b) => Ok(InternedMapKey::Bool(*b)),
+        Value::String(s) => Ok(InternedMapKey::Str(s.as_str())),
+        Value::Interned(k) => match unsafe { w_kind(*k) } {
+            CelKind::Int => Ok(InternedMapKey::Int(unsafe {
+                (*k.cast::<W_IntObject>()).intval
+            })),
+            CelKind::UInt => Ok(InternedMapKey::Uint(unsafe {
+                (*k.cast::<W_UIntObject>()).uintval
+            })),
+            CelKind::Bool => Ok(InternedMapKey::Bool(unsafe {
+                (*k.cast::<W_BoolObject>()).boolval != 0
+            })),
+            CelKind::Str => match unsafe { string_as_str(*k) } {
+                Some(s) => Ok(InternedMapKey::Str(s)),
+                None => Err(ExecutionError::unsupported_key_type(key.unpack())),
+            },
+            _ => Err(ExecutionError::unsupported_key_type(key.unpack())),
+        },
+        other => Err(ExecutionError::unsupported_key_type(other.unpack())),
+    }
+}
+
+fn interned_map_key_display(key: &InternedMapKey<'_>) -> String {
+    match key {
+        InternedMapKey::Int(i) => i.to_string(),
+        InternedMapKey::Uint(u) => u.to_string(),
+        InternedMapKey::Bool(b) => b.to_string(),
+        InternedMapKey::Str(s) => (*s).to_string(),
+    }
+}
+
+fn interned_map_index(w: CelRef, key: &Value) -> Option<Result<Value, ExecutionError>> {
+    let viewed = match interned_map_key(key) {
+        Ok(k) => k,
+        Err(e) => return Some(Err(e)),
+    };
+    let found = match &viewed {
+        InternedMapKey::Str(field) => unsafe { interned_map_lookup_string(w, field) },
+        _ => {
+            if unsafe { (*w.cast::<W_MapObject>()).strategy } == MapStrategy::Record {
+                return None;
+            }
+            let k = match key {
+                Value::Interned(k) => *k,
+                _ => intern_leaf(key)?,
+            };
+            unsafe { map_lookup(w, k) }
+        }
+    };
+    Some(match found {
+        Some(item) => Ok(Value::from_interned(item)),
+        None => Err(ExecutionError::NoSuchKey(Arc::new(
+            interned_map_key_display(&viewed),
+        ))),
+    })
+}
+
 /// `container.field`, looked up without materializing the field name.
 ///
 /// `KeyRef::String` borrows, so a map field select costs no allocation. Going
@@ -2158,7 +2287,14 @@ pub(crate) fn value_field(container: &Value, field: &str) -> Result<Value, Execu
 }
 
 /// `container[key]`, for every container the walker can index.
+///
+/// An interned list or map is indexed in place. Rebuilding a public
+/// `List`/`Map` is the fallback for every other shape, and for interned
+/// cases that are not cheap to read from the leaf.
 pub(crate) fn value_index(container: &Value, key: &Value) -> Result<Value, ExecutionError> {
+    if let Some(result) = try_interned_value_index(container, key) {
+        return result;
+    }
     let container = container.unpack();
     let key = key.unpack();
     match &container {

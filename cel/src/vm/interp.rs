@@ -1032,8 +1032,14 @@ impl<'a> Vm<'a> {
         if self.frame.len() == self.stack_base {
             return None;
         }
+        let index = self.frame.len() - 1;
         let popped = self.frame.pop();
         unsafe {
+            // The parked/popped operand is no longer below valuestackdepth.
+            let cap = (*self.cel_frame).locals_stack_w.capacity();
+            if index < cap {
+                *cel_frame_slot(self.cel_frame, index as i64) = core::ptr::null_mut();
+            }
             (*self.cel_frame).valuestackdepth = self.frame.len() as i64;
         }
         popped
@@ -1074,9 +1080,17 @@ impl<'a> Vm<'a> {
             "unwinding to depth {depth} from {}",
             self.depth()
         );
+        let old = self.frame.len();
         self.frame.truncate(self.stack_base + depth);
         unsafe {
-            (*self.cel_frame).valuestackdepth = self.frame.len() as i64;
+            let new = self.frame.len();
+            let cap = (*self.cel_frame).locals_stack_w.capacity();
+            let mut i = new;
+            while i < old && i < cap {
+                *cel_frame_slot(self.cel_frame, i as i64) = core::ptr::null_mut();
+                i += 1;
+            }
+            (*self.cel_frame).valuestackdepth = new as i64;
         }
     }
 
@@ -1374,10 +1388,7 @@ impl<'a> Vm<'a> {
             Operand::EmptyList(_) => Ok(Value::from_interned(
                 crate::runtime::object::new_list(&[]) as CelRef,
             )),
-            Operand::Ints(words) => {
-                let items: Vec<CelRef> = words.iter().map(|&n| new_int(n) as CelRef).collect();
-                Ok(Value::from_interned(new_list(&items) as CelRef))
-            }
+            Operand::Ints(words) => Ok(Value::list(ListStorage::Ints(words))),
             Operand::List(items) => Ok(Value::list(items)),
             Operand::Refs(items) => Ok(Value::from_interned(new_list(&items) as CelRef)),
             Operand::Map(entries) => Ok(Value::Map(Map::object(entries))),
@@ -1946,6 +1957,13 @@ impl<'a> Vm<'a> {
             OpCode::Index | OpCode::OptIndex => {
                 let key = self.pop_operand().ok_or(CelErr::InternalError)?;
                 let operand = self.pop_operand().ok_or(CelErr::InternalError)?;
+                // `MapRefs` finishes interned; close it so Index reads the
+                // map in place. Other builders finish public and stay that way.
+                let operand = if let Operand::MapRefs(pairs) = operand {
+                    Operand::Interned(crate::runtime::object::new_map(&pairs) as CelRef)
+                } else {
+                    operand
+                };
                 if self.try_interned_index(&operand, &key, op == OpCode::OptIndex)? {
                     // interned item already pushed
                 } else {
@@ -3587,6 +3605,17 @@ fn interned_optional_is_none(w: CelRef) -> bool {
 }
 
 fn optional_inner(value: &Value) -> OptView {
+    if let Value::Interned(w) = value {
+        if unsafe { w_kind(*w) } != CelKind::Optional {
+            return OptView::Plain;
+        }
+        let inner = unsafe { (*w.cast::<crate::runtime::object::W_OptionalObject>()).w_value };
+        return if inner.is_null() {
+            OptView::Empty
+        } else {
+            OptView::Present(Value::from_interned(inner))
+        };
+    }
     let unpacked = value.unpack();
     match as_optional(&unpacked) {
         None => OptView::Plain,
@@ -3602,6 +3631,11 @@ fn optional_inner(value: &Value) -> OptView {
 /// A non-bool is an overload failure rather than a coercion, which is what
 /// makes `1 && false` an *absorbed* error and not a truthiness test.
 fn as_bool(value: &Value) -> CelResult<bool> {
+    if let Value::Interned(w) = value {
+        if unsafe { w_kind(*w) } == CelKind::Bool {
+            return Ok(unsafe { (*w.cast::<W_BoolObject>()).boolval } != 0);
+        }
+    }
     match value.unpack() {
         Value::Bool(b) => Ok(b),
         _ => Err(CelErr::NoSuchOverload),

@@ -32,7 +32,7 @@ use std::sync::Arc;
 
 use cel::objects::{Key, OptionalValue};
 use cel::parser::Parser;
-use cel::{Context, ExecutionError, Value};
+use cel::{Context, ExecutionError, Program, Value};
 
 /// The fewest expressions the generator may compare before the gate refuses.
 ///
@@ -487,5 +487,114 @@ fn a_large_comprehension_agrees() {
             let vm = show(&cel::vm::cel_eval_loop(&code, &ctx));
             assert_eq!(walker, vm, "`{src}` at n={n}");
         }
+    }
+}
+
+/// Indexing an interned list or map must answer what the walker answers,
+/// including the error cases, through both [`Program::execute`] and the
+/// bytecode loop.
+#[test]
+fn interned_index_agrees_between_vm_and_walker() {
+    let mut ctx = Context::default();
+    ctx.add_variable_from_value(
+        "list",
+        Value::list(vec![
+            Value::Int(0),
+            Value::Int(1),
+            Value::Int(2),
+            Value::Int(3),
+            Value::Int(4),
+        ]),
+    );
+    let mut m = std::collections::HashMap::new();
+    m.insert(Key::String(Arc::new("k".to_string())), Value::Int(7));
+    ctx.add_variable_from_value("m", Value::Map(cel::objects::Map::object(Arc::new(m))));
+
+    let plain: &[&str] = &[
+        "{'a': 1, 'b': 2}['a']",
+        "{'a': 1}['zz']",
+        "{1: 'x', 2: 'y'}[2]",
+        "{1u: 'x'}[1u]",
+        "{true: 1}[true]",
+        "[1, 2, 3, 4, 5][2]",
+        "[1, 2, 3][5]",
+        "[1, 2, 3][-1]",
+        "[1, 2, 3][1u]",
+        "[[1, 2], [3]][0][1]",
+        "{'a': {'b': [10, 20]}}['a']['b'][1]",
+        "list[3]",
+        "m['k']",
+    ];
+    for src in plain {
+        let expr = Parser::default()
+            .parse(src)
+            .unwrap_or_else(|e| panic!("parse {src}: {e:?}"));
+        let walker = show(&Value::resolve_value(&expr, &ctx));
+        let program = Program::compile(src).unwrap_or_else(|e| panic!("compile {src}: {e:?}"));
+        let executed = show(&program.execute(&ctx));
+        let code = cel::vm::compile(&expr).unwrap_or_else(|e| panic!("vm compile {src}: {e}"));
+        let looped = show(&cel::vm::cel_eval_loop(&code, &ctx));
+        assert_eq!(walker, executed, "`{src}` Program::execute");
+        assert_eq!(walker, looped, "`{src}` cel_eval_loop");
+    }
+
+    let optional: &[&str] = &["{'a': 1}[?'a']", "{'a': 1}[?'zz']", "[1, 2][?5]"];
+    for src in optional {
+        let parser = Parser::default().enable_optional_syntax(true);
+        let expr = parser
+            .parse(src)
+            .unwrap_or_else(|e| panic!("parse optional {src}: {e:?}"));
+        let walker = show(&Value::resolve_value(&expr, &ctx));
+        let code = cel::vm::compile(&expr).unwrap_or_else(|e| panic!("vm compile {src}: {e}"));
+        let looped = show(&cel::vm::cel_eval_loop(&code, &ctx));
+        assert_eq!(walker, looped, "`{src}` optional index");
+    }
+}
+
+/// A finished literal on a builder slot is published as a null `CelRef`.
+/// Portal helpers must decline that slot so residual dispatch finishes it.
+#[test]
+fn null_builder_portal_agrees_between_vm_and_walker() {
+    let mut ctx = Context::default();
+    ctx.add_variable_from_value("s", Value::String(Arc::new("hello".to_string())));
+    ctx.add_variable_from_value("opt_none", Value::Opaque(Arc::new(OptionalValue::none())));
+    ctx.add_variable_from_value(
+        "opt_some",
+        Value::Opaque(Arc::new(OptionalValue::of(Value::Int(9)))),
+    );
+    let cases: &[&str] = &[
+        "type([1])",
+        "type({'a': 1})",
+        "size([1, 2])",
+        "size({'a': 1})",
+        "[1, 2].size()",
+        "has({'a': 1}.a)",
+        "{'a': 1}.a",
+        "1 in [1, 2]",
+        "'a' in {'a': 1}",
+        "-[1][0]",
+        "![true][0]",
+        // Identifier receiver: CallQualified parks the argument, so the
+        // portal CallMethod slot is not a live leaf.
+        "s.startsWith(\"he\")",
+        "s.startsWith(\"h\")",
+        "s.startsWith(\"hello\") && s.endsWith(\"world\") && s.contains(\"o w\")",
+        "s.endsWith(\"lo\")",
+        "s.contains(\"ell\")",
+        "s.matches(\"h.*\")",
+        "opt_none.orValue(3)",
+        "opt_some.orValue(3)",
+    ];
+    for src in cases {
+        let expr = Parser::default()
+            .parse(src)
+            .unwrap_or_else(|e| panic!("parse {src}: {e:?}"));
+        let walker = show(&Value::resolve_value(&expr, &ctx));
+        let program = Program::compile(src).unwrap_or_else(|e| panic!("compile {src}: {e:?}"));
+        let executed = show(&program.execute(&ctx));
+        let code = cel::vm::compile(&expr).unwrap_or_else(|e| panic!("vm compile {src}: {e}"));
+        let looped = show(&cel::vm::cel_eval_loop(&code, &ctx));
+        assert_eq!(walker, executed, "`{src}` Program::execute");
+        assert_eq!(walker, looped, "`{src}` cel_eval_loop");
     }
 }

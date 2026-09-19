@@ -45,6 +45,39 @@ const PORTAL_DONE: i64 = -1;
 /// `dispatch_one` failed with no handler.
 const PORTAL_FAIL: i64 = -2;
 
+/// A published interned leaf, or `None` when the cell is null.
+fn slot_leaf(w: i64) -> Option<CelRef> {
+    let w = w as usize as CelRef;
+    if w.is_null() {
+        None
+    } else {
+        Some(w)
+    }
+}
+
+/// Operand `from_top` down the value stack (1 = top).
+///
+/// Locals occupy `0..n_slots`. A `CallQualified` miss parks its arguments and
+/// drops `valuestackdepth` to the locals, so a later `CallMethod` must not
+/// treat a local — or the items-block header at index `-1` — as an operand.
+fn operand_cell(frame: &W_CelFrame, from_top: i64) -> Option<CelRef> {
+    let i = frame.valuestackdepth - from_top;
+    if i < frame.n_slots {
+        return None;
+    }
+    let w = frame.locals_stack_w[i];
+    #[cfg(debug_assertions)]
+    crate::runtime::heap::assert_frame_cell(w);
+    Some(w)
+}
+
+fn read_cell(frame: &W_CelFrame, i: i64) -> CelRef {
+    let w = frame.locals_stack_w[i];
+    #[cfg(debug_assertions)]
+    crate::runtime::heap::assert_frame_cell(w);
+    w
+}
+
 const OP_LOAD_LOCAL: i64 = OpCode::LoadLocal as i64;
 const OP_STORE_LOCAL: i64 = OpCode::StoreLocal as i64;
 const OP_ADD: i64 = OpCode::Add as i64;
@@ -120,41 +153,40 @@ const OP_GE_LOCAL_K_APPEND: i64 = OpCode::GreaterEqualsLocalConstAppend as i64;
 
 macro_rules! interned_binop {
     ($frame:ident, $vm:ident, $here:ident, $op:expr) => {{
-        let depth = $frame.valuestackdepth;
-        let b = $frame.locals_stack_w[depth - 1];
-        let a = $frame.locals_stack_w[depth - 2];
-        if a.is_null() || b.is_null() {
-            residual_dispatch($vm, $here)
-        } else {
-            let r = unsafe { $op(a, b) };
-            if r == ERROR_SENTINEL {
-                residual_dispatch($vm, $here)
-            } else {
-                $frame.locals_stack_w[depth - 2] = r;
-                $frame.valuestackdepth = depth - 1;
-                vm_sync_binop($vm, r as i64);
-                $here + 1
+        match (operand_cell($frame, 2), operand_cell($frame, 1)) {
+            (Some(a), Some(b)) if !a.is_null() && !b.is_null() => {
+                let r = unsafe { $op(a, b) };
+                if r == ERROR_SENTINEL {
+                    residual_dispatch($vm, $here)
+                } else {
+                    let depth = $frame.valuestackdepth;
+                    $frame.locals_stack_w[depth - 2] = r;
+                    $frame.valuestackdepth = depth - 1;
+                    vm_sync_binop($vm, r as i64);
+                    $here + 1
+                }
             }
+            _ => residual_dispatch($vm, $here),
         }
     }};
 }
 
 macro_rules! interned_binop_k {
     ($frame:ident, $vm:ident, $program:ident, $pc:ident, $here:ident, $op:expr) => {{
-        let depth = $frame.valuestackdepth;
-        let a = $frame.locals_stack_w[depth - 1];
         let k = intern_const($program, insn_a($program, $pc));
-        if a.is_null() || k == 0 {
-            residual_dispatch($vm, $here)
-        } else {
-            let r = unsafe { $op(a, k as usize as CelRef) };
-            if r == ERROR_SENTINEL {
-                residual_dispatch($vm, $here)
-            } else {
-                $frame.locals_stack_w[depth - 1] = r;
-                vm_sync_replace($vm, r as i64);
-                $here + 1
+        match operand_cell($frame, 1) {
+            Some(a) if !a.is_null() && k != 0 => {
+                let r = unsafe { $op(a, k as usize as CelRef) };
+                if r == ERROR_SENTINEL {
+                    residual_dispatch($vm, $here)
+                } else {
+                    let depth = $frame.valuestackdepth;
+                    $frame.locals_stack_w[depth - 1] = r;
+                    vm_sync_replace($vm, r as i64);
+                    $here + 1
+                }
             }
+            _ => residual_dispatch($vm, $here),
         }
     }};
 }
@@ -162,7 +194,7 @@ macro_rules! interned_binop_k {
 macro_rules! interned_local_k {
     ($frame:ident, $vm:ident, $program:ident, $pc:ident, $here:ident, $op:expr) => {{
         let slot = insn_a($program, $pc);
-        let a = $frame.locals_stack_w[slot];
+        let a = read_cell($frame, slot);
         let k = intern_const($program, insn_b($program, $pc));
         if a.is_null() || k == 0 {
             residual_dispatch($vm, $here)
@@ -183,19 +215,18 @@ macro_rules! interned_local_k {
 
 macro_rules! interned_local_k_append {
     ($frame:ident, $vm:ident, $program:ident, $pc:ident, $here:ident, $op:expr) => {{
-        let a = $frame.locals_stack_w[insn_a($program, $pc)];
+        let a = read_cell($frame, insn_a($program, $pc));
         let k = intern_const($program, insn_b($program, $pc));
-        let depth = $frame.valuestackdepth;
-        let list = $frame.locals_stack_w[depth - 1];
-        if a.is_null() || k == 0 || list.is_null() {
-            residual_dispatch($vm, $here)
-        } else {
-            let r = unsafe { $op(a, k as usize as CelRef) };
-            if r == ERROR_SENTINEL || try_append(list as i64, r as i64) == 0 {
-                residual_dispatch($vm, $here)
-            } else {
-                $here + 1
+        match operand_cell($frame, 1) {
+            Some(list) if !a.is_null() && k != 0 && !list.is_null() => {
+                let r = unsafe { $op(a, k as usize as CelRef) };
+                if r == ERROR_SENTINEL || try_append(list as i64, r as i64) == 0 {
+                    residual_dispatch($vm, $here)
+                } else {
+                    $here + 1
+                }
             }
+            _ => residual_dispatch($vm, $here),
         }
     }};
 }
@@ -247,7 +278,13 @@ fn insn_c(program: &CelCode, pc: usize) -> i64 {
 /// Intern `consts[idx]`. 0 means the constant is not a class-family leaf.
 #[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
 fn interned_item(list: i64, index: i64) -> i64 {
-    match unsafe { interned_list_get(list as usize as CelRef, index) } {
+    let Some(list) = slot_leaf(list) else {
+        return 0;
+    };
+    if unsafe { w_kind(list) } != CelKind::List {
+        return 0;
+    }
+    match unsafe { interned_list_get(list, index) } {
         Some(w) => w as usize as i64,
         None => 0,
     }
@@ -255,12 +292,13 @@ fn interned_item(list: i64, index: i64) -> i64 {
 
 #[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
 fn try_append(list: i64, item: i64) -> i64 {
-    unsafe {
-        i64::from(list_try_append(
-            list as usize as CelRef,
-            item as usize as CelRef,
-        ))
-    }
+    let Some(list) = slot_leaf(list) else {
+        return 0;
+    };
+    let Some(item) = slot_leaf(item) else {
+        return 0;
+    };
+    unsafe { i64::from(list_try_append(list, item)) }
 }
 
 fn intern_const(program: &CelCode, idx: i64) -> i64 {
@@ -273,10 +311,9 @@ fn intern_const(program: &CelCode, idx: i64) -> i64 {
 /// Field `names[name_idx]` of interned map/struct `w`. 0 means residual.
 #[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
 fn interned_field(w: i64, program: &CelCode, name_idx: i64) -> i64 {
-    let w = w as usize as CelRef;
-    if w.is_null() {
+    let Some(w) = slot_leaf(w) else {
         return 0;
-    }
+    };
     let Some(field) = program.name(NameId(name_idx as u32)) else {
         return 0;
     };
@@ -294,10 +331,9 @@ fn interned_field(w: i64, program: &CelCode, name_idx: i64) -> i64 {
 /// `0` residual, `1` false, `2` true.
 #[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
 fn interned_has_field(w: i64, program: &CelCode, name_idx: i64) -> i64 {
-    let w = w as usize as CelRef;
-    if w.is_null() {
+    let Some(w) = slot_leaf(w) else {
         return 0;
-    }
+    };
     let Some(field) = program.name(NameId(name_idx as u32)) else {
         return 0;
     };
@@ -324,11 +360,12 @@ fn interned_has_field(w: i64, program: &CelCode, name_idx: i64) -> i64 {
 /// Interned `container[key]`. 0 means residual (including a miss).
 #[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
 fn interned_index(container: i64, key: i64) -> i64 {
-    let w = container as usize as CelRef;
-    let k = key as usize as CelRef;
-    if w.is_null() || k.is_null() {
+    let Some(w) = slot_leaf(container) else {
         return 0;
-    }
+    };
+    let Some(k) = slot_leaf(key) else {
+        return 0;
+    };
     let found = match unsafe { w_kind(w) } {
         CelKind::List => {
             if unsafe { w_kind(k) } != CelKind::Int {
@@ -354,11 +391,12 @@ fn interned_index(container: i64, key: i64) -> i64 {
 /// Interned `needle in container`. `0` residual, `1` false, `2` true.
 #[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
 fn interned_contains(container: i64, needle: i64) -> i64 {
-    let c = container as usize as CelRef;
-    let n = needle as usize as CelRef;
-    if c.is_null() || n.is_null() {
+    let Some(c) = slot_leaf(container) else {
         return 0;
-    }
+    };
+    let Some(n) = slot_leaf(needle) else {
+        return 0;
+    };
     match unsafe { w_kind(c) } {
         CelKind::List => {
             if unsafe { list_contains(c, n) } {
@@ -394,10 +432,9 @@ fn interned_contains(container: i64, needle: i64) -> i64 {
 /// Length of an interned list/map/string/bytes. `-1` means residual.
 #[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
 fn interned_len(w: i64) -> i64 {
-    let w = w as usize as CelRef;
-    if w.is_null() {
+    let Some(w) = slot_leaf(w) else {
         return -1;
-    }
+    };
     match unsafe { w_kind(w) } {
         CelKind::List => unsafe { list_len(w) },
         CelKind::Map => unsafe { map_len(w) },
@@ -416,10 +453,9 @@ fn interned_is_size(program: &CelCode, idx: i64) -> i64 {
 /// Unary optional method. 0 residual, else the result (may be `ERROR_SENTINEL`).
 #[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
 fn interned_optional_unary(program: &CelCode, name_idx: i64, w: i64) -> i64 {
-    let w = w as usize as CelRef;
-    if w.is_null() {
+    let Some(w) = slot_leaf(w) else {
         return 0;
-    }
+    };
     match program.name(NameId(name_idx as u32)) {
         Some("value") => unsafe { cel_optional_value(w) as i64 },
         Some("hasValue") => unsafe { cel_optional_has_value(w) as i64 },
@@ -433,11 +469,12 @@ fn interned_method1(program: &CelCode, name_idx: i64, recv: i64, arg: i64) -> i6
     let Some(name) = program.name(NameId(name_idx as u32)) else {
         return 0;
     };
-    let r = recv as usize as CelRef;
-    let a = arg as usize as CelRef;
-    if r.is_null() || a.is_null() {
+    let Some(r) = slot_leaf(recv) else {
         return 0;
-    }
+    };
+    let Some(a) = slot_leaf(arg) else {
+        return 0;
+    };
     match name {
         "contains" => {
             let found = interned_contains(recv, arg);
@@ -483,8 +520,10 @@ fn interned_qualified_kind(program: &CelCode, name_idx: i64) -> i64 {
 /// `0` not optional, `1` some, `2` none.
 #[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
 fn interned_optional_state(w: i64) -> i64 {
-    let w = w as usize as CelRef;
-    if w.is_null() || unsafe { w_kind(w) } != CelKind::Optional {
+    let Some(w) = slot_leaf(w) else {
+        return 0;
+    };
+    if unsafe { w_kind(w) } != CelKind::Optional {
         return 0;
     }
     if unsafe { (*w.cast::<W_OptionalObject>()).w_value }.is_null() {
@@ -496,8 +535,10 @@ fn interned_optional_state(w: i64) -> i64 {
 
 #[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
 fn interned_optional_inner(w: i64) -> i64 {
-    let w = w as usize as CelRef;
-    if w.is_null() || unsafe { w_kind(w) } != CelKind::Optional {
+    let Some(w) = slot_leaf(w) else {
+        return 0;
+    };
+    if unsafe { w_kind(w) } != CelKind::Optional {
         return 0;
     }
     let inner = unsafe { (*w.cast::<W_OptionalObject>()).w_value };
@@ -511,10 +552,9 @@ fn interned_optional_inner(w: i64) -> i64 {
 /// `0` residual, `1` false, `2` true, `3` non-bool.
 #[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
 fn interned_as_bool(w: i64) -> i64 {
-    let w = w as usize as CelRef;
-    if w.is_null() {
+    let Some(w) = slot_leaf(w) else {
         return 0;
-    }
+    };
     if unsafe { w_kind(w) } != CelKind::Bool {
         return 3;
     }
@@ -528,11 +568,12 @@ fn interned_as_bool(w: i64) -> i64 {
 /// Optional index. `0` residual, else an optional leaf.
 #[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
 fn interned_opt_index(container: i64, key: i64) -> i64 {
-    let mut w = container as usize as CelRef;
-    let k = key as usize as CelRef;
-    if w.is_null() || k.is_null() {
+    let Some(mut w) = slot_leaf(container) else {
         return 0;
-    }
+    };
+    let Some(k) = slot_leaf(key) else {
+        return 0;
+    };
     if unsafe { w_kind(w) } == CelKind::Optional {
         let inner = unsafe { (*w.cast::<W_OptionalObject>()).w_value };
         if inner.is_null() {
@@ -568,10 +609,9 @@ fn interned_opt_index(container: i64, key: i64) -> i64 {
 /// Optional field. `0` residual, else an optional leaf.
 #[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
 fn interned_opt_select(w: i64, program: &CelCode, name_idx: i64) -> i64 {
-    let mut w = w as usize as CelRef;
-    if w.is_null() {
+    let Some(mut w) = slot_leaf(w) else {
         return 0;
-    }
+    };
     if unsafe { w_kind(w) } == CelKind::Optional {
         let inner = unsafe { (*w.cast::<W_OptionalObject>()).w_value };
         if inner.is_null() {
@@ -611,18 +651,24 @@ fn intern_var(vm_bits: i64, program: &CelCode, idx: i64) -> i64 {
 
 #[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
 fn interned_unary(vm_bits: i64, program: &CelCode, name_idx: i64, w: i64) -> i64 {
+    let Some(w) = slot_leaf(w) else {
+        return 0;
+    };
     let Some(name) = program.name(NameId(name_idx as u32)) else {
         return 0;
     };
-    vm_of(vm_bits).interned_unary_bits(name, w as usize as CelRef)
+    vm_of(vm_bits).interned_unary_bits(name, w)
 }
 
 #[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
 fn interned_temporal(vm_bits: i64, program: &CelCode, name_idx: i64, w: i64) -> i64 {
+    let Some(w) = slot_leaf(w) else {
+        return 0;
+    };
     let Some(name) = program.name(NameId(name_idx as u32)) else {
         return 0;
     };
-    match vm_of(vm_bits).interned_temporal_int(name, w as usize as CelRef) {
+    match vm_of(vm_bits).interned_temporal_int(name, w) {
         Some(n) => new_int(n) as i64,
         None => 0,
     }
@@ -630,8 +676,10 @@ fn interned_temporal(vm_bits: i64, program: &CelCode, name_idx: i64, w: i64) -> 
 
 #[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
 fn interned_map_keys(vm_bits: i64, w: i64) -> i64 {
-    let w = w as usize as CelRef;
-    if w.is_null() || unsafe { w_kind(w) } != CelKind::Map {
+    let Some(w) = slot_leaf(w) else {
+        return 0;
+    };
+    if unsafe { w_kind(w) } != CelKind::Map {
         return 0;
     }
     vm_of(vm_bits).interned_map_key_list(w) as i64
@@ -639,8 +687,10 @@ fn interned_map_keys(vm_bits: i64, w: i64) -> i64 {
 
 #[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
 fn interned_list_indices(vm_bits: i64, w: i64) -> i64 {
-    let w = w as usize as CelRef;
-    if w.is_null() || unsafe { w_kind(w) } != CelKind::List {
+    let Some(w) = slot_leaf(w) else {
+        return 0;
+    };
+    if unsafe { w_kind(w) } != CelKind::List {
         return 0;
     }
     vm_of(vm_bits).interned_list_index_list(w) as i64
@@ -881,34 +931,38 @@ fn run_cel_portal(
                     here + 1
                 }
             }
-            OP_GET_FIELD => {
-                let depth = frame.valuestackdepth;
-                let recv = frame.locals_stack_w[depth - 1];
-                let found = interned_field(recv as i64, program, insn_a(program, pc));
-                if recv.is_null() || found == 0 {
-                    residual_dispatch(vm, here)
-                } else {
-                    let r = found as usize as CelRef;
-                    frame.locals_stack_w[depth - 1] = r;
-                    vm_sync_replace(vm, found);
-                    here + 1
+            OP_GET_FIELD => match operand_cell(frame, 1) {
+                Some(recv) if !recv.is_null() => {
+                    let found = interned_field(recv as i64, program, insn_a(program, pc));
+                    if found == 0 {
+                        residual_dispatch(vm, here)
+                    } else {
+                        let depth = frame.valuestackdepth;
+                        let r = found as usize as CelRef;
+                        frame.locals_stack_w[depth - 1] = r;
+                        vm_sync_replace(vm, found);
+                        here + 1
+                    }
                 }
-            }
-            OP_HAS_FIELD => {
-                let depth = frame.valuestackdepth;
-                let recv = frame.locals_stack_w[depth - 1];
-                let found = interned_has_field(recv as i64, program, insn_a(program, pc));
-                if recv.is_null() || found == 0 {
-                    residual_dispatch(vm, here)
-                } else {
-                    let r = new_bool(found == 2) as CelRef;
-                    frame.locals_stack_w[depth - 1] = r;
-                    vm_sync_replace(vm, r as i64);
-                    here + 1
+                _ => residual_dispatch(vm, here),
+            },
+            OP_HAS_FIELD => match operand_cell(frame, 1) {
+                Some(recv) if !recv.is_null() => {
+                    let found = interned_has_field(recv as i64, program, insn_a(program, pc));
+                    if found == 0 {
+                        residual_dispatch(vm, here)
+                    } else {
+                        let depth = frame.valuestackdepth;
+                        let r = new_bool(found == 2) as CelRef;
+                        frame.locals_stack_w[depth - 1] = r;
+                        vm_sync_replace(vm, r as i64);
+                        here + 1
+                    }
                 }
-            }
+                _ => residual_dispatch(vm, here),
+            },
             OP_GET_FIELD_LOCAL => {
-                let recv = frame.locals_stack_w[insn_a(program, pc)];
+                let recv = read_cell(frame, insn_a(program, pc));
                 let found = interned_field(recv as i64, program, insn_b(program, pc));
                 if recv.is_null() || found == 0 {
                     residual_dispatch(vm, here)
@@ -922,7 +976,7 @@ fn run_cel_portal(
                 }
             }
             OP_HAS_FIELD_LOCAL => {
-                let recv = frame.locals_stack_w[insn_a(program, pc)];
+                let recv = read_cell(frame, insn_a(program, pc));
                 let found = interned_has_field(recv as i64, program, insn_b(program, pc));
                 if recv.is_null() || found == 0 {
                     residual_dispatch(vm, here)
@@ -936,7 +990,7 @@ fn run_cel_portal(
                 }
             }
             OP_GET_FIELD_LOCAL_APPEND => {
-                let recv = frame.locals_stack_w[insn_a(program, pc)];
+                let recv = read_cell(frame, insn_a(program, pc));
                 let found = interned_field(recv as i64, program, insn_b(program, pc));
                 let depth = frame.valuestackdepth;
                 let list = frame.locals_stack_w[depth - 1];
@@ -951,7 +1005,7 @@ fn run_cel_portal(
                 }
             }
             OP_HAS_FIELD_LOCAL_APPEND => {
-                let recv = frame.locals_stack_w[insn_a(program, pc)];
+                let recv = read_cell(frame, insn_a(program, pc));
                 let found = interned_has_field(recv as i64, program, insn_b(program, pc));
                 let depth = frame.valuestackdepth;
                 let list = frame.locals_stack_w[depth - 1];
@@ -966,49 +1020,53 @@ fn run_cel_portal(
                     }
                 }
             }
-            OP_INDEX => {
-                let depth = frame.valuestackdepth;
-                let key = frame.locals_stack_w[depth - 1];
-                let container = frame.locals_stack_w[depth - 2];
-                let item = interned_index(container as i64, key as i64);
-                if container.is_null() || key.is_null() || item == 0 {
-                    residual_dispatch(vm, here)
-                } else {
-                    let r = item as usize as CelRef;
-                    frame.locals_stack_w[depth - 2] = r;
-                    frame.valuestackdepth = depth - 1;
-                    vm_sync_binop(vm, item);
-                    here + 1
+            OP_INDEX => match (operand_cell(frame, 2), operand_cell(frame, 1)) {
+                (Some(container), Some(key)) if !container.is_null() && !key.is_null() => {
+                    let item = interned_index(container as i64, key as i64);
+                    if item == 0 {
+                        residual_dispatch(vm, here)
+                    } else {
+                        let depth = frame.valuestackdepth;
+                        let r = item as usize as CelRef;
+                        frame.locals_stack_w[depth - 2] = r;
+                        frame.valuestackdepth = depth - 1;
+                        vm_sync_binop(vm, item);
+                        here + 1
+                    }
                 }
-            }
-            OP_OPT_INDEX => {
-                let depth = frame.valuestackdepth;
-                let key = frame.locals_stack_w[depth - 1];
-                let container = frame.locals_stack_w[depth - 2];
-                let item = interned_opt_index(container as i64, key as i64);
-                if container.is_null() || key.is_null() || item == 0 {
-                    residual_dispatch(vm, here)
-                } else {
-                    let r = item as usize as CelRef;
-                    frame.locals_stack_w[depth - 2] = r;
-                    frame.valuestackdepth = depth - 1;
-                    vm_sync_binop(vm, item);
-                    here + 1
+                _ => residual_dispatch(vm, here),
+            },
+            OP_OPT_INDEX => match (operand_cell(frame, 2), operand_cell(frame, 1)) {
+                (Some(container), Some(key)) if !container.is_null() && !key.is_null() => {
+                    let item = interned_opt_index(container as i64, key as i64);
+                    if item == 0 {
+                        residual_dispatch(vm, here)
+                    } else {
+                        let depth = frame.valuestackdepth;
+                        let r = item as usize as CelRef;
+                        frame.locals_stack_w[depth - 2] = r;
+                        frame.valuestackdepth = depth - 1;
+                        vm_sync_binop(vm, item);
+                        here + 1
+                    }
                 }
-            }
-            OP_OPT_SELECT => {
-                let depth = frame.valuestackdepth;
-                let recv = frame.locals_stack_w[depth - 1];
-                let found = interned_opt_select(recv as i64, program, insn_a(program, pc));
-                if recv.is_null() || found == 0 {
-                    residual_dispatch(vm, here)
-                } else {
-                    let r = found as usize as CelRef;
-                    frame.locals_stack_w[depth - 1] = r;
-                    vm_sync_replace(vm, found);
-                    here + 1
+                _ => residual_dispatch(vm, here),
+            },
+            OP_OPT_SELECT => match operand_cell(frame, 1) {
+                Some(recv) if !recv.is_null() => {
+                    let found = interned_opt_select(recv as i64, program, insn_a(program, pc));
+                    if found == 0 {
+                        residual_dispatch(vm, here)
+                    } else {
+                        let depth = frame.valuestackdepth;
+                        let r = found as usize as CelRef;
+                        frame.locals_stack_w[depth - 1] = r;
+                        vm_sync_replace(vm, found);
+                        here + 1
+                    }
                 }
-            }
+                _ => residual_dispatch(vm, here),
+            },
             OP_JUMP_IF_OPT_NONE => {
                 let depth = frame.valuestackdepth;
                 let w = frame.locals_stack_w[depth - 1];
@@ -1093,61 +1151,61 @@ fn run_cel_portal(
             OP_GE_LOCAL_K_APPEND => {
                 interned_local_k_append!(frame, vm, program, pc, here, cel_greater_equals)
             }
-            OP_NOT => {
-                let depth = frame.valuestackdepth;
-                let w = frame.locals_stack_w[depth - 1];
-                if w.is_null() || unsafe { w_kind(w) } != CelKind::Bool {
-                    residual_dispatch(vm, here)
-                } else {
+            OP_NOT => match operand_cell(frame, 1) {
+                Some(w) if !w.is_null() && unsafe { w_kind(w) } == CelKind::Bool => {
                     let r = unsafe { cel_negate(w) };
                     if r == ERROR_SENTINEL {
                         residual_dispatch(vm, here)
                     } else {
+                        let depth = frame.valuestackdepth;
                         frame.locals_stack_w[depth - 1] = r;
                         vm_sync_replace(vm, r as i64);
                         here + 1
                     }
                 }
-            }
-            OP_NEGATE => {
-                let depth = frame.valuestackdepth;
-                let w = frame.locals_stack_w[depth - 1];
-                if w.is_null() {
-                    residual_dispatch(vm, here)
-                } else {
+                _ => residual_dispatch(vm, here),
+            },
+            OP_NEGATE => match operand_cell(frame, 1) {
+                Some(w) if !w.is_null() => {
                     let r = unsafe { cel_negate(w) };
                     if r == ERROR_SENTINEL {
                         residual_dispatch(vm, here)
                     } else {
+                        let depth = frame.valuestackdepth;
                         frame.locals_stack_w[depth - 1] = r;
                         vm_sync_replace(vm, r as i64);
                         here + 1
                     }
                 }
-            }
-            OP_IN => {
-                let depth = frame.valuestackdepth;
-                let container = frame.locals_stack_w[depth - 1];
-                let needle = frame.locals_stack_w[depth - 2];
-                let found = interned_contains(container as i64, needle as i64);
-                if container.is_null() || needle.is_null() || found == 0 {
-                    residual_dispatch(vm, here)
-                } else {
-                    let r = new_bool(found == 2) as CelRef;
-                    frame.locals_stack_w[depth - 2] = r;
-                    frame.valuestackdepth = depth - 1;
-                    vm_sync_binop(vm, r as i64);
-                    here + 1
+                _ => residual_dispatch(vm, here),
+            },
+            OP_IN => match (operand_cell(frame, 2), operand_cell(frame, 1)) {
+                (Some(needle), Some(container)) if !needle.is_null() && !container.is_null() => {
+                    let found = interned_contains(container as i64, needle as i64);
+                    if found == 0 {
+                        residual_dispatch(vm, here)
+                    } else {
+                        let depth = frame.valuestackdepth;
+                        let r = new_bool(found == 2) as CelRef;
+                        frame.locals_stack_w[depth - 2] = r;
+                        frame.valuestackdepth = depth - 1;
+                        vm_sync_binop(vm, r as i64);
+                        here + 1
+                    }
                 }
-            }
+                _ => residual_dispatch(vm, here),
+            },
             OP_LOAD_LOCAL_APPEND => {
-                let w = frame.locals_stack_w[insn_a(program, pc)];
-                let depth = frame.valuestackdepth;
-                let list = frame.locals_stack_w[depth - 1];
-                if w.is_null() || list.is_null() || try_append(list as i64, w as i64) == 0 {
-                    residual_dispatch(vm, here)
-                } else {
-                    here + 1
+                let w = read_cell(frame, insn_a(program, pc));
+                match operand_cell(frame, 1) {
+                    Some(list)
+                        if !w.is_null()
+                            && !list.is_null()
+                            && try_append(list as i64, w as i64) != 0 =>
+                    {
+                        here + 1
+                    }
+                    _ => residual_dispatch(vm, here),
                 }
             }
             OP_CALL_HOST | OP_CALL_METHOD => {
@@ -1155,48 +1213,62 @@ fn run_cel_portal(
                 let name = insn_a(program, pc);
                 let unary_arity = if opcode == OP_CALL_HOST { 1 } else { 0 };
                 if arity == unary_arity && interned_is_size(program, name) != 0 {
-                    let depth = frame.valuestackdepth;
-                    let w = frame.locals_stack_w[depth - 1];
-                    let n = interned_len(w as i64);
-                    if w.is_null() || n < 0 {
-                        residual_dispatch(vm, here)
-                    } else {
-                        let r = new_int(n) as CelRef;
-                        frame.locals_stack_w[depth - 1] = r;
-                        vm_sync_replace(vm, r as i64);
-                        here + 1
+                    match operand_cell(frame, 1) {
+                        Some(w) if !w.is_null() => {
+                            let n = interned_len(w as i64);
+                            if n < 0 {
+                                residual_dispatch(vm, here)
+                            } else {
+                                let depth = frame.valuestackdepth;
+                                let r = new_int(n) as CelRef;
+                                frame.locals_stack_w[depth - 1] = r;
+                                vm_sync_replace(vm, r as i64);
+                                here + 1
+                            }
+                        }
+                        _ => residual_dispatch(vm, here),
                     }
                 } else if arity == unary_arity {
-                    let depth = frame.valuestackdepth;
-                    let w = frame.locals_stack_w[depth - 1];
-                    let mut out = interned_unary(vm, program, name, w as i64);
-                    if out == 0 && opcode == OP_CALL_METHOD {
-                        out = interned_temporal(vm, program, name, w as i64);
-                    }
-                    if out == 0 && opcode == OP_CALL_METHOD {
-                        out = interned_optional_unary(program, name, w as i64);
-                    }
-                    if w.is_null() || out == 0 || out == ERROR_SENTINEL as i64 {
-                        residual_dispatch(vm, here)
-                    } else {
-                        let r = out as usize as CelRef;
-                        frame.locals_stack_w[depth - 1] = r;
-                        vm_sync_replace(vm, out);
-                        here + 1
+                    match operand_cell(frame, 1) {
+                        Some(w) if !w.is_null() => {
+                            let mut out = interned_unary(vm, program, name, w as i64);
+                            if out == 0 && opcode == OP_CALL_METHOD {
+                                out = interned_temporal(vm, program, name, w as i64);
+                            }
+                            if out == 0 && opcode == OP_CALL_METHOD {
+                                out = interned_optional_unary(program, name, w as i64);
+                            }
+                            if out == 0 || out == ERROR_SENTINEL as i64 {
+                                residual_dispatch(vm, here)
+                            } else {
+                                let depth = frame.valuestackdepth;
+                                let r = out as usize as CelRef;
+                                frame.locals_stack_w[depth - 1] = r;
+                                vm_sync_replace(vm, out);
+                                here + 1
+                            }
+                        }
+                        _ => residual_dispatch(vm, here),
                     }
                 } else if opcode == OP_CALL_METHOD && arity == 1 {
-                    let depth = frame.valuestackdepth;
-                    let recv = frame.locals_stack_w[depth - 1];
-                    let arg = frame.locals_stack_w[depth - 2];
-                    let out = interned_method1(program, name, recv as i64, arg as i64);
-                    if recv.is_null() || arg.is_null() || out == 0 || out == ERROR_SENTINEL as i64 {
-                        residual_dispatch(vm, here)
-                    } else {
-                        let r = out as usize as CelRef;
-                        frame.locals_stack_w[depth - 2] = r;
-                        frame.valuestackdepth = depth - 1;
-                        vm_sync_binop(vm, out);
-                        here + 1
+                    // After a CallQualified miss the arguments are parked and
+                    // only the receiver sits on the stack. `operand_cell(2)`
+                    // is then a local or the items-block header; decline.
+                    match (operand_cell(frame, 1), operand_cell(frame, 2)) {
+                        (Some(recv), Some(arg)) if !recv.is_null() && !arg.is_null() => {
+                            let out = interned_method1(program, name, recv as i64, arg as i64);
+                            if out == 0 || out == ERROR_SENTINEL as i64 {
+                                residual_dispatch(vm, here)
+                            } else {
+                                let depth = frame.valuestackdepth;
+                                let r = out as usize as CelRef;
+                                frame.locals_stack_w[depth - 2] = r;
+                                frame.valuestackdepth = depth - 1;
+                                vm_sync_binop(vm, out);
+                                here + 1
+                            }
+                        }
+                        _ => residual_dispatch(vm, here),
                     }
                 } else {
                     residual_dispatch(vm, here)
@@ -1317,13 +1389,10 @@ fn run_cel_portal(
                 }
             }
             OP_JUMP => insn_a(program, pc),
-            OP_JUMP_IF_FALSE | OP_JUMP_IF_TRUE => {
-                let depth = frame.valuestackdepth;
-                let w = frame.locals_stack_w[depth - 1];
-                if w.is_null() || unsafe { w_kind(w) } != CelKind::Bool {
-                    residual_dispatch(vm, here)
-                } else {
+            OP_JUMP_IF_FALSE | OP_JUMP_IF_TRUE => match operand_cell(frame, 1) {
+                Some(w) if !w.is_null() && unsafe { w_kind(w) } == CelKind::Bool => {
                     let truthy = unsafe { (*w.cast::<W_BoolObject>()).boolval } != 0;
+                    let depth = frame.valuestackdepth;
                     frame.valuestackdepth = depth - 1;
                     vm_sync_pop(vm);
                     let want = opcode == OP_JUMP_IF_TRUE;
@@ -1333,7 +1402,8 @@ fn run_cel_portal(
                         here + 1
                     }
                 }
-            }
+                _ => residual_dispatch(vm, here),
+            },
             OP_NEW_LIST => {
                 let w = new_list_with_capacity(insn_a(program, pc)) as CelRef;
                 let depth = frame.valuestackdepth;
@@ -1343,7 +1413,7 @@ fn run_cel_portal(
                 here + 1
             }
             OP_NEW_LIST_FROM_ARG => {
-                let src = frame.locals_stack_w[insn_a(program, pc)];
+                let src = read_cell(frame, insn_a(program, pc));
                 if src.is_null() || unsafe { w_kind(src) } != CelKind::List {
                     residual_dispatch(vm, here)
                 } else {
