@@ -1,8 +1,54 @@
 //! The code object: a compiled expression.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
 use super::error::NameId;
 use super::opcode::OpCode;
 use crate::Value;
+
+static NEXT_CODE_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Process-wide identity of one compiled bytecode object.
+///
+/// A clone of a [`CelCode`] is the same bytecode, so it shares this id and
+/// the liveness flag. A fresh compile mints a new id even for identical
+/// source. [`PartialEq`] is always true so [`CelCode`]'s derived equality
+/// stays bytecode equality.
+#[derive(Clone)]
+pub(crate) struct CodeIdentity {
+    pub(crate) id: u64,
+    pub(crate) live: Arc<()>,
+}
+
+impl CodeIdentity {
+    fn new() -> Self {
+        CodeIdentity {
+            id: NEXT_CODE_ID.fetch_add(1, Ordering::Relaxed),
+            live: Arc::new(()),
+        }
+    }
+}
+
+impl Default for CodeIdentity {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PartialEq for CodeIdentity {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl std::fmt::Debug for CodeIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CodeIdentity")
+            .field("id", &self.id)
+            .finish()
+    }
+}
 
 /// One instruction, already decoded.
 ///
@@ -44,6 +90,9 @@ pub struct CelCode {
     /// Where an error raised inside a short-circuit operator's *left* operand
     /// is caught. Innermost match wins.
     pub handlers: Vec<Handler>,
+    /// Unique id minted at compile. A clone shares it; a drop of the last
+    /// clone is the drop signal the per-thread driver table observes.
+    pub(crate) identity: CodeIdentity,
 }
 
 /// One entry of the handler table.
@@ -189,5 +238,16 @@ mod tests {
         assert_eq!(code.name(NameId(1)), None);
         assert_eq!(code.konst(0), Some(&Value::Int(7)));
         assert_eq!(code.konst(1), None);
+    }
+
+    #[test]
+    fn a_clone_shares_code_identity_and_a_fresh_code_does_not() {
+        let a = CelCode::default();
+        let b = a.clone();
+        assert_eq!(a.identity.id, b.identity.id);
+        assert!(std::sync::Arc::ptr_eq(&a.identity.live, &b.identity.live));
+        let c = CelCode::default();
+        assert_ne!(a.identity.id, c.identity.id);
+        assert_eq!(a, c);
     }
 }

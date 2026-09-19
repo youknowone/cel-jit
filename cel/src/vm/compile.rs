@@ -147,6 +147,7 @@ impl Compiler {
             max_stack: u32::try_from(self.max_stack).unwrap_or(u32::MAX),
             n_logic: self.n_logic,
             handlers: self.handlers,
+            identity: Default::default(),
         })
     }
 

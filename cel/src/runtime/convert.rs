@@ -183,13 +183,7 @@ pub unsafe fn ref_to_value(w: CelRef) -> Result<Value, ConvertError> {
         }
         CelKind::Bytes if class == &CEL_BYTES_CLASS => {
             let leaf = unsafe { &*w.cast::<W_BytesObject>() };
-            let n = leaf.length as usize;
-            let base = unsafe { bytes_base(leaf.data) };
-            if base.is_null() && n != 0 {
-                return Err(ConvertError::Corrupt("bytes"));
-            }
-            let bytes = unsafe { std::slice::from_raw_parts(base, n) };
-            Ok(Value::Bytes(Arc::new(bytes.to_vec())))
+            Ok(Value::Bytes(bytes_from_leaf(leaf)?))
         }
         CelKind::List if class == &CEL_LIST_CLASS => Ok(Value::List(unsafe { list_from_ref(w)? })),
         CelKind::Map if class == &CEL_MAP_CLASS => Ok(Value::Map(unsafe { map_from_ref(w)? })),
@@ -365,8 +359,66 @@ fn value_as_int(v: &Value) -> Option<i64> {
     }
 }
 
+/// Record a non-owning link from an interned leaf back to the public
+/// handle it was wrapped from. The caller keeps that handle alive.
+pub(crate) fn link_public_handle(w: CelRef, value: &Value) {
+    unsafe {
+        match value {
+            Value::List(list) => {
+                if w_kind(w) != CelKind::List {
+                    return;
+                }
+                let leaf = &mut *w.cast::<W_ListObject>();
+                leaf.public = Arc::as_ptr(list.storage_arc()) as *const ();
+                leaf.public_start = list.window_start() as u32;
+                leaf.public_len = list.len() as u32;
+            }
+            Value::Map(map) => {
+                if w_kind(w) != CelKind::Map {
+                    return;
+                }
+                if let Some(arc) = map.object_arc() {
+                    (*w.cast::<W_MapObject>()).public = Arc::as_ptr(arc) as *const ();
+                }
+            }
+            Value::String(s) => {
+                if w_kind(w) != CelKind::Str {
+                    return;
+                }
+                (*w.cast::<W_StringObject>()).public = Arc::as_ptr(s) as *const ();
+            }
+            Value::Bytes(b) => {
+                if w_kind(w) != CelKind::Bytes {
+                    return;
+                }
+                (*w.cast::<W_BytesObject>()).public = Arc::as_ptr(b) as *const ();
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Increment the strong count of the `Arc` behind `ptr` and return a new
+/// handle. `ptr` is `Arc::as_ptr` of a live allocation.
+unsafe fn clone_arc<T>(ptr: *const T) -> Option<Arc<T>> {
+    if ptr.is_null() {
+        return None;
+    }
+    unsafe {
+        Arc::increment_strong_count(ptr);
+        Some(Arc::from_raw(ptr))
+    }
+}
+
 unsafe fn list_from_ref(w: CelRef) -> Result<ListRef, ConvertError> {
     let leaf = &*w.cast::<W_ListObject>();
+    if let Some(storage) = clone_arc(leaf.public as *const ListStorage) {
+        return Ok(ListRef::from_linked(
+            storage,
+            leaf.public_start,
+            leaf.public_len,
+        ));
+    }
     match leaf.strategy {
         ListStrategy::Object => {
             let n = leaf.length as usize;
@@ -445,6 +497,9 @@ fn intern_map(map: &Map) -> Result<CelRef, ConvertError> {
 
 unsafe fn map_from_ref(w: CelRef) -> Result<Map, ConvertError> {
     let leaf = &*w.cast::<W_MapObject>();
+    if let Some(entries) = clone_arc(leaf.public as *const HashMap<Key, Value>) {
+        return Ok(Map::object(entries));
+    }
     match leaf.strategy {
         MapStrategy::Object => {
             let n = leaf.length as usize;
@@ -540,6 +595,9 @@ fn map_pairs(map: &Map) -> Result<Vec<(CelRef, CelRef)>, ConvertError> {
 }
 
 fn string_from_leaf(leaf: &W_StringObject) -> Result<Arc<String>, ConvertError> {
+    if let Some(s) = unsafe { clone_arc(leaf.public as *const String) } {
+        return Ok(s);
+    }
     let n = leaf.byte_len as usize;
     let base = unsafe { bytes_base(leaf.chars) };
     if base.is_null() && n != 0 {
@@ -548,6 +606,19 @@ fn string_from_leaf(leaf: &W_StringObject) -> Result<Arc<String>, ConvertError> 
     let bytes = unsafe { std::slice::from_raw_parts(base, n) };
     let s = std::str::from_utf8(bytes).map_err(|_| ConvertError::Corrupt("string"))?;
     Ok(Arc::new(s.to_string()))
+}
+
+fn bytes_from_leaf(leaf: &W_BytesObject) -> Result<Arc<Vec<u8>>, ConvertError> {
+    if let Some(b) = unsafe { clone_arc(leaf.public as *const Vec<u8>) } {
+        return Ok(b);
+    }
+    let n = leaf.length as usize;
+    let base = unsafe { bytes_base(leaf.data) };
+    if base.is_null() && n != 0 {
+        return Err(ConvertError::Corrupt("bytes"));
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(base, n) };
+    Ok(Arc::new(bytes.to_vec()))
 }
 
 #[cfg(feature = "structs")]
@@ -810,5 +881,45 @@ mod tests {
         let v: Value = Arc::new("drop-in".to_string()).into();
         assert_eq!(v, Value::String(Arc::new("drop-in".into())));
         assert_eq!(roundtrip(v.clone()), v);
+    }
+
+    #[test]
+    fn a_linked_public_list_unpacks_the_same_buffer() {
+        let original = ListRef::from(vec![Value::Int(1), Value::Int(2)]);
+        let value = Value::List(original.clone());
+        let w = intern_leaf(&value).expect("intern");
+        link_public_handle(w, &value);
+        let back = unsafe { list_from_ref(w) }.expect("unpack");
+        assert!(original.ptr_eq(&back));
+    }
+
+    #[test]
+    fn a_vm_born_list_has_no_public_link() {
+        let value = Value::List(ListRef::from(vec![Value::Int(1)]));
+        let w = intern_leaf(&value).expect("intern");
+        let leaf = unsafe { &*w.cast::<W_ListObject>() };
+        assert!(leaf.public.is_null());
+    }
+
+    #[test]
+    fn a_linked_public_map_unpacks_the_same_table() {
+        let mut entries = HashMap::new();
+        entries.insert(Key::String(Arc::new("a".into())), Value::Int(1));
+        let original = Map::object(Arc::new(entries));
+        let value = Value::Map(original.clone());
+        let w = intern_leaf(&value).expect("intern");
+        link_public_handle(w, &value);
+        let back = unsafe { map_from_ref(w) }.expect("unpack");
+        assert!(original.ptr_eq(&back));
+    }
+
+    #[test]
+    fn a_linked_public_string_unpacks_the_same_arc() {
+        let original = Arc::new("hello".to_string());
+        let value = Value::String(original.clone());
+        let w = intern_leaf(&value).expect("intern");
+        link_public_handle(w, &value);
+        let back = string_from_leaf(unsafe { &*w.cast::<W_StringObject>() }).expect("unpack");
+        assert!(Arc::ptr_eq(&original, &back));
     }
 }

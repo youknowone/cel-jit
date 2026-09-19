@@ -36,11 +36,17 @@ pub enum Context<'a> {
         variables: BTreeMap<Box<str>, Value>,
         resolver: Option<&'a dyn VariableResolver>,
         env: Arc<Env>,
+        /// Owning public handles for values wrapped at bind. Interned
+        /// leaves hold a non-owning link into these; they stay alive for
+        /// the Context's lifetime so a rebind cannot dangle a pointer
+        /// still sitting on the operand stack.
+        retained: Vec<Value>,
     },
     Child {
         parent: &'a Context<'a>,
         variables: BTreeMap<Box<str>, Value>,
         resolver: Option<&'a dyn VariableResolver>,
+        retained: Vec<Value>,
     },
 }
 
@@ -59,14 +65,36 @@ fn store(variables: &mut BTreeMap<Box<str>, Value>, name: impl AsRef<str>, value
 }
 
 /// Wrap a value as it enters the system: a class-family leaf is stored as
-/// [`Value::Interned`], so a later load is a pointer copy. Already-interned
-/// values are left as they are.
-fn wrap_entry(value: Value) -> Value {
-    crate::runtime::heap::with_old_space(|| {
-        crate::runtime::convert::intern_leaf(&value)
-            .map(Value::from_interned)
-            .unwrap_or(value)
+/// [`Value::Interned`], so a later load is a pointer copy. A container,
+/// string or bytes wrapped from a public handle records a non-owning link
+/// back to that handle; [`retain_public`] keeps the handle alive.
+fn wrap_entry(ctx: &mut Context, value: Value) -> Value {
+    crate::runtime::heap::with_old_space(|| match crate::runtime::convert::intern_leaf(&value) {
+        Some(w) => {
+            crate::runtime::convert::link_public_handle(w, &value);
+            retain_public(ctx, value);
+            Value::from_interned(w)
+        }
+        None => value,
     })
+}
+
+fn retain_public(ctx: &mut Context, value: Value) {
+    if matches!(
+        &value,
+        Value::List(_) | Value::Map(_) | Value::String(_) | Value::Bytes(_)
+    ) {
+        ctx.retained_mut().push(value);
+    }
+}
+
+/// The public form of a bound value. Interned leaves unpack through the
+/// public link when one exists, so a bound list is `Value::List` again.
+fn public_form(v: Value) -> Value {
+    match v {
+        Value::Interned(w) => Value::from_interned(w).unpack(),
+        other => other,
+    }
 }
 
 impl<'a> Context<'a> {
@@ -79,7 +107,8 @@ impl<'a> Context<'a> {
         S: AsRef<str>,
         V: TryIntoValue,
     {
-        self.bind_value(name, wrap_entry(value.try_into_value()?));
+        let wrapped = wrap_entry(self, value.try_into_value()?);
+        self.bind_value(name, wrapped);
         Ok(())
     }
 
@@ -88,7 +117,8 @@ impl<'a> Context<'a> {
         S: AsRef<str>,
         V: Into<Value>,
     {
-        self.bind_value(name, wrap_entry(value.into()));
+        let wrapped = wrap_entry(self, value.into());
+        self.bind_value(name, wrapped);
     }
 
     /// Binds an application type that CEL treats as an opaque handle.
@@ -104,7 +134,8 @@ impl<'a> Context<'a> {
     where
         S: AsRef<str>,
     {
-        self.bind_value(name, wrap_entry(Value::Opaque(value)));
+        let wrapped = wrap_entry(self, Value::Opaque(value));
+        self.bind_value(name, wrapped);
     }
 
     fn bind_value<S>(&mut self, name: S, value: Value)
@@ -116,6 +147,13 @@ impl<'a> Context<'a> {
             Context::Child { variables, .. } => variables,
         };
         store(variables, name, value);
+    }
+
+    fn retained_mut(&mut self) -> &mut Vec<Value> {
+        match self {
+            Context::Root { retained, .. } => retained,
+            Context::Child { retained, .. } => retained,
+        }
     }
 
     /// Store `value` as given. A comprehension rebinding is an internal move,
@@ -158,11 +196,20 @@ impl<'a> Context<'a> {
     /// It costs a string match only where the answer was previously
     /// `UndeclaredReference`, because every bound name is found before the
     /// chain bottoms out.
+    ///
+    /// A bound container, string or bytes is returned in public form
+    /// (`Value::List` / `Map` / `String` / `Bytes`), never as
+    /// [`Value::Interned`].
     pub fn get_variable<S>(&self, name: S) -> Option<Value>
     where
         S: AsRef<str>,
     {
-        let name = name.as_ref();
+        self.lookup_raw(name.as_ref()).map(public_form)
+    }
+
+    /// The value stored under `name`, still interned if wrap-at-bind interned
+    /// it. Loads inside an evaluation use this so they stay a pointer copy.
+    pub(crate) fn lookup_raw(&self, name: &str) -> Option<Value> {
         let from_resolver =
             |resolver: &Option<&'a dyn VariableResolver>| resolver.and_then(|r| r.resolve(name));
         match self {
@@ -170,14 +217,15 @@ impl<'a> Context<'a> {
                 variables,
                 parent,
                 resolver,
+                ..
             } => from_resolver(resolver).or_else(|| {
                 variables
                     .get(name)
                     .cloned()
-                    .or_else(|| parent.get_variable(name))
+                    .or_else(|| parent.lookup_raw(name))
             }),
             // The base case of the recursion, so a `Child` reaches this through
-            // `parent.get_variable` and the type identifiers stay behind every
+            // `parent.lookup_raw` and the type identifiers stay behind every
             // scope at every depth.
             Context::Root {
                 variables,
@@ -253,6 +301,7 @@ impl<'a> Context<'a> {
             parent: self,
             variables: Default::default(),
             resolver: None,
+            retained: Vec::new(),
         }
     }
 
@@ -273,6 +322,7 @@ impl<'a> Context<'a> {
             variables: Default::default(),
             functions: Default::default(),
             resolver: None,
+            retained: Vec::new(),
         }
     }
 
@@ -282,6 +332,7 @@ impl<'a> Context<'a> {
             variables: Default::default(),
             functions: Default::default(),
             resolver: None,
+            retained: Vec::new(),
         }
     }
 }
@@ -293,6 +344,7 @@ impl Default for Context<'_> {
             variables: Default::default(),
             functions: Default::default(),
             resolver: None,
+            retained: Vec::new(),
         }
     }
 }

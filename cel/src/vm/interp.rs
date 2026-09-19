@@ -885,7 +885,7 @@ impl<'a> Vm<'a> {
     }
 
     pub(crate) fn intern_context_var(&self, name: &str) -> Option<CelRef> {
-        match self.ctx.get_variable(name)? {
+        match self.ctx.lookup_raw(name)? {
             Value::Interned(w) => Some(w),
             other => intern_leaf(&other),
         }
@@ -1910,7 +1910,7 @@ impl<'a> Vm<'a> {
                 let name = self.name(a)?;
                 let value = self
                     .ctx
-                    .get_variable(name)
+                    .lookup_raw(name)
                     .ok_or(CelErr::UndeclaredReference(NameId(a)))?;
                 self.push(value);
             }

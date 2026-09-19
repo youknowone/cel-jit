@@ -243,6 +243,31 @@ impl Map {
         &self.storage
     }
 
+    /// True when both maps name the same object table or the same record row.
+    pub fn ptr_eq(&self, other: &Map) -> bool {
+        match (&self.storage, &other.storage) {
+            (MapStorage::Object(a), MapStorage::Object(b)) => Arc::ptr_eq(a, b),
+            (
+                MapStorage::Record {
+                    schema: sa,
+                    index: ia,
+                },
+                MapStorage::Record {
+                    schema: sb,
+                    index: ib,
+                },
+            ) => Arc::ptr_eq(sa, sb) && ia == ib,
+            _ => false,
+        }
+    }
+
+    pub(crate) fn object_arc(&self) -> Option<&Arc<HashMap<Key, Value>>> {
+        match &self.storage {
+            MapStorage::Object(a) => Some(a),
+            _ => None,
+        }
+    }
+
     pub fn len(&self) -> usize {
         match &self.storage {
             MapStorage::Object(map) => map.len(),
@@ -843,8 +868,27 @@ impl ListRef {
         &self.storage
     }
 
+    pub(crate) fn storage_arc(&self) -> &Arc<ListStorage> {
+        &self.storage
+    }
+
+    /// Reconstruct a window from a bind-time public link. The offsets were
+    /// recorded from a live [`ListRef`] over this buffer.
+    pub(crate) fn from_linked(storage: Arc<ListStorage>, start: u32, len: u32) -> ListRef {
+        ListRef {
+            storage,
+            start,
+            len,
+        }
+    }
+
     pub(crate) fn window_start(&self) -> usize {
         self.start as usize
+    }
+
+    /// True when `other` is the same window over the same buffer.
+    pub fn ptr_eq(&self, other: &ListRef) -> bool {
+        self.shares_storage_with(other) && self.start == other.start && self.len == other.len
     }
 
     /// The window `storage[start .. start + len]`.
@@ -1667,7 +1711,7 @@ fn resolve_inner(expr: &Expression, ctx: &Context) -> Result<Value, ExecutionErr
             }
         }
         Expr::Ident(name) => ctx
-            .get_variable(name)
+            .lookup_raw(name)
             .ok_or_else(|| ExecutionError::UndeclaredReference(Arc::new(name.to_string()))),
         Expr::Select(select) => {
             let left = resolve_inner(select.operand.deref(), ctx)?;
@@ -1695,13 +1739,13 @@ fn resolve_inner(expr: &Expression, ctx: &Context) -> Result<Value, ExecutionErr
                     match as_optional(&value) {
                         Some(opt) => {
                             if let Some(inner) = opt.value() {
-                                list.push(inner.clone());
+                                list.push(inner.unpack());
                             }
                         }
-                        None => list.push(value),
+                        None => list.push(value.unpack()),
                     }
                 } else {
-                    list.push(value);
+                    list.push(value.unpack());
                 }
             }
             Ok(Value::list(list))
@@ -1719,13 +1763,13 @@ fn resolve_inner(expr: &Expression, ctx: &Context) -> Result<Value, ExecutionErr
                 if is_optional {
                     if let Some(opt) = as_optional(&value) {
                         if let Some(inner) = opt.value() {
-                            map.insert(key, inner.clone());
+                            map.insert(key, inner.unpack());
                         }
                     } else {
-                        map.insert(key, value);
+                        map.insert(key, value.unpack());
                     }
                 } else {
-                    map.insert(key, value);
+                    map.insert(key, value.unpack());
                 }
             }
             Ok(Value::Map(Map::object(Arc::new(map))))

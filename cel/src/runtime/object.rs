@@ -399,6 +399,9 @@ pub struct W_BytesObject {
     /// Live length in bytes. Upstream's `("length", Signed)` on the wrapper:
     /// the block's word is a capacity and a shrink must not move it.
     pub length: i64,
+    /// Non-owning pointer at the public `Arc<Vec<u8>>` this leaf was wrapped
+    /// from, or null if the bytes were allocated by the VM.
+    pub public: *const (),
 }
 
 pub static CEL_BYTES_CLASS: CelClass = CelClass::new("bytes", CelKind::Bytes);
@@ -421,6 +424,7 @@ pub fn new_bytes(bytes: &[u8]) -> *mut W_BytesObject {
         },
         data,
         length,
+        public: core::ptr::null(),
     })
 }
 
@@ -439,6 +443,9 @@ pub struct W_StringObject {
     pub ob_header: CelObject,
     pub chars: *mut CelBytesBlock,
     pub byte_len: i64,
+    /// Non-owning pointer at the public `Arc<String>` this leaf was wrapped
+    /// from, or null if the string was allocated by the VM.
+    pub public: *const (),
 }
 
 pub static CEL_STRING_CLASS: CelClass = CelClass::new("string", CelKind::Str);
@@ -457,6 +464,7 @@ pub fn new_string(s: &str) -> *mut W_StringObject {
         },
         chars,
         byte_len,
+        public: core::ptr::null(),
     })
 }
 
@@ -534,6 +542,12 @@ pub struct W_ListObject {
     pub items: *mut CelItemsBlock,
     pub start: i64,
     pub length: i64,
+    /// Non-owning pointer at the public list buffer this leaf was wrapped
+    /// from, or null if the list was allocated by the VM. The Context that
+    /// performed the wrap keeps the owning handle alive.
+    pub public: *const (),
+    pub public_start: u32,
+    pub public_len: u32,
 }
 
 pub static CEL_LIST_CLASS: CelClass = CelClass::new("list", CelKind::List);
@@ -736,6 +750,9 @@ pub fn new_list_with_capacity(cap: i64) -> *mut W_ListObject {
         items,
         start: 0,
         length: 0,
+        public: core::ptr::null(),
+        public_start: 0,
+        public_len: 0,
     })
 }
 
@@ -779,6 +796,9 @@ pub fn new_list(values: &[CelRef]) -> *mut W_ListObject {
         items,
         start: 0,
         length,
+        public: core::ptr::null(),
+        public_start: 0,
+        public_len: 0,
     })
 }
 
@@ -795,6 +815,9 @@ pub fn new_list_ints(values: &[i64]) -> *mut W_ListObject {
         items: core::ptr::null_mut(),
         start: 0,
         length,
+        public: core::ptr::null(),
+        public_start: 0,
+        public_len: 0,
     })
 }
 
@@ -809,6 +832,9 @@ pub fn new_list_window(storage: CelRef, start: i64, length: i64) -> *mut W_ListO
         items: core::ptr::null_mut(),
         start,
         length,
+        public: core::ptr::null(),
+        public_start: 0,
+        public_len: 0,
     })
 }
 
@@ -853,6 +879,9 @@ pub struct W_MapObject {
     pub items: *mut CelItemsBlock,
     /// Live entry count, not the number of references in [`Self::items`].
     pub length: i64,
+    /// Non-owning pointer at the public object-map table this leaf was
+    /// wrapped from, or null if the map was allocated by the VM.
+    pub public: *const (),
 }
 
 pub static CEL_MAP_CLASS: CelClass = CelClass::new("map", CelKind::Map);
@@ -920,6 +949,7 @@ pub fn new_map(pairs: &[(CelRef, CelRef)]) -> *mut W_MapObject {
         storage: core::ptr::null_mut(),
         items,
         length,
+        public: core::ptr::null(),
     })
 }
 
@@ -933,6 +963,7 @@ pub fn new_map_record(storage: CelRef, length: i64) -> *mut W_MapObject {
         storage,
         items: core::ptr::null_mut(),
         length,
+        public: core::ptr::null(),
     })
 }
 

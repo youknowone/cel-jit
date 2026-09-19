@@ -798,19 +798,74 @@ fn portal_threshold() -> u32 {
         .unwrap_or(1_000_000)
 }
 
+struct DriverEntry {
+    id: u64,
+    live: std::sync::Weak<()>,
+    driver: JitDriver<PortalState>,
+}
+
+struct PortalTable {
+    /// Id of the last driver this thread ran. Zero means none.
+    last_id: u64,
+    last_idx: usize,
+    entries: Vec<DriverEntry>,
+}
+
+impl PortalTable {
+    const fn new() -> Self {
+        PortalTable {
+            last_id: 0,
+            last_idx: 0,
+            entries: Vec::new(),
+        }
+    }
+
+    fn sweep_dead(&mut self) {
+        self.entries.retain(|e| e.live.strong_count() > 0);
+        self.last_id = 0;
+        self.last_idx = 0;
+    }
+
+    fn index_for(
+        &mut self,
+        id: u64,
+        live: &std::sync::Arc<()>,
+        state: &mut PortalState,
+        code: &CelCode,
+    ) -> usize {
+        if self.last_id == id {
+            return self.last_idx;
+        }
+        if let Some(i) = self.entries.iter().position(|e| e.id == id) {
+            self.last_id = id;
+            self.last_idx = i;
+            return i;
+        }
+        self.sweep_dead();
+        self.entries.push(DriverEntry {
+            id,
+            live: std::sync::Arc::downgrade(live),
+            driver: fresh_portal_driver(state, code),
+        });
+        self.last_id = id;
+        self.last_idx = self.entries.len() - 1;
+        self.last_idx
+    }
+}
+
 thread_local! {
-    /// One driver per `CelCode` pointer this thread has evaluated.
+    /// One driver per live `CelCode` this thread has evaluated.
     ///
-    /// Keyed by the code pointer: `CelCode` is `Clone` + `PartialEq`, so
-    /// identity is the address. A single slot that was replaced on every
-    /// other program rebuilt the driver — thousands of allocations — for
-    /// any caller holding two programs. A new driver per `execute` also
-    /// zeroed the counters and never compiled. Heat is necessary but not
-    /// sufficient: traces still abort with `AbortPermanent` until
-    /// `lower_dispatch_body` produces a dispatch JitCode for
-    /// `run_cel_portal`.
-    static PORTAL_DRIVER: std::cell::RefCell<Vec<(usize, JitDriver<PortalState>)>> =
-        const { std::cell::RefCell::new(Vec::new()) };
+    /// Keyed by the code object's minted id, never by address. `JitDriver`
+    /// is not `Send`; `Program` is shared across threads, so the table stays
+    /// thread-local. A clone of a `CelCode` shares the id. Dead entries are
+    /// dropped on insert, when the last clone's liveness flag is gone.
+    static PORTAL_DRIVER: std::cell::RefCell<PortalTable> =
+        const { std::cell::RefCell::new(PortalTable::new()) };
+}
+
+pub(crate) fn driver_table_len() -> usize {
+    PORTAL_DRIVER.with(|cell| cell.borrow().entries.len())
 }
 
 fn fresh_portal_driver(state: &mut PortalState, code: &CelCode) -> JitDriver<PortalState> {
@@ -838,18 +893,13 @@ pub(crate) fn eval_through_portal(
     };
     // Census is not installed here — that hook is process-global and
     // would clobber the columnar machine.
-    let key = code as *const CelCode as usize;
+    let id = code.identity.id;
+    let live = &code.identity.live;
     let bits = PORTAL_DRIVER.with(|slot| {
         match slot.try_borrow_mut() {
-            Ok(mut slot) => {
-                let i = match slot.iter().position(|(k, _)| *k == key) {
-                    Some(i) => i,
-                    None => {
-                        slot.push((key, fresh_portal_driver(&mut state, code)));
-                        slot.len() - 1
-                    }
-                };
-                run_cel_portal(&mut slot[i].1, code, &mut state, 0)
+            Ok(mut table) => {
+                let i = table.index_for(id, live, &mut state, code);
+                run_cel_portal(&mut table.entries[i].driver, code, &mut state, 0)
             }
             Err(_) => {
                 // Outer portal still holds the cell; a host re-entry uses a
