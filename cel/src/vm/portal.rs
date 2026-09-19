@@ -799,16 +799,18 @@ fn portal_threshold() -> u32 {
 }
 
 thread_local! {
-    /// One driver per live `CelCode` identity on this thread.
+    /// One driver per `CelCode` pointer this thread has evaluated.
     ///
-    /// PyPy keeps the jitdriver on the code object. `CelCode` is `Clone` +
-    /// `PartialEq`, so the driver lives here keyed by the code pointer.
-    /// A new `JitDriver` per `execute` zeroed the counters and never
-    /// compiled. Heat is necessary but not sufficient: traces still
-    /// abort with `AbortPermanent` until `lower_dispatch_body` produces
-    /// a dispatch JitCode for `run_cel_portal`.
-    static PORTAL_DRIVER: std::cell::RefCell<Option<(usize, JitDriver<PortalState>)>> =
-        const { std::cell::RefCell::new(None) };
+    /// Keyed by the code pointer: `CelCode` is `Clone` + `PartialEq`, so
+    /// identity is the address. A single slot that was replaced on every
+    /// other program rebuilt the driver — thousands of allocations — for
+    /// any caller holding two programs. A new driver per `execute` also
+    /// zeroed the counters and never compiled. Heat is necessary but not
+    /// sufficient: traces still abort with `AbortPermanent` until
+    /// `lower_dispatch_body` produces a dispatch JitCode for
+    /// `run_cel_portal`.
+    static PORTAL_DRIVER: std::cell::RefCell<Vec<(usize, JitDriver<PortalState>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 fn fresh_portal_driver(state: &mut PortalState, code: &CelCode) -> JitDriver<PortalState> {
@@ -840,11 +842,14 @@ pub(crate) fn eval_through_portal(
     let bits = PORTAL_DRIVER.with(|slot| {
         match slot.try_borrow_mut() {
             Ok(mut slot) => {
-                if slot.as_ref().is_none_or(|(k, _)| *k != key) {
-                    *slot = Some((key, fresh_portal_driver(&mut state, code)));
-                }
-                let driver = &mut slot.as_mut().expect("just installed").1;
-                run_cel_portal(driver, code, &mut state, 0)
+                let i = match slot.iter().position(|(k, _)| *k == key) {
+                    Some(i) => i,
+                    None => {
+                        slot.push((key, fresh_portal_driver(&mut state, code)));
+                        slot.len() - 1
+                    }
+                };
+                run_cel_portal(&mut slot[i].1, code, &mut state, 0)
             }
             Err(_) => {
                 // Outer portal still holds the cell; a host re-entry uses a

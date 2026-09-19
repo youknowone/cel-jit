@@ -726,8 +726,7 @@ unsafe fn object_list_eq_ints(w: CelRef, ints: &[i64]) -> bool {
 /// An empty list whose items block has room for `cap` appends.
 pub fn new_list_with_capacity(cap: i64) -> *mut W_ListObject {
     let n = cap.max(0) as usize;
-    let nulls = vec![core::ptr::null_mut::<CelObject>(); n];
-    let items = object_array::new_items_block(&nulls);
+    let items = object_array::new_items_block_zeroed(n);
     lltype::malloc_typed(W_ListObject {
         ob_header: CelObject {
             ob_type: &CEL_LIST_CLASS,
@@ -1102,8 +1101,7 @@ pub fn new_cel_frame_in(
     max_stack: i64,
 ) -> *mut W_CelFrame {
     let cap = (n_slots + max_stack).max(0) as usize;
-    let nulls = vec![core::ptr::null_mut::<CelObject>(); cap];
-    let items = object_array::new_items_block_in(heap, &nulls);
+    let items = object_array::new_items_block_zeroed_in(heap, cap);
     heap.alloc(W_CelFrame {
         ob_header: CelObject {
             ob_type: &CEL_FRAME_CLASS,

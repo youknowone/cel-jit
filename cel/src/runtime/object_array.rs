@@ -242,6 +242,36 @@ pub fn new_items_block(values: &[CelRef]) -> *mut CelItemsBlock {
     super::heap::with_heap(|h| new_items_block_in(h, values))
 }
 
+/// An items block of `cap` null slots on `heap`.
+///
+/// The slots are written in place so a caller does not need a side `Vec` of
+/// nulls — that `Vec` was one global-allocator call per evaluation.
+pub fn new_items_block_zeroed_in(heap: &super::heap::CelHeap, cap: usize) -> *mut CelItemsBlock {
+    let block = unsafe {
+        alloc_block_in(
+            heap,
+            CEL_ITEMS_BLOCK_TOKEN.base_size,
+            CEL_ITEMS_BLOCK_TOKEN.item_size,
+            core::mem::align_of::<CelItemsBlock>(),
+            cap,
+        )
+    } as *mut CelItemsBlock;
+    unsafe {
+        let base = items_block_items_base(block);
+        let mut i = 0;
+        while i < cap {
+            *base.add(i) = core::ptr::null_mut();
+            i += 1;
+        }
+    }
+    block
+}
+
+/// An items block of `cap` null slots on this thread's heap.
+pub fn new_items_block_zeroed(cap: usize) -> *mut CelItemsBlock {
+    super::heap::with_heap(|h| new_items_block_zeroed_in(h, cap))
+}
+
 /// A block holding `bytes`.
 pub fn new_bytes_block(bytes: &[u8]) -> *mut CelBytesBlock {
     let block = unsafe {

@@ -516,6 +516,9 @@ thread_local! {
     /// them to take exactly one argument — the finished value. A heap
     /// parameter would be a second one.
     static HEAP: CelHeap = CelHeap::new();
+    /// Nested [`with_old_space`] depth. A `Cell` of its own so a load during
+    /// intern does not go through [`HEAP`].
+    static FORCE_OLD: Cell<u32> = const { Cell::new(0) };
 }
 
 /// Run `f` against this thread's heap.
@@ -544,13 +547,11 @@ impl EvalScope {
         self.outermost
     }
 
-    /// Move a nursery result out if this is the outermost scope.
+    /// The public form of `v`. An interned leaf unpacks; a value that is
+    /// already public is returned as it is. Nested and outermost both unpack,
+    /// so a host re-entry never observes `Value::Interned`.
     pub fn finish(self, v: crate::Value) -> crate::Value {
-        if self.outermost {
-            promote_on(self.heap(), v)
-        } else {
-            v
-        }
+        to_public(v)
     }
 }
 
@@ -569,15 +570,9 @@ pub fn enter_eval() -> EvalScope {
     })
 }
 
-fn promote_on(heap: &CelHeap, v: crate::Value) -> crate::Value {
+fn to_public(v: crate::Value) -> crate::Value {
     match v {
-        crate::Value::Interned(w)
-            if (heap.nursery.bytes.get() != heap.snap_bytes.get()
-                || heap.young_host_n.get() != heap.snap_hosts.get())
-                && heap.is_young(w as *const u8) =>
-        {
-            crate::Value::from_interned(w).unpack()
-        }
+        crate::Value::Interned(w) => crate::Value::from_interned(w).unpack(),
         other => other,
     }
 }
@@ -587,9 +582,11 @@ pub fn with_old_space<R>(f: impl FnOnce() -> R) -> R {
     struct Guard;
     impl Drop for Guard {
         fn drop(&mut self) {
+            FORCE_OLD.with(|c| c.set(c.get().saturating_sub(1)));
             let _ = HEAP.try_with(|h| h.force_old.set(h.force_old.get().saturating_sub(1)));
         }
     }
+    FORCE_OLD.with(|c| c.set(c.get() + 1));
     let _ = HEAP.try_with(|h| h.force_old.set(h.force_old.get() + 1));
     let _g = Guard;
     f()
@@ -597,7 +594,7 @@ pub fn with_old_space<R>(f: impl FnOnce() -> R) -> R {
 
 /// Whether this thread is forcing old-space allocation.
 pub fn is_forcing_old() -> bool {
-    HEAP.with(|h| h.force_old.get() > 0)
+    FORCE_OLD.with(|c| c.get() > 0)
 }
 
 /// Whether `ptr` is live nursery memory on this thread.

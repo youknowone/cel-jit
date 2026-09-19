@@ -885,7 +885,10 @@ impl<'a> Vm<'a> {
     }
 
     pub(crate) fn intern_context_var(&self, name: &str) -> Option<CelRef> {
-        intern_leaf(&self.ctx.get_variable(name)?)
+        match self.ctx.get_variable(name)? {
+            Value::Interned(w) => Some(w),
+            other => intern_leaf(&other),
+        }
     }
 
     pub(crate) fn interned_unary_bits(&self, name: &str, w: CelRef) -> i64 {

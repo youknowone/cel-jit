@@ -55,10 +55,10 @@ pub enum ConvertError {
 /// Move a nursery result to the public owned form. An interned value that
 /// already lives in old or immortal memory is returned as it is.
 pub fn promote_eval_result(v: Value) -> Value {
-    super::heap::with_heap(|h| match v {
-        Value::Interned(w) if h.is_young(w as *const u8) => Value::from_interned(w).unpack(),
+    match v {
+        Value::Interned(w) => Value::from_interned(w).unpack(),
         other => other,
-    })
+    }
 }
 
 /// Intern `v` onto a class-family leaf. Total: every public variant has
