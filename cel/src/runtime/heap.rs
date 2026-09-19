@@ -17,12 +17,10 @@
 //!
 //! # What this does NOT do
 //!
-//! **It does not collect.** The root set §7 of the design enumerates — the live
-//! frame and its array, `Context` variables, `CelCode.co_consts`, the in-flight
-//! result and the eleven `ExecutionError` payloads, and an embedder handle
-//! registry — has no walker, and a collector without a root set frees live
-//! objects. So an allocation is reclaimed when its heap is dropped and not
-//! before.
+//! **It does not walk objects.** The nursery is reclaimed by resetting a bump
+//! pointer when the outermost evaluation on this thread finishes; old space
+//! is not reclaimed until the heap is dropped. There is still no root walker,
+//! so nothing is copied except the evaluation result at the public door.
 //!
 //! That is a bound rather than a fix, and it is worth being exact about the
 //! direction: against today's `Arc`-based `Value` it is a regression in
@@ -60,6 +58,19 @@ use core::marker::PhantomData;
 /// trades header overhead against how much a mostly-empty last segment wastes.
 /// One 64 KiB segment holds ~4000 two-word leaves.
 const SEGMENT_BYTES: usize = 64 * 1024;
+
+/// Nursery segments kept after a reset. A huge evaluation may have opened
+/// more; those extras are released so they do not pin memory for the rest
+/// of the thread's life.
+const NURSERY_KEEP_SEGMENTS: usize = 2;
+
+/// Fill byte for reclaimed nursery memory in debug builds.
+#[cfg(debug_assertions)]
+const NURSERY_POISON: u8 = 0xDB;
+
+/// High bit on a [`CelHeap::push_host`] index: the host sits in the
+/// evaluation-scoped table and is dropped when the outermost scope resets.
+const YOUNG_HOST_BIT: i64 = 1 << 62;
 
 /// Carrier for the compile-time refusal of a type this heap cannot own.
 ///
@@ -112,6 +123,20 @@ impl Segment {
         // SAFETY: `end <= capacity`, so `start` is inside the allocation.
         Some(unsafe { self.base.add(start) })
     }
+
+    fn contains(&self, p: usize) -> bool {
+        let base = self.base as usize;
+        p >= base && p < base.saturating_add(self.used)
+    }
+
+    #[cfg(debug_assertions)]
+    fn poison_from(&mut self, from: usize) {
+        if from < self.used {
+            unsafe {
+                core::ptr::write_bytes(self.base.add(from), NURSERY_POISON, self.used - from);
+            }
+        }
+    }
 }
 
 impl Drop for Segment {
@@ -124,47 +149,254 @@ impl Drop for Segment {
     }
 }
 
-/// One thread's value heap.
+/// One bump space: a run of non-moving segments.
 ///
-/// Not `Send` and not `Sync`, and deliberately without the `unsafe impl` that
-/// would say otherwise: pyre's collector claims both, justified by holding the
-/// GIL. CEL has no GIL, so the claim does not transfer.
-pub struct CelHeap {
+/// The open segment's bump lives in [`Cell`]s so a rewind does not borrow
+/// the segment vector. Opening a new segment is the only `RefCell` path.
+struct Space {
     segments: RefCell<Vec<Segment>>,
-    /// Objects handed out. The design's P5 verification reads allocations per
-    /// eval from this counter and from the JIT's own, so it counts objects
-    /// rather than bytes — a byte total cannot be compared against a `New`
-    /// count.
     objects: Cell<u64>,
     bytes: Cell<u64>,
+    n_segs: Cell<usize>,
+    open_used: Cell<usize>,
+    open_base: Cell<*mut u8>,
+    open_cap: Cell<usize>,
+}
+
+impl Space {
+    fn new() -> Space {
+        Space {
+            segments: RefCell::new(Vec::new()),
+            objects: Cell::new(0),
+            bytes: Cell::new(0),
+            n_segs: Cell::new(0),
+            open_used: Cell::new(0),
+            open_base: Cell::new(core::ptr::null_mut()),
+            open_cap: Cell::new(0),
+        }
+    }
+
+    fn bump(&self, size: usize, align: usize) -> *mut u8 {
+        let used = self.open_used.get();
+        let start = (used + align - 1) & !(align - 1);
+        if let Some(end) = start.checked_add(size) {
+            if end <= self.open_cap.get() {
+                self.open_used.set(end);
+                self.objects.set(self.objects.get() + 1);
+                self.bytes.set(self.bytes.get() + size as u64);
+                return unsafe { self.open_base.get().add(start) };
+            }
+        }
+        self.bump_grow(size, align)
+    }
+
+    fn bump_grow(&self, size: usize, align: usize) -> *mut u8 {
+        let mut segments = self.segments.borrow_mut();
+        if let Some(open) = segments.last_mut() {
+            open.used = self.open_used.get();
+        }
+        let capacity = SEGMENT_BYTES.max(size + align);
+        segments.push(Segment::with_capacity(capacity));
+        let open = segments
+            .last_mut()
+            .expect("the segment just pushed is present");
+        let ptr = open
+            .bump(size, align)
+            .expect("a segment sized for this request serves it");
+        self.open_base.set(open.base);
+        self.open_cap.set(open.capacity);
+        self.open_used.set(open.used);
+        self.n_segs.set(segments.len());
+        self.objects.set(self.objects.get() + 1);
+        self.bytes.set(self.bytes.get() + size as u64);
+        ptr
+    }
+
+    fn contains(&self, p: usize) -> bool {
+        let segs = self.segments.borrow();
+        let last = segs.len().saturating_sub(1);
+        segs.iter().enumerate().any(|(i, seg)| {
+            if i == last {
+                let base = seg.base as usize;
+                p >= base && p < base.saturating_add(self.open_used.get())
+            } else {
+                seg.contains(p)
+            }
+        })
+    }
+
+    fn sync_open(&self) {
+        let segs = self.segments.borrow();
+        match segs.last() {
+            Some(open) => {
+                self.open_base.set(open.base);
+                self.open_cap.set(open.capacity);
+                self.open_used.set(open.used);
+                self.n_segs.set(segs.len());
+            }
+            None => {
+                self.open_base.set(core::ptr::null_mut());
+                self.open_cap.set(0);
+                self.open_used.set(0);
+                self.n_segs.set(0);
+            }
+        }
+    }
+}
+
+/// One thread's value heap.
+///
+/// Not `Send` and not `Sync`. Two spaces: old lives until the heap is
+/// dropped; the nursery is reset when the outermost evaluation on this
+/// thread finishes.
+pub struct CelHeap {
+    old: Space,
+    nursery: Space,
+    /// Outermost-evaluation nesting. Zero means no evaluation is running.
+    depth: Cell<u32>,
+    /// Nested `with_old_space` calls force allocation into old.
+    force_old: Cell<u32>,
+    snap_len: Cell<usize>,
+    snap_used: Cell<usize>,
+    snap_bytes: Cell<u64>,
+    snap_objects: Cell<u64>,
+    snap_hosts: Cell<usize>,
+    young_host_n: Cell<usize>,
+    nursery_high_water: Cell<u64>,
     /// Host objects behind [`super::object::W_OpaqueObject::host_index`].
     ///
-    /// D12: they live as long as this heap. A side table, not a `Drop` payload
-    /// on the leaf — `alloc` refuses types that need dropping, and a finalizer
-    /// is the other contract the design left open.
+    /// A side table, not a `Drop` payload on the leaf — `alloc` refuses types
+    /// that need dropping. Old-space hosts live as long as this heap; young
+    /// hosts are dropped when the outermost evaluation resets.
     hosts: RefCell<Vec<Box<dyn Any>>>,
+    young_hosts: RefCell<Vec<Box<dyn Any>>>,
 }
 
 impl CelHeap {
     pub fn new() -> CelHeap {
         CelHeap {
-            segments: RefCell::new(Vec::new()),
-            objects: Cell::new(0),
-            bytes: Cell::new(0),
+            old: Space::new(),
+            nursery: Space::new(),
+            depth: Cell::new(0),
+            force_old: Cell::new(0),
+            snap_len: Cell::new(0),
+            snap_used: Cell::new(0),
+            snap_bytes: Cell::new(0),
+            snap_objects: Cell::new(0),
+            snap_hosts: Cell::new(0),
+            young_host_n: Cell::new(0),
+            nursery_high_water: Cell::new(0),
             hosts: RefCell::new(Vec::new()),
+            young_hosts: RefCell::new(Vec::new()),
         }
+    }
+
+    fn in_nursery(&self) -> bool {
+        self.depth.get() > 0 && self.force_old.get() == 0
+    }
+
+    fn enter(&self) -> bool {
+        let d = self.depth.get();
+        if d == 0 {
+            self.snap_len.set(self.nursery.n_segs.get());
+            self.snap_used.set(self.nursery.open_used.get());
+            self.snap_bytes.set(self.nursery.bytes.get());
+            self.snap_objects.set(self.nursery.objects.get());
+            self.snap_hosts.set(self.young_host_n.get());
+        }
+        self.depth.set(d + 1);
+        d == 0
+    }
+
+    fn leave(&self, outermost: bool) {
+        let d = self.depth.get();
+        self.depth.set(d.saturating_sub(1));
+        if !outermost {
+            return;
+        }
+        if self.nursery.bytes.get() == self.snap_bytes.get()
+            && self.young_host_n.get() == self.snap_hosts.get()
+        {
+            return;
+        }
+        if self.nursery.n_segs.get() == self.snap_len.get()
+            && self.young_host_n.get() == self.snap_hosts.get()
+        {
+            self.rewind_nursery();
+        } else {
+            self.reset_nursery();
+        }
+    }
+
+    /// Rewind the open bump. Same segment count, no young hosts.
+    fn rewind_nursery(&self) {
+        #[cfg(debug_assertions)]
+        {
+            let from = self.snap_used.get();
+            let to = self.nursery.open_used.get();
+            let base = self.nursery.open_base.get();
+            if !base.is_null() && to > from {
+                unsafe {
+                    core::ptr::write_bytes(base.add(from), NURSERY_POISON, to - from);
+                }
+            }
+        }
+        self.nursery.open_used.set(self.snap_used.get());
+        self.nursery.bytes.set(self.snap_bytes.get());
+        self.nursery.objects.set(self.snap_objects.get());
+    }
+
+    fn reset_nursery(&self) {
+        let snap_len = self.snap_len.get();
+        let snap_used = self.snap_used.get();
+        let mut segs = self.nursery.segments.borrow_mut();
+        for (i, seg) in segs.iter_mut().enumerate() {
+            if i < snap_len {
+                if i + 1 == snap_len {
+                    #[cfg(debug_assertions)]
+                    seg.poison_from(snap_used);
+                    seg.used = snap_used;
+                }
+            } else {
+                #[cfg(debug_assertions)]
+                seg.poison_from(0);
+                seg.used = 0;
+            }
+        }
+        let retain = if segs.is_empty() {
+            0
+        } else {
+            snap_len.max(NURSERY_KEEP_SEGMENTS.min(segs.len()))
+        };
+        segs.truncate(retain);
+        self.nursery.bytes.set(self.snap_bytes.get());
+        self.nursery.objects.set(self.snap_objects.get());
+        self.young_hosts
+            .borrow_mut()
+            .truncate(self.snap_hosts.get());
+        self.young_host_n.set(self.snap_hosts.get());
+        drop(segs);
+        self.nursery.sync_open();
     }
 
     /// Allocate `value` in this heap and return a pointer to it.
     ///
-    /// The pointer is valid until the heap is dropped. Nothing shorter is
-    /// available: see the module documentation on why there is no collection
-    /// yet.
+    /// During an evaluation the pointer is nursery memory and is invalid
+    /// after the outermost scope resets, unless it was allocated through
+    /// [`alloc_old`].
     pub fn alloc<T>(&self, value: T) -> *mut T {
         let () = AssertNoDrop::<T>::OK;
         let ptr = self.alloc_raw(size_of::<T>(), align_of::<T>()) as *mut T;
         // SAFETY: `alloc_raw` returns an address with `T`'s size and alignment
         // that nothing else has been handed.
+        unsafe { ptr.write(value) };
+        ptr
+    }
+
+    /// Allocate `value` in old space even if an evaluation is running.
+    pub fn alloc_old<T>(&self, value: T) -> *mut T {
+        let () = AssertNoDrop::<T>::OK;
+        let ptr = self.alloc_old_raw(size_of::<T>(), align_of::<T>()) as *mut T;
         unsafe { ptr.write(value) };
         ptr
     }
@@ -175,79 +407,98 @@ impl CelHeap {
     /// Public because the payload blocks in [`super::object_array`] are sized
     /// at run time and so cannot go through the generic [`alloc`].
     pub fn alloc_raw(&self, size: usize, align: usize) -> *mut u8 {
-        let mut segments = self.segments.borrow_mut();
-        // Nested rather than a `let` chain: this crate is edition 2021, where
-        // chained `let` in an `if` is not available.
-        if let Some(open) = segments.last_mut() {
-            if let Some(ptr) = open.bump(size, align) {
-                self.count(size);
-                return ptr;
+        if self.in_nursery() {
+            let ptr = self.nursery.bump(size, align);
+            let live = self.nursery.bytes.get();
+            if live > self.nursery_high_water.get() {
+                self.nursery_high_water.set(live);
             }
+            ptr
+        } else {
+            self.old.bump(size, align)
         }
-        // A request larger than the segment size gets a segment of its own
-        // rather than growing every future segment to fit it.
-        let capacity = SEGMENT_BYTES.max(size + align);
-        segments.push(Segment::with_capacity(capacity));
-        let ptr = segments
-            .last_mut()
-            .expect("the segment just pushed is present")
-            .bump(size, align)
-            .expect("a segment sized for this request serves it");
-        self.count(size);
-        ptr
     }
 
-    fn count(&self, size: usize) {
-        self.objects.set(self.objects.get() + 1);
-        self.bytes.set(self.bytes.get() + size as u64);
+    /// Reserve `size` bytes in old space.
+    pub fn alloc_old_raw(&self, size: usize, align: usize) -> *mut u8 {
+        self.old.bump(size, align)
     }
 
-    /// Objects handed out since this heap was created.
+    /// Objects handed out that are still live: old space plus the current
+    /// nursery bump. A reset drops the nursery contribution.
     pub fn allocated_objects(&self) -> u64 {
-        self.objects.get()
+        self.old.objects.get() + self.nursery.objects.get()
     }
 
-    /// Bytes handed out since this heap was created, excluding the padding a
-    /// request's alignment skipped.
+    /// Bytes handed out that are still live, excluding alignment padding.
     pub fn allocated_bytes(&self) -> u64 {
-        self.bytes.get()
+        self.old.bytes.get() + self.nursery.bytes.get()
     }
 
-    /// Segments currently held.
-    ///
-    /// The one observable that distinguishes "reused the open segment" from
-    /// "took a new one", which is what the growth tests need.
+    /// Old-space bytes. Unchanged by an evaluation that only uses the nursery.
+    pub fn old_allocated_bytes(&self) -> u64 {
+        self.old.bytes.get()
+    }
+
+    /// Segments currently held in both spaces.
     pub fn segments(&self) -> usize {
-        self.segments.borrow().len()
+        self.old.segments.borrow().len() + self.nursery.segments.borrow().len()
     }
 
-    /// Park `host` for the life of this heap and return its index.
+    /// Old-space segments.
+    pub fn old_segments(&self) -> usize {
+        self.old.segments.borrow().len()
+    }
+
+    /// Peak live nursery bytes since this heap was created.
+    pub fn nursery_high_water(&self) -> u64 {
+        self.nursery_high_water.get()
+    }
+
+    /// Park `host` and return its index. During an evaluation the host is
+    /// young and is dropped on reset; otherwise it lives as long as the heap.
     pub fn push_host(&self, host: Box<dyn Any>) -> i64 {
-        let mut hosts = self.hosts.borrow_mut();
-        let idx = hosts.len() as i64;
-        hosts.push(host);
-        idx
+        if self.in_nursery() {
+            let mut hosts = self.young_hosts.borrow_mut();
+            let idx = hosts.len() as i64;
+            hosts.push(host);
+            self.young_host_n.set(hosts.len());
+            idx | YOUNG_HOST_BIT
+        } else {
+            let mut hosts = self.hosts.borrow_mut();
+            let idx = hosts.len() as i64;
+            hosts.push(host);
+            idx
+        }
     }
 
     /// Borrow host `idx` for the duration of `f`.
     pub fn with_host<R>(&self, idx: i64, f: impl FnOnce(&dyn Any) -> R) -> Option<R> {
-        let hosts = self.hosts.borrow();
-        let slot = hosts.get(idx as usize)?;
-        Some(f(slot.as_ref()))
+        if idx & YOUNG_HOST_BIT != 0 {
+            let hosts = self.young_hosts.borrow();
+            let slot = hosts.get((idx & !YOUNG_HOST_BIT) as usize)?;
+            Some(f(slot.as_ref()))
+        } else {
+            let hosts = self.hosts.borrow();
+            let slot = hosts.get(idx as usize)?;
+            Some(f(slot.as_ref()))
+        }
     }
 
-    /// How many host objects this heap is holding.
+    /// How many host objects this heap is holding, both spaces.
     pub fn host_count(&self) -> usize {
-        self.hosts.borrow().len()
+        self.hosts.borrow().len() + self.young_hosts.borrow().len()
     }
 
-    /// Whether `ptr` lies in a segment this heap has handed out.
+    /// Whether `ptr` lies in live old or live nursery memory.
     pub fn contains(&self, ptr: *const u8) -> bool {
         let p = ptr as usize;
-        self.segments.borrow().iter().any(|seg| {
-            let base = seg.base as usize;
-            p >= base && p < base.saturating_add(seg.used)
-        })
+        self.old.contains(p) || self.nursery.contains(p)
+    }
+
+    /// Whether `ptr` is live nursery memory.
+    pub fn is_young(&self, ptr: *const u8) -> bool {
+        self.nursery.contains(ptr as usize)
     }
 }
 
@@ -270,6 +521,93 @@ thread_local! {
 /// Run `f` against this thread's heap.
 pub fn with_heap<R>(f: impl FnOnce(&CelHeap) -> R) -> R {
     HEAP.with(f)
+}
+
+/// Guard for one evaluation. Reset runs in [`Drop`], including on panic.
+///
+/// The heap pointer is resolved once at entry. Depth and the nursery bump
+/// live in [`Cell`]s on that heap, so leaving does not touch thread-local
+/// storage again.
+pub struct EvalScope {
+    heap: *const CelHeap,
+    outermost: bool,
+}
+
+impl EvalScope {
+    /// The heap this scope opened. Valid until [`Drop`].
+    pub fn heap(&self) -> &CelHeap {
+        unsafe { &*self.heap }
+    }
+
+    /// Whether this guard opened the outermost scope on this thread.
+    pub fn is_outermost(&self) -> bool {
+        self.outermost
+    }
+
+    /// Move a nursery result out if this is the outermost scope.
+    pub fn finish(self, v: crate::Value) -> crate::Value {
+        if self.outermost {
+            promote_on(self.heap(), v)
+        } else {
+            v
+        }
+    }
+}
+
+impl Drop for EvalScope {
+    fn drop(&mut self) {
+        unsafe { (*self.heap).leave(self.outermost) };
+    }
+}
+
+/// Open an evaluation scope on this thread. Nested calls increment depth;
+/// only the outermost reset reclaims the nursery.
+pub fn enter_eval() -> EvalScope {
+    HEAP.with(|h| EvalScope {
+        heap: h as *const CelHeap,
+        outermost: h.enter(),
+    })
+}
+
+fn promote_on(heap: &CelHeap, v: crate::Value) -> crate::Value {
+    match v {
+        crate::Value::Interned(w)
+            if (heap.nursery.bytes.get() != heap.snap_bytes.get()
+                || heap.young_host_n.get() != heap.snap_hosts.get())
+                && heap.is_young(w as *const u8) =>
+        {
+            crate::Value::from_interned(w).unpack()
+        }
+        other => other,
+    }
+}
+
+/// Force allocations (and host parks) into old space for the duration of `f`.
+pub fn with_old_space<R>(f: impl FnOnce() -> R) -> R {
+    struct Guard;
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            let _ = HEAP.try_with(|h| h.force_old.set(h.force_old.get().saturating_sub(1)));
+        }
+    }
+    let _ = HEAP.try_with(|h| h.force_old.set(h.force_old.get() + 1));
+    let _g = Guard;
+    f()
+}
+
+/// Whether this thread is forcing old-space allocation.
+pub fn is_forcing_old() -> bool {
+    HEAP.with(|h| h.force_old.get() > 0)
+}
+
+/// Whether `ptr` is live nursery memory on this thread.
+pub fn is_young(ptr: *const u8) -> bool {
+    HEAP.with(|h| h.is_young(ptr))
+}
+
+/// Nesting depth of [`enter_eval`] on this thread.
+pub fn eval_depth() -> u32 {
+    HEAP.with(|h| h.depth.get())
 }
 
 /// Bytes preceding an immortal payload. The backend reads
@@ -319,7 +657,8 @@ pub fn alloc_immortal<T>(value: T) -> *mut T {
     payload
 }
 
-/// A frame cell: null, an immortal singleton, or a leaf on this thread's heap.
+/// A frame cell: null, an immortal singleton, or a leaf in live old or
+/// live nursery memory. A pointer into reclaimed nursery fails.
 #[cfg(debug_assertions)]
 pub fn assert_frame_cell(w: crate::runtime::object::CelRef) {
     debug_assert!(
@@ -449,5 +788,39 @@ mod tests {
         let after = with_heap(|h| h.allocated_objects());
         assert_eq!(after, before + 1);
         unsafe { assert_eq!(*p, 7) };
+    }
+
+    /// An outermost scope reclaims nursery memory; old space is untouched.
+    #[test]
+    fn outermost_scope_resets_the_nursery() {
+        let heap = CelHeap::new();
+        let old = heap.alloc(1u64);
+        assert!(heap.enter());
+        let young = heap.alloc(2u64);
+        assert!(heap.contains(young as *const u8));
+        assert!(heap.is_young(young as *const u8));
+        assert!(!heap.is_young(old as *const u8));
+        let bytes_during = heap.allocated_bytes();
+        heap.leave(true);
+        assert!(heap.contains(old as *const u8));
+        assert!(!heap.contains(young as *const u8));
+        assert!(heap.allocated_bytes() < bytes_during);
+        unsafe { assert_eq!(*old, 1) };
+    }
+
+    /// Nested scopes do not reset; only the outermost does.
+    #[test]
+    fn nested_scope_does_not_reset() {
+        let heap = CelHeap::new();
+        assert!(heap.enter());
+        let a = heap.alloc(1u64);
+        assert!(!heap.enter());
+        let b = heap.alloc(2u64);
+        heap.leave(false);
+        assert!(heap.contains(a as *const u8));
+        assert!(heap.contains(b as *const u8));
+        heap.leave(true);
+        assert!(!heap.contains(a as *const u8));
+        assert!(!heap.contains(b as *const u8));
     }
 }

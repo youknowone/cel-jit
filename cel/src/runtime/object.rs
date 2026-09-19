@@ -1092,10 +1092,19 @@ pub const CELFRAME_LOCALS_STACK_OFFSET: usize = offset_of!(W_CelFrame, locals_st
 
 /// Allocate a frame whose array is `n_slots + max_stack` and never resized.
 pub fn new_cel_frame(n_slots: i64, max_stack: i64) -> *mut W_CelFrame {
+    crate::runtime::heap::with_heap(|h| new_cel_frame_in(h, n_slots, max_stack))
+}
+
+/// Allocate a frame on `heap`.
+pub fn new_cel_frame_in(
+    heap: &crate::runtime::heap::CelHeap,
+    n_slots: i64,
+    max_stack: i64,
+) -> *mut W_CelFrame {
     let cap = (n_slots + max_stack).max(0) as usize;
     let nulls = vec![core::ptr::null_mut::<CelObject>(); cap];
-    let items = object_array::new_items_block(&nulls);
-    lltype::malloc_typed(W_CelFrame {
+    let items = object_array::new_items_block_in(heap, &nulls);
+    heap.alloc(W_CelFrame {
         ob_header: CelObject {
             ob_type: &CEL_FRAME_CLASS,
         },

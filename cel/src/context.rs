@@ -62,9 +62,11 @@ fn store(variables: &mut BTreeMap<Box<str>, Value>, name: impl AsRef<str>, value
 /// [`Value::Interned`], so a later load is a pointer copy. Already-interned
 /// values are left as they are.
 fn wrap_entry(value: Value) -> Value {
-    crate::runtime::convert::intern_leaf(&value)
-        .map(Value::from_interned)
-        .unwrap_or(value)
+    crate::runtime::heap::with_old_space(|| {
+        crate::runtime::convert::intern_leaf(&value)
+            .map(Value::from_interned)
+            .unwrap_or(value)
+    })
 }
 
 impl<'a> Context<'a> {

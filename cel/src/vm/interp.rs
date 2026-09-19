@@ -45,10 +45,11 @@ use crate::runtime::convert::{intern_leaf, interned_list_get, ref_to_value};
 use crate::runtime::error::{take_error, CelErrCode, ERROR_SENTINEL};
 use crate::runtime::object::{
     cel_frame_slot, force_virtualizable_if_necessary, interned_list_eq, list_int_at, list_len,
-    map_len, new_bytes, new_cel_frame, new_double, new_int, new_list, new_list_ints, new_null,
-    new_optional, new_optional_none, new_string, new_type, new_uint, opaque_host_index,
-    string_as_str, string_byte_len, w_kind, w_type, CelKind, CelRef, W_BoolObject, W_CelFrame,
-    W_DoubleObject, W_IntObject, W_UIntObject, CEL_OPAQUE_CLASS, CEL_TYPE_CLASS,
+    map_len, new_bytes, new_cel_frame_in, new_double, new_int, new_list, new_list_ints,
+    new_list_with_capacity, new_null, new_optional, new_optional_none, new_string, new_type,
+    new_uint, opaque_host_index, string_as_str, string_byte_len, w_kind, w_type, CelKind, CelRef,
+    W_BoolObject, W_CelFrame, W_DoubleObject, W_IntObject, W_UIntObject, CEL_OPAQUE_CLASS,
+    CEL_TYPE_CLASS,
 };
 use crate::runtime::optional::{
     cel_optional_has_value, cel_optional_none, cel_optional_of, cel_optional_of_non_zero_value,
@@ -64,7 +65,8 @@ use std::cmp::Ordering;
 /// error is a [`CelErr`], which is [`Copy`] and carries no allocation, because
 /// `&&` and `||` absorb errors and so raise them on ordinary control flow.
 pub fn cel_eval_loop(code: &CelCode, ctx: &Context) -> Result<Value, ExecutionError> {
-    let mut vm = Vm::new(code, ctx);
+    let scope = crate::runtime::heap::enter_eval();
+    let mut vm = Vm::new(code, ctx, scope.heap());
     #[cfg(feature = "__drop-arm-probe")]
     {
         vm.probe = PROBE.with(std::cell::Cell::get);
@@ -89,16 +91,13 @@ pub fn cel_eval_loop(code: &CelCode, ctx: &Context) -> Result<Value, ExecutionEr
         };
     }
     #[cfg(feature = "jit")]
-    {
-        crate::vm::portal::eval_through_portal(&mut vm, code)
-    }
+    let result = crate::vm::portal::eval_through_portal(&mut vm, code);
     #[cfg(not(feature = "jit"))]
-    {
-        match vm.run() {
-            Ok(value) => Ok(value),
-            Err(err) => Err(vm.public_error(err)),
-        }
-    }
+    let result = match vm.run() {
+        Ok(value) => Ok(value),
+        Err(err) => Err(vm.public_error(err)),
+    };
+    result.map(|v| scope.finish(v))
 }
 
 /// Run `code` in `ctx` under an explicit probe policy.
@@ -794,7 +793,7 @@ impl<'a> Vm<'a> {
     /// the operand stack the compiler proved it needs, as one array. On a
     /// thread that has evaluated anything before, the capacity is already
     /// there and none of this allocates.
-    fn new(code: &'a CelCode, ctx: &'a Context<'a>) -> Self {
+    fn new(code: &'a CelCode, ctx: &'a Context<'a>, heap: &crate::runtime::heap::CelHeap) -> Self {
         let mut scratch = SCRATCH
             .try_with(std::cell::Cell::take)
             .ok()
@@ -813,7 +812,7 @@ impl<'a> Vm<'a> {
                 .logic
                 .resize(code.n_logic as usize, Err(CelErr::InternalError));
         }
-        let cel_frame = new_cel_frame(code.n_slots as i64, code.max_stack as i64);
+        let cel_frame = new_cel_frame_in(heap, code.n_slots as i64, code.max_stack as i64);
         Vm {
             code,
             ctx,
@@ -999,7 +998,6 @@ impl<'a> Vm<'a> {
     fn vable_cell(operand: &Operand) -> CelRef {
         match operand {
             Operand::Interned(w) => *w,
-            Operand::Value(Value::Int(_)) => core::ptr::null_mut(),
             Operand::Value(v) => intern_leaf(v).unwrap_or(core::ptr::null_mut()),
             _ => core::ptr::null_mut(),
         }
@@ -1150,7 +1148,6 @@ impl<'a> Vm<'a> {
     fn leaf_of(operand: &Operand) -> Option<CelRef> {
         match operand {
             Operand::Interned(w) => Some(*w),
-            Operand::Value(Value::Int(_)) => None,
             Operand::Value(v) => intern_leaf(v),
             _ => None,
         }
@@ -1264,7 +1261,7 @@ impl<'a> Vm<'a> {
                         self.push_operand(Operand::Interned(unsafe { cel_optional_of(item) }));
                         return Ok(true);
                     }
-                    self.push_operand(Operand::Value(Value::Int(n)));
+                    self.push_operand(Operand::Interned(new_int(n) as CelRef));
                     return Ok(true);
                 }
                 match unsafe { interned_list_get(w, index) } {
@@ -1510,10 +1507,6 @@ impl<'a> Vm<'a> {
     /// `W_Root` pointers on [`Operand::Refs`], the object-strategy list.
     fn append_operand(&mut self, operand: Operand) -> CelResult<()> {
         match operand {
-            Operand::Interned(w) if unsafe { w_kind(w) } == CelKind::Int => {
-                let word = unsafe { (*w.cast::<W_IntObject>()).intval };
-                self.append_int(word)
-            }
             Operand::Interned(w) => self.append_ref(w),
             Operand::Value(Value::Int(word)) => self.append_int(word),
             Operand::Value(value) => {
@@ -1680,7 +1673,9 @@ impl<'a> Vm<'a> {
                 }
                 Operand::Value(v) => match optional_inner(v) {
                     OptView::Empty => return Ok(()),
-                    OptView::Present(inner) => Operand::Value(inner),
+                    OptView::Present(inner) => intern_leaf(&inner)
+                        .map(Operand::Interned)
+                        .unwrap_or(Operand::Value(inner)),
                     OptView::Plain => value,
                 },
                 _ => value,
@@ -2012,10 +2007,14 @@ impl<'a> Vm<'a> {
             OpCode::OptSelect => self.opt_select_arm(a)?,
 
             // -- aggregates ----------------------------------------------
-            OpCode::NewList => self.push_operand(Operand::EmptyList(a as usize)),
+            OpCode::NewList => {
+                let w = new_list_with_capacity(a as i64);
+                self.push_operand(Operand::Interned(w as CelRef));
+            }
             OpCode::NewListFromArg => {
                 let len = self.sequence_len(a)?;
-                self.push_operand(Operand::EmptyList(len as usize));
+                let w = new_list_with_capacity(len);
+                self.push_operand(Operand::Interned(w as CelRef));
             }
             OpCode::ListAppend => {
                 let operand = self.pop_operand().ok_or(CelErr::InternalError)?;
@@ -2778,11 +2777,15 @@ impl<'a> Vm<'a> {
         match self.local_operand(sequence).ok_or(CelErr::InternalError)? {
             Operand::Value(Value::List(seq)) => seq
                 .get(index as usize)
-                .map(Operand::Value)
+                .map(|v| {
+                    intern_leaf(&v)
+                        .map(Operand::Interned)
+                        .unwrap_or(Operand::Value(v))
+                })
                 .ok_or(CelErr::IndexOutOfBounds),
             Operand::Interned(w) if unsafe { w_kind(*w) } == CelKind::List => {
                 if let Some(n) = unsafe { list_int_at(*w, index) } {
-                    return Ok(Operand::Value(Value::Int(n)));
+                    return Ok(Operand::Interned(new_int(n) as CelRef));
                 }
                 let item =
                     unsafe { interned_list_get(*w, index) }.ok_or(CelErr::IndexOutOfBounds)?;
@@ -2802,7 +2805,6 @@ impl<'a> Vm<'a> {
     fn store_operand(&mut self, slot: u32, operand: Operand) -> CelResult<()> {
         let stored = match operand {
             Operand::Interned(w) => Operand::Interned(w),
-            Operand::Value(Value::Int(i)) => Operand::Value(Value::Int(i)),
             Operand::Value(v) => intern_leaf(&v)
                 .map(Operand::Interned)
                 .unwrap_or(Operand::Value(v)),
@@ -4218,7 +4220,7 @@ mod tests {
             ..CelCode::default()
         };
         let ctx = Context::default();
-        let mut vm = Vm::new(&code, &ctx);
+        let mut vm = crate::runtime::heap::with_heap(|h| Vm::new(&code, &ctx, h));
 
         assert_eq!(vm.depth(), 0);
         assert!(vm.top().is_none());
@@ -4261,7 +4263,7 @@ mod tests {
             ..CelCode::default()
         };
         let ctx = Context::default();
-        let mut vm = Vm::new(&code, &ctx);
+        let mut vm = crate::runtime::heap::with_heap(|h| Vm::new(&code, &ctx, h));
         unsafe {
             assert_eq!((*vm.cel_frame).last_instr, -1);
             assert_eq!((*vm.cel_frame).valuestackdepth, 1);
@@ -4739,7 +4741,7 @@ mod tests {
         // `all` does the moment the accumulator turns false.
         let source = "xs.map(x, (1 / 0 == 1) && false)";
         let code = compile(&parse(source)).expect("compiles");
-        let mut vm = Vm::new(&code, &ctx);
+        let mut vm = crate::runtime::heap::with_heap(|h| Vm::new(&code, &ctx, h));
         let result = vm.run().expect("every element absorbs its error");
         assert_eq!(
             result,
@@ -4777,7 +4779,7 @@ mod tests {
             ),
         ] {
             let code = compile(&parse(source)).expect("compiles");
-            let mut vm = Vm::new(&code, &ctx);
+            let mut vm = crate::runtime::heap::with_heap(|h| Vm::new(&code, &ctx, h));
             let got = vm
                 .run()
                 .unwrap_or_else(|e| panic!("{source}: {:?}", vm.public_error(e)));
@@ -4813,7 +4815,7 @@ mod tests {
         let ctx = Context::default();
         let code = compile(&parse("1")).expect("compiles");
         for arity in 0..4usize {
-            let mut vm = Vm::new(&code, &ctx);
+            let mut vm = crate::runtime::heap::with_heap(|h| Vm::new(&code, &ctx, h));
             for i in 0..arity {
                 vm.push(Value::Int(i as i64));
             }
@@ -4857,7 +4859,7 @@ mod tests {
     fn a_map_literal_is_built_in_the_arc_it_is_handed_over_in() {
         let ctx = Context::default();
         let code = compile(&parse(r#"{"x": {"y": 3}}"#)).expect("compiles");
-        let mut vm = Vm::new(&code, &ctx);
+        let mut vm = crate::runtime::heap::with_heap(|h| Vm::new(&code, &ctx, h));
 
         // `Vm::run`'s loop with one line added: each builder is recorded the
         // first time it is seen on top of the stack. Neither table is freed
@@ -4928,7 +4930,7 @@ mod tests {
         let ctx = Context::default();
         let source = "([1, 2, undefined_name][0] == 1) && false";
         let code = compile(&parse(source)).expect("compiles");
-        let mut vm = Vm::new(&code, &ctx);
+        let mut vm = crate::runtime::heap::with_heap(|h| Vm::new(&code, &ctx, h));
         assert_eq!(vm.run(), Ok(Value::Bool(false)));
         assert_eq!(vm.depth(), 0, "the operand stack was left dirty");
     }

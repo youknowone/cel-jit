@@ -293,8 +293,7 @@ unsafe fn interned_not_equals(a: CelRef, b: CelRef) -> CelRef {
     }
 }
 
-/// Item of an interned object-strategy list. 0 residual, including Ints
-/// lists, which have no per-element leaf.
+/// Item of an interned list. Ints wrap as a young `int` leaf.
 #[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
 fn interned_item(list: i64, index: i64) -> i64 {
     let Some(list) = slot_leaf(list) else {
@@ -303,8 +302,8 @@ fn interned_item(list: i64, index: i64) -> i64 {
     if unsafe { w_kind(list) } != CelKind::List {
         return 0;
     }
-    if unsafe { list_int_at(list, index) }.is_some() {
-        return 0;
+    if let Some(n) = unsafe { list_int_at(list, index) } {
+        return new_int(n) as i64;
     }
     match unsafe { interned_list_get(list, index) } {
         Some(w) => w as usize as i64,
@@ -393,10 +392,10 @@ fn interned_index(container: i64, key: i64) -> i64 {
             if unsafe { w_kind(k) } != CelKind::Int {
                 return 0;
             }
-            if unsafe { list_ints_slice(w) }.is_some() {
-                return 0;
-            }
             let index = unsafe { (*k.cast::<W_IntObject>()).intval };
+            if let Some(n) = unsafe { list_int_at(w, index) } {
+                return new_int(n) as i64;
+            }
             unsafe { interned_list_get(w, index) }
         }
         CelKind::Map => match unsafe { string_as_str(k) } {
@@ -812,6 +811,19 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+fn fresh_portal_driver(state: &mut PortalState, code: &CelCode) -> JitDriver<PortalState> {
+    let threshold = portal_threshold();
+    let mut driver = JitDriver::new(threshold);
+    driver.set_param("function_threshold", i64::from(threshold));
+    {
+        use majit_metainterp::JitState as _;
+        state
+            .build_meta(0, code)
+            .install_canonical_liveness(&mut driver);
+    }
+    driver
+}
+
 /// Evaluate `code` through the portal loop.
 pub(crate) fn eval_through_portal(
     vm: &mut Vm<'_>,
@@ -826,21 +838,21 @@ pub(crate) fn eval_through_portal(
     // would clobber the columnar machine.
     let key = code as *const CelCode as usize;
     let bits = PORTAL_DRIVER.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        if slot.as_ref().is_none_or(|(k, _)| *k != key) {
-            let threshold = portal_threshold();
-            let mut driver = JitDriver::new(threshold);
-            driver.set_param("function_threshold", i64::from(threshold));
-            {
-                use majit_metainterp::JitState as _;
-                state
-                    .build_meta(0, code)
-                    .install_canonical_liveness(&mut driver);
+        match slot.try_borrow_mut() {
+            Ok(mut slot) => {
+                if slot.as_ref().is_none_or(|(k, _)| *k != key) {
+                    *slot = Some((key, fresh_portal_driver(&mut state, code)));
+                }
+                let driver = &mut slot.as_mut().expect("just installed").1;
+                run_cel_portal(driver, code, &mut state, 0)
             }
-            *slot = Some((key, driver));
+            Err(_) => {
+                // Outer portal still holds the cell; a host re-entry uses a
+                // throwaway driver.
+                let mut driver = fresh_portal_driver(&mut state, code);
+                run_cel_portal(&mut driver, code, &mut state, 0)
+            }
         }
-        let driver = &mut slot.as_mut().expect("just installed").1;
-        run_cel_portal(driver, code, &mut state, 0)
     });
     match bits {
         PORTAL_DONE => match vm.portal_ret.take() {

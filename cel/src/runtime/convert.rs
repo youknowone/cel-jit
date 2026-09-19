@@ -52,11 +52,26 @@ pub enum ConvertError {
     Corrupt(&'static str),
 }
 
+/// Move a nursery result to the public owned form. An interned value that
+/// already lives in old or immortal memory is returned as it is.
+pub fn promote_eval_result(v: Value) -> Value {
+    super::heap::with_heap(|h| match v {
+        Value::Interned(w) if h.is_young(w as *const u8) => Value::from_interned(w).unpack(),
+        other => other,
+    })
+}
+
 /// Intern `v` onto a class-family leaf. Total: every public variant has
 /// a leaf, including leftover opaques and column/record windows.
 pub fn intern_leaf(v: &Value) -> Option<CelRef> {
     match v {
-        Value::Interned(w) => Some(*w),
+        Value::Interned(w) => {
+            if super::heap::is_forcing_old() && super::heap::is_young(*w as *const u8) {
+                intern_leaf(&Value::from_interned(*w).unpack())
+            } else {
+                Some(*w)
+            }
+        }
         Value::Int(i) => Some(new_int(*i) as CelRef),
         Value::UInt(u) => Some(new_uint(*u) as CelRef),
         Value::Float(f) => Some(new_double(*f) as CelRef),
@@ -84,7 +99,9 @@ pub fn intern_leaf(v: &Value) -> Option<CelRef> {
 /// Allocate the internal form of `v` on this thread's heap.
 pub fn value_to_ref(v: &Value) -> Result<CelRef, ConvertError> {
     match v {
-        Value::Interned(w) => Ok(*w),
+        Value::Interned(w) => {
+            intern_leaf(&Value::Interned(*w)).ok_or(ConvertError::Corrupt("interned"))
+        }
         Value::Int(i) => Ok(new_int(*i) as CelRef),
         Value::UInt(u) => Ok(new_uint(*u) as CelRef),
         Value::Float(f) => Ok(new_double(*f) as CelRef),

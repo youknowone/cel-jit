@@ -48,12 +48,9 @@
 //! shape a collector would walk is on record and tested against a real minor
 //! collection.
 //!
-//! What is still absent is any block that carries those type ids: `alloc_block`
-//! allocates from `std::alloc`, where the collector owns no header, and routing
-//! it to the nursery is not a change this module can make alone. The leaf that
-//! points at a block is itself a [`super::lltype`] allocation the collector does
-//! not own, so a GC-allocated block would be reachable from nothing and freed
-//! while live. The blocks move onto the collector when the leaves do.
+//! The blocks are reserved on this thread's value heap with the leaves.
+//! They still do not carry a collector type id on the allocated body; that
+//! moves with the leaves.
 
 use super::object::CelRef;
 
@@ -135,29 +132,34 @@ pub const CEL_BYTES_BLOCK_TOKEN: ArrayToken = ArrayToken {
 /// be a call the matcher inspects and silently declines. Here it cannot be
 /// mistaken for one.
 ///
-/// Leaks, like everything else this layer allocates. The tracing heap arrives
-/// with the registration mechanism.
+/// Reserved on this thread's value heap.
 ///
 /// # Safety
 ///
 /// The caller writes `cap` items before anything reads them.
-unsafe fn alloc_block(base: usize, item_size: usize, align: usize, cap: usize) -> *mut u8 {
+unsafe fn alloc_block_in(
+    heap: &super::heap::CelHeap,
+    base: usize,
+    item_size: usize,
+    align: usize,
+    cap: usize,
+) -> *mut u8 {
     let size = base + item_size * cap;
-    let layout = std::alloc::Layout::from_size_align(size, align)
-        .expect("payload block layout is representable");
-    let raw = unsafe { std::alloc::alloc(layout) };
-    if raw.is_null() {
-        std::alloc::handle_alloc_error(layout);
-    }
+    let raw = heap.alloc_raw(size, align);
     // The length word first, so a block is never observable without one.
     unsafe { (raw as *mut usize).write(cap) };
     raw
 }
 
-/// A block holding `values`.
-pub fn new_items_block(values: &[CelRef]) -> *mut CelItemsBlock {
+unsafe fn alloc_block(base: usize, item_size: usize, align: usize, cap: usize) -> *mut u8 {
+    super::heap::with_heap(|h| alloc_block_in(h, base, item_size, align, cap))
+}
+
+/// A block holding `values` on `heap`.
+pub fn new_items_block_in(heap: &super::heap::CelHeap, values: &[CelRef]) -> *mut CelItemsBlock {
     let block = unsafe {
-        alloc_block(
+        alloc_block_in(
+            heap,
             CEL_ITEMS_BLOCK_TOKEN.base_size,
             CEL_ITEMS_BLOCK_TOKEN.item_size,
             core::mem::align_of::<CelItemsBlock>(),
@@ -233,6 +235,11 @@ pub fn new_items_block(values: &[CelRef]) -> *mut CelItemsBlock {
         }
     }
     block
+}
+
+/// A block holding `values` on this thread's heap.
+pub fn new_items_block(values: &[CelRef]) -> *mut CelItemsBlock {
+    super::heap::with_heap(|h| new_items_block_in(h, values))
 }
 
 /// A block holding `bytes`.
