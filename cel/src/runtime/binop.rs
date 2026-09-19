@@ -94,6 +94,7 @@ macro_rules! checked_int_arm {
         /// # Safety
         ///
         /// Both operands must be live values of this arm's class.
+        #[inline]
         pub unsafe fn $name(a: CelRef, b: CelRef) -> CelRef {
             let l = payload!(a, $leaf, $field);
             let r = payload!(b, $leaf, $field);
@@ -552,6 +553,7 @@ macro_rules! same_class_chain {
 /// # Safety
 ///
 /// Both operands must be live values.
+#[inline]
 pub unsafe fn cel_add(a: CelRef, b: CelRef) -> CelRef {
     let ta = class_of(a);
     let tb = class_of(b);
@@ -591,6 +593,7 @@ unsafe fn cel_add_slow(a: CelRef, b: CelRef, ta: *const CelClass, tb: *const Cel
 /// # Safety
 ///
 /// Both operands must be live values.
+#[inline]
 pub unsafe fn cel_sub(a: CelRef, b: CelRef) -> CelRef {
     let ta = class_of(a);
     let tb = class_of(b);
@@ -641,6 +644,7 @@ unsafe fn cel_sub_slow(a: CelRef, b: CelRef, ta: *const CelClass, tb: *const Cel
 /// # Safety
 ///
 /// Both operands must be live values.
+#[inline]
 pub unsafe fn cel_mul(a: CelRef, b: CelRef) -> CelRef {
     let ta = class_of(a);
     if ta == class_of(b) {
@@ -658,6 +662,7 @@ pub unsafe fn cel_mul(a: CelRef, b: CelRef) -> CelRef {
 /// # Safety
 ///
 /// Both operands must be live values.
+#[inline]
 pub unsafe fn cel_div(a: CelRef, b: CelRef) -> CelRef {
     let ta = class_of(a);
     if ta == class_of(b) {
@@ -677,6 +682,7 @@ pub unsafe fn cel_div(a: CelRef, b: CelRef) -> CelRef {
 /// # Safety
 ///
 /// Both operands must be live values.
+#[inline]
 pub unsafe fn cel_rem(a: CelRef, b: CelRef) -> CelRef {
     let ta = class_of(a);
     if ta == class_of(b) {

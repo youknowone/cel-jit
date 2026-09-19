@@ -29,6 +29,7 @@ use super::heap;
 /// It is valid until the thread's heap is torn down, and no sooner: nothing
 /// collects yet, because the root set the design enumerates has no walker. See
 /// [`super::heap`] for what that bounds and what it does not.
+#[inline]
 pub fn malloc_typed<T>(value: T) -> *mut T {
     heap::with_heap(|h| h.alloc(value))
 }
@@ -38,6 +39,7 @@ pub fn malloc_typed<T>(value: T) -> *mut T {
 /// Kept distinct from [`malloc_typed`] because the matcher names both and the
 /// heap will eventually route them differently — one to the collector's
 /// managed old-gen, one to an immortal region. They are the same call today.
+#[inline]
 pub fn malloc_typed_managed<T>(value: T) -> *mut T {
     heap::with_heap(|h| h.alloc(value))
 }

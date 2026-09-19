@@ -176,6 +176,7 @@ impl Space {
         }
     }
 
+    #[inline]
     fn bump(&self, size: usize, align: usize) -> *mut u8 {
         let used = self.open_used.get();
         let start = (used + align - 1) & !(align - 1);
@@ -190,6 +191,8 @@ impl Space {
         self.bump_grow(size, align)
     }
 
+    #[cold]
+    #[inline(never)]
     fn bump_grow(&self, size: usize, align: usize) -> *mut u8 {
         let mut segments = self.segments.borrow_mut();
         if let Some(open) = segments.last_mut() {
@@ -291,6 +294,7 @@ impl CelHeap {
         }
     }
 
+    #[inline]
     fn in_nursery(&self) -> bool {
         self.depth.get() > 0 && self.force_old.get() == 0
     }
@@ -311,6 +315,10 @@ impl CelHeap {
     fn leave(&self, outermost: bool) {
         let d = self.depth.get();
         self.depth.set(d.saturating_sub(1));
+        let live = self.nursery.bytes.get();
+        if live > self.nursery_high_water.get() {
+            self.nursery_high_water.set(live);
+        }
         if !outermost {
             return;
         }
@@ -384,11 +392,13 @@ impl CelHeap {
     /// During an evaluation the pointer is nursery memory and is invalid
     /// after the outermost scope resets, unless it was allocated through
     /// [`alloc_old`].
+    #[inline]
     pub fn alloc<T>(&self, value: T) -> *mut T {
         let () = AssertNoDrop::<T>::OK;
         let ptr = self.alloc_raw(size_of::<T>(), align_of::<T>()) as *mut T;
         // SAFETY: `alloc_raw` returns an address with `T`'s size and alignment
-        // that nothing else has been handed.
+        // that nothing else has been handed. The bytes are written here, so
+        // the bump does not zero them.
         unsafe { ptr.write(value) };
         ptr
     }
@@ -406,20 +416,23 @@ impl CelHeap {
     ///
     /// Public because the payload blocks in [`super::object_array`] are sized
     /// at run time and so cannot go through the generic [`alloc`].
+    #[inline]
     pub fn alloc_raw(&self, size: usize, align: usize) -> *mut u8 {
         if self.in_nursery() {
-            let ptr = self.nursery.bump(size, align);
-            let live = self.nursery.bytes.get();
-            if live > self.nursery_high_water.get() {
-                self.nursery_high_water.set(live);
-            }
-            ptr
+            self.nursery.bump(size, align)
         } else {
-            self.old.bump(size, align)
+            self.alloc_raw_slow(size, align)
         }
     }
 
+    #[cold]
+    #[inline(never)]
+    fn alloc_raw_slow(&self, size: usize, align: usize) -> *mut u8 {
+        self.old.bump(size, align)
+    }
+
     /// Reserve `size` bytes in old space.
+    #[inline]
     pub fn alloc_old_raw(&self, size: usize, align: usize) -> *mut u8 {
         self.old.bump(size, align)
     }
@@ -522,6 +535,7 @@ thread_local! {
 }
 
 /// Run `f` against this thread's heap.
+#[inline]
 pub fn with_heap<R>(f: impl FnOnce(&CelHeap) -> R) -> R {
     HEAP.with(f)
 }
@@ -538,6 +552,7 @@ pub struct EvalScope {
 
 impl EvalScope {
     /// The heap this scope opened. Valid until [`Drop`].
+    #[inline]
     pub fn heap(&self) -> &CelHeap {
         unsafe { &*self.heap }
     }
@@ -803,6 +818,27 @@ mod tests {
         assert!(!heap.contains(young as *const u8));
         assert!(heap.allocated_bytes() < bytes_during);
         unsafe { assert_eq!(*old, 1) };
+    }
+
+    /// A young fixed-size allocation updates the live counters by one object
+    /// and `size_of` bytes, including when many fit in the open segment.
+    #[test]
+    fn young_fixed_size_counts_stay_exact() {
+        let heap = CelHeap::new();
+        assert!(heap.enter());
+        let before_n = heap.allocated_objects();
+        let before_b = heap.allocated_bytes();
+        for i in 0..64u64 {
+            heap.alloc(i);
+        }
+        assert_eq!(heap.allocated_objects(), before_n + 64);
+        assert_eq!(
+            heap.allocated_bytes(),
+            before_b + 64 * size_of::<u64>() as u64
+        );
+        heap.leave(true);
+        assert_eq!(heap.allocated_objects(), before_n);
+        assert_eq!(heap.allocated_bytes(), before_b);
     }
 
     /// Nested scopes do not reset; only the outermost does.

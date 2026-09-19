@@ -45,7 +45,7 @@ use crate::runtime::convert::{intern_leaf, interned_list_get, ref_to_value};
 use crate::runtime::error::{take_error, CelErrCode, ERROR_SENTINEL};
 use crate::runtime::object::{
     cel_frame_slot, force_virtualizable_if_necessary, interned_list_eq, list_int_at, list_len,
-    map_len, new_bytes, new_cel_frame_in, new_double, new_int, new_list, new_list_ints,
+    map_len, new_bytes, new_cel_frame_in, new_double, new_int, new_int_in, new_list, new_list_ints,
     new_list_with_capacity, new_null, new_optional, new_optional_none, new_string, new_type,
     new_uint, opaque_host_index, string_as_str, string_byte_len, w_kind, w_type, CelKind, CelRef,
     W_BoolObject, W_CelFrame, W_DoubleObject, W_IntObject, W_UIntObject, CEL_OPAQUE_CLASS,
@@ -728,6 +728,9 @@ pub(crate) struct Vm<'a> {
     /// `PyFrame` virtualizable: `last_instr`, `valuestackdepth`,
     /// `locals_stack_w[*]`. Interned slots are written through here.
     pub(crate) cel_frame: *mut W_CelFrame,
+    /// Heap resolved at evaluation entry. Allocation sites on this path
+    /// use it instead of re-entering thread-local storage.
+    pub(crate) heap: *const crate::runtime::heap::CelHeap,
     /// Result parked by the JIT portal when `dispatch_one` returns.
     pub(crate) portal_ret: Option<CelResult<Value>>,
     /// Arguments a missed [`OpCode::CallQualified`] popped, held for the
@@ -820,6 +823,7 @@ impl<'a> Vm<'a> {
             scratch: std::mem::ManuallyDrop::new(scratch),
             stack_base,
             cel_frame,
+            heap: heap as *const crate::runtime::heap::CelHeap,
             portal_ret: None,
             pending_args: None,
             #[cfg(feature = "__drop-arm-probe")]
@@ -910,11 +914,13 @@ impl<'a> Vm<'a> {
         unsafe { interned_list_indices(w) }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn sync_store_interned(&mut self, slot: u32, w: CelRef) {
         let _ = self.pop_operand();
         let _ = self.store_operand(slot, Operand::Interned(w));
     }
 
+    #[allow(dead_code)]
     pub(crate) fn sync_write_local(&mut self, slot: u32, w: CelRef) {
         let _ = self.store_operand(slot, Operand::Interned(w));
     }
@@ -997,6 +1003,56 @@ impl<'a> Vm<'a> {
     // reads `Vm::stack`, so what "the top of the stack" means is answered in
     // one place rather than at each of the sites that asks. `Scratch::release`
     // clears the pool's own buffer, which no `Vm` owns by then.
+
+    #[inline]
+    pub(crate) fn heap(&self) -> &crate::runtime::heap::CelHeap {
+        unsafe { &*self.heap }
+    }
+
+    #[inline]
+    fn box_int(&self, n: i64) -> CelRef {
+        new_int_in(self.heap(), n) as CelRef
+    }
+
+    /// Copy interned cells back into the operand array.
+    ///
+    /// Portal interned arms write `locals_stack_w` and `valuestackdepth`
+    /// only. A residual instruction still reads `frame`, so this rebuilds
+    /// interned slots from the cells. A builder operand has no leaf and
+    /// keeps its existing variant: its cell is null and is not overwritten.
+    pub(crate) fn hydrate_from_cells(&mut self) {
+        unsafe {
+            let vdepth = (*self.cel_frame).valuestackdepth as usize;
+            let cap = (*self.cel_frame).locals_stack_w.capacity();
+            let want = vdepth.max(self.stack_base);
+            if self.frame.len() > want {
+                self.frame.truncate(want);
+            }
+            while self.frame.len() < want {
+                self.frame.push(Operand::NULL);
+            }
+            let n = want.min(cap);
+            let mut i = 0;
+            while i < n {
+                let w = *cel_frame_slot(self.cel_frame, i as i64);
+                if !w.is_null() {
+                    match self.frame.get(i) {
+                        Some(
+                            Operand::EmptyList(_)
+                            | Operand::Ints(_)
+                            | Operand::List(_)
+                            | Operand::Refs(_)
+                            | Operand::Map(_)
+                            | Operand::MapRefs(_)
+                            | Operand::Struct(_, _),
+                        ) => {}
+                        _ => self.frame[i] = Operand::Interned(w),
+                    }
+                }
+                i += 1;
+            }
+        }
+    }
 
     fn vable_cell(operand: &Operand) -> CelRef {
         match operand {
@@ -1260,11 +1316,11 @@ impl<'a> Vm<'a> {
                 };
                 if let Some(n) = unsafe { list_int_at(w, index) } {
                     if is_optional {
-                        let item = new_int(n) as CelRef;
+                        let item = self.box_int(n);
                         self.push_operand(Operand::Interned(unsafe { cel_optional_of(item) }));
                         return Ok(true);
                     }
-                    self.push_operand(Operand::Interned(new_int(n) as CelRef));
+                    self.push_operand(Operand::Interned(self.box_int(n)));
                     return Ok(true);
                 }
                 match unsafe { interned_list_get(w, index) } {
@@ -1527,6 +1583,7 @@ impl<'a> Vm<'a> {
     }
 
     fn append_int(&mut self, word: i64) -> CelResult<()> {
+        let boxed = self.box_int(word);
         let top = self.top_mut().ok_or(CelErr::InternalError)?;
         match top {
             Operand::Ints(words) => words.push(word),
@@ -1535,18 +1592,17 @@ impl<'a> Vm<'a> {
                 words.push(word);
                 *top = Operand::Ints(words);
             }
-            Operand::Refs(items) => items.push(new_int(word) as CelRef),
+            Operand::Refs(items) => items.push(boxed),
             Operand::List(items) => items.push(Value::Int(word)),
             Operand::Interned(list)
-                if unsafe {
-                    crate::runtime::object::list_try_append(*list, new_int(word) as CelRef)
-                } => {}
+                if unsafe { crate::runtime::object::list_try_append(*list, boxed) } => {}
             _ => return Err(CelErr::InternalError),
         }
         Ok(())
     }
 
     fn append_ref(&mut self, w: CelRef) -> CelResult<()> {
+        let heap = self.heap;
         let top = self.top_mut().ok_or(CelErr::InternalError)?;
         match top {
             Operand::Refs(items) => items.push(w),
@@ -1557,7 +1613,11 @@ impl<'a> Vm<'a> {
             }
             Operand::Ints(words) => {
                 let mut items = Vec::with_capacity(words.capacity().max(words.len() + 1));
-                items.extend(words.iter().map(|&n| new_int(n) as CelRef));
+                items.extend(
+                    words
+                        .iter()
+                        .map(|&n| new_int_in(unsafe { &*heap }, n) as CelRef),
+                );
                 items.push(w);
                 *top = Operand::Refs(items);
             }
@@ -2525,7 +2585,7 @@ impl<'a> Vm<'a> {
             }
             OpCode::IterLen => {
                 let len = self.sequence_len(a)?;
-                self.push_operand(Operand::Interned(new_int(len) as CelRef));
+                self.push_operand(Operand::Interned(self.box_int(len)));
             }
             OpCode::IterAt => {
                 let element = self.element_at(a, b)?;
@@ -2777,25 +2837,25 @@ impl<'a> Vm<'a> {
         let Some(index) = self.local_int(index) else {
             return Err(CelErr::InternalError);
         };
-        match self.local_operand(sequence).ok_or(CelErr::InternalError)? {
-            Operand::Value(Value::List(seq)) => seq
-                .get(index as usize)
-                .map(|v| {
-                    intern_leaf(&v)
-                        .map(Operand::Interned)
-                        .unwrap_or(Operand::Value(v))
-                })
-                .ok_or(CelErr::IndexOutOfBounds),
-            Operand::Interned(w) if unsafe { w_kind(*w) } == CelKind::List => {
-                if let Some(n) = unsafe { list_int_at(*w, index) } {
-                    return Ok(Operand::Interned(new_int(n) as CelRef));
-                }
-                let item =
-                    unsafe { interned_list_get(*w, index) }.ok_or(CelErr::IndexOutOfBounds)?;
-                Ok(Operand::Interned(item))
+        let interned = match self.local_operand(sequence).ok_or(CelErr::InternalError)? {
+            Operand::Value(Value::List(seq)) => {
+                return seq
+                    .get(index as usize)
+                    .map(|v| {
+                        intern_leaf(&v)
+                            .map(Operand::Interned)
+                            .unwrap_or(Operand::Value(v))
+                    })
+                    .ok_or(CelErr::IndexOutOfBounds);
             }
-            _ => Err(CelErr::InternalError),
+            Operand::Interned(w) if unsafe { w_kind(*w) } == CelKind::List => *w,
+            _ => return Err(CelErr::InternalError),
+        };
+        if let Some(n) = unsafe { list_int_at(interned, index) } {
+            return Ok(Operand::Interned(self.box_int(n)));
         }
+        let item = unsafe { interned_list_get(interned, index) }.ok_or(CelErr::IndexOutOfBounds)?;
+        Ok(Operand::Interned(item))
     }
 
     /// Write `value` into `slot`, dropping what was there.
@@ -2806,8 +2866,22 @@ impl<'a> Vm<'a> {
     }
 
     fn store_operand(&mut self, slot: u32, operand: Operand) -> CelResult<()> {
+        if let Operand::Interned(w) = operand {
+            let dest = self.local_operand_mut(slot).ok_or(CelErr::InternalError)?;
+            let previous = std::mem::replace(dest, Operand::Interned(w));
+            self.write_vable_cell(slot as usize, w);
+            match previous {
+                Operand::Interned(_) | Operand::Value(Value::Null) => {}
+                other => {
+                    if let Ok(value) = self.finish(other) {
+                        self.discard(value);
+                    }
+                }
+            }
+            return Ok(());
+        }
         let stored = match operand {
-            Operand::Interned(w) => Operand::Interned(w),
+            Operand::Interned(_) => unreachable!(),
             Operand::Value(v) => intern_leaf(&v)
                 .map(Operand::Interned)
                 .unwrap_or(Operand::Value(v)),
@@ -2837,6 +2911,7 @@ impl<'a> Vm<'a> {
     /// list.
     #[inline(always)]
     fn advance_counter(&mut self, slot: u32) -> CelResult<()> {
+        let heap = self.heap;
         let dest = self.local_operand_mut(slot).ok_or(CelErr::InternalError)?;
         match dest {
             Operand::Value(Value::Int(counter)) => {
@@ -2847,7 +2922,7 @@ impl<'a> Vm<'a> {
             Operand::Interned(w) if unsafe { w_kind(*w) } == CelKind::Int => {
                 let n = unsafe { (*(*w as *mut W_IntObject)).intval };
                 let next = n.checked_add(1).ok_or(CelErr::Overflow(OpCode::Add))?;
-                *w = new_int(next) as CelRef;
+                *w = new_int_in(unsafe { &*heap }, next) as CelRef;
             }
             _ => return Err(CelErr::InternalError),
         }
@@ -2951,7 +3026,7 @@ impl<'a> Vm<'a> {
             }
         };
         let _ = self.pop_operand();
-        self.push_operand(Operand::Interned(new_int(n) as CelRef));
+        self.push_operand(Operand::Interned(self.box_int(n)));
         Ok(true)
     }
 
@@ -3054,7 +3129,7 @@ impl<'a> Vm<'a> {
             return Ok(false);
         };
         let _ = self.pop_operand();
-        self.push_operand(Operand::Interned(new_int(n) as CelRef));
+        self.push_operand(Operand::Interned(self.box_int(n)));
         Ok(true)
     }
 

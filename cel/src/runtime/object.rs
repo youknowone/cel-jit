@@ -210,6 +210,7 @@ macro_rules! scalar_leaf {
         };
 
         $(#[$ctor_doc])*
+        #[inline]
         pub fn $ctor(value: $pty) -> *mut $leaf {
             lltype::malloc_typed($leaf {
                 ob_header: CelObject { ob_type: &$class },
@@ -1275,12 +1276,54 @@ fn small_ints() -> &'static [usize] {
 ///
 /// Values in [`PREBUILT_INT_FROM`]..[`PREBUILT_INT_TO`] are immortal
 /// singletons. Everything else is a fresh [`new_int_raw`].
+#[inline]
 pub fn new_int(value: i64) -> *mut W_IntObject {
     if (PREBUILT_INT_FROM..PREBUILT_INT_TO).contains(&value) {
         let idx = (value - PREBUILT_INT_FROM) as usize;
         return small_ints()[idx] as *mut W_IntObject;
     }
     new_int_raw(value)
+}
+
+/// Box `value` as a CEL `int` on `heap`.
+///
+/// The interned range is the same singletons [`new_int`] returns. A miss
+/// writes a young leaf through `heap` and does not re-resolve thread-local
+/// storage.
+#[inline]
+pub fn new_int_in(heap: &super::heap::CelHeap, value: i64) -> *mut W_IntObject {
+    if (PREBUILT_INT_FROM..PREBUILT_INT_TO).contains(&value) {
+        let idx = (value - PREBUILT_INT_FROM) as usize;
+        return small_ints()[idx] as *mut W_IntObject;
+    }
+    heap.alloc(W_IntObject {
+        ob_header: CelObject {
+            ob_type: &CEL_INT_CLASS,
+        },
+        intval: value,
+    })
+}
+
+/// Box `value` as a CEL `uint` on `heap`.
+#[inline]
+pub fn new_uint_in(heap: &super::heap::CelHeap, value: u64) -> *mut W_UIntObject {
+    heap.alloc(W_UIntObject {
+        ob_header: CelObject {
+            ob_type: &CEL_UINT_CLASS,
+        },
+        uintval: value,
+    })
+}
+
+/// Box `value` as a CEL `double` on `heap`.
+#[inline]
+pub fn new_double_in(heap: &super::heap::CelHeap, value: f64) -> *mut W_DoubleObject {
+    heap.alloc(W_DoubleObject {
+        ob_header: CelObject {
+            ob_type: &CEL_DOUBLE_CLASS,
+        },
+        floatval: value,
+    })
 }
 
 #[cfg(test)]
@@ -1596,5 +1639,20 @@ mod tests {
         let _ = new_int(1000);
         let later = crate::runtime::heap::with_heap(|h| h.allocated_objects());
         assert_eq!(later, after + 1);
+    }
+
+    /// `new_int_in` writes a miss on the heap it was handed, not a second one.
+    #[test]
+    fn new_int_in_counts_against_the_given_heap() {
+        let heap = crate::runtime::heap::CelHeap::new();
+        let before = heap.allocated_objects();
+        let w = new_int_in(&heap, 1000);
+        assert_eq!(heap.allocated_objects(), before + 1);
+        unsafe {
+            assert_eq!((*w).intval, 1000);
+        }
+        let interned = new_int_in(&heap, 1);
+        assert_eq!(heap.allocated_objects(), before + 1);
+        assert_eq!(interned, new_int(1));
     }
 }
