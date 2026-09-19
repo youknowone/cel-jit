@@ -485,6 +485,9 @@ pub unsafe fn w_uint_rem(a: CelRef, b: CelRef) -> CelRef {
 }
 
 /// `duration + duration` / `duration - duration`.
+///
+/// An i64 overflow means the leaf cannot hold the result, not that the
+/// language overflowed. The evaluator unpacks and keeps the public answer.
 macro_rules! duration_arm {
     ($name:ident, $checked:ident, $op:literal) => {
         /// # Safety
@@ -507,7 +510,8 @@ duration_arm!(w_duration_sub, checked_sub, "sub");
 /// `timestamp ± duration`, keeping the timestamp's offset.
 ///
 /// The offset is display state, not part of the instant, so shifting an instant
-/// must not reinterpret it in another zone.
+/// must not reinterpret it in another zone. An i64 overflow means the leaf
+/// cannot hold the result; the evaluator unpacks and keeps the public answer.
 ///
 /// # Safety
 ///
@@ -615,6 +619,9 @@ pub unsafe fn cel_sub(a: CelRef, b: CelRef) -> CelRef {
 
 /// `timestamp - timestamp`, yielding a `duration`.
 ///
+/// An i64 overflow means the leaf cannot hold the span; the evaluator unpacks
+/// and keeps the public answer.
+///
 /// # Safety
 ///
 /// Both operands must be live `timestamp` values.
@@ -721,6 +728,7 @@ pub unsafe fn cel_negate(a: CelRef) -> CelRef {
         let v = payload!(a, W_DurationObject, nanos);
         return match v.checked_neg() {
             Some(n) => new_duration(n) as CelRef,
+            // The leaf cannot hold `-i64::MIN` ns; the evaluator unpacks.
             None => raise(CelErrCode::Overflow, "negate", a, ERROR_SENTINEL),
         };
     }

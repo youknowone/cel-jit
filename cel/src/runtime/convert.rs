@@ -61,8 +61,11 @@ pub fn promote_eval_result(v: Value) -> Value {
     }
 }
 
-/// Intern `v` onto a class-family leaf. Total: every public variant has
-/// a leaf, including leftover opaques and column/record windows.
+/// Intern `v` onto a class-family leaf.
+///
+/// A duration or timestamp whose instant does not fit i64 nanoseconds has no
+/// leaf and stays public: `None` here is that case, not an error and not a
+/// truncation.
 pub fn intern_leaf(v: &Value) -> Option<CelRef> {
     match v {
         Value::Interned(w) => {
@@ -90,7 +93,11 @@ pub fn intern_leaf(v: &Value) -> Option<CelRef> {
             .map(|cls| new_type(cls) as CelRef)
             .or_else(|| Some(intern_host_opaque(opaque))),
         #[cfg(feature = "chrono")]
-        Value::Duration(_) | Value::Timestamp(_) => value_to_ref(v).ok(),
+        Value::Duration(d) => d.num_nanoseconds().map(|n| new_duration(n) as CelRef),
+        #[cfg(feature = "chrono")]
+        Value::Timestamp(ts) => ts
+            .timestamp_nanos_opt()
+            .map(|n| new_timestamp(n, i64::from(ts.offset().local_minus_utc())) as CelRef),
         #[cfg(feature = "structs")]
         Value::Struct(_) => value_to_ref(v).ok(),
     }

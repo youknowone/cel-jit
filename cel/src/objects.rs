@@ -1156,10 +1156,19 @@ impl Value {
         Value::from_interned(crate::runtime::object::new_null() as CelRef)
     }
 
-    /// The class-family kind. Every public value now has a leaf.
+    /// The class-family kind. A duration or timestamp that does not fit the
+    /// leaf stays public and still reports its kind.
     pub fn kind(&self) -> crate::runtime::object::CelKind {
-        let w = crate::runtime::convert::intern_leaf(self).expect("intern_leaf is total");
-        unsafe { crate::runtime::object::w_kind(w) }
+        if let Some(w) = crate::runtime::convert::intern_leaf(self) {
+            return unsafe { crate::runtime::object::w_kind(w) };
+        }
+        #[cfg(feature = "chrono")]
+        match self {
+            Value::Duration(_) => return crate::runtime::object::CelKind::Duration,
+            Value::Timestamp(_) => return crate::runtime::object::CelKind::Timestamp,
+            _ => {}
+        }
+        panic!("intern_leaf is total for this variant")
     }
 
     /// Restore the typed variants. An interned leaf that convert cannot
@@ -2446,17 +2455,21 @@ pub(crate) fn value_len(value: &Value) -> Option<i64> {
     }
 }
 
-fn interned_binop_result(w: CelRef) -> ResolveResult {
-    if w == ERROR_SENTINEL {
-        Err(raised_execution_error())
-    } else {
-        Ok(Value::from_interned(w))
+/// Finish an interned arithmetic op. An i64 overflow on a temporal leaf is
+/// not the language overflow: the public implementation on the unpacked
+/// operands decides, and a result with no leaf stays public.
+pub(crate) fn interned_binop_result(w: CelRef) -> ResolveResult {
+    if w != ERROR_SENTINEL {
+        return Ok(Value::from_interned(w));
     }
+    interned_arith_error()
 }
 
-fn raised_execution_error() -> ExecutionError {
+fn interned_arith_error() -> ResolveResult {
     let Some(err) = take_error() else {
-        return ExecutionError::InternalError("raised without an error".to_owned());
+        return Err(ExecutionError::InternalError(
+            "raised without an error".to_owned(),
+        ));
     };
     let lhs = unsafe { crate::runtime::convert::ref_to_value(err.lhs) }.unwrap_or(Value::Null);
     let rhs = if err.rhs == ERROR_SENTINEL {
@@ -2464,20 +2477,52 @@ fn raised_execution_error() -> ExecutionError {
     } else {
         unsafe { crate::runtime::convert::ref_to_value(err.rhs) }.unwrap_or(Value::Null)
     };
-    match err.code {
-        CelErrCode::Overflow => ExecutionError::Overflow(err.op, lhs, rhs),
+    if err.code == CelErrCode::Overflow {
+        #[cfg(feature = "chrono")]
+        if let Some(result) = temporal_public_arith(err.op, &lhs, &rhs) {
+            return result;
+        }
+    }
+    Err(raised_to_execution(err.code, err.op, lhs, rhs))
+}
+
+#[cfg(feature = "chrono")]
+fn temporal_public_arith(op: &'static str, lhs: &Value, rhs: &Value) -> Option<ResolveResult> {
+    if op == "negate" && matches!(lhs, Value::Duration(_)) {
+        return Some(value_negate(lhs.clone()));
+    }
+    if matches!(
+        (lhs, rhs),
+        (Value::Duration(_), Value::Duration(_))
+            | (Value::Timestamp(_), Value::Duration(_))
+            | (Value::Duration(_), Value::Timestamp(_))
+            | (Value::Timestamp(_), Value::Timestamp(_))
+    ) {
+        return Some(binary_values_ref(op, lhs, rhs));
+    }
+    None
+}
+
+fn raised_to_execution(
+    code: CelErrCode,
+    op: &'static str,
+    lhs: Value,
+    rhs: Value,
+) -> ExecutionError {
+    match code {
+        CelErrCode::Overflow => ExecutionError::Overflow(op, lhs, rhs),
         CelErrCode::DivisionByZero => ExecutionError::DivisionByZero(lhs),
         CelErrCode::RemainderByZero => ExecutionError::RemainderByZero(lhs),
         CelErrCode::UnsupportedBinaryOperator => {
-            if mismatch_is_no_such_overload(err.op, &lhs) {
+            if mismatch_is_no_such_overload(op, &lhs) {
                 ExecutionError::NoSuchOverload
             } else {
-                ExecutionError::UnsupportedBinaryOperator(err.op, lhs, rhs)
+                ExecutionError::UnsupportedBinaryOperator(op, lhs, rhs)
             }
         }
         CelErrCode::NoSuchOverload => ExecutionError::NoSuchOverload,
         CelErrCode::NoneDereference => {
-            ExecutionError::function_error(err.op, "optional.none() dereference")
+            ExecutionError::function_error(op, "optional.none() dereference")
         }
     }
 }
@@ -2697,9 +2742,13 @@ fn interned_eq_public(w: CelRef, other: &Value) -> bool {
             return public_list_eq_ints(list, ints);
         }
     }
-    intern_leaf(other)
-        .map(|b| interned_eq(w, b))
-        .unwrap_or(false)
+    match intern_leaf(other) {
+        Some(b) => interned_eq(w, b),
+        None => match unsafe { crate::runtime::convert::ref_to_value(w) } {
+            Ok(unpacked) => unpacked == *other,
+            Err(_) => false,
+        },
+    }
 }
 
 fn public_list_eq_ints(list: &ListRef, ints: &[i64]) -> bool {

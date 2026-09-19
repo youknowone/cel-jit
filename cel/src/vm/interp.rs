@@ -33,8 +33,9 @@ use super::error::{CelErr, CelResult, ColdId, NameId};
 use super::opcode::OpCode;
 use crate::context::Context;
 use crate::objects::{
-    as_optional, binary_values_ref, compare_values, optional_none, optional_of, value_contains,
-    value_field, value_index, value_iter, value_key, value_negate, Key, ListStorage, Map,
+    as_optional, binary_values_ref, compare_values, interned_binop_result, optional_none,
+    optional_of, value_contains, value_field, value_index, value_iter, value_key, value_negate,
+    Key, ListStorage, Map,
 };
 use crate::runtime::binop::{
     cel_add, cel_div, cel_equals, cel_greater, cel_greater_equals, cel_less, cel_less_equals,
@@ -1383,7 +1384,7 @@ impl<'a> Vm<'a> {
 
     fn apply_cel_binop(
         &mut self,
-        op: OpCode,
+        _op: OpCode,
         name: &'static str,
         lhs: CelRef,
         rhs: CelRef,
@@ -1398,7 +1399,24 @@ impl<'a> Vm<'a> {
                 _ => return Err(CelErr::InternalError),
             }
         };
-        self.push_interned(w, op)
+        self.push_interned_arith(w)
+    }
+
+    /// Interned arithmetic: a live leaf is pushed as-is. A sentinel declines
+    /// to the public implementation when the leaf cannot hold a temporal
+    /// result, otherwise it is the raised error.
+    fn push_interned_arith(&mut self, w: CelRef) -> CelResult<()> {
+        if w != ERROR_SENTINEL {
+            self.push_operand(Operand::Interned(w));
+            return Ok(());
+        }
+        match interned_binop_result(w) {
+            Ok(value) => {
+                self.push(value);
+                Ok(())
+            }
+            Err(e) => Err(self.park(e)),
+        }
     }
 
     /// Pop one operand, finishing an aggregate that was still being built.
@@ -2394,10 +2412,14 @@ impl<'a> Vm<'a> {
                             _ => cel_rem(a_ref, b_ref),
                         }
                     };
-                    if w == ERROR_SENTINEL {
-                        return Err(self.raised_as_cel_err(op));
+                    if w != ERROR_SENTINEL {
+                        self.append_operand(Operand::Interned(w))?;
+                    } else {
+                        match interned_binop_result(w) {
+                            Ok(value) => self.append_to_list(value)?,
+                            Err(e) => return Err(self.park(e)),
+                        }
                     }
-                    self.append_operand(Operand::Interned(w))?;
                 } else {
                     let lhs = self.local_as_value(a).ok_or(CelErr::InternalError)?;
                     let value = binary_values_ref(name, &lhs, rhs).map_err(|e| self.park(e))?;
@@ -2465,7 +2487,7 @@ impl<'a> Vm<'a> {
                 let operand = self.pop_operand().ok_or(CelErr::InternalError)?;
                 if let Some(w) = Self::leaf_of(&operand) {
                     let out = unsafe { cel_negate(w) };
-                    self.push_interned(out, op)?;
+                    self.push_interned_arith(out)?;
                 } else {
                     let value = self.finish(operand)?;
                     let value = value_negate(value).map_err(|e| self.park(e))?;
