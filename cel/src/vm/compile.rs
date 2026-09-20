@@ -268,6 +268,7 @@ impl Compiler {
                 if leaf.is_null() {
                     return None;
                 }
+                crate::runtime::convert::link_public_handle(leaf, &value);
                 Some((value, leaf))
             }
             Expr::List(list) => {
@@ -276,6 +277,7 @@ impl Compiler {
                 if leaf.is_null() {
                     return None;
                 }
+                crate::runtime::convert::link_public_handle(leaf, &value);
                 Some((value, leaf))
             }
             Expr::Map(map) => self.intern_const_map(map),

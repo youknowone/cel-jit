@@ -302,6 +302,27 @@ pub fn new_bytes_block(bytes: &[u8]) -> *mut CelBytesBlock {
     block
 }
 
+/// A block holding `a` then `b`, written in place so concat does not
+/// allocate a temporary `String` / `Vec`.
+pub fn new_bytes_block_concat(a: &[u8], b: &[u8]) -> *mut CelBytesBlock {
+    let n = a.len() + b.len();
+    let block = unsafe {
+        alloc_block(
+            CEL_BYTES_BLOCK_TOKEN.base_size,
+            CEL_BYTES_BLOCK_TOKEN.item_size,
+            core::mem::align_of::<CelBytesBlock>(),
+            n,
+        )
+    } as *mut CelBytesBlock;
+    // The block has `n` live bytes; `a` and `b` are the two halves.
+    unsafe {
+        let dest = bytes_base(block);
+        core::ptr::copy_nonoverlapping(a.as_ptr(), dest, a.len());
+        core::ptr::copy_nonoverlapping(b.as_ptr(), dest.add(a.len()), b.len());
+    }
+    block
+}
+
 /// Item 0 of a reference block, or null for a null block.
 ///
 /// ⚠ **The NAME is a contract with the front end, not a style choice, and it

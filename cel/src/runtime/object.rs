@@ -429,6 +429,20 @@ pub fn new_bytes(bytes: &[u8]) -> *mut W_BytesObject {
     })
 }
 
+/// Box the concatenation of two byte slices as a CEL `bytes`.
+pub fn new_bytes_concat(left: &[u8], right: &[u8]) -> *mut W_BytesObject {
+    let data = object_array::new_bytes_block_concat(left, right);
+    let length = (left.len() + right.len()) as i64;
+    lltype::malloc_typed(W_BytesObject {
+        ob_header: CelObject {
+            ob_type: &CEL_BYTES_CLASS,
+        },
+        data,
+        length,
+        public: core::ptr::null(),
+    })
+}
+
 /// A CEL `string`.
 ///
 /// Its own leaf rather than a `bytes` with a different class word, because the
@@ -459,6 +473,20 @@ const _: () = {
 pub fn new_string(s: &str) -> *mut W_StringObject {
     let chars = object_array::new_bytes_block(s.as_bytes());
     let byte_len = s.len() as i64;
+    lltype::malloc_typed(W_StringObject {
+        ob_header: CelObject {
+            ob_type: &CEL_STRING_CLASS,
+        },
+        chars,
+        byte_len,
+        public: core::ptr::null(),
+    })
+}
+
+/// Box the concatenation of two UTF-8 slices as a CEL `string`.
+pub fn new_string_concat(left: &[u8], right: &[u8]) -> *mut W_StringObject {
+    let chars = object_array::new_bytes_block_concat(left, right);
+    let byte_len = (left.len() + right.len()) as i64;
     lltype::malloc_typed(W_StringObject {
         ob_header: CelObject {
             ob_type: &CEL_STRING_CLASS,

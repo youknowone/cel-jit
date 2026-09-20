@@ -57,8 +57,9 @@
 
 use super::error::{raise, CelErrCode, ERROR_SENTINEL};
 use super::object::{
-    list_ints_slice, new_bool, new_bytes, new_double, new_duration, new_int, new_list,
-    new_list_ints, new_null, new_string, new_timestamp, new_uint, CelClass, CelRef,
+    list_ints_slice, new_bool, new_bytes_concat, new_double, new_duration, new_int, new_list,
+    new_list_ints, new_null, new_string_concat, new_timestamp, new_uint,
+    CelClass, CelRef,
     W_BytesObject, W_MapObject, W_StringObject, CEL_BOOL_CLASS, CEL_BYTES_CLASS, CEL_DOUBLE_CLASS,
     CEL_DURATION_CLASS, CEL_INT_CLASS, CEL_LIST_CLASS, CEL_MAP_CLASS, CEL_NULL_CLASS,
     CEL_OPAQUE_CLASS, CEL_OPTIONAL_CLASS, CEL_STRING_CLASS, CEL_TIMESTAMP_CLASS, CEL_TYPE_CLASS,
@@ -210,10 +211,7 @@ fn cmp_bytes(l: &[u8], r: &[u8]) -> i64 {
 pub unsafe fn w_string_add(a: CelRef, b: CelRef) -> CelRef {
     let left = string_bytes(a);
     let right = string_bytes(b);
-    let mut out = String::with_capacity(left.len() + right.len());
-    out.push_str(std::str::from_utf8_unchecked(left));
-    out.push_str(std::str::from_utf8_unchecked(right));
-    new_string(&out) as CelRef
+    new_string_concat(left, right) as CelRef
 }
 
 /// # Safety
@@ -222,10 +220,7 @@ pub unsafe fn w_string_add(a: CelRef, b: CelRef) -> CelRef {
 pub unsafe fn w_bytes_add(a: CelRef, b: CelRef) -> CelRef {
     let left = bytes_payload(a);
     let right = bytes_payload(b);
-    let mut out = Vec::with_capacity(left.len() + right.len());
-    out.extend_from_slice(left);
-    out.extend_from_slice(right);
-    new_bytes(&out) as CelRef
+    new_bytes_concat(left, right) as CelRef
 }
 
 /// # Safety

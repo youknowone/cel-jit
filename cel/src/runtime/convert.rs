@@ -499,8 +499,15 @@ unsafe fn interned_object_list_ints(leaf: &W_ListObject) -> Option<Vec<i64>> {
         return None;
     }
     let start = leaf.start as usize;
+    // A nested list or map as the first element is the common miss: do not
+    // allocate the int buffer before that is known.
+    let first = unsafe { *base.add(start) };
+    if first.is_null() || unsafe { w_kind(first) } != CelKind::Int {
+        return None;
+    }
     let mut ints = Vec::with_capacity(n);
-    let mut i = 0;
+    ints.push(unsafe { (*first.cast::<W_IntObject>()).intval });
+    let mut i = 1;
     while i < n {
         let item = unsafe { *base.add(start + i) };
         if item.is_null() || unsafe { w_kind(item) } != CelKind::Int {
@@ -864,6 +871,19 @@ mod tests {
         assert_eq!(
             v,
             Value::List(ListRef::whole(Arc::new(ListStorage::Ints(vec![1, 2, 3]))))
+        );
+    }
+
+    #[test]
+    fn nested_object_list_finish_rebuilds_each_inner() {
+        let inner = new_list(&[new_int(15) as CelRef]);
+        let outer = new_list(&[inner as CelRef]);
+        let v = interned_to_public(outer as CelRef);
+        assert_eq!(
+            v,
+            Value::list(vec![Value::List(ListRef::whole(Arc::new(
+                ListStorage::Ints(vec![15])
+            )))])
         );
     }
 
