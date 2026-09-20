@@ -56,9 +56,73 @@ pub enum ConvertError {
 /// already lives in old or immortal memory is returned as it is.
 pub fn promote_eval_result(v: Value) -> Value {
     match v {
-        Value::Interned(w) => Value::from_interned(w).unpack(),
+        Value::Interned(w) => interned_to_public(w),
         other => other,
     }
+}
+
+/// An interned immediate as a public scalar. No allocation.
+#[inline]
+pub(crate) fn interned_immediate(w: CelRef) -> Option<Value> {
+    match unsafe { w_kind(w) } {
+        CelKind::Int => Some(Value::Int(unsafe { (*w.cast::<W_IntObject>()).intval })),
+        CelKind::UInt => Some(Value::UInt(unsafe { (*w.cast::<W_UIntObject>()).uintval })),
+        CelKind::Double => Some(Value::Float(unsafe {
+            (*w.cast::<W_DoubleObject>()).floatval
+        })),
+        CelKind::Bool => Some(Value::Bool(
+            unsafe { (*w.cast::<W_BoolObject>()).boolval } != 0,
+        )),
+        CelKind::Null => Some(Value::Null),
+        _ => None,
+    }
+}
+
+/// An interned container, string or bytes that still has its bind-time
+/// public handle: one Arc clone, no rebuild.
+#[inline]
+pub(crate) fn interned_linked(w: CelRef) -> Option<Value> {
+    unsafe {
+        match w_kind(w) {
+            CelKind::List => {
+                let leaf = &*w.cast::<W_ListObject>();
+                clone_arc(leaf.public as *const ListStorage).map(|storage| {
+                    Value::List(ListRef::from_linked(
+                        storage,
+                        leaf.public_start,
+                        leaf.public_len,
+                    ))
+                })
+            }
+            CelKind::Map => {
+                let leaf = &*w.cast::<W_MapObject>();
+                clone_arc(leaf.public as *const HashMap<Key, Value>)
+                    .map(|entries| Value::Map(Map::object(entries)))
+            }
+            CelKind::Str => {
+                let leaf = &*w.cast::<W_StringObject>();
+                clone_arc(leaf.public as *const String).map(Value::String)
+            }
+            CelKind::Bytes => {
+                let leaf = &*w.cast::<W_BytesObject>();
+                clone_arc(leaf.public as *const Vec<u8>).map(Value::Bytes)
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Public form of `w`. Immediates and linked handles do not allocate;
+/// everything else rebuilds through [`ref_to_value`].
+#[inline]
+pub fn interned_to_public(w: CelRef) -> Value {
+    interned_immediate(w)
+        .or_else(|| interned_linked(w))
+        .unwrap_or_else(|| match unsafe { ref_to_value(w) } {
+            Ok(Value::Interned(_)) => Value::Null,
+            Ok(v) => v,
+            Err(_) => Value::Null,
+        })
 }
 
 /// Intern `v` onto a class-family leaf.
@@ -407,6 +471,7 @@ pub(crate) fn link_public_handle(w: CelRef, value: &Value) {
 
 /// Increment the strong count of the `Arc` behind `ptr` and return a new
 /// handle. `ptr` is `Arc::as_ptr` of a live allocation.
+#[inline]
 unsafe fn clone_arc<T>(ptr: *const T) -> Option<Arc<T>> {
     if ptr.is_null() {
         return None;

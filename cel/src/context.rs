@@ -92,7 +92,7 @@ fn retain_public(ctx: &mut Context, value: Value) {
 /// public link when one exists, so a bound list is `Value::List` again.
 fn public_form(v: Value) -> Value {
     match v {
-        Value::Interned(w) => Value::from_interned(w).unpack(),
+        Value::Interned(w) => crate::runtime::convert::interned_to_public(w),
         other => other,
     }
 }
@@ -247,6 +247,41 @@ impl<'a> Context<'a> {
                         .and_then(leaf_of)
                 })
             }
+        }
+    }
+
+    /// Load a bound identifier for the walker: an interned immediate becomes
+    /// the public scalar without a clone of the interned handle; a container
+    /// stays interned so iteration can read it in place.
+    #[inline]
+    pub(crate) fn load_ident(&self, name: &str) -> Option<Value> {
+        fn from_stored(v: &Value) -> Value {
+            match v {
+                Value::Interned(w) => crate::runtime::convert::interned_immediate(*w)
+                    .unwrap_or(Value::Interned(*w)),
+                other => other.clone(),
+            }
+        }
+        let from_resolver =
+            |resolver: &Option<&'a dyn VariableResolver>| resolver.and_then(|r| r.resolve(name));
+        match self {
+            Context::Child {
+                variables,
+                parent,
+                resolver,
+                ..
+            } => from_resolver(resolver)
+                .map(|v| from_stored(&v))
+                .or_else(|| variables.get(name).map(from_stored))
+                .or_else(|| parent.load_ident(name)),
+            Context::Root {
+                variables,
+                resolver,
+                ..
+            } => from_resolver(resolver)
+                .map(|v| from_stored(&v))
+                .or_else(|| variables.get(name).map(from_stored))
+                .or_else(|| crate::common::types::r#type::type_ident(name)),
         }
     }
 

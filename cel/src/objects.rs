@@ -1175,17 +1175,22 @@ impl Value {
     /// read back is `Null`.
     pub fn unpack(&self) -> Value {
         match self {
-            Value::Interned(w) => self.unpack_interned(*w),
+            Value::Interned(w) => crate::runtime::convert::interned_to_public(*w),
             other => other.clone(),
         }
     }
 
-    fn unpack_interned(&self, w: CelRef) -> Value {
-        match unsafe { crate::runtime::convert::ref_to_value(w) } {
-            Ok(Value::Interned(_)) => Value::Null,
-            Ok(v) => v,
-            Err(_) => Value::Null,
+    /// [`unpack`] taking ownership, so a value that is already public is
+    /// moved rather than cloned.
+    pub(crate) fn into_public(self) -> Value {
+        match self {
+            Value::Interned(w) => crate::runtime::convert::interned_to_public(w),
+            other => other,
         }
+    }
+
+    fn unpack_interned(&self, w: CelRef) -> Value {
+        crate::runtime::convert::interned_to_public(w)
     }
 
     pub fn type_of(&self) -> ValueType {
@@ -1489,6 +1494,66 @@ impl<'a> AccuAppend<'a> {
     }
 }
 
+/// The bool-accumulator shape `all` and `exists` expand to.
+///
+/// `all(x, p)` is `@result && p` with a stop when `@result` is false;
+/// `exists(x, p)` is `@result || p` with a stop when `@result` is true.
+/// The accumulator is a bool the loop already holds, so the step does not
+/// rebind it and the condition does not look it up.
+struct BoolAccu<'a> {
+    /// `true` for `all` (AND, stop on false); `false` for `exists` (OR, stop
+    /// on true).
+    and: bool,
+    pred: &'a Expression,
+}
+
+impl<'a> BoolAccu<'a> {
+    fn of(comprehension: &'a ComprehensionExpr) -> Option<Self> {
+        let accu_var = comprehension.accu_var.as_str();
+        let is_accu = |expr: &Expression| matches!(&expr.expr, Expr::Ident(n) if n == accu_var);
+        if !is_accu(&comprehension.result) {
+            return None;
+        }
+        let Expr::Call(step) = &comprehension.loop_step.expr else {
+            return None;
+        };
+        if step.args.len() != 2 || !is_accu(&step.args[0]) {
+            return None;
+        }
+        let and = if step.func_name == operators::LOGICAL_AND {
+            true
+        } else if step.func_name == operators::LOGICAL_OR {
+            false
+        } else {
+            return None;
+        };
+        let Expr::Call(cond) = &comprehension.loop_cond.expr else {
+            return None;
+        };
+        if cond.func_name != operators::NOT_STRICTLY_FALSE || cond.args.len() != 1 {
+            return None;
+        }
+        let inner = &cond.args[0];
+        if and {
+            if !is_accu(inner) {
+                return None;
+            }
+        } else {
+            match &inner.expr {
+                Expr::Call(not)
+                    if not.func_name == operators::LOGICAL_NOT
+                        && not.args.len() == 1
+                        && is_accu(&not.args[0]) => {}
+                _ => return None,
+            }
+        }
+        Some(BoolAccu {
+            and,
+            pred: &step.args[1],
+        })
+    }
+}
+
 impl Value {
     pub fn resolve_all(expr: &[Expression], ctx: &Context) -> ResolveResult {
         let mut res = Vec::with_capacity(expr.len());
@@ -1721,7 +1786,7 @@ fn resolve_inner(expr: &Expression, ctx: &Context) -> Result<Value, ExecutionErr
             }
         }
         Expr::Ident(name) => ctx
-            .lookup_raw(name)
+            .load_ident(name)
             .ok_or_else(|| ExecutionError::UndeclaredReference(Arc::new(name.to_string()))),
         Expr::Select(select) => {
             let left = resolve_inner(select.operand.deref(), ctx)?;
@@ -1748,11 +1813,11 @@ fn resolve_inner(expr: &Expression, ctx: &Context) -> Result<Value, ExecutionErr
                 if list_expr.optional_indices.contains(&idx) {
                     match optional_view(&value) {
                         OptView::Empty => {}
-                        OptView::Present(inner) => list.push(inner.unpack()),
-                        OptView::Plain => list.push(value.unpack()),
+                        OptView::Present(inner) => list.push(inner.into_public()),
+                        OptView::Plain => list.push(value.into_public()),
                     }
                 } else {
-                    list.push(value.unpack());
+                    list.push(value.into_public());
                 }
             }
             Ok(Value::list(list))
@@ -1771,14 +1836,14 @@ fn resolve_inner(expr: &Expression, ctx: &Context) -> Result<Value, ExecutionErr
                     match optional_view(&value) {
                         OptView::Empty => {}
                         OptView::Present(inner) => {
-                            map.insert(key, inner.unpack());
+                            map.insert(key, inner.into_public());
                         }
                         OptView::Plain => {
-                            map.insert(key, value.unpack());
+                            map.insert(key, value.into_public());
                         }
                     }
                 } else {
-                    map.insert(key, value.unpack());
+                    map.insert(key, value.into_public());
                 }
             }
             Ok(Value::Map(Map::object(Arc::new(map))))
@@ -1788,6 +1853,22 @@ fn resolve_inner(expr: &Expression, ctx: &Context) -> Result<Value, ExecutionErr
             let iter = resolve_inner(&comprehension.iter_range, ctx)?;
             let mut ctx = ctx.new_inner_scope();
             let mut items = iter_items(&iter)?;
+
+            if let Some(bool_accu) = BoolAccu::of(comprehension) {
+                let mut accu = interned_as_bool(&accu_init).ok_or(NoSuchOverload)?;
+                while let Some(item) = items.next() {
+                    if bool_accu.and {
+                        if !accu {
+                            break;
+                        }
+                    } else if accu {
+                        break;
+                    }
+                    ctx.rebind(&comprehension.iter_var, item);
+                    accu = try_bool_value(resolve_inner(bool_accu.pred, &ctx))?;
+                }
+                return Ok(Value::Bool(accu));
+            }
 
             if let Some(append) = AccuAppend::of(comprehension) {
                 if let Value::List(list) = accu_init {

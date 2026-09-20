@@ -299,41 +299,57 @@ impl CelHeap {
         self.depth.get() > 0 && self.force_old.get() == 0
     }
 
+    #[inline]
     fn enter(&self) -> bool {
         let d = self.depth.get();
         if d == 0 {
-            self.snap_len.set(self.nursery.n_segs.get());
-            self.snap_used.set(self.nursery.open_used.get());
-            self.snap_bytes.set(self.nursery.bytes.get());
-            self.snap_objects.set(self.nursery.objects.get());
-            self.snap_hosts.set(self.young_host_n.get());
+            self.install_snap(NurserySnap::read(self));
         }
         self.depth.set(d + 1);
         d == 0
     }
 
+    #[inline]
     fn leave(&self, outermost: bool) {
+        self.leave_with(
+            outermost,
+            NurserySnap {
+                used: self.snap_used.get(),
+                len: self.snap_len.get(),
+                hosts: self.snap_hosts.get(),
+            },
+        );
+    }
+
+    #[inline]
+    fn leave_with(&self, outermost: bool, snap: NurserySnap) {
         let d = self.depth.get();
         self.depth.set(d.saturating_sub(1));
+        if !outermost {
+            return;
+        }
+        if self.nursery.open_used.get() == snap.used && self.young_host_n.get() == snap.hosts {
+            return;
+        }
+        self.install_snap(snap);
         let live = self.nursery.bytes.get();
         if live > self.nursery_high_water.get() {
             self.nursery_high_water.set(live);
         }
-        if !outermost {
-            return;
-        }
-        if self.nursery.bytes.get() == self.snap_bytes.get()
-            && self.young_host_n.get() == self.snap_hosts.get()
-        {
-            return;
-        }
-        if self.nursery.n_segs.get() == self.snap_len.get()
-            && self.young_host_n.get() == self.snap_hosts.get()
-        {
+        if self.nursery.n_segs.get() == snap.len && self.young_host_n.get() == snap.hosts {
             self.rewind_nursery();
         } else {
             self.reset_nursery();
         }
+    }
+
+    #[inline]
+    fn install_snap(&self, snap: NurserySnap) {
+        self.snap_used.set(snap.used);
+        self.snap_len.set(snap.len);
+        self.snap_hosts.set(snap.hosts);
+        self.snap_bytes.set(0);
+        self.snap_objects.set(0);
     }
 
     /// Rewind the open bump. Same segment count, no young hosts.
@@ -529,9 +545,27 @@ thread_local! {
     /// them to take exactly one argument — the finished value. A heap
     /// parameter would be a second one.
     static HEAP: CelHeap = CelHeap::new();
+    /// Cached pointer at [`HEAP`]. Const-initialised so a load is native TLS
+    /// plus a null check, not the lazy-init state machine [`HEAP`] uses.
+    static HEAP_PTR: Cell<*const CelHeap> = const { Cell::new(core::ptr::null()) };
     /// Nested [`with_old_space`] depth. A `Cell` of its own so a load during
     /// intern does not go through [`HEAP`].
     static FORCE_OLD: Cell<u32> = const { Cell::new(0) };
+}
+
+/// This thread's heap, resolved once.
+#[inline]
+fn heap_ptr() -> *const CelHeap {
+    HEAP_PTR.with(|p| {
+        let cached = p.get();
+        if cached.is_null() {
+            let h = HEAP.with(|heap| heap as *const CelHeap);
+            p.set(h);
+            h
+        } else {
+            cached
+        }
+    })
 }
 
 /// Run `f` against this thread's heap.
@@ -540,14 +574,44 @@ pub fn with_heap<R>(f: impl FnOnce(&CelHeap) -> R) -> R {
     HEAP.with(f)
 }
 
+/// Nursery bump captured at outermost entry. Leave compares [`Self::used`]
+/// with the live bump; a match means this evaluation allocated nothing young.
+/// `len` / `bytes` / `objects` are filled on the moved path from this
+/// snapshot plus zeros: an outermost enter always sees a rewound nursery.
+#[derive(Clone, Copy)]
+struct NurserySnap {
+    used: usize,
+    len: usize,
+    hosts: usize,
+}
+
+impl NurserySnap {
+    const ZERO: NurserySnap = NurserySnap {
+        used: 0,
+        len: 0,
+        hosts: 0,
+    };
+
+    #[inline]
+    fn read(heap: &CelHeap) -> NurserySnap {
+        NurserySnap {
+            used: heap.nursery.open_used.get(),
+            len: heap.nursery.n_segs.get(),
+            hosts: heap.young_host_n.get(),
+        }
+    }
+}
+
 /// Guard for one evaluation. Reset runs in [`Drop`], including on panic.
 ///
 /// The heap pointer is resolved once at entry. Depth and the nursery bump
 /// live in [`Cell`]s on that heap, so leaving does not touch thread-local
-/// storage again.
+/// storage again. The bump at entry sits on this guard so an evaluation
+/// that never allocates young compares one word and returns.
 pub struct EvalScope {
     heap: *const CelHeap,
     outermost: bool,
+    snap: NurserySnap,
 }
 
 impl EvalScope {
@@ -565,6 +629,7 @@ impl EvalScope {
     /// The public form of `v`. An interned leaf unpacks; a value that is
     /// already public is returned as it is. Nested and outermost both unpack,
     /// so a host re-entry never observes `Value::Interned`.
+    #[inline]
     pub fn finish(self, v: crate::Value) -> crate::Value {
         to_public(v)
     }
@@ -572,26 +637,34 @@ impl EvalScope {
 
 impl Drop for EvalScope {
     fn drop(&mut self) {
-        unsafe { (*self.heap).leave(self.outermost) };
+        unsafe { (*self.heap).leave_with(self.outermost, self.snap) };
     }
 }
 
 /// Open an evaluation scope on this thread. Nested calls increment depth;
 /// only the outermost reset reclaims the nursery.
+#[inline]
 pub fn enter_eval() -> EvalScope {
-    HEAP.with(|h| EvalScope {
-        heap: h as *const CelHeap,
-        outermost: h.enter(),
-    })
+    let heap = unsafe { &*heap_ptr() };
+    let d = heap.depth.get();
+    let outermost = d == 0;
+    let snap = if outermost {
+        NurserySnap::read(heap)
+    } else {
+        NurserySnap::ZERO
+    };
+    heap.depth.set(d + 1);
+    EvalScope {
+        heap,
+        outermost,
+        snap,
+    }
 }
 
+#[inline]
 fn to_public(v: crate::Value) -> crate::Value {
     match v {
-        crate::Value::Interned(w) => match unsafe { crate::runtime::convert::ref_to_value(w) } {
-            Ok(crate::Value::Interned(_)) => crate::Value::Null,
-            Ok(public) => public,
-            Err(_) => crate::Value::Null,
-        },
+        crate::Value::Interned(w) => crate::runtime::convert::interned_to_public(w),
         other => other,
     }
 }
@@ -618,12 +691,12 @@ pub fn is_forcing_old() -> bool {
 
 /// Whether `ptr` is live nursery memory on this thread.
 pub fn is_young(ptr: *const u8) -> bool {
-    HEAP.with(|h| h.is_young(ptr))
+    unsafe { (*heap_ptr()).is_young(ptr) }
 }
 
 /// Nesting depth of [`enter_eval`] on this thread.
 pub fn eval_depth() -> u32 {
-    HEAP.with(|h| h.depth.get())
+    unsafe { (*heap_ptr()).depth.get() }
 }
 
 /// Bytes preceding an immortal payload. The backend reads
@@ -859,5 +932,19 @@ mod tests {
         heap.leave(true);
         assert!(!heap.contains(a as *const u8));
         assert!(!heap.contains(b as *const u8));
+    }
+
+    /// An evaluation that never bumps young memory does not reset: leave
+    /// compares the saved bump and returns.
+    #[test]
+    fn no_young_allocation_skips_reset() {
+        let heap = CelHeap::new();
+        let old = heap.alloc(1u64);
+        let bytes = heap.allocated_bytes();
+        assert!(heap.enter());
+        heap.leave(true);
+        assert_eq!(heap.allocated_bytes(), bytes);
+        assert!(heap.contains(old as *const u8));
+        unsafe { assert_eq!(*old, 1) };
     }
 }
