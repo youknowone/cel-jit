@@ -906,6 +906,17 @@ impl<'a> BatchRun<'a> {
         self.words[self.trap_at] != 0
     }
 
+    /// This program's compiled-loop status on this thread's persistent driver
+    /// at `threshold` — the shape [`float_bank::run_jit_persistent_f`] keys on.
+    pub fn persistent_loop_status(&self, threshold: u32) -> float_bank::PersistentLoopStatus {
+        float_bank::persistent_loop_status(
+            &self.code,
+            self.bank_end - self.trap_at - 1,
+            self.num_float_regs,
+            threshold,
+        )
+    }
+
     /// Run the prepared batch with `run`, which selects the tier. `None` means a
     /// row trapped (`int` overflow, division by zero), where the tree-walker
     /// raises and no sum is the right answer.
@@ -1621,6 +1632,15 @@ pub fn eval_batch_sum_float(
 pub mod float_bank {
     use super::{Code, CodeCheck};
     use majit_metainterp::embed::Census;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// Compiled-code entries through this crate's persistent drivers.
+    ///
+    /// Those drivers occupy `on_compiled_entry` with a per-driver tally, so the
+    /// process-global Census hook on that slot does not see them. [`jit_stats`]
+    /// folds this in so a diagnostic still counts every persistent entry.
+    static BATCH_COMPILED_ENTRIES: AtomicUsize = AtomicUsize::new(0);
 
     /// The tier's counters are [`Census`]'s, not this module's.
     ///
@@ -4053,6 +4073,11 @@ pub mod float_bank {
     /// where upstream would hold one per cell.
     struct PooledDriver {
         driver: majit_metainterp::JitDriver<VmStateF>,
+        /// Entries into compiled code on this driver. Occupies the driver's
+        /// compiled-entry hook (one slot) and also bumps
+        /// [`BATCH_COMPILED_ENTRIES`], which [`jit_stats`] folds into the
+        /// process-global census so that diagnostic still counts these entries.
+        compiled_entries: Arc<AtomicUsize>,
         /// In first-sighting order, so a caller that has already resolved one
         /// reaches it by index. Appended to and never reordered or removed:
         /// the whole driver is flushed at once ([`MAX_PROGRAMS_PER_DRIVER`]),
@@ -4110,8 +4135,16 @@ pub mod float_bank {
 
     impl PooledDriver {
         fn new(threshold: u32, num_regs: usize, num_fregs: usize) -> Self {
+            let mut driver = new_driver_f(threshold, num_regs, num_fregs);
+            let compiled_entries = Arc::new(AtomicUsize::new(0));
+            let bump = Arc::clone(&compiled_entries);
+            driver.set_on_compiled_entry(move |_green_key, _target_pc| {
+                bump.fetch_add(1, Ordering::Relaxed);
+                BATCH_COMPILED_ENTRIES.fetch_add(1, Ordering::Relaxed);
+            });
             PooledDriver {
-                driver: new_driver_f(threshold, num_regs, num_fregs),
+                driver,
+                compiled_entries,
                 programs: Vec::new(),
                 by_addr: std::collections::HashMap::new(),
                 state: VmStateF {
@@ -4451,6 +4484,73 @@ pub mod float_bank {
     #[cfg(feature = "__entry-stage-probe")]
     pub fn reset_entry_stage_sub_passes() {
         ENTRY_STAGE_SUB_PASSES.with(|slot| slot.set([0; 5]));
+    }
+
+    /// Whether this program has a runnable compiled loop on this thread's
+    /// persistent driver, and how many times that driver has entered compiled
+    /// code.
+    ///
+    /// `runnable` is the cell-owned procedure token on this program's entry or
+    /// loop-header green key, plus frontend meta — the same question the yield
+    /// probe asks. `compiled_entries` is this driver's compiled-entry tally,
+    /// not the process-global census.
+    #[derive(Clone, Copy, Debug)]
+    pub struct PersistentLoopStatus {
+        pub runnable: bool,
+        pub compiled_entries: usize,
+    }
+
+    /// [`PersistentLoopStatus`] for `program` on this thread's driver of shape
+    /// `(num_regs, num_fregs, threshold)`.
+    ///
+    /// An empty pool, a checked-out driver, or a program this driver has not
+    /// interned answers `runnable: false`. `compiled_entries` is still the
+    /// driver's tally when the driver is in the pool.
+    pub fn persistent_loop_status(
+        program: &std::sync::Arc<Code>,
+        num_regs: usize,
+        num_fregs: usize,
+        threshold: u32,
+    ) -> PersistentLoopStatus {
+        let key = (num_regs, num_fregs, threshold);
+        let addr = program.as_ptr() as usize;
+        DRIVERS.with(|cell| {
+            let pool = cell.borrow();
+            let Some(entry) = pool.entries.iter().find(|e| e.key == key) else {
+                return PersistentLoopStatus {
+                    runnable: false,
+                    compiled_entries: 0,
+                };
+            };
+            let Some(pooled) = entry.driver.as_ref() else {
+                return PersistentLoopStatus {
+                    runnable: false,
+                    compiled_entries: 0,
+                };
+            };
+            let compiled_entries = pooled.compiled_entries.load(Ordering::Relaxed);
+            let Some(&index) = pooled.by_addr.get(&addr) else {
+                return PersistentLoopStatus {
+                    runnable: false,
+                    compiled_entries,
+                };
+            };
+            let pooled_program = &pooled.programs[index];
+            let driver = &pooled.driver;
+            let runnable = pooled_program
+                .entry_key
+                .resolve_runnable(driver)
+                .1
+                .is_some()
+                || pooled_program
+                    .loop_keys
+                    .iter()
+                    .any(|k| k.resolve_runnable(driver).1.is_some());
+            PersistentLoopStatus {
+                runnable,
+                compiled_entries,
+            }
+        })
     }
 
     /// [`run_jit_seeded_f`] on a driver that outlives the call, so a program
@@ -4837,7 +4937,11 @@ pub mod float_bank {
     /// window's whole life and is not reentrant, so it cannot be what a
     /// free-standing `jit_stats()` call opens.
     pub fn jit_stats() -> JitStats {
-        Census::totals()
+        let mut stats = Census::totals();
+        stats.compiled_entries = stats
+            .compiled_entries
+            .saturating_add(BATCH_COMPILED_ENTRIES.load(Ordering::Relaxed));
+        stats
     }
 
     /// Zero every counter, opening a fresh measurement window.
@@ -4849,6 +4953,7 @@ pub mod float_bank {
     /// return two different windows in one struct.
     pub fn reset_jit_stats() {
         Census::reset();
+        BATCH_COMPILED_ENTRIES.store(0, Ordering::Relaxed);
     }
 
     /// Snapshot majit's abort-reason tallies as `(label, count)` pairs.

@@ -1372,6 +1372,13 @@ impl BoundBatch<'_, '_> {
         })
     }
 
+    /// This program's compiled-loop status on this thread's persistent driver.
+    fn compiled_loop(&self) -> float_bank::PersistentLoopStatus {
+        self.run
+            .borrow()
+            .persistent_loop_status(DEFAULT_JIT_THRESHOLD)
+    }
+
     /// Trace this batch on [`Tier::Jit`] until a compiled loop is entered, then
     /// return. Subsequent [`Tier::Jit`] runs of this program reuse that loop —
     /// the compile is paid here, not on the first production call.
@@ -1388,13 +1395,17 @@ impl BoundBatch<'_, '_> {
     /// [`Tier::Auto`] still routes by cost after this returns: a one-row
     /// straight-line batch stays on [`Tier::Clean`] unless the caller names
     /// [`Tier::Jit`].
+    ///
+    /// The wait is this program on this thread's driver: a runnable procedure
+    /// token on the entry or loop-header cell, and a compiled-code entry on
+    /// that driver during the run that just finished.
     pub fn eager_compile(&self) -> Result<(), BatchError> {
-        use super::bytecode::float_bank::jit_stats;
-        let before = jit_stats().compiled_entries;
         for _ in 0..EAGER_COMPILE_ATTEMPTS {
+            let before = self.compiled_loop();
             self.execute(Tier::Jit, DEFAULT_JIT_THRESHOLD)
                 .ok_or(BatchError::Trapped)?;
-            if jit_stats().compiled_entries > before {
+            let after = self.compiled_loop();
+            if after.runnable && after.compiled_entries > before.compiled_entries {
                 return Ok(());
             }
         }
@@ -4683,21 +4694,21 @@ mod tests {
     /// a later [`Tier::Jit`] run stays on that loop and matches [`Tier::Clean`].
     #[test]
     fn eager_compile_waits_until_the_loop_is_entered() {
-        use crate::majit::bytecode::float_bank::{
-            jit_stats, reset_jit_stats, reset_persistent_state,
-        };
-        let _serial = serial();
+        use crate::majit::bytecode::float_bank::reset_persistent_state;
         reset_persistent_state();
-        reset_jit_stats();
         let s = schema(&[("x", ValType::Int)]);
         let program = BatchProgram::compile("x * 2 + 1", &s).unwrap();
         let one = vec![7i64];
         let batch = Batch::new(1).column("x", ColumnRef::Int(&one));
         let bound = program.bind_per_row(&batch).unwrap();
         bound.eager_compile().expect("1-row x*2+1 compiles");
-        let after = jit_stats().compiled_entries;
+        let after = bound.compiled_loop();
         assert!(
-            after > 0,
+            after.runnable,
+            "eager_compile returned without a compiled loop for this program"
+        );
+        assert!(
+            after.compiled_entries > 0,
             "eager_compile returned without entering compiled code"
         );
         let jit = bound.collect_on(Tier::Jit).unwrap();
@@ -4705,9 +4716,45 @@ mod tests {
         assert_eq!(jit, clean);
         assert_eq!(jit, vec![Value::Int(15)]);
         assert!(
-            jit_stats().compiled_entries > after,
+            bound.compiled_loop().compiled_entries > after.compiled_entries,
             "the warmed loop is entered again on the next Jit run"
         );
+    }
+
+    /// Two threads each compile a different program; neither returns until its
+    /// own loop is compiled, even if the other thread enters compiled code first.
+    #[test]
+    fn eager_compile_on_two_threads_compiles_each_program() {
+        use std::sync::{Arc, Barrier};
+        let barrier = Arc::new(Barrier::new(2));
+        let spawn = |src: &'static str, x: i64, barrier: Arc<Barrier>| {
+            std::thread::spawn(move || {
+                let s = schema(&[("x", ValType::Int)]);
+                let program = BatchProgram::compile(src, &s).unwrap();
+                let one = vec![x];
+                let batch = Batch::new(1).column("x", ColumnRef::Int(&one));
+                let bound = program.bind_per_row(&batch).unwrap();
+                barrier.wait();
+                bound.eager_compile().expect(src);
+                let status = bound.compiled_loop();
+                assert!(
+                    status.runnable,
+                    "{src}: eager_compile returned without this program's loop"
+                );
+                assert!(
+                    status.compiled_entries > 0,
+                    "{src}: eager_compile returned without entering compiled code"
+                );
+                match bound.collect_on(Tier::Jit).unwrap().as_slice() {
+                    [Value::Int(v)] => *v,
+                    other => panic!("{src}: expected one Int, got {other:?}"),
+                }
+            })
+        };
+        let a = spawn("x * 2 + 1", 7, Arc::clone(&barrier));
+        let b = spawn("x * 3 + 2", 5, barrier);
+        assert_eq!(a.join().unwrap(), 15);
+        assert_eq!(b.join().unwrap(), 17);
     }
 
     /// A column the expression reads and the batch does not carry is the
