@@ -250,16 +250,31 @@ impl<'a> Context<'a> {
         }
     }
 
-    /// Load a bound identifier for the walker: an interned immediate becomes
-    /// the public scalar without a clone of the interned handle; a container
-    /// stays interned so iteration can read it in place.
+    /// Load a bound identifier for the walker.
+    ///
+    /// A root interned immediate is handed as the public scalar, which is
+    /// the form an evaluation result wants. A child binding is handed as
+    /// stored: an interned element stays interned so interned arithmetic
+    /// does not unpack it, and an unboxed scalar is copied as that scalar
+    /// without going through [`Clone`] on the whole enum.
     #[inline]
     pub(crate) fn load_ident(&self, name: &str) -> Option<Value> {
-        fn from_stored(v: &Value) -> Value {
+        fn copy_leaf(v: &Value) -> Value {
+            match v {
+                Value::Int(i) => Value::Int(*i),
+                Value::UInt(u) => Value::UInt(*u),
+                Value::Float(f) => Value::Float(*f),
+                Value::Bool(b) => Value::Bool(*b),
+                Value::Null => Value::Null,
+                Value::Interned(w) => Value::Interned(*w),
+                other => other.clone(),
+            }
+        }
+        fn from_root(v: &Value) -> Value {
             match v {
                 Value::Interned(w) => crate::runtime::convert::interned_immediate(*w)
                     .unwrap_or(Value::Interned(*w)),
-                other => other.clone(),
+                other => copy_leaf(other),
             }
         }
         let from_resolver =
@@ -271,16 +286,15 @@ impl<'a> Context<'a> {
                 resolver,
                 ..
             } => from_resolver(resolver)
-                .map(|v| from_stored(&v))
-                .or_else(|| variables.get(name).map(from_stored))
+                .or_else(|| variables.get(name).map(copy_leaf))
                 .or_else(|| parent.load_ident(name)),
             Context::Root {
                 variables,
                 resolver,
                 ..
             } => from_resolver(resolver)
-                .map(|v| from_stored(&v))
-                .or_else(|| variables.get(name).map(from_stored))
+                .map(|v| from_root(&v))
+                .or_else(|| variables.get(name).map(from_root))
                 .or_else(|| crate::common::types::r#type::type_ident(name)),
         }
     }

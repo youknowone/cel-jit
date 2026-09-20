@@ -1451,6 +1451,7 @@ struct AccuAppend<'a> {
 }
 
 impl<'a> AccuAppend<'a> {
+    #[inline(never)]
     fn of(comprehension: &'a ComprehensionExpr) -> Option<Self> {
         // The accumulator is held outside the context on this path, so nothing
         // evaluated per iteration may read it. The loop condition is the one
@@ -1508,6 +1509,7 @@ struct BoolAccu<'a> {
 }
 
 impl<'a> BoolAccu<'a> {
+    #[inline(never)]
     fn of(comprehension: &'a ComprehensionExpr) -> Option<Self> {
         let accu_var = comprehension.accu_var.as_str();
         let is_accu = |expr: &Expression| matches!(&expr.expr, Expr::Ident(n) if n == accu_var);
@@ -1552,6 +1554,31 @@ impl<'a> BoolAccu<'a> {
             pred: &step.args[1],
         })
     }
+}
+
+/// `all` / `exists` bool-accumulator loop, kept out of [`resolve_inner`]
+/// so it does not sit on the map/filter path.
+#[inline(never)]
+fn eval_bool_accu(
+    bool_accu: BoolAccu<'_>,
+    accu_init: &Value,
+    items: &mut IterItems,
+    ctx: &mut Context,
+    iter_var: &str,
+) -> Result<Value, ExecutionError> {
+    let mut accu = interned_as_bool(accu_init).ok_or(NoSuchOverload)?;
+    while let Some(item) = items.next() {
+        if bool_accu.and {
+            if !accu {
+                break;
+            }
+        } else if accu {
+            break;
+        }
+        ctx.rebind(iter_var, item);
+        accu = try_bool_value(resolve_inner(bool_accu.pred, ctx))?;
+    }
+    Ok(Value::Bool(accu))
 }
 
 impl Value {
@@ -1854,22 +1881,9 @@ fn resolve_inner(expr: &Expression, ctx: &Context) -> Result<Value, ExecutionErr
             let mut ctx = ctx.new_inner_scope();
             let mut items = iter_items(&iter)?;
 
-            if let Some(bool_accu) = BoolAccu::of(comprehension) {
-                let mut accu = interned_as_bool(&accu_init).ok_or(NoSuchOverload)?;
-                while let Some(item) = items.next() {
-                    if bool_accu.and {
-                        if !accu {
-                            break;
-                        }
-                    } else if accu {
-                        break;
-                    }
-                    ctx.rebind(&comprehension.iter_var, item);
-                    accu = try_bool_value(resolve_inner(bool_accu.pred, &ctx))?;
-                }
-                return Ok(Value::Bool(accu));
-            }
-
+            // Map/filter before `all`/`exists`: AccuAppend::of declines
+            // `all` on the loop condition, so the map loop stays in this
+            // function the way it did before BoolAccu existed.
             if let Some(append) = AccuAppend::of(comprehension) {
                 if let Value::List(list) = accu_init {
                     // The accumulator stays here rather than in the
@@ -1894,6 +1908,16 @@ fn resolve_inner(expr: &Expression, ctx: &Context) -> Result<Value, ExecutionErr
                     return resolve_inner(&comprehension.result, &ctx);
                 }
                 unreachable!("AccuAppend::of implies a list accumulator");
+            }
+
+            if let Some(bool_accu) = BoolAccu::of(comprehension) {
+                return eval_bool_accu(
+                    bool_accu,
+                    &accu_init,
+                    &mut items,
+                    &mut ctx,
+                    &comprehension.iter_var,
+                );
             }
 
             ctx.rebind(&comprehension.accu_var, accu_init);
