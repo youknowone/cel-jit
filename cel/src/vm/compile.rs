@@ -118,6 +118,8 @@ impl Decided {
 struct Compiler {
     insns: Vec<Insn>,
     consts: Vec<Value>,
+    const_pool: crate::runtime::const_pool::ConstPool,
+    const_leaves: Vec<crate::runtime::object::CelRef>,
     names: Vec<Box<str>>,
     name_index: HashMap<Box<str>, u32>,
     /// Innermost last. Each scope maps a comprehension variable to its slot.
@@ -142,6 +144,10 @@ impl Compiler {
         Ok(CelCode {
             insns: self.insns,
             consts: self.consts,
+            interned: crate::runtime::const_pool::InternedConsts::from_pool(
+                self.const_pool,
+                self.const_leaves,
+            ),
             names: self.names,
             n_slots: self.n_slots,
             max_stack: u32::try_from(self.max_stack).unwrap_or(u32::MAX),
@@ -223,7 +229,14 @@ impl Compiler {
             kind: CompileErrorKind::TooLarge("constant pool"),
             id,
         })?;
+        // Wrapped into this code object's pool, not the compiling thread's
+        // heap. Immutable after compile; freed only when the pool drops.
+        let leaf = self.const_pool.intern(&value);
+        if !leaf.is_null() {
+            crate::runtime::convert::link_public_handle(leaf, &value);
+        }
         self.consts.push(value);
+        self.const_leaves.push(leaf);
         Ok(index)
     }
 

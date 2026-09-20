@@ -2078,8 +2078,14 @@ impl<'a> Vm<'a> {
         match op {
             // -- loads --------------------------------------------------
             OpCode::LoadConst => {
-                let value = self.code.konst(a).ok_or(CelErr::InternalError)?.clone();
-                self.push(value);
+                if let Some(w) = self.code.const_leaf(a) {
+                    #[cfg(debug_assertions)]
+                    crate::runtime::heap::assert_frame_cell(w);
+                    self.push_operand(Operand::Interned(w));
+                } else {
+                    let value = self.code.konst(a).ok_or(CelErr::InternalError)?.clone();
+                    self.push(value);
+                }
             }
             OpCode::LoadVar => {
                 let name = self.name(a)?;

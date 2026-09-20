@@ -1056,12 +1056,39 @@ pub fn eval_depth() -> u32 {
 /// would put that load in rodata or unmapped memory.
 pub const IMMORTAL_HEADER_SIZE: usize = core::mem::size_of::<usize>();
 
-/// Non-zero so a header-relative load is not a null-page read.
-const IMMORTAL_MARK: usize = 0xC3_11_07_7A;
+
 
 /// Payloads handed out by [`alloc_immortal`]. The tripwire that a
 /// prebuilt is not a Rust `static` asserts against this list.
 static IMMORTAL_PAYLOADS: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+
+/// Live constant-pool spans owned by [`super::const_pool::ConstPool`].
+/// `(payload, payload+len)` so [`is_immortal`] treats them like prebuilts
+/// until the pool drops.
+static CONST_SPANS: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
+
+pub(crate) const IMMORTAL_MARK: usize = 0xC3_11_07_7A;
+
+/// Register a constant-pool payload so [`is_immortal`] accepts it.
+pub(crate) fn register_const_span(payload: *mut u8, len: usize) {
+    if payload.is_null() || len == 0 {
+        return;
+    }
+    let start = payload as usize;
+    CONST_SPANS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .push((start, start.saturating_add(len)));
+}
+
+/// Forget a constant-pool payload; the caller then frees the block.
+pub(crate) fn unregister_const_span(payload: *mut u8) {
+    let start = payload as usize;
+    CONST_SPANS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .retain(|(s, _)| *s != start);
+}
 
 /// Allocate `value` for process lifetime, with a header word in front
 /// of the payload.
@@ -1109,13 +1136,26 @@ pub fn assert_frame_cell(w: crate::runtime::object::CelRef) {
     );
 }
 
-/// Whether `ptr` is a payload [`alloc_immortal`] handed out.
+/// Whether `ptr` is a payload [`alloc_immortal`] handed out, or a live
+/// constant-pool leaf owned by a [`super::const_pool::ConstPool`].
 pub fn is_immortal(ptr: *const u8) -> bool {
+    if ptr.is_null() {
+        return false;
+    }
+    let p = ptr as usize;
+    if CONST_SPANS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .any(|&(s, e)| p >= s && p < e)
+    {
+        return true;
+    }
     IMMORTAL_PAYLOADS
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .iter()
-        .any(|&p| p == ptr as usize)
+        .any(|&q| q == p)
 }
 
 /// The header word immediately before an immortal payload.

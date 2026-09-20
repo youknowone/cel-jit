@@ -139,6 +139,10 @@ pub struct CelCode {
     pub insns: Vec<Insn>,
     /// Literal values, indexed by a `LoadConst` operand.
     pub consts: Vec<Value>,
+    /// Interned form of [`Self::consts`], wrapped once at compile into a
+    /// pool this code object owns. `LoadConst` pushes those pointers.
+    /// The public `Value` in `consts` keeps any Arc alive.
+    pub(crate) interned: crate::runtime::const_pool::InternedConsts,
     /// Identifiers, field names and function names, indexed by [`NameId`].
     pub names: Vec<Box<str>>,
     /// Size of the activation record -- the high-water mark of the compiler's
@@ -188,6 +192,16 @@ impl CelCode {
     /// The literal behind a `LoadConst` operand.
     pub fn konst(&self, index: u32) -> Option<&Value> {
         self.consts.get(index as usize)
+    }
+
+    /// The interned leaf for a `LoadConst` operand, if compile wrapped one.
+    #[inline]
+    pub(crate) fn const_leaf(&self, index: u32) -> Option<crate::runtime::object::CelRef> {
+        self.interned
+            .leaves
+            .get(index as usize)
+            .copied()
+            .filter(|w| !w.is_null())
     }
 
     /// Walk the whole program, yielding `(pc, opcode, operands)`.

@@ -44,6 +44,7 @@
 //! cel objects and no walker able to see both.
 
 pub mod binop;
+pub mod const_pool;
 pub mod convert;
 pub mod error;
 pub mod heap;

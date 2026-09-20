@@ -1,4 +1,6 @@
-use crate::common::ast::{operators, CallExpr, ComprehensionExpr, EntryExpr, Expr, LiteralValue};
+use crate::common::ast::{
+    operators, CallExpr, ComprehensionExpr, EntryExpr, Expr, ListExpr, LiteralValue,
+};
 #[cfg(feature = "structs")]
 use crate::common::types::CelStruct;
 use crate::context::Context;
@@ -1608,6 +1610,52 @@ impl Value {
     }
 }
 
+/// A list literal. All-int *literals* close as [`ListStorage::Ints`] from
+/// the AST; any other element list starts in object storage sized to `n`.
+/// Optional indices keep the public-element loop.
+#[inline(never)]
+fn eval_list_literal(list_expr: &ListExpr, ctx: &Context) -> Result<Value, ExecutionError> {
+    if !list_expr.optional_indices.is_empty() {
+        let mut list = Vec::with_capacity(list_expr.elements.len());
+        for (idx, element) in list_expr.elements.iter().enumerate() {
+            let value = resolve_inner(element, ctx)?;
+            if list_expr.optional_indices.contains(&idx) {
+                match optional_view(&value) {
+                    OptView::Empty => {}
+                    OptView::Present(inner) => list.push(inner.into_public()),
+                    OptView::Plain => list.push(value.into_public()),
+                }
+            } else {
+                list.push(value.into_public());
+            }
+        }
+        return Ok(Value::list(list));
+    }
+    let n = list_expr.elements.len();
+    if n == 0 {
+        return Ok(Value::list(Vec::<Value>::new()));
+    }
+    if list_expr
+        .elements
+        .iter()
+        .all(|e| matches!(&e.expr, Expr::Literal(LiteralValue::Int(_))))
+    {
+        let mut ints = Vec::with_capacity(n);
+        for element in &list_expr.elements {
+            let Expr::Literal(LiteralValue::Int(v)) = &element.expr else {
+                unreachable!()
+            };
+            ints.push(*v);
+        }
+        return Ok(Value::list(ListStorage::Ints(ints)));
+    }
+    let mut list = Vec::with_capacity(n);
+    for element in &list_expr.elements {
+        list.push(resolve_inner(element, ctx)?.into_public());
+    }
+    Ok(Value::list(list))
+}
+
 fn resolve_inner(expr: &Expression, ctx: &Context) -> Result<Value, ExecutionError> {
     match &expr.expr {
         Expr::Literal(literal) => Ok(literal.to_value()),
@@ -1836,22 +1884,7 @@ fn resolve_inner(expr: &Expression, ctx: &Context) -> Result<Value, ExecutionErr
                 value_field(&left, field)
             }
         }
-        Expr::List(list_expr) => {
-            let mut list = Vec::with_capacity(list_expr.elements.len());
-            for (idx, element) in list_expr.elements.iter().enumerate() {
-                let value = resolve_inner(element, ctx)?;
-                if list_expr.optional_indices.contains(&idx) {
-                    match optional_view(&value) {
-                        OptView::Empty => {}
-                        OptView::Present(inner) => list.push(inner.into_public()),
-                        OptView::Plain => list.push(value.into_public()),
-                    }
-                } else {
-                    list.push(value.into_public());
-                }
-            }
-            Ok(Value::list(list))
-        }
+        Expr::List(list_expr) => eval_list_literal(list_expr, ctx),
         Expr::Map(map_expr) => {
             let mut map = HashMap::with_capacity(map_expr.entries.len());
             for entry in map_expr.entries.iter() {

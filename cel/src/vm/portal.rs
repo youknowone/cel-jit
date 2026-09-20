@@ -426,6 +426,9 @@ fn try_map_insert(map: i64, key: i64, value: i64) -> i64 {
 }
 
 fn intern_const(program: &CelCode, idx: i64) -> i64 {
+    if let Some(w) = program.const_leaf(idx as u32) {
+        return w as usize as i64;
+    }
     let Some(value) = program.konst(idx as u32) else {
         return 0;
     };

@@ -542,8 +542,11 @@ unsafe fn list_from_ref(w: CelRef) -> Result<ListRef, ConvertError> {
             let col = &*leaf.storage.cast::<W_IntColumn>();
             let start = leaf.start as usize;
             let n = leaf.length as usize;
-            if col.data.is_null() && n != 0 {
-                return Err(ConvertError::Corrupt("list"));
+            if n == 0 || col.data.is_null() {
+                if n != 0 {
+                    return Err(ConvertError::Corrupt("list"));
+                }
+                return Ok(ListRef::whole(Arc::new(ListStorage::Ints(Vec::new()))));
             }
             let ints = unsafe { std::slice::from_raw_parts(col.data.add(start), n) };
             Ok(ListRef::whole(Arc::new(ListStorage::Ints(ints.to_vec()))))

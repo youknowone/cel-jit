@@ -157,6 +157,39 @@ fn eight_live_contexts_then_drop_leave_old_space_flat() {
     );
 }
 
+/// Compiling programs whose constants are strings and doubles must not grow
+/// this thread's old space: those leaves belong to the code object, not the
+/// compiling thread's heap.
+#[test]
+fn compiling_string_and_double_consts_leave_old_space_flat() {
+    const WARM: u32 = 200;
+    const ROUNDS: u32 = 4_000;
+    fn compile_one(i: u32) {
+        let src = format!(r#"["a-{i}", "bb", 2.5, b"xy"]"#);
+        let program = Program::compile(&src).expect("compiles");
+        drop(program);
+    }
+    for i in 0..WARM {
+        compile_one(i);
+    }
+    let old_after_warm = old_bytes();
+    println!("old_bytes_after_warm: {old_after_warm}");
+    for i in 0..ROUNDS {
+        compile_one(WARM + i);
+    }
+    let old_after = old_bytes();
+    println!("old_bytes_after_rounds: {old_after}");
+    println!(
+        "old_growth_warm_to_end: {}",
+        old_after.saturating_sub(old_after_warm)
+    );
+    const SLACK: u64 = 256 * 1024;
+    assert!(
+        old_after <= old_after_warm.saturating_add(SLACK),
+        "old-space bytes grew from {old_after_warm} after warmup to {old_after} after {ROUNDS} compiles"
+    );
+}
+
 #[test]
 fn a_kept_result_survives_dropping_the_context() {
     let program = Program::compile("list.map(i, i * 2)").expect("compiles");
