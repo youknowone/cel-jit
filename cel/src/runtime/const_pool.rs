@@ -6,16 +6,16 @@
 
 use super::heap::{register_const_span, unregister_const_span, IMMORTAL_HEADER_SIZE, IMMORTAL_MARK};
 use super::object::{
-    new_bool, new_null, prebuilt_int, CelObject, CelRef, ListStrategy, W_BytesObject,
-    W_DoubleObject, W_IntColumn, W_IntObject, W_ListObject, W_StringObject, W_UIntObject,
-    CEL_BYTES_CLASS, CEL_DOUBLE_CLASS, CEL_INT_CLASS, CEL_INT_COLUMN_CLASS, CEL_LIST_CLASS,
-    CEL_STRING_CLASS, CEL_UINT_CLASS,
+    new_bool, new_null, prebuilt_int, CelObject, CelRef, ListStrategy, MapStrategy, W_BytesObject,
+    W_DoubleObject, W_IntColumn, W_IntObject, W_ListObject, W_MapObject, W_StringObject,
+    W_UIntObject, CEL_BYTES_CLASS, CEL_DOUBLE_CLASS, CEL_INT_CLASS, CEL_INT_COLUMN_CLASS,
+    CEL_LIST_CLASS, CEL_MAP_CLASS, CEL_STRING_CLASS, CEL_UINT_CLASS,
 };
 use super::object_array::{
     bytes_base, items_block_items_base, CelBytesBlock, CelItemsBlock, CEL_BYTES_BLOCK_ITEMS_OFFSET,
     CEL_ITEMS_BLOCK_ITEMS_OFFSET,
 };
-use crate::objects::{ListRef, ListStorage};
+use crate::objects::{Key, ListRef, ListStorage, Map, MapStorage};
 use crate::Value;
 use core::alloc::Layout;
 use core::mem::{align_of, size_of};
@@ -153,6 +153,7 @@ impl ConstPool {
                 }) as CelRef
             }
             Value::List(list) => self.intern_list(list),
+            Value::Map(map) => self.intern_map(map),
             #[cfg(feature = "chrono")]
             Value::Duration(d) => d
                 .num_nanoseconds()
@@ -184,7 +185,7 @@ impl ConstPool {
 
     /// A list element: pool intern, or the immortal prebuilt [`new_int`] /
     /// [`new_bool`] / [`new_null`] already answer. Never a thread-heap alloc.
-    fn intern_elem(&mut self, v: &Value) -> CelRef {
+    pub(crate) fn intern_elem(&mut self, v: &Value) -> CelRef {
         let w = self.intern(v);
         if !w.is_null() {
             return w;
@@ -250,6 +251,85 @@ impl ConstPool {
             public: core::ptr::null(),
             public_start: 0,
             public_len: 0,
+        }) as CelRef
+    }
+
+    /// An empty object map with room for `cap` [`map_try_insert`]s.
+    /// Length starts at 0; the pool supplies the items block.
+    pub(crate) fn alloc_empty_map(&mut self, cap: usize) -> CelRef {
+        let nrefs = cap.saturating_mul(2);
+        let size = CEL_ITEMS_BLOCK_ITEMS_OFFSET
+            .checked_add(nrefs.saturating_mul(size_of::<CelRef>()))
+            .expect("items block fits");
+        let block = self.alloc_raw(size, align_of::<CelItemsBlock>()) as *mut CelItemsBlock;
+        unsafe {
+            (*block).capacity = nrefs;
+        }
+        self.alloc(W_MapObject {
+            ob_header: CelObject {
+                ob_type: &CEL_MAP_CLASS,
+            },
+            strategy: MapStrategy::Object,
+            storage: core::ptr::null_mut(),
+            items: block,
+            length: 0,
+            public: core::ptr::null(),
+        }) as CelRef
+    }
+
+    fn intern_map(&mut self, map: &Map) -> CelRef {
+        let MapStorage::Object(entries) = map.storage() else {
+            return core::ptr::null_mut();
+        };
+        let mut pairs = Vec::with_capacity(entries.len());
+        for (k, v) in entries.iter() {
+            let key = self.intern_key(k);
+            let value = self.intern_elem(v);
+            if key.is_null() || value.is_null() {
+                return core::ptr::null_mut();
+            }
+            pairs.push((key, value));
+        }
+        self.intern_object_map(&pairs)
+    }
+
+    fn intern_key(&mut self, key: &Key) -> CelRef {
+        match key {
+            Key::Int(i) => self.intern_elem(&Value::Int(*i)),
+            Key::Uint(u) => self.intern(&Value::UInt(*u)),
+            Key::Bool(b) => new_bool(*b) as CelRef,
+            Key::String(s) => self.intern(&Value::String(s.clone())),
+        }
+    }
+
+    fn intern_object_map(&mut self, pairs: &[(CelRef, CelRef)]) -> CelRef {
+        let n = pairs.len();
+        let nrefs = n.saturating_mul(2);
+        let size = CEL_ITEMS_BLOCK_ITEMS_OFFSET
+            .checked_add(nrefs.saturating_mul(size_of::<CelRef>()))
+            .expect("items block fits");
+        let block = self.alloc_raw(size, align_of::<CelItemsBlock>()) as *mut CelItemsBlock;
+        unsafe {
+            (*block).capacity = nrefs;
+            if nrefs != 0 {
+                let dest = items_block_items_base(block);
+                let mut i = 0;
+                while i < n {
+                    *dest.add(2 * i) = pairs[i].0;
+                    *dest.add(2 * i + 1) = pairs[i].1;
+                    i += 1;
+                }
+            }
+        }
+        self.alloc(W_MapObject {
+            ob_header: CelObject {
+                ob_type: &CEL_MAP_CLASS,
+            },
+            strategy: MapStrategy::Object,
+            storage: core::ptr::null_mut(),
+            items: block,
+            length: n as i64,
+            public: core::ptr::null(),
         }) as CelRef
     }
 

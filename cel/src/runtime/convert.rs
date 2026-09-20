@@ -27,7 +27,10 @@ use crate::common::types::{
     Kind, Type, TypeValue, BOOL_TYPE, BYTES_TYPE, DOUBLE_TYPE, INT_TYPE, LIST_TYPE, MAP_TYPE,
     NULL_TYPE, OPTIONAL_TYPE, STRING_TYPE, TYPE_TYPE, UINT_TYPE,
 };
-use crate::objects::{Key, ListRef, ListStorage, Map, MapStorage, Opaque, OptionalValue};
+use crate::objects::{
+    map_get_by_key, map_has_exact_key, Key, KeyRef, ListRef, ListStorage, Map, MapStorage,
+    Opaque, OptionalValue,
+};
 use crate::Value;
 
 #[cfg(feature = "structs")]
@@ -557,20 +560,101 @@ unsafe fn list_from_ref(w: CelRef) -> Result<ListRef, ConvertError> {
     }
 }
 
+/// An interned leaf as a map [`KeyRef`], or `None` if it cannot be a map key.
+///
+/// # Safety
+///
+/// `w` is a live value.
+pub unsafe fn interned_as_keyref<'a>(w: CelRef) -> Option<KeyRef<'a>> {
+    match w_kind(w) {
+        CelKind::Int => Some(KeyRef::Int((*w.cast::<W_IntObject>()).intval)),
+        CelKind::UInt => Some(KeyRef::Uint((*w.cast::<W_UIntObject>()).uintval)),
+        CelKind::Bool => Some(KeyRef::Bool((*w.cast::<W_BoolObject>()).boolval != 0)),
+        CelKind::Str => super::object::string_as_str(w).map(KeyRef::String),
+        _ => None,
+    }
+}
+
+unsafe fn interned_object_get_exact(w: CelRef, needle: KeyRef<'_>) -> Option<CelRef> {
+    let leaf = &*w.cast::<W_MapObject>();
+    if leaf.strategy != MapStrategy::Object {
+        return None;
+    }
+    let n = leaf.length as usize;
+    let base = items_block_items_base(leaf.items);
+    if base.is_null() {
+        return None;
+    }
+    let mut i = 0;
+    while i < n {
+        let k = *base.add(2 * i);
+        if interned_key_eq(k, needle) {
+            return Some(*base.add(2 * i + 1));
+        }
+        i += 1;
+    }
+    None
+}
+
+#[inline]
+unsafe fn interned_key_eq(w: CelRef, needle: KeyRef<'_>) -> bool {
+    match needle {
+        KeyRef::Int(i) => {
+            w_kind(w) == CelKind::Int && (*w.cast::<W_IntObject>()).intval == i
+        }
+        KeyRef::Uint(u) => {
+            w_kind(w) == CelKind::UInt && (*w.cast::<W_UIntObject>()).uintval == u
+        }
+        KeyRef::Bool(b) => {
+            w_kind(w) == CelKind::Bool && ((*w.cast::<W_BoolObject>()).boolval != 0) == b
+        }
+        KeyRef::String(s) => super::object::string_eq_str(w, s),
+    }
+}
+
+/// Look up `needle` on an interned map with the walker's exact-then-cross-type
+/// rule ([`map_get_by_key`]).
+///
+/// # Safety
+///
+/// `w` is a live [`W_MapObject`].
+pub unsafe fn interned_map_get(w: CelRef, needle: KeyRef<'_>) -> Option<CelRef> {
+    let leaf = &*w.cast::<W_MapObject>();
+    match leaf.strategy {
+        MapStrategy::Object => map_get_by_key(|k| interned_object_get_exact(w, k), needle),
+        MapStrategy::Record => {
+            let map = host_map(opaque_host_index(leaf.storage))?;
+            intern_leaf(map.get(&needle)?.as_ref())
+        }
+    }
+}
+
+/// `in` on an interned map: exact `Key` ([`map_has_exact_key`]), the same
+/// probe [`crate::objects::Map::contains_key`] uses.
+///
+/// # Safety
+///
+/// `w` is a live [`W_MapObject`].
+#[inline(never)]
+pub unsafe fn interned_map_contains(w: CelRef, needle: KeyRef<'_>) -> bool {
+    let leaf = &*w.cast::<W_MapObject>();
+    match leaf.strategy {
+        MapStrategy::Object => {
+            map_has_exact_key(|k| interned_object_get_exact(w, k).is_some(), needle)
+        }
+        MapStrategy::Record => host_map(opaque_host_index(leaf.storage))
+            .map(|m| m.contains_key(&needle))
+            .unwrap_or(false),
+    }
+}
+
 /// Look up a string field on an interned map, including record-row strategy.
 ///
 /// # Safety
 ///
 /// `w` is a live [`W_MapObject`].
 pub unsafe fn interned_map_lookup_string(w: CelRef, field: &str) -> Option<CelRef> {
-    let leaf = &*w.cast::<W_MapObject>();
-    match leaf.strategy {
-        MapStrategy::Object => super::object::map_lookup_string(w, field),
-        MapStrategy::Record => {
-            let map = host_map(opaque_host_index(leaf.storage))?;
-            intern_leaf(map.get(&Key::from(field))?.as_ref())
-        }
-    }
+    interned_map_get(w, KeyRef::String(field))
 }
 
 /// Item `index` of an interned list, including int-column and window strategies.

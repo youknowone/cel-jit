@@ -4,13 +4,15 @@ use crate::common::ast::{
 #[cfg(feature = "structs")]
 use crate::common::types::CelStruct;
 use crate::context::Context;
-use crate::runtime::binop::{cel_add, map_contains_key, map_key_refs, map_lookup, values_equal};
-use crate::runtime::convert::{intern_leaf, interned_list_get, interned_map_lookup_string};
+use crate::runtime::binop::{cel_add, map_contains_key, map_key_refs, values_equal};
+use crate::runtime::convert::{
+    intern_leaf, interned_as_keyref, interned_list_get, interned_map_get, interned_map_lookup_string,
+};
 use crate::runtime::error::{take_error, CelErrCode, ERROR_SENTINEL};
 use crate::runtime::object::{
-    bytes_len, list_int_at, list_len, map_len, new_optional, new_optional_none, string_as_str,
-    string_byte_len, w_kind, CelKind, CelRef, ListStrategy, MapStrategy, W_BoolObject,
-    W_DoubleObject, W_IntColumn, W_IntObject, W_ListObject, W_MapObject, W_OptionalObject,
+    bytes_len, list_int_at, list_len, map_len, new_optional, new_optional_none,
+    string_byte_len, w_kind, CelKind, CelRef, ListStrategy, W_BoolObject,
+    W_DoubleObject, W_IntColumn, W_IntObject, W_ListObject, W_OptionalObject,
     W_UIntObject,
 };
 use crate::runtime::object_array::{items_block_items_base, items_capacity};
@@ -283,6 +285,11 @@ impl Map {
     }
 
     pub(crate) fn contains_key(&self, key: &(dyn AsKeyRef + '_)) -> bool {
+        map_has_exact_key(|k| self.has_exact_key(k), key.as_keyref())
+    }
+
+    fn has_exact_key(&self, key: KeyRef<'_>) -> bool {
+        let key: &(dyn AsKeyRef + '_) = &key;
         match &self.storage {
             MapStorage::Object(map) => map.contains_key(key),
             MapStorage::Record { schema, .. } => schema.position(key).is_some(),
@@ -293,15 +300,7 @@ impl Map {
     /// strategy does not already hold it. Implicitly converts between int and
     /// uint keys.
     pub fn get(&self, key: &(dyn AsKeyRef + '_)) -> Option<Cow<'_, Value>> {
-        self.get_exact(key).or_else(|| {
-            // Also check keys that are cross type comparable.
-            let keyref = key.as_keyref();
-            match keyref {
-                KeyRef::Int(k) => self.get_exact(&KeyRef::Uint(u64::try_from(k).ok()?)),
-                KeyRef::Uint(k) => self.get_exact(&KeyRef::Int(i64::try_from(k).ok()?)),
-                _ => None,
-            }
-        })
+        map_get_by_key(|k| self.get_exact(&k), key.as_keyref())
     }
 
     fn get_exact(&self, key: &(dyn AsKeyRef + '_)) -> Option<Cow<'_, Value>> {
@@ -463,6 +462,35 @@ impl<'a> Borrow<dyn AsKeyRef + 'a> for Key {
     fn borrow(&self) -> &(dyn AsKeyRef + 'a) {
         self
     }
+}
+
+/// Map index / field / `has`: exact `Key` first, then the other numeric
+/// kind if the value fits. Interned maps call this over a linear scan;
+/// the public map calls it over [`HashMap`]. `in` is [`map_has_exact_key`].
+#[inline]
+pub fn map_get_by_key<T>(
+    mut exact: impl FnMut(KeyRef<'_>) -> Option<T>,
+    needle: KeyRef<'_>,
+) -> Option<T> {
+    if let Some(v) = exact(needle) {
+        return Some(v);
+    }
+    match needle {
+        KeyRef::Int(k) => exact(KeyRef::Uint(u64::try_from(k).ok()?)),
+        KeyRef::Uint(k) => exact(KeyRef::Int(i64::try_from(k).ok()?)),
+        _ => None,
+    }
+}
+
+/// `in` on a map: exact `Key` only, no cross-type numeric fallback.
+/// Interned maps call this over a linear scan; the public map over
+/// [`HashMap`] / record schema position.
+#[inline]
+pub fn map_has_exact_key(
+    mut exact: impl FnMut(KeyRef<'_>) -> bool,
+    needle: KeyRef<'_>,
+) -> bool {
+    exact(needle)
 }
 
 /// Implement conversions from primitive types to [`Key`]
@@ -978,18 +1006,12 @@ impl ListRef {
     /// (`listobject.py` `switch_to_object_strategy`). A window onto a buffer it
     /// does not own entirely has to copy out — appending in place would grow
     /// the buffer every other list of the batch is reading.
+    ///
+    /// Two int lists, or an int list and an object list of ints, stay
+    /// [`ListStorage::Ints`]: the elements are copied as words, not boxed.
     pub fn concat(mut self, other: &ListRef) -> ListRef {
-        if let (ListStorage::Ints(left), ListStorage::Ints(right)) =
-            (self.storage.as_ref(), other.storage.as_ref())
-        {
-            let l0 = self.window_start();
-            let r0 = other.window_start();
-            let ln = self.len();
-            let rn = other.len();
-            let mut out = Vec::with_capacity(ln + rn);
-            out.extend_from_slice(&left[l0..l0 + ln]);
-            out.extend_from_slice(&right[r0..r0 + rn]);
-            return ListRef::whole(Arc::new(ListStorage::Ints(out)));
+        if let Some(out) = concat_int_lists(&self, other) {
+            return out;
         }
         if self.whole_object().is_some() {
             if let Some(ListStorage::Object(items)) = Arc::get_mut(&mut self.storage) {
@@ -1020,6 +1042,59 @@ impl ListRef {
             ListStorage::Object(v) if self.start == 0 && self.len() == v.len() => Some(v),
             _ => None,
         }
+    }
+
+}
+
+#[inline(never)]
+fn concat_int_lists(left: &ListRef, right: &ListRef) -> Option<ListRef> {
+    let mut out = Vec::with_capacity(left.len() + right.len());
+    if !append_list_ints(&mut out, left) {
+        return None;
+    }
+    if !append_list_ints(&mut out, right) {
+        return None;
+    }
+    Some(ListRef::whole(Arc::new(ListStorage::Ints(out))))
+}
+
+/// Append this list's integers onto `out`. `false` if any element is not an int.
+#[inline(never)]
+fn append_list_ints(out: &mut Vec<i64>, list: &ListRef) -> bool {
+    match list.storage.as_ref() {
+        ListStorage::Ints(v) => {
+            let start = list.window_start();
+            let Some(s) = v.get(start..start + list.len()) else {
+                return false;
+            };
+            out.extend_from_slice(s);
+            true
+        }
+        ListStorage::Object(v) => {
+            let start = list.window_start();
+            let n = list.len();
+            let Some(slice) = v.get(start..start + n) else {
+                return false;
+            };
+            for item in slice {
+                let Some(i) = value_as_int(item) else {
+                    return false;
+                };
+                out.push(i);
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+fn value_as_int(v: &Value) -> Option<i64> {
+    match v {
+        Value::Int(i) => Some(*i),
+        Value::Interned(w) if unsafe { w_kind(*w) } == CelKind::Int => {
+            Some(unsafe { (*w.cast::<W_IntObject>()).intval })
+        }
+        _ => None,
     }
 }
 
@@ -2088,6 +2163,14 @@ fn resolve_args(args: &[Expression], ctx: &Context) -> Result<Vec<Value>, Execut
     args.iter().map(|arg| resolve_inner(arg, ctx)).collect()
 }
 
+fn value_is_list(value: &Value) -> bool {
+    match value {
+        Value::List(_) => true,
+        Value::Interned(w) => unsafe { w_kind(*w) == CelKind::List },
+        _ => false,
+    }
+}
+
 /// Whether an incompatible right-hand side makes `op` on this receiver answer
 /// `NoSuchOverload` rather than `UnsupportedBinaryOperator`.
 ///
@@ -2136,7 +2219,21 @@ pub(crate) fn binary_values(
     lhs: Value,
     rhs: Value,
 ) -> Result<Value, ExecutionError> {
-    binary_values_ref(op, &lhs, &rhs)
+    if let Some(result) = numeric_binop(op, &lhs, &rhs) {
+        return binop_mismatch(op, &lhs, result);
+    }
+    let no_such = mismatch_is_no_such_overload(op, &lhs);
+    binop_mismatch_flag(
+        no_such,
+        match op {
+            "add" => lhs + rhs,
+            "sub" => lhs - rhs,
+            "div" => lhs / rhs,
+            "mul" => lhs * rhs,
+            "rem" => lhs % rhs,
+            _ => unreachable!("unknown binary operator {op}"),
+        },
+    )
 }
 
 /// [`binary_values`] without taking ownership. The fused VM ops read a
@@ -2147,9 +2244,12 @@ pub(crate) fn binary_values_ref(
     lhs: &Value,
     rhs: &Value,
 ) -> Result<Value, ExecutionError> {
-    let result = if let Some(result) = numeric_binop(op, lhs, rhs) {
-        result
-    } else {
+    if let Some(result) = numeric_binop(op, lhs, rhs) {
+        return binop_mismatch(op, lhs, result);
+    }
+    binop_mismatch(
+        op,
+        lhs,
         match op {
             "add" => lhs.clone() + rhs.clone(),
             "sub" => lhs.clone() - rhs.clone(),
@@ -2157,12 +2257,24 @@ pub(crate) fn binary_values_ref(
             "mul" => lhs.clone() * rhs.clone(),
             "rem" => lhs.clone() % rhs.clone(),
             _ => unreachable!("unknown binary operator {op}"),
-        }
-    };
+        },
+    )
+}
+
+fn binop_mismatch(
+    op: &'static str,
+    lhs: &Value,
+    result: Result<Value, ExecutionError>,
+) -> Result<Value, ExecutionError> {
+    binop_mismatch_flag(mismatch_is_no_such_overload(op, lhs), result)
+}
+
+fn binop_mismatch_flag(
+    no_such: bool,
+    result: Result<Value, ExecutionError>,
+) -> Result<Value, ExecutionError> {
     match result {
-        Err(ExecutionError::UnsupportedBinaryOperator(..))
-            if mismatch_is_no_such_overload(op, lhs) =>
-        {
+        Err(ExecutionError::UnsupportedBinaryOperator(..)) if no_such => {
             Err(ExecutionError::NoSuchOverload)
         }
         other => other,
@@ -2485,72 +2597,32 @@ fn list_index_error_key(key: &Value) -> Value {
     }
 }
 
-/// A map key that can be read without rebuilding the map.
-enum InternedMapKey<'a> {
-    Int(i64),
-    Uint(u64),
-    Bool(bool),
-    Str(&'a str),
-}
-
-fn interned_map_key(key: &Value) -> Result<InternedMapKey<'_>, ExecutionError> {
+fn interned_or_public_map_key(key: &Value) -> Option<KeyRef<'_>> {
     match key {
-        Value::Int(i) => Ok(InternedMapKey::Int(*i)),
-        Value::UInt(u) => Ok(InternedMapKey::Uint(*u)),
-        Value::Bool(b) => Ok(InternedMapKey::Bool(*b)),
-        Value::String(s) => Ok(InternedMapKey::Str(s.as_str())),
-        Value::Interned(k) => match unsafe { w_kind(*k) } {
-            CelKind::Int => Ok(InternedMapKey::Int(unsafe {
-                (*k.cast::<W_IntObject>()).intval
-            })),
-            CelKind::UInt => Ok(InternedMapKey::Uint(unsafe {
-                (*k.cast::<W_UIntObject>()).uintval
-            })),
-            CelKind::Bool => Ok(InternedMapKey::Bool(unsafe {
-                (*k.cast::<W_BoolObject>()).boolval != 0
-            })),
-            CelKind::Str => match unsafe { string_as_str(*k) } {
-                Some(s) => Ok(InternedMapKey::Str(s)),
-                None => Err(ExecutionError::unsupported_key_type(key.unpack())),
-            },
-            _ => Err(ExecutionError::unsupported_key_type(key.unpack())),
-        },
-        other => Err(ExecutionError::unsupported_key_type(other.unpack())),
+        Value::Int(i) => Some(KeyRef::Int(*i)),
+        Value::UInt(u) => Some(KeyRef::Uint(*u)),
+        Value::Bool(b) => Some(KeyRef::Bool(*b)),
+        Value::String(s) => Some(KeyRef::String(s.as_str())),
+        Value::Interned(w) => unsafe { interned_as_keyref(*w) },
+        _ => None,
     }
 }
 
-fn interned_map_key_display(key: &InternedMapKey<'_>) -> String {
+fn keyref_display(key: &KeyRef<'_>) -> String {
     match key {
-        InternedMapKey::Int(i) => i.to_string(),
-        InternedMapKey::Uint(u) => u.to_string(),
-        InternedMapKey::Bool(b) => b.to_string(),
-        InternedMapKey::Str(s) => (*s).to_string(),
+        KeyRef::Int(i) => i.to_string(),
+        KeyRef::Uint(u) => u.to_string(),
+        KeyRef::Bool(b) => b.to_string(),
+        KeyRef::String(s) => (*s).to_string(),
     }
 }
 
 fn interned_map_index(w: CelRef, key: &Value) -> Option<Result<Value, ExecutionError>> {
-    let viewed = match interned_map_key(key) {
-        Ok(k) => k,
-        Err(e) => return Some(Err(e)),
-    };
-    let found = match &viewed {
-        InternedMapKey::Str(field) => unsafe { interned_map_lookup_string(w, field) },
-        _ => {
-            if unsafe { (*w.cast::<W_MapObject>()).strategy } == MapStrategy::Record {
-                return None;
-            }
-            let k = match key {
-                Value::Interned(k) => *k,
-                _ => intern_leaf(key)?,
-            };
-            unsafe { map_lookup(w, k) }
-        }
-    };
+    let needle = interned_or_public_map_key(key)?;
+    let found = unsafe { interned_map_get(w, needle) };
     Some(match found {
         Some(item) => Ok(Value::from_interned(item)),
-        None => Err(ExecutionError::NoSuchKey(Arc::new(
-            interned_map_key_display(&viewed),
-        ))),
+        None => Err(ExecutionError::NoSuchKey(Arc::new(keyref_display(&needle)))),
     })
 }
 
@@ -2825,14 +2897,12 @@ pub(crate) fn interned_contains(container: CelRef, needle: CelRef) -> Result<boo
             }
             Ok(interned_list_contains_in_place(container, needle))
         }
-        CelKind::Map => match unsafe { w_kind(needle) } {
-            CelKind::Int | CelKind::UInt | CelKind::Bool | CelKind::Str => {
-                Ok(unsafe { map_contains_key(container, needle) })
+        CelKind::Map => {
+            if unsafe { interned_as_keyref(needle) }.is_none() {
+                value_key(Value::from_interned(needle).unpack())?;
             }
-            _ => Err(ExecutionError::unsupported_key_type(
-                Value::from_interned(needle).unpack(),
-            )),
-        },
+            Ok(unsafe { map_contains_key(container, needle) })
+        }
         _ => Err(ExecutionError::NoSuchOverload),
     }
 }
@@ -3049,6 +3119,13 @@ impl ops::Add<Value> for Value {
     #[inline(always)]
     fn add(self, rhs: Value) -> Self::Output {
         if matches!(self, Value::Interned(_)) || matches!(rhs, Value::Interned(_)) {
+            // List `+` is [`ListRef::concat`]. Interning a public list to
+            // reach `w_list_add` would box every int and rebuild the result
+            // at the door; unpack (a linked bound list is an Arc clone) and
+            // use the one implementation.
+            if value_is_list(&self) && value_is_list(&rhs) {
+                return self.unpack().add(rhs.unpack());
+            }
             if let (Some(a), Some(b)) = (intern_leaf(&self), intern_leaf(&rhs)) {
                 let w = unsafe { cel_add(a, b) };
                 return interned_binop_result(w);
@@ -3070,14 +3147,26 @@ impl ops::Add<Value> for Value {
 
             (Value::List(l), Value::List(r)) => Ok(Value::List(l.concat(&r))),
             (Value::String(mut l), Value::String(r)) => {
-                // If this is the only reference to `l`, we can append to it in place.
-                // `l` is replaced with a clone otherwise.
-                Arc::make_mut(&mut l).push_str(&r);
-                Ok(Value::String(l))
+                if let Some(s) = Arc::get_mut(&mut l) {
+                    s.push_str(&r);
+                    Ok(Value::String(l))
+                } else {
+                    let mut out = String::with_capacity(l.len() + r.len());
+                    out.push_str(&l);
+                    out.push_str(&r);
+                    Ok(Value::String(Arc::new(out)))
+                }
             }
             (Value::Bytes(mut l), Value::Bytes(r)) => {
-                Arc::make_mut(&mut l).extend_from_slice(&r);
-                Ok(Value::Bytes(l))
+                if let Some(s) = Arc::get_mut(&mut l) {
+                    s.extend_from_slice(&r);
+                    Ok(Value::Bytes(l))
+                } else {
+                    let mut out = Vec::with_capacity(l.len() + r.len());
+                    out.extend_from_slice(&l);
+                    out.extend_from_slice(&r);
+                    Ok(Value::Bytes(Arc::new(out)))
+                }
             }
             #[cfg(feature = "chrono")]
             (Value::Duration(l), Value::Duration(r)) => l
@@ -3297,6 +3386,18 @@ mod tests {
                 Value::Int(4),
                 Value::Int(5)
             ]
+        );
+    }
+
+    #[test]
+    fn concat_of_int_list_and_object_int_stays_ints() {
+        let a = ListRef::whole(Arc::new(ListStorage::Ints(vec![1, 2, 3])));
+        let b = ListRef::from(vec![Value::Int(15)]);
+        let out = a.concat(&b);
+        assert!(matches!(out.storage(), ListStorage::Ints(_)));
+        assert_eq!(
+            out.to_vec(),
+            vec![Value::Int(1), Value::Int(2), Value::Int(3), Value::Int(15)]
         );
     }
 

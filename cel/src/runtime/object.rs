@@ -935,7 +935,7 @@ unsafe fn lookup_string_pairs(
     None
 }
 
-unsafe fn string_eq_str(w: CelRef, field: &str) -> bool {
+pub(crate) unsafe fn string_eq_str(w: CelRef, field: &str) -> bool {
     if w.is_null() || w_kind(w) != CelKind::Str {
         return false;
     }
@@ -970,7 +970,12 @@ pub fn new_map_with_capacity_in(heap: &super::heap::CelHeap, cap: i64) -> *mut W
     })
 }
 
-/// Append `(key, value)` to an object-strategy map if the block still has room.
+/// Insert `(key, value)` into an object-strategy map: overwrite the value of
+/// an existing pair whose key is the same [`crate::objects::Key`] (same
+/// kind, same payload), otherwise append if the block still has room.
+///
+/// A key that is not Int/UInt/Bool/Str is refused so the residual path
+/// raises through [`crate::objects::value_key`].
 ///
 /// # Safety
 ///
@@ -980,26 +985,95 @@ pub unsafe fn map_try_insert(w: CelRef, key: CelRef, value: CelRef) -> bool {
     if w_kind(w) != CelKind::Map {
         return false;
     }
+    match w_kind(key) {
+        CelKind::Int | CelKind::UInt | CelKind::Bool | CelKind::Str => {}
+        _ => return false,
+    }
     let leaf = &mut *w.cast::<W_MapObject>();
     if leaf.strategy != MapStrategy::Object {
         return false;
     }
-    let cap = crate::runtime::object_array::items_capacity(leaf.items);
     if leaf.length < 0 {
         return false;
     }
-    let used = (leaf.length as usize).saturating_mul(2);
+    let n = leaf.length as usize;
+    let mut base = core::ptr::null_mut();
+    if n != 0 {
+        base = crate::runtime::object_array::items_block_items_base(leaf.items);
+        if base.is_null() {
+            return false;
+        }
+        let mut i = 0;
+        while i < n {
+            if interned_same_map_key(*base.add(2 * i), key) {
+                *base.add(2 * i + 1) = value;
+                return true;
+            }
+            i += 1;
+        }
+    }
+    let cap = crate::runtime::object_array::items_capacity(leaf.items);
+    let used = n.saturating_mul(2);
     if used.saturating_add(2) > cap {
         return false;
     }
-    let base = crate::runtime::object_array::items_block_items_base(leaf.items);
     if base.is_null() {
-        return false;
+        base = crate::runtime::object_array::items_block_items_base(leaf.items);
+        if base.is_null() {
+            return false;
+        }
     }
     *base.add(used) = key;
     *base.add(used + 1) = value;
     leaf.length += 1;
     true
+}
+
+/// Exact [`crate::objects::Key`] equality on two interned leaves: kind and
+/// payload, not [`super::binop::values_equal`].
+#[inline]
+unsafe fn interned_same_map_key(a: CelRef, b: CelRef) -> bool {
+    if a == b {
+        return true;
+    }
+    let ka = w_kind(a);
+    if ka != w_kind(b) {
+        return false;
+    }
+    match ka {
+        CelKind::Int => (*a.cast::<W_IntObject>()).intval == (*b.cast::<W_IntObject>()).intval,
+        CelKind::UInt => (*a.cast::<W_UIntObject>()).uintval == (*b.cast::<W_UIntObject>()).uintval,
+        CelKind::Bool => (*a.cast::<W_BoolObject>()).boolval == (*b.cast::<W_BoolObject>()).boolval,
+        CelKind::Str => interned_string_bytes_eq(a, b),
+        _ => false,
+    }
+}
+
+#[inline]
+unsafe fn interned_string_bytes_eq(a: CelRef, b: CelRef) -> bool {
+    let la = &*a.cast::<W_StringObject>();
+    let lb = &*b.cast::<W_StringObject>();
+    if la.byte_len != lb.byte_len {
+        return false;
+    }
+    let n = la.byte_len as usize;
+    let ba = crate::runtime::object_array::bytes_base(la.chars);
+    let bb = crate::runtime::object_array::bytes_base(lb.chars);
+    if ba.is_null() || bb.is_null() {
+        return n == 0;
+    }
+    if n >= 8 {
+        // Each payload is `byte_len` live bytes; n >= 8 so an unaligned word fits.
+        let wa = core::ptr::read_unaligned(ba as *const u64);
+        let wb = core::ptr::read_unaligned(bb as *const u64);
+        if wa != wb {
+            return false;
+        }
+        if n == 8 {
+            return true;
+        }
+    }
+    std::slice::from_raw_parts(ba, n) == std::slice::from_raw_parts(bb, n)
 }
 
 /// Box `pairs` as a CEL `map`.

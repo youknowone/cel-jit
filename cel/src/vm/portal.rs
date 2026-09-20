@@ -17,9 +17,11 @@ use super::interp::{Step, Vm};
 use super::opcode::OpCode;
 use crate::runtime::binop::{
     cel_add, cel_div, cel_equals, cel_greater, cel_greater_equals, cel_less, cel_less_equals,
-    cel_mul, cel_negate, cel_not_equals, cel_rem, cel_sub, map_lookup,
+    cel_mul, cel_negate, cel_not_equals, cel_rem, cel_sub,
 };
-use crate::runtime::convert::{intern_leaf, interned_list_get, interned_map_lookup_string};
+use crate::runtime::convert::{
+    intern_leaf, interned_as_keyref, interned_list_get, interned_map_get, interned_map_lookup_string,
+};
 use crate::runtime::error::ERROR_SENTINEL;
 use crate::runtime::heap::CelHeap;
 use crate::runtime::object::{
@@ -420,10 +422,6 @@ fn try_map_insert(map: i64, key: i64, value: i64) -> i64 {
     let Some(value) = slot_leaf(value) else {
         return 0;
     };
-    match unsafe { w_kind(key) } {
-        CelKind::Int | CelKind::UInt | CelKind::Bool | CelKind::Str => {}
-        _ => return 0,
-    }
     unsafe { i64::from(map_try_insert(map, key, value)) }
 }
 
@@ -506,10 +504,12 @@ fn interned_index(container: i64, key: i64) -> i64 {
             }
             unsafe { interned_list_get(w, index) }
         }
-        CelKind::Map => match unsafe { string_as_str(k) } {
-            Some(field) => unsafe { interned_map_lookup_string(w, field) },
-            None => unsafe { map_lookup(w, k) },
-        },
+        CelKind::Map => {
+            let Some(needle) = (unsafe { interned_as_keyref(k) }) else {
+                return 0;
+            };
+            unsafe { interned_map_get(w, needle) }
+        }
         #[cfg(feature = "structs")]
         CelKind::Struct => match unsafe { string_as_str(k) } {
             Some(field) => unsafe { crate::runtime::object::struct_lookup_field(w, field) },
@@ -702,10 +702,12 @@ fn interned_opt_index(container: i64, key: i64) -> i64 {
             }
             unsafe { interned_list_get(w, index) }
         }
-        CelKind::Map => match unsafe { string_as_str(k) } {
-            Some(field) => unsafe { interned_map_lookup_string(w, field) },
-            None => unsafe { map_lookup(w, k) },
-        },
+        CelKind::Map => {
+            let Some(needle) = (unsafe { interned_as_keyref(k) }) else {
+                return 0;
+            };
+            unsafe { interned_map_get(w, needle) }
+        }
         #[cfg(feature = "structs")]
         CelKind::Struct => match unsafe { string_as_str(k) } {
             Some(field) => unsafe { crate::runtime::object::struct_lookup_field(w, field) },

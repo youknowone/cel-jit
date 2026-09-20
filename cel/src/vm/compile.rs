@@ -5,6 +5,7 @@
 //! reaches a runtime fallback.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use super::code::{CelCode, Handler, Insn};
 use super::error::NameId;
@@ -13,7 +14,8 @@ use crate::common::ast::{
     operators, CallExpr, ComprehensionExpr, EntryExpr, Expr, IdedExpr, ListExpr, LiteralValue,
     MapExpr, SelectExpr, StructExpr,
 };
-use crate::objects::ListStorage;
+use crate::objects::{ListStorage, Map};
+use crate::runtime::object::{map_try_insert, CelRef};
 use crate::Value;
 
 /// Why an expression could not be compiled.
@@ -241,6 +243,72 @@ impl Compiler {
         Ok(index)
     }
 
+    fn add_const_leaf(
+        &mut self,
+        value: Value,
+        leaf: CelRef,
+        id: u64,
+    ) -> Result<u32, CompileError> {
+        let index = u32::try_from(self.consts.len()).map_err(|_| CompileError {
+            kind: CompileErrorKind::TooLarge("constant pool"),
+            id,
+        })?;
+        self.consts.push(value);
+        self.const_leaves.push(leaf);
+        Ok(index)
+    }
+
+    /// A compile-time value and its pool leaf, or `None` if `expr` is not
+    /// constant. Map literals intern with [`map_try_insert`] in source order.
+    fn intern_const(&mut self, expr: &Expr) -> Option<(Value, CelRef)> {
+        match expr {
+            Expr::Literal(literal) => {
+                let value = literal.to_value();
+                let leaf = self.const_pool.intern_elem(&value);
+                if leaf.is_null() {
+                    return None;
+                }
+                Some((value, leaf))
+            }
+            Expr::List(list) => {
+                let value = const_list(list)?;
+                let leaf = self.const_pool.intern(&value);
+                if leaf.is_null() {
+                    return None;
+                }
+                Some((value, leaf))
+            }
+            Expr::Map(map) => self.intern_const_map(map),
+            _ => None,
+        }
+    }
+
+    /// Pool-allocate an empty map and [`map_try_insert`] each entry in source
+    /// order. The pool supplies the memory; insert is the same routine the
+    /// unfolded `NewMap` path uses. A non-constant entry declines the fold.
+    fn intern_const_map(&mut self, map: &MapExpr) -> Option<(Value, CelRef)> {
+        let n = map.entries.len();
+        let mut public = HashMap::with_capacity(n);
+        let leaf = self.const_pool.alloc_empty_map(n);
+        for entry in &map.entries {
+            let EntryExpr::MapEntry(kv) = &entry.expr else {
+                return None;
+            };
+            if kv.optional {
+                return None;
+            }
+            let (key, key_w) = self.intern_const(&kv.key.expr)?;
+            let (value, value_w) = self.intern_const(&kv.value.expr)?;
+            if !unsafe { map_try_insert(leaf, key_w, value_w) } {
+                return None;
+            }
+            public.insert(crate::objects::value_key(key).ok()?, value);
+        }
+        let value = Value::Map(Map::object(Arc::new(public)));
+        crate::runtime::convert::link_public_handle(leaf, &value);
+        Some((value, leaf))
+    }
+
     fn add_name(&mut self, name: &str, id: u64) -> Result<NameId, CompileError> {
         if let Some(&index) = self.name_index.get(name) {
             return Ok(NameId(index));
@@ -389,6 +457,11 @@ impl Compiler {
     }
 
     fn map(&mut self, map: &MapExpr, id: u64) -> Result<(), CompileError> {
+        if let Some((value, leaf)) = self.intern_const_map(map) {
+            let index = self.add_const_leaf(value, leaf, id)?;
+            self.emit(OpCode::LoadConst, &[index], id)?;
+            return Ok(());
+        }
         let count = u32::try_from(map.entries.len()).unwrap_or(u32::MAX);
         self.emit(OpCode::NewMap, &[count], id)?;
         for entry in &map.entries {
@@ -1377,6 +1450,24 @@ mod tests {
         .expect_err("an unspecified expression has no value");
         assert_eq!(err.kind, CompileErrorKind::UnspecifiedExpr);
         assert_eq!(err.id, 7);
+    }
+
+    /// A map whose keys and values are literals is one `LoadConst`, the same
+    /// shape as an all-constant list. A bound value in an entry keeps NewMap.
+    #[test]
+    fn a_constant_map_literal_is_one_load_const() {
+        let code = code_of(r#"{"a": 1, "b": 2}"#);
+        assert_eq!(count(&code, OpCode::NewMap), 0, "{}", code.disassemble());
+        assert_eq!(count(&code, OpCode::MapInsert), 0, "{}", code.disassemble());
+        assert_eq!(count(&code, OpCode::LoadConst), 1, "{}", code.disassemble());
+        let bound = code_of(r#"{"a": x}"#);
+        assert_eq!(count(&bound, OpCode::NewMap), 1, "{}", bound.disassemble());
+        assert_eq!(
+            count(&bound, OpCode::MapInsert),
+            1,
+            "{}",
+            bound.disassemble()
+        );
     }
 
     /// `has(m.x)` is a flag on a `Select` node, not a call, so it has to

@@ -57,11 +57,12 @@
 
 use super::error::{raise, CelErrCode, ERROR_SENTINEL};
 use super::object::{
-    new_bool, new_bytes, new_double, new_duration, new_int, new_list, new_null, new_string,
-    new_timestamp, new_uint, CelClass, CelRef, W_BytesObject, W_MapObject, W_StringObject,
-    CEL_BOOL_CLASS, CEL_BYTES_CLASS, CEL_DOUBLE_CLASS, CEL_DURATION_CLASS, CEL_INT_CLASS,
-    CEL_LIST_CLASS, CEL_MAP_CLASS, CEL_NULL_CLASS, CEL_OPAQUE_CLASS, CEL_OPTIONAL_CLASS,
-    CEL_STRING_CLASS, CEL_TIMESTAMP_CLASS, CEL_TYPE_CLASS, CEL_UINT_CLASS,
+    list_ints_slice, new_bool, new_bytes, new_double, new_duration, new_int, new_list,
+    new_list_ints, new_null, new_string, new_timestamp, new_uint, CelClass, CelRef,
+    W_BytesObject, W_MapObject, W_StringObject, CEL_BOOL_CLASS, CEL_BYTES_CLASS, CEL_DOUBLE_CLASS,
+    CEL_DURATION_CLASS, CEL_INT_CLASS, CEL_LIST_CLASS, CEL_MAP_CLASS, CEL_NULL_CLASS,
+    CEL_OPAQUE_CLASS, CEL_OPTIONAL_CLASS, CEL_STRING_CLASS, CEL_TIMESTAMP_CLASS, CEL_TYPE_CLASS,
+    CEL_UINT_CLASS,
 };
 use super::object_array::{bytes_base, items_block_items_base};
 
@@ -231,12 +232,64 @@ pub unsafe fn w_bytes_add(a: CelRef, b: CelRef) -> CelRef {
 ///
 /// Both operands are live lists.
 pub unsafe fn w_list_add(a: CelRef, b: CelRef) -> CelRef {
+    if let Some(ints) = concat_int_columns(a, b) {
+        return new_list_ints(&ints) as CelRef;
+    }
     let left = list_items(a);
     let right = list_items(b);
     let mut out = Vec::with_capacity(left.len() + right.len());
     out.extend_from_slice(&left);
     out.extend_from_slice(&right);
     new_list(&out) as CelRef
+}
+
+/// Two interned lists as one int column, matching [`crate::objects::ListRef::concat`].
+#[inline(never)]
+unsafe fn concat_int_columns(a: CelRef, b: CelRef) -> Option<Vec<i64>> {
+    let n = super::object::list_len(a) as usize + super::object::list_len(b) as usize;
+    let mut out = Vec::with_capacity(n);
+    if !append_interned_ints(&mut out, a) {
+        return None;
+    }
+    if !append_interned_ints(&mut out, b) {
+        return None;
+    }
+    Some(out)
+}
+
+/// Append `w`'s integers onto `out`. `false` if any element is not an int.
+#[inline(never)]
+unsafe fn append_interned_ints(out: &mut Vec<i64>, w: CelRef) -> bool {
+    if let Some(s) = list_ints_slice(w) {
+        out.extend_from_slice(s);
+        return true;
+    }
+    if super::object::w_kind(w) != super::object::CelKind::List {
+        return false;
+    }
+    let leaf = &*w.cast::<super::object::W_ListObject>();
+    if leaf.strategy != super::object::ListStrategy::Object {
+        return false;
+    }
+    let n = leaf.length as usize;
+    if n == 0 {
+        return true;
+    }
+    let base = items_block_items_base(leaf.items);
+    if base.is_null() {
+        return false;
+    }
+    let start = leaf.start as usize;
+    let mut i = 0;
+    while i < n {
+        let item = *base.add(start + i);
+        if item.is_null() || super::object::w_kind(item) != super::object::CelKind::Int {
+            return false;
+        }
+        out.push((*item.cast::<super::object::W_IntObject>()).intval);
+        i += 1;
+    }
+    true
 }
 
 /// # Safety
@@ -333,31 +386,30 @@ pub unsafe fn list_contains(w: CelRef, needle: CelRef) -> bool {
     false
 }
 
-/// Look up `key` on a map leaf. Keys compare with [`values_equal`].
+/// Look up `key` on a map leaf. The match is [`crate::objects::map_get_by_key`].
+///
+/// A key that is not Int/UInt/Bool/Str is a miss here; the caller declines
+/// so [`crate::objects::value_key`] raises.
 ///
 /// # Safety
 ///
 /// `w` is a live map; `key` is a live value.
 pub unsafe fn map_lookup(w: CelRef, key: CelRef) -> Option<CelRef> {
-    let pairs = map_pairs(w);
-    let n = pairs.len() / 2;
-    let mut i = 0;
-    while i < n {
-        if values_equal(pairs[2 * i], key) {
-            return Some(pairs[2 * i + 1]);
-        }
-        i += 1;
-    }
-    None
+    let needle = super::convert::interned_as_keyref(key)?;
+    super::convert::interned_map_get(w, needle)
 }
 
-/// `key in map`.
+/// `key in map`. Exact `Key` ([`crate::objects::map_has_exact_key`]), not
+/// the cross-type rule [`map_lookup`] uses.
 ///
 /// # Safety
 ///
 /// As [`map_lookup`].
 pub unsafe fn map_contains_key(w: CelRef, key: CelRef) -> bool {
-    map_lookup(w, key).is_some()
+    let Some(needle) = super::convert::interned_as_keyref(key) else {
+        return false;
+    };
+    super::convert::interned_map_contains(w, needle)
 }
 
 /// The keys of a map leaf, in storage order.

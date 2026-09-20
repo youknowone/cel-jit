@@ -21,6 +21,7 @@ fn show(r: &Result<Value, ExecutionError>) -> String {
 
 fn ctx() -> Context<'static> {
     let mut ctx = Context::default();
+    ctx.add_variable_from_value("x", 15i64);
     ctx.add_variable_from_value(
         "xs",
         Value::list(vec![Value::Int(1), Value::Int(2), Value::Int(3)]),
@@ -118,6 +119,132 @@ fn mixed_constant_lists_agree() {
     agree("[]", false);
 }
 
+/// An all-constant map is one `LoadConst` from the code object's pool.
+/// Run through [`Program::execute`] three times so a portal that rebuilt
+/// or mutated the pooled object cannot hide behind a single pass.
+///
+/// Two-entry maps are compared by equality and field reads rather than
+/// `Debug`: `HashMap` iteration order is not insertion order, so a
+/// compile-time table and a freshly built one print keys differently.
+#[test]
+fn constant_maps_agree() {
+    agree_repeat("{\"a\": 1}");
+    agree_repeat("{}");
+    agree_repeat("{\"a\": 1, \"b\": 2} == {\"b\": 2, \"a\": 1}");
+    agree_repeat("{\"a\": 1, \"b\": 2}.a");
+    agree_repeat("{\"a\": 1, \"b\": 2}.b");
+    agree_repeat("{\"a\": 1}.a");
+    agree_repeat("has({\"a\": 1}.a)");
+}
+
+/// The same pooled constant is read twice in one program; the second
+/// load must still see the original, not a mutation of the first use.
+#[test]
+fn the_same_constant_evaluated_twice_agrees() {
+    agree_repeat("{\"a\": 1} == {\"a\": 1}");
+    agree_repeat("[1, 2] == [1, 2]");
+    agree_repeat("[{\"k\": 1}, {\"k\": 1}]");
+}
+
+/// Concatenating or extending a pooled constant must copy, not mutate
+/// the object the code object owns.
+#[test]
+fn concatenating_a_constant_list_agrees() {
+    agree_repeat("[1, 2] + [3, 4]");
+    agree_repeat("[1, 2] + xs");
+    agree_repeat("xs + [1, 2]");
+    agree_repeat("[1, 2] + [x]");
+}
+
+/// Interned maps must match the walker's `HashMap<Key, Value>`: replace on
+/// exact `Key`, lookup exact kind first then the other numeric kind, reject
+/// a float index. Compared with the walker (Value equality, not Debug order).
+#[test]
+fn interned_maps_match_the_walker_on_keys() {
+    let mut failed = Vec::new();
+    for src in [
+        r#"size({"a":1,"a":2})"#,
+        r#"{"a":1,"a":2}.map(k,k)"#,
+        r#"{"a":1,"a":2} == {"a":2}"#,
+        r#"size({"a":x,"a":2})"#,
+        r#"{x:1, 15:2}[15]"#,
+        r#"{x:"p", 15:"q"}.map(k, k)"#,
+        r#"{1:"a", 1u:"b"}[1u]"#,
+        r#"{1u:"a", 1:"b"}[1]"#,
+        r#"{x:1, 15u:2}[15u]"#,
+        r#"{x:1}[15.0]"#,
+        r#"{x:1, 15u:2}[15]"#,
+        r#"15 in {x:1, 15u:2}"#,
+        r#"has({"a":x,"a":2}.a)"#,
+        r#"{"a":x,"a":2}"#,
+        r#"{x:1}[15u]"#,
+        r#"{"a":1, "a":2}.a"#,
+        r#"{1:"a", 1u:"b"}[1]"#,
+        r#"15u in {x:1}"#,
+        r#"15 in {x:1}"#,
+        r#"15.0 in {x:1}"#,
+        r#"15u in {15u:1}"#,
+        r#"1 in {1u:2}"#,
+        r#""a" in {"a":1}"#,
+        r#"true in {true:1}"#,
+        r#"null in {x:1}"#,
+    ] {
+        if let Some(msg) = agree_repeat_if_compiles(src) {
+            failed.push(msg);
+        }
+    }
+    assert!(
+        failed.is_empty(),
+        "walker/vm disagreements:\n{}",
+        failed.join("\n")
+    );
+}
+
+/// A folded constant map must keep source-order pairs and the same
+/// duplicate-key / cross-type numeric lookup as unfolded NewMap/MapInsert.
+/// Compared with the walker (Value equality, not HashMap Debug order).
+#[test]
+fn folded_maps_and_concat_chains_agree_with_the_walker() {
+    let mut failed = Vec::new();
+    for src in [
+        r#"{"a":1, "a":2}"#,
+        r#"{1:"a", 1u:"b"}"#,
+        r#"{"a":1, "a":2}.a"#,
+        r#"{1:"a", 1u:"b"}[1]"#,
+        r#"{1u:"a", 1:"b"}[1u]"#,
+        r#"{"a": {"b": [1, 2]}}.a.b[1]"#,
+        r#"{"a":1}.b"#,
+        r#"has({"a":1}.b)"#,
+        r#"{true: 1, false: 2}[x > 3]"#,
+        r#"{"a":1, "b":2}.map(k, k).size()"#,
+        r#"{"a":1, "b":2}.all(k, k in {"a":1, "b":2})"#,
+        r#"{"k": x, "a": 1, "a": 2}"#,
+        r#"[{"a":1}, {"a":1}][0] == {"a":1}"#,
+        r#"{1: 2, 2: 3}[1] + {1: 2}[1]"#,
+        r#"{"a": 1.5, "b": b"x", "c": null}"#,
+        r#"{} == {}"#,
+        r#"size({})"#,
+        r#"{"a": []}.a + [x]"#,
+        r#""a" + "b" + "c" + "d""#,
+        r#"[1,2].map(e, "p" + string(e) + "s")"#,
+        r#"b"ab" + b"cd" + b"ef""#,
+        r#"[] + []"#,
+        r#"[x] + [x] + []"#,
+        r#"[1, 2] + ["a"]"#,
+        r#"[1u] + [1]"#,
+        r#"type([] + [])"#,
+    ] {
+        if let Some(msg) = agree_repeat_if_compiles(src) {
+            failed.push(msg);
+        }
+    }
+    assert!(
+        failed.is_empty(),
+        "walker/vm disagreements:\n{}",
+        failed.join("\n")
+    );
+}
+
 /// `AndLocal` does not write the logic slot; merge still raises NoSuchOverload
 /// when the right side is not a bool (`keep_right_merge`'s never-wrote case).
 #[test]
@@ -145,11 +272,45 @@ fn agree_repeat(src: &str) {
         .unwrap_or_else(|e| panic!("parse {src}: {e}"));
     let program = Program::compile(src).unwrap_or_else(|e| panic!("compile {src}: {e}"));
     let ctx = ctx();
-    let walker = show(&Value::resolve_value(&expr, &ctx));
+    let walker = Value::resolve_value(&expr, &ctx);
     for i in 0..3 {
-        let vm = show(&program.execute(&ctx));
-        assert_eq!(walker, vm, "`{src}` execute {i}");
+        let vm = program.execute(&ctx);
+        assert_eq!(
+            show(&walker),
+            show(&vm),
+            "`{src}` execute {i}"
+        );
+        match (&walker, &vm) {
+            (Ok(a), Ok(b)) => assert_eq!(a, b, "`{src}` execute {i} value"),
+            _ => {}
+        }
     }
+}
+
+fn agree_repeat_if_compiles(src: &str) -> Option<String> {
+    let Ok(expr) = Parser::default().parse(src) else {
+        return None;
+    };
+    let Ok(program) = Program::compile(src) else {
+        return None;
+    };
+    let ctx = ctx();
+    let walker = Value::resolve_value(&expr, &ctx);
+    for i in 0..3 {
+        let vm = program.execute(&ctx);
+        let ok = match (&walker, &vm) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => show(&walker) == show(&vm),
+        };
+        if !ok {
+            return Some(format!(
+                "`{src}` execute {i} walker={} vm={}",
+                show(&walker),
+                show(&vm)
+            ));
+        }
+    }
+    None
 }
 
 #[test]
