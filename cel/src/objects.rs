@@ -28,7 +28,7 @@ use std::convert::{Infallible, TryFrom, TryInto};
 use std::fmt::{Debug, Display, Formatter};
 use std::ops;
 use std::ops::Deref;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 #[cfg(feature = "chrono")]
 use std::sync::LazyLock;
 
@@ -60,11 +60,160 @@ static MIN_TIMESTAMP: LazyLock<chrono::DateTime<chrono::FixedOffset>> = LazyLock
         .from_utc_datetime(&naive)
 });
 
+/// Insertion-ordered map table. Lookup scans when the table is small and
+/// otherwise builds an index on the first lookup.
+pub struct MapEntries {
+    entries: Box<[(Key, Value)]>,
+    index: OnceLock<HashMap<Key, u32>>,
+}
+
+impl MapEntries {
+    /// Tables this small are scanned; larger tables build [`Self::index`] on
+    /// the first lookup.
+    const SCAN_LIMIT: usize = 8;
+
+    /// Compact `entries` with replace-on-insert: a later pair whose [`Key`]
+    /// matches an earlier one overwrites that earlier value and keeps its
+    /// position.
+    pub fn new(entries: Box<[(Key, Value)]>) -> MapEntries {
+        MapEntries {
+            entries: Self::compact_replace_on_insert(entries),
+            index: OnceLock::new(),
+        }
+    }
+
+    /// `entries` already has unique keys. The interned map replaces on
+    /// insert, so a VM-born table is unique before it is unpacked.
+    pub(crate) fn from_unique(entries: Box<[(Key, Value)]>) -> MapEntries {
+        debug_assert!(
+            Self::keys_are_unique(&entries),
+            "from_unique requires unique keys"
+        );
+        MapEntries {
+            entries,
+            index: OnceLock::new(),
+        }
+    }
+
+    #[cfg_attr(not(debug_assertions), allow(dead_code))]
+    fn keys_are_unique(entries: &[(Key, Value)]) -> bool {
+        if entries.len() <= 1 {
+            return true;
+        }
+        if entries.len() <= Self::SCAN_LIMIT {
+            return entries.iter().enumerate().all(|(i, (k, _))| {
+                let needle = k.as_keyref();
+                entries[..i].iter().all(|(ok, _)| ok.as_keyref() != needle)
+            });
+        }
+        let mut seen = HashMap::with_capacity(entries.len());
+        entries
+            .iter()
+            .all(|(k, _)| seen.insert(k.clone(), ()).is_none())
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn iter(&self) -> std::slice::Iter<'_, (Key, Value)> {
+        self.entries.iter()
+    }
+
+    fn compact_replace_on_insert(entries: Box<[(Key, Value)]>) -> Box<[(Key, Value)]> {
+        let mut entries = entries.into_vec();
+        let n = entries.len();
+        if n <= 1 {
+            return entries.into_boxed_slice();
+        }
+        let mut write = 0usize;
+        if n <= Self::SCAN_LIMIT {
+            for read in 0..n {
+                let existing = {
+                    let needle = entries[read].0.as_keyref();
+                    entries[..write]
+                        .iter()
+                        .position(|(k, _)| k.as_keyref() == needle)
+                };
+                Self::replace_or_keep(&mut entries, &mut write, read, existing);
+            }
+        } else {
+            let mut index = HashMap::with_capacity(n);
+            for read in 0..n {
+                let existing = index.get(&entries[read].0).copied().map(|i| i as usize);
+                if existing.is_none() {
+                    index.insert(entries[read].0.clone(), write as u32);
+                }
+                Self::replace_or_keep(&mut entries, &mut write, read, existing);
+            }
+        }
+        entries.truncate(write);
+        entries.into_boxed_slice()
+    }
+
+    fn replace_or_keep(
+        entries: &mut [(Key, Value)],
+        write: &mut usize,
+        read: usize,
+        existing: Option<usize>,
+    ) {
+        if let Some(i) = existing {
+            entries[i].1 = std::mem::replace(&mut entries[read].1, Value::Null);
+        } else {
+            if *write != read {
+                entries.swap(*write, read);
+            }
+            *write += 1;
+        }
+    }
+
+    fn position(&self, key: &(dyn AsKeyRef + '_)) -> Option<usize> {
+        if self.entries.len() <= Self::SCAN_LIMIT {
+            let needle = key.as_keyref();
+            return self
+                .entries
+                .iter()
+                .position(|(k, _)| k.as_keyref() == needle);
+        }
+        let index = self.index.get_or_init(|| {
+            let mut m = HashMap::with_capacity(self.entries.len());
+            for (i, (k, _)) in self.entries.iter().enumerate() {
+                m.insert(k.clone(), i as u32);
+            }
+            m
+        });
+        index.get(key).map(|&i| i as usize)
+    }
+
+    fn get_exact(&self, key: &(dyn AsKeyRef + '_)) -> Option<&Value> {
+        self.position(key).map(|i| &self.entries[i].1)
+    }
+
+    fn has_exact_key(&self, key: &(dyn AsKeyRef + '_)) -> bool {
+        self.position(key).is_some()
+    }
+}
+
+fn entries_tables_eq(a: &MapEntries, b: &MapEntries) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    if a.entries == b.entries {
+        return true;
+    }
+    a.entries
+        .iter()
+        .all(|(k, v)| b.get_exact(k).is_some_and(|o| o == v))
+}
+
 /// How a [`Map`] holds its entries -- the map counterpart of [`ListStorage`].
 #[derive(Clone)]
 pub enum MapStorage {
     /// An owned table of boxed entries.
     Object(Arc<HashMap<Key, Value>>),
+    /// Insertion-ordered pairs. Lookup scans a small table and otherwise
+    /// hashes on the first get.
+    Entries(Arc<MapEntries>),
     /// One row of a record batch. The field names and the column banks live in
     /// `schema` and are shared with every other row, so this row is an index
     /// into them and a field is boxed only when it is read.
@@ -235,6 +384,14 @@ impl Map {
         }
     }
 
+    /// A map over an insertion-ordered table. Lookup hashes only when the
+    /// table is first read and is larger than a linear scan.
+    pub fn entries(entries: Arc<MapEntries>) -> Map {
+        Map {
+            storage: MapStorage::Entries(entries),
+        }
+    }
+
     /// Record `index` of `schema`, which costs a reference count and no
     /// allocation at all.
     pub fn record(schema: Arc<RecordSchema>, index: usize) -> Map {
@@ -248,10 +405,12 @@ impl Map {
         &self.storage
     }
 
-    /// True when both maps name the same object table or the same record row.
+    /// True when both maps name the same object table, entries table, or
+    /// record row.
     pub fn ptr_eq(&self, other: &Map) -> bool {
         match (&self.storage, &other.storage) {
             (MapStorage::Object(a), MapStorage::Object(b)) => Arc::ptr_eq(a, b),
+            (MapStorage::Entries(a), MapStorage::Entries(b)) => Arc::ptr_eq(a, b),
             (
                 MapStorage::Record {
                     schema: sa,
@@ -273,9 +432,17 @@ impl Map {
         }
     }
 
+    pub(crate) fn entries_arc(&self) -> Option<&Arc<MapEntries>> {
+        match &self.storage {
+            MapStorage::Entries(a) => Some(a),
+            _ => None,
+        }
+    }
+
     pub fn len(&self) -> usize {
         match &self.storage {
             MapStorage::Object(map) => map.len(),
+            MapStorage::Entries(entries) => entries.len(),
             MapStorage::Record { schema, .. } => schema.field_count(),
         }
     }
@@ -284,7 +451,7 @@ impl Map {
         self.len() == 0
     }
 
-    pub(crate) fn contains_key(&self, key: &(dyn AsKeyRef + '_)) -> bool {
+    pub fn contains_key(&self, key: &(dyn AsKeyRef + '_)) -> bool {
         map_has_exact_key(|k| self.has_exact_key(k), key.as_keyref())
     }
 
@@ -292,6 +459,7 @@ impl Map {
         let key: &(dyn AsKeyRef + '_) = &key;
         match &self.storage {
             MapStorage::Object(map) => map.contains_key(key),
+            MapStorage::Entries(entries) => entries.has_exact_key(key),
             MapStorage::Record { schema, .. } => schema.position(key).is_some(),
         }
     }
@@ -306,6 +474,7 @@ impl Map {
     fn get_exact(&self, key: &(dyn AsKeyRef + '_)) -> Option<Cow<'_, Value>> {
         match &self.storage {
             MapStorage::Object(map) => map.get(key).map(Cow::Borrowed),
+            MapStorage::Entries(entries) => entries.get_exact(key).map(Cow::Borrowed),
             MapStorage::Record { schema, index } => {
                 let field = schema.position(key)?;
                 Some(Cow::Owned(schema.columns[field].value_at(*index)))
@@ -318,6 +487,7 @@ impl Map {
     pub fn iter(&self) -> MapIter<'_> {
         match &self.storage {
             MapStorage::Object(map) => MapIter::Object(map.iter()),
+            MapStorage::Entries(entries) => MapIter::Entries(entries.iter()),
             MapStorage::Record { schema, index } => MapIter::Record {
                 schema,
                 index: *index,
@@ -327,12 +497,12 @@ impl Map {
     }
 
     /// The entries as the owned table the rest of the language expects. Free
-    /// for [`MapStorage::Object`], and the point at which a record row pays for
-    /// the representation it was avoiding.
+    /// for [`MapStorage::Object`], and the point at which a record row or an
+    /// entries table pays for the hashed representation.
     pub fn to_hashmap(&self) -> HashMap<Key, Value> {
         match &self.storage {
             MapStorage::Object(map) => (**map).clone(),
-            MapStorage::Record { .. } => self
+            MapStorage::Entries(_) | MapStorage::Record { .. } => self
                 .iter()
                 .map(|(k, v)| (k.clone(), v.into_owned()))
                 .collect(),
@@ -342,6 +512,7 @@ impl Map {
 
 pub enum MapIter<'a> {
     Object(std::collections::hash_map::Iter<'a, Key, Value>),
+    Entries(std::slice::Iter<'a, (Key, Value)>),
     Record {
         schema: &'a RecordSchema,
         index: usize,
@@ -355,6 +526,7 @@ impl<'a> Iterator for MapIter<'a> {
     fn next(&mut self) -> Option<Self::Item> {
         match self {
             MapIter::Object(it) => it.next().map(|(k, v)| (k, Cow::Borrowed(v))),
+            MapIter::Entries(it) => it.next().map(|(k, v)| (k, Cow::Borrowed(v))),
             MapIter::Record {
                 schema,
                 index,
@@ -375,11 +547,21 @@ impl PartialEq for Map {
     fn eq(&self, other: &Self) -> bool {
         match (&self.storage, &other.storage) {
             (MapStorage::Object(a), MapStorage::Object(b)) => a == b,
+            (MapStorage::Entries(a), MapStorage::Entries(b)) => entries_tables_eq(a, b),
             _ => {
-                self.len() == other.len()
-                    && self
-                        .iter()
-                        .all(|(k, v)| other.get(k).is_some_and(|o| *o == *v))
+                if self.len() != other.len() {
+                    return false;
+                }
+                // Iterate the entries table when one side is one, so a map
+                // that is only compared never builds its lookup index.
+                let (iter_side, get_side) = match (&self.storage, &other.storage) {
+                    (MapStorage::Entries(_), _) => (self, other),
+                    (_, MapStorage::Entries(_)) => (other, self),
+                    _ => (self, other),
+                };
+                iter_side
+                    .iter()
+                    .all(|(k, v)| get_side.get(k).is_some_and(|o| *o == *v))
             }
         }
     }
@@ -1973,7 +2155,7 @@ fn resolve_inner(expr: &Expression, ctx: &Context) -> Result<Value, ExecutionErr
         }
         Expr::List(list_expr) => eval_list_literal(list_expr, ctx),
         Expr::Map(map_expr) => {
-            let mut map = HashMap::with_capacity(map_expr.entries.len());
+            let mut entries = Vec::with_capacity(map_expr.entries.len());
             for entry in map_expr.entries.iter() {
                 let (k, v, is_optional) = match &entry.expr {
                     EntryExpr::StructField(_) => panic!("WAT?"),
@@ -1981,22 +2163,22 @@ fn resolve_inner(expr: &Expression, ctx: &Context) -> Result<Value, ExecutionErr
                 };
                 let key = value_key(resolve_inner(k, ctx)?)?;
                 let value = resolve_inner(v, ctx)?;
-
-                if is_optional {
+                let stored = if is_optional {
                     match optional_view(&value) {
-                        OptView::Empty => {}
-                        OptView::Present(inner) => {
-                            map.insert(key, inner.into_public());
-                        }
-                        OptView::Plain => {
-                            map.insert(key, value.into_public());
-                        }
+                        OptView::Empty => None,
+                        OptView::Present(inner) => Some(inner.into_public()),
+                        OptView::Plain => Some(value.into_public()),
                     }
                 } else {
-                    map.insert(key, value.into_public());
+                    Some(value.into_public())
+                };
+                if let Some(stored) = stored {
+                    entries.push((key, stored));
                 }
             }
-            Ok(Value::Map(Map::object(Arc::new(map))))
+            Ok(Value::Map(Map::entries(Arc::new(MapEntries::new(
+                entries.into_boxed_slice(),
+            )))))
         }
         Expr::Comprehension(comprehension) => {
             let accu_init = resolve_inner(&comprehension.accu_init, ctx)?;
@@ -2838,6 +3020,7 @@ pub(crate) fn value_index(container: &Value, key: &Value) -> Result<Value, Execu
 fn map_keys(map: &Map) -> Vec<Value> {
     match map.storage() {
         MapStorage::Object(entries) => entries.keys().map(key_value).collect(),
+        MapStorage::Entries(entries) => entries.iter().map(|(k, _)| key_value(k)).collect(),
         MapStorage::Record { schema, .. } => schema.keys.iter().map(key_value).collect(),
     }
 }

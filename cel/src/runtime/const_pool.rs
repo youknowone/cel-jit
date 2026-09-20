@@ -274,23 +274,26 @@ impl ConstPool {
             items: block,
             length: 0,
             public: core::ptr::null(),
+            public_kind: 0,
         }) as CelRef
     }
 
     fn intern_map(&mut self, map: &Map) -> CelRef {
-        let MapStorage::Object(entries) = map.storage() else {
-            return core::ptr::null_mut();
-        };
-        let mut pairs = Vec::with_capacity(entries.len());
-        for (k, v) in entries.iter() {
-            let key = self.intern_key(k);
-            let value = self.intern_elem(v);
-            if key.is_null() || value.is_null() {
-                return core::ptr::null_mut();
+        match map.storage() {
+            MapStorage::Record { .. } => core::ptr::null_mut(),
+            MapStorage::Object(_) | MapStorage::Entries(_) => {
+                let mut pairs = Vec::with_capacity(map.len());
+                for (k, v) in map.iter() {
+                    let key = self.intern_key(k);
+                    let value = self.intern_elem(v.as_ref());
+                    if key.is_null() || value.is_null() {
+                        return core::ptr::null_mut();
+                    }
+                    pairs.push((key, value));
+                }
+                self.intern_object_map(&pairs)
             }
-            pairs.push((key, value));
         }
-        self.intern_object_map(&pairs)
     }
 
     fn intern_key(&mut self, key: &Key) -> CelRef {
@@ -330,6 +333,7 @@ impl ConstPool {
             items: block,
             length: n as i64,
             public: core::ptr::null(),
+            public_kind: 0,
         }) as CelRef
     }
 

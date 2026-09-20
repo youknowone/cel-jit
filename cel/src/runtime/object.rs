@@ -918,9 +918,12 @@ pub struct W_MapObject {
     pub items: *mut CelItemsBlock,
     /// Live entry count, not the number of references in [`Self::items`].
     pub length: i64,
-    /// Non-owning pointer at the public object-map table this leaf was
-    /// wrapped from, or null if the map was allocated by the VM.
+    /// Non-owning pointer at the public map table this leaf was wrapped
+    /// from, or null if the map was allocated by the VM.
     pub public: *const (),
+    /// Discriminator for [`Self::public`]: 0 is a `HashMap` object table,
+    /// 1 is a [`crate::objects::MapEntries`].
+    pub public_kind: u32,
 }
 
 pub static CEL_MAP_CLASS: CelClass = CelClass::new("map", CelKind::Map);
@@ -995,6 +998,7 @@ pub fn new_map_with_capacity_in(heap: &super::heap::CelHeap, cap: i64) -> *mut W
         items,
         length: 0,
         public: core::ptr::null(),
+        public_kind: 0,
     })
 }
 
@@ -1117,6 +1121,7 @@ pub fn new_map(pairs: &[(CelRef, CelRef)]) -> *mut W_MapObject {
         items,
         length,
         public: core::ptr::null(),
+        public_kind: 0,
     })
 }
 
@@ -1131,6 +1136,7 @@ pub fn new_map_record(storage: CelRef, length: i64) -> *mut W_MapObject {
         items: core::ptr::null_mut(),
         length,
         public: core::ptr::null(),
+        public_kind: 0,
     })
 }
 
