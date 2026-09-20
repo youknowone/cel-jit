@@ -1,6 +1,8 @@
 //! The code object: a compiled expression.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(feature = "jit")]
+use std::cell::{Cell, UnsafeCell};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use super::error::NameId;
@@ -8,6 +10,63 @@ use super::opcode::OpCode;
 use crate::Value;
 
 static NEXT_CODE_ID: AtomicU64 = AtomicU64::new(1);
+
+/// JIT driver this code object owns for ONE thread.
+///
+/// `owner` is claimed once by compare-exchange of a per-thread token.
+/// That thread reaches the driver through one load; every other thread
+/// uses the portal's per-thread table. `in_use` is the owner thread's
+/// re-entry flag and is never read or written by any other thread.
+///
+/// The pointer is a `Box<JitDriver<PortalState>>`. The portal installs the
+/// drop glue; this type does not name that driver.
+#[cfg(feature = "jit")]
+pub(crate) struct CodeJit {
+    pub(crate) owner: AtomicUsize,
+    pub(crate) driver: UnsafeCell<usize>,
+    pub(crate) in_use: Cell<bool>,
+    pub(crate) drop_fn: Cell<Option<unsafe fn(usize)>>,
+}
+
+// SAFETY: `owner` is atomic. `driver` and `in_use` are accessed only by
+// the thread whose token equals `owner` (the winner of the compare-exchange),
+// or by `Drop` when the last `Arc` is gone and no evaluation can hold a
+// borrow of the driver. Other threads never touch those fields; they keep
+// their own driver in the per-thread table.
+#[cfg(feature = "jit")]
+unsafe impl Send for CodeJit {}
+#[cfg(feature = "jit")]
+unsafe impl Sync for CodeJit {}
+
+#[cfg(feature = "jit")]
+impl Default for CodeJit {
+    fn default() -> Self {
+        CodeJit {
+            owner: AtomicUsize::new(0),
+            driver: UnsafeCell::new(0),
+            in_use: Cell::new(false),
+            drop_fn: Cell::new(None),
+        }
+    }
+}
+
+#[cfg(feature = "jit")]
+impl Drop for CodeJit {
+    fn drop(&mut self) {
+        let ptr = *self.driver.get_mut();
+        if ptr != 0 {
+            if let Some(drop_fn) = *self.drop_fn.get_mut() {
+                unsafe { drop_fn(ptr) };
+            }
+        }
+    }
+}
+
+/// Shared by every clone of one compiled bytecode object.
+pub(crate) struct CodeLive {
+    #[cfg(feature = "jit")]
+    pub(crate) jit: CodeJit,
+}
 
 /// Process-wide identity of one compiled bytecode object.
 ///
@@ -18,14 +77,17 @@ static NEXT_CODE_ID: AtomicU64 = AtomicU64::new(1);
 #[derive(Clone)]
 pub(crate) struct CodeIdentity {
     pub(crate) id: u64,
-    pub(crate) live: Arc<()>,
+    pub(crate) live: Arc<CodeLive>,
 }
 
 impl CodeIdentity {
     fn new() -> Self {
         CodeIdentity {
             id: NEXT_CODE_ID.fetch_add(1, Ordering::Relaxed),
-            live: Arc::new(()),
+            live: Arc::new(CodeLive {
+                #[cfg(feature = "jit")]
+                jit: CodeJit::default(),
+            }),
         }
     }
 }
@@ -90,8 +152,8 @@ pub struct CelCode {
     /// Where an error raised inside a short-circuit operator's *left* operand
     /// is caught. Innermost match wins.
     pub handlers: Vec<Handler>,
-    /// Unique id minted at compile. A clone shares it; a drop of the last
-    /// clone is the drop signal the per-thread driver table observes.
+    /// Unique id minted at compile. A clone shares it, and with it the JIT
+    /// driver the portal stored on first evaluation.
     pub(crate) identity: CodeIdentity,
 }
 

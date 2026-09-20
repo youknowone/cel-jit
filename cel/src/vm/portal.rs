@@ -1156,7 +1156,7 @@ fn portal_threshold() -> u32 {
 
 struct DriverEntry {
     id: u64,
-    live: std::sync::Weak<()>,
+    live: std::sync::Weak<super::code::CodeLive>,
     driver: JitDriver<PortalState>,
 }
 
@@ -1185,7 +1185,7 @@ impl PortalTable {
     fn index_for(
         &mut self,
         id: u64,
-        live: &std::sync::Arc<()>,
+        live: &std::sync::Arc<super::code::CodeLive>,
         state: &mut PortalState,
         code: &CelCode,
     ) -> usize {
@@ -1210,14 +1210,19 @@ impl PortalTable {
 }
 
 thread_local! {
-    /// One driver per live `CelCode` this thread has evaluated.
-    ///
-    /// Keyed by the code object's minted id, never by address. `JitDriver`
-    /// is not `Send`; `Program` is shared across threads, so the table stays
-    /// thread-local. A clone of a `CelCode` shares the id. Dead entries are
-    /// dropped on insert, when the last clone's liveness flag is gone.
+    /// Address of this byte is this thread's owner token. Const-initialised,
+    /// so the first `with` is a TLS lookup, not a constructor.
+    static OWNER_TOKEN: u8 = const { 0u8 };
+    /// Drivers for programs this thread did not claim. Keyed by code id.
+    /// `JitDriver` is not `Send`; a program another thread owns is reached
+    /// through this table instead of the code-owned pointer.
     static PORTAL_DRIVER: std::cell::RefCell<PortalTable> =
         const { std::cell::RefCell::new(PortalTable::new()) };
+}
+
+#[inline(always)]
+fn thread_owner_token() -> usize {
+    OWNER_TOKEN.with(|b| b as *const u8 as usize)
 }
 
 pub(crate) fn driver_table_len() -> usize {
@@ -1237,6 +1242,69 @@ fn fresh_portal_driver(state: &mut PortalState, code: &CelCode) -> JitDriver<Por
     driver
 }
 
+unsafe fn drop_portal_driver(ptr: usize) {
+    drop(Box::from_raw(ptr as *mut JitDriver<PortalState>));
+}
+
+/// The driver stored on `code`, created on first use by the owner thread.
+///
+/// # Safety
+///
+/// The caller is the owner thread and `jit.in_use` is true for the
+/// duration of the returned borrow, so no other call holds a mutable
+/// reference to the same driver.
+unsafe fn driver_on_code<'a>(
+    jit: &'a super::code::CodeJit,
+    state: &mut PortalState,
+    code: &CelCode,
+) -> &'a mut JitDriver<PortalState> {
+    let slot = &mut *jit.driver.get();
+    if *slot == 0 {
+        let boxed = Box::new(fresh_portal_driver(state, code));
+        jit.drop_fn.set(Some(drop_portal_driver));
+        *slot = Box::into_raw(boxed) as usize;
+    }
+    &mut *(*slot as *mut JitDriver<PortalState>)
+}
+
+#[inline(always)]
+fn run_owned_driver(
+    jit: &super::code::CodeJit,
+    code: &CelCode,
+    state: &mut PortalState,
+) -> i64 {
+    if jit.in_use.get() {
+        let mut driver = fresh_portal_driver(state, code);
+        return run_cel_portal(&mut driver, code, state, 0);
+    }
+    jit.in_use.set(true);
+    let in_use = &jit.in_use as *const std::cell::Cell<bool>;
+    struct Guard(*const std::cell::Cell<bool>);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            unsafe { (*self.0).set(false) };
+        }
+    }
+    let _g = Guard(in_use);
+    let driver = unsafe { driver_on_code(jit, state, code) };
+    run_cel_portal(driver, code, state, 0)
+}
+
+fn run_table_driver(code: &CelCode, state: &mut PortalState) -> i64 {
+    let id = code.identity.id;
+    let live = &code.identity.live;
+    PORTAL_DRIVER.with(|slot| match slot.try_borrow_mut() {
+        Ok(mut table) => {
+            let i = table.index_for(id, live, state, code);
+            run_cel_portal(&mut table.entries[i].driver, code, state, 0)
+        }
+        Err(_) => {
+            let mut driver = fresh_portal_driver(state, code);
+            run_cel_portal(&mut driver, code, state, 0)
+        }
+    })
+}
+
 /// Evaluate `code` through the portal loop.
 #[inline(always)]
 pub(crate) fn eval_through_portal(
@@ -1250,22 +1318,25 @@ pub(crate) fn eval_through_portal(
     };
     // Census is not installed here — that hook is process-global and
     // would clobber the columnar machine.
-    let id = code.identity.id;
-    let live = &code.identity.live;
-    let bits = PORTAL_DRIVER.with(|slot| {
-        match slot.try_borrow_mut() {
-            Ok(mut table) => {
-                let i = table.index_for(id, live, &mut state, code);
-                run_cel_portal(&mut table.entries[i].driver, code, &mut state, 0)
-            }
-            Err(_) => {
-                // Outer portal still holds the cell; a host re-entry uses a
-                // throwaway driver.
-                let mut driver = fresh_portal_driver(&mut state, code);
-                run_cel_portal(&mut driver, code, &mut state, 0)
-            }
+    let jit = &code.identity.live.jit;
+    let token = thread_owner_token();
+    let owner = jit.owner.load(std::sync::atomic::Ordering::Acquire);
+    let bits = if owner == token {
+        run_owned_driver(jit, code, &mut state)
+    } else if owner == 0 {
+        match jit.owner.compare_exchange(
+            0,
+            token,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        ) {
+            Ok(_) => run_owned_driver(jit, code, &mut state),
+            Err(actual) if actual == token => run_owned_driver(jit, code, &mut state),
+            Err(_) => run_table_driver(code, &mut state),
         }
-    });
+    } else {
+        run_table_driver(code, &mut state)
+    };
     match bits {
         PORTAL_DONE => match vm.portal_ret.take() {
             Some(Ok(value)) => Ok(value),

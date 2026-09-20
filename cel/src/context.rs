@@ -207,6 +207,49 @@ impl<'a> Context<'a> {
         self.lookup_raw(name.as_ref()).map(public_form)
     }
 
+    /// The interned leaf stored under `name`, without cloning the public
+    /// [`Value`]. A miss, or a binding with no leaf, is `None`.
+    pub(crate) fn lookup_interned(&self, name: &str) -> Option<crate::runtime::object::CelRef> {
+        fn leaf_of(v: &Value) -> Option<crate::runtime::object::CelRef> {
+            match v {
+                Value::Interned(w) => Some(*w),
+                other => crate::runtime::convert::intern_leaf(other),
+            }
+        }
+        let from_resolver =
+            |resolver: &Option<&'a dyn VariableResolver>| resolver.and_then(|r| r.resolve(name));
+        match self {
+            Context::Child {
+                variables,
+                parent,
+                resolver,
+                ..
+            } => {
+                if let Some(v) = from_resolver(resolver) {
+                    return leaf_of(&v);
+                }
+                variables
+                    .get(name)
+                    .and_then(leaf_of)
+                    .or_else(|| parent.lookup_interned(name))
+            }
+            Context::Root {
+                variables,
+                resolver,
+                ..
+            } => {
+                if let Some(v) = from_resolver(resolver) {
+                    return leaf_of(&v);
+                }
+                variables.get(name).and_then(leaf_of).or_else(|| {
+                    crate::common::types::r#type::type_ident(name)
+                        .as_ref()
+                        .and_then(leaf_of)
+                })
+            }
+        }
+    }
+
     /// The value stored under `name`, still interned if wrap-at-bind interned
     /// it. Loads inside an evaluation use this so they stay a pointer copy.
     pub(crate) fn lookup_raw(&self, name: &str) -> Option<Value> {

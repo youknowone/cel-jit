@@ -692,6 +692,14 @@ std::thread_local! {
     static SCRATCH: std::cell::Cell<Option<Box<Scratch>>> = const { std::cell::Cell::new(None) };
 }
 
+fn take_scratch_box() -> Box<Scratch> {
+    SCRATCH
+        .try_with(std::cell::Cell::take)
+        .ok()
+        .flatten()
+        .unwrap_or_default()
+}
+
 pub(crate) struct Vm<'a> {
     code: &'a CelCode,
     ctx: &'a Context<'a>,
@@ -713,17 +721,13 @@ pub(crate) struct Vm<'a> {
     /// Sized once per run: the locals, then capacity for `max_stack` more,
     /// the compiler's proof of how deep the stack goes.
     ///
-    /// Taken out of the pool's box by `Vm::new` and put back by [`Drop`]:
-    /// the one buffer every instruction touches is a field of the record
-    /// the loop already holds, not a load away through the box.
+    /// Taken out of the pool's box by residual hydrate and put back by
+    /// [`Drop`]. Interned-only evaluation never constructs this vector.
     frame: Vec<Operand>,
-    /// The pool's box, holding the two buffers a run needs less often, and
-    /// the empty twin of `frame` until [`Drop`] returns it. `Vm::new` moves
-    /// one pointer in and [`Drop`] moves one pointer back out. Measured the
-    /// other way -- take all three buffers out, swap them back -- and the
-    /// moves plus the drops of the emptied twins were a third of the fixed
-    /// price of evaluating `1`.
-    scratch: std::mem::ManuallyDrop<Box<Scratch>>,
+    /// The pool's box. `None` until a residual instruction hydrates, so an
+    /// interned-only evaluation does not take or return the thread-local
+    /// pool.
+    scratch: Option<Box<Scratch>>,
     /// Where the operand stack begins in `frame`: `n_slots`.
     stack_base: usize,
     /// `PyFrame` virtualizable: `last_instr`, `valuestackdepth`,
@@ -776,16 +780,13 @@ pub(crate) struct Vm<'a> {
 /// exactly as long as a run holds it.
 impl Drop for Vm<'_> {
     fn drop(&mut self) {
-        // SAFETY: taken exactly once, here, and nothing reads the field
-        // afterwards: this is the drop. `ManuallyDrop` is what lets the box
-        // leave a type that implements `Drop` without a placeholder that
-        // would itself have to be built or dropped.
-        let mut scratch = unsafe { std::mem::ManuallyDrop::take(&mut self.scratch) };
-        scratch.frame = std::mem::take(&mut self.frame);
-        scratch.release();
-        // Dropped rather than pooled where the slot is already gone; see
-        // `SCRATCH`.
-        let _ = SCRATCH.try_with(|slot| slot.set(Some(scratch)));
+        if let Some(mut scratch) = self.scratch.take() {
+            scratch.frame = std::mem::take(&mut self.frame);
+            scratch.release();
+            // Dropped rather than pooled where the slot is already gone; see
+            // `SCRATCH`.
+            let _ = SCRATCH.try_with(|slot| slot.set(Some(scratch)));
+        }
     }
 }
 
@@ -798,30 +799,30 @@ impl<'a> Vm<'a> {
     /// thread that has evaluated anything before, the capacity is already
     /// there and none of this allocates.
     fn new(code: &'a CelCode, ctx: &'a Context<'a>, heap: &crate::runtime::heap::CelHeap) -> Self {
-        let mut scratch = SCRATCH
-            .try_with(std::cell::Cell::take)
-            .ok()
-            .flatten()
-            .unwrap_or_default();
         let stack_base = code.n_slots as usize;
-        let mut frame = std::mem::take(&mut scratch.frame);
-        // Each sizing call is out of line and most programs need neither:
-        // a scalar expression has no locals and no `&&`/`||`.
-        if stack_base > 0 {
-            frame.resize_with(stack_base, || Operand::NULL);
-        }
-        frame.reserve(code.max_stack as usize);
-        if code.n_logic > 0 {
-            scratch
-                .logic
-                .resize(code.n_logic as usize, Err(CelErr::InternalError));
-        }
         let cel_frame = new_cel_frame_in(heap, code.n_slots as i64, code.max_stack as i64);
+        #[cfg(feature = "jit")]
+        let (frame, scratch) = (Vec::new(), None);
+        #[cfg(not(feature = "jit"))]
+        let (frame, scratch) = {
+            let mut scratch = take_scratch_box();
+            let mut frame = std::mem::take(&mut scratch.frame);
+            if stack_base > 0 {
+                frame.resize_with(stack_base, || Operand::NULL);
+            }
+            frame.reserve(code.max_stack as usize);
+            if code.n_logic > 0 {
+                scratch
+                    .logic
+                    .resize(code.n_logic as usize, Err(CelErr::InternalError));
+            }
+            (frame, Some(scratch))
+        };
         Vm {
             code,
             ctx,
             frame,
-            scratch: std::mem::ManuallyDrop::new(scratch),
+            scratch,
             stack_base,
             cel_frame,
             heap: heap as *const crate::runtime::heap::CelHeap,
@@ -851,8 +852,9 @@ impl<'a> Vm<'a> {
     #[cold]
     #[inline(never)]
     fn park(&mut self, err: ExecutionError) -> CelErr {
-        let id = u32::try_from(self.scratch.cold.len()).unwrap_or(u32::MAX);
-        self.scratch.cold.push(err);
+        let scratch = self.scratch_mut();
+        let id = u32::try_from(scratch.cold.len()).unwrap_or(u32::MAX);
+        scratch.cold.push(err);
         CelErr::Cold(ColdId(id))
     }
 
@@ -865,8 +867,10 @@ impl<'a> Vm<'a> {
     /// discarded `Cold` is always the last entry.
     fn unpark(&mut self, err: CelErr) {
         if let CelErr::Cold(ColdId(id)) = err {
-            if id as usize + 1 == self.scratch.cold.len() {
-                self.scratch.cold.pop();
+            if let Some(scratch) = self.scratch.as_mut() {
+                if id as usize + 1 == scratch.cold.len() {
+                    scratch.cold.pop();
+                }
             }
         }
     }
@@ -890,10 +894,7 @@ impl<'a> Vm<'a> {
     }
 
     pub(crate) fn intern_context_var(&self, name: &str) -> Option<CelRef> {
-        match self.ctx.lookup_raw(name)? {
-            Value::Interned(w) => Some(w),
-            other => intern_leaf(&other),
-        }
+        self.ctx.lookup_interned(name)
     }
 
     pub(crate) fn interned_unary_bits(&self, name: &str, w: CelRef) -> i64 {
@@ -950,8 +951,8 @@ impl<'a> Vm<'a> {
         match err {
             CelErr::Cold(ColdId(id)) => self
                 .scratch
-                .cold
-                .get(id as usize)
+                .as_ref()
+                .and_then(|s| s.cold.get(id as usize))
                 .cloned()
                 .unwrap_or_else(|| ExecutionError::InternalError("cold error lost".to_string())),
             CelErr::NoSuchOverload => ExecutionError::NoSuchOverload,
@@ -1012,7 +1013,37 @@ impl<'a> Vm<'a> {
 
     #[inline]
     pub(crate) fn logic_copy(&self, slot: u32) -> Option<CelResult<bool>> {
-        self.scratch.logic.get(slot as usize).copied()
+        match self.scratch.as_ref() {
+            Some(s) => s.logic.get(slot as usize).copied(),
+            None if (slot as usize) < self.code.n_logic as usize => {
+                Some(Err(CelErr::InternalError))
+            }
+            None => None,
+        }
+    }
+
+    fn scratch_mut(&mut self) -> &mut Scratch {
+        self.ensure_scratch();
+        self.scratch.as_mut().expect("ensure_scratch filled the pool")
+    }
+
+    fn ensure_scratch(&mut self) {
+        if self.scratch.is_some() {
+            return;
+        }
+        let mut scratch = take_scratch_box();
+        let mut frame = std::mem::take(&mut scratch.frame);
+        if self.stack_base > 0 && frame.len() < self.stack_base {
+            frame.resize_with(self.stack_base, || Operand::NULL);
+        }
+        frame.reserve(self.code.max_stack as usize);
+        if self.code.n_logic > 0 {
+            scratch
+                .logic
+                .resize(self.code.n_logic as usize, Err(CelErr::InternalError));
+        }
+        self.frame = frame;
+        self.scratch = Some(scratch);
     }
 
     #[inline]
@@ -1027,6 +1058,7 @@ impl<'a> Vm<'a> {
     /// interned slots from the cells. A builder operand has no leaf and
     /// keeps its existing variant: its cell is null and is not overwritten.
     pub(crate) fn hydrate_from_cells(&mut self) {
+        self.ensure_scratch();
         unsafe {
             let vdepth = (*self.cel_frame).valuestackdepth as usize;
             let cap = (*self.cel_frame).locals_stack_w.capacity();
@@ -1080,6 +1112,7 @@ impl<'a> Vm<'a> {
 
     #[inline(always)]
     fn push_operand(&mut self, operand: Operand) {
+        self.ensure_scratch();
         let index = self.frame.len();
         let w = Self::vable_cell(&operand);
         self.frame.push(operand);
@@ -1093,7 +1126,7 @@ impl<'a> Vm<'a> {
     /// a value pays for closing it.
     #[inline(always)]
     fn pop_operand(&mut self) -> Option<Operand> {
-        if self.frame.len() == self.stack_base {
+        if self.frame.len() <= self.stack_base {
             return None;
         }
         let index = self.frame.len() - 1;
@@ -1129,7 +1162,7 @@ impl<'a> Vm<'a> {
 
     /// How many operands are held.
     fn depth(&self) -> usize {
-        self.frame.len() - self.stack_base
+        self.frame.len().saturating_sub(self.stack_base)
     }
 
     /// Drop every operand above `depth`.
@@ -1803,6 +1836,7 @@ impl<'a> Vm<'a> {
     // -- the loop -----------------------------------------------------------
 
     pub(crate) fn run(&mut self) -> CelResult<Value> {
+        self.ensure_scratch();
         unsafe {
             force_virtualizable_if_necessary(self.cel_frame);
         }
@@ -1861,7 +1895,7 @@ impl<'a> Vm<'a> {
             return Err(err);
         };
         *self
-            .scratch
+            .scratch_mut()
             .logic
             .get_mut(logic as usize)
             .ok_or(CelErr::InternalError)? = Err(err);
@@ -2682,7 +2716,7 @@ impl<'a> Vm<'a> {
                     as_bool(&accu)
                 };
                 *self
-                    .scratch
+                    .scratch_mut()
                     .logic
                     .get_mut(b as usize)
                     .ok_or(CelErr::InternalError)? = outcome;
@@ -2720,7 +2754,7 @@ impl<'a> Vm<'a> {
                 let outcome = as_bool(&value);
                 self.discard(value);
                 *self
-                    .scratch
+                    .scratch_mut()
                     .logic
                     .get_mut(a as usize)
                     .ok_or(CelErr::InternalError)? = outcome;
@@ -2733,8 +2767,8 @@ impl<'a> Vm<'a> {
                 let right = self.pop()?;
                 let left = *self
                     .scratch
-                    .logic
-                    .get(a as usize)
+                    .as_ref()
+                    .and_then(|s| s.logic.get(a as usize))
                     .ok_or(CelErr::InternalError)?;
                 let value = merge(left, &right, op == OpCode::OrMerge)?;
                 self.discard(right);
@@ -4860,10 +4894,10 @@ mod tests {
             Value::list(vec![Value::Bool(false); 64]),
             "the loop has to actually run 64 times"
         );
+        let parked = vm.scratch.as_ref().map(|s| s.cold.len()).unwrap_or(0);
         assert!(
-            vm.scratch.cold.len() <= 1,
-            "64 absorbed errors left {} parked",
-            vm.scratch.cold.len()
+            parked <= 1,
+            "64 absorbed errors left {parked} parked"
         );
     }
 

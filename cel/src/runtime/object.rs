@@ -1181,14 +1181,19 @@ pub fn new_cel_frame(n_slots: i64, max_stack: i64) -> *mut W_CelFrame {
 }
 
 /// Allocate a frame on `heap`.
+///
+/// The block is `n_slots + max_stack` cells. Locals (`0..n_slots`) start
+/// null so a residual hydrate can scan them; stack cells are written
+/// before they are read and are left uninitialised.
 #[inline(always)]
 pub fn new_cel_frame_in(
     heap: &crate::runtime::heap::CelHeap,
     n_slots: i64,
     max_stack: i64,
 ) -> *mut W_CelFrame {
-    let cap = (n_slots + max_stack).max(0) as usize;
-    let items = object_array::new_items_block_zeroed_in(heap, cap);
+    let n_slots_us = n_slots.max(0) as usize;
+    let cap = n_slots_us.saturating_add(max_stack.max(0) as usize);
+    let items = object_array::new_items_block_with_zeroed_prefix_in(heap, cap, n_slots_us);
     heap.alloc(W_CelFrame {
         ob_header: CelObject {
             ob_type: &CEL_FRAME_CLASS,

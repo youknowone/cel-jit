@@ -587,7 +587,11 @@ pub fn enter_eval() -> EvalScope {
 
 fn to_public(v: crate::Value) -> crate::Value {
     match v {
-        crate::Value::Interned(w) => crate::Value::from_interned(w).unpack(),
+        crate::Value::Interned(w) => match unsafe { crate::runtime::convert::ref_to_value(w) } {
+            Ok(crate::Value::Interned(_)) => crate::Value::Null,
+            Ok(public) => public,
+            Err(_) => crate::Value::Null,
+        },
         other => other,
     }
 }

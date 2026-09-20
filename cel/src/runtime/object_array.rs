@@ -242,11 +242,14 @@ pub fn new_items_block(values: &[CelRef]) -> *mut CelItemsBlock {
     super::heap::with_heap(|h| new_items_block_in(h, values))
 }
 
-/// An items block of `cap` null slots on `heap`.
-///
-/// The slots are written in place so a caller does not need a side `Vec` of
-/// nulls — that `Vec` was one global-allocator call per evaluation.
-pub fn new_items_block_zeroed_in(heap: &super::heap::CelHeap, cap: usize) -> *mut CelItemsBlock {
+/// An items block of `cap` slots on `heap`, with the first `zero_n` written
+/// null. Slots past `zero_n` are uninitialised; the caller writes them
+/// before anything reads them.
+pub fn new_items_block_with_zeroed_prefix_in(
+    heap: &super::heap::CelHeap,
+    cap: usize,
+    zero_n: usize,
+) -> *mut CelItemsBlock {
     let block = unsafe {
         alloc_block_in(
             heap,
@@ -256,15 +259,26 @@ pub fn new_items_block_zeroed_in(heap: &super::heap::CelHeap, cap: usize) -> *mu
             cap,
         )
     } as *mut CelItemsBlock;
-    unsafe {
-        let base = items_block_items_base(block);
-        let mut i = 0;
-        while i < cap {
-            *base.add(i) = core::ptr::null_mut();
-            i += 1;
+    let n = zero_n.min(cap);
+    if n > 0 {
+        unsafe {
+            let base = items_block_items_base(block);
+            let mut i = 0;
+            while i < n {
+                *base.add(i) = core::ptr::null_mut();
+                i += 1;
+            }
         }
     }
     block
+}
+
+/// An items block of `cap` null slots on `heap`.
+///
+/// The slots are written in place so a caller does not need a side `Vec` of
+/// nulls — that `Vec` was one global-allocator call per evaluation.
+pub fn new_items_block_zeroed_in(heap: &super::heap::CelHeap, cap: usize) -> *mut CelItemsBlock {
+    new_items_block_with_zeroed_prefix_in(heap, cap, cap)
 }
 
 /// An items block of `cap` null slots on this thread's heap.
