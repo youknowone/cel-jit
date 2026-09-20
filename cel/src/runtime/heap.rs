@@ -19,7 +19,9 @@
 //!
 //! **It does not walk objects.** The nursery is reclaimed by resetting a bump
 //! pointer when the outermost evaluation on this thread finishes; old space
-//! is not reclaimed until the heap is dropped. There is still no root walker,
+//! is not reclaimed until the heap is dropped. Objects wrapped at bind live
+//! in a [`BindRegion`] owned by the [`crate::Context`] that bound them and
+//! are released when that Context is dropped. There is still no root walker,
 //! so nothing is copied except the evaluation result at the public door.
 //!
 //! That is a bound rather than a fix, and it is worth being exact about the
@@ -51,6 +53,7 @@ use core::alloc::Layout;
 use core::any::Any;
 use core::cell::{Cell, RefCell};
 use core::marker::PhantomData;
+use core::ptr::{null_mut, NonNull};
 
 /// Bytes per segment.
 ///
@@ -68,9 +71,17 @@ const NURSERY_KEEP_SEGMENTS: usize = 2;
 #[cfg(debug_assertions)]
 const NURSERY_POISON: u8 = 0xDB;
 
+/// Bind regions kept after a Context drops, so the next wrap on this
+/// thread reuses the chunk instead of asking the allocator again.
+const SPARE_REGIONS: usize = 2;
+
 /// High bit on a [`CelHeap::push_host`] index: the host sits in the
 /// evaluation-scoped table and is dropped when the outermost scope resets.
 const YOUNG_HOST_BIT: i64 = 1 << 62;
+
+/// Host parked in a [`BindRegion`]. The next 29 bits are the region's id
+/// on this heap; the low 32 bits are the slot in that region's table.
+const REGION_HOST_BIT: i64 = 1 << 61;
 
 /// Carrier for the compile-time refusal of a type this heap cannot own.
 ///
@@ -245,19 +256,143 @@ impl Space {
             }
         }
     }
+
+    #[cfg(debug_assertions)]
+    fn poison_all(&self) {
+        let mut segs = self.segments.borrow_mut();
+        if let Some(open) = segs.last_mut() {
+            open.used = self.open_used.get();
+        }
+        for seg in segs.iter_mut() {
+            seg.poison_from(0);
+        }
+    }
+}
+
+/// Chunk list a [`crate::Context`] allocates bind-wrapped leaves from.
+///
+/// Dropping it poisons the chunks in debug builds and releases them in
+/// O(chunks). Immortal singletons are not allocated here.
+#[doc(hidden)]
+pub struct BindRegion {
+    space: Space,
+    hosts: RefCell<Vec<Box<dyn Any>>>,
+    heap: Cell<*const CelHeap>,
+    id: Cell<u32>,
+}
+
+impl BindRegion {
+    pub fn new() -> BindRegion {
+        BindRegion {
+            space: Space::new(),
+            hosts: RefCell::new(Vec::new()),
+            heap: Cell::new(core::ptr::null()),
+            id: Cell::new(0),
+        }
+    }
+
+    #[inline]
+    fn bump(&self, size: usize, align: usize) -> *mut u8 {
+        self.space.bump(size, align)
+    }
+
+    fn contains(&self, p: usize) -> bool {
+        self.space.contains(p)
+    }
+
+    fn push_host(&self, host: Box<dyn Any>) -> i64 {
+        let mut hosts = self.hosts.borrow_mut();
+        let idx = hosts.len() as i64;
+        hosts.push(host);
+        REGION_HOST_BIT | ((self.id.get() as i64) << 32) | idx
+    }
+
+    fn rewind(&self) {
+        #[cfg(debug_assertions)]
+        self.space.poison_all();
+        let mut segs = self.space.segments.borrow_mut();
+        for seg in segs.iter_mut() {
+            seg.used = 0;
+        }
+        drop(segs);
+        self.space.bytes.set(0);
+        self.space.objects.set(0);
+        self.space.sync_open();
+        self.space.open_used.set(0);
+        self.hosts.borrow_mut().clear();
+        self.id.set(0);
+        self.heap.set(core::ptr::null());
+    }
+}
+
+impl Drop for BindRegion {
+    fn drop(&mut self) {
+        let heap = self.heap.get();
+        if !heap.is_null() {
+            unsafe { (*heap).detach_region(self) };
+        }
+        #[cfg(debug_assertions)]
+        self.space.poison_all();
+    }
+}
+
+/// `Option<Box<BindRegion>>` that returns the box to this thread's heap
+/// spare on drop, so the next Context reuses the chunk.
+#[doc(hidden)]
+pub struct BindRegionSlot {
+    inner: Option<Box<BindRegion>>,
+}
+
+impl BindRegionSlot {
+    pub(crate) const fn empty() -> BindRegionSlot {
+        BindRegionSlot { inner: None }
+    }
+
+    pub(crate) fn get_or_insert(&mut self) -> *mut BindRegion {
+        self.inner
+            .get_or_insert_with(take_bind_region)
+            .as_mut() as *mut BindRegion
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_none(&self) -> bool {
+        self.inner.is_none()
+    }
+}
+
+impl Drop for BindRegionSlot {
+    fn drop(&mut self) {
+        if let Some(region) = self.inner.take() {
+            recycle_bind_region(region);
+        }
+    }
+}
+
+fn take_bind_region() -> Box<BindRegion> {
+    HEAP.with(|h| h.take_spare_region())
+        .unwrap_or_else(|| Box::new(BindRegion::new()))
+}
+
+fn recycle_bind_region(region: Box<BindRegion>) {
+    let heap = region.heap.get();
+    if heap.is_null() {
+        return;
+    }
+    unsafe { (*heap).recycle_region(region) };
 }
 
 /// One thread's value heap.
 ///
 /// Not `Send` and not `Sync`. Two spaces: old lives until the heap is
 /// dropped; the nursery is reset when the outermost evaluation on this
-/// thread finishes.
+/// thread finishes. Bind-wrapped objects live in [`BindRegion`]s attached
+/// here so [`contains`] can see them while the owning Context lives.
 pub struct CelHeap {
     old: Space,
     nursery: Space,
     /// Outermost-evaluation nesting. Zero means no evaluation is running.
     depth: Cell<u32>,
-    /// Nested `with_old_space` calls force allocation into old.
+    /// Nested `with_old_space` / [`with_bind_region`] calls skip the nursery.
     force_old: Cell<u32>,
     snap_len: Cell<usize>,
     snap_used: Cell<usize>,
@@ -273,6 +408,12 @@ pub struct CelHeap {
     /// hosts are dropped when the outermost evaluation resets.
     hosts: RefCell<Vec<Box<dyn Any>>>,
     young_hosts: RefCell<Vec<Box<dyn Any>>>,
+    /// Region wrap-at-bind is filling. Only consulted on the old-space path.
+    bind_region: Cell<*mut BindRegion>,
+    /// Live Context regions, so [`contains`] and region-host lookup see them.
+    regions: RefCell<Vec<NonNull<BindRegion>>>,
+    next_region_id: Cell<u32>,
+    spare_regions: RefCell<Vec<Box<BindRegion>>>,
 }
 
 impl CelHeap {
@@ -291,6 +432,48 @@ impl CelHeap {
             nursery_high_water: Cell::new(0),
             hosts: RefCell::new(Vec::new()),
             young_hosts: RefCell::new(Vec::new()),
+            bind_region: Cell::new(null_mut()),
+            regions: RefCell::new(Vec::new()),
+            next_region_id: Cell::new(0),
+            spare_regions: RefCell::new(Vec::new()),
+        }
+    }
+
+    #[cold]
+    fn attach_region(&self, region: *mut BindRegion) {
+        let region = unsafe { &*region };
+        if !region.heap.get().is_null() {
+            return;
+        }
+        region.heap.set(self as *const CelHeap);
+        let id = self.next_region_id.get().wrapping_add(1).max(1);
+        self.next_region_id.set(id);
+        region.id.set(id);
+        self.regions
+            .borrow_mut()
+            .push(unsafe { NonNull::new_unchecked(region as *const BindRegion as *mut BindRegion) });
+    }
+
+    #[cold]
+    fn detach_region(&self, region: *mut BindRegion) {
+        self.regions.borrow_mut().retain(|r| r.as_ptr() != region);
+        if self.bind_region.get() == region {
+            self.bind_region.set(null_mut());
+        }
+    }
+
+    #[cold]
+    fn take_spare_region(&self) -> Option<Box<BindRegion>> {
+        self.spare_regions.borrow_mut().pop()
+    }
+
+    #[cold]
+    fn recycle_region(&self, mut region: Box<BindRegion>) {
+        self.detach_region(region.as_mut());
+        region.rewind();
+        let mut spare = self.spare_regions.borrow_mut();
+        if spare.len() < SPARE_REGIONS {
+            spare.push(region);
         }
     }
 
@@ -444,6 +627,10 @@ impl CelHeap {
     #[cold]
     #[inline(never)]
     fn alloc_raw_slow(&self, size: usize, align: usize) -> *mut u8 {
+        let region = self.bind_region.get();
+        if !region.is_null() {
+            return unsafe { (*region).bump(size, align) };
+        }
         self.old.bump(size, align)
     }
 
@@ -454,14 +641,29 @@ impl CelHeap {
     }
 
     /// Objects handed out that are still live: old space plus the current
-    /// nursery bump. A reset drops the nursery contribution.
+    /// nursery bump plus attached bind regions. A reset drops the nursery
+    /// contribution; dropping a Context drops its region.
     pub fn allocated_objects(&self) -> u64 {
-        self.old.objects.get() + self.nursery.objects.get()
+        self.old.objects.get()
+            + self.nursery.objects.get()
+            + self
+                .regions
+                .borrow()
+                .iter()
+                .map(|r| unsafe { r.as_ref().space.objects.get() })
+                .sum::<u64>()
     }
 
     /// Bytes handed out that are still live, excluding alignment padding.
     pub fn allocated_bytes(&self) -> u64 {
-        self.old.bytes.get() + self.nursery.bytes.get()
+        self.old.bytes.get()
+            + self.nursery.bytes.get()
+            + self
+                .regions
+                .borrow()
+                .iter()
+                .map(|r| unsafe { r.as_ref().space.bytes.get() })
+                .sum::<u64>()
     }
 
     /// Old-space bytes. Unchanged by an evaluation that only uses the nursery.
@@ -485,7 +687,8 @@ impl CelHeap {
     }
 
     /// Park `host` and return its index. During an evaluation the host is
-    /// young and is dropped on reset; otherwise it lives as long as the heap.
+    /// young and is dropped on reset; during wrap it is parked on the active
+    /// bind region; otherwise it lives as long as the heap.
     pub fn push_host(&self, host: Box<dyn Any>) -> i64 {
         if self.in_nursery() {
             let mut hosts = self.young_hosts.borrow_mut();
@@ -493,6 +696,8 @@ impl CelHeap {
             hosts.push(host);
             self.young_host_n.set(hosts.len());
             idx | YOUNG_HOST_BIT
+        } else if !self.bind_region.get().is_null() {
+            unsafe { (*self.bind_region.get()).push_host(host) }
         } else {
             let mut hosts = self.hosts.borrow_mut();
             let idx = hosts.len() as i64;
@@ -507,6 +712,19 @@ impl CelHeap {
             let hosts = self.young_hosts.borrow();
             let slot = hosts.get((idx & !YOUNG_HOST_BIT) as usize)?;
             Some(f(slot.as_ref()))
+        } else if idx & REGION_HOST_BIT != 0 {
+            let id = ((idx & !REGION_HOST_BIT) >> 32) as u32;
+            let local = (idx as u32) as usize;
+            let regions = self.regions.borrow();
+            for region in regions.iter() {
+                let region = unsafe { region.as_ref() };
+                if region.id.get() == id {
+                    let hosts = region.hosts.borrow();
+                    let slot = hosts.get(local)?;
+                    return Some(f(slot.as_ref()));
+                }
+            }
+            None
         } else {
             let hosts = self.hosts.borrow();
             let slot = hosts.get(idx as usize)?;
@@ -514,15 +732,27 @@ impl CelHeap {
         }
     }
 
-    /// How many host objects this heap is holding, both spaces.
+    /// How many host objects this heap is holding, both spaces and regions.
     pub fn host_count(&self) -> usize {
-        self.hosts.borrow().len() + self.young_hosts.borrow().len()
+        let region_hosts = self
+            .regions
+            .borrow()
+            .iter()
+            .map(|r| unsafe { r.as_ref().hosts.borrow().len() })
+            .sum::<usize>();
+        self.hosts.borrow().len() + self.young_hosts.borrow().len() + region_hosts
     }
 
-    /// Whether `ptr` lies in live old or live nursery memory.
+    /// Whether `ptr` lies in live old, live nursery, or a live bind region.
     pub fn contains(&self, ptr: *const u8) -> bool {
         let p = ptr as usize;
-        self.old.contains(p) || self.nursery.contains(p)
+        self.old.contains(p)
+            || self.nursery.contains(p)
+            || self
+                .regions
+                .borrow()
+                .iter()
+                .any(|r| unsafe { r.as_ref().contains(p) })
     }
 
     /// Whether `ptr` is live nursery memory.
@@ -684,6 +914,36 @@ pub fn with_old_space<R>(f: impl FnOnce() -> R) -> R {
     f()
 }
 
+/// Route allocations and host parks into `region` for the duration of `f`.
+///
+/// The region stays attached to this thread's heap until it is dropped, so
+/// [`CelHeap::contains`] keeps recognising its objects after wrap returns.
+#[cold]
+pub(crate) fn with_bind_region<R>(region: *mut BindRegion, f: impl FnOnce() -> R) -> R {
+    struct Guard {
+        prev: *mut BindRegion,
+    }
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            FORCE_OLD.with(|c| c.set(c.get().saturating_sub(1)));
+            let _ = HEAP.try_with(|h| {
+                h.force_old.set(h.force_old.get().saturating_sub(1));
+                h.bind_region.set(self.prev);
+            });
+        }
+    }
+    FORCE_OLD.with(|c| c.set(c.get() + 1));
+    let prev = HEAP.with(|h| {
+        h.force_old.set(h.force_old.get() + 1);
+        let prev = h.bind_region.get();
+        h.bind_region.set(region);
+        h.attach_region(region);
+        prev
+    });
+    let _g = Guard { prev };
+    f()
+}
+
 /// Whether this thread is forcing old-space allocation.
 pub fn is_forcing_old() -> bool {
     FORCE_OLD.with(|c| c.get() > 0)
@@ -746,8 +1006,9 @@ pub fn alloc_immortal<T>(value: T) -> *mut T {
     payload
 }
 
-/// A frame cell: null, an immortal singleton, or a leaf in live old or
-/// live nursery memory. A pointer into reclaimed nursery fails.
+/// A frame cell: null, an immortal singleton, or a leaf in live old,
+/// live nursery, or a live bind region. A pointer into reclaimed nursery
+/// or a dropped Context's region fails.
 #[cfg(debug_assertions)]
 pub fn assert_frame_cell(w: crate::runtime::object::CelRef) {
     debug_assert!(
@@ -946,5 +1207,23 @@ mod tests {
         assert_eq!(heap.allocated_bytes(), bytes);
         assert!(heap.contains(old as *const u8));
         unsafe { assert_eq!(*old, 1) };
+    }
+
+    /// A bind region is live for `contains` until it is dropped, and its
+    /// bytes are not old-space bytes.
+    #[test]
+    fn a_bind_region_is_contained_until_it_drops() {
+        let heap = CelHeap::new();
+        let region = Box::new(BindRegion::new());
+        heap.attach_region((&*region) as *const BindRegion as *mut BindRegion);
+        let p = region.bump(size_of::<u64>(), align_of::<u64>()) as *mut u64;
+        unsafe { p.write(7) };
+        assert!(heap.contains(p as *const u8));
+        assert!(!heap.is_young(p as *const u8));
+        assert_eq!(heap.old_allocated_bytes(), 0);
+        assert_eq!(heap.allocated_objects(), 1);
+        drop(region);
+        assert!(!heap.contains(p as *const u8));
+        assert_eq!(heap.allocated_objects(), 0);
     }
 }

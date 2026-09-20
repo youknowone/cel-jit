@@ -41,12 +41,17 @@ pub enum Context<'a> {
         /// the Context's lifetime so a rebind cannot dangle a pointer
         /// still sitting on the operand stack.
         retained: Vec<Value>,
+        /// Chunks wrap-at-bind allocated. Empty until the first wrap;
+        /// dropped with the Context. A child created for a comprehension
+        /// never wraps, so it stays empty.
+        region: crate::runtime::heap::BindRegionSlot,
     },
     Child {
         parent: &'a Context<'a>,
         variables: BTreeMap<Box<str>, Value>,
         resolver: Option<&'a dyn VariableResolver>,
         retained: Vec<Value>,
+        region: crate::runtime::heap::BindRegionSlot,
     },
 }
 
@@ -68,14 +73,20 @@ fn store(variables: &mut BTreeMap<Box<str>, Value>, name: impl AsRef<str>, value
 /// [`Value::Interned`], so a later load is a pointer copy. A container,
 /// string or bytes wrapped from a public handle records a non-owning link
 /// back to that handle; [`retain_public`] keeps the handle alive.
+///
+/// The interned leaf is allocated from this Context's region, so dropping
+/// the Context releases it. Immortal singletons are not allocated here.
 fn wrap_entry(ctx: &mut Context, value: Value) -> Value {
-    crate::runtime::heap::with_old_space(|| match crate::runtime::convert::intern_leaf(&value) {
-        Some(w) => {
-            crate::runtime::convert::link_public_handle(w, &value);
-            retain_public(ctx, value);
-            Value::from_interned(w)
+    let region = ctx.ensure_region();
+    crate::runtime::heap::with_bind_region(region, || {
+        match crate::runtime::convert::intern_leaf(&value) {
+            Some(w) => {
+                crate::runtime::convert::link_public_handle(w, &value);
+                retain_public(ctx, value);
+                Value::from_interned(w)
+            }
+            None => value,
         }
-        None => value,
     })
 }
 
@@ -154,6 +165,13 @@ impl<'a> Context<'a> {
             Context::Root { retained, .. } => retained,
             Context::Child { retained, .. } => retained,
         }
+    }
+
+    fn ensure_region(&mut self) -> *mut crate::runtime::heap::BindRegion {
+        let slot = match self {
+            Context::Root { region, .. } | Context::Child { region, .. } => region,
+        };
+        slot.get_or_insert()
     }
 
     /// Store `value` as given. A comprehension rebinding is an internal move,
@@ -394,6 +412,7 @@ impl<'a> Context<'a> {
             variables: Default::default(),
             resolver: None,
             retained: Vec::new(),
+            region: crate::runtime::heap::BindRegionSlot::empty(),
         }
     }
 
@@ -415,6 +434,7 @@ impl<'a> Context<'a> {
             functions: Default::default(),
             resolver: None,
             retained: Vec::new(),
+            region: crate::runtime::heap::BindRegionSlot::empty(),
         }
     }
 
@@ -425,6 +445,7 @@ impl<'a> Context<'a> {
             functions: Default::default(),
             resolver: None,
             retained: Vec::new(),
+            region: crate::runtime::heap::BindRegionSlot::empty(),
         }
     }
 }
@@ -437,6 +458,7 @@ impl Default for Context<'_> {
             functions: Default::default(),
             resolver: None,
             retained: Vec::new(),
+            region: crate::runtime::heap::BindRegionSlot::empty(),
         }
     }
 }
@@ -481,5 +503,42 @@ impl<T: VariableResolver> VariableResolver for Arc<T> {
 impl<T: VariableResolver> VariableResolver for &T {
     fn resolve(&self, variable: &str) -> Option<Value> {
         (**self).resolve(variable)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::heap::with_heap;
+
+    #[test]
+    fn a_child_scope_has_no_region_until_it_wraps() {
+        let ctx = Context::default();
+        let mut inner = ctx.new_inner_scope();
+        inner.rebind("x", Value::Int(1));
+        match &inner {
+            Context::Child { region, .. } => assert!(region.is_none()),
+            Context::Root { .. } => panic!("inner scope is a child"),
+        }
+    }
+
+    #[test]
+    fn a_bound_leaf_is_contained_only_while_the_context_lives() {
+        let mut ctx = Context::default();
+        ctx.add_variable_from_value("n", 1000i64);
+        let w = ctx.lookup_interned("n").expect("leaf");
+        assert!(
+            with_heap(|h| h.contains(w as *const u8)),
+            "region object is live while the Context lives"
+        );
+        assert!(
+            !with_heap(|h| h.is_young(w as *const u8)),
+            "a bound leaf is not nursery memory"
+        );
+        drop(ctx);
+        assert!(
+            !with_heap(|h| h.contains(w as *const u8)),
+            "dropping the Context releases the region"
+        );
     }
 }
