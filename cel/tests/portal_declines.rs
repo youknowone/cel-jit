@@ -22,6 +22,7 @@ fn show(r: &Result<Value, ExecutionError>) -> String {
 fn ctx() -> Context<'static> {
     let mut ctx = Context::default();
     ctx.add_variable_from_value("x", 15i64);
+    ctx.add_variable_from_value("list", (1..=10i64).collect::<Vec<_>>());
     ctx.add_variable_from_value(
         "xs",
         Value::list(vec![Value::Int(1), Value::Int(2), Value::Int(3)]),
@@ -267,19 +268,40 @@ fn or_absorbs_a_left_error_when_the_right_is_true() {
 /// mixed residual and interned arms across loop iterations cannot hide behind
 /// a single `cel_eval_loop` pass.
 fn agree_repeat(src: &str) {
-    let expr = Parser::default()
+    agree_repeat_parsed(src, false);
+}
+
+fn agree_repeat_opt(src: &str) {
+    agree_repeat_parsed(src, true);
+}
+
+fn agree_repeat_parsed(src: &str, optional: bool) {
+    let parser = if optional {
+        Parser::default().enable_optional_syntax(true)
+    } else {
+        Parser::default()
+    };
+    let expr = parser
         .parse(src)
         .unwrap_or_else(|e| panic!("parse {src}: {e}"));
-    let program = Program::compile(src).unwrap_or_else(|e| panic!("compile {src}: {e}"));
     let ctx = ctx();
     let walker = Value::resolve_value(&expr, &ctx);
+    if optional {
+        let code = cel::vm::compile(&expr).unwrap_or_else(|e| panic!("compile {src}: {e}"));
+        for i in 0..3 {
+            let vm = cel::vm::cel_eval_loop(&code, &ctx);
+            assert_eq!(show(&walker), show(&vm), "`{src}` execute {i}");
+            match (&walker, &vm) {
+                (Ok(a), Ok(b)) => assert_eq!(a, b, "`{src}` execute {i} value"),
+                _ => {}
+            }
+        }
+        return;
+    }
+    let program = Program::compile(src).unwrap_or_else(|e| panic!("compile {src}: {e}"));
     for i in 0..3 {
         let vm = program.execute(&ctx);
-        assert_eq!(
-            show(&walker),
-            show(&vm),
-            "`{src}` execute {i}"
-        );
+        assert_eq!(show(&walker), show(&vm), "`{src}` execute {i}");
         match (&walker, &vm) {
             (Ok(a), Ok(b)) => assert_eq!(a, b, "`{src}` execute {i} value"),
             _ => {}
@@ -321,6 +343,26 @@ fn and_or_slot_is_not_stale_across_loop_iterations() {
     agree_repeat("[1,2,1,3].map(e, (10/(e-1) < 0) || e < 3)");
     agree_repeat("[1,2,3].filter(e, (10/(e-1) > 0) && e > 1)");
     agree_repeat("[1,2,3].all(e, ((10/(e-1) > 0) && e > 1) || e == 1)");
+}
+
+/// `JumpIfOptNone` on a plain interned list/map must match the walker
+/// (fall through, do not hydrate). Optional-index forms jump only on none.
+#[test]
+fn jump_if_opt_none_on_plain_and_optional_index_matches_the_walker() {
+    agree_repeat("list[3]");
+    agree_repeat(r#"{"a": x}["a"]"#);
+}
+
+#[test]
+fn jump_if_opt_none_optional_and_comprehension_forms_match_the_walker() {
+    agree_repeat("[1, 2, 3].map(e, list[e])");
+    agree_repeat("optional.of(list)[3]");
+    agree_repeat_opt("list[?3]");
+    agree_repeat_opt("list[?30]");
+    agree_repeat_opt(r#"{"a": x}[?"a"]"#);
+    agree_repeat_opt(r#"{"a": x}[?"b"]"#);
+    agree_repeat_opt("optional.none()[?0]");
+    agree_repeat_opt("[0, 30].map(e, list[?e].hasValue())");
 }
 
 /// `AndLocal`/`OrLocal` fire when the left operand is already a slot. A

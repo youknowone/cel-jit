@@ -13,7 +13,7 @@ use majit_metainterp::JitDriver;
 
 use super::code::CelCode;
 use super::error::{CelErr, NameId};
-use super::interp::{Step, Vm};
+use super::interp::{interned_optional_is_none, Step, Vm};
 use super::opcode::OpCode;
 use crate::runtime::binop::{
     cel_add, cel_div, cel_equals, cel_greater, cel_greater_equals, cel_less, cel_less_equals,
@@ -630,11 +630,10 @@ fn interned_optional_state(w: i64) -> i64 {
     let Some(w) = slot_leaf(w) else {
         return 0;
     };
-    if unsafe { w_kind(w) } != CelKind::Optional {
-        return 0;
-    }
-    if unsafe { (*w.cast::<W_OptionalObject>()).w_value }.is_null() {
+    if interned_optional_is_none(w) {
         2
+    } else if unsafe { w_kind(w) } != CelKind::Optional {
+        0
     } else {
         1
     }
@@ -855,10 +854,12 @@ fn portal_rare(
         OP_JUMP_IF_OPT_NONE => {
             let depth = frame.valuestackdepth;
             let w = frame.locals_stack_w[depth - 1];
-            match interned_optional_state(w as i64) {
-                2 => insn_a(program, pc),
-                1 => here + 1,
-                _ => residual_dispatch(vm, here),
+            // Residual jumps only when interned_optional_is_none; a plain
+            // value, a some, a missing cell, and a builder all fall through.
+            if !w.is_null() && interned_optional_is_none(w) {
+                insn_a(program, pc)
+            } else {
+                here + 1
             }
         }
         OP_LIST_APPEND_OPTIONAL => {

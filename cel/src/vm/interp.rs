@@ -3856,7 +3856,7 @@ fn interned_size(w: CelRef) -> Option<i64> {
     }
 }
 
-fn interned_optional_is_none(w: CelRef) -> bool {
+pub(crate) fn interned_optional_is_none(w: CelRef) -> bool {
     unsafe {
         w_kind(w) == CelKind::Optional
             && (*w.cast::<crate::runtime::object::W_OptionalObject>())
