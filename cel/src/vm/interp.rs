@@ -48,7 +48,8 @@ use crate::runtime::object::{
     map_len, map_try_insert, new_bytes, new_cel_frame_in, new_double, new_int, new_int_in,
     new_list, new_list_ints, new_list_with_capacity_in, new_map_with_capacity_in, new_null,
     new_optional, new_optional_none, new_string, new_type, new_uint, opaque_host_index,
-    string_as_str, string_byte_len, w_kind, w_type, CelKind, CelRef, W_BoolObject, W_CelFrame,
+    reset_cel_frame, string_as_str, string_byte_len, w_kind, w_type, CelKind, CelRef,
+    W_BoolObject, W_CelFrame,
     W_DoubleObject, W_IntObject, W_UIntObject, CEL_OPAQUE_CLASS, CEL_TYPE_CLASS,
 };
 use crate::runtime::optional::{
@@ -66,8 +67,8 @@ use std::cmp::Ordering;
 /// `&&` and `||` absorb errors and so raise them on ordinary control flow.
 #[inline(always)]
 pub fn cel_eval_loop(code: &CelCode, ctx: &Context) -> Result<Value, ExecutionError> {
-    let scope = crate::runtime::heap::enter_eval();
-    let mut vm = Vm::new(code, ctx, scope.heap());
+    let scope = crate::runtime::heap::enter_eval_for(ctx);
+    let mut vm = Vm::new(code, ctx, scope.heap(), scope.is_outermost());
     #[cfg(feature = "__drop-arm-probe")]
     {
         vm.probe = PROBE.with(std::cell::Cell::get);
@@ -98,7 +99,10 @@ pub fn cel_eval_loop(code: &CelCode, ctx: &Context) -> Result<Value, ExecutionEr
         Ok(value) => Ok(value),
         Err(err) => Err(vm.public_error(err)),
     };
-    result.map(|v| scope.finish(v))
+    match result {
+        Ok(v) => Ok(scope.finish(v)),
+        Err(e) => Err(e),
+    }
 }
 
 /// Run `code` in `ctx` under an explicit probe policy.
@@ -771,6 +775,40 @@ pub(crate) struct Vm<'a> {
     anchor: u32,
 }
 
+/// Frame for this execute: a region-owned frame on the outermost call,
+/// else a nursery allocation that the scope rewind reclaims.
+///
+/// Nested execute (a host re-entering while this frame is live) must not
+/// reuse the cached pointer. A larger code object abandons the previous
+/// frame inside the region; rewind and drop reclaim it with the region.
+fn frame_for_execute(
+    ctx: &Context,
+    heap: &crate::runtime::heap::CelHeap,
+    outermost: bool,
+    n_slots: i64,
+    max_stack: i64,
+) -> *mut W_CelFrame {
+    if !outermost {
+        return new_cel_frame_in(heap, n_slots, max_stack);
+    }
+    let Some(region) = ctx.eval_region() else {
+        return new_cel_frame_in(heap, n_slots, max_stack);
+    };
+    let need = (n_slots.max(0) as usize).saturating_add(max_stack.max(0) as usize);
+    let cached = region.take_eval_frame(need);
+    if !cached.is_null() {
+        let frame = cached as *mut u8 as *mut W_CelFrame;
+        unsafe { reset_cel_frame(frame, n_slots) };
+        return frame;
+    }
+    let region_ptr = region as *const _ as *mut crate::runtime::heap::BindRegion;
+    let frame = crate::runtime::heap::with_bind_region(region_ptr, || {
+        new_cel_frame_in(heap, n_slots, max_stack)
+    });
+    region.store_eval_frame(frame as *mut u8, need);
+    frame
+}
+
 /// Return the buffers to this thread's pool.
 ///
 /// A [`Drop`] impl rather than a call at the end of [`cel_eval_loop`], because
@@ -798,9 +836,20 @@ impl<'a> Vm<'a> {
     /// the operand stack the compiler proved it needs, as one array. On a
     /// thread that has evaluated anything before, the capacity is already
     /// there and none of this allocates.
-    fn new(code: &'a CelCode, ctx: &'a Context<'a>, heap: &crate::runtime::heap::CelHeap) -> Self {
+    fn new(
+        code: &'a CelCode,
+        ctx: &'a Context<'a>,
+        heap: &crate::runtime::heap::CelHeap,
+        outermost: bool,
+    ) -> Self {
         let stack_base = code.n_slots as usize;
-        let cel_frame = new_cel_frame_in(heap, code.n_slots as i64, code.max_stack as i64);
+        let cel_frame = frame_for_execute(
+            ctx,
+            heap,
+            outermost,
+            code.n_slots as i64,
+            code.max_stack as i64,
+        );
         #[cfg(feature = "jit")]
         let (frame, scratch) = (Vec::new(), None);
         #[cfg(not(feature = "jit"))]
@@ -4366,7 +4415,7 @@ mod tests {
             ..CelCode::default()
         };
         let ctx = Context::default();
-        let mut vm = crate::runtime::heap::with_heap(|h| Vm::new(&code, &ctx, h));
+        let mut vm = crate::runtime::heap::with_heap(|h| Vm::new(&code, &ctx, h, true));
 
         assert_eq!(vm.depth(), 0);
         assert!(vm.top().is_none());
@@ -4409,7 +4458,7 @@ mod tests {
             ..CelCode::default()
         };
         let ctx = Context::default();
-        let mut vm = crate::runtime::heap::with_heap(|h| Vm::new(&code, &ctx, h));
+        let mut vm = crate::runtime::heap::with_heap(|h| Vm::new(&code, &ctx, h, true));
         unsafe {
             assert_eq!((*vm.cel_frame).last_instr, -1);
             assert_eq!((*vm.cel_frame).valuestackdepth, 1);
@@ -4887,7 +4936,7 @@ mod tests {
         // `all` does the moment the accumulator turns false.
         let source = "xs.map(x, (1 / 0 == 1) && false)";
         let code = compile(&parse(source)).expect("compiles");
-        let mut vm = crate::runtime::heap::with_heap(|h| Vm::new(&code, &ctx, h));
+        let mut vm = crate::runtime::heap::with_heap(|h| Vm::new(&code, &ctx, h, true));
         let result = vm.run().expect("every element absorbs its error");
         assert_eq!(
             result,
@@ -4925,7 +4974,7 @@ mod tests {
             ),
         ] {
             let code = compile(&parse(source)).expect("compiles");
-            let mut vm = crate::runtime::heap::with_heap(|h| Vm::new(&code, &ctx, h));
+            let mut vm = crate::runtime::heap::with_heap(|h| Vm::new(&code, &ctx, h, true));
             let got = vm
                 .run()
                 .unwrap_or_else(|e| panic!("{source}: {:?}", vm.public_error(e)));
@@ -4961,7 +5010,7 @@ mod tests {
         let ctx = Context::default();
         let code = compile(&parse("1")).expect("compiles");
         for arity in 0..4usize {
-            let mut vm = crate::runtime::heap::with_heap(|h| Vm::new(&code, &ctx, h));
+            let mut vm = crate::runtime::heap::with_heap(|h| Vm::new(&code, &ctx, h, true));
             for i in 0..arity {
                 vm.push(Value::Int(i as i64));
             }
@@ -4988,7 +5037,7 @@ mod tests {
     fn a_map_literal_is_built_in_the_arc_it_is_handed_over_in() {
         let ctx = Context::default();
         let code = compile(&parse(r#"{"x": {"y": 3}}"#)).expect("compiles");
-        let mut vm = crate::runtime::heap::with_heap(|h| Vm::new(&code, &ctx, h));
+        let mut vm = crate::runtime::heap::with_heap(|h| Vm::new(&code, &ctx, h, true));
 
         let mut opened_hash = 0usize;
         let mut opened_maps = 0usize;
@@ -5060,7 +5109,7 @@ mod tests {
         let ctx = Context::default();
         let source = "([1, 2, undefined_name][0] == 1) && false";
         let code = compile(&parse(source)).expect("compiles");
-        let mut vm = crate::runtime::heap::with_heap(|h| Vm::new(&code, &ctx, h));
+        let mut vm = crate::runtime::heap::with_heap(|h| Vm::new(&code, &ctx, h, true));
         assert_eq!(vm.run(), Ok(Value::Bool(false)));
         assert_eq!(vm.depth(), 0, "the operand stack was left dirty");
     }

@@ -277,8 +277,17 @@ impl Space {
 pub struct BindRegion {
     space: Space,
     hosts: RefCell<Vec<Box<dyn Any>>>,
+    /// The heap this region was attached to. Evaluation against the owning
+    /// Context loads this pointer so the scope guard does not read
+    /// thread-local storage. Context is neither Send nor Sync, so the load
+    /// stays on the attaching thread.
     heap: Cell<*const CelHeap>,
     id: Cell<u32>,
+    /// Evaluation frame reused across `Program::execute` calls on the
+    /// owning Context. Allocated in this region's chunks, so rewind and
+    /// drop reclaim it. Null until the first execute that needs one.
+    eval_frame: Cell<*mut u8>,
+    eval_frame_cap: Cell<usize>,
 }
 
 impl BindRegion {
@@ -288,6 +297,8 @@ impl BindRegion {
             hosts: RefCell::new(Vec::new()),
             heap: Cell::new(core::ptr::null()),
             id: Cell::new(0),
+            eval_frame: Cell::new(core::ptr::null_mut()),
+            eval_frame_cap: Cell::new(0),
         }
     }
 
@@ -322,6 +333,26 @@ impl BindRegion {
         self.hosts.borrow_mut().clear();
         self.id.set(0);
         self.heap.set(core::ptr::null());
+        self.eval_frame.set(core::ptr::null_mut());
+        self.eval_frame_cap.set(0);
+    }
+
+    /// A previously allocated evaluation frame whose item cap is at least
+    /// `need`, or null.
+    #[inline]
+    pub(crate) fn take_eval_frame(&self, need: usize) -> *mut u8 {
+        let p = self.eval_frame.get();
+        if !p.is_null() && self.eval_frame_cap.get() >= need {
+            p
+        } else {
+            core::ptr::null_mut()
+        }
+    }
+
+    #[inline]
+    pub(crate) fn store_eval_frame(&self, ptr: *mut u8, cap: usize) {
+        self.eval_frame.set(ptr);
+        self.eval_frame_cap.set(cap);
     }
 }
 
@@ -352,6 +383,26 @@ impl BindRegionSlot {
         self.inner
             .get_or_insert_with(take_bind_region)
             .as_mut() as *mut BindRegion
+    }
+
+    /// The heap this slot's region was attached to, if wrap-at-bind has run.
+    #[inline]
+    pub(crate) fn attached_heap(&self) -> Option<&CelHeap> {
+        let region = self.inner.as_deref()?;
+        let heap = region.heap.get();
+        if heap.is_null() {
+            None
+        } else {
+            // SAFETY: `attach_region` stores the attaching heap; the region
+            // is detached before that heap is dropped. Context is neither
+            // Send nor Sync, so this is only read on the attaching thread.
+            Some(unsafe { &*heap })
+        }
+    }
+
+    #[inline]
+    pub(crate) fn get(&self) -> Option<&BindRegion> {
+        self.inner.as_deref()
     }
 
     #[cfg(test)]
@@ -504,7 +555,7 @@ impl CelHeap {
         );
     }
 
-    #[inline]
+    #[inline(always)]
     fn leave_with(&self, outermost: bool, snap: NurserySnap) {
         let d = self.depth.get();
         self.depth.set(d.saturating_sub(1));
@@ -514,6 +565,12 @@ impl CelHeap {
         if self.nursery.open_used.get() == snap.used && self.young_host_n.get() == snap.hosts {
             return;
         }
+        self.leave_slow(snap);
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn leave_slow(&self, snap: NurserySnap) {
         self.install_snap(snap);
         let live = self.nursery.bytes.get();
         if live > self.nursery_high_water.get() {
@@ -832,12 +889,12 @@ impl NurserySnap {
     }
 }
 
-/// Guard for one evaluation. Reset runs in [`Drop`], including on panic.
+/// Guard for one evaluation. Leave runs in [`Self::finish`] on the happy
+/// path and in [`Drop`] on panic or error.
 ///
-/// The heap pointer is resolved once at entry. Depth and the nursery bump
-/// live in [`Cell`]s on that heap, so leaving does not touch thread-local
-/// storage again. The bump at entry sits on this guard so an evaluation
-/// that never allocates young compares one word and returns.
+/// The heap is the Context's bind-region heap when one is attached,
+/// otherwise this thread's heap. Leave does not read thread-local storage.
+/// An evaluation that never allocated young compares one word and returns.
 pub struct EvalScope {
     heap: *const CelHeap,
     outermost: bool,
@@ -845,13 +902,14 @@ pub struct EvalScope {
 }
 
 impl EvalScope {
-    /// The heap this scope opened. Valid until [`Drop`].
+    /// The heap this scope opened. Valid until leave.
     #[inline]
     pub fn heap(&self) -> &CelHeap {
         unsafe { &*self.heap }
     }
 
     /// Whether this guard opened the outermost scope on this thread.
+    #[inline]
     pub fn is_outermost(&self) -> bool {
         self.outermost
     }
@@ -859,9 +917,14 @@ impl EvalScope {
     /// The public form of `v`. An interned leaf unpacks; a value that is
     /// already public is returned as it is. Nested and outermost both unpack,
     /// so a host re-entry never observes `Value::Interned`.
-    #[inline]
+    ///
+    /// Leave is the inlined bump compare; [`Drop`] is not taken on this path.
+    #[inline(always)]
     pub fn finish(self, v: crate::Value) -> crate::Value {
-        to_public(v)
+        let out = to_public(v);
+        unsafe { (*self.heap).leave_with(self.outermost, self.snap) };
+        core::mem::forget(self);
+        out
     }
 }
 
@@ -871,11 +934,10 @@ impl Drop for EvalScope {
     }
 }
 
-/// Open an evaluation scope on this thread. Nested calls increment depth;
-/// only the outermost reset reclaims the nursery.
-#[inline]
-pub fn enter_eval() -> EvalScope {
-    let heap = unsafe { &*heap_ptr() };
+/// Open an evaluation scope on `heap`. Nested calls increment depth;
+/// only the outermost leave reclaims the nursery.
+#[inline(always)]
+pub fn enter_eval_on(heap: &CelHeap) -> EvalScope {
     let d = heap.depth.get();
     let outermost = d == 0;
     let snap = if outermost {
@@ -888,6 +950,36 @@ pub fn enter_eval() -> EvalScope {
         heap,
         outermost,
         snap,
+    }
+}
+
+/// Open an evaluation scope on this thread. Nested calls increment depth;
+/// only the outermost reset reclaims the nursery.
+#[inline]
+pub fn enter_eval() -> EvalScope {
+    enter_eval_on(unsafe { &*heap_ptr() })
+}
+
+#[cold]
+#[inline(never)]
+fn enter_eval_unbound() -> EvalScope {
+    enter_eval()
+}
+
+/// Open an evaluation scope on `ctx`'s attached heap, or this thread's
+/// heap if the Context has not bound a region.
+///
+/// A bound Context's region is attached to the binding thread's heap.
+/// Context is neither Send nor Sync, so evaluation stays on that thread
+/// and this path does not read thread-local storage.
+#[inline]
+pub fn enter_eval_for(ctx: &crate::context::Context) -> EvalScope {
+    match ctx.eval_heap() {
+        Some(heap) => {
+            debug_assert!(core::ptr::eq(heap as *const CelHeap, heap_ptr()));
+            enter_eval_on(heap)
+        }
+        None => enter_eval_unbound(),
     }
 }
 
@@ -1193,6 +1285,15 @@ mod tests {
         heap.leave(true);
         assert!(!heap.contains(a as *const u8));
         assert!(!heap.contains(b as *const u8));
+    }
+
+    #[test]
+    fn enter_eval_on_tracks_depth_on_the_given_heap() {
+        let scope = enter_eval_on(unsafe { &*heap_ptr() });
+        assert!(scope.is_outermost());
+        assert_eq!(eval_depth(), 1);
+        drop(scope);
+        assert_eq!(eval_depth(), 0);
     }
 
     /// An evaluation that never bumps young memory does not reset: leave

@@ -1216,6 +1216,26 @@ pub fn new_cel_frame_in(
     })
 }
 
+/// Reset a reused frame so the next execute sees the same initial state as
+/// a freshly allocated one. Locals (`0..n_slots`) are nulled; stack cells
+/// are written before they are read.
+///
+/// # Safety
+///
+/// `frame` is a live [`W_CelFrame`] whose item block holds at least
+/// `n_slots` cells.
+#[inline]
+pub unsafe fn reset_cel_frame(frame: *mut W_CelFrame, n_slots: i64) {
+    (*frame).vable_token = 0;
+    (*frame).last_instr = -1;
+    (*frame).valuestackdepth = n_slots;
+    (*frame).n_slots = n_slots;
+    if n_slots > 0 {
+        let base = crate::runtime::object_array::items_block_items_base((*frame).locals_stack_w.block);
+        core::ptr::write_bytes(base, 0, n_slots as usize);
+    }
+}
+
 /// Slot `i` of a live frame.
 ///
 /// # Safety

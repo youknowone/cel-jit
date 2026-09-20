@@ -1600,8 +1600,11 @@ impl Value {
     /// walker it replaced, the two held to the same answers by the differential
     /// corpus in `tests/oracle.rs`, which still gates this one alone.
     pub fn resolve_value(expr: &Expression, ctx: &Context) -> Result<Value, ExecutionError> {
-        let scope = crate::runtime::heap::enter_eval();
-        resolve_inner(expr, ctx).map(|v| scope.finish(v))
+        let scope = crate::runtime::heap::enter_eval_for(ctx);
+        match resolve_inner(expr, ctx) {
+            Ok(v) => Ok(scope.finish(v)),
+            Err(e) => Err(e),
+        }
     }
 }
 

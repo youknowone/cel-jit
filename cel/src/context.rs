@@ -30,6 +30,20 @@ use std::sync::Arc;
 ///                  ↑
 /// Only in scope for the duration of the map expression
 ///
+/// Neither `Send` nor `Sync`. Interned leaves are pointers into a bind
+/// region attached to the binding thread's heap, and
+/// `&dyn VariableResolver` has no `Send` bound. A Context cannot move
+/// onto another thread; concurrent evaluation is one Context per thread.
+///
+/// ```compile_fail
+/// fn needs_send<T: Send>(_: T) {}
+/// needs_send(cel::Context::default());
+/// ```
+///
+/// ```compile_fail
+/// fn needs_sync<T: Sync>(_: &T) {}
+/// needs_sync(&cel::Context::default());
+/// ```
 pub enum Context<'a> {
     Root {
         functions: FunctionRegistry,
@@ -172,6 +186,28 @@ impl<'a> Context<'a> {
             Context::Root { region, .. } | Context::Child { region, .. } => region,
         };
         slot.get_or_insert()
+    }
+
+    /// The heap wrap-at-bind attached this Context's region to, if any.
+    ///
+    /// Child scopes do not walk the parent: an empty child region means
+    /// this evaluation has not bound, and the thread-local heap is the
+    /// right fallback. A bound Root's pointer is the binding thread's
+    /// heap; Context is neither Send nor Sync, so evaluation against it
+    /// stays on that thread.
+    #[inline]
+    pub(crate) fn eval_heap(&self) -> Option<&crate::runtime::heap::CelHeap> {
+        match self {
+            Context::Root { region, .. } | Context::Child { region, .. } => region.attached_heap(),
+        }
+    }
+
+    /// This Context's bind region, if wrap-at-bind has created one.
+    #[inline]
+    pub(crate) fn eval_region(&self) -> Option<&crate::runtime::heap::BindRegion> {
+        match self {
+            Context::Root { region, .. } | Context::Child { region, .. } => region.get(),
+        }
     }
 
     /// Store `value` as given. A comprehension rebinding is an internal move,
@@ -546,6 +582,20 @@ mod tests {
         assert!(
             !with_heap(|h| h.contains(w as *const u8)),
             "dropping the Context releases the region"
+        );
+    }
+
+    #[test]
+    fn a_bound_context_eval_heap_is_this_threads_heap() {
+        let mut ctx = Context::default();
+        assert!(ctx.eval_heap().is_none());
+        ctx.add_variable_from_value("x", 1i64);
+        let heap = ctx.eval_heap().expect("bound");
+        with_heap(|h| assert!(core::ptr::eq(heap as *const _, h as *const _)));
+        let inner = ctx.new_inner_scope();
+        assert!(
+            inner.eval_heap().is_none(),
+            "a child does not inherit the parent's region"
         );
     }
 }

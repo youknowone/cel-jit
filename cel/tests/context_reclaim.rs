@@ -113,6 +113,50 @@ fn two_hundred_thousand_fresh_contexts_leave_old_space_flat() {
     );
 }
 
+/// More Contexts than spare regions, each caching an evaluation frame,
+/// then all dropped. Old space must not grow: a frame that lived in old
+/// space would survive the region's drop once the spare list is full.
+#[test]
+fn eight_live_contexts_then_drop_leave_old_space_flat() {
+    let program = Program::compile("x").expect("compiles");
+    const LIVE: usize = 8;
+    const WARM: u32 = 200;
+    const ROUNDS: u32 = 4_000;
+
+    fn round(program: &Program) {
+        let mut ctxs = Vec::with_capacity(LIVE);
+        for i in 0..LIVE {
+            let mut ctx = Context::default();
+            ctx.add_variable_from_value("x", i as i64);
+            let got = eval_vm(program, &ctx);
+            assert_eq!(got, Value::Int(i as i64), "vm at {i}");
+            ctxs.push(ctx);
+        }
+        drop(ctxs);
+    }
+
+    for _ in 0..WARM {
+        round(&program);
+    }
+    let old_after_warm = old_bytes();
+    println!("old_bytes_after_warm: {old_after_warm}");
+    for _ in 0..ROUNDS {
+        round(&program);
+    }
+    let old_after = old_bytes();
+    println!("old_bytes_after_rounds: {old_after}");
+    println!(
+        "old_growth_warm_to_end: {}",
+        old_after.saturating_sub(old_after_warm)
+    );
+
+    const SLACK: u64 = 256 * 1024;
+    assert!(
+        old_after <= old_after_warm.saturating_add(SLACK),
+        "old-space bytes grew from {old_after_warm} after warmup to {old_after} after {ROUNDS} rounds of {LIVE} live Contexts"
+    );
+}
+
 #[test]
 fn a_kept_result_survives_dropping_the_context() {
     let program = Program::compile("list.map(i, i * 2)").expect("compiles");
