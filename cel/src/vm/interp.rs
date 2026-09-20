@@ -46,7 +46,7 @@ use crate::runtime::error::{take_error, CelErrCode, ERROR_SENTINEL};
 use crate::runtime::object::{
     cel_frame_slot, force_virtualizable_if_necessary, interned_list_eq, list_int_at, list_len,
     map_len, map_try_insert, new_bytes, new_cel_frame_in, new_double, new_int, new_int_in,
-    new_list, new_list_ints, new_list_with_capacity, new_map_with_capacity_in, new_null,
+    new_list, new_list_ints, new_list_with_capacity_in, new_map_with_capacity_in, new_null,
     new_optional, new_optional_none, new_string, new_type, new_uint, opaque_host_index,
     string_as_str, string_byte_len, w_kind, w_type, CelKind, CelRef, W_BoolObject, W_CelFrame,
     W_DoubleObject, W_IntObject, W_UIntObject, CEL_OPAQUE_CLASS, CEL_TYPE_CLASS,
@@ -2137,12 +2137,12 @@ impl<'a> Vm<'a> {
 
             // -- aggregates ----------------------------------------------
             OpCode::NewList => {
-                let w = new_list_with_capacity(a as i64);
+                let w = new_list_with_capacity_in(self.heap(), a as i64);
                 self.push_operand(Operand::Interned(w as CelRef));
             }
             OpCode::NewListFromArg => {
                 let len = self.sequence_len(a)?;
-                let w = new_list_with_capacity(len);
+                let w = new_list_with_capacity_in(self.heap(), len);
                 self.push_operand(Operand::Interned(w as CelRef));
             }
             OpCode::ListAppend => {

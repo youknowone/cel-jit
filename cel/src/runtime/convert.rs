@@ -482,6 +482,33 @@ unsafe fn clone_arc<T>(ptr: *const T) -> Option<Arc<T>> {
     }
 }
 
+/// Integers of an object-strategy list, or `None` if any element is not an
+/// interned int. The public form of a literal `[1, 2, 3]` is this buffer
+/// rather than a `Vec<Value>` rebuilt element by element.
+#[inline(never)]
+unsafe fn interned_object_list_ints(leaf: &W_ListObject) -> Option<Vec<i64>> {
+    let n = leaf.length as usize;
+    if n == 0 {
+        return None;
+    }
+    let base = items_block_items_base(leaf.items);
+    if base.is_null() {
+        return None;
+    }
+    let start = leaf.start as usize;
+    let mut ints = Vec::with_capacity(n);
+    let mut i = 0;
+    while i < n {
+        let item = unsafe { *base.add(start + i) };
+        if item.is_null() || unsafe { w_kind(item) } != CelKind::Int {
+            return None;
+        }
+        ints.push(unsafe { (*item.cast::<W_IntObject>()).intval });
+        i += 1;
+    }
+    Some(ints)
+}
+
 unsafe fn list_from_ref(w: CelRef) -> Result<ListRef, ConvertError> {
     let leaf = &*w.cast::<W_ListObject>();
     if let Some(storage) = clone_arc(leaf.public as *const ListStorage) {
@@ -493,6 +520,9 @@ unsafe fn list_from_ref(w: CelRef) -> Result<ListRef, ConvertError> {
     }
     match leaf.strategy {
         ListStrategy::Object => {
+            if let Some(ints) = interned_object_list_ints(leaf) {
+                return Ok(ListRef::whole(Arc::new(ListStorage::Ints(ints))));
+            }
             let n = leaf.length as usize;
             let base = items_block_items_base(leaf.items);
             if base.is_null() && n != 0 {
@@ -734,6 +764,20 @@ mod tests {
         ] {
             assert_eq!(roundtrip(v.clone()), v, "{v:?}");
         }
+    }
+
+    #[test]
+    fn interned_object_list_of_ints_matches_public_ints() {
+        let w = new_list(&[
+            new_int(1) as CelRef,
+            new_int(2) as CelRef,
+            new_int(3) as CelRef,
+        ]);
+        let v = interned_to_public(w as CelRef);
+        assert_eq!(
+            v,
+            Value::List(ListRef::whole(Arc::new(ListStorage::Ints(vec![1, 2, 3]))))
+        );
     }
 
     #[test]

@@ -740,9 +740,19 @@ unsafe fn object_list_eq_ints(w: CelRef, ints: &[i64]) -> bool {
 
 /// An empty list whose items block has room for `cap` appends.
 pub fn new_list_with_capacity(cap: i64) -> *mut W_ListObject {
+    super::heap::with_heap(|h| new_list_with_capacity_in(h, cap))
+}
+
+/// [`new_list_with_capacity`] on `heap`. Slots past `length` are written
+/// by append before anything reads them, so they are not zeroed.
+#[inline(never)]
+pub fn new_list_with_capacity_in(
+    heap: &super::heap::CelHeap,
+    cap: i64,
+) -> *mut W_ListObject {
     let n = cap.max(0) as usize;
-    let items = object_array::new_items_block_zeroed(n);
-    lltype::malloc_typed(W_ListObject {
+    let items = object_array::new_items_block_with_zeroed_prefix_in(heap, n, 0);
+    heap.alloc(W_ListObject {
         ob_header: CelObject {
             ob_type: &CEL_LIST_CLASS,
         },

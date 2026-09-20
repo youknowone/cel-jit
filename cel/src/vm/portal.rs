@@ -24,7 +24,7 @@ use crate::runtime::error::ERROR_SENTINEL;
 use crate::runtime::heap::CelHeap;
 use crate::runtime::object::{
     bytes_len, interned_list_eq, list_int_at, list_ints_slice, list_len, list_try_append, map_len,
-    map_try_insert, new_bool, new_int, new_int_in, new_list_with_capacity, new_map_with_capacity_in,
+    map_try_insert, new_bool, new_int, new_int_in, new_list_with_capacity_in, new_map_with_capacity_in,
     string_as_str, string_byte_len, w_kind, w_type, CelKind, CelRef,
     W_BoolObject, W_IntObject, W_OptionalObject, CEL_INT_CLASS,
 };
@@ -1419,7 +1419,7 @@ pub(crate) fn eval_through_portal(
         vm_heap => inline_ref,
         new_int_in => inline_ref,
         try_append => residual_int,
-        new_list_with_capacity => inline_ref,
+        new_list_with_capacity_in => inline_ref,
         residual_dispatch => residual_int,
         vm_sync_binop => residual_int,
         vm_sync_replace => residual_int,
@@ -1788,7 +1788,7 @@ fn run_cel_portal(
                 _ => residual_dispatch(vm, here),
             },
             OP_NEW_LIST => {
-                let w = new_list_with_capacity(insn_a(program, pc)) as CelRef;
+                let w = new_list_with_capacity_in(vm_heap(vm), insn_a(program, pc)) as CelRef;
                 let depth = frame.valuestackdepth;
                 frame.locals_stack_w[depth] = w;
                 frame.valuestackdepth = depth + 1;
@@ -1799,7 +1799,8 @@ fn run_cel_portal(
                 if src.is_null() || unsafe { w_kind(src) } != CelKind::List {
                     residual_dispatch(vm, here)
                 } else {
-                    let w = new_list_with_capacity(unsafe { list_len(src) }) as CelRef;
+                    let w = new_list_with_capacity_in(vm_heap(vm), unsafe { list_len(src) })
+                        as CelRef;
                     let depth = frame.valuestackdepth;
                     frame.locals_stack_w[depth] = w;
                     frame.valuestackdepth = depth + 1;

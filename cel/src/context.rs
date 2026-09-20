@@ -290,8 +290,15 @@ impl<'a> Context<'a> {
         }
         fn from_root(v: &Value) -> Value {
             match v {
-                Value::Interned(w) => crate::runtime::convert::interned_immediate(*w)
-                    .unwrap_or(Value::Interned(*w)),
+                Value::Interned(w) => {
+                    if let Some(immediate) =
+                        crate::runtime::convert::interned_immediate(*w)
+                    {
+                        immediate
+                    } else {
+                        Value::Interned(*w)
+                    }
+                }
                 other => copy_leaf(other),
             }
         }
