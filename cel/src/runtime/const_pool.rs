@@ -6,13 +6,16 @@
 
 use super::heap::{register_const_span, unregister_const_span, IMMORTAL_HEADER_SIZE, IMMORTAL_MARK};
 use super::object::{
-    CelObject, CelRef, W_BytesObject, W_DoubleObject, W_IntObject, W_StringObject, W_UIntObject,
-    CEL_BYTES_CLASS, CEL_DOUBLE_CLASS, CEL_INT_CLASS, CEL_STRING_CLASS, CEL_UINT_CLASS,
-    PREBUILT_INT_FROM, PREBUILT_INT_TO,
+    new_bool, new_null, prebuilt_int, CelObject, CelRef, ListStrategy, W_BytesObject,
+    W_DoubleObject, W_IntColumn, W_IntObject, W_ListObject, W_StringObject, W_UIntObject,
+    CEL_BYTES_CLASS, CEL_DOUBLE_CLASS, CEL_INT_CLASS, CEL_INT_COLUMN_CLASS, CEL_LIST_CLASS,
+    CEL_STRING_CLASS, CEL_UINT_CLASS,
 };
 use super::object_array::{
-    bytes_base, CelBytesBlock, CEL_BYTES_BLOCK_ITEMS_OFFSET,
+    bytes_base, items_block_items_base, CelBytesBlock, CelItemsBlock, CEL_BYTES_BLOCK_ITEMS_OFFSET,
+    CEL_ITEMS_BLOCK_ITEMS_OFFSET,
 };
+use crate::objects::{ListRef, ListStorage};
 use crate::Value;
 use core::alloc::Layout;
 use core::mem::{align_of, size_of};
@@ -107,9 +110,7 @@ impl ConstPool {
             Value::Interned(w) => *w,
             // Small ints, bool and null are already immortal prebuilts;
             // LoadConst clones the public scalar instead of pushing a pointer.
-            Value::Int(i) if (*i >= PREBUILT_INT_FROM) && (*i < PREBUILT_INT_TO) => {
-                core::ptr::null_mut()
-            }
+            Value::Int(i) if prebuilt_int(*i).is_some() => core::ptr::null_mut(),
             Value::Int(i) => self.alloc(W_IntObject {
                 ob_header: CelObject {
                     ob_type: &CEL_INT_CLASS,
@@ -151,6 +152,7 @@ impl ConstPool {
                     public: core::ptr::null(),
                 }) as CelRef
             }
+            Value::List(list) => self.intern_list(list),
             #[cfg(feature = "chrono")]
             Value::Duration(d) => d
                 .num_nanoseconds()
@@ -178,6 +180,104 @@ impl ConstPool {
                 .unwrap_or(core::ptr::null_mut()),
             _ => core::ptr::null_mut(),
         }
+    }
+
+    /// A list element: pool intern, or the immortal prebuilt [`new_int`] /
+    /// [`new_bool`] / [`new_null`] already answer. Never a thread-heap alloc.
+    fn intern_elem(&mut self, v: &Value) -> CelRef {
+        let w = self.intern(v);
+        if !w.is_null() {
+            return w;
+        }
+        match v {
+            Value::Int(i) => prebuilt_int(*i)
+                .map(|p| p as CelRef)
+                .unwrap_or(core::ptr::null_mut()),
+            Value::Bool(b) => new_bool(*b) as CelRef,
+            Value::Null => new_null() as CelRef,
+            _ => core::ptr::null_mut(),
+        }
+    }
+
+    fn intern_list(&mut self, list: &ListRef) -> CelRef {
+        match list.storage() {
+            ListStorage::Ints(values) => {
+                let start = list.window_start();
+                self.intern_ints_list(&values[start..start + list.len()])
+            }
+            ListStorage::Object(items)
+                if list.window_start() == 0 && list.len() == items.len() =>
+            {
+                let mut refs = Vec::with_capacity(items.len());
+                for v in items {
+                    let w = self.intern_elem(v);
+                    if w.is_null() {
+                        return core::ptr::null_mut();
+                    }
+                    refs.push(w);
+                }
+                self.intern_object_list(&refs)
+            }
+            _ => core::ptr::null_mut(),
+        }
+    }
+
+    fn intern_ints_list(&mut self, ints: &[i64]) -> CelRef {
+        let n = ints.len();
+        let data = if n == 0 {
+            core::ptr::null_mut()
+        } else {
+            let raw = self.alloc_raw(n * size_of::<i64>(), align_of::<i64>()) as *mut i64;
+            unsafe { core::ptr::copy_nonoverlapping(ints.as_ptr(), raw, n) };
+            raw
+        };
+        let col = self.alloc(W_IntColumn {
+            ob_header: CelObject {
+                ob_type: &CEL_INT_COLUMN_CLASS,
+            },
+            data,
+            length: n as i64,
+        }) as CelRef;
+        self.alloc(W_ListObject {
+            ob_header: CelObject {
+                ob_type: &CEL_LIST_CLASS,
+            },
+            strategy: ListStrategy::Ints,
+            storage: col,
+            items: core::ptr::null_mut(),
+            start: 0,
+            length: n as i64,
+            public: core::ptr::null(),
+            public_start: 0,
+            public_len: 0,
+        }) as CelRef
+    }
+
+    fn intern_object_list(&mut self, items: &[CelRef]) -> CelRef {
+        let n = items.len();
+        let size = CEL_ITEMS_BLOCK_ITEMS_OFFSET
+            .checked_add(n.saturating_mul(size_of::<CelRef>()))
+            .expect("items block fits");
+        let block = self.alloc_raw(size, align_of::<CelItemsBlock>()) as *mut CelItemsBlock;
+        unsafe {
+            (*block).capacity = n;
+            if n != 0 {
+                core::ptr::copy_nonoverlapping(items.as_ptr(), items_block_items_base(block), n);
+            }
+        }
+        self.alloc(W_ListObject {
+            ob_header: CelObject {
+                ob_type: &CEL_LIST_CLASS,
+            },
+            strategy: ListStrategy::Object,
+            storage: core::ptr::null_mut(),
+            items: block,
+            start: 0,
+            length: n as i64,
+            public: core::ptr::null(),
+            public_start: 0,
+            public_len: 0,
+        }) as CelRef
     }
 }
 

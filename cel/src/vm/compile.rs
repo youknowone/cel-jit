@@ -13,6 +13,7 @@ use crate::common::ast::{
     operators, CallExpr, ComprehensionExpr, EntryExpr, Expr, IdedExpr, ListExpr, LiteralValue,
     MapExpr, SelectExpr, StructExpr,
 };
+use crate::objects::ListStorage;
 use crate::Value;
 
 /// Why an expression could not be compiled.
@@ -361,6 +362,11 @@ impl Compiler {
     }
 
     fn list(&mut self, list: &ListExpr, id: u64) -> Result<(), CompileError> {
+        if let Some(value) = const_list(list) {
+            let index = self.add_const(value, id)?;
+            self.emit(OpCode::LoadConst, &[index], id)?;
+            return Ok(());
+        }
         // The element count is the capacity the literal's list reserves,
         // `BUILD_LIST n`; an optional element that turns out empty leaves one
         // slot of it unused. A hint, so a count past the operand width
@@ -537,6 +543,43 @@ fn appending_producer(op: OpCode) -> Option<OpCode> {
         _ => return None,
     };
     Some(fused)
+}
+
+/// A list whose every element is a compile-time constant, including nested
+/// list literals. Empty and mixed lists stay object storage; an all-int
+/// list is [`ListStorage::Ints`].
+fn const_list(list: &ListExpr) -> Option<Value> {
+    if !list.optional_indices.is_empty() {
+        return None;
+    }
+    let mut items = Vec::with_capacity(list.elements.len());
+    let mut all_int = true;
+    for element in &list.elements {
+        let value = const_expr(&element.expr)?;
+        all_int &= matches!(value, Value::Int(_));
+        items.push(value);
+    }
+    Some(if all_int && !items.is_empty() {
+        Value::list(ListStorage::Ints(
+            items
+                .into_iter()
+                .map(|v| match v {
+                    Value::Int(i) => i,
+                    _ => unreachable!(),
+                })
+                .collect(),
+        ))
+    } else {
+        Value::list(items)
+    })
+}
+
+fn const_expr(expr: &Expr) -> Option<Value> {
+    match expr {
+        Expr::Literal(literal) => Some(literal.to_value()),
+        Expr::List(list) => const_list(list),
+        _ => None,
+    }
 }
 
 /// The producer recognisers.

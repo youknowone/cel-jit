@@ -705,7 +705,7 @@ fn take_scratch_box() -> Box<Scratch> {
 }
 
 pub(crate) struct Vm<'a> {
-    code: &'a CelCode,
+    pub(crate) code: &'a CelCode,
     ctx: &'a Context<'a>,
     /// The activation record, `| locals | stack |` in ONE array, the layout
     /// `PyFrame.__init__` gives `locals_cells_stack_w`. A local is read at
@@ -1068,6 +1068,22 @@ impl<'a> Vm<'a> {
                 Some(Err(CelErr::InternalError))
             }
             None => None,
+        }
+    }
+
+    /// Scratch cell back to never-wrote, without allocating the pool.
+    ///
+    /// Residual `And`/`Or` persist an outcome only for the merge that will
+    /// read it. After that merge consumes it, or when the left short-circuits
+    /// and the merge will not run, the cell is [`CelErr::InternalError`].
+    /// Portal arms never write the slot, so a later interned fall-through
+    /// cannot observe a previous left.
+    #[inline(never)]
+    fn logic_reset(&mut self, slot: u32) {
+        if let Some(s) = self.scratch.as_mut() {
+            if let Some(cell) = s.logic.get_mut(slot as usize) {
+                *cell = Err(CelErr::InternalError);
+            }
         }
     }
 
@@ -2764,21 +2780,9 @@ impl<'a> Vm<'a> {
                     return Ok(Step::Jump(b));
                 }
             }
-            OpCode::AndLocal | OpCode::OrLocal => {
-                let short = op == OpCode::OrLocal;
-                let outcome = {
-                    let accu = self.local_as_value(a).ok_or(CelErr::InternalError)?;
-                    as_bool(&accu)
-                };
-                *self
-                    .scratch_mut()
-                    .logic
-                    .get_mut(b as usize)
-                    .ok_or(CelErr::InternalError)? = outcome;
-                if outcome == Ok(short) {
-                    self.push(Value::Bool(short));
-                    return Ok(Step::Jump(c));
-                }
+            OpCode::AndLocal | OpCode::OrLocal | OpCode::And | OpCode::Or
+            | OpCode::AndMerge | OpCode::OrMerge => {
+                return self.logic_step(op, a, b, c);
             }
 
             // -- control flow ---------------------------------------------------
@@ -2803,41 +2807,79 @@ impl<'a> Vm<'a> {
                     return Ok(Step::Jump(a));
                 }
             }
+            OpCode::Return => return Ok(Step::Return(self.pop()?)),
+        }
+        let _ = (pc, next);
+        Ok(Step::Next)
+    }
+
+    /// Residual `&&` / `||`. Out of [`Vm::step`] so the dispatch match stays
+    /// the size it was before these arms grew a slot-reset.
+    #[inline(never)]
+    fn logic_step(&mut self, op: OpCode, a: u32, b: u32, c: u32) -> CelResult<Step> {
+        match op {
+            OpCode::AndLocal | OpCode::OrLocal => {
+                let short = op == OpCode::OrLocal;
+                let outcome = {
+                    let accu = self.local_as_value(a).ok_or(CelErr::InternalError)?;
+                    as_bool(&accu)
+                };
+                if outcome == Ok(short) {
+                    self.logic_reset(b);
+                    self.push(Value::Bool(short));
+                    return Ok(Step::Jump(c));
+                }
+                *self
+                    .scratch_mut()
+                    .logic
+                    .get_mut(b as usize)
+                    .ok_or(CelErr::InternalError)? = outcome;
+                Ok(Step::Next)
+            }
             OpCode::And | OpCode::Or => {
                 let value = self.pop()?;
                 let short = op == OpCode::Or;
                 let outcome = as_bool(&value);
                 self.discard(value);
+                if outcome == Ok(short) {
+                    self.logic_reset(a);
+                    self.push(Value::Bool(short));
+                    return Ok(Step::Jump(b));
+                }
                 *self
                     .scratch_mut()
                     .logic
                     .get_mut(a as usize)
                     .ok_or(CelErr::InternalError)? = outcome;
-                if outcome == Ok(short) {
-                    self.push(Value::Bool(short));
-                    return Ok(Step::Jump(b));
-                }
+                Ok(Step::Next)
             }
             OpCode::AndMerge | OpCode::OrMerge => {
                 let right = self.pop()?;
-                let left = *self
+                let is_or = op == OpCode::OrMerge;
+                let recorded = self
                     .scratch
                     .as_ref()
                     .and_then(|s| s.logic.get(a as usize))
-                    .ok_or(CelErr::InternalError)?;
-                let value = merge(left, &right, op == OpCode::OrMerge)?;
+                    .copied();
+                // Interned And/Or fall-through never writes the slot;
+                // keep_right_merge treats that as the non-short-circuiting bool.
+                let left = match recorded {
+                    None | Some(Err(CelErr::InternalError)) => Ok(!is_or),
+                    Some(outcome) => outcome,
+                };
+                let merged = merge(left, &right, is_or);
                 self.discard(right);
-                // The left-hand error survived only to be weighed here, and
-                // it has just lost. Nothing can observe it now.
-                if let Err(absorbed) = left {
-                    self.unpark(absorbed);
+                if merged.is_ok() {
+                    if let Some(Err(absorbed)) = recorded {
+                        self.unpark(absorbed);
+                    }
                 }
-                self.push(Value::Bool(value));
+                self.logic_reset(a);
+                self.push(Value::Bool(merged?));
+                Ok(Step::Next)
             }
-            OpCode::Return => return Ok(Step::Return(self.pop()?)),
+            _ => Err(CelErr::InternalError),
         }
-        let _ = (pc, next);
-        Ok(Step::Next)
     }
 
     // -- the two arms the tracer is not shown -------------------------------

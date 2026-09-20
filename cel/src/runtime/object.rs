@@ -1362,17 +1362,28 @@ fn small_ints() -> &'static [usize] {
     })
 }
 
+/// The immortal singleton for `value`, if it is in the prebuilt int table.
+///
+/// Process-lifetime; no thread-heap allocation. [`new_int`] and [`new_int_in`]
+/// use this lookup; a const-pool list holds the same pointer for a small-int
+/// element.
+#[inline]
+pub fn prebuilt_int(value: i64) -> Option<*mut W_IntObject> {
+    if (PREBUILT_INT_FROM..PREBUILT_INT_TO).contains(&value) {
+        let idx = (value - PREBUILT_INT_FROM) as usize;
+        Some(small_ints()[idx] as *mut W_IntObject)
+    } else {
+        None
+    }
+}
+
 /// Box `value` as a CEL `int`.
 ///
 /// Values in [`PREBUILT_INT_FROM`]..[`PREBUILT_INT_TO`] are immortal
 /// singletons. Everything else is a fresh [`new_int_raw`].
 #[inline]
 pub fn new_int(value: i64) -> *mut W_IntObject {
-    if (PREBUILT_INT_FROM..PREBUILT_INT_TO).contains(&value) {
-        let idx = (value - PREBUILT_INT_FROM) as usize;
-        return small_ints()[idx] as *mut W_IntObject;
-    }
-    new_int_raw(value)
+    prebuilt_int(value).unwrap_or_else(|| new_int_raw(value))
 }
 
 /// Box `value` as a CEL `int` on `heap`.
@@ -1382,9 +1393,8 @@ pub fn new_int(value: i64) -> *mut W_IntObject {
 /// storage.
 #[inline]
 pub fn new_int_in(heap: &super::heap::CelHeap, value: i64) -> *mut W_IntObject {
-    if (PREBUILT_INT_FROM..PREBUILT_INT_TO).contains(&value) {
-        let idx = (value - PREBUILT_INT_FROM) as usize;
-        return small_ints()[idx] as *mut W_IntObject;
+    if let Some(w) = prebuilt_int(value) {
+        return w;
     }
     heap.alloc(W_IntObject {
         ob_header: CelObject {

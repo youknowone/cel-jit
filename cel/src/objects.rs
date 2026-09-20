@@ -979,6 +979,18 @@ impl ListRef {
     /// does not own entirely has to copy out — appending in place would grow
     /// the buffer every other list of the batch is reading.
     pub fn concat(mut self, other: &ListRef) -> ListRef {
+        if let (ListStorage::Ints(left), ListStorage::Ints(right)) =
+            (self.storage.as_ref(), other.storage.as_ref())
+        {
+            let l0 = self.window_start();
+            let r0 = other.window_start();
+            let ln = self.len();
+            let rn = other.len();
+            let mut out = Vec::with_capacity(ln + rn);
+            out.extend_from_slice(&left[l0..l0 + ln]);
+            out.extend_from_slice(&right[r0..r0 + rn]);
+            return ListRef::whole(Arc::new(ListStorage::Ints(out)));
+        }
         if self.whole_object().is_some() {
             if let Some(ListStorage::Object(items)) = Arc::get_mut(&mut self.storage) {
                 items.extend(other.iter());
@@ -2806,11 +2818,10 @@ pub(crate) fn interned_contains(container: CelRef, needle: CelRef) -> Result<boo
     match unsafe { w_kind(container) } {
         CelKind::List => {
             if let Some(ints) = interned_ints_slice(container) {
-                if unsafe { w_kind(needle) } != CelKind::Int {
-                    return Ok(false);
+                if unsafe { w_kind(needle) } == CelKind::Int {
+                    let n = unsafe { (*needle.cast::<W_IntObject>()).intval };
+                    return Ok(ints.contains(&n));
                 }
-                let n = unsafe { (*needle.cast::<W_IntObject>()).intval };
-                return Ok(ints.contains(&n));
             }
             Ok(interned_list_contains_in_place(container, needle))
         }
@@ -3266,9 +3277,28 @@ fn checked_op(
 
 #[cfg(test)]
 mod tests {
+    use super::{ListRef, ListStorage};
     use crate::{objects::Key, Context, ExecutionError, Program, Value};
     use std::collections::HashMap;
     use std::sync::Arc;
+
+    #[test]
+    fn concat_of_two_int_lists_stays_ints() {
+        let a = ListRef::whole(Arc::new(ListStorage::Ints(vec![1, 2, 3])));
+        let b = ListRef::whole(Arc::new(ListStorage::Ints(vec![4, 5])));
+        let out = a.concat(&b);
+        assert!(matches!(out.storage(), ListStorage::Ints(_)));
+        assert_eq!(
+            out.to_vec(),
+            vec![
+                Value::Int(1),
+                Value::Int(2),
+                Value::Int(3),
+                Value::Int(4),
+                Value::Int(5)
+            ]
+        );
+    }
 
     /// `math.max(x)` and `s.startsWith(x)` parse the same, so the walker asks
     /// whether a namespaced function exists before treating the target as a

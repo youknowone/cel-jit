@@ -111,6 +111,8 @@ const OP_NE_LOCAL_K: i64 = OpCode::NotEqualsLocalConst as i64;
 const OP_LT_LOCAL_K: i64 = OpCode::LessLocalConst as i64;
 const OP_GT_LOCAL_K: i64 = OpCode::GreaterLocalConst as i64;
 const OP_GE_LOCAL_K: i64 = OpCode::GreaterEqualsLocalConst as i64;
+const OP_AND: i64 = OpCode::And as i64;
+const OP_OR: i64 = OpCode::Or as i64;
 const OP_AND_LOCAL: i64 = OpCode::AndLocal as i64;
 const OP_OR_LOCAL: i64 = OpCode::OrLocal as i64;
 const OP_AND_MERGE: i64 = OpCode::AndMerge as i64;
@@ -741,6 +743,18 @@ fn vm_heap<'a>(vm_bits: i64) -> &'a CelHeap {
     unsafe { &*(*(vm_bits as *mut Vm<'a>)).heap }
 }
 
+/// Interned left of `&&` / `||`. `1` short-circuits (the result is `is_or`),
+/// `2` falls through to the right, `0` declines to residual.
+fn interned_bool_short(w: CelRef, is_or: bool) -> i64 {
+    if w.is_null() || unsafe { w_kind(w) } != CelKind::Bool {
+        0
+    } else if unsafe { (*w.cast::<W_BoolObject>()).boolval != 0 } == is_or {
+        1
+    } else {
+        2
+    }
+}
+
 /// `1` if a merge can keep the interned right-hand bool: the left was the
 /// non-short-circuiting bool, or the interned arm never wrote the slot.
 fn keep_right_merge(vm_bits: i64, slot: i64, is_or: bool) -> i64 {
@@ -924,23 +938,38 @@ fn portal_rare(
                 residual_dispatch(vm, here)
             }
         }
+        OP_AND | OP_OR => match operand_cell(frame, 1) {
+            Some(w) => {
+                let is_or = opcode == OP_OR;
+                match interned_bool_short(w, is_or) {
+                    1 => {
+                        let depth = frame.valuestackdepth;
+                        frame.locals_stack_w[depth - 1] = new_bool(is_or) as CelRef;
+                        insn_b(program, pc)
+                    }
+                    2 => {
+                        frame.valuestackdepth -= 1;
+                        here + 1
+                    }
+                    _ => residual_hydrate(vm, here),
+                }
+            }
+            _ => residual_hydrate(vm, here),
+        },
         OP_AND_LOCAL | OP_OR_LOCAL => {
             let slot = insn_a(program, pc);
             let w = frame.locals_stack_w[slot];
-            if w.is_null() || unsafe { w_kind(w) } != CelKind::Bool {
-                residual_dispatch(vm, here)
-            } else {
-                let truthy = unsafe { (*w.cast::<W_BoolObject>()).boolval } != 0;
-                let short = opcode == OP_OR_LOCAL;
-                if truthy == short {
-                    let r = new_bool(short) as CelRef;
+            let is_or = opcode == OP_OR_LOCAL;
+            match interned_bool_short(w, is_or) {
+                1 => {
+                    let r = new_bool(is_or) as CelRef;
                     let depth = frame.valuestackdepth;
                     frame.locals_stack_w[depth] = r;
                     frame.valuestackdepth = depth + 1;
                     insn_c(program, pc)
-                } else {
-                    here + 1
                 }
+                2 => here + 1,
+                _ => residual_dispatch(vm, here),
             }
         }
         OP_AND_MERGE | OP_OR_MERGE => match operand_cell(frame, 1) {
@@ -1127,8 +1156,27 @@ fn vm_sync_pop(vm_bits: i64) {
 }
 
 /// One instruction of the existing evaluator, residual.
-#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+///
+/// `And`/`Or` are not hot-match arms (that grouping cost a fixed ~1 ns on
+/// `LoadVar`). They land here with every unmatched opcode; interned `&&`/`||`
+/// divert to [`portal_rare`] before hydrate.
+///
+/// `#[inline(never)]` keeps this a single default-arm callee in the
+/// interpreter (same jump-table group as s15). The tracer still walks it
+/// (`inline_ref`) so compiled `&&`/`||` call [`portal_rare`] directly.
+#[inline(never)]
 fn residual_dispatch(vm_bits: i64, pc: i64) -> i64 {
+    let vm = unsafe { &mut *(vm_bits as usize as *mut Vm<'_>) };
+    let opcode = insn_op(vm.code, pc as usize);
+    if opcode == OP_AND || opcode == OP_OR {
+        let frame = unsafe { &mut *vm.cel_frame };
+        return portal_rare(frame, vm_bits, vm.code, pc as usize, pc, opcode);
+    }
+    residual_hydrate(vm_bits, pc)
+}
+
+#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+fn residual_hydrate(vm_bits: i64, pc: i64) -> i64 {
     let vm = unsafe { &mut *(vm_bits as usize as *mut Vm<'_>) };
     vm.hydrate_from_cells();
     match vm.dispatch_one(pc as u32) {
@@ -1423,7 +1471,8 @@ pub(crate) fn eval_through_portal(
         new_int_in => inline_ref,
         try_append => residual_int,
         new_list_with_capacity_in => inline_ref,
-        residual_dispatch => residual_int,
+        residual_dispatch => inline_ref,
+        residual_hydrate => residual_int,
         vm_sync_binop => residual_int,
         vm_sync_replace => residual_int,
         vm_sync_push => residual_int,
