@@ -26,9 +26,13 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::convert::{Infallible, TryFrom, TryInto};
 use std::fmt::{Debug, Display, Formatter};
+use std::alloc::{alloc, dealloc, handle_alloc_error, Layout};
+use std::marker::PhantomData;
 use std::ops;
 use std::ops::Deref;
-use std::mem::MaybeUninit;
+use std::mem::{ManuallyDrop, MaybeUninit};
+use std::ptr::NonNull;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::Arc;
 #[cfg(feature = "chrono")]
 use std::sync::LazyLock;
@@ -172,7 +176,12 @@ pub(crate) fn try_build_map<E, const REPLACE: bool>(
     mut write: impl FnMut(usize) -> Result<Option<(Key, Value)>, E>,
 ) -> Result<Map, E> {
     if n <= ORDERED_SCAN_LIMIT {
-        let arc = try_fill_ordered_arc::<E, REPLACE>(n, write)?;
+        let arc = try_fill_arc::<(Key, Value), E, REPLACE>(
+            n,
+            write,
+            |filled, pair| existing_filled_index(filled, &pair.0),
+            |slot, pair| slot.1 = pair.1,
+        )?;
         Ok(Map {
             storage: MapStorage::Entries(MapEntries { entries: arc }),
         })
@@ -190,22 +199,20 @@ pub(crate) fn try_build_map<E, const REPLACE: bool>(
     }
 }
 
-/// One `Arc<[(Key, Value)]>` allocation. If the final length is less than
-/// `cap`, a second exact-size allocation holds the filled prefix.
-fn try_fill_ordered_arc<E, const REPLACE: bool>(
-    cap: usize,
-    mut write: impl FnMut(usize) -> Result<Option<(Key, Value)>, E>,
-) -> Result<Arc<[(Key, Value)]>, E> {
-    if cap == 0 {
-        return Ok(Arc::from([]));
-    }
-    let mut uninit: Arc<[MaybeUninit<(Key, Value)>]> = Arc::new_uninit_slice(cap);
-    let slot = Arc::get_mut(&mut uninit).expect("unique");
-    struct Guard<'a> {
-        slot: &'a mut [MaybeUninit<(Key, Value)>],
+/// Write `write(0..cap)` into `slot`. `None` skips a source index. `REPLACE`
+/// overwrites an already-written slot that `find_replace` names. Written
+/// values are dropped if `write` fails. Returns how many slots were filled.
+fn fill_uninit_slots<T, E, const REPLACE: bool>(
+    slot: &mut [MaybeUninit<T>],
+    mut write: impl FnMut(usize) -> Result<Option<T>, E>,
+    mut find_replace: impl FnMut(&[T], &T) -> Option<usize>,
+    mut apply_replace: impl FnMut(&mut T, T),
+) -> Result<usize, E> {
+    struct Guard<'a, T> {
+        slot: &'a mut [MaybeUninit<T>],
         filled: usize,
     }
-    impl Drop for Guard<'_> {
+    impl<T> Drop for Guard<'_, T> {
         fn drop(&mut self) {
             for i in 0..self.filled {
                 // SAFETY: `slot[i]` was written before `filled` advanced past i.
@@ -213,48 +220,61 @@ fn try_fill_ordered_arc<E, const REPLACE: bool>(
             }
         }
     }
+    let cap = slot.len();
     let mut guard = Guard { slot, filled: 0 };
     for i in 0..cap {
-        let Some((key, value)) = write(i)? else {
+        let Some(item) = write(i)? else {
             continue;
         };
         if REPLACE {
             let filled = unsafe {
                 // SAFETY: `slot[0..filled]` was written.
-                std::slice::from_raw_parts(
-                    guard.slot.as_ptr() as *const (Key, Value),
-                    guard.filled,
-                )
+                std::slice::from_raw_parts(guard.slot.as_ptr() as *const T, guard.filled)
             };
-            if let Some(at) = existing_filled_index(filled, &key) {
-                // SAFETY: `existing` is an index into `0..filled`, which was written.
-                unsafe { guard.slot[at].assume_init_mut() }.1 = value;
+            if let Some(at) = find_replace(filled, &item) {
+                // SAFETY: `at` is an index into `0..filled`, which was written.
+                apply_replace(unsafe { guard.slot[at].assume_init_mut() }, item);
                 continue;
             }
         }
-        guard.slot[guard.filled].write((key, value));
+        guard.slot[guard.filled].write(item);
         guard.filled += 1;
     }
     let filled = guard.filled;
+    core::mem::forget(guard);
+    Ok(filled)
+}
+
+/// One `Arc<[T]>` allocation. If the final length is less than `cap`, a
+/// second exact-size allocation holds the filled prefix.
+fn try_fill_arc<T, E, const REPLACE: bool>(
+    cap: usize,
+    write: impl FnMut(usize) -> Result<Option<T>, E>,
+    find_replace: impl FnMut(&[T], &T) -> Option<usize>,
+    apply_replace: impl FnMut(&mut T, T),
+) -> Result<Arc<[T]>, E> {
+    if cap == 0 {
+        return Ok(Arc::from([]));
+    }
+    let mut uninit: Arc<[MaybeUninit<T>]> = Arc::new_uninit_slice(cap);
+    let slot = Arc::get_mut(&mut uninit).expect("unique");
+    let filled = fill_uninit_slots::<T, E, REPLACE>(slot, write, find_replace, apply_replace)?;
     let arc = if filled == cap {
-        core::mem::forget(guard);
         // SAFETY: every index in 0..cap was written.
         unsafe { uninit.assume_init() }
     } else if filled == 0 {
-        core::mem::forget(guard);
         Arc::from([])
     } else {
-        let mut exact: Arc<[MaybeUninit<(Key, Value)>]> = Arc::new_uninit_slice(filled);
+        let mut exact: Arc<[MaybeUninit<T>]> = Arc::new_uninit_slice(filled);
         {
             let dst = Arc::get_mut(&mut exact).expect("unique");
+            let src = Arc::get_mut(&mut uninit).expect("unique");
             for i in 0..filled {
-                // SAFETY: `guard.slot[i]` is initialized; the read moves it so
-                // the guard must not drop it.
-                dst[i].write(unsafe { guard.slot[i].assume_init_read() });
+                // SAFETY: `src[i]` is initialized; the read moves it so the
+                // leftover `MaybeUninit` drop is a no-op.
+                dst[i].write(unsafe { src[i].assume_init_read() });
             }
         }
-        guard.filled = 0;
-        core::mem::forget(guard);
         // SAFETY: every index in 0..filled was written.
         unsafe { exact.assume_init() }
     };
@@ -1064,6 +1084,592 @@ impl TryIntoValue for Value {
     }
 }
 
+/// Thin reference-counted slice: one allocation of a header followed by
+/// `len` elements. `Arc<[T]>` is a fat pointer (16 bytes); putting one in
+/// [`ListRef`] would make [`Value`] 32.
+///
+/// Every list buffer — object, ints, and shared column/record — starts with
+/// this header so [`ListBuf::clone`] / [`ListBuf::drop`] bump the count at
+/// the untagged address with no kind test. The static empty header starts
+/// at 1 and is never released: [`RcSlice::empty`] takes an extra count.
+///
+/// # Safety
+///
+/// `ptr` addresses either the process-lifetime empty header or a unique
+/// allocation of [`rc_slice_layout`] whose `len` initialized `T` values
+/// follow the header. `Send`/`Sync` when `T: Send + Sync`.
+struct RcSlice<T> {
+    ptr: NonNull<RcSliceHeader>,
+    _pd: PhantomData<T>,
+}
+
+#[repr(C)]
+struct RcSliceHeader {
+    strong: AtomicUsize,
+    len: u32,
+    kind: u8,
+}
+
+const LIST_TAG_OBJECT: usize = 0;
+const LIST_TAG_INTS: usize = 1;
+const LIST_TAG_SHARED: usize = 2;
+
+static EMPTY_OBJECT: RcSliceHeader = RcSliceHeader {
+    strong: AtomicUsize::new(1),
+    len: 0,
+    kind: LIST_TAG_OBJECT as u8,
+};
+static EMPTY_INTS: RcSliceHeader = RcSliceHeader {
+    strong: AtomicUsize::new(1),
+    len: 0,
+    kind: LIST_TAG_INTS as u8,
+};
+
+fn rc_slice_layout<T>(len: usize) -> (Layout, usize) {
+    let (layout, offset) = Layout::new::<RcSliceHeader>()
+        .extend(Layout::array::<T>(len).expect("list buffer layout"))
+        .expect("list buffer layout");
+    (layout.pad_to_align(), offset)
+}
+
+fn rc_header_inc(header: &RcSliceHeader) {
+    let old = header.strong.fetch_add(1, AtomicOrdering::Relaxed);
+    if old > (isize::MAX as usize) {
+        std::process::abort();
+    }
+}
+
+fn is_empty_header(ptr: *const RcSliceHeader) -> bool {
+    std::ptr::eq(ptr, &EMPTY_OBJECT) || std::ptr::eq(ptr, &EMPTY_INTS)
+}
+
+fn counted_empty(header: &'static RcSliceHeader) -> NonNull<RcSliceHeader> {
+    let ptr = NonNull::from(header);
+    // SAFETY: process-lifetime header; the initial 1 is never released.
+    rc_header_inc(unsafe { ptr.as_ref() });
+    ptr
+}
+
+// SAFETY: shared only through the atomic `strong` count; `T: Send + Sync`.
+unsafe impl<T: Send + Sync> Send for RcSlice<T> {}
+unsafe impl<T: Send + Sync> Sync for RcSlice<T> {}
+
+impl<T> RcSlice<T> {
+    fn empty() -> Self {
+        let ptr = if core::mem::size_of::<T>() == core::mem::size_of::<i64>()
+            && core::mem::align_of::<T>() == core::mem::align_of::<i64>()
+        {
+            counted_empty(&EMPTY_INTS)
+        } else {
+            counted_empty(&EMPTY_OBJECT)
+        };
+        RcSlice {
+            ptr,
+            _pd: PhantomData,
+        }
+    }
+
+    fn len(&self) -> usize {
+        // SAFETY: `ptr` is the empty header or a live allocation.
+        unsafe { self.ptr.as_ref().len as usize }
+    }
+
+    #[allow(dead_code)]
+    fn as_slice(&self) -> &[T] {
+        // SAFETY: `ptr` is the empty header or a live allocation.
+        unsafe { rc_slice_as_slice(self.ptr) }
+    }
+
+    fn from_vec(v: Vec<T>) -> Self {
+        if v.is_empty() {
+            return Self::empty();
+        }
+        match try_fill_rc::<T, std::convert::Infallible>(v.len(), {
+            let mut iter = v.into_iter();
+            move |_| Ok(iter.next())
+        }) {
+            Ok(s) => s,
+            Err(e) => match e {},
+        }
+    }
+}
+
+impl<T> Clone for RcSlice<T> {
+    fn clone(&self) -> Self {
+        // SAFETY: empty header or a live allocation; count is at offset 0.
+        rc_header_inc(unsafe { self.ptr.as_ref() });
+        RcSlice {
+            ptr: self.ptr,
+            _pd: PhantomData,
+        }
+    }
+}
+
+impl<T> Drop for RcSlice<T> {
+    fn drop(&mut self) {
+        let ptr = self.ptr.as_ptr();
+        // SAFETY: empty header or a live allocation.
+        if unsafe { (*ptr).strong.fetch_sub(1, AtomicOrdering::Release) } != 1 {
+            return;
+        }
+        std::sync::atomic::fence(AtomicOrdering::Acquire);
+        if is_empty_header(ptr) {
+            return;
+        }
+        // SAFETY: last owner of a heap buffer.
+        unsafe { rc_slice_drop_in_place::<T>(self.ptr) };
+    }
+}
+
+struct UninitRcSlice<T> {
+    slice: ManuallyDrop<RcSlice<T>>,
+    filled: usize,
+    cap: usize,
+}
+
+impl<T> UninitRcSlice<T> {
+    fn new(cap: usize) -> Self {
+        if cap > u32::MAX as usize {
+            panic!(
+                "a list buffer past {} elements cannot be allocated",
+                u32::MAX
+            );
+        }
+        if cap == 0 {
+            return UninitRcSlice {
+                slice: ManuallyDrop::new(RcSlice::empty()),
+                filled: 0,
+                cap: 0,
+            };
+        }
+        let (layout, _) = rc_slice_layout::<T>(cap);
+        // SAFETY: `layout` is non-zero (`cap > 0`) and correctly aligned
+        // for the header plus `cap` elements.
+        let raw = unsafe { alloc(layout) };
+        if raw.is_null() {
+            handle_alloc_error(layout);
+        }
+        let header = raw.cast::<RcSliceHeader>();
+        // SAFETY: `raw` is a unique allocation of `layout`, large enough
+        // for the header.
+        unsafe {
+            header.write(RcSliceHeader {
+                strong: AtomicUsize::new(1),
+                len: 0,
+                kind: 0,
+            });
+        }
+        UninitRcSlice {
+            slice: ManuallyDrop::new(RcSlice {
+                // SAFETY: `raw` is a non-null allocation of `layout`.
+                ptr: unsafe { NonNull::new_unchecked(header) },
+                _pd: PhantomData,
+            }),
+            filled: 0,
+            cap,
+        }
+    }
+
+    fn slot(&mut self) -> &mut [MaybeUninit<T>] {
+        if self.cap == 0 {
+            return &mut [];
+        }
+        let (_, offset) = rc_slice_layout::<T>(self.cap);
+        // SAFETY: unique allocation of [`rc_slice_layout`] for `cap`
+        // elements; nothing else aliases this array until `finish`.
+        unsafe {
+            let data = self.slice.ptr.as_ptr().cast::<u8>().add(offset);
+            std::slice::from_raw_parts_mut(data.cast::<MaybeUninit<T>>(), self.cap)
+        }
+    }
+
+    fn finish(mut self) -> RcSlice<T> {
+        let filled = self.filled;
+        let cap = self.cap;
+        if filled == 0 {
+            return RcSlice::empty();
+        }
+        if filled != cap {
+            let mut exact = UninitRcSlice::new(filled);
+            // SAFETY: `self` uniquely owns `filled` initialized elements;
+            // `exact` is a unique allocation of that many slots. The read
+            // moves each element so `self`'s drop must not run them.
+            unsafe {
+                let src = {
+                    let (_, offset) = rc_slice_layout::<T>(cap);
+                    self.slice.ptr.as_ptr().cast::<u8>().add(offset).cast::<T>()
+                };
+                let dst = {
+                    let (_, offset) = rc_slice_layout::<T>(filled);
+                    exact
+                        .slice
+                        .ptr
+                        .as_ptr()
+                        .cast::<u8>()
+                        .add(offset)
+                        .cast::<T>()
+                };
+                for i in 0..filled {
+                    dst.add(i).write(src.add(i).read());
+                }
+            }
+            exact.filled = filled;
+            self.filled = 0;
+            return exact.finish();
+        }
+        // SAFETY: unique allocation; every slot in 0..cap was written.
+        // `filled == cap <= u32::MAX` because [`UninitRcSlice::new`] rejected
+        // a larger `cap`.
+        unsafe {
+            (*self.slice.ptr.as_ptr()).len = filled as u32;
+        }
+        // SAFETY: transferring the unique strong count to the returned handle.
+        let slice = unsafe { ManuallyDrop::take(&mut self.slice) };
+        self.filled = 0;
+        self.cap = 0;
+        core::mem::forget(self);
+        slice
+    }
+}
+
+impl<T> Drop for UninitRcSlice<T> {
+    fn drop(&mut self) {
+        if self.cap == 0 {
+            // SAFETY: counted empty handle from [`RcSlice::empty`].
+            unsafe { ManuallyDrop::drop(&mut self.slice) };
+            return;
+        }
+        // SAFETY: unique allocation of `cap` slots; the first `filled`
+        // elements were written and have not been moved. The `RcSlice`
+        // field is not dropped: that would free the same allocation.
+        unsafe {
+            let (layout, offset) = rc_slice_layout::<T>(self.cap);
+            let data = self
+                .slice
+                .ptr
+                .as_ptr()
+                .cast::<u8>()
+                .add(offset)
+                .cast::<T>();
+            for i in 0..self.filled {
+                std::ptr::drop_in_place(data.add(i));
+            }
+            dealloc(self.slice.ptr.as_ptr().cast(), layout);
+        }
+    }
+}
+
+/// Borrow the elements of a live [`RcSlice`] header.
+///
+/// # Safety
+///
+/// `ptr` is the empty header or a live allocation of `T`, and the borrow
+/// does not outlive that allocation.
+unsafe fn rc_slice_as_slice<'a, T>(ptr: NonNull<RcSliceHeader>) -> &'a [T] {
+    // SAFETY: caller: `ptr` is the empty header or a live allocation.
+    let n = unsafe { ptr.as_ref().len as usize };
+    if n == 0 {
+        return &[];
+    }
+    let (_, offset) = rc_slice_layout::<T>(n);
+    // SAFETY: element array of `n` initialized `T` follows the header.
+    let data = unsafe { ptr.as_ptr().cast::<u8>().add(offset).cast::<T>() };
+    unsafe { std::slice::from_raw_parts(data, n) }
+}
+
+fn try_fill_rc<T, E>(
+    cap: usize,
+    write: impl FnMut(usize) -> Result<Option<T>, E>,
+) -> Result<RcSlice<T>, E> {
+    if cap == 0 {
+        return Ok(RcSlice::empty());
+    }
+    let n = u32::try_from(cap).expect("a list buffer past u32::MAX elements") as usize;
+    let mut uninit = UninitRcSlice::new(n);
+    uninit.filled = fill_uninit_slots::<T, E, false>(
+        uninit.slot(),
+        write,
+        |_, _| None,
+        |_, _| {},
+    )?;
+    Ok(uninit.finish())
+}
+
+/// One allocation of a [`RcSliceHeader`] followed by a [`ListStorage`].
+/// Used for column / record windows (and any other [`ListStorage`] that is
+/// not an owned object or int buffer).
+#[repr(C)]
+struct SharedBuf {
+    header: RcSliceHeader,
+    inner: SharedInner,
+}
+
+/// Payload of [`SharedBuf`].
+///
+/// `Arc` is only for a [`ListStorage`] the caller still shares with someone
+/// else (batch windows over one column). [`ListRef`] clone bumps
+/// [`SharedBuf::header`], not that `Arc`.
+enum SharedInner {
+    Owned(ListStorage),
+    Arc(Arc<ListStorage>),
+}
+
+impl SharedInner {
+    fn storage(&self) -> &ListStorage {
+        match self {
+            SharedInner::Owned(s) => s,
+            SharedInner::Arc(a) => a,
+        }
+    }
+
+    fn identity(&self) -> *const ListStorage {
+        match self {
+            SharedInner::Owned(s) => s as *const ListStorage,
+            SharedInner::Arc(a) => Arc::as_ptr(a),
+        }
+    }
+}
+
+/// Thin pointer at an object buffer, an int buffer, or a shared
+/// [`ListStorage`] (column / record). The kind lives in
+/// [`RcSliceHeader::kind`] so clone/drop do not untag.
+pub(crate) struct ListBuf {
+    ptr: NonNull<RcSliceHeader>,
+}
+
+impl ListBuf {
+    fn from_object(s: RcSlice<Value>) -> Self {
+        if !is_empty_header(s.ptr.as_ptr()) {
+            // SAFETY: unique heap object header.
+            unsafe { (*s.ptr.as_ptr()).kind = LIST_TAG_OBJECT as u8 };
+        }
+        let ptr = s.ptr;
+        core::mem::forget(s);
+        ListBuf { ptr }
+    }
+
+    fn from_ints(s: RcSlice<i64>) -> Self {
+        if !is_empty_header(s.ptr.as_ptr()) {
+            // SAFETY: unique heap int header.
+            unsafe { (*s.ptr.as_ptr()).kind = LIST_TAG_INTS as u8 };
+        }
+        let ptr = s.ptr;
+        core::mem::forget(s);
+        ListBuf { ptr }
+    }
+
+    fn from_shared(arc: Arc<ListStorage>) -> Self {
+        let inner = match Arc::try_unwrap(arc) {
+            Ok(storage) => SharedInner::Owned(storage),
+            Err(arc) => SharedInner::Arc(arc),
+        };
+        let layout = Layout::new::<SharedBuf>();
+        // SAFETY: `SharedBuf` is non-zero and aligned; the header sits at
+        // offset 0 so clone/drop can bump `strong` without a kind test.
+        let raw = unsafe { alloc(layout) };
+        if raw.is_null() {
+            handle_alloc_error(layout);
+        }
+        // SAFETY: `raw` is a unique allocation of `layout`.
+        unsafe {
+            raw.cast::<SharedBuf>().write(SharedBuf {
+                header: RcSliceHeader {
+                    strong: AtomicUsize::new(1),
+                    len: 0,
+                    kind: LIST_TAG_SHARED as u8,
+                },
+                inner,
+            });
+        }
+        ListBuf {
+            // SAFETY: `alloc` returned non-null.
+            ptr: unsafe { NonNull::new_unchecked(raw.cast()) },
+        }
+    }
+
+    fn tag(&self) -> usize {
+        // SAFETY: live header of every kind.
+        unsafe { self.ptr.as_ref().kind as usize }
+    }
+
+    fn raw(&self) -> NonNull<u8> {
+        self.ptr.cast()
+    }
+
+    fn as_raw_tagged(&self) -> *const () {
+        self.ptr.as_ptr() as *const ()
+    }
+
+    /// Increment the buffer and return a new handle. `ptr` is the header
+    /// stored by [`link_public_handle`].
+    ///
+    /// # Safety
+    ///
+    /// `ptr` is null or a live [`ListBuf`] header.
+    unsafe fn clone_from_raw(ptr: *const ()) -> Option<ListBuf> {
+        if ptr.is_null() {
+            return None;
+        }
+        let buf = ListBuf {
+            ptr: NonNull::new(ptr as *mut RcSliceHeader)?,
+        };
+        let out = buf.clone();
+        core::mem::forget(buf);
+        Some(out)
+    }
+
+    fn len(&self) -> usize {
+        match self.tag() {
+            LIST_TAG_OBJECT => self.object_slice().map_or(0, <[Value]>::len),
+            LIST_TAG_INTS => self.ints_slice().map_or(0, <[i64]>::len),
+            LIST_TAG_SHARED => self.shared().map_or(0, ListStorage::len),
+            _ => 0,
+        }
+    }
+
+    fn object_slice(&self) -> Option<&[Value]> {
+        match self.tag() {
+            // SAFETY: tag names an object [`RcSlice<Value>`] header.
+            LIST_TAG_OBJECT => Some(unsafe { rc_slice_as_slice(self.raw().cast()) }),
+            LIST_TAG_SHARED => match self.shared()? {
+                ListStorage::Object(v) => Some(v.as_slice()),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn ints_slice(&self) -> Option<&[i64]> {
+        match self.tag() {
+            // SAFETY: tag names an int [`RcSlice<i64>`] header.
+            LIST_TAG_INTS => Some(unsafe { rc_slice_as_slice(self.raw().cast()) }),
+            LIST_TAG_SHARED => match self.shared()? {
+                ListStorage::Ints(v) => Some(v.as_slice()),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn shared(&self) -> Option<&ListStorage> {
+        if self.tag() != LIST_TAG_SHARED {
+            return None;
+        }
+        // SAFETY: tag names a live [`SharedBuf`] produced by
+        // [`ListBuf::from_shared`].
+        Some(unsafe { (*self.raw().as_ptr().cast::<SharedBuf>()).inner.storage() })
+    }
+
+    fn shared_identity(&self) -> Option<*const ListStorage> {
+        if self.tag() != LIST_TAG_SHARED {
+            return None;
+        }
+        // SAFETY: tag names a live [`SharedBuf`].
+        Some(unsafe { (*self.raw().as_ptr().cast::<SharedBuf>()).inner.identity() })
+    }
+
+    fn element_at(&self, index: usize) -> Value {
+        if let Some(v) = self.object_slice() {
+            return v[index].clone();
+        }
+        if let Some(v) = self.ints_slice() {
+            return Value::Int(v[index]);
+        }
+        match self.shared() {
+            Some(s) => s.element_at(index),
+            None => panic!("list buffer has no element at {index}"),
+        }
+    }
+}
+
+const _: fn() = || {
+    fn ok<T: Send + Sync>() {}
+    ok::<i64>();
+    ok::<RcSliceHeader>();
+};
+
+// SAFETY: clone/drop only touch the atomic at offset 0; the payload is
+// dropped by the last owner on this thread. `i64` and the header are
+// `Send + Sync` (see the assertion above).
+unsafe impl Send for ListBuf {}
+unsafe impl Sync for ListBuf {}
+
+impl Clone for ListBuf {
+    fn clone(&self) -> Self {
+        // SAFETY: `ptr` is a live header; kind is in the header, not the pointer.
+        rc_header_inc(unsafe { self.ptr.as_ref() });
+        ListBuf { ptr: self.ptr }
+    }
+}
+
+impl Drop for ListBuf {
+    fn drop(&mut self) {
+        // SAFETY: `ptr` is a live header of every kind.
+        if unsafe { self.ptr.as_ref().strong.fetch_sub(1, AtomicOrdering::Release) } != 1 {
+            return;
+        }
+        std::sync::atomic::fence(AtomicOrdering::Acquire);
+        // SAFETY: last owner of this buffer.
+        unsafe { list_buf_drop_slow(self.ptr) };
+    }
+}
+
+/// Last-owner drop: dispatch on [`RcSliceHeader::kind`], drop elements /
+/// storage, deallocate.
+///
+/// # Safety
+///
+/// `ptr` is a unique remaining handle of a heap buffer (not a static empty
+/// header, which never reaches a zero count).
+#[inline(never)]
+unsafe fn list_buf_drop_slow(ptr: NonNull<RcSliceHeader>) {
+    if is_empty_header(ptr.as_ptr()) {
+        return;
+    }
+    // SAFETY: unique heap header.
+    let kind = unsafe { ptr.as_ref().kind as usize };
+    match kind {
+        LIST_TAG_OBJECT => {
+            // SAFETY: object buffer; unique owner; `len` elements follow.
+            unsafe { rc_slice_drop_in_place::<Value>(ptr) };
+        }
+        LIST_TAG_INTS => {
+            // SAFETY: int buffer; unique owner; `len` elements follow.
+            unsafe { rc_slice_drop_in_place::<i64>(ptr) };
+        }
+        LIST_TAG_SHARED => {
+            let layout = Layout::new::<SharedBuf>();
+            // SAFETY: unique [`SharedBuf`]; dropping it releases `inner`.
+            unsafe {
+                std::ptr::drop_in_place(ptr.as_ptr().cast::<SharedBuf>());
+                dealloc(ptr.as_ptr().cast(), layout);
+            }
+        }
+        _ => unreachable!("list buffer kind"),
+    }
+}
+
+/// Drop `len` elements and free an [`RcSlice`] allocation.
+///
+/// # Safety
+///
+/// `ptr` is a unique heap [`RcSliceHeader`] of `T` whose `len` elements
+/// were written when the buffer was closed.
+unsafe fn rc_slice_drop_in_place<T>(ptr: NonNull<RcSliceHeader>) {
+    let raw = ptr.as_ptr();
+    // SAFETY: unique heap header.
+    let n = unsafe { (*raw).len as usize };
+    let (layout, offset) = rc_slice_layout::<T>(n);
+    // SAFETY: element array of `n` initialized `T` follows the header.
+    unsafe {
+        let data = raw.cast::<u8>().add(offset).cast::<T>();
+        for i in 0..n {
+            std::ptr::drop_in_place(data.add(i));
+        }
+        dealloc(raw.cast(), layout);
+    }
+}
+
 /// How a list's elements are stored.
 ///
 /// A list built element by element owns a `Vec<Value>` and is what every
@@ -1149,16 +1755,15 @@ impl FromIterator<Value> for ListStorage {
 /// row is a pair of offsets into the buffer and a reference count — no
 /// allocation at all, where a list that owned its own storage cost one per row.
 ///
-/// This is PyPy's list-strategy arrangement — `objspace/std/listobject.py:1886`
-/// `ObjectListStrategy`, `:1939` `IntegerListStrategy`, `:2043`
-/// `FloatListStrategy`: a homogeneous list keeps unboxed storage, and boxing
-/// happens on access rather than on construction.
+/// An owned object or int list is one allocation: a reference-counted header
+/// followed by the inline element array. Column and record lists keep a
+/// shared [`ListStorage`] so a batch of windows still shares one buffer.
 ///
 /// Every consumer goes through the accessors below rather than matching a
 /// storage variant, so adding a strategy does not reopen the call sites.
 #[derive(Clone)]
 pub struct ListRef {
-    storage: Arc<ListStorage>,
+    buf: ListBuf,
     /// 32-bit so a `Value` stays 24 bytes. A buffer is checked against this
     /// bound when the window is built rather than truncated silently.
     start: u32,
@@ -1166,21 +1771,95 @@ pub struct ListRef {
 }
 
 impl ListRef {
-    pub(crate) fn storage(&self) -> &ListStorage {
-        &self.storage
+    #[allow(dead_code)]
+    pub(crate) fn storage(&self) -> Option<&ListStorage> {
+        self.buf.shared()
     }
 
-    pub(crate) fn storage_arc(&self) -> &Arc<ListStorage> {
-        &self.storage
+    pub(crate) fn public_ptr(&self) -> *const () {
+        self.buf.as_raw_tagged()
+    }
+
+    pub(crate) fn ints_slice(&self) -> Option<&[i64]> {
+        self.buf.ints_slice()
+    }
+
+    pub(crate) fn object_slice(&self) -> Option<&[Value]> {
+        self.buf.object_slice()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn is_ints(&self) -> bool {
+        self.buf.ints_slice().is_some()
+    }
+
+    pub(crate) fn is_whole(&self) -> bool {
+        self.start == 0 && self.len() == self.buf.len()
     }
 
     /// Reconstruct a window from a bind-time public link. The offsets were
     /// recorded from a live [`ListRef`] over this buffer.
-    pub(crate) fn from_linked(storage: Arc<ListStorage>, start: u32, len: u32) -> ListRef {
+    pub(crate) fn from_linked(buf: ListBuf, start: u32, len: u32) -> ListRef {
+        ListRef { buf, start, len }
+    }
+
+    /// # Safety
+    ///
+    /// `ptr` is null or a header stored by [`link_public_handle`].
+    pub(crate) unsafe fn clone_from_public(ptr: *const ()) -> Option<ListBuf> {
+        // SAFETY: forwarded to [`ListBuf::clone_from_raw`]; same contract.
+        unsafe { ListBuf::clone_from_raw(ptr) }
+    }
+
+    pub(crate) fn try_fill_values<E>(
+        n: usize,
+        write: impl FnMut(usize) -> Result<Option<Value>, E>,
+    ) -> Result<ListRef, E> {
+        Ok(ListRef::from_object_buf(try_fill_rc(n, write)?))
+    }
+
+    pub(crate) fn try_fill_ints<E>(
+        n: usize,
+        write: impl FnMut(usize) -> Result<Option<i64>, E>,
+    ) -> Result<ListRef, E> {
+        Ok(ListRef::from_ints_buf(try_fill_rc(n, write)?))
+    }
+
+    fn from_object_buf(buf: RcSlice<Value>) -> ListRef {
+        let len = u32::try_from(buf.len()).expect("a list past u32::MAX elements");
         ListRef {
-            storage,
-            start,
+            buf: ListBuf::from_object(buf),
+            start: 0,
             len,
+        }
+    }
+
+    fn from_ints_buf(buf: RcSlice<i64>) -> ListRef {
+        let len = u32::try_from(buf.len()).expect("a list past u32::MAX elements");
+        ListRef {
+            buf: ListBuf::from_ints(buf),
+            start: 0,
+            len,
+        }
+    }
+
+    fn from_storage_arc(storage: Arc<ListStorage>, start: usize, len: usize) -> ListRef {
+        assert!(
+            start + len <= storage.len(),
+            "list window {start}..{} runs past the {} element buffer",
+            start + len,
+            storage.len()
+        );
+        let (Ok(start_u), Ok(len_u)) = (u32::try_from(start), u32::try_from(len)) else {
+            panic!(
+                "a list buffer past {} elements cannot be windowed",
+                u32::MAX
+            );
+        };
+        ListRef {
+            buf: ListBuf::from_shared(storage),
+            start: start_u,
+            len: len_u,
         }
     }
 
@@ -1195,23 +1874,7 @@ impl ListRef {
 
     /// The window `storage[start .. start + len]`.
     pub fn window(storage: Arc<ListStorage>, start: usize, len: usize) -> ListRef {
-        assert!(
-            start + len <= storage.len(),
-            "list window {start}..{} runs past the {} element buffer",
-            start + len,
-            storage.len()
-        );
-        let (Ok(start), Ok(len)) = (u32::try_from(start), u32::try_from(len)) else {
-            panic!(
-                "a list buffer past {} elements cannot be windowed",
-                u32::MAX
-            );
-        };
-        ListRef {
-            storage,
-            start,
-            len,
-        }
+        ListRef::from_storage_arc(storage, start, len)
     }
 
     /// The whole of `storage` as one list.
@@ -1230,7 +1893,7 @@ impl ListRef {
 
     /// The element at `index`, boxed on the way out. `None` past the end.
     pub fn get(&self, index: usize) -> Option<Value> {
-        (index < self.len()).then(|| self.storage.element_at(self.start as usize + index))
+        (index < self.len()).then(|| self.buf.element_at(self.start as usize + index))
     }
 
     pub fn iter(&self) -> impl Iterator<Item = Value> + '_ {
@@ -1240,24 +1903,18 @@ impl ListRef {
         })
     }
 
-    /// The boxed elements. Free for a whole [`ListStorage::Object`], and the
-    /// point at which an unboxed strategy pays for the representation the rest
-    /// of the language expects.
+    /// The boxed elements. Free for a whole object buffer, and the point at
+    /// which an unboxed strategy pays for the representation the rest of the
+    /// language expects.
     pub fn to_vec(&self) -> Vec<Value> {
         match self.whole_object() {
-            Some(v) => v.clone(),
+            Some(v) => v.to_vec(),
             None => self.iter().collect(),
         }
     }
 
-    /// The elements as an owned `Vec`, moving them when this list is the sole
-    /// owner of a boxed buffer it covers entirely.
-    pub fn into_vec(mut self) -> Vec<Value> {
-        if self.whole_object().is_some() {
-            if let Some(ListStorage::Object(v)) = Arc::get_mut(&mut self.storage) {
-                return std::mem::take(v);
-            }
-        }
+    /// The elements as an owned `Vec`.
+    pub fn into_vec(self) -> Vec<Value> {
         self.iter().collect()
     }
 
@@ -1272,91 +1929,74 @@ impl ListRef {
 
     /// This list's elements followed by `other`'s.
     ///
-    /// An unboxed strategy that is asked to grow becomes the boxed one first,
-    /// which is what PyPy's strategies do when a list stops being homogeneous
-    /// (`listobject.py` `switch_to_object_strategy`). A window onto a buffer it
-    /// does not own entirely has to copy out — appending in place would grow
-    /// the buffer every other list of the batch is reading.
-    ///
     /// Two int lists, or an int list and an object list of ints, stay
     /// [`ListStorage::Ints`]: the elements are copied as words, not boxed.
-    pub fn concat(mut self, other: &ListRef) -> ListRef {
+    pub fn concat(self, other: &ListRef) -> ListRef {
         if let Some(out) = concat_int_lists(&self, other) {
             return out;
         }
-        if self.whole_object().is_some() {
-            if let Some(ListStorage::Object(items)) = Arc::get_mut(&mut self.storage) {
-                items.extend(other.iter());
-                let len = items.len();
-                self.len = u32::try_from(len).expect("a list past u32::MAX elements");
-                return self;
-            }
+        let n = self.len() + other.len();
+        let mut left = self.iter();
+        let mut right = other.iter();
+        match ListRef::try_fill_values::<std::convert::Infallible>(n, |_| {
+            Ok(left.next().or_else(|| right.next()))
+        }) {
+            Ok(out) => out,
+            Err(e) => match e {},
         }
-        let mut items = self.to_vec();
-        items.extend(other.iter());
-        ListRef::from(items)
     }
 
     /// Whether both lists read the same buffer.
     ///
     /// This is the invariant the batch door depends on: every row of one output
-    /// is a window onto one [`ListStorage`], so a row costs no allocation. It
-    /// is observable rather than private because a change that quietly went
-    /// back to a buffer per row would otherwise pass every test.
+    /// is a window onto one buffer, so a row costs no allocation. It is
+    /// observable rather than private because a change that quietly went back
+    /// to a buffer per row would otherwise pass every test.
     pub fn shares_storage_with(&self, other: &ListRef) -> bool {
-        Arc::ptr_eq(&self.storage, &other.storage)
-    }
-
-    /// The boxed buffer, when this list is exactly all of one.
-    fn whole_object(&self) -> Option<&Vec<Value>> {
-        match &*self.storage {
-            ListStorage::Object(v) if self.start == 0 && self.len() == v.len() => Some(v),
-            _ => None,
+        if self.buf.tag() != other.buf.tag() {
+            return false;
+        }
+        match self.buf.shared_identity() {
+            Some(a) => Some(a) == other.buf.shared_identity(),
+            None => self.buf.raw() == other.buf.raw(),
         }
     }
 
+    /// The boxed buffer, when this list is exactly all of one.
+    fn whole_object(&self) -> Option<&[Value]> {
+        let v = self.buf.object_slice()?;
+        (self.start == 0 && self.len() == v.len()).then_some(v)
+    }
 }
 
 #[inline(never)]
 fn concat_int_lists(left: &ListRef, right: &ListRef) -> Option<ListRef> {
-    let mut out = Vec::with_capacity(left.len() + right.len());
-    if !append_list_ints(&mut out, left) {
-        return None;
-    }
-    if !append_list_ints(&mut out, right) {
-        return None;
-    }
-    Some(ListRef::whole(Arc::new(ListStorage::Ints(out))))
+    let n = left.len() + right.len();
+    let mut i = 0usize;
+    ListRef::try_fill_ints::<()>(n, |_| {
+        let src = if i < left.len() {
+            int_at(left, i)
+        } else {
+            int_at(right, i - left.len())
+        };
+        i += 1;
+        match src {
+            Some(v) => Ok(Some(v)),
+            None => Err(()),
+        }
+    })
+    .ok()
 }
 
-/// Append this list's integers onto `out`. `false` if any element is not an int.
-#[inline(never)]
-fn append_list_ints(out: &mut Vec<i64>, list: &ListRef) -> bool {
-    match list.storage.as_ref() {
-        ListStorage::Ints(v) => {
-            let start = list.window_start();
-            let Some(s) = v.get(start..start + list.len()) else {
-                return false;
-            };
-            out.extend_from_slice(s);
-            true
-        }
-        ListStorage::Object(v) => {
-            let start = list.window_start();
-            let n = list.len();
-            let Some(slice) = v.get(start..start + n) else {
-                return false;
-            };
-            for item in slice {
-                let Some(i) = value_as_int(item) else {
-                    return false;
-                };
-                out.push(i);
-            }
-            true
-        }
-        _ => false,
+fn int_at(list: &ListRef, i: usize) -> Option<i64> {
+    let at = list.window_start() + i;
+    if let Some(v) = list.ints_slice() {
+        return v.get(at).copied();
     }
+    if let Some(v) = list.object_slice() {
+        return value_as_int(v.get(at)?);
+    }
+    value_as_int(&list.get(i)?)
 }
 
 fn value_as_int(v: &Value) -> Option<i64> {
@@ -1377,7 +2017,14 @@ impl Default for ListRef {
 
 impl<T: Into<ListStorage>> From<T> for ListRef {
     fn from(items: T) -> Self {
-        ListRef::whole(Arc::new(items.into()))
+        match items.into() {
+            ListStorage::Object(v) => ListRef::from_object_buf(RcSlice::from_vec(v)),
+            ListStorage::Ints(v) => ListRef::from_ints_buf(RcSlice::from_vec(v)),
+            other => {
+                let len = other.len();
+                ListRef::window(Arc::new(other), 0, len)
+            }
+        }
     }
 }
 
@@ -1435,6 +2082,7 @@ pub enum Value {
 const _: () = {
     assert!(core::mem::size_of::<Value>() == 24);
     assert!(core::mem::size_of::<Map>() == 24);
+    assert!(core::mem::size_of::<ListRef>() == 16);
 };
 
 impl Debug for Value {
@@ -1979,20 +2627,22 @@ impl Value {
 #[inline(never)]
 fn eval_list_literal(list_expr: &ListExpr, ctx: &Context) -> Result<Value, ExecutionError> {
     if !list_expr.optional_indices.is_empty() {
-        let mut list = Vec::with_capacity(list_expr.elements.len());
-        for (idx, element) in list_expr.elements.iter().enumerate() {
+        let n = list_expr.elements.len();
+        let mut src = list_expr.elements.iter().enumerate();
+        let list = ListRef::try_fill_values(n, |_| {
+            let (idx, element) = src.next().expect("n source elements");
             let value = resolve_inner(element, ctx)?;
             if list_expr.optional_indices.contains(&idx) {
-                match optional_view(&value) {
-                    OptView::Empty => {}
-                    OptView::Present(inner) => list.push(inner.into_public()),
-                    OptView::Plain => list.push(value.into_public()),
-                }
+                Ok(match optional_view(&value) {
+                    OptView::Empty => None,
+                    OptView::Present(inner) => Some(inner.into_public()),
+                    OptView::Plain => Some(value.into_public()),
+                })
             } else {
-                list.push(value.into_public());
+                Ok(Some(value.into_public()))
             }
-        }
-        return Ok(Value::list(list));
+        })?;
+        return Ok(Value::List(list));
     }
     let n = list_expr.elements.len();
     if n == 0 {
@@ -2003,20 +2653,20 @@ fn eval_list_literal(list_expr: &ListExpr, ctx: &Context) -> Result<Value, Execu
         .iter()
         .all(|e| matches!(&e.expr, Expr::Literal(LiteralValue::Int(_))))
     {
-        let mut ints = Vec::with_capacity(n);
-        for element in &list_expr.elements {
-            let Expr::Literal(LiteralValue::Int(v)) = &element.expr else {
+        let mut src = list_expr.elements.iter();
+        let list = ListRef::try_fill_ints::<ExecutionError>(n, |_| {
+            let Expr::Literal(LiteralValue::Int(v)) = &src.next().expect("n ints").expr else {
                 unreachable!()
             };
-            ints.push(*v);
-        }
-        return Ok(Value::list(ListStorage::Ints(ints)));
+            Ok(Some(*v))
+        })?;
+        return Ok(Value::List(list));
     }
-    let mut list = Vec::with_capacity(n);
-    for element in &list_expr.elements {
-        list.push(resolve_inner(element, ctx)?.into_public());
-    }
-    Ok(Value::list(list))
+    let mut src = list_expr.elements.iter();
+    let list = ListRef::try_fill_values(n, |_| {
+        Ok(Some(resolve_inner(src.next().expect("n elements"), ctx)?.into_public()))
+    })?;
+    Ok(Value::List(list))
 }
 
 fn resolve_inner(expr: &Expression, ctx: &Context) -> Result<Value, ExecutionError> {
@@ -2282,26 +2932,26 @@ fn resolve_inner(expr: &Expression, ctx: &Context) -> Result<Value, ExecutionErr
             // `all` on the loop condition, so the map loop stays in this
             // function the way it did before BoolAccu existed.
             if let Some(append) = AccuAppend::of(comprehension) {
-                if let Value::List(list) = accu_init {
+                if let Value::List(_) = accu_init {
                     // The accumulator stays here rather than in the
                     // context: `@result` is not a name CEL can parse, so
                     // the guard and the element cannot read it, and a
                     // nested comprehension binds its own in its own scope.
-                    let mut list = list.into_vec();
                     // Sized by the range up front, as the VM's
                     // `NewListFromArg` does: `filter` may leave some of
                     // it unused, `map` fills it exactly.
-                    list.reserve(items.len());
-                    while let Some(item) = items.next() {
+                    let n = items.len();
+                    let list = ListRef::try_fill_values(n, |_| {
+                        let item = items.next().expect("n source items");
                         ctx.rebind(&comprehension.iter_var, item);
                         if let Some(guard) = append.guard {
                             if !try_bool_value(resolve_inner(guard, &ctx))? {
-                                continue;
+                                return Ok(None);
                             }
                         }
-                        list.push(resolve_inner(append.element, &ctx)?);
-                    }
-                    ctx.rebind(&comprehension.accu_var, Value::list(list));
+                        Ok(Some(resolve_inner(append.element, &ctx)?))
+                    })?;
+                    ctx.rebind(&comprehension.accu_var, Value::List(list));
                     return resolve_inner(&comprehension.result, &ctx);
                 }
                 unreachable!("AccuAppend::of implies a list accumulator");
@@ -3257,13 +3907,11 @@ fn public_list_eq_ints(list: &ListRef, ints: &[i64]) -> bool {
     if list.len() != ints.len() {
         return false;
     }
-    match list.storage() {
-        ListStorage::Ints(v) => {
-            let start = list.window_start();
-            v.get(start..start + ints.len()) == Some(ints)
-        }
-        _ => (0..ints.len()).all(|i| list.get(i) == Some(Value::Int(ints[i]))),
+    if let Some(v) = list.ints_slice() {
+        let start = list.window_start();
+        return v.get(start..start + ints.len()) == Some(ints);
     }
+    (0..ints.len()).all(|i| list.get(i) == Some(Value::Int(ints[i])))
 }
 
 fn interned_ints_slice<'a>(w: CelRef) -> Option<&'a [i64]> {
@@ -3656,7 +4304,7 @@ mod tests {
         let a = ListRef::whole(Arc::new(ListStorage::Ints(vec![1, 2, 3])));
         let b = ListRef::whole(Arc::new(ListStorage::Ints(vec![4, 5])));
         let out = a.concat(&b);
-        assert!(matches!(out.storage(), ListStorage::Ints(_)));
+        assert!(out.is_ints());
         assert_eq!(
             out.to_vec(),
             vec![
@@ -3674,11 +4322,227 @@ mod tests {
         let a = ListRef::whole(Arc::new(ListStorage::Ints(vec![1, 2, 3])));
         let b = ListRef::from(vec![Value::Int(15)]);
         let out = a.concat(&b);
-        assert!(matches!(out.storage(), ListStorage::Ints(_)));
+        assert!(out.is_ints());
         assert_eq!(
             out.to_vec(),
             vec![Value::Int(1), Value::Int(2), Value::Int(3), Value::Int(15)]
         );
+    }
+
+    #[test]
+    fn empty_list_clone_and_drop() {
+        let a = ListRef::from(Vec::<Value>::new());
+        assert!(a.is_empty());
+        let b = a.clone();
+        assert!(a.ptr_eq(&b));
+        drop(a);
+        assert_eq!(b.to_vec(), Vec::<Value>::new());
+        drop(b);
+        let ints = ListRef::whole(Arc::new(ListStorage::Ints(Vec::new())));
+        assert!(ints.is_empty());
+        assert!(ints.is_ints());
+    }
+
+    #[test]
+    fn zero_sized_window_clone_and_drop() {
+        let storage = Arc::new(ListStorage::Ints(vec![1, 2, 3]));
+        let z = ListRef::window(Arc::clone(&storage), 1, 0);
+        assert_eq!(z.len(), 0);
+        assert_eq!(z.to_vec(), Vec::<Value>::new());
+        let z2 = z.clone();
+        assert!(z.shares_storage_with(&z2));
+        drop(z);
+        assert_eq!(z2.to_vec(), Vec::<Value>::new());
+        let whole = ListRef::whole(storage);
+        assert_eq!(whole.len(), 3);
+        assert!(z2.shares_storage_with(&whole));
+    }
+
+    #[test]
+    fn windowing_a_list_is_a_refcount_bump() {
+        let storage = Arc::new(ListStorage::Ints(vec![1, 2, 3, 4]));
+        let a = ListRef::window(Arc::clone(&storage), 0, 2);
+        let b = ListRef::window(Arc::clone(&storage), 2, 2);
+        assert!(a.shares_storage_with(&b));
+        assert!(matches!(a.storage(), Some(ListStorage::Ints(_))));
+        assert_eq!(a.to_vec(), vec![Value::Int(1), Value::Int(2)]);
+        assert_eq!(b.to_vec(), vec![Value::Int(3), Value::Int(4)]);
+        drop(storage);
+        assert_eq!(a.get(1), Some(Value::Int(2)));
+        assert_eq!(b.get(0), Some(Value::Int(3)));
+    }
+
+    #[test]
+    fn rc_slice_clone_drop_empty_and_slice() {
+        let empty = super::RcSlice::<i64>::empty();
+        assert!(empty.as_slice().is_empty());
+        let cloned = empty.clone();
+        drop(empty);
+        assert!(cloned.as_slice().is_empty());
+        drop(cloned);
+        let s = super::RcSlice::from_vec(vec![1i64, 2, 3]);
+        assert_eq!(s.as_slice(), &[1, 2, 3]);
+        let c = s.clone();
+        drop(s);
+        assert_eq!(c.as_slice(), &[1, 2, 3]);
+    }
+
+    #[test]
+    fn listref_is_send_sync() {
+        fn assert_ss<T: Send + Sync>() {}
+        assert_ss::<ListRef>();
+        assert_ss::<super::ListBuf>();
+    }
+
+    #[test]
+    fn list_fill_drops_prefix_on_error() {
+        let s = Arc::new("keep".to_string());
+        let err = ListRef::try_fill_values::<&'static str>(2, |i| {
+            if i == 0 {
+                Ok(Some(Value::String(s.clone())))
+            } else {
+                Err("fail")
+            }
+        });
+        assert_eq!(err, Err("fail"));
+        assert_eq!(Arc::strong_count(&s), 1);
+    }
+
+    #[derive(Debug)]
+    struct DropProbe(Arc<std::sync::atomic::AtomicUsize>);
+    impl PartialEq for DropProbe {
+        fn eq(&self, _: &Self) -> bool {
+            true
+        }
+    }
+    impl Eq for DropProbe {}
+    impl super::Opaque for DropProbe {
+        fn runtime_type_name(&self) -> &str {
+            "test.DropProbe"
+        }
+    }
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    fn probe() -> (Value, Arc<std::sync::atomic::AtomicUsize>) {
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        (
+            Value::Opaque(Arc::new(DropProbe(Arc::clone(&hits)))),
+            hits,
+        )
+    }
+
+    #[test]
+    fn object_list_clone_drop_reaches_zero_once() {
+        let (v, hits) = probe();
+        let list = ListRef::from(vec![v]);
+        let clone = list.clone();
+        drop(list);
+        assert_eq!(hits.load(std::sync::atomic::Ordering::Relaxed), 0);
+        drop(clone);
+        assert_eq!(hits.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn ints_list_clone_drop_and_window() {
+        let list = ListRef::try_fill_ints::<()>(3, |i| Ok(Some(i as i64 + 1))).unwrap();
+        let a = list.clone();
+        drop(list);
+        assert_eq!(a.to_vec(), vec![Value::Int(1), Value::Int(2), Value::Int(3)]);
+        let storage = Arc::new(ListStorage::Ints(vec![10, 20, 30]));
+        let w = ListRef::window(Arc::clone(&storage), 1, 1);
+        assert_eq!(w.to_vec(), vec![Value::Int(20)]);
+        let w2 = w.clone();
+        drop(w);
+        drop(storage);
+        assert_eq!(w2.get(0), Some(Value::Int(20)));
+        drop(a);
+        drop(w2);
+    }
+
+    #[test]
+    fn shared_list_clone_drop_reaches_zero_once() {
+        let (v, hits) = probe();
+        let storage = Arc::new(ListStorage::Object(vec![v]));
+        let a = ListRef::window(Arc::clone(&storage), 0, 1);
+        let b = ListRef::window(storage, 0, 1);
+        assert!(a.shares_storage_with(&b));
+        drop(a);
+        assert_eq!(hits.load(std::sync::atomic::Ordering::Relaxed), 0);
+        drop(b);
+        assert_eq!(hits.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn empty_and_windows_over_each_kind() {
+        let empty = ListRef::from(Vec::<Value>::new());
+        assert!(empty.is_empty());
+        drop(empty.clone());
+        drop(empty);
+
+        let (v, hits) = probe();
+        let object = ListRef::from(vec![v]);
+        let object_w = ListRef::from_linked(object.clone().buf, 0, 0);
+        assert_eq!(object_w.len(), 0);
+        drop(object);
+        drop(object_w);
+        assert_eq!(hits.load(std::sync::atomic::Ordering::Relaxed), 1);
+
+        let ints = ListRef::try_fill_ints::<()>(2, |i| Ok(Some(i as i64))).unwrap();
+        let ints_w = ListRef::from_linked(ints.clone().buf, 1, 0);
+        assert_eq!(ints_w.len(), 0);
+        drop(ints);
+        drop(ints_w);
+
+        let col = Arc::new(ListStorage::Column(super::ValueColumn::Scalar {
+            bank: super::ScalarBank::Int,
+            words: Arc::from([1i64, 2, 3].as_slice()),
+        }));
+        let col_w = ListRef::window(Arc::clone(&col), 1, 0);
+        assert_eq!(col_w.len(), 0);
+        let col_full = ListRef::window(col, 0, 3);
+        assert!(col_w.shares_storage_with(&col_full));
+        drop(col_w);
+        assert_eq!(col_full.len(), 3);
+        drop(col_full);
+    }
+
+    #[test]
+    fn fill_ints_drops_on_error() {
+        let err = ListRef::try_fill_ints::<&'static str>(2, |i| {
+            if i == 0 {
+                Ok(Some(1))
+            } else {
+                Err("fail")
+            }
+        });
+        assert_eq!(err, Err("fail"));
+    }
+
+    #[test]
+    fn list_clone_drop_from_four_threads() {
+        let (v, hits) = probe();
+        let object = ListRef::from(vec![v]);
+        let ints = ListRef::try_fill_ints::<()>(4, |i| Ok(Some(i as i64))).unwrap();
+        let (v2, hits2) = probe();
+        let shared = ListRef::whole(Arc::new(ListStorage::Object(vec![v2])));
+        std::thread::scope(|s| {
+            for _ in 0..4 {
+                s.spawn(|| {
+                    drop(object.clone());
+                    drop(ints.clone());
+                    drop(shared.clone());
+                });
+            }
+        });
+        drop(object);
+        drop(ints);
+        drop(shared);
+        assert_eq!(hits.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(hits2.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
 
     /// `math.max(x)` and `s.startsWith(x)` parse the same, so the walker asks

@@ -81,6 +81,9 @@ fn mallocs_per_eval_on_finish_rows() {
     let inner_lists = count("list.map(e, [e, e])", |ctx| {
         ctx.add_variable_from_value("list", (1..=10i64).collect::<Vec<_>>())
     });
+    let pair = count("[x, x]", |ctx| ctx.add_variable_from_value("x", 15i64));
+    let ints = count("[1, 2, 3]", |_| {});
+    let walker_list = count_walker("[x, x]", |ctx| ctx.add_variable_from_value("x", 15i64));
     println!("[[x]] mallocs/eval={nested}");
     println!("string-chain mallocs/eval={chain}");
     println!("list.map(e, {{k:e}}) mallocs/eval={maps}");
@@ -89,11 +92,17 @@ fn mallocs_per_eval_on_finish_rows() {
         ctx.add_variable_from_value("x", 15i64)
     });
     println!("list.map(e, [e,e]) mallocs/eval={inner_lists}");
+    println!("[x, x] mallocs/eval={pair}");
+    println!("[1, 2, 3] mallocs/eval={ints}");
+    println!("walker [x, x] mallocs/eval={walker_list}");
     println!("walker {{a: x}} mallocs/eval={walker_one}");
-    assert_eq!(nested, 4, "[[x]] finish mallocs");
+    assert_eq!(nested, 2, "[[x]] finish mallocs");
     assert_eq!(chain, 2, "string-chain finish mallocs");
-    assert_eq!(maps, 12, "1-entry map-in-map finish mallocs");
-    assert_eq!(maps3, 12, "3-entry map-in-map finish mallocs");
-    assert_eq!(inner_lists, 22, "list-of-lists finish mallocs");
+    assert_eq!(maps, 11, "1-entry map-in-map finish mallocs");
+    assert_eq!(maps3, 11, "3-entry map-in-map finish mallocs");
+    assert_eq!(inner_lists, 11, "list-of-lists finish mallocs");
+    assert_eq!(pair, 1, "[x, x] finish mallocs");
+    assert_eq!(ints, 0, "int-list finish mallocs");
+    assert_eq!(walker_list, 1, "walker list literal mallocs");
     assert_eq!(walker_one, 1, "walker {{a: x}} mallocs");
 }

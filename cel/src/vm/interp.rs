@@ -477,6 +477,7 @@ impl Operand {
 /// than in a benchmark.
 const _: () = {
     assert!(core::mem::size_of::<Operand>() == 32);
+    assert!(core::mem::size_of::<crate::objects::ListRef>() == 16);
 };
 
 /// Which drop policy [`Vm::discard`] applies to a discarded operand.

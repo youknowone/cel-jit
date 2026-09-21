@@ -15,7 +15,7 @@ use super::object_array::{
     bytes_base, items_block_items_base, CelBytesBlock, CelItemsBlock, CEL_BYTES_BLOCK_ITEMS_OFFSET,
     CEL_ITEMS_BLOCK_ITEMS_OFFSET,
 };
-use crate::objects::{Key, ListRef, ListStorage, Map, MapStorage};
+use crate::objects::{Key, ListRef, Map, MapStorage};
 use crate::Value;
 use core::alloc::Layout;
 use core::mem::{align_of, size_of};
@@ -201,14 +201,11 @@ impl ConstPool {
     }
 
     fn intern_list(&mut self, list: &ListRef) -> CelRef {
-        match list.storage() {
-            ListStorage::Ints(values) => {
-                let start = list.window_start();
-                self.intern_ints_list(&values[start..start + list.len()])
-            }
-            ListStorage::Object(items)
-                if list.window_start() == 0 && list.len() == items.len() =>
-            {
+        if let Some(values) = list.ints_slice() {
+            let start = list.window_start();
+            self.intern_ints_list(&values[start..start + list.len()])
+        } else if list.is_whole() {
+            if let Some(items) = list.object_slice() {
                 let mut refs = Vec::with_capacity(items.len());
                 for v in items {
                     let w = self.intern_elem(v);
@@ -218,8 +215,11 @@ impl ConstPool {
                     refs.push(w);
                 }
                 self.intern_object_list(&refs)
+            } else {
+                core::ptr::null_mut()
             }
-            _ => core::ptr::null_mut(),
+        } else {
+            core::ptr::null_mut()
         }
     }
 

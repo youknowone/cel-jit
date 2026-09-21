@@ -28,9 +28,11 @@ use crate::common::types::{
     NULL_TYPE, OPTIONAL_TYPE, STRING_TYPE, TYPE_TYPE, UINT_TYPE,
 };
 use crate::objects::{
-    map_get_by_key, map_has_exact_key, try_build_map, Key, KeyRef, ListRef, ListStorage,
-    Map, MapStorage, Opaque, OptionalValue,
+    map_get_by_key, map_has_exact_key, try_build_map, Key, KeyRef, ListRef, Map, MapStorage,
+    Opaque, OptionalValue,
 };
+#[cfg(test)]
+use crate::objects::ListStorage;
 use crate::Value;
 
 #[cfg(feature = "structs")]
@@ -89,9 +91,9 @@ pub(crate) fn interned_linked(w: CelRef) -> Option<Value> {
         match w_kind(w) {
             CelKind::List => {
                 let leaf = &*w.cast::<W_ListObject>();
-                clone_arc(leaf.public as *const ListStorage).map(|storage| {
+                ListRef::clone_from_public(leaf.public).map(|buf| {
                     Value::List(ListRef::from_linked(
-                        storage,
+                        buf,
                         leaf.public_start,
                         leaf.public_len,
                     ))
@@ -384,28 +386,22 @@ fn type_from_class(cls: *const CelClass) -> Option<Type> {
 }
 
 fn intern_list(list: &ListRef) -> CelRef {
-    match list.storage() {
-        ListStorage::Ints(values) => {
-            let start = list.window_start();
-            let end = start + list.len();
-            new_list_ints(&values[start..end]) as CelRef
+    if let Some(values) = list.ints_slice() {
+        let start = list.window_start();
+        let end = start + list.len();
+        new_list_ints(&values[start..end]) as CelRef
+    } else if list.is_whole() && list.object_slice().is_some() {
+        if let Some(ints) = object_list_as_ints(list) {
+            return new_list_ints(&ints) as CelRef;
         }
-        ListStorage::Object(_)
-            if list.window_start() == 0 && list.len() == list.storage().len() =>
-        {
-            if let Some(ints) = object_list_as_ints(list) {
-                return new_list_ints(&ints) as CelRef;
-            }
-            let mut items = Vec::with_capacity(list.len());
-            for elt in list.iter() {
-                items.push(value_to_ref(&elt).unwrap_or_else(|_| new_null() as CelRef));
-            }
-            new_list(&items) as CelRef
+        let mut items = Vec::with_capacity(list.len());
+        for elt in list.iter() {
+            items.push(value_to_ref(&elt).unwrap_or_else(|_| new_null() as CelRef));
         }
-        _ => {
-            let host = intern_host_any(Box::new(list.clone()));
-            new_list_window(host, 0, list.len() as i64) as CelRef
-        }
+        new_list(&items) as CelRef
+    } else {
+        let host = intern_host_any(Box::new(list.clone()));
+        new_list_window(host, 0, list.len() as i64) as CelRef
     }
 }
 
@@ -442,7 +438,7 @@ pub(crate) fn link_public_handle(w: CelRef, value: &Value) {
                     return;
                 }
                 let leaf = &mut *w.cast::<W_ListObject>();
-                leaf.public = Arc::as_ptr(list.storage_arc()) as *const ();
+                leaf.public = list.public_ptr();
                 leaf.public_start = list.window_start() as u32;
                 leaf.public_len = list.len() as u32;
             }
@@ -499,7 +495,7 @@ unsafe fn clone_arc<T>(ptr: *const T) -> Option<Arc<T>> {
 /// interned int. The public form of a literal `[1, 2, 3]` is this buffer
 /// rather than a `Vec<Value>` rebuilt element by element.
 #[inline(never)]
-unsafe fn interned_object_list_ints(leaf: &W_ListObject) -> Option<Vec<i64>> {
+unsafe fn interned_object_list_ints(leaf: &W_ListObject) -> Option<ListRef> {
     let n = leaf.length as usize;
     if n == 0 {
         return None;
@@ -515,25 +511,21 @@ unsafe fn interned_object_list_ints(leaf: &W_ListObject) -> Option<Vec<i64>> {
     if first.is_null() || unsafe { w_kind(first) } != CelKind::Int {
         return None;
     }
-    let mut ints = Vec::with_capacity(n);
-    ints.push(unsafe { (*first.cast::<W_IntObject>()).intval });
-    let mut i = 1;
-    while i < n {
+    ListRef::try_fill_ints::<()>(n, |i| {
         let item = unsafe { *base.add(start + i) };
         if item.is_null() || unsafe { w_kind(item) } != CelKind::Int {
-            return None;
+            return Err(());
         }
-        ints.push(unsafe { (*item.cast::<W_IntObject>()).intval });
-        i += 1;
-    }
-    Some(ints)
+        Ok(Some(unsafe { (*item.cast::<W_IntObject>()).intval }))
+    })
+    .ok()
 }
 
 unsafe fn list_from_ref(w: CelRef) -> Result<ListRef, ConvertError> {
     let leaf = &*w.cast::<W_ListObject>();
-    if let Some(storage) = clone_arc(leaf.public as *const ListStorage) {
+    if let Some(buf) = unsafe { ListRef::clone_from_public(leaf.public) } {
         return Ok(ListRef::from_linked(
-            storage,
+            buf,
             leaf.public_start,
             leaf.public_len,
         ));
@@ -541,19 +533,17 @@ unsafe fn list_from_ref(w: CelRef) -> Result<ListRef, ConvertError> {
     match leaf.strategy {
         ListStrategy::Object => {
             if let Some(ints) = interned_object_list_ints(leaf) {
-                return Ok(ListRef::whole(Arc::new(ListStorage::Ints(ints))));
+                return Ok(ints);
             }
             let n = leaf.length as usize;
             let base = items_block_items_base(leaf.items);
             if base.is_null() && n != 0 {
                 return Err(ConvertError::Corrupt("list"));
             }
-            let mut items = Vec::with_capacity(n);
             let start = leaf.start as usize;
-            for i in 0..n {
-                items.push(unsafe { ref_to_value(*base.add(start + i))? });
-            }
-            Ok(ListRef::from(items))
+            ListRef::try_fill_values(n, |i| {
+                Ok(Some(unsafe { ref_to_value(*base.add(start + i))? }))
+            })
         }
         ListStrategy::Ints => {
             if leaf.storage.is_null() {
@@ -566,10 +556,10 @@ unsafe fn list_from_ref(w: CelRef) -> Result<ListRef, ConvertError> {
                 if n != 0 {
                     return Err(ConvertError::Corrupt("list"));
                 }
-                return Ok(ListRef::whole(Arc::new(ListStorage::Ints(Vec::new()))));
+                return ListRef::try_fill_ints::<ConvertError>(0, |_| Ok(None));
             }
             let ints = unsafe { std::slice::from_raw_parts(col.data.add(start), n) };
-            Ok(ListRef::whole(Arc::new(ListStorage::Ints(ints.to_vec()))))
+            ListRef::try_fill_ints(n, |i| Ok(Some(ints[i])))
         }
         ListStrategy::Window => {
             host_list_ref(opaque_host_index(leaf.storage)).ok_or(ConvertError::Corrupt("list"))
