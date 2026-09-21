@@ -1264,6 +1264,9 @@ impl PortalTable {
 }
 
 thread_local! {
+    /// Vm pointer for [`step_hot`]. The dispatch arm only passes the
+    /// portal greens `program` and `pc`.
+    static PORTAL_VM: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
     /// Address of this byte is this thread's owner token. Const-initialised,
     /// so the first `with` is a TLS lookup, not a constructor.
     static OWNER_TOKEN: u8 = const { 0u8 };
@@ -1370,6 +1373,7 @@ pub(crate) fn eval_through_portal(
         vm: vm as *mut Vm<'_> as i64,
         ret: 0,
     };
+    PORTAL_VM.with(|cell| cell.set(state.vm));
     // Census is not installed here — that hook is process-global and
     // would clobber the columnar machine.
     let jit = &code.identity.live.jit;
@@ -1408,6 +1412,518 @@ pub(crate) fn eval_through_portal(
         _ => Err(ExecutionError::InternalError(format!(
             "portal returned unexpected pc {bits}"
         ))),
+    }
+}
+
+/// Every opcode of one portal step.
+///
+/// The dispatch JitCode lowers a call. It does not lower the arm
+/// bodies, and those became abort stubs. This callee keeps them in
+/// the interpreter so the portal loop itself can trace.
+#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+fn step_hot(program: &CelCode, pc: usize) -> i64 {
+    let vm = PORTAL_VM.with(|cell| cell.get());
+    let here = pc as i64;
+    let opcode = insn_op(program, pc);
+    let frame = unsafe { &mut *vm_of(vm).cel_frame };
+    match opcode {
+    OP_LOAD_VAR => {
+        let w = intern_var(vm, program, insn_a(program, pc));
+        if w == 0 {
+            residual_dispatch(vm, here)
+        } else {
+            let r = w as usize as CelRef;
+            let depth = frame.valuestackdepth;
+            frame.locals_stack_w[depth] = r;
+            frame.valuestackdepth = depth + 1;
+            here + 1
+        }
+    }
+    OP_GET_FIELD => match operand_cell(frame, 1) {
+        Some(recv) if !recv.is_null() => {
+            let found = interned_field(recv as i64, program, insn_a(program, pc));
+            if found == 0 {
+                residual_dispatch(vm, here)
+            } else {
+                let depth = frame.valuestackdepth;
+                let r = found as usize as CelRef;
+                frame.locals_stack_w[depth - 1] = r;
+                here + 1
+            }
+        }
+        _ => residual_dispatch(vm, here),
+    },
+    OP_HAS_FIELD
+    | OP_HAS_FIELD_LOCAL
+    | OP_HAS_FIELD_LOCAL_APPEND
+    | OP_OPT_INDEX
+    | OP_OPT_SELECT
+    | OP_JUMP_IF_OPT_NONE
+    | OP_LIST_APPEND_OPTIONAL
+    | OP_NOT_STRICTLY_FALSE
+    | OP_IN
+    | OP_CALL_QUALIFIED
+    | OP_AND_LOCAL
+    | OP_OR_LOCAL
+    | OP_AND_MERGE
+    | OP_OR_MERGE
+    | OP_NEW_MAP
+    | OP_MAP_INSERT
+    | OP_MAP_INSERT_OPTIONAL => portal_rare(frame, vm, program, pc, here, opcode),
+    OP_GET_FIELD_LOCAL => {
+        let recv = read_cell(frame, insn_a(program, pc));
+        let found = interned_field(recv as i64, program, insn_b(program, pc));
+        if recv.is_null() || found == 0 {
+            residual_dispatch(vm, here)
+        } else {
+            let r = found as usize as CelRef;
+            let depth = frame.valuestackdepth;
+            frame.locals_stack_w[depth] = r;
+            frame.valuestackdepth = depth + 1;
+            here + 1
+        }
+    }
+    OP_GET_FIELD_LOCAL_APPEND => {
+        let recv = read_cell(frame, insn_a(program, pc));
+        let found = interned_field(recv as i64, program, insn_b(program, pc));
+        let depth = frame.valuestackdepth;
+        let list = frame.locals_stack_w[depth - 1];
+        if recv.is_null()
+            || found == 0
+            || list.is_null()
+            || try_append(list as i64, found) == 0
+        {
+            residual_dispatch(vm, here)
+        } else {
+            here + 1
+        }
+    }
+    OP_INDEX => match (operand_cell(frame, 2), operand_cell(frame, 1)) {
+        (Some(container), Some(key)) if !container.is_null() && !key.is_null() => {
+            let item = interned_index(container as i64, key as i64);
+            if item == 0 {
+                residual_dispatch(vm, here)
+            } else {
+                let depth = frame.valuestackdepth;
+                let r = item as usize as CelRef;
+                frame.locals_stack_w[depth - 2] = r;
+                frame.valuestackdepth = depth - 1;
+                here + 1
+            }
+        }
+        _ => residual_dispatch(vm, here),
+    },
+    OP_ACCU_LOOP_COND => {
+        let w = frame.locals_stack_w[insn_a(program, pc)];
+        if w.is_null() || unsafe { w_kind(w) } != CelKind::Bool {
+            residual_dispatch(vm, here)
+        } else if unsafe { (*w.cast::<W_BoolObject>()).boolval } == 0 {
+            insn_b(program, pc)
+        } else {
+            here + 1
+        }
+    }
+    OP_ACCU_LOOP_COND_NOT => {
+        let w = frame.locals_stack_w[insn_a(program, pc)];
+        if w.is_null() || unsafe { w_kind(w) } != CelKind::Bool {
+            residual_dispatch(vm, here)
+        } else if unsafe { (*w.cast::<W_BoolObject>()).boolval } != 0 {
+            insn_b(program, pc)
+        } else {
+            here + 1
+        }
+    }
+    OP_ADD_LOCAL_K_APPEND => {
+        interned_arith_local_k_append!(frame, vm, program, pc, here, interned_add)
+    }
+    OP_MUL_LOCAL_K_APPEND => {
+        interned_arith_local_k_append!(frame, vm, program, pc, here, interned_mul)
+    }
+    OP_MOD_LOCAL_K_APPEND => {
+        interned_arith_local_k_append!(frame, vm, program, pc, here, interned_rem)
+    }
+    OP_EQ_LOCAL_K_APPEND => {
+        interned_local_k_append!(frame, vm, program, pc, here, cel_equals)
+    }
+    OP_NE_LOCAL_K_APPEND => {
+        interned_local_k_append!(frame, vm, program, pc, here, cel_not_equals)
+    }
+    OP_LT_LOCAL_K_APPEND => {
+        interned_local_k_append!(frame, vm, program, pc, here, cel_less)
+    }
+    OP_GT_LOCAL_K_APPEND => {
+        interned_local_k_append!(frame, vm, program, pc, here, cel_greater)
+    }
+    OP_GE_LOCAL_K_APPEND => {
+        interned_local_k_append!(frame, vm, program, pc, here, cel_greater_equals)
+    }
+    OP_NOT => match operand_cell(frame, 1) {
+        Some(w) if !w.is_null() && unsafe { w_kind(w) } == CelKind::Bool => {
+            let r = unsafe { cel_negate(w) };
+            if r == ERROR_SENTINEL {
+                residual_dispatch(vm, here)
+            } else {
+                let depth = frame.valuestackdepth;
+                frame.locals_stack_w[depth - 1] = r;
+                here + 1
+            }
+        }
+        _ => residual_dispatch(vm, here),
+    },
+    OP_NEGATE => match operand_cell(frame, 1) {
+        Some(w) if !w.is_null() => {
+            let r = unsafe { cel_negate(w) };
+            if r == ERROR_SENTINEL {
+                residual_dispatch(vm, here)
+            } else {
+                let depth = frame.valuestackdepth;
+                frame.locals_stack_w[depth - 1] = r;
+                here + 1
+            }
+        }
+        _ => residual_dispatch(vm, here),
+    },
+    OP_LOAD_LOCAL_APPEND => {
+        let w = read_cell(frame, insn_a(program, pc));
+        match operand_cell(frame, 1) {
+            Some(list)
+                if !w.is_null()
+                    && !list.is_null()
+                    && try_append(list as i64, w as i64) != 0 =>
+            {
+                here + 1
+            }
+            _ => residual_dispatch(vm, here),
+        }
+    }
+    OP_CALL_HOST | OP_CALL_METHOD => {
+        let arity = insn_b(program, pc);
+        let name = insn_a(program, pc);
+        let unary_arity = if opcode == OP_CALL_HOST { 1 } else { 0 };
+        if arity == unary_arity && interned_is_size(program, name) != 0 {
+            match operand_cell(frame, 1) {
+                Some(w) if !w.is_null() => {
+                    let n = interned_len(w as i64);
+                    if n < 0 {
+                        residual_dispatch(vm, here)
+                    } else {
+                        let depth = frame.valuestackdepth;
+                        let r = new_int(n) as CelRef;
+                        frame.locals_stack_w[depth - 1] = r;
+                        here + 1
+                    }
+                }
+                _ => residual_dispatch(vm, here),
+            }
+        } else if arity == unary_arity {
+            match operand_cell(frame, 1) {
+                Some(w) if !w.is_null() => {
+                    let mut out = interned_unary(vm, program, name, w as i64);
+                    if out == 0 && opcode == OP_CALL_METHOD {
+                        out = interned_temporal(vm, program, name, w as i64);
+                    }
+                    if out == 0 && opcode == OP_CALL_METHOD {
+                        out = interned_optional_unary(program, name, w as i64);
+                    }
+                    if out == 0 || out == ERROR_SENTINEL as i64 {
+                        residual_dispatch(vm, here)
+                    } else {
+                        let depth = frame.valuestackdepth;
+                        let r = out as usize as CelRef;
+                        frame.locals_stack_w[depth - 1] = r;
+                        here + 1
+                    }
+                }
+                _ => residual_dispatch(vm, here),
+            }
+        } else if opcode == OP_CALL_METHOD && arity == 1 {
+            // After a CallQualified miss the arguments are parked and
+            // only the receiver sits on the stack. `operand_cell(2)`
+            // is then a local or the items-block header; decline.
+            match (operand_cell(frame, 1), operand_cell(frame, 2)) {
+                (Some(recv), Some(arg)) if !recv.is_null() && !arg.is_null() => {
+                    let out = interned_method1(program, name, recv as i64, arg as i64);
+                    if out == 0 || out == ERROR_SENTINEL as i64 {
+                        residual_dispatch(vm, here)
+                    } else {
+                        let depth = frame.valuestackdepth;
+                        let r = out as usize as CelRef;
+                        frame.locals_stack_w[depth - 2] = r;
+                        frame.valuestackdepth = depth - 1;
+                        here + 1
+                    }
+                }
+                _ => residual_dispatch(vm, here),
+            }
+        } else {
+            residual_dispatch(vm, here)
+        }
+    }
+    OP_LOAD_LOCAL => {
+        let slot = insn_a(program, pc);
+        let w = frame.locals_stack_w[slot];
+        if w.is_null() {
+            residual_dispatch(vm, here)
+        } else {
+            let depth = frame.valuestackdepth;
+            frame.locals_stack_w[depth] = w;
+            frame.valuestackdepth = depth + 1;
+            here + 1
+        }
+    }
+    OP_STORE_LOCAL => {
+        let depth = frame.valuestackdepth;
+        let w = frame.locals_stack_w[depth - 1];
+        if w.is_null() {
+            residual_dispatch(vm, here)
+        } else {
+            let slot = insn_a(program, pc);
+            frame.locals_stack_w[slot] = w;
+            frame.valuestackdepth = depth - 1;
+            here + 1
+        }
+    }
+    OP_ADD => interned_arith!(frame, vm, here, interned_add),
+    OP_SUB => interned_arith!(frame, vm, here, interned_sub),
+    OP_MUL => interned_arith!(frame, vm, here, interned_mul),
+    OP_DIV => interned_arith!(frame, vm, here, interned_div),
+    OP_MOD => interned_arith!(frame, vm, here, interned_rem),
+    OP_EQ => interned_binop!(frame, vm, here, interned_equals),
+    OP_NE => interned_binop!(frame, vm, here, interned_not_equals),
+    OP_LT => interned_binop!(frame, vm, here, cel_less),
+    OP_LE => interned_binop!(frame, vm, here, cel_less_equals),
+    OP_GT => interned_binop!(frame, vm, here, cel_greater),
+    OP_GE => interned_binop!(frame, vm, here, cel_greater_equals),
+    OP_LOAD_CONST => {
+        let w = intern_const(program, insn_a(program, pc));
+        if w == 0 {
+            residual_dispatch(vm, here)
+        } else {
+            let depth = frame.valuestackdepth;
+            frame.locals_stack_w[depth] = w as usize as CelRef;
+            frame.valuestackdepth = depth + 1;
+            here + 1
+        }
+    }
+    OP_ADD_K => interned_arith_k!(frame, vm, program, pc, here, interned_add),
+    OP_MUL_K => interned_arith_k!(frame, vm, program, pc, here, interned_mul),
+    OP_MOD_K => interned_arith_k!(frame, vm, program, pc, here, interned_rem),
+    OP_EQ_K => interned_binop_k!(frame, vm, program, pc, here, cel_equals),
+    OP_NE_K => interned_binop_k!(frame, vm, program, pc, here, cel_not_equals),
+    OP_LT_K => interned_binop_k!(frame, vm, program, pc, here, cel_less),
+    OP_GT_K => interned_binop_k!(frame, vm, program, pc, here, cel_greater),
+    OP_GE_K => interned_binop_k!(frame, vm, program, pc, here, cel_greater_equals),
+    OP_ADD_LOCAL_K => interned_arith_local_k!(frame, vm, program, pc, here, interned_add),
+    OP_MUL_LOCAL_K => interned_arith_local_k!(frame, vm, program, pc, here, interned_mul),
+    OP_MOD_LOCAL_K => interned_arith_local_k!(frame, vm, program, pc, here, interned_rem),
+    OP_EQ_LOCAL_K => interned_local_k!(frame, vm, program, pc, here, cel_equals),
+    OP_NE_LOCAL_K => interned_local_k!(frame, vm, program, pc, here, cel_not_equals),
+    OP_LT_LOCAL_K => interned_local_k!(frame, vm, program, pc, here, cel_less),
+    OP_GT_LOCAL_K => interned_local_k!(frame, vm, program, pc, here, cel_greater),
+    OP_GE_LOCAL_K => interned_local_k!(frame, vm, program, pc, here, cel_greater_equals),
+    OP_INC_LOCAL => {
+        let slot = insn_a(program, pc);
+        let w = frame.locals_stack_w[slot];
+        if w.is_null() || unsafe { w_kind(w) } != CelKind::Int {
+            residual_dispatch(vm, here)
+        } else {
+            let n = unsafe { (*w.cast::<W_IntObject>()).intval };
+            match n.checked_add(1) {
+                None => residual_dispatch(vm, here),
+                Some(next) => {
+                    let r = new_int_in(vm_heap(vm), next) as CelRef;
+                    frame.locals_stack_w[slot] = r;
+                    here + 1
+                }
+            }
+        }
+    }
+    OP_JUMP => insn_a(program, pc),
+    OP_JUMP_IF_FALSE | OP_JUMP_IF_TRUE => match operand_cell(frame, 1) {
+        Some(w) if !w.is_null() && unsafe { w_kind(w) } == CelKind::Bool => {
+            let truthy = unsafe { (*w.cast::<W_BoolObject>()).boolval } != 0;
+            let depth = frame.valuestackdepth;
+            frame.valuestackdepth = depth - 1;
+            let want = opcode == OP_JUMP_IF_TRUE;
+            if truthy == want {
+                insn_a(program, pc)
+            } else {
+                here + 1
+            }
+        }
+        _ => residual_dispatch(vm, here),
+    },
+    OP_NEW_LIST => {
+        let w = new_list_with_capacity_in(vm_heap(vm), insn_a(program, pc)) as CelRef;
+        let depth = frame.valuestackdepth;
+        frame.locals_stack_w[depth] = w;
+        frame.valuestackdepth = depth + 1;
+        here + 1
+    }
+    OP_NEW_LIST_FROM_ARG => {
+        let src = read_cell(frame, insn_a(program, pc));
+        if src.is_null() || unsafe { w_kind(src) } != CelKind::List {
+            residual_dispatch(vm, here)
+        } else {
+            let w = new_list_with_capacity_in(vm_heap(vm), unsafe { list_len(src) })
+                as CelRef;
+            let depth = frame.valuestackdepth;
+            frame.locals_stack_w[depth] = w;
+            frame.valuestackdepth = depth + 1;
+            here + 1
+        }
+    }
+    OP_LIST_APPEND => {
+        let depth = frame.valuestackdepth;
+        let item = frame.locals_stack_w[depth - 1];
+        let list = frame.locals_stack_w[depth - 2];
+        if item.is_null() || list.is_null() || try_append(list as i64, item as i64) == 0 {
+            residual_dispatch(vm, here)
+        } else {
+            frame.valuestackdepth = depth - 1;
+            here + 1
+        }
+    }
+    OP_ITER_ELEMS => {
+        let depth = frame.valuestackdepth;
+        let w = frame.locals_stack_w[depth - 1];
+        if w.is_null() {
+            residual_dispatch(vm, here)
+        } else if unsafe { w_kind(w) } == CelKind::List {
+            here + 1
+        } else {
+            let keys = interned_map_keys(vm, w as i64);
+            if keys == 0 {
+                residual_dispatch(vm, here)
+            } else {
+                let r = keys as usize as CelRef;
+                frame.locals_stack_w[depth - 1] = r;
+                here + 1
+            }
+        }
+    }
+    OP_ITER_KEYS => {
+        let depth = frame.valuestackdepth;
+        let w = frame.locals_stack_w[depth - 1];
+        let keys = if w.is_null() {
+            0
+        } else if unsafe { w_kind(w) } == CelKind::List {
+            interned_list_indices(vm, w as i64)
+        } else {
+            interned_map_keys(vm, w as i64)
+        };
+        if keys == 0 {
+            residual_dispatch(vm, here)
+        } else {
+            let r = keys as usize as CelRef;
+            frame.locals_stack_w[depth - 1] = r;
+            here + 1
+        }
+    }
+    OP_ITER_LEN => {
+        let src = frame.locals_stack_w[insn_a(program, pc)];
+        if src.is_null() || unsafe { w_kind(src) } != CelKind::List {
+            residual_dispatch(vm, here)
+        } else {
+            let w = new_int_in(vm_heap(vm), unsafe { list_len(src) }) as CelRef;
+            let depth = frame.valuestackdepth;
+            frame.locals_stack_w[depth] = w;
+            frame.valuestackdepth = depth + 1;
+            here + 1
+        }
+    }
+    OP_ITER_GUARD => {
+        let idx_w = frame.locals_stack_w[insn_a(program, pc)];
+        let src = frame.locals_stack_w[insn_b(program, pc)];
+        if idx_w.is_null()
+            || src.is_null()
+            || unsafe { w_kind(idx_w) } != CelKind::Int
+            || unsafe { w_kind(src) } != CelKind::List
+        {
+            residual_dispatch(vm, here)
+        } else {
+            let index = unsafe { (*idx_w.cast::<W_IntObject>()).intval };
+            let len = unsafe { list_len(src) };
+            if index >= len {
+                insn_c(program, pc)
+            } else {
+                here + 1
+            }
+        }
+    }
+    OP_ITER_AT => {
+        let src = frame.locals_stack_w[insn_a(program, pc)];
+        let idx_w = frame.locals_stack_w[insn_b(program, pc)];
+        if src.is_null()
+            || idx_w.is_null()
+            || unsafe { w_kind(src) } != CelKind::List
+            || unsafe { w_kind(idx_w) } != CelKind::Int
+        {
+            residual_dispatch(vm, here)
+        } else {
+            let index = unsafe { (*idx_w.cast::<W_IntObject>()).intval };
+            let item = interned_item(vm, src as i64, index);
+            if item == 0 {
+                residual_dispatch(vm, here)
+            } else {
+                let w = item as usize as CelRef;
+                let depth = frame.valuestackdepth;
+                frame.locals_stack_w[depth] = w;
+                frame.valuestackdepth = depth + 1;
+                here + 1
+            }
+        }
+    }
+    OP_ITER_BIND => {
+        let src = frame.locals_stack_w[insn_a(program, pc)];
+        let idx_w = frame.locals_stack_w[insn_b(program, pc)];
+        if src.is_null()
+            || idx_w.is_null()
+            || unsafe { w_kind(src) } != CelKind::List
+            || unsafe { w_kind(idx_w) } != CelKind::Int
+        {
+            residual_dispatch(vm, here)
+        } else {
+            let index = unsafe { (*idx_w.cast::<W_IntObject>()).intval };
+            let item = interned_item(vm, src as i64, index);
+            if item == 0 {
+                residual_dispatch(vm, here)
+            } else {
+                let slot = insn_c(program, pc);
+                let w = item as usize as CelRef;
+                frame.locals_stack_w[slot] = w;
+                here + 1
+            }
+        }
+    }
+    OP_ITER_ADVANCE => {
+        let slot = insn_a(program, pc);
+        let w = frame.locals_stack_w[slot];
+        if w.is_null() || unsafe { w_kind(w) } != CelKind::Int {
+            residual_dispatch(vm, here)
+        } else {
+            let n = unsafe { (*w.cast::<W_IntObject>()).intval };
+            match n.checked_add(1) {
+                None => residual_dispatch(vm, here),
+                Some(next) => {
+                    let r = new_int_in(vm_heap(vm), next) as CelRef;
+                    frame.locals_stack_w[slot] = r;
+                    insn_b(program, pc)
+                }
+            }
+        }
+    }
+    OP_RETURN => {
+        let depth = frame.valuestackdepth;
+        let w = frame.locals_stack_w[depth - 1];
+        if w.is_null() {
+            residual_dispatch(vm, here)
+        } else {
+            vm_park_return(vm, w as i64);
+            PORTAL_DONE
+        }
+    }
+    _ => residual_dispatch(vm, here),
     }
 }
 
@@ -1483,6 +1999,7 @@ pub(crate) fn eval_through_portal(
         vm_sync_write_local => residual_int,
         vm_sync_pop => residual_int,
         vm_park_return => residual_int,
+        step_hot => residual_int,
         new_int => inline_ref,
         new_bool => inline_ref,
         cel_add => inline_ref,
@@ -1513,506 +2030,8 @@ fn run_cel_portal(
         let frame = unsafe { &mut *(state.frame as *mut W_CelFrame) };
         frame.last_instr = pc as i64;
         let opcode = insn_op(program, pc);
-        let vm = state.vm;
-        let here = pc as i64;
         let next = match opcode {
-            OP_LOAD_VAR => {
-                let w = intern_var(vm, program, insn_a(program, pc));
-                if w == 0 {
-                    residual_dispatch(vm, here)
-                } else {
-                    let r = w as usize as CelRef;
-                    let depth = frame.valuestackdepth;
-                    frame.locals_stack_w[depth] = r;
-                    frame.valuestackdepth = depth + 1;
-                    here + 1
-                }
-            }
-            OP_GET_FIELD => match operand_cell(frame, 1) {
-                Some(recv) if !recv.is_null() => {
-                    let found = interned_field(recv as i64, program, insn_a(program, pc));
-                    if found == 0 {
-                        residual_dispatch(vm, here)
-                    } else {
-                        let depth = frame.valuestackdepth;
-                        let r = found as usize as CelRef;
-                        frame.locals_stack_w[depth - 1] = r;
-                        here + 1
-                    }
-                }
-                _ => residual_dispatch(vm, here),
-            },
-            OP_HAS_FIELD
-            | OP_HAS_FIELD_LOCAL
-            | OP_HAS_FIELD_LOCAL_APPEND
-            | OP_OPT_INDEX
-            | OP_OPT_SELECT
-            | OP_JUMP_IF_OPT_NONE
-            | OP_LIST_APPEND_OPTIONAL
-            | OP_NOT_STRICTLY_FALSE
-            | OP_IN
-            | OP_CALL_QUALIFIED
-            | OP_AND_LOCAL
-            | OP_OR_LOCAL
-            | OP_AND_MERGE
-            | OP_OR_MERGE
-            | OP_NEW_MAP
-            | OP_MAP_INSERT
-            | OP_MAP_INSERT_OPTIONAL => portal_rare(frame, vm, program, pc, here, opcode),
-            OP_GET_FIELD_LOCAL => {
-                let recv = read_cell(frame, insn_a(program, pc));
-                let found = interned_field(recv as i64, program, insn_b(program, pc));
-                if recv.is_null() || found == 0 {
-                    residual_dispatch(vm, here)
-                } else {
-                    let r = found as usize as CelRef;
-                    let depth = frame.valuestackdepth;
-                    frame.locals_stack_w[depth] = r;
-                    frame.valuestackdepth = depth + 1;
-                    here + 1
-                }
-            }
-            OP_GET_FIELD_LOCAL_APPEND => {
-                let recv = read_cell(frame, insn_a(program, pc));
-                let found = interned_field(recv as i64, program, insn_b(program, pc));
-                let depth = frame.valuestackdepth;
-                let list = frame.locals_stack_w[depth - 1];
-                if recv.is_null()
-                    || found == 0
-                    || list.is_null()
-                    || try_append(list as i64, found) == 0
-                {
-                    residual_dispatch(vm, here)
-                } else {
-                    here + 1
-                }
-            }
-            OP_INDEX => match (operand_cell(frame, 2), operand_cell(frame, 1)) {
-                (Some(container), Some(key)) if !container.is_null() && !key.is_null() => {
-                    let item = interned_index(container as i64, key as i64);
-                    if item == 0 {
-                        residual_dispatch(vm, here)
-                    } else {
-                        let depth = frame.valuestackdepth;
-                        let r = item as usize as CelRef;
-                        frame.locals_stack_w[depth - 2] = r;
-                        frame.valuestackdepth = depth - 1;
-                        here + 1
-                    }
-                }
-                _ => residual_dispatch(vm, here),
-            },
-            OP_ACCU_LOOP_COND => {
-                let w = frame.locals_stack_w[insn_a(program, pc)];
-                if w.is_null() || unsafe { w_kind(w) } != CelKind::Bool {
-                    residual_dispatch(vm, here)
-                } else if unsafe { (*w.cast::<W_BoolObject>()).boolval } == 0 {
-                    insn_b(program, pc)
-                } else {
-                    here + 1
-                }
-            }
-            OP_ACCU_LOOP_COND_NOT => {
-                let w = frame.locals_stack_w[insn_a(program, pc)];
-                if w.is_null() || unsafe { w_kind(w) } != CelKind::Bool {
-                    residual_dispatch(vm, here)
-                } else if unsafe { (*w.cast::<W_BoolObject>()).boolval } != 0 {
-                    insn_b(program, pc)
-                } else {
-                    here + 1
-                }
-            }
-            OP_ADD_LOCAL_K_APPEND => {
-                interned_arith_local_k_append!(frame, vm, program, pc, here, interned_add)
-            }
-            OP_MUL_LOCAL_K_APPEND => {
-                interned_arith_local_k_append!(frame, vm, program, pc, here, interned_mul)
-            }
-            OP_MOD_LOCAL_K_APPEND => {
-                interned_arith_local_k_append!(frame, vm, program, pc, here, interned_rem)
-            }
-            OP_EQ_LOCAL_K_APPEND => {
-                interned_local_k_append!(frame, vm, program, pc, here, cel_equals)
-            }
-            OP_NE_LOCAL_K_APPEND => {
-                interned_local_k_append!(frame, vm, program, pc, here, cel_not_equals)
-            }
-            OP_LT_LOCAL_K_APPEND => {
-                interned_local_k_append!(frame, vm, program, pc, here, cel_less)
-            }
-            OP_GT_LOCAL_K_APPEND => {
-                interned_local_k_append!(frame, vm, program, pc, here, cel_greater)
-            }
-            OP_GE_LOCAL_K_APPEND => {
-                interned_local_k_append!(frame, vm, program, pc, here, cel_greater_equals)
-            }
-            OP_NOT => match operand_cell(frame, 1) {
-                Some(w) if !w.is_null() && unsafe { w_kind(w) } == CelKind::Bool => {
-                    let r = unsafe { cel_negate(w) };
-                    if r == ERROR_SENTINEL {
-                        residual_dispatch(vm, here)
-                    } else {
-                        let depth = frame.valuestackdepth;
-                        frame.locals_stack_w[depth - 1] = r;
-                        here + 1
-                    }
-                }
-                _ => residual_dispatch(vm, here),
-            },
-            OP_NEGATE => match operand_cell(frame, 1) {
-                Some(w) if !w.is_null() => {
-                    let r = unsafe { cel_negate(w) };
-                    if r == ERROR_SENTINEL {
-                        residual_dispatch(vm, here)
-                    } else {
-                        let depth = frame.valuestackdepth;
-                        frame.locals_stack_w[depth - 1] = r;
-                        here + 1
-                    }
-                }
-                _ => residual_dispatch(vm, here),
-            },
-            OP_LOAD_LOCAL_APPEND => {
-                let w = read_cell(frame, insn_a(program, pc));
-                match operand_cell(frame, 1) {
-                    Some(list)
-                        if !w.is_null()
-                            && !list.is_null()
-                            && try_append(list as i64, w as i64) != 0 =>
-                    {
-                        here + 1
-                    }
-                    _ => residual_dispatch(vm, here),
-                }
-            }
-            OP_CALL_HOST | OP_CALL_METHOD => {
-                let arity = insn_b(program, pc);
-                let name = insn_a(program, pc);
-                let unary_arity = if opcode == OP_CALL_HOST { 1 } else { 0 };
-                if arity == unary_arity && interned_is_size(program, name) != 0 {
-                    match operand_cell(frame, 1) {
-                        Some(w) if !w.is_null() => {
-                            let n = interned_len(w as i64);
-                            if n < 0 {
-                                residual_dispatch(vm, here)
-                            } else {
-                                let depth = frame.valuestackdepth;
-                                let r = new_int(n) as CelRef;
-                                frame.locals_stack_w[depth - 1] = r;
-                                here + 1
-                            }
-                        }
-                        _ => residual_dispatch(vm, here),
-                    }
-                } else if arity == unary_arity {
-                    match operand_cell(frame, 1) {
-                        Some(w) if !w.is_null() => {
-                            let mut out = interned_unary(vm, program, name, w as i64);
-                            if out == 0 && opcode == OP_CALL_METHOD {
-                                out = interned_temporal(vm, program, name, w as i64);
-                            }
-                            if out == 0 && opcode == OP_CALL_METHOD {
-                                out = interned_optional_unary(program, name, w as i64);
-                            }
-                            if out == 0 || out == ERROR_SENTINEL as i64 {
-                                residual_dispatch(vm, here)
-                            } else {
-                                let depth = frame.valuestackdepth;
-                                let r = out as usize as CelRef;
-                                frame.locals_stack_w[depth - 1] = r;
-                                here + 1
-                            }
-                        }
-                        _ => residual_dispatch(vm, here),
-                    }
-                } else if opcode == OP_CALL_METHOD && arity == 1 {
-                    // After a CallQualified miss the arguments are parked and
-                    // only the receiver sits on the stack. `operand_cell(2)`
-                    // is then a local or the items-block header; decline.
-                    match (operand_cell(frame, 1), operand_cell(frame, 2)) {
-                        (Some(recv), Some(arg)) if !recv.is_null() && !arg.is_null() => {
-                            let out = interned_method1(program, name, recv as i64, arg as i64);
-                            if out == 0 || out == ERROR_SENTINEL as i64 {
-                                residual_dispatch(vm, here)
-                            } else {
-                                let depth = frame.valuestackdepth;
-                                let r = out as usize as CelRef;
-                                frame.locals_stack_w[depth - 2] = r;
-                                frame.valuestackdepth = depth - 1;
-                                here + 1
-                            }
-                        }
-                        _ => residual_dispatch(vm, here),
-                    }
-                } else {
-                    residual_dispatch(vm, here)
-                }
-            }
-            OP_LOAD_LOCAL => {
-                let slot = insn_a(program, pc);
-                let w = frame.locals_stack_w[slot];
-                if w.is_null() {
-                    residual_dispatch(vm, here)
-                } else {
-                    let depth = frame.valuestackdepth;
-                    frame.locals_stack_w[depth] = w;
-                    frame.valuestackdepth = depth + 1;
-                    here + 1
-                }
-            }
-            OP_STORE_LOCAL => {
-                let depth = frame.valuestackdepth;
-                let w = frame.locals_stack_w[depth - 1];
-                if w.is_null() {
-                    residual_dispatch(vm, here)
-                } else {
-                    let slot = insn_a(program, pc);
-                    frame.locals_stack_w[slot] = w;
-                    frame.valuestackdepth = depth - 1;
-                    here + 1
-                }
-            }
-            OP_ADD => interned_arith!(frame, vm, here, interned_add),
-            OP_SUB => interned_arith!(frame, vm, here, interned_sub),
-            OP_MUL => interned_arith!(frame, vm, here, interned_mul),
-            OP_DIV => interned_arith!(frame, vm, here, interned_div),
-            OP_MOD => interned_arith!(frame, vm, here, interned_rem),
-            OP_EQ => interned_binop!(frame, vm, here, interned_equals),
-            OP_NE => interned_binop!(frame, vm, here, interned_not_equals),
-            OP_LT => interned_binop!(frame, vm, here, cel_less),
-            OP_LE => interned_binop!(frame, vm, here, cel_less_equals),
-            OP_GT => interned_binop!(frame, vm, here, cel_greater),
-            OP_GE => interned_binop!(frame, vm, here, cel_greater_equals),
-            OP_LOAD_CONST => {
-                let w = intern_const(program, insn_a(program, pc));
-                if w == 0 {
-                    residual_dispatch(vm, here)
-                } else {
-                    let depth = frame.valuestackdepth;
-                    frame.locals_stack_w[depth] = w as usize as CelRef;
-                    frame.valuestackdepth = depth + 1;
-                    here + 1
-                }
-            }
-            OP_ADD_K => interned_arith_k!(frame, vm, program, pc, here, interned_add),
-            OP_MUL_K => interned_arith_k!(frame, vm, program, pc, here, interned_mul),
-            OP_MOD_K => interned_arith_k!(frame, vm, program, pc, here, interned_rem),
-            OP_EQ_K => interned_binop_k!(frame, vm, program, pc, here, cel_equals),
-            OP_NE_K => interned_binop_k!(frame, vm, program, pc, here, cel_not_equals),
-            OP_LT_K => interned_binop_k!(frame, vm, program, pc, here, cel_less),
-            OP_GT_K => interned_binop_k!(frame, vm, program, pc, here, cel_greater),
-            OP_GE_K => interned_binop_k!(frame, vm, program, pc, here, cel_greater_equals),
-            OP_ADD_LOCAL_K => interned_arith_local_k!(frame, vm, program, pc, here, interned_add),
-            OP_MUL_LOCAL_K => interned_arith_local_k!(frame, vm, program, pc, here, interned_mul),
-            OP_MOD_LOCAL_K => interned_arith_local_k!(frame, vm, program, pc, here, interned_rem),
-            OP_EQ_LOCAL_K => interned_local_k!(frame, vm, program, pc, here, cel_equals),
-            OP_NE_LOCAL_K => interned_local_k!(frame, vm, program, pc, here, cel_not_equals),
-            OP_LT_LOCAL_K => interned_local_k!(frame, vm, program, pc, here, cel_less),
-            OP_GT_LOCAL_K => interned_local_k!(frame, vm, program, pc, here, cel_greater),
-            OP_GE_LOCAL_K => interned_local_k!(frame, vm, program, pc, here, cel_greater_equals),
-            OP_INC_LOCAL => {
-                let slot = insn_a(program, pc);
-                let w = frame.locals_stack_w[slot];
-                if w.is_null() || unsafe { w_kind(w) } != CelKind::Int {
-                    residual_dispatch(vm, here)
-                } else {
-                    let n = unsafe { (*w.cast::<W_IntObject>()).intval };
-                    match n.checked_add(1) {
-                        None => residual_dispatch(vm, here),
-                        Some(next) => {
-                            let r = new_int_in(vm_heap(vm), next) as CelRef;
-                            frame.locals_stack_w[slot] = r;
-                            here + 1
-                        }
-                    }
-                }
-            }
-            OP_JUMP => insn_a(program, pc),
-            OP_JUMP_IF_FALSE | OP_JUMP_IF_TRUE => match operand_cell(frame, 1) {
-                Some(w) if !w.is_null() && unsafe { w_kind(w) } == CelKind::Bool => {
-                    let truthy = unsafe { (*w.cast::<W_BoolObject>()).boolval } != 0;
-                    let depth = frame.valuestackdepth;
-                    frame.valuestackdepth = depth - 1;
-                    let want = opcode == OP_JUMP_IF_TRUE;
-                    if truthy == want {
-                        insn_a(program, pc)
-                    } else {
-                        here + 1
-                    }
-                }
-                _ => residual_dispatch(vm, here),
-            },
-            OP_NEW_LIST => {
-                let w = new_list_with_capacity_in(vm_heap(vm), insn_a(program, pc)) as CelRef;
-                let depth = frame.valuestackdepth;
-                frame.locals_stack_w[depth] = w;
-                frame.valuestackdepth = depth + 1;
-                here + 1
-            }
-            OP_NEW_LIST_FROM_ARG => {
-                let src = read_cell(frame, insn_a(program, pc));
-                if src.is_null() || unsafe { w_kind(src) } != CelKind::List {
-                    residual_dispatch(vm, here)
-                } else {
-                    let w = new_list_with_capacity_in(vm_heap(vm), unsafe { list_len(src) })
-                        as CelRef;
-                    let depth = frame.valuestackdepth;
-                    frame.locals_stack_w[depth] = w;
-                    frame.valuestackdepth = depth + 1;
-                    here + 1
-                }
-            }
-            OP_LIST_APPEND => {
-                let depth = frame.valuestackdepth;
-                let item = frame.locals_stack_w[depth - 1];
-                let list = frame.locals_stack_w[depth - 2];
-                if item.is_null() || list.is_null() || try_append(list as i64, item as i64) == 0 {
-                    residual_dispatch(vm, here)
-                } else {
-                    frame.valuestackdepth = depth - 1;
-                    here + 1
-                }
-            }
-            OP_ITER_ELEMS => {
-                let depth = frame.valuestackdepth;
-                let w = frame.locals_stack_w[depth - 1];
-                if w.is_null() {
-                    residual_dispatch(vm, here)
-                } else if unsafe { w_kind(w) } == CelKind::List {
-                    here + 1
-                } else {
-                    let keys = interned_map_keys(vm, w as i64);
-                    if keys == 0 {
-                        residual_dispatch(vm, here)
-                    } else {
-                        let r = keys as usize as CelRef;
-                        frame.locals_stack_w[depth - 1] = r;
-                        here + 1
-                    }
-                }
-            }
-            OP_ITER_KEYS => {
-                let depth = frame.valuestackdepth;
-                let w = frame.locals_stack_w[depth - 1];
-                let keys = if w.is_null() {
-                    0
-                } else if unsafe { w_kind(w) } == CelKind::List {
-                    interned_list_indices(vm, w as i64)
-                } else {
-                    interned_map_keys(vm, w as i64)
-                };
-                if keys == 0 {
-                    residual_dispatch(vm, here)
-                } else {
-                    let r = keys as usize as CelRef;
-                    frame.locals_stack_w[depth - 1] = r;
-                    here + 1
-                }
-            }
-            OP_ITER_LEN => {
-                let src = frame.locals_stack_w[insn_a(program, pc)];
-                if src.is_null() || unsafe { w_kind(src) } != CelKind::List {
-                    residual_dispatch(vm, here)
-                } else {
-                    let w = new_int_in(vm_heap(vm), unsafe { list_len(src) }) as CelRef;
-                    let depth = frame.valuestackdepth;
-                    frame.locals_stack_w[depth] = w;
-                    frame.valuestackdepth = depth + 1;
-                    here + 1
-                }
-            }
-            OP_ITER_GUARD => {
-                let idx_w = frame.locals_stack_w[insn_a(program, pc)];
-                let src = frame.locals_stack_w[insn_b(program, pc)];
-                if idx_w.is_null()
-                    || src.is_null()
-                    || unsafe { w_kind(idx_w) } != CelKind::Int
-                    || unsafe { w_kind(src) } != CelKind::List
-                {
-                    residual_dispatch(vm, here)
-                } else {
-                    let index = unsafe { (*idx_w.cast::<W_IntObject>()).intval };
-                    let len = unsafe { list_len(src) };
-                    if index >= len {
-                        insn_c(program, pc)
-                    } else {
-                        here + 1
-                    }
-                }
-            }
-            OP_ITER_AT => {
-                let src = frame.locals_stack_w[insn_a(program, pc)];
-                let idx_w = frame.locals_stack_w[insn_b(program, pc)];
-                if src.is_null()
-                    || idx_w.is_null()
-                    || unsafe { w_kind(src) } != CelKind::List
-                    || unsafe { w_kind(idx_w) } != CelKind::Int
-                {
-                    residual_dispatch(vm, here)
-                } else {
-                    let index = unsafe { (*idx_w.cast::<W_IntObject>()).intval };
-                    let item = interned_item(vm, src as i64, index);
-                    if item == 0 {
-                        residual_dispatch(vm, here)
-                    } else {
-                        let w = item as usize as CelRef;
-                        let depth = frame.valuestackdepth;
-                        frame.locals_stack_w[depth] = w;
-                        frame.valuestackdepth = depth + 1;
-                        here + 1
-                    }
-                }
-            }
-            OP_ITER_BIND => {
-                let src = frame.locals_stack_w[insn_a(program, pc)];
-                let idx_w = frame.locals_stack_w[insn_b(program, pc)];
-                if src.is_null()
-                    || idx_w.is_null()
-                    || unsafe { w_kind(src) } != CelKind::List
-                    || unsafe { w_kind(idx_w) } != CelKind::Int
-                {
-                    residual_dispatch(vm, here)
-                } else {
-                    let index = unsafe { (*idx_w.cast::<W_IntObject>()).intval };
-                    let item = interned_item(vm, src as i64, index);
-                    if item == 0 {
-                        residual_dispatch(vm, here)
-                    } else {
-                        let slot = insn_c(program, pc);
-                        let w = item as usize as CelRef;
-                        frame.locals_stack_w[slot] = w;
-                        here + 1
-                    }
-                }
-            }
-            OP_ITER_ADVANCE => {
-                let slot = insn_a(program, pc);
-                let w = frame.locals_stack_w[slot];
-                if w.is_null() || unsafe { w_kind(w) } != CelKind::Int {
-                    residual_dispatch(vm, here)
-                } else {
-                    let n = unsafe { (*w.cast::<W_IntObject>()).intval };
-                    match n.checked_add(1) {
-                        None => residual_dispatch(vm, here),
-                        Some(next) => {
-                            let r = new_int_in(vm_heap(vm), next) as CelRef;
-                            frame.locals_stack_w[slot] = r;
-                            insn_b(program, pc)
-                        }
-                    }
-                }
-            }
-            OP_RETURN => {
-                let depth = frame.valuestackdepth;
-                let w = frame.locals_stack_w[depth - 1];
-                if w.is_null() {
-                    residual_dispatch(vm, here)
-                } else {
-                    vm_park_return(vm, w as i64);
-                    PORTAL_DONE
-                }
-            }
-            _ => residual_dispatch(vm, here),
+            _ => step_hot(program, pc),
         };
         if next < 0 {
             state.ret = next;
