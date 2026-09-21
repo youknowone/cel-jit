@@ -28,8 +28,8 @@ use crate::common::types::{
     NULL_TYPE, OPTIONAL_TYPE, STRING_TYPE, TYPE_TYPE, UINT_TYPE,
 };
 use crate::objects::{
-    map_get_by_key, map_has_exact_key, Key, KeyRef, ListRef, ListStorage, Map, MapEntries,
-    MapStorage, Opaque, OptionalValue,
+    map_get_by_key, map_has_exact_key, try_build_map, Key, KeyRef, ListRef, ListStorage,
+    Map, MapStorage, Opaque, OptionalValue,
 };
 use crate::Value;
 
@@ -454,9 +454,15 @@ pub(crate) fn link_public_handle(w: CelRef, value: &Value) {
                 if let Some(arc) = map.object_arc() {
                     leaf.public = Arc::as_ptr(arc) as *const ();
                     leaf.public_kind = MAP_PUBLIC_OBJECT;
+                    leaf.public_len = 0;
                 } else if let Some(arc) = map.entries_arc() {
-                    leaf.public = Arc::as_ptr(arc) as *const ();
+                    let n = arc.len();
+                    if n > u32::MAX as usize {
+                        return;
+                    }
+                    leaf.public = Arc::as_ptr(arc) as *const (Key, Value) as *const ();
                     leaf.public_kind = MAP_PUBLIC_ENTRIES;
+                    leaf.public_len = n as u32;
                 }
             }
             Value::String(s) => {
@@ -687,7 +693,9 @@ pub unsafe fn interned_list_get(w: CelRef, index: i64) -> Option<CelRef> {
 
 fn intern_map(map: &Map) -> Result<CelRef, ConvertError> {
     match map.storage() {
-        MapStorage::Object(_) | MapStorage::Entries(_) => Ok(new_map(&map_pairs(map)?) as CelRef),
+        MapStorage::Object(_) | MapStorage::Entries(_) => {
+            Ok(new_map(&map_pairs(map)?) as CelRef)
+        }
         MapStorage::Record { .. } => {
             let host = intern_host_any(Box::new(map.clone()));
             Ok(new_map_record(host, map.len() as i64) as CelRef)
@@ -697,7 +705,8 @@ fn intern_map(map: &Map) -> Result<CelRef, ConvertError> {
 
 /// `W_MapObject::public` addresses a [`HashMap<Key, Value>`].
 const MAP_PUBLIC_OBJECT: u32 = 0;
-/// `W_MapObject::public` addresses a [`MapEntries`].
+/// `W_MapObject::public` is the data pointer of an `Arc<[(Key, Value)]>`;
+/// [`W_MapObject::public_len`] is the slice length.
 const MAP_PUBLIC_ENTRIES: u32 = 1;
 
 unsafe fn linked_public_map(leaf: &W_MapObject) -> Option<Map> {
@@ -705,9 +714,31 @@ unsafe fn linked_public_map(leaf: &W_MapObject) -> Option<Map> {
         return None;
     }
     if leaf.public_kind == MAP_PUBLIC_ENTRIES {
-        clone_arc(leaf.public as *const MapEntries).map(Map::entries)
+        clone_arc_slice(
+            leaf.public as *const (Key, Value),
+            leaf.public_len as usize,
+        )
+        .map(Map::from_linked_entries)
     } else {
         clone_arc(leaf.public as *const HashMap<Key, Value>).map(Map::object)
+    }
+}
+
+/// Rebuild an `Arc<[T]>` from the data pointer stored in a leaf and the
+/// leaf's length word.
+///
+/// # Safety
+///
+/// `data` is `Arc::as_ptr` of a live `Arc<[T]>` of length `len`, and that
+/// `Arc` outlives this increment.
+unsafe fn clone_arc_slice<T>(data: *const T, len: usize) -> Option<Arc<[T]>> {
+    if data.is_null() {
+        return None;
+    }
+    let fat = std::ptr::slice_from_raw_parts(data, len);
+    unsafe {
+        Arc::increment_strong_count(fat);
+        Some(Arc::from_raw(fat))
     }
 }
 
@@ -723,15 +754,11 @@ unsafe fn map_from_ref(w: CelRef) -> Result<Map, ConvertError> {
             if base.is_null() && n != 0 {
                 return Err(ConvertError::Corrupt("map"));
             }
-            let mut entries = Vec::with_capacity(n);
-            for i in 0..n {
+            try_build_map::<_, false>(n, |i| {
                 let key = unsafe { ref_to_key(*base.add(2 * i))? };
                 let value = unsafe { ref_to_value(*base.add(2 * i + 1))? };
-                entries.push((key, value));
-            }
-            Ok(Map::entries(Arc::new(MapEntries::from_unique(
-                entries.into_boxed_slice(),
-            ))))
+                Ok(Some((key, value)))
+            })
         }
         MapStrategy::Record => {
             host_map(opaque_host_index(leaf.storage)).ok_or(ConvertError::Corrupt("map"))
@@ -848,11 +875,19 @@ fn string_from_ref(w: CelRef) -> Result<Arc<String>, ConvertError> {
 }
 
 fn ref_to_key(w: CelRef) -> Result<Key, ConvertError> {
-    match unsafe { ref_to_value(w) }? {
-        Value::Int(i) => Ok(Key::Int(i)),
-        Value::UInt(u) => Ok(Key::Uint(u)),
-        Value::Bool(b) => Ok(Key::Bool(b)),
-        Value::String(s) => Ok(Key::String(s)),
+    if w.is_null() {
+        return Err(ConvertError::Corrupt("map key"));
+    }
+    match unsafe { w_kind(w) } {
+        CelKind::Int => Ok(Key::Int(unsafe { (*w.cast::<W_IntObject>()).intval })),
+        CelKind::UInt => Ok(Key::Uint(unsafe { (*w.cast::<W_UIntObject>()).uintval })),
+        CelKind::Bool => Ok(Key::Bool(
+            unsafe { (*w.cast::<W_BoolObject>()).boolval } != 0,
+        )),
+        CelKind::Str => {
+            let leaf = unsafe { &*w.cast::<W_StringObject>() };
+            Ok(Key::String(string_from_leaf(leaf)?))
+        }
         _ => Err(ConvertError::Corrupt("map key")),
     }
 }
@@ -860,6 +895,8 @@ fn ref_to_key(w: CelRef) -> Result<Key, ConvertError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::objects::MapEntries;
+    use crate::runtime::object::{map_try_insert, new_map_with_capacity};
 
     fn roundtrip(v: Value) -> Value {
         let w = value_to_ref(&v).expect("to_ref");
@@ -1160,14 +1197,83 @@ mod tests {
 
     #[test]
     fn a_linked_public_entries_map_unpacks_the_same_table() {
-        let original = Map::entries(Arc::new(MapEntries::new(
+        let original = Map::entries(MapEntries::new(
             vec![(Key::String(Arc::new("a".into())), Value::Int(1))].into_boxed_slice(),
-        )));
+        ));
         let value = Value::Map(original.clone());
         let w = intern_leaf(&value).expect("intern");
         link_public_handle(w, &value);
         let back = unsafe { map_from_ref(w) }.expect("unpack");
         assert!(original.ptr_eq(&back));
+    }
+
+    #[test]
+    fn linked_entries_map_survives_map_try_insert() {
+        // Copy-out of a linked Entries table rebuilds the Arc from `public`
+        // and `public_len`, not from `W_MapObject::length`. `map_try_insert`
+        // grows `length` and does not clear `public`; using `length` would
+        // pass the wrong layout to `Arc::from_raw`. The expected copy-out is
+        // still the original two-entry table (`ptr_eq`), not a three-entry
+        // rebuild of the interned items.
+        let original = Map::ordered(
+            vec![
+                (Key::String(Arc::new("a".into())), Value::Int(1)),
+                (Key::String(Arc::new("b".into())), Value::Int(2)),
+            ]
+            .into_boxed_slice(),
+        );
+        let value = Value::Map(original.clone());
+        let w = new_map_with_capacity(4) as CelRef;
+        assert!(unsafe {
+            map_try_insert(
+                w,
+                new_string("a") as CelRef,
+                new_int(1) as CelRef,
+            )
+        });
+        assert!(unsafe {
+            map_try_insert(
+                w,
+                new_string("b") as CelRef,
+                new_int(2) as CelRef,
+            )
+        });
+        link_public_handle(w, &value);
+        let leaf = unsafe { &*w.cast::<W_MapObject>() };
+        assert_eq!(leaf.length, 2);
+        assert_eq!(leaf.public_kind, MAP_PUBLIC_ENTRIES);
+        assert_eq!(leaf.public_len, 2);
+        assert!(unsafe {
+            map_try_insert(
+                w,
+                new_string("c") as CelRef,
+                new_int(3) as CelRef,
+            )
+        });
+        let leaf = unsafe { &*w.cast::<W_MapObject>() };
+        assert_eq!(leaf.length, 3, "insert grew the interned table");
+        assert_eq!(leaf.public_len, 2, "link length is unchanged");
+        let back = unsafe { map_from_ref(w) }.expect("unpack");
+        assert!(original.ptr_eq(&back));
+        assert_eq!(back.len(), 2);
+    }
+
+    #[test]
+    fn map_copy_out_error_drops_a_written_opaque() {
+        let spy: Arc<dyn Opaque> = Arc::new(HostId(7));
+        let opaque_w = intern_leaf(&Value::Opaque(spy.clone())).expect("opaque intern");
+        let before = Arc::strong_count(&spy);
+        let w = new_map(&[
+            (new_string("k") as CelRef, opaque_w),
+            (new_list(&[new_int(0) as CelRef]) as CelRef, new_int(2) as CelRef),
+        ]);
+        let err = unsafe { map_from_ref(w as CelRef) };
+        assert!(matches!(err, Err(ConvertError::Corrupt("map key"))));
+        assert_eq!(
+            Arc::strong_count(&spy),
+            before,
+            "the first pair must be dropped when a later key fails"
+        );
     }
 
     #[test]

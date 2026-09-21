@@ -6,7 +6,7 @@ use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(feature = "vm")]
-use cel::{Context, Program};
+use cel::{Context, Program, Value};
 
 std::thread_local! {
     static LOCAL: Cell<u64> = const { Cell::new(0) };
@@ -51,11 +51,31 @@ fn count(src: &str, setup: impl FnOnce(&mut Context)) -> u64 {
 }
 
 #[cfg(feature = "vm")]
+fn count_walker(src: &str, setup: impl FnOnce(&mut Context)) -> u64 {
+    let program = Program::compile(src).expect(src);
+    let mut ctx = Context::default();
+    setup(&mut ctx);
+    Value::resolve_value(program.expression(), &ctx).expect(src);
+    for _ in 0..8 {
+        let _ = Value::resolve_value(program.expression(), &ctx);
+    }
+    let t0 = LOCAL.with(Cell::get);
+    let n = 32u64;
+    for _ in 0..n {
+        let _ = Value::resolve_value(program.expression(), &ctx);
+    }
+    (LOCAL.with(Cell::get) - t0) / n
+}
+
+#[cfg(feature = "vm")]
 #[test]
 fn mallocs_per_eval_on_finish_rows() {
     let nested = count("[[x]]", |ctx| ctx.add_variable_from_value("x", 15i64));
     let chain = count(r#""a" + "b" + "c" + "d""#, |_| {});
     let maps = count(r#"list.map(e, {"k": e})"#, |ctx| {
+        ctx.add_variable_from_value("list", (1..=10i64).collect::<Vec<_>>())
+    });
+    let maps3 = count(r#"list.map(e, {"k": e, "v": e, "w": e})"#, |ctx| {
         ctx.add_variable_from_value("list", (1..=10i64).collect::<Vec<_>>())
     });
     let inner_lists = count("list.map(e, [e, e])", |ctx| {
@@ -64,9 +84,16 @@ fn mallocs_per_eval_on_finish_rows() {
     println!("[[x]] mallocs/eval={nested}");
     println!("string-chain mallocs/eval={chain}");
     println!("list.map(e, {{k:e}}) mallocs/eval={maps}");
+    println!("list.map(e, {{k,v,w}}) mallocs/eval={maps3}");
+    let walker_one = count_walker(r#"{"a": x}"#, |ctx| {
+        ctx.add_variable_from_value("x", 15i64)
+    });
     println!("list.map(e, [e,e]) mallocs/eval={inner_lists}");
+    println!("walker {{a: x}} mallocs/eval={walker_one}");
     assert_eq!(nested, 4, "[[x]] finish mallocs");
     assert_eq!(chain, 2, "string-chain finish mallocs");
-    assert_eq!(maps, 22, "map-in-map finish mallocs");
+    assert_eq!(maps, 12, "1-entry map-in-map finish mallocs");
+    assert_eq!(maps3, 12, "3-entry map-in-map finish mallocs");
     assert_eq!(inner_lists, 22, "list-of-lists finish mallocs");
+    assert_eq!(walker_one, 1, "walker {{a: x}} mallocs");
 }

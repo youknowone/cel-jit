@@ -28,7 +28,8 @@ use std::convert::{Infallible, TryFrom, TryInto};
 use std::fmt::{Debug, Display, Formatter};
 use std::ops;
 use std::ops::Deref;
-use std::sync::{Arc, OnceLock};
+use std::mem::MaybeUninit;
+use std::sync::Arc;
 #[cfg(feature = "chrono")]
 use std::sync::LazyLock;
 
@@ -60,56 +61,30 @@ static MIN_TIMESTAMP: LazyLock<chrono::DateTime<chrono::FixedOffset>> = LazyLock
         .from_utc_datetime(&naive)
 });
 
-/// Insertion-ordered map table. Lookup scans when the table is small and
-/// otherwise builds an index on the first lookup.
+/// Tables this small are scanned as [`MapStorage::Entries`]; larger tables
+/// are [`MapStorage::Object`].
+const ORDERED_SCAN_LIMIT: usize = 8;
+
+/// Insertion-ordered pairs in one `Arc` allocation. Used when the table is
+/// small enough to scan.
+#[derive(Clone)]
 pub struct MapEntries {
-    entries: Box<[(Key, Value)]>,
-    index: OnceLock<HashMap<Key, u32>>,
+    entries: Arc<[(Key, Value)]>,
 }
 
 impl MapEntries {
-    /// Tables this small are scanned; larger tables build [`Self::index`] on
-    /// the first lookup.
-    const SCAN_LIMIT: usize = 8;
-
-    /// Compact `entries` with replace-on-insert: a later pair whose [`Key`]
-    /// matches an earlier one overwrites that earlier value and keeps its
-    /// position.
-    pub fn new(entries: Box<[(Key, Value)]>) -> MapEntries {
-        MapEntries {
-            entries: Self::compact_replace_on_insert(entries),
-            index: OnceLock::new(),
-        }
-    }
-
-    /// `entries` already has unique keys. The interned map replaces on
-    /// insert, so a VM-born table is unique before it is unpacked.
-    pub(crate) fn from_unique(entries: Box<[(Key, Value)]>) -> MapEntries {
+    pub(crate) fn new(entries: Box<[(Key, Value)]>) -> MapEntries {
         debug_assert!(
-            Self::keys_are_unique(&entries),
-            "from_unique requires unique keys"
+            entries.len() <= ORDERED_SCAN_LIMIT,
+            "Entries tables are at most ORDERED_SCAN_LIMIT long"
         );
         MapEntries {
-            entries,
-            index: OnceLock::new(),
+            entries: Arc::from(compact_replace_on_insert(entries)),
         }
     }
 
-    #[cfg_attr(not(debug_assertions), allow(dead_code))]
-    fn keys_are_unique(entries: &[(Key, Value)]) -> bool {
-        if entries.len() <= 1 {
-            return true;
-        }
-        if entries.len() <= Self::SCAN_LIMIT {
-            return entries.iter().enumerate().all(|(i, (k, _))| {
-                let needle = k.as_keyref();
-                entries[..i].iter().all(|(ok, _)| ok.as_keyref() != needle)
-            });
-        }
-        let mut seen = HashMap::with_capacity(entries.len());
-        entries
-            .iter()
-            .all(|(k, _)| seen.insert(k.clone(), ()).is_none())
+    pub(crate) fn entries_arc(&self) -> &Arc<[(Key, Value)]> {
+        &self.entries
     }
 
     pub fn len(&self) -> usize {
@@ -119,91 +94,171 @@ impl MapEntries {
     pub fn iter(&self) -> std::slice::Iter<'_, (Key, Value)> {
         self.entries.iter()
     }
+}
 
-    fn compact_replace_on_insert(entries: Box<[(Key, Value)]>) -> Box<[(Key, Value)]> {
-        let mut entries = entries.into_vec();
-        let n = entries.len();
-        if n <= 1 {
-            return entries.into_boxed_slice();
-        }
-        let mut write = 0usize;
-        if n <= Self::SCAN_LIMIT {
-            for read in 0..n {
-                let existing = {
-                    let needle = entries[read].0.as_keyref();
-                    entries[..write]
-                        .iter()
-                        .position(|(k, _)| k.as_keyref() == needle)
-                };
-                Self::replace_or_keep(&mut entries, &mut write, read, existing);
-            }
-        } else {
-            let mut index = HashMap::with_capacity(n);
-            for read in 0..n {
-                let existing = index.get(&entries[read].0).copied().map(|i| i as usize);
-                if existing.is_none() {
-                    index.insert(entries[read].0.clone(), write as u32);
-                }
-                Self::replace_or_keep(&mut entries, &mut write, read, existing);
-            }
-        }
-        entries.truncate(write);
-        entries.into_boxed_slice()
+/// Compact `entries` with replace-on-insert: a later pair whose [`Key`]
+/// matches an earlier one overwrites that earlier value and keeps its
+/// position. Only used for tables that fit in [`ORDERED_SCAN_LIMIT`].
+fn compact_replace_on_insert(entries: Box<[(Key, Value)]>) -> Box<[(Key, Value)]> {
+    let mut entries = entries.into_vec();
+    let n = entries.len();
+    if n <= 1 {
+        return entries.into_boxed_slice();
     }
+    let mut write = 0usize;
+    for read in 0..n {
+        let existing = existing_filled_index(&entries[..write], &entries[read].0);
+        replace_or_keep(&mut entries, &mut write, read, existing);
+    }
+    entries.truncate(write);
+    entries.into_boxed_slice()
+}
 
-    fn replace_or_keep(
-        entries: &mut [(Key, Value)],
-        write: &mut usize,
-        read: usize,
-        existing: Option<usize>,
-    ) {
-        if let Some(i) = existing {
-            entries[i].1 = std::mem::replace(&mut entries[read].1, Value::Null);
-        } else {
-            if *write != read {
-                entries.swap(*write, read);
-            }
-            *write += 1;
+fn replace_or_keep(
+    entries: &mut [(Key, Value)],
+    write: &mut usize,
+    read: usize,
+    existing: Option<usize>,
+) {
+    if let Some(i) = existing {
+        entries[i].1 = std::mem::replace(&mut entries[read].1, Value::Null);
+    } else {
+        if *write != read {
+            entries.swap(*write, read);
         }
-    }
-
-    fn position(&self, key: &(dyn AsKeyRef + '_)) -> Option<usize> {
-        if self.entries.len() <= Self::SCAN_LIMIT {
-            let needle = key.as_keyref();
-            return self
-                .entries
-                .iter()
-                .position(|(k, _)| k.as_keyref() == needle);
-        }
-        let index = self.index.get_or_init(|| {
-            let mut m = HashMap::with_capacity(self.entries.len());
-            for (i, (k, _)) in self.entries.iter().enumerate() {
-                m.insert(k.clone(), i as u32);
-            }
-            m
-        });
-        index.get(key).map(|&i| i as usize)
-    }
-
-    fn get_exact(&self, key: &(dyn AsKeyRef + '_)) -> Option<&Value> {
-        self.position(key).map(|i| &self.entries[i].1)
-    }
-
-    fn has_exact_key(&self, key: &(dyn AsKeyRef + '_)) -> bool {
-        self.position(key).is_some()
+        *write += 1;
     }
 }
 
-fn entries_tables_eq(a: &MapEntries, b: &MapEntries) -> bool {
+fn existing_filled_index(filled: &[(Key, Value)], key: &Key) -> Option<usize> {
+    let needle = key.as_keyref();
+    filled.iter().position(|(k, _)| k.as_keyref() == needle)
+}
+
+fn pairs_position(pairs: &[(Key, Value)], key: &(dyn AsKeyRef + '_)) -> Option<usize> {
+    debug_assert!(
+        pairs.len() <= ORDERED_SCAN_LIMIT,
+        "Entries lookup scans at most ORDERED_SCAN_LIMIT pairs"
+    );
+    let needle = key.as_keyref();
+    pairs.iter().position(|(k, _)| k.as_keyref() == needle)
+}
+
+fn pairs_get<'a>(
+    pairs: &'a [(Key, Value)],
+    key: &(dyn AsKeyRef + '_),
+) -> Option<&'a Value> {
+    pairs_position(pairs, key).map(|i| &pairs[i].1)
+}
+
+fn ordered_tables_eq(a: &[(Key, Value)], b: &[(Key, Value)]) -> bool {
     if a.len() != b.len() {
         return false;
     }
-    if a.entries == b.entries {
+    if a == b {
         return true;
     }
-    a.entries
-        .iter()
-        .all(|(k, v)| b.get_exact(k).is_some_and(|o| o == v))
+    a.iter()
+        .all(|(k, v)| pairs_get(b, k).is_some_and(|o| o == v))
+}
+
+/// Build a public map from `n` source slots. `n <= ORDERED_SCAN_LIMIT`
+/// fills one `Arc` slice ([`MapStorage::Entries`]); a larger table is a
+/// [`HashMap`]. `REPLACE` scans for a repeated key on the slice path;
+/// the unique path skips that scan. `write` may skip (`None`). Written
+/// pairs are dropped if `write` fails.
+pub(crate) fn try_build_map<E, const REPLACE: bool>(
+    n: usize,
+    mut write: impl FnMut(usize) -> Result<Option<(Key, Value)>, E>,
+) -> Result<Map, E> {
+    if n <= ORDERED_SCAN_LIMIT {
+        let arc = try_fill_ordered_arc::<E, REPLACE>(n, write)?;
+        Ok(Map {
+            storage: MapStorage::Entries(MapEntries { entries: arc }),
+        })
+    } else {
+        let mut map = HashMap::with_capacity(n);
+        for i in 0..n {
+            if let Some((key, value)) = write(i)? {
+                let prev = map.insert(key, value);
+                if !REPLACE {
+                    debug_assert!(prev.is_none(), "unique fill requires unique keys");
+                }
+            }
+        }
+        Ok(Map::object(Arc::new(map)))
+    }
+}
+
+/// One `Arc<[(Key, Value)]>` allocation. If the final length is less than
+/// `cap`, a second exact-size allocation holds the filled prefix.
+fn try_fill_ordered_arc<E, const REPLACE: bool>(
+    cap: usize,
+    mut write: impl FnMut(usize) -> Result<Option<(Key, Value)>, E>,
+) -> Result<Arc<[(Key, Value)]>, E> {
+    if cap == 0 {
+        return Ok(Arc::from([]));
+    }
+    let mut uninit: Arc<[MaybeUninit<(Key, Value)>]> = Arc::new_uninit_slice(cap);
+    let slot = Arc::get_mut(&mut uninit).expect("unique");
+    struct Guard<'a> {
+        slot: &'a mut [MaybeUninit<(Key, Value)>],
+        filled: usize,
+    }
+    impl Drop for Guard<'_> {
+        fn drop(&mut self) {
+            for i in 0..self.filled {
+                // SAFETY: `slot[i]` was written before `filled` advanced past i.
+                unsafe { self.slot[i].assume_init_drop() };
+            }
+        }
+    }
+    let mut guard = Guard { slot, filled: 0 };
+    for i in 0..cap {
+        let Some((key, value)) = write(i)? else {
+            continue;
+        };
+        if REPLACE {
+            let filled = unsafe {
+                // SAFETY: `slot[0..filled]` was written.
+                std::slice::from_raw_parts(
+                    guard.slot.as_ptr() as *const (Key, Value),
+                    guard.filled,
+                )
+            };
+            if let Some(at) = existing_filled_index(filled, &key) {
+                // SAFETY: `existing` is an index into `0..filled`, which was written.
+                unsafe { guard.slot[at].assume_init_mut() }.1 = value;
+                continue;
+            }
+        }
+        guard.slot[guard.filled].write((key, value));
+        guard.filled += 1;
+    }
+    let filled = guard.filled;
+    let arc = if filled == cap {
+        core::mem::forget(guard);
+        // SAFETY: every index in 0..cap was written.
+        unsafe { uninit.assume_init() }
+    } else if filled == 0 {
+        core::mem::forget(guard);
+        Arc::from([])
+    } else {
+        let mut exact: Arc<[MaybeUninit<(Key, Value)>]> = Arc::new_uninit_slice(filled);
+        {
+            let dst = Arc::get_mut(&mut exact).expect("unique");
+            for i in 0..filled {
+                // SAFETY: `guard.slot[i]` is initialized; the read moves it so
+                // the guard must not drop it.
+                dst[i].write(unsafe { guard.slot[i].assume_init_read() });
+            }
+        }
+        guard.filled = 0;
+        core::mem::forget(guard);
+        // SAFETY: every index in 0..filled was written.
+        unsafe { exact.assume_init() }
+    };
+    Ok(arc)
 }
 
 /// How a [`Map`] holds its entries -- the map counterpart of [`ListStorage`].
@@ -211,9 +266,8 @@ fn entries_tables_eq(a: &MapEntries, b: &MapEntries) -> bool {
 pub enum MapStorage {
     /// An owned table of boxed entries.
     Object(Arc<HashMap<Key, Value>>),
-    /// Insertion-ordered pairs. Lookup scans a small table and otherwise
-    /// hashes on the first get.
-    Entries(Arc<MapEntries>),
+    /// Insertion-ordered pairs small enough to scan.
+    Entries(MapEntries),
     /// One row of a record batch. The field names and the column banks live in
     /// `schema` and are shared with every other row, so this row is an index
     /// into them and a field is boxed only when it is read.
@@ -384,11 +438,43 @@ impl Map {
         }
     }
 
-    /// A map over an insertion-ordered table. Lookup hashes only when the
-    /// table is first read and is larger than a linear scan.
-    pub fn entries(entries: Arc<MapEntries>) -> Map {
+    /// A map over an insertion-ordered table of at most [`ORDERED_SCAN_LIMIT`]
+    /// pairs.
+    pub fn entries(entries: MapEntries) -> Map {
+        debug_assert!(entries.len() <= ORDERED_SCAN_LIMIT);
         Map {
             storage: MapStorage::Entries(entries),
+        }
+    }
+
+    /// Compact `entries` with replace-on-insert. Tables that fit in
+    /// [`ORDERED_SCAN_LIMIT`] are [`MapStorage::Entries`]; larger tables
+    /// are [`MapStorage::Object`].
+    pub fn ordered(entries: Box<[(Key, Value)]>) -> Map {
+        if entries.len() <= ORDERED_SCAN_LIMIT {
+            Map {
+                storage: MapStorage::Entries(MapEntries::new(entries)),
+            }
+        } else {
+            let mut map = HashMap::with_capacity(entries.len());
+            for (key, value) in Vec::from(entries) {
+                map.insert(key, value);
+            }
+            Map::object(Arc::new(map))
+        }
+    }
+
+    pub(crate) fn from_linked_entries(entries: Arc<[(Key, Value)]>) -> Map {
+        debug_assert!(entries.len() <= ORDERED_SCAN_LIMIT);
+        Map {
+            storage: MapStorage::Entries(MapEntries { entries }),
+        }
+    }
+
+    fn ordered_pairs(&self) -> Option<&[(Key, Value)]> {
+        match &self.storage {
+            MapStorage::Entries(e) => Some(&e.entries),
+            _ => None,
         }
     }
 
@@ -410,7 +496,9 @@ impl Map {
     pub fn ptr_eq(&self, other: &Map) -> bool {
         match (&self.storage, &other.storage) {
             (MapStorage::Object(a), MapStorage::Object(b)) => Arc::ptr_eq(a, b),
-            (MapStorage::Entries(a), MapStorage::Entries(b)) => Arc::ptr_eq(a, b),
+            (MapStorage::Entries(a), MapStorage::Entries(b)) => {
+                Arc::ptr_eq(a.entries_arc(), b.entries_arc())
+            }
             (
                 MapStorage::Record {
                     schema: sa,
@@ -432,9 +520,9 @@ impl Map {
         }
     }
 
-    pub(crate) fn entries_arc(&self) -> Option<&Arc<MapEntries>> {
+    pub(crate) fn entries_arc(&self) -> Option<&Arc<[(Key, Value)]>> {
         match &self.storage {
-            MapStorage::Entries(a) => Some(a),
+            MapStorage::Entries(a) => Some(a.entries_arc()),
             _ => None,
         }
     }
@@ -442,7 +530,7 @@ impl Map {
     pub fn len(&self) -> usize {
         match &self.storage {
             MapStorage::Object(map) => map.len(),
-            MapStorage::Entries(entries) => entries.len(),
+            MapStorage::Entries(e) => e.len(),
             MapStorage::Record { schema, .. } => schema.field_count(),
         }
     }
@@ -459,7 +547,7 @@ impl Map {
         let key: &(dyn AsKeyRef + '_) = &key;
         match &self.storage {
             MapStorage::Object(map) => map.contains_key(key),
-            MapStorage::Entries(entries) => entries.has_exact_key(key),
+            MapStorage::Entries(e) => pairs_position(&e.entries, key).is_some(),
             MapStorage::Record { schema, .. } => schema.position(key).is_some(),
         }
     }
@@ -474,7 +562,7 @@ impl Map {
     fn get_exact(&self, key: &(dyn AsKeyRef + '_)) -> Option<Cow<'_, Value>> {
         match &self.storage {
             MapStorage::Object(map) => map.get(key).map(Cow::Borrowed),
-            MapStorage::Entries(entries) => entries.get_exact(key).map(Cow::Borrowed),
+            MapStorage::Entries(e) => pairs_get(&e.entries, key).map(Cow::Borrowed),
             MapStorage::Record { schema, index } => {
                 let field = schema.position(key)?;
                 Some(Cow::Owned(schema.columns[field].value_at(*index)))
@@ -487,7 +575,7 @@ impl Map {
     pub fn iter(&self) -> MapIter<'_> {
         match &self.storage {
             MapStorage::Object(map) => MapIter::Object(map.iter()),
-            MapStorage::Entries(entries) => MapIter::Entries(entries.iter()),
+            MapStorage::Entries(e) => MapIter::Entries(e.entries.iter()),
             MapStorage::Record { schema, index } => MapIter::Record {
                 schema,
                 index: *index,
@@ -547,13 +635,14 @@ impl PartialEq for Map {
     fn eq(&self, other: &Self) -> bool {
         match (&self.storage, &other.storage) {
             (MapStorage::Object(a), MapStorage::Object(b)) => a == b,
-            (MapStorage::Entries(a), MapStorage::Entries(b)) => entries_tables_eq(a, b),
+            (MapStorage::Entries(_), MapStorage::Entries(_)) => ordered_tables_eq(
+                self.ordered_pairs().expect("ordered"),
+                other.ordered_pairs().expect("ordered"),
+            ),
             _ => {
                 if self.len() != other.len() {
                     return false;
                 }
-                // Iterate the entries table when one side is one, so a map
-                // that is only compared never builds its lookup index.
                 let (iter_side, get_side) = match (&self.storage, &other.storage) {
                     (MapStorage::Entries(_), _) => (self, other),
                     (_, MapStorage::Entries(_)) => (other, self),
@@ -1342,6 +1431,11 @@ pub enum Value {
     /// the typed variants for match sites that have not moved yet.
     Interned(CelRef),
 }
+
+const _: () = {
+    assert!(core::mem::size_of::<Value>() == 24);
+    assert!(core::mem::size_of::<Map>() == 24);
+};
 
 impl Debug for Value {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
@@ -2155,8 +2249,10 @@ fn resolve_inner(expr: &Expression, ctx: &Context) -> Result<Value, ExecutionErr
         }
         Expr::List(list_expr) => eval_list_literal(list_expr, ctx),
         Expr::Map(map_expr) => {
-            let mut entries = Vec::with_capacity(map_expr.entries.len());
-            for entry in map_expr.entries.iter() {
+            let n = map_expr.entries.len();
+            let mut src = map_expr.entries.iter();
+            let map = try_build_map::<_, true>(n, |_| {
+                let entry = src.next().expect("n source entries");
                 let (k, v, is_optional) = match &entry.expr {
                     EntryExpr::StructField(_) => panic!("WAT?"),
                     EntryExpr::MapEntry(e) => (&e.key, &e.value, e.optional),
@@ -2172,13 +2268,9 @@ fn resolve_inner(expr: &Expression, ctx: &Context) -> Result<Value, ExecutionErr
                 } else {
                     Some(value.into_public())
                 };
-                if let Some(stored) = stored {
-                    entries.push((key, stored));
-                }
-            }
-            Ok(Value::Map(Map::entries(Arc::new(MapEntries::new(
-                entries.into_boxed_slice(),
-            )))))
+                Ok::<_, ExecutionError>(stored.map(|value| (key, value)))
+            })?;
+            Ok(Value::Map(map))
         }
         Expr::Comprehension(comprehension) => {
             let accu_init = resolve_inner(&comprehension.accu_init, ctx)?;
@@ -3020,7 +3112,12 @@ pub(crate) fn value_index(container: &Value, key: &Value) -> Result<Value, Execu
 fn map_keys(map: &Map) -> Vec<Value> {
     match map.storage() {
         MapStorage::Object(entries) => entries.keys().map(key_value).collect(),
-        MapStorage::Entries(entries) => entries.iter().map(|(k, _)| key_value(k)).collect(),
+        MapStorage::Entries(_) => map
+            .ordered_pairs()
+            .expect("ordered")
+            .iter()
+            .map(|(k, _)| key_value(k))
+            .collect(),
         MapStorage::Record { schema, .. } => schema.keys.iter().map(key_value).collect(),
     }
 }

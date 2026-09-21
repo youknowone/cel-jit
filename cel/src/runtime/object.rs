@@ -922,8 +922,12 @@ pub struct W_MapObject {
     /// from, or null if the map was allocated by the VM.
     pub public: *const (),
     /// Discriminator for [`Self::public`]: 0 is a `HashMap` object table,
-    /// 1 is a [`crate::objects::MapEntries`].
+    /// 1 is the data pointer of an `Arc<[(Key, Value)]>` whose length is
+    /// [`Self::public_len`].
     pub public_kind: u32,
+    /// Slice length for [`Self::public`] when [`Self::public_kind`] is 1.
+    /// Independent of [`Self::length`], which interned inserts may change.
+    pub public_len: u32,
 }
 
 pub static CEL_MAP_CLASS: CelClass = CelClass::new("map", CelKind::Map);
@@ -999,6 +1003,7 @@ pub fn new_map_with_capacity_in(heap: &super::heap::CelHeap, cap: i64) -> *mut W
         length: 0,
         public: core::ptr::null(),
         public_kind: 0,
+        public_len: 0,
     })
 }
 
@@ -1122,6 +1127,7 @@ pub fn new_map(pairs: &[(CelRef, CelRef)]) -> *mut W_MapObject {
         length,
         public: core::ptr::null(),
         public_kind: 0,
+        public_len: 0,
     })
 }
 
@@ -1137,6 +1143,7 @@ pub fn new_map_record(storage: CelRef, length: i64) -> *mut W_MapObject {
         length,
         public: core::ptr::null(),
         public_kind: 0,
+        public_len: 0,
     })
 }
 

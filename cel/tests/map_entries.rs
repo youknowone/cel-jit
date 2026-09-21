@@ -3,11 +3,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use cel::objects::{Key, Map, MapEntries, MapStorage};
+use cel::objects::{Key, Map, MapStorage};
 use cel::{Context, Program, Value};
 
 fn entries_map(pairs: Vec<(Key, Value)>) -> Map {
-    Map::entries(Arc::new(MapEntries::new(pairs.into_boxed_slice())))
+    Map::ordered(pairs.into_boxed_slice())
 }
 
 fn object_map(pairs: &[(Key, Value)]) -> Map {
@@ -51,9 +51,14 @@ fn assert_storages_agree(pairs: &[(Key, Value)]) {
     }
 
     assert_eq!(entries.to_hashmap(), object.to_hashmap());
-    let order: Vec<Key> = entries.iter().map(|(k, _)| k.clone()).collect();
-    let expected: Vec<Key> = pairs.iter().map(|(k, _)| k.clone()).collect();
-    assert_eq!(order, expected);
+    if pairs.len() <= 8 {
+        assert!(matches!(entries.storage(), MapStorage::Entries(_)));
+        let order: Vec<Key> = entries.iter().map(|(k, _)| k.clone()).collect();
+        let expected: Vec<Key> = pairs.iter().map(|(k, _)| k.clone()).collect();
+        assert_eq!(order, expected);
+    } else {
+        assert!(matches!(entries.storage(), MapStorage::Object(_)));
+    }
 }
 
 #[test]
@@ -137,6 +142,7 @@ fn bound_entries_map_round_trips_as_ptr_eq() {
 
 fn assert_replace_keeps_first_position(input: Vec<(Key, Value)>, unique: &[(Key, Value)]) {
     let map = entries_map(input);
+    assert!(matches!(map.storage(), MapStorage::Entries(_)));
     assert_eq!(map.len(), unique.len());
     let got: Vec<(Key, Value)> = map
         .iter()
@@ -162,24 +168,24 @@ fn new_replaces_duplicate_keys_on_a_scanned_table() {
 }
 
 #[test]
-fn new_replaces_duplicate_keys_on_an_indexed_table() {
+fn new_replaces_duplicate_keys_on_an_object_table() {
     let mut input: Vec<(Key, Value)> = (1i64..=18)
         .map(|i| (Key::Int(i), Value::Int(i)))
         .collect();
     input.push((Key::Int(1), Value::Int(100)));
     input.push((Key::Int(10), Value::Int(1000)));
     assert_eq!(input.len(), 20);
-    let unique: Vec<(Key, Value)> = (1i64..=18)
-        .map(|i| {
-            let v = match i {
-                1 => 100,
-                10 => 1000,
-                other => other,
-            };
-            (Key::Int(i), Value::Int(v))
-        })
-        .collect();
-    assert_replace_keeps_first_position(input, &unique);
+    let map = entries_map(input);
+    assert!(matches!(map.storage(), MapStorage::Object(_)));
+    assert_eq!(map.len(), 18);
+    for i in 1i64..=18 {
+        let v = match i {
+            1 => 100,
+            10 => 1000,
+            other => other,
+        };
+        assert_eq!(map.get(&Key::Int(i)).as_deref(), Some(&Value::Int(v)));
+    }
 }
 
 #[test]
@@ -194,6 +200,79 @@ fn twenty_entry_entries_maps_compare_equal_in_any_order() {
     assert_eq!(a, b);
     assert_eq!(a.len(), 20);
     assert_eq!(b.len(), 20);
+}
+
+fn twenty_literal() -> String {
+    let mut src = String::from("{");
+    for i in 0..20 {
+        if i > 0 {
+            src.push_str(", ");
+        }
+        src.push_str(&format!("\"k{i}\": x"));
+    }
+    src.push('}');
+    src
+}
+
+#[cfg(feature = "vm")]
+#[test]
+fn twenty_entry_vm_and_walker_are_object_and_equal() {
+    let src = twenty_literal();
+    let mut ctx = Context::default();
+    ctx.add_variable_from_value("x", 7i64);
+    let program = Program::compile(&src).expect("compiles");
+    let walker = Value::resolve_value(program.expression(), &ctx).expect("walker");
+    let Value::Map(walker_map) = &walker else {
+        panic!("expected map");
+    };
+    assert!(matches!(walker_map.storage(), MapStorage::Object(_)));
+
+    let door = program.execute(&ctx).expect("execute");
+    let Value::Map(vm_map) = &door else {
+        panic!("expected map");
+    };
+    assert!(matches!(vm_map.storage(), MapStorage::Object(_)));
+    assert_eq!(walker, door);
+    let object = object_map(
+        &(0..20)
+            .map(|i| {
+                (
+                    Key::String(Arc::new(format!("k{i}"))),
+                    Value::Int(7),
+                )
+            })
+            .collect::<Vec<_>>(),
+    );
+    assert_eq!(*walker_map, object);
+    assert_eq!(*vm_map, object);
+}
+
+#[test]
+fn thousand_entry_object_looks_up_by_hash() {
+    let pairs: Vec<(Key, Value)> = (0..1000)
+        .map(|i| (Key::Int(i), Value::Int(i)))
+        .collect();
+    let map = entries_map(pairs);
+    assert!(matches!(map.storage(), MapStorage::Object(_)));
+    for i in 0..1000 {
+        assert_eq!(map.get(&Key::Int(i)).as_deref(), Some(&Value::Int(i)));
+    }
+}
+
+#[test]
+fn bound_object_map_round_trips_as_ptr_eq() {
+    let pairs: Vec<(Key, Value)> = (1i64..=20)
+        .map(|i| (Key::Int(i), Value::Int(i)))
+        .collect();
+    let original = entries_map(pairs);
+    assert!(matches!(original.storage(), MapStorage::Object(_)));
+    let mut ctx = Context::default();
+    ctx.add_variable_from_value("m", Value::Map(original.clone()));
+    let program = Program::compile("m").expect("compiles");
+    let Value::Map(got) = program.execute(&ctx).expect("execute") else {
+        panic!("expected map");
+    };
+    assert!(original.ptr_eq(&got));
 }
 
 #[test]

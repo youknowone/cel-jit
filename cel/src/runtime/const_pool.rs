@@ -275,6 +275,7 @@ impl ConstPool {
             length: 0,
             public: core::ptr::null(),
             public_kind: 0,
+            public_len: 0,
         }) as CelRef
     }
 
@@ -334,6 +335,7 @@ impl ConstPool {
             length: n as i64,
             public: core::ptr::null(),
             public_kind: 0,
+            public_len: 0,
         }) as CelRef
     }
 
