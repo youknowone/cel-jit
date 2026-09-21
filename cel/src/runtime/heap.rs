@@ -360,18 +360,25 @@ impl Drop for BindRegion {
     fn drop(&mut self) {
         let heap = self.heap.get();
         if !heap.is_null() {
-            unsafe { (*heap).detach_region(self) };
+            // SAFETY: `heap` is the attaching [`CelHeap`]; recycle detaches
+            // first so this arm does not run for a slot that is returned to
+            // the spare list. `detach_region` compares addresses only.
+            unsafe { (*heap).detach_region(self as *mut BindRegion) };
         }
         #[cfg(debug_assertions)]
         self.space.poison_all();
     }
 }
 
-/// `Option<Box<BindRegion>>` that returns the box to this thread's heap
-/// spare on drop, so the next Context reuses the chunk.
+/// Owning slot for a [`BindRegion`]: one raw pointer from `Box::into_raw`.
+///
+/// The heap's region list holds the same pointer. Access is a shared
+/// reference (the region mutates through interior mutability). Dropping
+/// the slot returns the region to this thread's heap spare, so the next
+/// Context reuses the chunk.
 #[doc(hidden)]
 pub struct BindRegionSlot {
-    inner: Option<Box<BindRegion>>,
+    inner: Option<NonNull<BindRegion>>,
 }
 
 impl BindRegionSlot {
@@ -380,15 +387,20 @@ impl BindRegionSlot {
     }
 
     pub(crate) fn get_or_insert(&mut self) -> *mut BindRegion {
-        self.inner
-            .get_or_insert_with(take_bind_region)
-            .as_mut() as *mut BindRegion
+        match self.inner {
+            Some(p) => p.as_ptr(),
+            None => {
+                let p = take_bind_region();
+                self.inner = Some(p);
+                p.as_ptr()
+            }
+        }
     }
 
     /// The heap this slot's region was attached to, if wrap-at-bind has run.
     #[inline]
     pub(crate) fn attached_heap(&self) -> Option<&CelHeap> {
-        let region = self.inner.as_deref()?;
+        let region = self.get()?;
         let heap = region.heap.get();
         if heap.is_null() {
             None
@@ -402,7 +414,12 @@ impl BindRegionSlot {
 
     #[inline]
     pub(crate) fn get(&self) -> Option<&BindRegion> {
-        self.inner.as_deref()
+        self.inner.map(|p| {
+            // SAFETY: `p` came from [`Box::into_raw`] and is still owned
+            // by this slot. The heap's region list, if any, holds the
+            // same pointer and only forms shared references.
+            unsafe { p.as_ref() }
+        })
     }
 
     #[cfg(test)]
@@ -419,17 +436,34 @@ impl Drop for BindRegionSlot {
     }
 }
 
-fn take_bind_region() -> Box<BindRegion> {
-    HEAP.with(|h| h.take_spare_region())
-        .unwrap_or_else(|| Box::new(BindRegion::new()))
+fn take_bind_region() -> NonNull<BindRegion> {
+    HEAP.with(|h| h.take_spare_region()).unwrap_or_else(|| {
+        // SAFETY: `Box::into_raw` is never null.
+        unsafe { NonNull::new_unchecked(Box::into_raw(Box::new(BindRegion::new()))) }
+    })
 }
 
-fn recycle_bind_region(region: Box<BindRegion>) {
-    let heap = region.heap.get();
+fn recycle_bind_region(region: NonNull<BindRegion>) {
+    // SAFETY: `region` is a live `Box::into_raw` pointer still owned by
+    // the slot that just released it.
+    let heap = unsafe { region.as_ref() }.heap.get();
     if heap.is_null() {
+        // SAFETY: never attached; not in a heap list.
+        unsafe { free_region(region) };
         return;
     }
+    // SAFETY: `heap` is the attaching [`CelHeap`], still live because
+    // the region is detached only inside `recycle_region`.
     unsafe { (*heap).recycle_region(region) };
+}
+
+/// # Safety
+///
+/// `region` came from [`Box::into_raw`] and is not stored in a
+/// [`CelHeap`] region list or spare list.
+unsafe fn free_region(region: NonNull<BindRegion>) {
+    // SAFETY: caller: unique remaining owner of this `Box::into_raw`.
+    unsafe { drop(Box::from_raw(region.as_ptr())) };
 }
 
 /// One thread's value heap.
@@ -462,9 +496,11 @@ pub struct CelHeap {
     /// Region wrap-at-bind is filling. Only consulted on the old-space path.
     bind_region: Cell<*mut BindRegion>,
     /// Live Context regions, so [`contains`] and region-host lookup see them.
+    /// Each pointer is the same `Box::into_raw` address the owning slot holds.
     regions: RefCell<Vec<NonNull<BindRegion>>>,
     next_region_id: Cell<u32>,
-    spare_regions: RefCell<Vec<Box<BindRegion>>>,
+    /// Detached, rewound regions waiting for the next Context on this thread.
+    spare_regions: RefCell<Vec<NonNull<BindRegion>>>,
 }
 
 impl CelHeap {
@@ -492,17 +528,22 @@ impl CelHeap {
 
     #[cold]
     fn attach_region(&self, region: *mut BindRegion) {
-        let region = unsafe { &*region };
-        if !region.heap.get().is_null() {
+        // SAFETY: `region` is a live `Box::into_raw` pointer. The region
+        // mutates through interior mutability; this is a shared borrow.
+        let r = unsafe { &*region };
+        if !r.heap.get().is_null() {
             return;
         }
-        region.heap.set(self as *const CelHeap);
+        r.heap.set(self as *const CelHeap);
         let id = self.next_region_id.get().wrapping_add(1).max(1);
         self.next_region_id.set(id);
-        region.id.set(id);
+        r.id.set(id);
+        // SAFETY: `region` is the same non-null `Box::into_raw` pointer
+        // the owning slot holds. Heap and owner both access it through
+        // shared references until detach.
         self.regions
             .borrow_mut()
-            .push(unsafe { NonNull::new_unchecked(region as *const BindRegion as *mut BindRegion) });
+            .push(unsafe { NonNull::new_unchecked(region) });
     }
 
     #[cold]
@@ -514,17 +555,22 @@ impl CelHeap {
     }
 
     #[cold]
-    fn take_spare_region(&self) -> Option<Box<BindRegion>> {
+    fn take_spare_region(&self) -> Option<NonNull<BindRegion>> {
         self.spare_regions.borrow_mut().pop()
     }
 
     #[cold]
-    fn recycle_region(&self, mut region: Box<BindRegion>) {
-        self.detach_region(region.as_mut());
-        region.rewind();
+    fn recycle_region(&self, region: NonNull<BindRegion>) {
+        self.detach_region(region.as_ptr());
+        // SAFETY: detached; the heap list no longer holds this pointer.
+        // Rewind uses interior mutability.
+        unsafe { region.as_ref() }.rewind();
         let mut spare = self.spare_regions.borrow_mut();
         if spare.len() < SPARE_REGIONS {
             spare.push(region);
+        } else {
+            // SAFETY: detached, rewound, not in spare; from `Box::into_raw`.
+            unsafe { free_region(region) };
         }
     }
 
@@ -821,6 +867,16 @@ impl CelHeap {
 impl Default for CelHeap {
     fn default() -> CelHeap {
         CelHeap::new()
+    }
+}
+
+impl Drop for CelHeap {
+    fn drop(&mut self) {
+        for region in self.spare_regions.get_mut().drain(..) {
+            // SAFETY: spare regions were detached and rewound; each
+            // pointer came from `Box::into_raw` and is not in `regions`.
+            unsafe { free_region(region) };
+        }
     }
 }
 
@@ -1355,15 +1411,16 @@ mod tests {
     #[test]
     fn a_bind_region_is_contained_until_it_drops() {
         let heap = CelHeap::new();
-        let region = Box::new(BindRegion::new());
-        heap.attach_region((&*region) as *const BindRegion as *mut BindRegion);
-        let p = region.bump(size_of::<u64>(), align_of::<u64>()) as *mut u64;
+        let mut slot = BindRegionSlot::empty();
+        let region = slot.get_or_insert();
+        heap.attach_region(region);
+        let p = unsafe { &*region }.bump(size_of::<u64>(), align_of::<u64>()) as *mut u64;
         unsafe { p.write(7) };
         assert!(heap.contains(p as *const u8));
         assert!(!heap.is_young(p as *const u8));
         assert_eq!(heap.old_allocated_bytes(), 0);
         assert_eq!(heap.allocated_objects(), 1);
-        drop(region);
+        drop(slot);
         assert!(!heap.contains(p as *const u8));
         assert_eq!(heap.allocated_objects(), 0);
     }

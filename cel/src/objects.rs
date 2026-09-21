@@ -4543,11 +4543,13 @@ mod tests {
     }
 
     #[test]
-    fn list_clone_drop_from_four_threads() {
-        // ListRef is !Send + !Sync, so the header atomic cannot be exercised
-        // across threads in safe code. Clone/drop still use that atomic on
-        // this thread. Arc<ListStorage> still uses its own atomic because the
-        // batch tier shares one column among windows.
+    fn list_clone_drop_on_this_thread() {
+        // ListRef is !Send + !Sync, so clone/drop of an owned header stays
+        // on this thread. The header count stays atomic: a pooled list
+        // leaf's public link points at the `ListBuf` in `CelCode::consts`,
+        // and two threads executing one `Arc<Program>` clone/drop it.
+        // Arc<ListStorage> still uses its own atomic because the batch
+        // tier shares one column among windows.
         let (v, hits) = probe();
         let object = ListRef::from(vec![v]);
         let ints = ListRef::try_fill_ints::<()>(4, |i| Ok(Some(i as i64))).unwrap();
