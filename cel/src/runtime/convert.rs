@@ -1199,12 +1199,9 @@ mod tests {
 
     #[test]
     fn linked_entries_map_survives_map_try_insert() {
-        // Copy-out of a linked Entries table rebuilds the Arc from `public`
-        // and `public_len`, not from `W_MapObject::length`. `map_try_insert`
-        // grows `length` and does not clear `public`; using `length` would
-        // pass the wrong layout to `Arc::from_raw`. The expected copy-out is
-        // still the original two-entry table (`ptr_eq`), not a three-entry
-        // rebuild of the interned items.
+        // A successful insert clears the public link, so copy-out rebuilds
+        // from the interned items and includes the new pair rather than
+        // returning the stale linked table.
         let original = Map::ordered(
             vec![
                 (Key::String(Arc::new("a".into())), Value::Int(1)),
@@ -1242,10 +1239,16 @@ mod tests {
         });
         let leaf = unsafe { &*w.cast::<W_MapObject>() };
         assert_eq!(leaf.length, 3, "insert grew the interned table");
-        assert_eq!(leaf.public_len, 2, "link length is unchanged");
+        assert!(leaf.public.is_null(), "mutation cleared the public link");
+        assert_eq!(leaf.public_len, 0);
+        assert_eq!(leaf.public_kind, 0);
         let back = unsafe { map_from_ref(w) }.expect("unpack");
-        assert!(original.ptr_eq(&back));
-        assert_eq!(back.len(), 2);
+        assert!(!original.ptr_eq(&back), "copy-out is a rebuild, not the stale link");
+        assert_eq!(back.len(), 3);
+        assert_eq!(
+            back.get(&Key::String(Arc::new("c".into()))).as_deref(),
+            Some(&Value::Int(3))
+        );
     }
 
     #[test]

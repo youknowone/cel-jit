@@ -5,7 +5,6 @@
 //! reaches a runtime fallback.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use super::code::{CelCode, Handler, Insn};
 use super::error::NameId;
@@ -290,7 +289,7 @@ impl Compiler {
     /// unfolded `NewMap` path uses. A non-constant entry declines the fold.
     fn intern_const_map(&mut self, map: &MapExpr) -> Option<(Value, CelRef)> {
         let n = map.entries.len();
-        let mut public = HashMap::with_capacity(n);
+        let mut pairs = Vec::with_capacity(n);
         let leaf = self.const_pool.alloc_empty_map(n);
         for entry in &map.entries {
             let EntryExpr::MapEntry(kv) = &entry.expr else {
@@ -304,9 +303,9 @@ impl Compiler {
             if !unsafe { map_try_insert(leaf, key_w, value_w) } {
                 return None;
             }
-            public.insert(crate::objects::value_key(key).ok()?, value);
+            pairs.push((crate::objects::value_key(key).ok()?, value));
         }
-        let value = Value::Map(Map::object(Arc::new(public)));
+        let value = Value::Map(Map::ordered(pairs.into_boxed_slice()));
         crate::runtime::convert::link_public_handle(leaf, &value);
         Some((value, leaf))
     }

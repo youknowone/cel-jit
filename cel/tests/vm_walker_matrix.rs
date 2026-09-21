@@ -68,6 +68,19 @@ fn make_ctx() -> Context<'static> {
     ctx
 }
 
+fn has_interned(v: &Value) -> bool {
+    match v {
+        Value::Interned(_) => true,
+        Value::List(list) => list.iter().any(|e| has_interned(&e)),
+        Value::Map(map) => map.iter().any(|(_, e)| has_interned(e.as_ref())),
+        Value::Opaque(o) => match o.downcast_ref::<OptionalValue>() {
+            Some(opt) => opt.value().is_some_and(has_interned),
+            None => false,
+        },
+        _ => false,
+    }
+}
+
 fn show(r: &Result<Value, ExecutionError>) -> String {
     match r {
         Ok(v) => format!("OK({})", render(&v.unpack())),
@@ -727,10 +740,24 @@ fn the_vm_answers_what_the_walker_answers() {
 
         let ctx = make_ctx();
         let walker = compiled.walker(&ctx);
+        if let Ok(v) = &walker {
+            assert!(
+                !has_interned(v),
+                "{}: walker result contains Interned",
+                case.src
+            );
+        }
         let walker_s = show(&walker);
         let mut failed = false;
         for i in 0..3 {
             let vm = compiled.execute(&ctx);
+            if let Ok(v) = &vm {
+                assert!(
+                    !has_interned(v),
+                    "{}: vm result contains Interned",
+                    case.src
+                );
+            }
             if !answers_agree(&case.src, &walker, &vm) {
                 mismatches.push(format!(
                     "{} | {} | {walker_s}  (execute {i})",

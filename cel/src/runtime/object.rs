@@ -820,6 +820,9 @@ pub unsafe fn list_try_append(w: CelRef, item: CelRef) -> bool {
     }
     *base.add(leaf.length as usize) = item;
     leaf.length += 1;
+    leaf.public = core::ptr::null();
+    leaf.public_start = 0;
+    leaf.public_len = 0;
     true
 }
 
@@ -1044,6 +1047,9 @@ pub unsafe fn map_try_insert(w: CelRef, key: CelRef, value: CelRef) -> bool {
         while i < n {
             if interned_same_map_key(*base.add(2 * i), key) {
                 *base.add(2 * i + 1) = value;
+                leaf.public = core::ptr::null();
+                leaf.public_kind = 0;
+                leaf.public_len = 0;
                 return true;
             }
             i += 1;
@@ -1063,6 +1069,9 @@ pub unsafe fn map_try_insert(w: CelRef, key: CelRef, value: CelRef) -> bool {
     *base.add(used) = key;
     *base.add(used + 1) = value;
     leaf.length += 1;
+    leaf.public = core::ptr::null();
+    leaf.public_kind = 0;
+    leaf.public_len = 0;
     true
 }
 

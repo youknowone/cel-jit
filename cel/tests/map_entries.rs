@@ -81,6 +81,25 @@ fn twenty_entry_entries_agrees_with_object() {
 
 #[cfg(feature = "vm")]
 #[test]
+fn const_map_literal_is_entries_in_source_order() {
+    let ctx = Context::default();
+    let program = Program::compile(r#"{"c": 1, "a": 2, "b": 3}"#).expect("compiles");
+    let Value::Map(map) = program.execute(&ctx).expect("execute") else {
+        panic!("expected map");
+    };
+    assert!(matches!(map.storage(), MapStorage::Entries(_)));
+    let keys: Vec<&str> = map
+        .iter()
+        .map(|(k, _)| match k {
+            Key::String(s) => s.as_str(),
+            other => panic!("expected string key, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(keys, ["c", "a", "b"]);
+}
+
+#[cfg(feature = "vm")]
+#[test]
 fn vm_map_result_is_entries_in_source_order() {
     let mut ctx = Context::default();
     ctx.add_variable_from_value("x", 1i64);

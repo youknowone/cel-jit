@@ -254,7 +254,9 @@ pub fn optional_of(ftx: &FunctionContext, value: Value) -> Result<Value> {
     if ftx.this.is_some() {
         return Err(ftx.error("unsupported function"));
     }
-    Ok(Value::Opaque(Arc::new(OptionalValue::of(value))))
+    Ok(Value::Opaque(Arc::new(OptionalValue::of(
+        crate::objects::public_store(value),
+    ))))
 }
 
 pub fn optional_of_non_zero_value(ftx: &FunctionContext, value: Value) -> Result<Value> {
@@ -264,7 +266,9 @@ pub fn optional_of_non_zero_value(ftx: &FunctionContext, value: Value) -> Result
     if value.is_zero() {
         Ok(Value::Opaque(Arc::new(OptionalValue::none())))
     } else {
-        Ok(Value::Opaque(Arc::new(OptionalValue::of(value))))
+        Ok(Value::Opaque(Arc::new(OptionalValue::of(
+            crate::objects::public_store(value),
+        ))))
     }
 }
 pub fn optional_value(This(this): This<Value>) -> Result<Value> {

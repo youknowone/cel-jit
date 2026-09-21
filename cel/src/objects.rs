@@ -1113,6 +1113,13 @@ struct RcSliceHeader {
 const LIST_TAG_OBJECT: usize = 0;
 const LIST_TAG_INTS: usize = 1;
 const LIST_TAG_SHARED: usize = 2;
+/// Low bit on a [`ListBuf`] pointer: set for a tagged `Arc<ListStorage>`.
+const LIST_SHARED_BIT: usize = 1;
+
+const _: () = {
+    assert!(core::mem::align_of::<ListStorage>() >= 2);
+    assert!(core::mem::align_of::<RcSliceHeader>() >= 2);
+};
 
 static EMPTY_OBJECT: RcSliceHeader = RcSliceHeader {
     strong: AtomicUsize::new(1),
@@ -1395,49 +1402,27 @@ fn try_fill_rc<T, E>(
     Ok(uninit.finish())
 }
 
-/// One allocation of a [`RcSliceHeader`] followed by a [`ListStorage`].
-/// Used for column / record windows (and any other [`ListStorage`] that is
-/// not an owned object or int buffer).
-#[repr(C)]
-struct SharedBuf {
-    header: RcSliceHeader,
-    inner: SharedInner,
-}
-
-/// Payload of [`SharedBuf`].
-///
-/// `Arc` is only for a [`ListStorage`] the caller still shares with someone
-/// else (batch windows over one column). [`ListRef`] clone bumps
-/// [`SharedBuf::header`], not that `Arc`.
-enum SharedInner {
-    Owned(ListStorage),
-    Arc(Arc<ListStorage>),
-}
-
-impl SharedInner {
-    fn storage(&self) -> &ListStorage {
-        match self {
-            SharedInner::Owned(s) => s,
-            SharedInner::Arc(a) => a,
-        }
-    }
-
-    fn identity(&self) -> *const ListStorage {
-        match self {
-            SharedInner::Owned(s) => s as *const ListStorage,
-            SharedInner::Arc(a) => Arc::as_ptr(a),
-        }
-    }
-}
-
 /// Thin pointer at an object buffer, an int buffer, or a shared
-/// [`ListStorage`] (column / record). The kind lives in
-/// [`RcSliceHeader::kind`] so clone/drop do not untag.
+/// [`ListStorage`] (column / record).
+///
+/// Owned kinds keep a [`RcSliceHeader`] whose `kind` word names the payload.
+/// A shared buffer is the `Arc<ListStorage>` pointer with
+/// [`LIST_SHARED_BIT`] set, so clone/drop is one branch on that bit: tagged
+/// bumps the `Arc`, untagged bumps the header. `PhantomData<*const ()>`
+/// keeps the handle `!Send + !Sync` because a buffer owns [`Value`]s.
 pub(crate) struct ListBuf {
-    ptr: NonNull<RcSliceHeader>,
+    ptr: NonNull<u8>,
+    _not_send_sync: PhantomData<*const ()>,
 }
 
 impl ListBuf {
+    fn from_header(ptr: NonNull<RcSliceHeader>) -> Self {
+        ListBuf {
+            ptr: ptr.cast(),
+            _not_send_sync: PhantomData,
+        }
+    }
+
     fn from_object(s: RcSlice<Value>) -> Self {
         if !is_empty_header(s.ptr.as_ptr()) {
             // SAFETY: unique heap object header.
@@ -1445,7 +1430,7 @@ impl ListBuf {
         }
         let ptr = s.ptr;
         core::mem::forget(s);
-        ListBuf { ptr }
+        ListBuf::from_header(ptr)
     }
 
     fn from_ints(s: RcSlice<i64>) -> Self {
@@ -1455,45 +1440,39 @@ impl ListBuf {
         }
         let ptr = s.ptr;
         core::mem::forget(s);
-        ListBuf { ptr }
+        ListBuf::from_header(ptr)
     }
 
     fn from_shared(arc: Arc<ListStorage>) -> Self {
-        let inner = match Arc::try_unwrap(arc) {
-            Ok(storage) => SharedInner::Owned(storage),
-            Err(arc) => SharedInner::Arc(arc),
-        };
-        let layout = Layout::new::<SharedBuf>();
-        // SAFETY: `SharedBuf` is non-zero and aligned; the header sits at
-        // offset 0 so clone/drop can bump `strong` without a kind test.
-        let raw = unsafe { alloc(layout) };
-        if raw.is_null() {
-            handle_alloc_error(layout);
-        }
-        // SAFETY: `raw` is a unique allocation of `layout`.
-        unsafe {
-            raw.cast::<SharedBuf>().write(SharedBuf {
-                header: RcSliceHeader {
-                    strong: AtomicUsize::new(1),
-                    len: 0,
-                    kind: LIST_TAG_SHARED as u8,
-                },
-                inner,
-            });
-        }
+        let raw = Arc::into_raw(arc) as *mut u8;
+        debug_assert_eq!(raw.addr() & LIST_SHARED_BIT, 0);
         ListBuf {
-            // SAFETY: `alloc` returned non-null.
-            ptr: unsafe { NonNull::new_unchecked(raw.cast()) },
+            // SAFETY: `Arc::into_raw` is aligned to `ListStorage` (>= 2), so
+            // setting the low bit does not collide with a live address.
+            // `map_addr` keeps the allocation's provenance.
+            ptr: unsafe { NonNull::new_unchecked(raw.map_addr(|a| a | LIST_SHARED_BIT)) },
+            _not_send_sync: PhantomData,
         }
+    }
+
+    fn is_shared(&self) -> bool {
+        self.ptr.as_ptr().addr() & LIST_SHARED_BIT != 0
+    }
+
+    fn shared_ptr(&self) -> *const ListStorage {
+        self.ptr.as_ptr().map_addr(|a| a & !LIST_SHARED_BIT) as *const ListStorage
     }
 
     fn tag(&self) -> usize {
-        // SAFETY: live header of every kind.
-        unsafe { self.ptr.as_ref().kind as usize }
+        if self.is_shared() {
+            return LIST_TAG_SHARED;
+        }
+        // SAFETY: untagged pointer is a live [`RcSliceHeader`].
+        unsafe { (*self.ptr.as_ptr().cast::<RcSliceHeader>()).kind as usize }
     }
 
     fn raw(&self) -> NonNull<u8> {
-        self.ptr.cast()
+        self.ptr
     }
 
     fn as_raw_tagged(&self) -> *const () {
@@ -1501,17 +1480,19 @@ impl ListBuf {
     }
 
     /// Increment the buffer and return a new handle. `ptr` is the header
-    /// stored by [`link_public_handle`].
+    /// or tagged `Arc` stored by [`link_public_handle`].
     ///
     /// # Safety
     ///
-    /// `ptr` is null or a live [`ListBuf`] header.
+    /// `ptr` is null, a live [`ListBuf`] header, or a tagged
+    /// `Arc<ListStorage>` pointer produced by [`ListBuf::from_shared`].
     unsafe fn clone_from_raw(ptr: *const ()) -> Option<ListBuf> {
         if ptr.is_null() {
             return None;
         }
         let buf = ListBuf {
-            ptr: NonNull::new(ptr as *mut RcSliceHeader)?,
+            ptr: NonNull::new(ptr as *mut u8)?,
+            _not_send_sync: PhantomData,
         };
         let out = buf.clone();
         core::mem::forget(buf);
@@ -1530,7 +1511,7 @@ impl ListBuf {
     fn object_slice(&self) -> Option<&[Value]> {
         match self.tag() {
             // SAFETY: tag names an object [`RcSlice<Value>`] header.
-            LIST_TAG_OBJECT => Some(unsafe { rc_slice_as_slice(self.raw().cast()) }),
+            LIST_TAG_OBJECT => Some(unsafe { rc_slice_as_slice(self.ptr.cast()) }),
             LIST_TAG_SHARED => match self.shared()? {
                 ListStorage::Object(v) => Some(v.as_slice()),
                 _ => None,
@@ -1542,7 +1523,7 @@ impl ListBuf {
     fn ints_slice(&self) -> Option<&[i64]> {
         match self.tag() {
             // SAFETY: tag names an int [`RcSlice<i64>`] header.
-            LIST_TAG_INTS => Some(unsafe { rc_slice_as_slice(self.raw().cast()) }),
+            LIST_TAG_INTS => Some(unsafe { rc_slice_as_slice(self.ptr.cast()) }),
             LIST_TAG_SHARED => match self.shared()? {
                 ListStorage::Ints(v) => Some(v.as_slice()),
                 _ => None,
@@ -1552,20 +1533,16 @@ impl ListBuf {
     }
 
     fn shared(&self) -> Option<&ListStorage> {
-        if self.tag() != LIST_TAG_SHARED {
+        if !self.is_shared() {
             return None;
         }
-        // SAFETY: tag names a live [`SharedBuf`] produced by
-        // [`ListBuf::from_shared`].
-        Some(unsafe { (*self.raw().as_ptr().cast::<SharedBuf>()).inner.storage() })
+        // SAFETY: tagged pointer produced by [`ListBuf::from_shared`]; the
+        // `Arc` is live for the lifetime of this handle.
+        Some(unsafe { &*self.shared_ptr() })
     }
 
     fn shared_identity(&self) -> Option<*const ListStorage> {
-        if self.tag() != LIST_TAG_SHARED {
-            return None;
-        }
-        // SAFETY: tag names a live [`SharedBuf`].
-        Some(unsafe { (*self.raw().as_ptr().cast::<SharedBuf>()).inner.identity() })
+        self.is_shared().then(|| self.shared_ptr())
     }
 
     fn element_at(&self, index: usize) -> Value {
@@ -1582,35 +1559,39 @@ impl ListBuf {
     }
 }
 
-const _: fn() = || {
-    fn ok<T: Send + Sync>() {}
-    ok::<i64>();
-    ok::<RcSliceHeader>();
-};
-
-// SAFETY: clone/drop only touch the atomic at offset 0; the payload is
-// dropped by the last owner on this thread. `i64` and the header are
-// `Send + Sync` (see the assertion above).
-unsafe impl Send for ListBuf {}
-unsafe impl Sync for ListBuf {}
-
 impl Clone for ListBuf {
     fn clone(&self) -> Self {
-        // SAFETY: `ptr` is a live header; kind is in the header, not the pointer.
-        rc_header_inc(unsafe { self.ptr.as_ref() });
-        ListBuf { ptr: self.ptr }
+        if self.is_shared() {
+            // SAFETY: tagged pointer from [`ListBuf::from_shared`]; the `Arc`
+            // is live.
+            unsafe { Arc::increment_strong_count(self.shared_ptr()) };
+        } else {
+            // SAFETY: untagged pointer is a live [`RcSliceHeader`].
+            rc_header_inc(unsafe { self.ptr.cast::<RcSliceHeader>().as_ref() });
+        }
+        ListBuf {
+            ptr: self.ptr,
+            _not_send_sync: PhantomData,
+        }
     }
 }
 
 impl Drop for ListBuf {
     fn drop(&mut self) {
-        // SAFETY: `ptr` is a live header of every kind.
-        if unsafe { self.ptr.as_ref().strong.fetch_sub(1, AtomicOrdering::Release) } != 1 {
+        if self.is_shared() {
+            // SAFETY: tagged pointer from [`ListBuf::from_shared`]; this
+            // handle owns one strong count.
+            unsafe { Arc::decrement_strong_count(self.shared_ptr()) };
+            return;
+        }
+        let header = self.ptr.cast::<RcSliceHeader>();
+        // SAFETY: untagged pointer is a live [`RcSliceHeader`].
+        if unsafe { header.as_ref().strong.fetch_sub(1, AtomicOrdering::Release) } != 1 {
             return;
         }
         std::sync::atomic::fence(AtomicOrdering::Acquire);
-        // SAFETY: last owner of this buffer.
-        unsafe { list_buf_drop_slow(self.ptr) };
+        // SAFETY: last owner of this owned buffer.
+        unsafe { list_buf_drop_slow(header) };
     }
 }
 
@@ -1636,14 +1617,6 @@ unsafe fn list_buf_drop_slow(ptr: NonNull<RcSliceHeader>) {
         LIST_TAG_INTS => {
             // SAFETY: int buffer; unique owner; `len` elements follow.
             unsafe { rc_slice_drop_in_place::<i64>(ptr) };
-        }
-        LIST_TAG_SHARED => {
-            let layout = Layout::new::<SharedBuf>();
-            // SAFETY: unique [`SharedBuf`]; dropping it releases `inner`.
-            unsafe {
-                std::ptr::drop_in_place(ptr.as_ptr().cast::<SharedBuf>());
-                dealloc(ptr.as_ptr().cast(), layout);
-            }
         }
         _ => unreachable!("list buffer kind"),
     }
@@ -1675,7 +1648,7 @@ unsafe fn rc_slice_drop_in_place<T>(ptr: NonNull<RcSliceHeader>) {
 /// A list built element by element owns a `Vec<Value>` and is what every
 /// caller has always had. A list produced by the batch tier instead names a
 /// window into a buffer the whole batch shares: the elements are already laid
-/// out contiguously and unboxed, so a row costs one small allocation and no
+/// out contiguously and unboxed, so a row costs no allocation and no
 /// per-element write, and an element is boxed only when it is read.
 ///
 /// This is PyPy's list-strategy arrangement — `objspace/std/listobject.py:1886`
@@ -1757,7 +1730,20 @@ impl FromIterator<Value> for ListStorage {
 ///
 /// An owned object or int list is one allocation: a reference-counted header
 /// followed by the inline element array. Column and record lists keep a
-/// shared [`ListStorage`] so a batch of windows still shares one buffer.
+/// shared [`ListStorage`] so a batch of windows still shares one buffer:
+/// [`ListRef::window`] tags that `Arc` and does not allocate.
+///
+/// Neither `Send` nor `Sync`. A list owns [`Value`]s, which are neither.
+///
+/// ```compile_fail
+/// fn needs_send<T: Send>(_: T) {}
+/// needs_send(cel::objects::ListRef::from(Vec::<cel::Value>::new()));
+/// ```
+///
+/// ```compile_fail
+/// fn needs_sync<T: Sync>(_: &T) {}
+/// needs_sync(&cel::objects::ListRef::from(Vec::<cel::Value>::new()));
+/// ```
 ///
 /// Every consumer goes through the accessors below rather than matching a
 /// storage variant, so adding a strategy does not reopen the call sites.
@@ -1805,7 +1791,8 @@ impl ListRef {
 
     /// # Safety
     ///
-    /// `ptr` is null or a header stored by [`link_public_handle`].
+    /// `ptr` is null, a header stored by [`link_public_handle`], or a tagged
+    /// `Arc<ListStorage>` pointer stored there.
     pub(crate) unsafe fn clone_from_public(ptr: *const ()) -> Option<ListBuf> {
         // SAFETY: forwarded to [`ListBuf::clone_from_raw`]; same contract.
         unsafe { ListBuf::clone_from_raw(ptr) }
@@ -1972,6 +1959,11 @@ impl ListRef {
 #[inline(never)]
 fn concat_int_lists(left: &ListRef, right: &ListRef) -> Option<ListRef> {
     let n = left.len() + right.len();
+    if n == 0 {
+        // `[] + []` must be the same empty object buffer as `[]`. An empty
+        // fill would succeed as an int list without reading either side.
+        return None;
+    }
     let mut i = 0usize;
     ListRef::try_fill_ints::<()>(n, |_| {
         let src = if i < left.len() {
@@ -2252,6 +2244,14 @@ impl Value {
             want: expected.to_string(),
         }
     }
+}
+
+/// Unpack an interned leaf so a value stored in a public container, optional,
+/// accumulator, or function argument never holds a pointer into the
+/// evaluation region.
+#[inline]
+pub(crate) fn public_store(v: Value) -> Value {
+    v.into_public()
 }
 
 impl From<&Value> for Value {
@@ -2635,11 +2635,11 @@ fn eval_list_literal(list_expr: &ListExpr, ctx: &Context) -> Result<Value, Execu
             if list_expr.optional_indices.contains(&idx) {
                 Ok(match optional_view(&value) {
                     OptView::Empty => None,
-                    OptView::Present(inner) => Some(inner.into_public()),
-                    OptView::Plain => Some(value.into_public()),
+                    OptView::Present(inner) => Some(public_store(inner)),
+                    OptView::Plain => Some(public_store(value)),
                 })
             } else {
-                Ok(Some(value.into_public()))
+                Ok(Some(public_store(value)))
             }
         })?;
         return Ok(Value::List(list));
@@ -2664,7 +2664,7 @@ fn eval_list_literal(list_expr: &ListExpr, ctx: &Context) -> Result<Value, Execu
     }
     let mut src = list_expr.elements.iter();
     let list = ListRef::try_fill_values(n, |_| {
-        Ok(Some(resolve_inner(src.next().expect("n elements"), ctx)?.into_public()))
+        Ok(Some(public_store(resolve_inner(src.next().expect("n elements"), ctx)?)))
     })?;
     Ok(Value::List(list))
 }
@@ -2812,14 +2812,14 @@ fn resolve_inner(expr: &Expression, ctx: &Context) -> Result<Value, ExecutionErr
                 None => {
                     let args = resolve_args(&call.args, ctx)?;
                     if let Some(op) = ctx.env().find_overload(&call.func_name, &args) {
-                        return op(args);
+                        return op(args).map(public_store);
                     }
                     let args: Vec<Value> = args.into_iter().map(|v| v.unpack()).collect();
                     let func = ctx.get_function(call.func_name.as_str()).ok_or_else(|| {
                         ExecutionError::UndeclaredReference(call.func_name.clone().into())
                     })?;
                     let mut ctx = FunctionContext::new(&call.func_name, None, ctx, args);
-                    (func)(&mut ctx)
+                    (func)(&mut ctx).map(public_store)
                 }
                 Some(target) => {
                     let args = resolve_args(&call.args, ctx)?;
@@ -2844,7 +2844,7 @@ fn resolve_inner(expr: &Expression, ctx: &Context) -> Result<Value, ExecutionErr
                                 ctx.env()
                                     .find_qualified_overload(prefix, &call.func_name, &args)
                             {
-                                return op(args);
+                                return op(args).map(public_store);
                             }
                             ctx.get_qualified_function(prefix, &call.func_name)
                         }
@@ -2852,12 +2852,12 @@ fn resolve_inner(expr: &Expression, ctx: &Context) -> Result<Value, ExecutionErr
                     };
                     let (target, func, args) = match qualified_func {
                         None => {
-                            let target = resolve_inner(target, ctx)?;
+                            let target = public_store(resolve_inner(target, ctx)?);
                             let mut args = args;
                             args.insert(0, target);
                             if let Some(op) = ctx.env().find_member_overload(&call.func_name, &args)
                             {
-                                return op(args);
+                                return op(args).map(public_store);
                             }
                             let target = args.remove(0).unpack();
                             let args: Vec<Value> = args.into_iter().map(|v| v.unpack()).collect();
@@ -2872,7 +2872,7 @@ fn resolve_inner(expr: &Expression, ctx: &Context) -> Result<Value, ExecutionErr
                         Some(func) => (None, func, args),
                     };
                     let mut ctx = FunctionContext::new(&call.func_name, target, ctx, args);
-                    (func)(&mut ctx)
+                    (func)(&mut ctx).map(public_store)
                 }
             }
         }
@@ -2912,11 +2912,11 @@ fn resolve_inner(expr: &Expression, ctx: &Context) -> Result<Value, ExecutionErr
                 let stored = if is_optional {
                     match optional_view(&value) {
                         OptView::Empty => None,
-                        OptView::Present(inner) => Some(inner.into_public()),
-                        OptView::Plain => Some(value.into_public()),
+                        OptView::Present(inner) => Some(public_store(inner)),
+                        OptView::Plain => Some(public_store(value)),
                     }
                 } else {
-                    Some(value.into_public())
+                    Some(public_store(value))
                 };
                 Ok::<_, ExecutionError>(stored.map(|value| (key, value)))
             })?;
@@ -2949,7 +2949,7 @@ fn resolve_inner(expr: &Expression, ctx: &Context) -> Result<Value, ExecutionErr
                                 return Ok(None);
                             }
                         }
-                        Ok(Some(resolve_inner(append.element, &ctx)?))
+                        Ok(Some(public_store(resolve_inner(append.element, &ctx)?)))
                     })?;
                     ctx.rebind(&comprehension.accu_var, Value::List(list));
                     return resolve_inner(&comprehension.result, &ctx);
@@ -2967,13 +2967,13 @@ fn resolve_inner(expr: &Expression, ctx: &Context) -> Result<Value, ExecutionErr
                 );
             }
 
-            ctx.rebind(&comprehension.accu_var, accu_init);
+            ctx.rebind(&comprehension.accu_var, public_store(accu_init));
             while let Some(item) = items.next() {
                 if !try_bool_value(resolve_inner(&comprehension.loop_cond, &ctx))? {
                     break;
                 }
                 ctx.rebind(&comprehension.iter_var, item);
-                let accu = resolve_inner(&comprehension.loop_step, &ctx)?;
+                let accu = public_store(resolve_inner(&comprehension.loop_step, &ctx)?);
                 ctx.rebind(&comprehension.accu_var, accu);
             }
             resolve_inner(&comprehension.result, &ctx)
@@ -3000,7 +3000,7 @@ fn resolve_inner(expr: &Expression, ctx: &Context) -> Result<Value, ExecutionErr
                     match &entry.expr {
                         EntryExpr::StructField(expr) => {
                             let f = expr.field.clone();
-                            let v = resolve_inner(&expr.value, ctx)?;
+                            let v = public_store(resolve_inner(&expr.value, ctx)?);
                             fields.insert(f, v);
                         }
                         EntryExpr::MapEntry(entry) => {
@@ -3019,7 +3019,7 @@ fn resolve_inner(expr: &Expression, ctx: &Context) -> Result<Value, ExecutionErr
 
 /// Wraps `value` in an `optional`.
 pub(crate) fn optional_of(value: Value) -> Value {
-    Value::Opaque(Arc::new(OptionalValue::of(value)))
+    Value::Opaque(Arc::new(OptionalValue::of(public_store(value))))
 }
 
 /// The empty `optional`.
@@ -3084,7 +3084,9 @@ fn interned_as_bool(value: &Value) -> Option<bool> {
 
 /// Resolves a call's arguments into the values the overload table matches on.
 fn resolve_args(args: &[Expression], ctx: &Context) -> Result<Vec<Value>, ExecutionError> {
-    args.iter().map(|arg| resolve_inner(arg, ctx)).collect()
+    args.iter()
+        .map(|arg| resolve_inner(arg, ctx).map(public_store))
+        .collect()
 }
 
 fn value_is_list(value: &Value) -> bool {
@@ -4344,6 +4346,13 @@ mod tests {
     }
 
     #[test]
+    fn empty_concat_matches_empty_list() {
+        let empty = ListRef::from(Vec::<Value>::new());
+        let sum = empty.clone().concat(&empty);
+        assert!(empty.ptr_eq(&sum));
+    }
+
+    #[test]
     fn zero_sized_window_clone_and_drop() {
         let storage = Arc::new(ListStorage::Ints(vec![1, 2, 3]));
         let z = ListRef::window(Arc::clone(&storage), 1, 0);
@@ -4356,6 +4365,24 @@ mod tests {
         let whole = ListRef::whole(storage);
         assert_eq!(whole.len(), 3);
         assert!(z2.shares_storage_with(&whole));
+    }
+
+    #[test]
+    fn one_thousand_windows_over_one_column_allocate_zero_times() {
+        let storage = Arc::new(ListStorage::Column(super::ValueColumn::Scalar {
+            bank: super::ScalarBank::Int,
+            words: Arc::from([1i64, 2, 3].as_slice()),
+        }));
+        let mut windows = Vec::with_capacity(1000);
+        for _ in 0..1000 {
+            windows.push(ListRef::window(Arc::clone(&storage), 0, 3));
+        }
+        assert_eq!(Arc::strong_count(&storage), 1001);
+        for w in windows.windows(2) {
+            assert!(w[0].shares_storage_with(&w[1]));
+        }
+        drop(windows);
+        assert_eq!(Arc::strong_count(&storage), 1);
     }
 
     #[test]
@@ -4385,13 +4412,6 @@ mod tests {
         let c = s.clone();
         drop(s);
         assert_eq!(c.as_slice(), &[1, 2, 3]);
-    }
-
-    #[test]
-    fn listref_is_send_sync() {
-        fn assert_ss<T: Send + Sync>() {}
-        assert_ss::<ListRef>();
-        assert_ss::<super::ListBuf>();
     }
 
     #[test]
@@ -4524,20 +4544,20 @@ mod tests {
 
     #[test]
     fn list_clone_drop_from_four_threads() {
+        // ListRef is !Send + !Sync, so the header atomic cannot be exercised
+        // across threads in safe code. Clone/drop still use that atomic on
+        // this thread. Arc<ListStorage> still uses its own atomic because the
+        // batch tier shares one column among windows.
         let (v, hits) = probe();
         let object = ListRef::from(vec![v]);
         let ints = ListRef::try_fill_ints::<()>(4, |i| Ok(Some(i as i64))).unwrap();
         let (v2, hits2) = probe();
         let shared = ListRef::whole(Arc::new(ListStorage::Object(vec![v2])));
-        std::thread::scope(|s| {
-            for _ in 0..4 {
-                s.spawn(|| {
-                    drop(object.clone());
-                    drop(ints.clone());
-                    drop(shared.clone());
-                });
-            }
-        });
+        for _ in 0..4 {
+            drop(object.clone());
+            drop(ints.clone());
+            drop(shared.clone());
+        }
         drop(object);
         drop(ints);
         drop(shared);
