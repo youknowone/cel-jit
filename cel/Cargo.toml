@@ -302,6 +302,25 @@ required-features = ["jit"]
 name = "majit_percall_steady"
 required-features = ["jit"]
 
+# Names `cel::majit` at module scope, so it does not build without `jit`.
+[[example]]
+name = "jit_regime"
+required-features = ["jit"]
+
+# The body is `#[cfg(feature = "jit")]`. The other `main` only prints that a
+# backend is required, so the file still builds when `jit` is off.
+[[example]]
+name = "rca_encode"
+
+# Walker and VM per-call sampler. Plain `Program::execute`, no `jit` types.
+[[example]]
+name = "rca_exec"
+
+# Portal census. `Program::execute` is the walker without `vm` and the portal
+# with `jit`, and the file builds in both.
+[[example]]
+name = "portal_stats"
+
 [features]
 default = ["regex", "chrono", "vm"]
 structs = []
