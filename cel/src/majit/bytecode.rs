@@ -288,10 +288,11 @@ pub const OP_MUL_OVF_K: i64 = 88; // [a, k, dst, trap]  regs[dst] = a * k
 /// `program` is a green argument, so an immediate is a CONSTANT to the trace
 /// optimizer while a register holding the same value is not — the prelude loads
 /// it once, outside the row loop, and it reaches the body as a loop-invariant
-/// argument with no known value. The signed constant divisors expand into
-/// multiply-and-shift (`optimize_call_int_py_div` / `_py_mod`). The unsigned
-/// ones stay on `int.udiv` / `int.umod`: a loop that also divides a bit
-/// pattern at or above 2^63 must not keep the signed expansion.
+/// argument with no known value. That distinction is the whole point of these
+/// four: on a constant divisor the optimizer expands the division into
+/// multiply-and-shift (`optimize_call_int_py_div` / `_py_mod`), while the
+/// register form leaves the `int.udiv`/`int.umod` residual call the census
+/// measured at one per element.
 ///
 /// The lowering emits these only for a nonzero divisor, so they carry no zero
 /// guard; a literal zero keeps the register form and traps there.
@@ -2212,10 +2213,15 @@ pub mod float_bank {
                     let a = state.regs[program[pc + 1] as usize];
                     let k = program[pc + 2];
                     let d = program[pc + 3] as usize;
-                    // Always the unsigned call. A dividend below 2^63 agrees
-                    // with signed division, but the trace keeps that arm and
-                    // then answers a later dividend at or above 2^63 with it.
-                    state.regs[d] = majit_uint_div(a, k);
+                    // A `uint` travels as its raw bit pattern, so an operand at
+                    // or above 2^63 reads negative and only the unsigned call
+                    // answers it. Below that the signed division agrees, and it
+                    // is the one carrying the constant.
+                    state.regs[d] = if k >= 0 && a >= 0 {
+                        majit_int_py_div(a, k)
+                    } else {
+                        majit_uint_div(a, k)
+                    };
                     pc += 4;
                 }
                 OP_UMOD_K => {
@@ -2226,6 +2232,8 @@ pub mod float_bank {
                         // A power-of-two divisor masks EVERY dividend, the
                         // patterns at or above 2^63 included.
                         a & k.wrapping_sub(1)
+                    } else if k >= 0 && a >= 0 {
+                        majit_int_py_mod(a, k)
                     } else {
                         majit_uint_mod(a, k)
                     };
