@@ -1365,7 +1365,17 @@ pub(crate) fn eval_through_portal(
         vm: vm as *mut Vm<'_> as i64,
         ret: 0,
     };
-    PORTAL_VM.with(|cell| cell.set(state.vm));
+    // A host call can re-enter this function on the same thread. The nested
+    // evaluation must not leave its VM in the thread-local, or the outer
+    // `RETURN` parks on that VM and this one finishes with no result.
+    let prev_vm = PORTAL_VM.with(|cell| cell.replace(state.vm));
+    struct PortalVmGuard(i64);
+    impl Drop for PortalVmGuard {
+        fn drop(&mut self) {
+            PORTAL_VM.with(|cell| cell.set(self.0));
+        }
+    }
+    let _portal_vm = PortalVmGuard(prev_vm);
     // Census is not installed here — that hook is process-global and
     // would clobber the columnar machine.
     let jit = &code.identity.live.jit;
