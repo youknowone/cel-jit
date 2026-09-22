@@ -1,8 +1,9 @@
 //! The JIT portal for [`super::interp::cel_eval_loop`].
 //!
-//! `interp_jit.py` `PyPyJitDriver`: greens are `(next_instr, code)`, the
-//! red virtualizable is `frame`. `jit_merge_point` is the first statement
-//! of the loop; `can_enter_jit` is only on a backward jump.
+//! Greens are `(pc, program)`. The frame is a red state field, not a
+//! virtualizable: its token starts at 0, and a virt array aborts trace
+//! entry before any op. `jit_merge_point` is the first statement of the
+//! loop; `can_enter_jit` is only on a backward jump.
 //!
 //! Interned arithmetic, comparison, local load/store, context load,
 //! field/index and return run on `frame.locals_stack_w[i]` — the
@@ -30,13 +31,7 @@ use crate::runtime::object::{
     string_as_str, string_byte_len, w_kind, w_type, CelKind, CelRef,
     W_BoolObject, W_IntObject, W_OptionalObject, CEL_INT_CLASS,
 };
-#[allow(unused_imports)] // named in `virtualizable_fields`
-use crate::runtime::object::{
-    W_CelFrame, CELFRAME_LAST_INSTR_OFFSET, CELFRAME_LOCALS_STACK_OFFSET,
-    CELFRAME_VABLE_TOKEN_OFFSET, CELFRAME_VALUESTACKDEPTH_OFFSET,
-};
-#[allow(unused_imports)]
-use crate::runtime::object_array::{CEL_ITEMS_BLOCK_ITEMS_OFFSET, CEL_ITEMS_BLOCK_LEN_OFFSET};
+use crate::runtime::object::W_CelFrame;
 use crate::runtime::optional::{
     cel_optional_has_value, cel_optional_none, cel_optional_of, cel_optional_of_non_zero_value,
     cel_optional_or, cel_optional_or_value, cel_optional_value,
@@ -1417,15 +1412,17 @@ pub(crate) fn eval_through_portal(
 
 /// Every opcode of one portal step.
 ///
-/// The dispatch JitCode lowers a call. It does not lower the arm
-/// bodies, and those became abort stubs. This callee keeps them in
-/// the interpreter so the portal loop itself can trace.
+/// The dispatch JitCode lowers the match arm, not these bodies. The
+/// arm calls this helper and writes `pc` from the value it returns.
+/// A `pc` store after the match is outside that arm, so the compiled
+/// loop would repeat one opcode.
 #[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
 fn step_hot(program: &CelCode, pc: usize) -> i64 {
     let vm = PORTAL_VM.with(|cell| cell.get());
     let here = pc as i64;
     let opcode = insn_op(program, pc);
     let frame = unsafe { &mut *vm_of(vm).cel_frame };
+    frame.last_instr = here;
     match opcode {
     OP_LOAD_VAR => {
         let w = intern_var(vm, program, insn_a(program, pc));
@@ -1936,21 +1933,8 @@ fn step_hot(program: &CelCode, pc: usize) -> i64 {
         vm: int,
         ret: int,
     },
-    virtualizable_fields = {
-        var: frame,
-        token_offset: CELFRAME_VABLE_TOKEN_OFFSET,
-        fields: {
-            last_instr: int @ CELFRAME_LAST_INSTR_OFFSET,
-            valuestackdepth: int @ CELFRAME_VALUESTACKDEPTH_OFFSET,
-        },
-        arrays: {
-            locals_stack_w: ref @ CELFRAME_LOCALS_STACK_OFFSET {
-                ptr_offset: 0,
-                length_offset: CEL_ITEMS_BLOCK_LEN_OFFSET,
-                items_offset: CEL_ITEMS_BLOCK_ITEMS_OFFSET,
-            },
-        },
-    },
+    // A virt array here makes trace entry demand a vable box. The frame
+    // token starts at 0, so that demand aborts the walk before any op.
     auto_calls = true,
     calls = {
         insn_op => residual_int,
@@ -2027,22 +2011,29 @@ fn run_cel_portal(
 ) -> i64 {
     loop {
         jit_merge_point!(driver, program, pc; *state);
-        let frame = unsafe { &mut *(state.frame as *mut W_CelFrame) };
-        frame.last_instr = pc as i64;
         let opcode = insn_op(program, pc);
-        let next = match opcode {
-            _ => step_hot(program, pc),
-        };
-        if next < 0 {
-            state.ret = next;
-            break;
+        // The dispatch JitCode is this match. `pc` is green, and only a
+        // write inside the arm reaches the merge-point register. `return`
+        // lowers only as the arm's last statement, so the exit stays after
+        // the forward `continue` rather than inside the `if`.
+        match opcode {
+            _ => {
+                let next = step_hot(program, pc);
+                if next >= 0 {
+                    let tgt = next as usize;
+                    if tgt < pc {
+                        can_enter_jit!(driver, tgt, &mut *state, program, || {});
+                    }
+                    pc = tgt;
+                    continue;
+                }
+                state.ret = next;
+                return next;
+            }
         }
-        let tgt = next as usize;
-        if tgt < pc {
-            can_enter_jit!(driver, tgt, &mut *state, program, || {});
-        }
-        pc = tgt;
     }
+    // The merge point's compiled-run close `break`s out of this loop.
+    // That path has no `return` of its own, so the value lives here.
     state.ret
 }
 
