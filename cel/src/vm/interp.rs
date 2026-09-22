@@ -3715,9 +3715,7 @@ fn interned_to_string(w: CelRef) -> Result<Option<CelRef>, ExecutionError> {
                 return Ok(None);
             }
             let bytes = unsafe { std::slice::from_raw_parts(base, n) };
-            Ok(Some(
-                new_string(&String::from_utf8_lossy(bytes)) as CelRef,
-            ))
+            Ok(Some(new_string(&String::from_utf8_lossy(bytes)) as CelRef))
         }
         #[cfg(feature = "chrono")]
         CelKind::Timestamp => match unsafe { ref_to_value(w) } {
