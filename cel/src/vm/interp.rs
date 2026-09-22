@@ -2049,7 +2049,7 @@ impl<'a> Vm<'a> {
                 Err(err) => return Err(err),
             }
         };
-        self.store_slot(shape.var, element)?;
+        self.store_operand(shape.var, element)?;
         if arm == FuseArm::Bind {
             return Ok(shape.after_bind);
         }
