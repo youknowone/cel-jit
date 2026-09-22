@@ -65,15 +65,15 @@ pastey = "0.2.1"
 # `jit-audits`: majit-ir gates `opref_audit`/`reg_write_audit` out of production
 # builds (#1215); `majit_trace_evidence.rs` consumes both, and an integration
 # test does not see majit-ir's own `cfg(test)`.
-majit-ir = { git = "https://github.com/youknowone/pyre.git", rev = "b8b6f6d3817b330e012fbfae1c8343233ed3ab4a", optional = true, features = ["jit-audits"] }
+majit-ir = { git = "https://github.com/youknowone/pyre.git", rev = "c841bdc1643276109932099051d090cbb1410355", optional = true, features = ["jit-audits"] }
 # Direct, not through `majit-metainterp`: it depends on `majit-gc` but re-exports
 # none of it, and `MiniMarkGC` / `TypeInfo` / the `GcAllocator` trait are what
 # class registration is spelled in. Same revision as its siblings — a different
 # one would give `set_gc_allocator` a `Box<dyn GcAllocator>` from a second copy
 # of the trait, which does not typecheck.
-majit-gc = { git = "https://github.com/youknowone/pyre.git", rev = "b8b6f6d3817b330e012fbfae1c8343233ed3ab4a", optional = true }
-majit-macros = { git = "https://github.com/youknowone/pyre.git", rev = "b8b6f6d3817b330e012fbfae1c8343233ed3ab4a", optional = true }
-majit-metainterp = { git = "https://github.com/youknowone/pyre.git", rev = "b8b6f6d3817b330e012fbfae1c8343233ed3ab4a", default-features = false, optional = true }
+majit-gc = { git = "https://github.com/youknowone/pyre.git", rev = "c841bdc1643276109932099051d090cbb1410355", optional = true }
+majit-macros = { git = "https://github.com/youknowone/pyre.git", rev = "c841bdc1643276109932099051d090cbb1410355", optional = true }
+majit-metainterp = { git = "https://github.com/youknowone/pyre.git", rev = "c841bdc1643276109932099051d090cbb1410355", default-features = false, optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.5.1", features = ["html_reports"] }
