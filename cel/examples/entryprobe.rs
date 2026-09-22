@@ -1073,7 +1073,20 @@ fn main() {
         100.0 * call / e3,
         splits.first().map_or(0, |s| s.call_shots)
     );
-    if frame_build_passes() == 0 {
+    // `frame_build_passes` exists only with `__entry-stage-probe`. Without
+    // that feature the import is configured out, and this example still has
+    // to build: the frame-build line is then the not-amplifiable row.
+    let frame_build_reached = {
+        #[cfg(feature = "__entry-stage-probe")]
+        {
+            frame_build_passes() != 0
+        }
+        #[cfg(not(feature = "__entry-stage-probe"))]
+        {
+            false
+        }
+    };
+    if !frame_build_reached {
         println!(
             "    {:<28} {:>8}      GC-managed JITFRAME: not safely amplifiable",
             "  of which frame build", "n/a"
