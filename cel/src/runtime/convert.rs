@@ -118,6 +118,7 @@ pub(crate) fn interned_linked(w: CelRef) -> Option<Value> {
 
 /// Public form of `w`. Immediates and linked handles do not allocate;
 /// everything else rebuilds through [`ref_to_value`].
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 #[inline]
 pub fn interned_to_public(w: CelRef) -> Value {
     interned_immediate(w)
@@ -338,48 +339,48 @@ fn type_class(tv: &TypeValue) -> Option<&'static CelClass> {
 }
 
 fn type_from_class(cls: *const CelClass) -> Option<Type> {
-    if cls == (&CEL_INT_CLASS as *const CelClass) {
+    if std::ptr::eq(cls, &CEL_INT_CLASS) {
         return Some(INT_TYPE.to_owned());
     }
-    if cls == (&CEL_UINT_CLASS as *const CelClass) {
+    if std::ptr::eq(cls, &CEL_UINT_CLASS) {
         return Some(UINT_TYPE.to_owned());
     }
-    if cls == (&CEL_DOUBLE_CLASS as *const CelClass) {
+    if std::ptr::eq(cls, &CEL_DOUBLE_CLASS) {
         return Some(DOUBLE_TYPE.to_owned());
     }
-    if cls == (&CEL_BOOL_CLASS as *const CelClass) {
+    if std::ptr::eq(cls, &CEL_BOOL_CLASS) {
         return Some(BOOL_TYPE.to_owned());
     }
-    if cls == (&CEL_STRING_CLASS as *const CelClass) {
+    if std::ptr::eq(cls, &CEL_STRING_CLASS) {
         return Some(STRING_TYPE.to_owned());
     }
-    if cls == (&CEL_BYTES_CLASS as *const CelClass) {
+    if std::ptr::eq(cls, &CEL_BYTES_CLASS) {
         return Some(BYTES_TYPE.to_owned());
     }
-    if cls == (&CEL_NULL_CLASS as *const CelClass) {
+    if std::ptr::eq(cls, &CEL_NULL_CLASS) {
         return Some(NULL_TYPE.to_owned());
     }
-    if cls == (&CEL_LIST_CLASS as *const CelClass) {
+    if std::ptr::eq(cls, &CEL_LIST_CLASS) {
         return Some(LIST_TYPE.to_owned());
     }
-    if cls == (&CEL_MAP_CLASS as *const CelClass) {
+    if std::ptr::eq(cls, &CEL_MAP_CLASS) {
         return Some(MAP_TYPE.to_owned());
     }
-    if cls == (&CEL_TYPE_CLASS as *const CelClass) {
+    if std::ptr::eq(cls, &CEL_TYPE_CLASS) {
         return Some(TYPE_TYPE.to_owned());
     }
-    if cls == (&CEL_OPTIONAL_CLASS as *const CelClass) {
+    if std::ptr::eq(cls, &CEL_OPTIONAL_CLASS) {
         return Some(OPTIONAL_TYPE.to_owned());
     }
-    if cls == (&CEL_OPAQUE_CLASS as *const CelClass) {
+    if std::ptr::eq(cls, &CEL_OPAQUE_CLASS) {
         return Some(crate::common::types::Type::new_opaque_type("opaque"));
     }
     #[cfg(feature = "chrono")]
-    if cls == (&CEL_DURATION_CLASS as *const CelClass) {
+    if std::ptr::eq(cls, &CEL_DURATION_CLASS) {
         return Some(DURATION_TYPE.to_owned());
     }
     #[cfg(feature = "chrono")]
-    if cls == (&CEL_TIMESTAMP_CLASS as *const CelClass) {
+    if std::ptr::eq(cls, &CEL_TIMESTAMP_CLASS) {
         return Some(TIMESTAMP_TYPE.to_owned());
     }
     None
@@ -977,10 +978,7 @@ mod tests {
         let interned_host = intern_leaf(&host).expect("leftover opaque intern");
         assert_eq!(unsafe { w_kind(interned_host) }, CelKind::Opaque);
         assert_eq!(roundtrip(host.clone()), host);
-        assert_eq!(
-            unsafe { crate::runtime::binop::values_equal(interned_host, interned_host) },
-            true
-        );
+        assert!(unsafe { crate::runtime::binop::values_equal(interned_host, interned_host) });
         let also = intern_leaf(&Value::Opaque(Arc::new(HostId(7)))).unwrap();
         assert!(unsafe { crate::runtime::binop::values_equal(interned_host, also) });
         let other = intern_leaf(&Value::Opaque(Arc::new(HostId(8)))).unwrap();

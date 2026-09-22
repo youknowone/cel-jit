@@ -290,6 +290,12 @@ pub struct BindRegion {
     eval_frame_cap: Cell<usize>,
 }
 
+impl Default for BindRegion {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl BindRegion {
     pub fn new() -> BindRegion {
         BindRegion {
@@ -579,6 +585,8 @@ impl CelHeap {
         self.depth.get() > 0 && self.force_old.get() == 0
     }
 
+    // Tests call these. A non-test build has no caller.
+    #[allow(dead_code)]
     #[inline]
     fn enter(&self) -> bool {
         let d = self.depth.get();
@@ -589,6 +597,7 @@ impl CelHeap {
         d == 0
     }
 
+    #[allow(dead_code)]
     #[inline]
     fn leave(&self, outermost: bool) {
         self.leave_with(
@@ -1208,8 +1217,7 @@ pub fn is_immortal(ptr: *const u8) -> bool {
     IMMORTAL_PAYLOADS
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .iter()
-        .any(|&q| q == p)
+        .contains(&p)
 }
 
 /// The header word immediately before an immortal payload.

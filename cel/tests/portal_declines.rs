@@ -293,9 +293,8 @@ fn agree_repeat_parsed(src: &str, optional: bool) {
         for i in 0..3 {
             let vm = cel::vm::cel_eval_loop(&code, &ctx);
             assert_eq!(show(&walker), show(&vm), "`{src}` execute {i}");
-            match (&walker, &vm) {
-                (Ok(a), Ok(b)) => assert_eq!(a, b, "`{src}` execute {i} value"),
-                _ => {}
+            if let (Ok(a), Ok(b)) = (&walker, &vm) {
+                assert_eq!(a, b, "`{src}` execute {i} value");
             }
         }
         return;
@@ -304,9 +303,8 @@ fn agree_repeat_parsed(src: &str, optional: bool) {
     for i in 0..3 {
         let vm = program.execute(&ctx);
         assert_eq!(show(&walker), show(&vm), "`{src}` execute {i}");
-        match (&walker, &vm) {
-            (Ok(a), Ok(b)) => assert_eq!(a, b, "`{src}` execute {i} value"),
-            _ => {}
+        if let (Ok(a), Ok(b)) = (&walker, &vm) {
+            assert_eq!(a, b, "`{src}` execute {i} value");
         }
     }
 }

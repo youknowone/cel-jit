@@ -131,7 +131,7 @@ fn census(shape: &str, source: &str, program: &BatchProgram, batch: &Batch<'_>, 
     let encode = read();
     drop(bound);
 
-    let (sa, sb) = sum.map_or((usize::MAX, usize::MAX), |c| c);
+    let (sa, sb) = sum.unwrap_or((usize::MAX, usize::MAX));
     let cell = |v: usize| {
         if v == usize::MAX {
             "n/a".to_string()

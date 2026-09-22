@@ -24,6 +24,7 @@ use core::mem::{align_of, size_of};
 use std::sync::Arc;
 
 /// Arena of interned constant leaves. Shared by clones of a [`crate::vm::CelCode`].
+#[derive(Default)]
 pub struct ConstPool {
     blocks: Vec<Block>,
 }
@@ -32,12 +33,6 @@ struct Block {
     base: *mut u8,
     payload: *mut u8,
     layout: Layout,
-}
-
-impl Default for ConstPool {
-    fn default() -> Self {
-        ConstPool { blocks: Vec::new() }
-    }
 }
 
 impl Drop for ConstPool {
@@ -228,7 +223,7 @@ impl ConstPool {
         let data = if n == 0 {
             core::ptr::null_mut()
         } else {
-            let raw = self.alloc_raw(n * size_of::<i64>(), align_of::<i64>()) as *mut i64;
+            let raw = self.alloc_raw(std::mem::size_of_val(ints), align_of::<i64>()) as *mut i64;
             unsafe { core::ptr::copy_nonoverlapping(ints.as_ptr(), raw, n) };
             raw
         };

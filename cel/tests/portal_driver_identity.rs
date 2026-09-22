@@ -64,7 +64,7 @@ fn a_second_thread_uses_the_table_for_a_program_it_does_not_own() {
     .join()
     .expect("other thread");
     assert!(
-        n >= 1 && n <= 8,
+        (1..=8).contains(&n),
         "other thread table length {n} is not a live fallback entry"
     );
 }

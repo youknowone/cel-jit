@@ -886,7 +886,7 @@ fn run_case(case: &Case, cfg: &Config) -> Row {
 fn distinct_count<T: PartialEq>(items: &[T]) -> usize {
     let mut seen: Vec<&T> = Vec::new();
     for item in items {
-        if !seen.iter().any(|s| *s == item) {
+        if !seen.contains(&item) {
             seen.push(item);
         }
     }
@@ -1179,7 +1179,7 @@ fn main() {
         println!("  skipped  {:<28} {why}", row.label);
     }
     for row in &unsteady {
-        let m = row.outcome.as_ref().ok().expect("filtered to measured");
+        let m = row.outcome.as_ref().expect("filtered to measured");
         let why = if !m.warm.reached {
             format!(
                 "never reached steady state in {} calls (first entry: {})",

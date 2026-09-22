@@ -536,7 +536,7 @@ pub fn new_int_column(values: &[i64]) -> *mut W_IntColumn {
     let data = if values.is_empty() {
         core::ptr::null_mut()
     } else {
-        let bytes = values.len() * core::mem::size_of::<i64>();
+        let bytes = core::mem::size_of_val(values);
         let ptr = super::heap::with_heap(|h| h.alloc_raw(bytes, align_of::<i64>())) as *mut i64;
         unsafe {
             core::ptr::copy_nonoverlapping(values.as_ptr(), ptr, values.len());

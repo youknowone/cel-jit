@@ -474,3 +474,9 @@ jit = [
 # lets `majit-metainterp` pick, which is not a configuration to measure from.
 jit-dynasm = ["jit", "majit-metainterp/dynasm"]
 jit-cranelift = ["jit", "majit-metainterp/cranelift"]
+
+# `Value` and list buffers are `!Send + !Sync` (`ListBuf`'s
+# `PhantomData<*const ()>`). Shared buffers are still `Arc`: clone and drop
+# bump that refcount. The `Arc` is the owner, not a cross-thread share.
+[lints.clippy]
+arc_with_non_send_sync = "allow"

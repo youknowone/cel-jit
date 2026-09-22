@@ -41,8 +41,8 @@
 //! * `empty`   — no cell at that bucket. Two failed lookups.
 //! * `single`  — one cell, the ordinary warm shape. Two successful lookups.
 //! * `chained` — two cells, which is the ONLY state `dc9146c` changes an ANSWER
-//!               in, and the only one that pays the typed key's two `Vec`
-//!               allocations.
+//!   in, and the only one that pays the typed key's two `Vec`
+//!   allocations.
 //!
 //! Arm A is the pre-`dc9146c` shape (`13a1ac9`): probe the bare hash. Arm B is
 //! HEAD: resolve, then probe. The harness reports `B - A`, so a positive delta

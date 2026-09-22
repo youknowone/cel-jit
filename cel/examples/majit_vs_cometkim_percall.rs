@@ -1353,12 +1353,15 @@ fn row_cost(case: &Case, lowered: &BatchProgram, tier: Tier) -> (Option<f64>, Op
     // GATE 3 — steady state: the slope must not be measuring trace/compile
     // churn, and the bigger batch must actually cost more.
     let churned = jit_stats().loops_compiled != c0 || jit_stats().loops_aborted != ab0;
-    if !entry_ok(entered, calls_hi + calls_lo) || churned || !(t_hi > t_lo) {
+    if !entry_ok(entered, calls_hi + calls_lo)
+        || churned
+        || t_hi.partial_cmp(&t_lo) != Some(std::cmp::Ordering::Greater)
+    {
         return (None, None);
     }
 
     let slope = (t_hi - t_lo) / (k_hi - k_lo) as f64;
-    if !(slope > 0.0) {
+    if slope.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
         return (None, None);
     }
     (Some(slope), Some(t_lo - k_lo as f64 * slope))

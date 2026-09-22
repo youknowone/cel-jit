@@ -1306,6 +1306,7 @@ unsafe fn drop_portal_driver(ptr: usize) {
 /// The caller is the owner thread and `jit.in_use` is true for the
 /// duration of the returned borrow, so no other call holds a mutable
 /// reference to the same driver.
+#[allow(clippy::mut_from_ref)]
 unsafe fn driver_on_code<'a>(
     jit: &'a super::code::CodeJit,
     state: &mut PortalState,
@@ -2019,6 +2020,7 @@ fn run_cel_portal(
         // write inside the arm reaches the merge-point register. `return`
         // lowers only as the arm's last statement, so the exit stays after
         // the forward `continue` rather than inside the `if`.
+        #[allow(clippy::match_single_binding)]
         match opcode {
             _ => {
                 let next = step_hot(program, pc);

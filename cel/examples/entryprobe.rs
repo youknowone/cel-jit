@@ -583,6 +583,7 @@ impl Split {
 }
 
 /// Finish a shape from its swept points and its arms.
+#[allow(clippy::too_many_arguments)]
 fn split(
     label: &'static str,
     points: &[(usize, f64, f64, f64)],
@@ -804,12 +805,11 @@ fn armcheck() {
 /// negative nanoseconds rather than failing. This is the check that catches
 /// that class, and it costs one pass over a 17-element array.
 fn check_barrier_wiring() {
-    for i in 0..STAGE_LABELS.len() {
+    for (i, label) in STAGE_LABELS.iter().enumerate() {
         let b = Split::barrier_for(i);
         assert!(
             STAGE_LABELS[b].contains("barrier"),
-            "arm `{}` is differenced against `{}`, which is not a barrier",
-            STAGE_LABELS[i],
+            "arm `{label}` is differenced against `{}`, which is not a barrier",
             STAGE_LABELS[b]
         );
     }

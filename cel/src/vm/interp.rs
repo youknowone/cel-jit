@@ -414,6 +414,7 @@ enum Operand {
     Interned(crate::runtime::object::CelRef),
     /// A list being built, before its first element decides a strategy: the
     /// capacity that first append reserves. `EmptyListStrategy`.
+    #[allow(dead_code)]
     EmptyList(usize),
     /// A list being built whose every element so far is an integer, as a
     /// buffer of words: a quarter of the writes of a boxed buffer, nothing to
@@ -447,6 +448,7 @@ enum Operand {
     /// every insert; see [`Vm::map_mut`].
     Map(Arc<HashMap<Key, Value>>),
     /// A map being built of interned keys and values. Closed as `new_map`.
+    #[allow(dead_code)]
     MapRefs(Vec<(CelRef, CelRef)>),
     /// The `names` index of the message type, and the fields set so far. The
     /// type is checked when the struct is opened, so that a bad type name
@@ -797,7 +799,7 @@ fn frame_for_execute(
     let need = (n_slots.max(0) as usize).saturating_add(max_stack.max(0) as usize);
     let cached = region.take_eval_frame(need);
     if !cached.is_null() {
-        let frame = cached as *mut u8 as *mut W_CelFrame;
+        let frame = cached as *mut W_CelFrame;
         unsafe { reset_cel_frame(frame, n_slots) };
         return frame;
     }
@@ -1034,7 +1036,10 @@ impl<'a> Vm<'a> {
                 ExecutionError::Overflow(operator(err), Value::Null, Value::Null)
             }
             CelErr::UnsupportedUnaryOperator(_) => {
-                ExecutionError::UnsupportedUnaryOperator(operator(err), Value::Null)
+                #[allow(deprecated)]
+                {
+                    ExecutionError::UnsupportedUnaryOperator(operator(err), Value::Null)
+                }
             }
             CelErr::UnsupportedBinaryOperator(_) => {
                 ExecutionError::UnsupportedBinaryOperator(operator(err), Value::Null, Value::Null)
@@ -1902,6 +1907,9 @@ impl<'a> Vm<'a> {
 
     // -- the loop -----------------------------------------------------------
 
+    // The non-`jit` door and the tests call this. An `--all-features` lib
+    // build routes `Program::execute` through the portal instead.
+    #[allow(dead_code)]
     pub(crate) fn run(&mut self) -> CelResult<Value> {
         self.ensure_scratch();
         unsafe {
@@ -2043,12 +2051,7 @@ impl<'a> Vm<'a> {
         let _ = pc;
 
         // -- the bind: `IterBind source index var`
-        let element = {
-            match self.element_at(shape.source, shape.index) {
-                Ok(element) => element,
-                Err(err) => return Err(err),
-            }
-        };
+        let element = self.element_at(shape.source, shape.index)?;
         self.store_operand(shape.var, element)?;
         if arm == FuseArm::Bind {
             return Ok(shape.after_bind);
@@ -3713,7 +3716,7 @@ fn interned_to_string(w: CelRef) -> Result<Option<CelRef>, ExecutionError> {
             }
             let bytes = unsafe { std::slice::from_raw_parts(base, n) };
             Ok(Some(
-                new_string(&String::from_utf8_lossy(bytes).into_owned()) as CelRef,
+                new_string(&String::from_utf8_lossy(bytes)) as CelRef,
             ))
         }
         #[cfg(feature = "chrono")]
