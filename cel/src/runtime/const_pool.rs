@@ -4,7 +4,9 @@
 //! by [`super::heap::is_immortal`], and freed only when the last code object
 //! sharing this pool drops.
 
-use super::heap::{register_const_span, unregister_const_span, IMMORTAL_HEADER_SIZE, IMMORTAL_MARK};
+use super::heap::{
+    register_const_span, unregister_const_span, IMMORTAL_HEADER_SIZE, IMMORTAL_MARK,
+};
 use super::object::{
     new_bool, new_null, prebuilt_int, CelObject, CelRef, ListStrategy, MapStrategy, W_BytesObject,
     W_DoubleObject, W_IntColumn, W_IntObject, W_ListObject, W_MapObject, W_StringObject,
@@ -59,9 +61,7 @@ impl ConstPool {
     fn alloc_raw(&mut self, size: usize, align: usize) -> *mut u8 {
         let align = align.max(align_of::<usize>());
         let header = IMMORTAL_HEADER_SIZE;
-        let total = header
-            .checked_add(size)
-            .expect("const payload fits usize");
+        let total = header.checked_add(size).expect("const payload fits usize");
         let layout = Layout::from_size_align(total, align).expect("const layout");
         let base = unsafe { std::alloc::alloc(layout) };
         if base.is_null() {

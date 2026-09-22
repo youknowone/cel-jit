@@ -44,7 +44,9 @@ fn agree(src: &str, optional: bool) {
     } else {
         Parser::default()
     };
-    let expr = parser.parse(src).unwrap_or_else(|e| panic!("parse {src}: {e}"));
+    let expr = parser
+        .parse(src)
+        .unwrap_or_else(|e| panic!("parse {src}: {e}"));
     let code = cel::vm::compile(&expr).unwrap_or_else(|e| panic!("compile {src}: {e}"));
     let walker = show(&Value::resolve_value(&expr, &ctx()));
     let vm = show(&cel::vm::cel_eval_loop(&code, &ctx()));

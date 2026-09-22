@@ -48,9 +48,8 @@ use crate::runtime::object::{
     map_len, map_try_insert, new_bytes, new_cel_frame_in, new_double, new_int, new_int_in,
     new_list, new_list_ints, new_list_with_capacity_in, new_map_with_capacity_in, new_null,
     new_optional, new_optional_none, new_string, new_type, new_uint, opaque_host_index,
-    reset_cel_frame, string_as_str, string_byte_len, w_kind, w_type, CelKind, CelRef,
-    W_BoolObject, W_CelFrame,
-    W_DoubleObject, W_IntObject, W_UIntObject, CEL_OPAQUE_CLASS, CEL_TYPE_CLASS,
+    reset_cel_frame, string_as_str, string_byte_len, w_kind, w_type, CelKind, CelRef, W_BoolObject,
+    W_CelFrame, W_DoubleObject, W_IntObject, W_UIntObject, CEL_OPAQUE_CLASS, CEL_TYPE_CLASS,
 };
 use crate::runtime::optional::{
     cel_optional_has_value, cel_optional_none, cel_optional_of, cel_optional_of_non_zero_value,
@@ -1090,7 +1089,9 @@ impl<'a> Vm<'a> {
 
     fn scratch_mut(&mut self) -> &mut Scratch {
         self.ensure_scratch();
-        self.scratch.as_mut().expect("ensure_scratch filled the pool")
+        self.scratch
+            .as_mut()
+            .expect("ensure_scratch filled the pool")
     }
 
     fn ensure_scratch(&mut self) {
@@ -2781,8 +2782,12 @@ impl<'a> Vm<'a> {
                     return Ok(Step::Jump(b));
                 }
             }
-            OpCode::AndLocal | OpCode::OrLocal | OpCode::And | OpCode::Or
-            | OpCode::AndMerge | OpCode::OrMerge => {
+            OpCode::AndLocal
+            | OpCode::OrLocal
+            | OpCode::And
+            | OpCode::Or
+            | OpCode::AndMerge
+            | OpCode::OrMerge => {
                 return self.logic_step(op, a, b, c);
             }
 
@@ -4993,10 +4998,7 @@ mod tests {
             "the loop has to actually run 64 times"
         );
         let parked = vm.scratch.as_ref().map(|s| s.cold.len()).unwrap_or(0);
-        assert!(
-            parked <= 1,
-            "64 absorbed errors left {parked} parked"
-        );
+        assert!(parked <= 1, "64 absorbed errors left {parked} parked");
     }
 
     /// A `CallQualified` miss hands its arguments to the `CallMethod` the

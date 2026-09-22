@@ -327,9 +327,7 @@ impl<'a> Context<'a> {
         fn from_root(v: &Value) -> Value {
             match v {
                 Value::Interned(w) => {
-                    if let Some(immediate) =
-                        crate::runtime::convert::interned_immediate(*w)
-                    {
+                    if let Some(immediate) = crate::runtime::convert::interned_immediate(*w) {
                         immediate
                     } else {
                         Value::Interned(*w)

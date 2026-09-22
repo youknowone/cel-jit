@@ -1112,8 +1112,6 @@ pub fn eval_depth() -> u32 {
 /// would put that load in rodata or unmapped memory.
 pub const IMMORTAL_HEADER_SIZE: usize = core::mem::size_of::<usize>();
 
-
-
 /// Payloads handed out by [`alloc_immortal`]. The tripwire that a
 /// prebuilt is not a Rust `static` asserts against this list.
 static IMMORTAL_PAYLOADS: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());

@@ -774,10 +774,7 @@ pub fn new_list_with_capacity(cap: i64) -> *mut W_ListObject {
 /// [`new_list_with_capacity`] on `heap`. Slots past `length` are written
 /// by append before anything reads them, so they are not zeroed.
 #[inline(never)]
-pub fn new_list_with_capacity_in(
-    heap: &super::heap::CelHeap,
-    cap: i64,
-) -> *mut W_ListObject {
+pub fn new_list_with_capacity_in(heap: &super::heap::CelHeap, cap: i64) -> *mut W_ListObject {
     let n = cap.max(0) as usize;
     let items = object_array::new_items_block_with_zeroed_prefix_in(heap, n, 0);
     heap.alloc(W_ListObject {
@@ -1355,7 +1352,8 @@ pub unsafe fn reset_cel_frame(frame: *mut W_CelFrame, n_slots: i64) {
     (*frame).valuestackdepth = n_slots;
     (*frame).n_slots = n_slots;
     if n_slots > 0 {
-        let base = crate::runtime::object_array::items_block_items_base((*frame).locals_stack_w.block);
+        let base =
+            crate::runtime::object_array::items_block_items_base((*frame).locals_stack_w.block);
         core::ptr::write_bytes(base, 0, n_slots as usize);
     }
 }

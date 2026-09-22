@@ -27,12 +27,12 @@ use crate::common::types::{
     Kind, Type, TypeValue, BOOL_TYPE, BYTES_TYPE, DOUBLE_TYPE, INT_TYPE, LIST_TYPE, MAP_TYPE,
     NULL_TYPE, OPTIONAL_TYPE, STRING_TYPE, TYPE_TYPE, UINT_TYPE,
 };
+#[cfg(test)]
+use crate::objects::ListStorage;
 use crate::objects::{
     map_get_by_key, map_has_exact_key, try_build_map, Key, KeyRef, ListRef, Map, MapStorage,
     Opaque, OptionalValue,
 };
-#[cfg(test)]
-use crate::objects::ListStorage;
 use crate::Value;
 
 #[cfg(feature = "structs")]
@@ -606,12 +606,8 @@ unsafe fn interned_object_get_exact(w: CelRef, needle: KeyRef<'_>) -> Option<Cel
 #[inline]
 unsafe fn interned_key_eq(w: CelRef, needle: KeyRef<'_>) -> bool {
     match needle {
-        KeyRef::Int(i) => {
-            w_kind(w) == CelKind::Int && (*w.cast::<W_IntObject>()).intval == i
-        }
-        KeyRef::Uint(u) => {
-            w_kind(w) == CelKind::UInt && (*w.cast::<W_UIntObject>()).uintval == u
-        }
+        KeyRef::Int(i) => w_kind(w) == CelKind::Int && (*w.cast::<W_IntObject>()).intval == i,
+        KeyRef::Uint(u) => w_kind(w) == CelKind::UInt && (*w.cast::<W_UIntObject>()).uintval == u,
         KeyRef::Bool(b) => {
             w_kind(w) == CelKind::Bool && ((*w.cast::<W_BoolObject>()).boolval != 0) == b
         }
@@ -683,9 +679,7 @@ pub unsafe fn interned_list_get(w: CelRef, index: i64) -> Option<CelRef> {
 
 fn intern_map(map: &Map) -> Result<CelRef, ConvertError> {
     match map.storage() {
-        MapStorage::Object(_) | MapStorage::Entries(_) => {
-            Ok(new_map(&map_pairs(map)?) as CelRef)
-        }
+        MapStorage::Object(_) | MapStorage::Entries(_) => Ok(new_map(&map_pairs(map)?) as CelRef),
         MapStorage::Record { .. } => {
             let host = intern_host_any(Box::new(map.clone()));
             Ok(new_map_record(host, map.len() as i64) as CelRef)
@@ -704,11 +698,8 @@ unsafe fn linked_public_map(leaf: &W_MapObject) -> Option<Map> {
         return None;
     }
     if leaf.public_kind == MAP_PUBLIC_ENTRIES {
-        clone_arc_slice(
-            leaf.public as *const (Key, Value),
-            leaf.public_len as usize,
-        )
-        .map(Map::from_linked_entries)
+        clone_arc_slice(leaf.public as *const (Key, Value), leaf.public_len as usize)
+            .map(Map::from_linked_entries)
     } else {
         clone_arc(leaf.public as *const HashMap<Key, Value>).map(Map::object)
     }
@@ -1211,39 +1202,24 @@ mod tests {
         );
         let value = Value::Map(original.clone());
         let w = new_map_with_capacity(4) as CelRef;
-        assert!(unsafe {
-            map_try_insert(
-                w,
-                new_string("a") as CelRef,
-                new_int(1) as CelRef,
-            )
-        });
-        assert!(unsafe {
-            map_try_insert(
-                w,
-                new_string("b") as CelRef,
-                new_int(2) as CelRef,
-            )
-        });
+        assert!(unsafe { map_try_insert(w, new_string("a") as CelRef, new_int(1) as CelRef,) });
+        assert!(unsafe { map_try_insert(w, new_string("b") as CelRef, new_int(2) as CelRef,) });
         link_public_handle(w, &value);
         let leaf = unsafe { &*w.cast::<W_MapObject>() };
         assert_eq!(leaf.length, 2);
         assert_eq!(leaf.public_kind, MAP_PUBLIC_ENTRIES);
         assert_eq!(leaf.public_len, 2);
-        assert!(unsafe {
-            map_try_insert(
-                w,
-                new_string("c") as CelRef,
-                new_int(3) as CelRef,
-            )
-        });
+        assert!(unsafe { map_try_insert(w, new_string("c") as CelRef, new_int(3) as CelRef,) });
         let leaf = unsafe { &*w.cast::<W_MapObject>() };
         assert_eq!(leaf.length, 3, "insert grew the interned table");
         assert!(leaf.public.is_null(), "mutation cleared the public link");
         assert_eq!(leaf.public_len, 0);
         assert_eq!(leaf.public_kind, 0);
         let back = unsafe { map_from_ref(w) }.expect("unpack");
-        assert!(!original.ptr_eq(&back), "copy-out is a rebuild, not the stale link");
+        assert!(
+            !original.ptr_eq(&back),
+            "copy-out is a rebuild, not the stale link"
+        );
         assert_eq!(back.len(), 3);
         assert_eq!(
             back.get(&Key::String(Arc::new("c".into()))).as_deref(),
@@ -1258,7 +1234,10 @@ mod tests {
         let before = Arc::strong_count(&spy);
         let w = new_map(&[
             (new_string("k") as CelRef, opaque_w),
-            (new_list(&[new_int(0) as CelRef]) as CelRef, new_int(2) as CelRef),
+            (
+                new_list(&[new_int(0) as CelRef]) as CelRef,
+                new_int(2) as CelRef,
+            ),
         ]);
         let err = unsafe { map_from_ref(w as CelRef) };
         assert!(matches!(err, Err(ConvertError::Corrupt("map key"))));

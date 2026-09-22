@@ -242,12 +242,7 @@ impl Compiler {
         Ok(index)
     }
 
-    fn add_const_leaf(
-        &mut self,
-        value: Value,
-        leaf: CelRef,
-        id: u64,
-    ) -> Result<u32, CompileError> {
+    fn add_const_leaf(&mut self, value: Value, leaf: CelRef, id: u64) -> Result<u32, CompileError> {
         let index = u32::try_from(self.consts.len()).map_err(|_| CompileError {
             kind: CompileErrorKind::TooLarge("constant pool"),
             id,

@@ -41,14 +41,11 @@ fn old_bytes() -> u64 {
 }
 
 fn eval_vm(program: &Program, ctx: &Context) -> Value {
-    program
-        .execute(ctx)
-        .unwrap_or_else(|e| panic!("vm: {e:?}"))
+    program.execute(ctx).unwrap_or_else(|e| panic!("vm: {e:?}"))
 }
 
 fn eval_walker(program: &Program, ctx: &Context) -> Value {
-    Value::resolve_value(program.expression(), ctx)
-        .unwrap_or_else(|e| panic!("walker: {e:?}"))
+    Value::resolve_value(program.expression(), ctx).unwrap_or_else(|e| panic!("walker: {e:?}"))
 }
 
 /// ns per {new Context, four binds, drop}. Printed for the bind-cost gate.
@@ -101,10 +98,7 @@ fn two_hundred_thousand_fresh_contexts_leave_old_space_flat() {
         "old_growth_1k_to_200k: {}",
         old_at_200k.saturating_sub(old_at_1k)
     );
-    println!(
-        "rss_growth_bytes: {}",
-        rss_after.saturating_sub(rss_before)
-    );
+    println!("rss_growth_bytes: {}", rss_after.saturating_sub(rss_before));
 
     const SLACK: u64 = 256 * 1024;
     assert!(

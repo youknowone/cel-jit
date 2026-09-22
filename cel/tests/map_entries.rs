@@ -135,10 +135,7 @@ fn vm_map_result_is_entries_in_source_order() {
             .collect();
         assert_eq!(
             pairs,
-            vec![(
-                Key::String(Arc::new("k".into())),
-                Value::Int(i as i64 + 1)
-            )]
+            vec![(Key::String(Arc::new("k".into())), Value::Int(i as i64 + 1))]
         );
     }
 }
@@ -188,9 +185,7 @@ fn new_replaces_duplicate_keys_on_a_scanned_table() {
 
 #[test]
 fn new_replaces_duplicate_keys_on_an_object_table() {
-    let mut input: Vec<(Key, Value)> = (1i64..=18)
-        .map(|i| (Key::Int(i), Value::Int(i)))
-        .collect();
+    let mut input: Vec<(Key, Value)> = (1i64..=18).map(|i| (Key::Int(i), Value::Int(i))).collect();
     input.push((Key::Int(1), Value::Int(100)));
     input.push((Key::Int(10), Value::Int(1000)));
     assert_eq!(input.len(), 20);
@@ -254,12 +249,7 @@ fn twenty_entry_vm_and_walker_are_object_and_equal() {
     assert_eq!(walker, door);
     let object = object_map(
         &(0..20)
-            .map(|i| {
-                (
-                    Key::String(Arc::new(format!("k{i}"))),
-                    Value::Int(7),
-                )
-            })
+            .map(|i| (Key::String(Arc::new(format!("k{i}"))), Value::Int(7)))
             .collect::<Vec<_>>(),
     );
     assert_eq!(*walker_map, object);
@@ -268,9 +258,7 @@ fn twenty_entry_vm_and_walker_are_object_and_equal() {
 
 #[test]
 fn thousand_entry_object_looks_up_by_hash() {
-    let pairs: Vec<(Key, Value)> = (0..1000)
-        .map(|i| (Key::Int(i), Value::Int(i)))
-        .collect();
+    let pairs: Vec<(Key, Value)> = (0..1000).map(|i| (Key::Int(i), Value::Int(i))).collect();
     let map = entries_map(pairs);
     assert!(matches!(map.storage(), MapStorage::Object(_)));
     for i in 0..1000 {
@@ -280,9 +268,7 @@ fn thousand_entry_object_looks_up_by_hash() {
 
 #[test]
 fn bound_object_map_round_trips_as_ptr_eq() {
-    let pairs: Vec<(Key, Value)> = (1i64..=20)
-        .map(|i| (Key::Int(i), Value::Int(i)))
-        .collect();
+    let pairs: Vec<(Key, Value)> = (1i64..=20).map(|i| (Key::Int(i), Value::Int(i))).collect();
     let original = entries_map(pairs);
     assert!(matches!(original.storage(), MapStorage::Object(_)));
     let mut ctx = Context::default();

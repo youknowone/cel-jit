@@ -58,9 +58,7 @@ fn reenter_ctx(program: Arc<SharedProgram>) -> Context<'static> {
 
 #[test]
 fn eight_threads_share_one_arc_program() {
-    let arith = Arc::new(SharedProgram(
-        Program::compile("x * 2 + 1").expect("arith"),
-    ));
+    let arith = Arc::new(SharedProgram(Program::compile("x * 2 + 1").expect("arith")));
     let mapped = Arc::new(SharedProgram(
         Program::compile("list.map(i, i * 2)").expect("map"),
     ));
@@ -79,10 +77,7 @@ fn eight_threads_share_one_arc_program() {
                 match i % 3 {
                     0 => assert_eq!(arith.0.execute(&ctx).expect("arith"), Value::Int(31)),
                     1 => assert_eq!(mapped.0.execute(&ctx).expect("map"), want_map),
-                    _ => assert_eq!(
-                        reenter.0.execute(&re_ctx).expect("reenter"),
-                        Value::Int(1)
-                    ),
+                    _ => assert_eq!(reenter.0.execute(&re_ctx).expect("reenter"), Value::Int(1)),
                 }
             }
         }));

@@ -88,9 +88,7 @@ fn mallocs_per_eval_on_finish_rows() {
     println!("string-chain mallocs/eval={chain}");
     println!("list.map(e, {{k:e}}) mallocs/eval={maps}");
     println!("list.map(e, {{k,v,w}}) mallocs/eval={maps3}");
-    let walker_one = count_walker(r#"{"a": x}"#, |ctx| {
-        ctx.add_variable_from_value("x", 15i64)
-    });
+    let walker_one = count_walker(r#"{"a": x}"#, |ctx| ctx.add_variable_from_value("x", 15i64));
     println!("list.map(e, [e,e]) mallocs/eval={inner_lists}");
     println!("[x, x] mallocs/eval={pair}");
     println!("[1, 2, 3] mallocs/eval={ints}");

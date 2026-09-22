@@ -50,8 +50,7 @@ fn run(src: &str, ctx: &Context) -> (Value, Value) {
         .enable_optional_syntax(true)
         .parse(src)
         .unwrap_or_else(|e| panic!("{src}: parse {e}"));
-    let walker =
-        Value::resolve(&expr, ctx).unwrap_or_else(|e| panic!("{src}: walker {e:?}"));
+    let walker = Value::resolve(&expr, ctx).unwrap_or_else(|e| panic!("{src}: walker {e:?}"));
     let code = cel::vm::compile(&expr).unwrap_or_else(|e| panic!("{src}: compile {e}"));
     let vm = cel::vm::cel_eval_loop(&code, ctx).unwrap_or_else(|e| panic!("{src}: vm {e:?}"));
     (walker, vm)
@@ -86,7 +85,11 @@ fn no_interned_in_walker_or_vm_results() {
         r#"{"a": xs, "b": s}"#,
         "xs.map(e, [e, e])",
     ];
-    assert!(EXPRS.len() >= 25, "need ~25 expressions, got {}", EXPRS.len());
+    assert!(
+        EXPRS.len() >= 25,
+        "need ~25 expressions, got {}",
+        EXPRS.len()
+    );
 
     let ctx = make_ctx();
     let mut pairs = Vec::with_capacity(EXPRS.len());

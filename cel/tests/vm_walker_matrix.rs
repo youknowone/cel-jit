@@ -117,9 +117,7 @@ fn err_kind(err: &ExecutionError) -> String {
         ExecutionError::UnsupportedFunctionCallIdentifierType(_) => {
             "UnsupportedFunctionCallIdentifierType".into()
         }
-        ExecutionError::UnsupportedFieldsConstruction(_) => {
-            "UnsupportedFieldsConstruction".into()
-        }
+        ExecutionError::UnsupportedFieldsConstruction(_) => "UnsupportedFieldsConstruction".into(),
         ExecutionError::FunctionError { function, .. } => format!("FunctionError:{function}"),
         ExecutionError::DivisionByZero(_) => "DivisionByZero".into(),
         ExecutionError::RemainderByZero(_) => "RemainderByZero".into(),
@@ -196,9 +194,7 @@ fn render_key(key: &Key) -> String {
 /// VM); those are not different answers.
 fn map_comprehension(src: &str) -> bool {
     let s = src.trim();
-    let over_map = s.starts_with('{')
-        || s.starts_with("m.")
-        || s.starts_with("cross.");
+    let over_map = s.starts_with('{') || s.starts_with("m.") || s.starts_with("cross.");
     over_map
         && (s.contains(".map(")
             || s.contains(".filter(")
@@ -665,9 +661,7 @@ fn compile_case(src: &str, optional: bool) -> Result<Compiled, String> {
     } else {
         Parser::default()
     };
-    let expr = parser
-        .parse(src)
-        .map_err(|e| format!("parse: {e}"))?;
+    let expr = parser.parse(src).map_err(|e| format!("parse: {e}"))?;
     if optional {
         let code = cel::vm::compile(&expr).map_err(|e| format!("compile: {e}"))?;
         Ok(Compiled::Optional { expr, code })

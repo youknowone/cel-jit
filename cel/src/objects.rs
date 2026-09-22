@@ -6,31 +6,31 @@ use crate::common::types::CelStruct;
 use crate::context::Context;
 use crate::runtime::binop::{cel_add, map_contains_key, map_key_refs, values_equal};
 use crate::runtime::convert::{
-    intern_leaf, interned_as_keyref, interned_list_get, interned_map_get, interned_map_lookup_string,
+    intern_leaf, interned_as_keyref, interned_list_get, interned_map_get,
+    interned_map_lookup_string,
 };
 use crate::runtime::error::{take_error, CelErrCode, ERROR_SENTINEL};
 use crate::runtime::object::{
-    bytes_len, list_int_at, list_len, map_len, new_optional, new_optional_none,
-    string_byte_len, w_kind, CelKind, CelRef, ListStrategy, W_BoolObject,
-    W_DoubleObject, W_IntColumn, W_IntObject, W_ListObject, W_OptionalObject,
-    W_UIntObject,
+    bytes_len, list_int_at, list_len, map_len, new_optional, new_optional_none, string_byte_len,
+    w_kind, CelKind, CelRef, ListStrategy, W_BoolObject, W_DoubleObject, W_IntColumn, W_IntObject,
+    W_ListObject, W_OptionalObject, W_UIntObject,
 };
 use crate::runtime::object_array::{items_block_items_base, items_capacity};
 use crate::ExecutionError::NoSuchOverload;
 use crate::{ExecutionError, Expression, FunctionContext};
 #[cfg(feature = "chrono")]
 use chrono::TimeZone;
+use std::alloc::{alloc, dealloc, handle_alloc_error, Layout};
 use std::any::Any;
 use std::borrow::{Borrow, Cow};
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::convert::{Infallible, TryFrom, TryInto};
 use std::fmt::{Debug, Display, Formatter};
-use std::alloc::{alloc, dealloc, handle_alloc_error, Layout};
 use std::marker::PhantomData;
+use std::mem::{ManuallyDrop, MaybeUninit};
 use std::ops;
 use std::ops::Deref;
-use std::mem::{ManuallyDrop, MaybeUninit};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::Arc;
@@ -148,10 +148,7 @@ fn pairs_position(pairs: &[(Key, Value)], key: &(dyn AsKeyRef + '_)) -> Option<u
     pairs.iter().position(|(k, _)| k.as_keyref() == needle)
 }
 
-fn pairs_get<'a>(
-    pairs: &'a [(Key, Value)],
-    key: &(dyn AsKeyRef + '_),
-) -> Option<&'a Value> {
+fn pairs_get<'a>(pairs: &'a [(Key, Value)], key: &(dyn AsKeyRef + '_)) -> Option<&'a Value> {
     pairs_position(pairs, key).map(|i| &pairs[i].1)
 }
 
@@ -777,10 +774,7 @@ pub fn map_get_by_key<T>(
 /// Interned maps call this over a linear scan; the public map over
 /// [`HashMap`] / record schema position.
 #[inline]
-pub fn map_has_exact_key(
-    mut exact: impl FnMut(KeyRef<'_>) -> bool,
-    needle: KeyRef<'_>,
-) -> bool {
+pub fn map_has_exact_key(mut exact: impl FnMut(KeyRef<'_>) -> bool, needle: KeyRef<'_>) -> bool {
     exact(needle)
 }
 
@@ -1351,13 +1345,7 @@ impl<T> Drop for UninitRcSlice<T> {
         // field is not dropped: that would free the same allocation.
         unsafe {
             let (layout, offset) = rc_slice_layout::<T>(self.cap);
-            let data = self
-                .slice
-                .ptr
-                .as_ptr()
-                .cast::<u8>()
-                .add(offset)
-                .cast::<T>();
+            let data = self.slice.ptr.as_ptr().cast::<u8>().add(offset).cast::<T>();
             for i in 0..self.filled {
                 std::ptr::drop_in_place(data.add(i));
             }
@@ -1393,12 +1381,7 @@ fn try_fill_rc<T, E>(
     }
     let n = u32::try_from(cap).expect("a list buffer past u32::MAX elements") as usize;
     let mut uninit = UninitRcSlice::new(n);
-    uninit.filled = fill_uninit_slots::<T, E, false>(
-        uninit.slot(),
-        write,
-        |_, _| None,
-        |_, _| {},
-    )?;
+    uninit.filled = fill_uninit_slots::<T, E, false>(uninit.slot(), write, |_, _| None, |_, _| {})?;
     Ok(uninit.finish())
 }
 
@@ -2664,7 +2647,10 @@ fn eval_list_literal(list_expr: &ListExpr, ctx: &Context) -> Result<Value, Execu
     }
     let mut src = list_expr.elements.iter();
     let list = ListRef::try_fill_values(n, |_| {
-        Ok(Some(public_store(resolve_inner(src.next().expect("n elements"), ctx)?)))
+        Ok(Some(public_store(resolve_inner(
+            src.next().expect("n elements"),
+            ctx,
+        )?)))
     })?;
     Ok(Value::List(list))
 }
@@ -4449,10 +4435,7 @@ mod tests {
 
     fn probe() -> (Value, Arc<std::sync::atomic::AtomicUsize>) {
         let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        (
-            Value::Opaque(Arc::new(DropProbe(Arc::clone(&hits)))),
-            hits,
-        )
+        (Value::Opaque(Arc::new(DropProbe(Arc::clone(&hits)))), hits)
     }
 
     #[test]
@@ -4471,7 +4454,10 @@ mod tests {
         let list = ListRef::try_fill_ints::<()>(3, |i| Ok(Some(i as i64 + 1))).unwrap();
         let a = list.clone();
         drop(list);
-        assert_eq!(a.to_vec(), vec![Value::Int(1), Value::Int(2), Value::Int(3)]);
+        assert_eq!(
+            a.to_vec(),
+            vec![Value::Int(1), Value::Int(2), Value::Int(3)]
+        );
         let storage = Arc::new(ListStorage::Ints(vec![10, 20, 30]));
         let w = ListRef::window(Arc::clone(&storage), 1, 1);
         assert_eq!(w.to_vec(), vec![Value::Int(20)]);

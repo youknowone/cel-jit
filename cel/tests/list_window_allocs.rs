@@ -2,8 +2,8 @@
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use cel::objects::{ListRef, ListStorage, ScalarBank, ValueColumn};
 
