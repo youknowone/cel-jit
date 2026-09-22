@@ -80,19 +80,23 @@ async fn list_todos(State(AppContext { todos, .. }): State<AppContext>) -> impl 
     Json(todos.lock().unwrap().clone())
 }
 
-// The policy engine for our TODOs app
-struct PolicyDecider(Context<'static>);
+// The policy engine for our TODOs app.
+//
+// The decider does not own a `Context`. A context carries the
+// thread's bind region, which is not `Send`, and axum's router
+// state has to be `Send + Sync`.
+struct PolicyDecider;
 
 impl PolicyDecider {
-    // Start with a wrapper around the default Context
     fn new() -> Self {
-        Self(Context::default())
+        Self
     }
 
     // Determine whether a given TODO is allowed
     fn todo_is_allowed(&self, todo: &Todo) -> Result<bool, TodosError> {
-        // Create a new mutable context out of the root context
-        let mut ctx = self.0.new_inner_scope();
+        // Create a new mutable context out of a root context
+        let root = Context::default();
+        let mut ctx = root.new_inner_scope();
         // Add the TODO's text as a variable so that it can be part of the expression
         ctx.add_variable_from_value("text", todo.text.clone());
 

@@ -1,3 +1,8 @@
 /target
 Cargo.lock
 dhat-heap.json
+# Extracted LLBC (scripts/extract-llbc.py). Regenerated from the sources it
+# fingerprints; a committed copy would go stale silently.
+/build/
+# Cohabitation-only majit path override (see the file for why it is not committed).
+/.cargo/

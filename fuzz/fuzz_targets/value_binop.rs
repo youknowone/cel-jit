@@ -36,6 +36,9 @@ impl<'arbitrary> arbitrary::Arbitrary<'arbitrary> for Input {
     }
 }
 
+// `Value` is `!Send`. The `Arc` owns the map inside this input, it is not
+// shared across threads.
+#[allow(clippy::arc_with_non_send_sync)]
 fn arbitrary_value(
     u: &mut arbitrary::Unstructured<'_>,
     mut depth: u32,
@@ -55,7 +58,7 @@ fn arbitrary_value(
                 for _ in 0..length {
                     list.push(arbitrary_value(u, depth)?);
                 }
-                Value::List(Arc::new(list))
+                Value::list(list)
             }
             1u64 => {
                 let length = <u8 as arbitrary::Arbitrary>::arbitrary(u)?;
@@ -63,7 +66,7 @@ fn arbitrary_value(
                 for _ in 0..length {
                     map.insert(arbitrary_key(u)?, arbitrary_value(u, depth)?);
                 }
-                Value::Map(Map { map: Arc::new(map) })
+                Value::Map(Map::object(Arc::new(map)))
             }
             2u64 => Value::Int(arbitrary::Arbitrary::arbitrary(u)?),
             3u64 => Value::UInt(arbitrary::Arbitrary::arbitrary(u)?),

@@ -1,9 +1,8 @@
 use crate::context::Context;
 use crate::magic::{Arguments, This};
-use crate::objects::{KeyRef, OptionalValue, Value};
+use crate::objects::{KeyRef, ListRef, OptionalValue, Value};
 use crate::resolvers::Resolver;
 use crate::ExecutionError;
-use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::convert::TryInto;
 use std::sync::Arc;
@@ -18,18 +17,18 @@ type Result<T> = std::result::Result<T, ExecutionError>;
 #[derive(Clone)]
 pub struct FunctionContext<'context, 'call: 'context> {
     pub name: &'call str,
-    pub this: Option<Cow<'context, dyn Val>>,
+    pub this: Option<Value>,
     pub ptx: &'context Context<'context>,
-    pub args: Vec<Cow<'context, dyn Val>>,
+    pub args: Vec<Value>,
     pub arg_idx: usize,
 }
 
 impl<'context, 'call: 'context> FunctionContext<'context, 'call> {
     pub fn new(
         name: &'call str,
-        this: Option<Cow<'context, dyn Val>>,
+        this: Option<Value>,
         ptx: &'context Context<'context>,
-        args: Vec<Cow<'context, dyn Val>>,
+        args: Vec<Value>,
     ) -> Self {
         Self {
             name,
@@ -74,13 +73,19 @@ impl<'context, 'call: 'context> FunctionContext<'context, 'call> {
 /// 'foobar'.size() == 6
 /// ```
 pub fn size(ftx: &FunctionContext, This(this): This<Value>) -> Result<i64> {
-    let size = match this {
-        Value::List(l) => l.len(),
-        Value::Map(m) => m.map.len(),
-        Value::String(s) => s.len(),
-        value => return Err(ftx.error(format!("cannot determine the size of {value:?}"))),
-    };
-    Ok(size as i64)
+    match &this {
+        Value::List(l) => Ok(l.len() as i64),
+        Value::Map(m) => Ok(m.len() as i64),
+        Value::String(s) => Ok(s.len() as i64),
+        Value::Interned(w) => match unsafe { crate::runtime::object::w_kind(*w) } {
+            crate::runtime::object::CelKind::List
+            | crate::runtime::object::CelKind::Map
+            | crate::runtime::object::CelKind::Str => crate::objects::value_len(&this)
+                .ok_or_else(|| ftx.error(format!("cannot determine the size of {this:?}"))),
+            _ => Err(ftx.error(format!("cannot determine the size of {this:?}"))),
+        },
+        value => Err(ftx.error(format!("cannot determine the size of {value:?}"))),
+    }
 }
 
 /// Returns true if the target contains the provided argument. The actual behavior
@@ -114,6 +119,30 @@ pub fn size(ftx: &FunctionContext, This(this): This<Value>) -> Result<i64> {
 /// b"abc".contains(b"c") == true
 /// ```
 pub fn contains(This(this): This<Value>, arg: Value) -> Result<Value> {
+    if let Value::Interned(w) = &this {
+        match unsafe { crate::runtime::object::w_kind(*w) } {
+            crate::runtime::object::CelKind::List | crate::runtime::object::CelKind::Map => {
+                return Ok(crate::objects::value_contains(&this, &arg)?.into());
+            }
+            crate::runtime::object::CelKind::Str => {
+                let hay = unsafe { crate::runtime::object::string_as_str(*w) }.unwrap_or("");
+                let found = match &arg {
+                    Value::String(s) => hay.contains(s.as_str()),
+                    Value::Interned(n)
+                        if unsafe { crate::runtime::object::w_kind(*n) }
+                            == crate::runtime::object::CelKind::Str =>
+                    {
+                        hay.contains(
+                            unsafe { crate::runtime::object::string_as_str(*n) }.unwrap_or(""),
+                        )
+                    }
+                    _ => false,
+                };
+                return Ok(found.into());
+            }
+            _ => return Ok(false.into()),
+        }
+    }
     Ok(match this {
         Value::List(v) => v.contains(&arg),
         Value::Map(v) => {
@@ -225,7 +254,9 @@ pub fn optional_of(ftx: &FunctionContext, value: Value) -> Result<Value> {
     if ftx.this.is_some() {
         return Err(ftx.error("unsupported function"));
     }
-    Ok(Value::Opaque(Arc::new(OptionalValue::of(value))))
+    Ok(Value::Opaque(Arc::new(OptionalValue::of(
+        crate::objects::public_store(value),
+    ))))
 }
 
 pub fn optional_of_non_zero_value(ftx: &FunctionContext, value: Value) -> Result<Value> {
@@ -235,7 +266,9 @@ pub fn optional_of_non_zero_value(ftx: &FunctionContext, value: Value) -> Result
     if value.is_zero() {
         Ok(Value::Opaque(Arc::new(OptionalValue::none())))
     } else {
-        Ok(Value::Opaque(Arc::new(OptionalValue::of(value))))
+        Ok(Value::Opaque(Arc::new(OptionalValue::of(
+            crate::objects::public_store(value),
+        ))))
     }
 }
 pub fn optional_value(This(this): This<Value>) -> Result<Value> {
@@ -280,13 +313,12 @@ pub fn matches(
     This(this): This<Arc<String>>,
     regex: Arc<String>,
 ) -> Result<bool> {
-    match regex::Regex::new(&regex) {
+    match crate::runtime::regex_intern::intern_regex(&regex) {
         Ok(re) => Ok(re.is_match(&this)),
-        Err(err) => Err(ftx.error(format!("'{regex}' not a valid regex:\n{err}"))),
+        Err(message) => Err(ftx.error(message)),
     }
 }
 
-use crate::common::value::Val;
 #[cfg(feature = "chrono")]
 pub use time::duration;
 
@@ -382,52 +414,42 @@ pub mod time {
     }
 }
 
-pub fn max(Arguments(args): Arguments) -> Result<Value> {
-    // If items is a list of values, then operate on the list
+/// The element `keep` orders ahead of every other. `max` and `min` differ only
+/// in that ordering, so the selection itself is written once.
+///
+/// An equal comparison takes the later element, which is what the fold this
+/// replaces did, and an incomparable pair is an error rather than a silent
+/// choice.
+fn extremum(args: ListRef, keep: Ordering) -> Result<Value> {
+    // A lone list argument is operated on element-wise; anything else compares
+    // the arguments themselves.
     let items = if args.len() == 1 {
-        match &args[0] {
-            Value::List(values) => values,
-            _ => return Ok(args[0].clone()),
+        match args.get(0) {
+            Some(Value::List(values)) => values,
+            Some(other) => return Ok(other),
+            None => args,
         }
     } else {
-        &args
+        args
     };
 
-    items
-        .iter()
-        .skip(1)
-        .try_fold(items.first().unwrap_or(&Value::Null), |acc, x| {
-            match acc.partial_cmp(x) {
-                Some(Ordering::Greater) => Ok(acc),
-                Some(_) => Ok(x),
-                None => Err(ExecutionError::ValuesNotComparable(acc.clone(), x.clone())),
-            }
-        })
-        .cloned()
+    let mut best = items.get(0).unwrap_or(Value::Null);
+    for x in items.iter().skip(1) {
+        match best.partial_cmp(&x) {
+            Some(ord) if ord == keep => {}
+            Some(_) => best = x,
+            None => return Err(ExecutionError::ValuesNotComparable(best, x)),
+        }
+    }
+    Ok(best)
+}
+
+pub fn max(Arguments(args): Arguments) -> Result<Value> {
+    extremum(args, Ordering::Greater)
 }
 
 pub fn min(Arguments(args): Arguments) -> Result<Value> {
-    // If items is a list of values, then operate on the list
-    let items = if args.len() == 1 {
-        match &args[0] {
-            Value::List(values) => values,
-            _ => return Ok(args[0].clone()),
-        }
-    } else {
-        &args
-    };
-
-    items
-        .iter()
-        .skip(1)
-        .try_fold(items.first().unwrap_or(&Value::Null), |acc, x| {
-            match acc.partial_cmp(x) {
-                Some(Ordering::Less) => Ok(acc),
-                Some(_) => Ok(x),
-                None => Err(ExecutionError::ValuesNotComparable(acc.clone(), x.clone())),
-            }
-        })
-        .cloned()
+    extremum(args, Ordering::Less)
 }
 
 #[cfg(test)]
@@ -494,6 +516,19 @@ mod tests {
                 "map to list",
                 r#"{'John': 'smart'}.map(key, key) == ['John']"#,
             ),
+            ("map empty list", "[].map(x, x * 2) == []"),
+            (
+                "map list filter, nothing kept",
+                "[1, 3, 5].map(y, y % 2 == 0, y + 1) == []",
+            ),
+            (
+                "map list filter, everything kept",
+                "[2, 4].map(y, y % 2 == 0, y + 1) == [3, 5]",
+            ),
+            (
+                "map preserves order",
+                "[3, 1, 2].map(x, x * 10) == [30, 10, 20]",
+            ),
         ]
         .iter()
         .for_each(assert_script);
@@ -501,9 +536,29 @@ mod tests {
 
     #[test]
     fn test_filter() {
-        [("filter list", "[1, 2, 3].filter(x, x > 2) == [3]")]
-            .iter()
-            .for_each(assert_script);
+        [
+            ("filter list", "[1, 2, 3].filter(x, x > 2) == [3]"),
+            ("filter empty list", "[].filter(x, x > 2) == []"),
+            ("filter keeps nothing", "[1, 2, 3].filter(x, x > 9) == []"),
+            (
+                "filter keeps everything",
+                "[1, 2, 3].filter(x, x > 0) == [1, 2, 3]",
+            ),
+            (
+                "filter preserves order",
+                "[3, 1, 2].filter(x, x > 1) == [3, 2]",
+            ),
+            (
+                "nested filter",
+                "[[1, 2], [3, 4]].filter(x, x.filter(y, y > 2) != []) == [[3, 4]]",
+            ),
+            (
+                "filter then map",
+                "[1, 2, 3, 4].filter(x, x % 2 == 0).map(x, x * 3) == [6, 12]",
+            ),
+        ]
+        .iter()
+        .for_each(assert_script);
     }
 
     #[test]

@@ -1,6 +1,7 @@
 #![allow(clippy::too_many_arguments)]
 use cel::extractors::This;
-use cel::{Context, ExecutionError, FunctionContext, Program, ResolveResult, Value};
+use cel::objects::ListRef;
+use cel::{Context, ExecutionError, FunctionContext, Program, ResolveResult};
 use chrono::{DateTime, Duration, FixedOffset};
 use std::sync::Arc;
 
@@ -59,7 +60,7 @@ fn primitives(
     _f: Arc<Vec<u8>>,
     _g: Duration,
     _h: DateTime<FixedOffset>,
-    _i: Arc<Vec<Value>>,
+    _i: ListRef,
 ) -> Duration {
     Duration::zero()
 }

@@ -1,0 +1,1258 @@
+//! Boundary between the public [`crate::Value`] enum and this class family.
+//!
+//! [`crate::Value`] is the cel drop-in and does not change: callers still
+//! construct `Value::Int`, match variants, and bind `This<Arc<String>>`.
+//! Evaluators that want a header-first object cross here, and only here.
+//!
+//! Leftover host opaques cross as [`super::object::W_OpaqueObject`], with the
+//! `Arc<dyn Opaque>` parked in this thread's heap table (D12). Record-row
+//! maps and column-window lists intern as strategy windows so the schema
+//! stays shared.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use super::object::{
+    new_bool, new_bytes, new_double, new_int, new_list, new_list_ints, new_list_window, new_map,
+    new_map_record, new_null, new_opaque, new_optional, new_optional_none, new_string, new_type,
+    new_uint, opaque_host_index, w_kind, w_type, CelClass, CelKind, CelRef, ListStrategy,
+    MapStrategy, W_BoolObject, W_BytesObject, W_DoubleObject, W_IntColumn, W_IntObject,
+    W_ListObject, W_MapObject, W_OptionalObject, W_StringObject, W_TypeObject, W_UIntObject,
+    CEL_BOOL_CLASS, CEL_BYTES_CLASS, CEL_DOUBLE_CLASS, CEL_INT_CLASS, CEL_LIST_CLASS,
+    CEL_MAP_CLASS, CEL_NULL_CLASS, CEL_OPAQUE_CLASS, CEL_OPTIONAL_CLASS, CEL_STRING_CLASS,
+    CEL_TYPE_CLASS, CEL_UINT_CLASS,
+};
+use super::object_array::{bytes_base, items_block_items_base};
+use crate::common::types::{
+    Kind, Type, TypeValue, BOOL_TYPE, BYTES_TYPE, DOUBLE_TYPE, INT_TYPE, LIST_TYPE, MAP_TYPE,
+    NULL_TYPE, OPTIONAL_TYPE, STRING_TYPE, TYPE_TYPE, UINT_TYPE,
+};
+#[cfg(test)]
+use crate::objects::ListStorage;
+use crate::objects::{
+    map_get_by_key, map_has_exact_key, try_build_map, Key, KeyRef, ListRef, Map, MapStorage,
+    Opaque, OptionalValue,
+};
+use crate::Value;
+
+#[cfg(feature = "structs")]
+use super::object::{new_struct, W_StructObject, CEL_STRUCT_CLASS};
+#[cfg(feature = "structs")]
+use crate::common::types::CelStruct;
+
+#[cfg(feature = "chrono")]
+use super::object::{
+    new_duration, new_timestamp, W_DurationObject, W_TimestampObject, CEL_DURATION_CLASS,
+    CEL_TIMESTAMP_CLASS,
+};
+#[cfg(feature = "chrono")]
+use crate::common::types::{DURATION_TYPE, TIMESTAMP_TYPE};
+
+/// Why a value could not cross the boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConvertError {
+    /// This family has no leaf for the public variant.
+    Unsupported(&'static str),
+    /// The `CelRef` is not a value this boundary can read back.
+    Corrupt(&'static str),
+}
+
+/// Move a nursery result to the public owned form. An interned value that
+/// already lives in old or immortal memory is returned as it is.
+pub fn promote_eval_result(v: Value) -> Value {
+    match v {
+        Value::Interned(w) => interned_to_public(w),
+        other => other,
+    }
+}
+
+/// An interned immediate as a public scalar. No allocation.
+#[inline]
+pub(crate) fn interned_immediate(w: CelRef) -> Option<Value> {
+    match unsafe { w_kind(w) } {
+        CelKind::Int => Some(Value::Int(unsafe { (*w.cast::<W_IntObject>()).intval })),
+        CelKind::UInt => Some(Value::UInt(unsafe { (*w.cast::<W_UIntObject>()).uintval })),
+        CelKind::Double => Some(Value::Float(unsafe {
+            (*w.cast::<W_DoubleObject>()).floatval
+        })),
+        CelKind::Bool => Some(Value::Bool(
+            unsafe { (*w.cast::<W_BoolObject>()).boolval } != 0,
+        )),
+        CelKind::Null => Some(Value::Null),
+        _ => None,
+    }
+}
+
+/// An interned container, string or bytes that still has its bind-time
+/// public handle: one Arc clone, no rebuild.
+#[inline]
+pub(crate) fn interned_linked(w: CelRef) -> Option<Value> {
+    unsafe {
+        match w_kind(w) {
+            CelKind::List => {
+                let leaf = &*w.cast::<W_ListObject>();
+                ListRef::clone_from_public(leaf.public).map(|buf| {
+                    Value::List(ListRef::from_linked(
+                        buf,
+                        leaf.public_start,
+                        leaf.public_len,
+                    ))
+                })
+            }
+            CelKind::Map => {
+                let leaf = &*w.cast::<W_MapObject>();
+                linked_public_map(leaf).map(Value::Map)
+            }
+            CelKind::Str => {
+                let leaf = &*w.cast::<W_StringObject>();
+                clone_arc(leaf.public as *const String).map(Value::String)
+            }
+            CelKind::Bytes => {
+                let leaf = &*w.cast::<W_BytesObject>();
+                clone_arc(leaf.public as *const Vec<u8>).map(Value::Bytes)
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Public form of `w`. Immediates and linked handles do not allocate;
+/// everything else rebuilds through [`ref_to_value`].
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+#[inline]
+pub fn interned_to_public(w: CelRef) -> Value {
+    interned_immediate(w)
+        .or_else(|| interned_linked(w))
+        .unwrap_or_else(|| match unsafe { ref_to_value(w) } {
+            Ok(Value::Interned(_)) => Value::Null,
+            Ok(v) => v,
+            Err(_) => Value::Null,
+        })
+}
+
+/// Intern `v` onto a class-family leaf.
+///
+/// A duration or timestamp whose instant does not fit i64 nanoseconds has no
+/// leaf and stays public: `None` here is that case, not an error and not a
+/// truncation.
+pub fn intern_leaf(v: &Value) -> Option<CelRef> {
+    match v {
+        Value::Interned(w) => {
+            if super::heap::is_forcing_old() && super::heap::is_young(*w as *const u8) {
+                intern_leaf(&Value::from_interned(*w).unpack())
+            } else {
+                Some(*w)
+            }
+        }
+        Value::Int(i) => Some(new_int(*i) as CelRef),
+        Value::UInt(u) => Some(new_uint(*u) as CelRef),
+        Value::Float(f) => Some(new_double(*f) as CelRef),
+        Value::Bool(b) => Some(new_bool(*b) as CelRef),
+        Value::Null => Some(new_null() as CelRef),
+        Value::String(s) => Some(new_string(s) as CelRef),
+        Value::Bytes(b) => Some(new_bytes(b) as CelRef),
+        Value::List(_) => value_to_ref(v).ok(),
+        Value::Map(_) => value_to_ref(v).ok(),
+        Value::Opaque(opaque) if opaque.downcast_ref::<OptionalValue>().is_some() => {
+            value_to_ref(v).ok()
+        }
+        Value::Opaque(opaque) => opaque
+            .downcast_ref::<TypeValue>()
+            .and_then(type_class)
+            .map(|cls| new_type(cls) as CelRef)
+            .or_else(|| Some(intern_host_opaque(opaque))),
+        #[cfg(feature = "chrono")]
+        Value::Duration(d) => d.num_nanoseconds().map(|n| new_duration(n) as CelRef),
+        #[cfg(feature = "chrono")]
+        Value::Timestamp(ts) => ts
+            .timestamp_nanos_opt()
+            .map(|n| new_timestamp(n, i64::from(ts.offset().local_minus_utc())) as CelRef),
+        #[cfg(feature = "structs")]
+        Value::Struct(_) => value_to_ref(v).ok(),
+    }
+}
+
+/// Allocate the internal form of `v` on this thread's heap.
+pub fn value_to_ref(v: &Value) -> Result<CelRef, ConvertError> {
+    match v {
+        Value::Interned(w) => {
+            intern_leaf(&Value::Interned(*w)).ok_or(ConvertError::Corrupt("interned"))
+        }
+        Value::Int(i) => Ok(new_int(*i) as CelRef),
+        Value::UInt(u) => Ok(new_uint(*u) as CelRef),
+        Value::Float(f) => Ok(new_double(*f) as CelRef),
+        Value::Bool(b) => Ok(new_bool(*b) as CelRef),
+        Value::Null => Ok(new_null() as CelRef),
+        Value::String(s) => Ok(new_string(s) as CelRef),
+        Value::Bytes(b) => Ok(new_bytes(b) as CelRef),
+        Value::List(list) => Ok(intern_list(list)),
+        Value::Map(map) => Ok(intern_map(map)?),
+        #[cfg(feature = "structs")]
+        Value::Struct(s) => {
+            let name = new_string(s.name());
+            let fields = s.field_values();
+            let mut pairs = Vec::with_capacity(fields.len());
+            for (fname, fval) in fields.iter() {
+                pairs.push((new_string(fname) as CelRef, value_to_ref(fval)?));
+            }
+            Ok(new_struct(name, &pairs) as CelRef)
+        }
+        Value::Opaque(opaque) => {
+            if let Some(opt) = opaque.downcast_ref::<OptionalValue>() {
+                return match opt.value() {
+                    None => Ok(new_optional_none() as CelRef),
+                    Some(inner) => Ok(new_optional(value_to_ref(inner)?) as CelRef),
+                };
+            }
+            if let Some(tv) = opaque.downcast_ref::<TypeValue>() {
+                if let Some(cls) = type_class(tv) {
+                    return Ok(new_type(cls) as CelRef);
+                }
+            }
+            Ok(intern_host_opaque(opaque))
+        }
+        #[cfg(feature = "chrono")]
+        Value::Duration(d) => {
+            let nanos = d
+                .num_nanoseconds()
+                .ok_or(ConvertError::Unsupported("duration"))?;
+            Ok(new_duration(nanos) as CelRef)
+        }
+        #[cfg(feature = "chrono")]
+        Value::Timestamp(ts) => {
+            let nanos = ts
+                .timestamp_nanos_opt()
+                .ok_or(ConvertError::Unsupported("timestamp"))?;
+            Ok(new_timestamp(nanos, i64::from(ts.offset().local_minus_utc())) as CelRef)
+        }
+    }
+}
+
+/// Read `w` back as the public [`Value`].
+///
+/// # Safety
+///
+/// `w` must point at a live object this thread's heap still owns.
+pub unsafe fn ref_to_value(w: CelRef) -> Result<Value, ConvertError> {
+    if w.is_null() {
+        return Err(ConvertError::Corrupt("null pointer"));
+    }
+    let kind = unsafe { w_kind(w) };
+    let class = unsafe { w_type(w) };
+    match kind {
+        CelKind::Int if class == &CEL_INT_CLASS => {
+            Ok(Value::Int(unsafe { (*w.cast::<W_IntObject>()).intval }))
+        }
+        CelKind::UInt if class == &CEL_UINT_CLASS => {
+            Ok(Value::UInt(unsafe { (*w.cast::<W_UIntObject>()).uintval }))
+        }
+        CelKind::Double if class == &CEL_DOUBLE_CLASS => Ok(Value::Float(unsafe {
+            (*w.cast::<W_DoubleObject>()).floatval
+        })),
+        CelKind::Bool if class == &CEL_BOOL_CLASS => Ok(Value::Bool(
+            unsafe { (*w.cast::<W_BoolObject>()).boolval } != 0,
+        )),
+        CelKind::Null if class == &CEL_NULL_CLASS => Ok(Value::Null),
+        CelKind::Str if class == &CEL_STRING_CLASS => {
+            let leaf = unsafe { &*w.cast::<W_StringObject>() };
+            Ok(Value::String(string_from_leaf(leaf)?))
+        }
+        CelKind::Bytes if class == &CEL_BYTES_CLASS => {
+            let leaf = unsafe { &*w.cast::<W_BytesObject>() };
+            Ok(Value::Bytes(bytes_from_leaf(leaf)?))
+        }
+        CelKind::List if class == &CEL_LIST_CLASS => Ok(Value::List(unsafe { list_from_ref(w)? })),
+        CelKind::Map if class == &CEL_MAP_CLASS => Ok(Value::Map(unsafe { map_from_ref(w)? })),
+        #[cfg(feature = "structs")]
+        CelKind::Struct if class == &CEL_STRUCT_CLASS => {
+            let leaf = unsafe { &*w.cast::<W_StructObject>() };
+            let name = string_from_ref(leaf.name as CelRef)?;
+            let n = leaf.length as usize;
+            let base = unsafe { items_block_items_base(leaf.fields) };
+            if base.is_null() && n != 0 {
+                return Err(ConvertError::Corrupt("struct"));
+            }
+            let mut s = CelStruct::new((*name).clone());
+            for i in 0..n {
+                let fname = unsafe { string_from_ref(*base.add(2 * i))? };
+                let fval = unsafe { ref_to_value(*base.add(2 * i + 1))? };
+                s.add_field_value((*fname).clone(), fval);
+            }
+            Ok(Value::Struct(Arc::new(s)))
+        }
+        CelKind::Optional if class == &CEL_OPTIONAL_CLASS => {
+            let inner = unsafe { (*w.cast::<W_OptionalObject>()).w_value };
+            let opt = if inner.is_null() {
+                OptionalValue::none()
+            } else {
+                OptionalValue::of(unsafe { ref_to_value(inner)? })
+            };
+            Ok(Value::Opaque(Arc::new(opt)))
+        }
+        CelKind::Type if class == &CEL_TYPE_CLASS => {
+            let denoted = unsafe { (*w.cast::<W_TypeObject>()).cls };
+            let ty = type_from_class(denoted).ok_or(ConvertError::Unsupported("type"))?;
+            Ok(Value::Opaque(Arc::new(TypeValue::new(ty))))
+        }
+        CelKind::Opaque if class == &CEL_OPAQUE_CLASS => {
+            let idx = unsafe { opaque_host_index(w) };
+            host_opaque(idx)
+                .map(Value::Opaque)
+                .ok_or(ConvertError::Corrupt("opaque"))
+        }
+        #[cfg(feature = "chrono")]
+        CelKind::Duration if class == &CEL_DURATION_CLASS => {
+            let nanos = unsafe { (*w.cast::<W_DurationObject>()).nanos };
+            Ok(Value::Duration(chrono::Duration::nanoseconds(nanos)))
+        }
+        #[cfg(feature = "chrono")]
+        CelKind::Timestamp if class == &CEL_TIMESTAMP_CLASS => {
+            let leaf = unsafe { &*w.cast::<W_TimestampObject>() };
+            let off = chrono::FixedOffset::east_opt(leaf.off_s as i32)
+                .ok_or(ConvertError::Corrupt("timestamp"))?;
+            let utc = chrono::DateTime::from_timestamp_nanos(leaf.nanos);
+            Ok(Value::Timestamp(utc.with_timezone(&off)))
+        }
+        _ => Err(ConvertError::Unsupported("class")),
+    }
+}
+
+fn type_class(tv: &TypeValue) -> Option<&'static CelClass> {
+    match tv.cel_type().kind() {
+        Kind::Int => Some(&CEL_INT_CLASS),
+        Kind::UInt => Some(&CEL_UINT_CLASS),
+        Kind::Double => Some(&CEL_DOUBLE_CLASS),
+        Kind::Boolean => Some(&CEL_BOOL_CLASS),
+        Kind::String => Some(&CEL_STRING_CLASS),
+        Kind::Bytes => Some(&CEL_BYTES_CLASS),
+        Kind::NullType => Some(&CEL_NULL_CLASS),
+        Kind::List => Some(&CEL_LIST_CLASS),
+        Kind::Map => Some(&CEL_MAP_CLASS),
+        Kind::Type => Some(&CEL_TYPE_CLASS),
+        Kind::Opaque if tv.name() == "optional_type" => Some(&CEL_OPTIONAL_CLASS),
+        #[cfg(feature = "chrono")]
+        Kind::Duration => Some(&CEL_DURATION_CLASS),
+        #[cfg(feature = "chrono")]
+        Kind::Timestamp => Some(&CEL_TIMESTAMP_CLASS),
+        _ => None,
+    }
+}
+
+fn type_from_class(cls: *const CelClass) -> Option<Type> {
+    if std::ptr::eq(cls, &CEL_INT_CLASS) {
+        return Some(INT_TYPE.to_owned());
+    }
+    if std::ptr::eq(cls, &CEL_UINT_CLASS) {
+        return Some(UINT_TYPE.to_owned());
+    }
+    if std::ptr::eq(cls, &CEL_DOUBLE_CLASS) {
+        return Some(DOUBLE_TYPE.to_owned());
+    }
+    if std::ptr::eq(cls, &CEL_BOOL_CLASS) {
+        return Some(BOOL_TYPE.to_owned());
+    }
+    if std::ptr::eq(cls, &CEL_STRING_CLASS) {
+        return Some(STRING_TYPE.to_owned());
+    }
+    if std::ptr::eq(cls, &CEL_BYTES_CLASS) {
+        return Some(BYTES_TYPE.to_owned());
+    }
+    if std::ptr::eq(cls, &CEL_NULL_CLASS) {
+        return Some(NULL_TYPE.to_owned());
+    }
+    if std::ptr::eq(cls, &CEL_LIST_CLASS) {
+        return Some(LIST_TYPE.to_owned());
+    }
+    if std::ptr::eq(cls, &CEL_MAP_CLASS) {
+        return Some(MAP_TYPE.to_owned());
+    }
+    if std::ptr::eq(cls, &CEL_TYPE_CLASS) {
+        return Some(TYPE_TYPE.to_owned());
+    }
+    if std::ptr::eq(cls, &CEL_OPTIONAL_CLASS) {
+        return Some(OPTIONAL_TYPE.to_owned());
+    }
+    if std::ptr::eq(cls, &CEL_OPAQUE_CLASS) {
+        return Some(crate::common::types::Type::new_opaque_type("opaque"));
+    }
+    #[cfg(feature = "chrono")]
+    if std::ptr::eq(cls, &CEL_DURATION_CLASS) {
+        return Some(DURATION_TYPE.to_owned());
+    }
+    #[cfg(feature = "chrono")]
+    if std::ptr::eq(cls, &CEL_TIMESTAMP_CLASS) {
+        return Some(TIMESTAMP_TYPE.to_owned());
+    }
+    None
+}
+
+fn intern_list(list: &ListRef) -> CelRef {
+    if let Some(values) = list.ints_slice() {
+        let start = list.window_start();
+        let end = start + list.len();
+        new_list_ints(&values[start..end]) as CelRef
+    } else if list.is_whole() && list.object_slice().is_some() {
+        if let Some(ints) = object_list_as_ints(list) {
+            return new_list_ints(&ints) as CelRef;
+        }
+        let mut items = Vec::with_capacity(list.len());
+        for elt in list.iter() {
+            items.push(value_to_ref(&elt).unwrap_or_else(|_| new_null() as CelRef));
+        }
+        new_list(&items) as CelRef
+    } else {
+        let host = intern_host_any(Box::new(list.clone()));
+        new_list_window(host, 0, list.len() as i64) as CelRef
+    }
+}
+
+/// All-int object lists become an int column. Empty lists and the first
+/// non-int stop the scan and keep object storage.
+fn object_list_as_ints(list: &ListRef) -> Option<Vec<i64>> {
+    if list.is_empty() {
+        return None;
+    }
+    let mut ints = Vec::with_capacity(list.len());
+    for elt in list.iter() {
+        ints.push(value_as_int(&elt)?);
+    }
+    Some(ints)
+}
+
+fn value_as_int(v: &Value) -> Option<i64> {
+    match v {
+        Value::Int(i) => Some(*i),
+        Value::Interned(w) if unsafe { w_kind(*w) } == CelKind::Int => {
+            Some(unsafe { (*w.cast::<W_IntObject>()).intval })
+        }
+        _ => None,
+    }
+}
+
+/// Record a non-owning link from an interned leaf back to the public
+/// handle it was wrapped from. The caller keeps that handle alive.
+pub(crate) fn link_public_handle(w: CelRef, value: &Value) {
+    unsafe {
+        match value {
+            Value::List(list) => {
+                if w_kind(w) != CelKind::List {
+                    return;
+                }
+                let leaf = &mut *w.cast::<W_ListObject>();
+                leaf.public = list.public_ptr();
+                leaf.public_start = list.window_start() as u32;
+                leaf.public_len = list.len() as u32;
+            }
+            Value::Map(map) => {
+                if w_kind(w) != CelKind::Map {
+                    return;
+                }
+                let leaf = &mut *w.cast::<W_MapObject>();
+                if let Some(arc) = map.object_arc() {
+                    leaf.public = Arc::as_ptr(arc) as *const ();
+                    leaf.public_kind = MAP_PUBLIC_OBJECT;
+                    leaf.public_len = 0;
+                } else if let Some(arc) = map.entries_arc() {
+                    let n = arc.len();
+                    if n > u32::MAX as usize {
+                        return;
+                    }
+                    leaf.public = Arc::as_ptr(arc) as *const (Key, Value) as *const ();
+                    leaf.public_kind = MAP_PUBLIC_ENTRIES;
+                    leaf.public_len = n as u32;
+                }
+            }
+            Value::String(s) => {
+                if w_kind(w) != CelKind::Str {
+                    return;
+                }
+                (*w.cast::<W_StringObject>()).public = Arc::as_ptr(s) as *const ();
+            }
+            Value::Bytes(b) => {
+                if w_kind(w) != CelKind::Bytes {
+                    return;
+                }
+                (*w.cast::<W_BytesObject>()).public = Arc::as_ptr(b) as *const ();
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Increment the strong count of the `Arc` behind `ptr` and return a new
+/// handle. `ptr` is `Arc::as_ptr` of a live allocation.
+#[inline]
+unsafe fn clone_arc<T>(ptr: *const T) -> Option<Arc<T>> {
+    if ptr.is_null() {
+        return None;
+    }
+    unsafe {
+        Arc::increment_strong_count(ptr);
+        Some(Arc::from_raw(ptr))
+    }
+}
+
+/// Integers of an object-strategy list, or `None` if any element is not an
+/// interned int. The public form of a literal `[1, 2, 3]` is this buffer
+/// rather than a `Vec<Value>` rebuilt element by element.
+#[inline(never)]
+unsafe fn interned_object_list_ints(leaf: &W_ListObject) -> Option<ListRef> {
+    let n = leaf.length as usize;
+    if n == 0 {
+        return None;
+    }
+    let base = items_block_items_base(leaf.items);
+    if base.is_null() {
+        return None;
+    }
+    let start = leaf.start as usize;
+    // A nested list or map as the first element is the common miss: do not
+    // allocate the int buffer before that is known.
+    let first = unsafe { *base.add(start) };
+    if first.is_null() || unsafe { w_kind(first) } != CelKind::Int {
+        return None;
+    }
+    ListRef::try_fill_ints::<()>(n, |i| {
+        let item = unsafe { *base.add(start + i) };
+        if item.is_null() || unsafe { w_kind(item) } != CelKind::Int {
+            return Err(());
+        }
+        Ok(Some(unsafe { (*item.cast::<W_IntObject>()).intval }))
+    })
+    .ok()
+}
+
+unsafe fn list_from_ref(w: CelRef) -> Result<ListRef, ConvertError> {
+    let leaf = &*w.cast::<W_ListObject>();
+    if let Some(buf) = unsafe { ListRef::clone_from_public(leaf.public) } {
+        return Ok(ListRef::from_linked(
+            buf,
+            leaf.public_start,
+            leaf.public_len,
+        ));
+    }
+    match leaf.strategy {
+        ListStrategy::Object => {
+            if let Some(ints) = interned_object_list_ints(leaf) {
+                return Ok(ints);
+            }
+            let n = leaf.length as usize;
+            let base = items_block_items_base(leaf.items);
+            if base.is_null() && n != 0 {
+                return Err(ConvertError::Corrupt("list"));
+            }
+            let start = leaf.start as usize;
+            ListRef::try_fill_values(n, |i| {
+                Ok(Some(unsafe { ref_to_value(*base.add(start + i))? }))
+            })
+        }
+        ListStrategy::Ints => {
+            if leaf.storage.is_null() {
+                return Ok(ListRef::from(Vec::new()));
+            }
+            let col = &*leaf.storage.cast::<W_IntColumn>();
+            let start = leaf.start as usize;
+            let n = leaf.length as usize;
+            if n == 0 || col.data.is_null() {
+                if n != 0 {
+                    return Err(ConvertError::Corrupt("list"));
+                }
+                return ListRef::try_fill_ints::<ConvertError>(0, |_| Ok(None));
+            }
+            let ints = unsafe { std::slice::from_raw_parts(col.data.add(start), n) };
+            ListRef::try_fill_ints(n, |i| Ok(Some(ints[i])))
+        }
+        ListStrategy::Window => {
+            host_list_ref(opaque_host_index(leaf.storage)).ok_or(ConvertError::Corrupt("list"))
+        }
+    }
+}
+
+/// An interned leaf as a map [`KeyRef`], or `None` if it cannot be a map key.
+///
+/// # Safety
+///
+/// `w` is a live value.
+pub unsafe fn interned_as_keyref<'a>(w: CelRef) -> Option<KeyRef<'a>> {
+    match w_kind(w) {
+        CelKind::Int => Some(KeyRef::Int((*w.cast::<W_IntObject>()).intval)),
+        CelKind::UInt => Some(KeyRef::Uint((*w.cast::<W_UIntObject>()).uintval)),
+        CelKind::Bool => Some(KeyRef::Bool((*w.cast::<W_BoolObject>()).boolval != 0)),
+        CelKind::Str => super::object::string_as_str(w).map(KeyRef::String),
+        _ => None,
+    }
+}
+
+unsafe fn interned_object_get_exact(w: CelRef, needle: KeyRef<'_>) -> Option<CelRef> {
+    let leaf = &*w.cast::<W_MapObject>();
+    if leaf.strategy != MapStrategy::Object {
+        return None;
+    }
+    let n = leaf.length as usize;
+    let base = items_block_items_base(leaf.items);
+    if base.is_null() {
+        return None;
+    }
+    let mut i = 0;
+    while i < n {
+        let k = *base.add(2 * i);
+        if interned_key_eq(k, needle) {
+            return Some(*base.add(2 * i + 1));
+        }
+        i += 1;
+    }
+    None
+}
+
+#[inline]
+unsafe fn interned_key_eq(w: CelRef, needle: KeyRef<'_>) -> bool {
+    match needle {
+        KeyRef::Int(i) => w_kind(w) == CelKind::Int && (*w.cast::<W_IntObject>()).intval == i,
+        KeyRef::Uint(u) => w_kind(w) == CelKind::UInt && (*w.cast::<W_UIntObject>()).uintval == u,
+        KeyRef::Bool(b) => {
+            w_kind(w) == CelKind::Bool && ((*w.cast::<W_BoolObject>()).boolval != 0) == b
+        }
+        KeyRef::String(s) => super::object::string_eq_str(w, s),
+    }
+}
+
+/// Look up `needle` on an interned map with the walker's exact-then-cross-type
+/// rule ([`map_get_by_key`]).
+///
+/// # Safety
+///
+/// `w` is a live [`W_MapObject`].
+pub unsafe fn interned_map_get(w: CelRef, needle: KeyRef<'_>) -> Option<CelRef> {
+    let leaf = &*w.cast::<W_MapObject>();
+    match leaf.strategy {
+        MapStrategy::Object => map_get_by_key(|k| interned_object_get_exact(w, k), needle),
+        MapStrategy::Record => {
+            let map = host_map(opaque_host_index(leaf.storage))?;
+            intern_leaf(map.get(&needle)?.as_ref())
+        }
+    }
+}
+
+/// `in` on an interned map: exact `Key` ([`map_has_exact_key`]), the same
+/// probe [`crate::objects::Map::contains_key`] uses.
+///
+/// # Safety
+///
+/// `w` is a live [`W_MapObject`].
+#[inline(never)]
+pub unsafe fn interned_map_contains(w: CelRef, needle: KeyRef<'_>) -> bool {
+    let leaf = &*w.cast::<W_MapObject>();
+    match leaf.strategy {
+        MapStrategy::Object => {
+            map_has_exact_key(|k| interned_object_get_exact(w, k).is_some(), needle)
+        }
+        MapStrategy::Record => host_map(opaque_host_index(leaf.storage))
+            .map(|m| m.contains_key(&needle))
+            .unwrap_or(false),
+    }
+}
+
+/// Look up a string field on an interned map, including record-row strategy.
+///
+/// # Safety
+///
+/// `w` is a live [`W_MapObject`].
+pub unsafe fn interned_map_lookup_string(w: CelRef, field: &str) -> Option<CelRef> {
+    interned_map_get(w, KeyRef::String(field))
+}
+
+/// Item `index` of an interned list, including int-column and window strategies.
+///
+/// # Safety
+///
+/// `w` is a live [`W_ListObject`].
+pub unsafe fn interned_list_get(w: CelRef, index: i64) -> Option<CelRef> {
+    let leaf = &*w.cast::<W_ListObject>();
+    if leaf.strategy != ListStrategy::Window {
+        return super::object::list_get(w, index);
+    }
+    if index < 0 || index >= leaf.length {
+        return None;
+    }
+    let list = host_list_ref(opaque_host_index(leaf.storage))?;
+    intern_leaf(&list.get(index as usize)?)
+}
+
+fn intern_map(map: &Map) -> Result<CelRef, ConvertError> {
+    match map.storage() {
+        MapStorage::Object(_) | MapStorage::Entries(_) => Ok(new_map(&map_pairs(map)?) as CelRef),
+        MapStorage::Record { .. } => {
+            let host = intern_host_any(Box::new(map.clone()));
+            Ok(new_map_record(host, map.len() as i64) as CelRef)
+        }
+    }
+}
+
+/// `W_MapObject::public` addresses a [`HashMap<Key, Value>`].
+const MAP_PUBLIC_OBJECT: u32 = 0;
+/// `W_MapObject::public` is the data pointer of an `Arc<[(Key, Value)]>`;
+/// [`W_MapObject::public_len`] is the slice length.
+const MAP_PUBLIC_ENTRIES: u32 = 1;
+
+unsafe fn linked_public_map(leaf: &W_MapObject) -> Option<Map> {
+    if leaf.public.is_null() {
+        return None;
+    }
+    if leaf.public_kind == MAP_PUBLIC_ENTRIES {
+        clone_arc_slice(leaf.public as *const (Key, Value), leaf.public_len as usize)
+            .map(Map::from_linked_entries)
+    } else {
+        clone_arc(leaf.public as *const HashMap<Key, Value>).map(Map::object)
+    }
+}
+
+/// Rebuild an `Arc<[T]>` from the data pointer stored in a leaf and the
+/// leaf's length word.
+///
+/// # Safety
+///
+/// `data` is `Arc::as_ptr` of a live `Arc<[T]>` of length `len`, and that
+/// `Arc` outlives this increment.
+unsafe fn clone_arc_slice<T>(data: *const T, len: usize) -> Option<Arc<[T]>> {
+    if data.is_null() {
+        return None;
+    }
+    let fat = std::ptr::slice_from_raw_parts(data, len);
+    unsafe {
+        Arc::increment_strong_count(fat);
+        Some(Arc::from_raw(fat))
+    }
+}
+
+unsafe fn map_from_ref(w: CelRef) -> Result<Map, ConvertError> {
+    let leaf = &*w.cast::<W_MapObject>();
+    if let Some(map) = linked_public_map(leaf) {
+        return Ok(map);
+    }
+    match leaf.strategy {
+        MapStrategy::Object => {
+            let n = leaf.length as usize;
+            let base = items_block_items_base(leaf.items);
+            if base.is_null() && n != 0 {
+                return Err(ConvertError::Corrupt("map"));
+            }
+            try_build_map::<_, false>(n, |i| {
+                let key = unsafe { ref_to_key(*base.add(2 * i))? };
+                let value = unsafe { ref_to_value(*base.add(2 * i + 1))? };
+                Ok(Some((key, value)))
+            })
+        }
+        MapStrategy::Record => {
+            host_map(opaque_host_index(leaf.storage)).ok_or(ConvertError::Corrupt("map"))
+        }
+    }
+}
+
+fn host_map(idx: i64) -> Option<Map> {
+    super::heap::with_heap(|h| {
+        h.with_host(idx, |any| any.downcast_ref::<Map>().cloned())
+            .flatten()
+    })
+}
+
+fn intern_host_any(host: Box<dyn std::any::Any>) -> CelRef {
+    let idx = super::heap::with_heap(|h| h.push_host(host));
+    new_opaque(new_type(&CEL_OPAQUE_CLASS) as CelRef, idx) as CelRef
+}
+
+fn host_list_ref(idx: i64) -> Option<ListRef> {
+    super::heap::with_heap(|h| {
+        h.with_host(idx, |any| any.downcast_ref::<ListRef>().cloned())
+            .flatten()
+    })
+}
+
+/// Park `host` in this thread's heap table and return a [`W_OpaqueObject`].
+fn intern_host_opaque(host: &Arc<dyn Opaque>) -> CelRef {
+    let idx = super::heap::with_heap(|h| h.push_host(Box::new(host.clone())));
+    new_opaque(new_type(&CEL_OPAQUE_CLASS) as CelRef, idx) as CelRef
+}
+
+/// The host parked at `idx`, if that slot still holds an [`Opaque`].
+pub(crate) fn host_opaque(idx: i64) -> Option<Arc<dyn Opaque>> {
+    super::heap::with_heap(|h| {
+        h.with_host(idx, |any| any.downcast_ref::<Arc<dyn Opaque>>().cloned())
+            .flatten()
+    })
+}
+
+/// Structural equality of two host-table slots. Sequential borrows so the
+/// table's `RefCell` is not held twice.
+pub(crate) fn opaque_hosts_equal(a: i64, b: i64) -> bool {
+    match (host_opaque(a), host_opaque(b)) {
+        (Some(left), Some(right)) => left.opaque_eq(right.as_ref()),
+        _ => false,
+    }
+}
+
+fn key_to_ref(k: &Key) -> CelRef {
+    match k {
+        Key::Int(i) => new_int(*i) as CelRef,
+        Key::Uint(u) => new_uint(*u) as CelRef,
+        Key::Bool(b) => new_bool(*b) as CelRef,
+        Key::String(s) => new_string(s) as CelRef,
+    }
+}
+
+fn map_pairs(map: &Map) -> Result<Vec<(CelRef, CelRef)>, ConvertError> {
+    match map.storage() {
+        MapStorage::Object(_) | MapStorage::Entries(_) => {
+            let mut pairs = Vec::with_capacity(map.len());
+            for (k, v) in map.iter() {
+                pairs.push((key_to_ref(k), value_to_ref(v.as_ref())?));
+            }
+            Ok(pairs)
+        }
+        // Record is a batch encoding, not a second class-family strategy:
+        // explode it at this boundary into the same interleaved pairs.
+        MapStorage::Record { .. } => {
+            let exploded = map.to_hashmap();
+            let mut pairs = Vec::with_capacity(exploded.len());
+            for (k, v) in exploded.iter() {
+                pairs.push((key_to_ref(k), value_to_ref(v)?));
+            }
+            Ok(pairs)
+        }
+    }
+}
+
+fn string_from_leaf(leaf: &W_StringObject) -> Result<Arc<String>, ConvertError> {
+    if let Some(s) = unsafe { clone_arc(leaf.public as *const String) } {
+        return Ok(s);
+    }
+    let n = leaf.byte_len as usize;
+    let base = unsafe { bytes_base(leaf.chars) };
+    if base.is_null() && n != 0 {
+        return Err(ConvertError::Corrupt("string"));
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(base, n) };
+    let s = std::str::from_utf8(bytes).map_err(|_| ConvertError::Corrupt("string"))?;
+    Ok(Arc::new(s.to_string()))
+}
+
+fn bytes_from_leaf(leaf: &W_BytesObject) -> Result<Arc<Vec<u8>>, ConvertError> {
+    if let Some(b) = unsafe { clone_arc(leaf.public as *const Vec<u8>) } {
+        return Ok(b);
+    }
+    let n = leaf.length as usize;
+    let base = unsafe { bytes_base(leaf.data) };
+    if base.is_null() && n != 0 {
+        return Err(ConvertError::Corrupt("bytes"));
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(base, n) };
+    Ok(Arc::new(bytes.to_vec()))
+}
+
+#[cfg(feature = "structs")]
+fn string_from_ref(w: CelRef) -> Result<Arc<String>, ConvertError> {
+    if w.is_null() || unsafe { w_type(w) } != &CEL_STRING_CLASS {
+        return Err(ConvertError::Corrupt("string"));
+    }
+    string_from_leaf(unsafe { &*w.cast::<W_StringObject>() })
+}
+
+fn ref_to_key(w: CelRef) -> Result<Key, ConvertError> {
+    if w.is_null() {
+        return Err(ConvertError::Corrupt("map key"));
+    }
+    match unsafe { w_kind(w) } {
+        CelKind::Int => Ok(Key::Int(unsafe { (*w.cast::<W_IntObject>()).intval })),
+        CelKind::UInt => Ok(Key::Uint(unsafe { (*w.cast::<W_UIntObject>()).uintval })),
+        CelKind::Bool => Ok(Key::Bool(
+            unsafe { (*w.cast::<W_BoolObject>()).boolval } != 0,
+        )),
+        CelKind::Str => {
+            let leaf = unsafe { &*w.cast::<W_StringObject>() };
+            Ok(Key::String(string_from_leaf(leaf)?))
+        }
+        _ => Err(ConvertError::Corrupt("map key")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::objects::MapEntries;
+    use crate::runtime::object::{map_try_insert, new_map_with_capacity};
+
+    fn roundtrip(v: Value) -> Value {
+        let w = value_to_ref(&v).expect("to_ref");
+        unsafe { ref_to_value(w) }.expect("to_value")
+    }
+
+    #[test]
+    fn public_scalars_roundtrip() {
+        for v in [
+            Value::Int(-3),
+            Value::UInt(9),
+            Value::Float(1.5),
+            Value::Bool(true),
+            Value::Bool(false),
+            Value::Null,
+            Value::String(Arc::new("hi".into())),
+            Value::Bytes(Arc::new(b"xy".to_vec())),
+        ] {
+            assert_eq!(roundtrip(v.clone()), v, "{v:?}");
+        }
+    }
+
+    #[test]
+    fn interned_object_list_of_ints_matches_public_ints() {
+        let w = new_list(&[
+            new_int(1) as CelRef,
+            new_int(2) as CelRef,
+            new_int(3) as CelRef,
+        ]);
+        let v = interned_to_public(w as CelRef);
+        assert_eq!(
+            v,
+            Value::List(ListRef::whole(Arc::new(ListStorage::Ints(vec![1, 2, 3]))))
+        );
+    }
+
+    #[test]
+    fn nested_object_list_finish_rebuilds_each_inner() {
+        let inner = new_list(&[new_int(15) as CelRef]);
+        let outer = new_list(&[inner as CelRef]);
+        let v = interned_to_public(outer as CelRef);
+        assert_eq!(
+            v,
+            Value::list(vec![Value::List(ListRef::whole(Arc::new(
+                ListStorage::Ints(vec![15])
+            )))])
+        );
+    }
+
+    #[test]
+    fn intern_leaf_is_the_prebuilt_for_bool_null_and_small_int() {
+        assert_eq!(
+            intern_leaf(&Value::Bool(true)),
+            Some(new_bool(true) as CelRef)
+        );
+        assert_eq!(intern_leaf(&Value::Null), Some(new_null() as CelRef));
+        assert_eq!(intern_leaf(&Value::Int(3)), Some(new_int(3) as CelRef));
+        assert!(intern_leaf(&Value::String(Arc::new("x".into()))).is_some());
+        let list = Value::List(ListRef::from(vec![Value::Int(1)]));
+        assert!(intern_leaf(&list).is_some());
+        assert!(intern_leaf(&Value::UInt(3)).is_some());
+        assert!(intern_leaf(&Value::Float(1.5)).is_some());
+        let object = Value::Map(Map::object(Arc::new(
+            [(Key::String(Arc::new("a".into())), Value::Int(1))]
+                .into_iter()
+                .collect(),
+        )));
+        assert!(intern_leaf(&object).is_some());
+        let schema = Arc::new(crate::objects::RecordSchema::new(
+            vec![Key::String(Arc::new("a".into()))],
+            vec![crate::objects::ValueColumn::Scalar {
+                bank: crate::objects::ScalarBank::Int,
+                words: Arc::from([1i64]),
+            }],
+        ));
+        let record = Value::Map(Map::record(schema, 0));
+        let interned_record = intern_leaf(&record).expect("record-row intern");
+        assert_eq!(unsafe { w_kind(interned_record) }, CelKind::Map);
+        assert_eq!(roundtrip(record.clone()), record);
+        let ints = Value::List(ListRef::whole(Arc::new(ListStorage::Ints(vec![1, 2, 3]))));
+        let interned_ints = intern_leaf(&ints).expect("ints list intern");
+        assert_eq!(unsafe { w_kind(interned_ints) }, CelKind::List);
+        assert_eq!(roundtrip(ints.clone()), ints);
+        assert_eq!(Value::int(3).kind(), CelKind::Int);
+        assert_eq!(Value::int(3), Value::Int(3));
+        assert_eq!(Value::bool(true), Value::Bool(true));
+        assert_eq!(Value::null(), Value::Null);
+        let none = Value::Opaque(Arc::new(OptionalValue::none()));
+        assert!(intern_leaf(&none).is_some());
+        let int_ty = Value::Opaque(Arc::new(TypeValue::new(INT_TYPE.to_owned())));
+        let interned_ty = intern_leaf(&int_ty).expect("type intern");
+        assert_eq!(unsafe { w_kind(interned_ty) }, CelKind::Type);
+        assert_eq!(roundtrip(int_ty.clone()), int_ty);
+        let some = Value::Opaque(Arc::new(OptionalValue::of(Value::Int(4))));
+        assert!(intern_leaf(&some).is_some());
+        let host = Value::Opaque(Arc::new(HostId(7)));
+        let interned_host = intern_leaf(&host).expect("leftover opaque intern");
+        assert_eq!(unsafe { w_kind(interned_host) }, CelKind::Opaque);
+        assert_eq!(roundtrip(host.clone()), host);
+        assert!(unsafe { crate::runtime::binop::values_equal(interned_host, interned_host) });
+        let also = intern_leaf(&Value::Opaque(Arc::new(HostId(7)))).unwrap();
+        assert!(unsafe { crate::runtime::binop::values_equal(interned_host, also) });
+        let other = intern_leaf(&Value::Opaque(Arc::new(HostId(8)))).unwrap();
+        assert!(!unsafe { crate::runtime::binop::values_equal(interned_host, other) });
+        #[cfg(feature = "chrono")]
+        {
+            assert!(intern_leaf(&Value::Duration(chrono::Duration::seconds(1))).is_some());
+            assert!(intern_leaf(&Value::Timestamp(
+                chrono::DateTime::parse_from_rfc3339("2020-01-01T00:00:00Z").unwrap()
+            ))
+            .is_some());
+        }
+    }
+
+    #[test]
+    fn interned_string_and_list_add_roundtrip() {
+        let hello = intern_leaf(&Value::String(Arc::new("he".into()))).unwrap();
+        let lo = intern_leaf(&Value::String(Arc::new("llo".into()))).unwrap();
+        let joined = unsafe { crate::runtime::binop::cel_add(hello, lo) };
+        assert_eq!(
+            unsafe { ref_to_value(joined) }.unwrap(),
+            Value::String(Arc::new("hello".into()))
+        );
+        let a = intern_leaf(&Value::List(ListRef::from(vec![Value::Int(1)]))).unwrap();
+        let b = intern_leaf(&Value::List(ListRef::from(vec![Value::Int(2)]))).unwrap();
+        let cat = unsafe { crate::runtime::binop::cel_add(a, b) };
+        assert_eq!(
+            unsafe { ref_to_value(cat) }.unwrap(),
+            Value::List(ListRef::from(vec![Value::Int(1), Value::Int(2)]))
+        );
+        let ua = intern_leaf(&Value::UInt(2)).unwrap();
+        let ub = intern_leaf(&Value::UInt(3)).unwrap();
+        assert_eq!(
+            unsafe { ref_to_value(crate::runtime::binop::cel_add(ua, ub)) }.unwrap(),
+            Value::UInt(5)
+        );
+        let fa = intern_leaf(&Value::Float(1.5)).unwrap();
+        let fb = intern_leaf(&Value::Float(2.25)).unwrap();
+        assert_eq!(
+            unsafe { ref_to_value(crate::runtime::binop::cel_add(fa, fb)) }.unwrap(),
+            Value::Float(3.75)
+        );
+        let ma = intern_leaf(&object_map()).unwrap();
+        let mb = intern_leaf(&object_map()).unwrap();
+        assert_eq!(
+            unsafe { ref_to_value(crate::runtime::binop::cel_equals(ma, mb)) }.unwrap(),
+            Value::Bool(true)
+        );
+        let none = intern_leaf(&Value::Opaque(Arc::new(OptionalValue::none()))).unwrap();
+        let also_none = intern_leaf(&Value::Opaque(Arc::new(OptionalValue::none()))).unwrap();
+        assert_eq!(
+            unsafe { ref_to_value(crate::runtime::binop::cel_equals(none, also_none)) }.unwrap(),
+            Value::Bool(true)
+        );
+        #[cfg(feature = "chrono")]
+        {
+            let d1 = intern_leaf(&Value::Duration(chrono::Duration::seconds(1))).unwrap();
+            let d2 = intern_leaf(&Value::Duration(chrono::Duration::seconds(2))).unwrap();
+            assert_eq!(
+                unsafe { ref_to_value(crate::runtime::binop::cel_add(d1, d2)) }.unwrap(),
+                Value::Duration(chrono::Duration::seconds(3))
+            );
+        }
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct HostId(u64);
+
+    impl crate::objects::Opaque for HostId {
+        fn runtime_type_name(&self) -> &str {
+            "example.HostId"
+        }
+    }
+
+    fn object_map() -> Value {
+        Value::Map(Map::object(Arc::new(
+            [(Key::String(Arc::new("k".into())), Value::Int(1))]
+                .into_iter()
+                .collect(),
+        )))
+    }
+
+    #[test]
+    fn public_list_and_optional_roundtrip() {
+        let list = Value::List(ListRef::from(vec![Value::Int(1), Value::Int(2)]));
+        assert_eq!(roundtrip(list.clone()), list);
+        let none = Value::Opaque(Arc::new(OptionalValue::none()));
+        assert_eq!(roundtrip(none.clone()), none);
+        let some = Value::Opaque(Arc::new(OptionalValue::of(Value::Int(4))));
+        assert_eq!(roundtrip(some.clone()), some);
+    }
+
+    #[test]
+    fn public_map_roundtrip() {
+        use crate::objects::{RecordSchema, ScalarBank, ValueColumn};
+
+        let empty = Value::Map(Map::object(Arc::new(HashMap::new())));
+        assert_eq!(roundtrip(empty.clone()), empty);
+
+        let mut entries = HashMap::new();
+        entries.insert(Key::Int(1), Value::String(Arc::new("one".into())));
+        entries.insert(Key::Uint(2), Value::Int(2));
+        entries.insert(Key::Bool(true), Value::Bool(false));
+        entries.insert(Key::String(Arc::new("k".into())), Value::UInt(3));
+        let object = Value::Map(Map::object(Arc::new(entries)));
+        assert_eq!(roundtrip(object.clone()), object);
+
+        let schema = Arc::new(RecordSchema::new(
+            vec![Key::from("a"), Key::Int(7)],
+            vec![
+                ValueColumn::Scalar {
+                    bank: ScalarBank::Int,
+                    words: Arc::from([42i64]),
+                },
+                ValueColumn::Scalar {
+                    bank: ScalarBank::Bool,
+                    words: Arc::from([1i64]),
+                },
+            ],
+        ));
+        let record = Value::Map(Map::record(schema, 0));
+        assert_eq!(roundtrip(record.clone()), record);
+    }
+
+    #[cfg(feature = "structs")]
+    #[test]
+    fn public_struct_roundtrip() {
+        let mut s = CelStruct::new("cel.Problem".into());
+        s.add_field_value("answer".into(), Value::Int(42));
+        s.add_field_value("solved".into(), Value::Bool(true));
+        let v = Value::Struct(Arc::new(s));
+        let back = roundtrip(v.clone());
+        match (v, back) {
+            (Value::Struct(a), Value::Struct(b)) => assert_eq!(*a, *b),
+            _ => panic!("expected struct"),
+        }
+
+        let empty = Value::Struct(Arc::new(CelStruct::new("cel.Empty".into())));
+        let back = roundtrip(empty.clone());
+        match (empty, back) {
+            (Value::Struct(a), Value::Struct(b)) => assert_eq!(*a, *b),
+            _ => panic!("expected empty struct"),
+        }
+    }
+
+    #[cfg(feature = "chrono")]
+    #[test]
+    fn public_temporal_roundtrip() {
+        let d = Value::Duration(chrono::Duration::seconds(3));
+        assert_eq!(roundtrip(d.clone()), d);
+        let ts = Value::Timestamp(
+            chrono::DateTime::from_timestamp(1_700_000_000, 0)
+                .unwrap()
+                .with_timezone(&chrono::FixedOffset::east_opt(3600).unwrap()),
+        );
+        assert_eq!(roundtrip(ts.clone()), ts);
+    }
+
+    #[test]
+    fn from_arc_string_still_builds_the_public_value() {
+        let v: Value = Arc::new("drop-in".to_string()).into();
+        assert_eq!(v, Value::String(Arc::new("drop-in".into())));
+        assert_eq!(roundtrip(v.clone()), v);
+    }
+
+    #[test]
+    fn a_linked_public_list_unpacks_the_same_buffer() {
+        let original = ListRef::from(vec![Value::Int(1), Value::Int(2)]);
+        let value = Value::List(original.clone());
+        let w = intern_leaf(&value).expect("intern");
+        link_public_handle(w, &value);
+        let back = unsafe { list_from_ref(w) }.expect("unpack");
+        assert!(original.ptr_eq(&back));
+    }
+
+    #[test]
+    fn a_vm_born_list_has_no_public_link() {
+        let value = Value::List(ListRef::from(vec![Value::Int(1)]));
+        let w = intern_leaf(&value).expect("intern");
+        let leaf = unsafe { &*w.cast::<W_ListObject>() };
+        assert!(leaf.public.is_null());
+    }
+
+    #[test]
+    fn a_linked_public_map_unpacks_the_same_table() {
+        let mut entries = HashMap::new();
+        entries.insert(Key::String(Arc::new("a".into())), Value::Int(1));
+        let original = Map::object(Arc::new(entries));
+        let value = Value::Map(original.clone());
+        let w = intern_leaf(&value).expect("intern");
+        link_public_handle(w, &value);
+        let back = unsafe { map_from_ref(w) }.expect("unpack");
+        assert!(original.ptr_eq(&back));
+    }
+
+    #[test]
+    fn a_linked_public_entries_map_unpacks_the_same_table() {
+        let original = Map::entries(MapEntries::new(
+            vec![(Key::String(Arc::new("a".into())), Value::Int(1))].into_boxed_slice(),
+        ));
+        let value = Value::Map(original.clone());
+        let w = intern_leaf(&value).expect("intern");
+        link_public_handle(w, &value);
+        let back = unsafe { map_from_ref(w) }.expect("unpack");
+        assert!(original.ptr_eq(&back));
+    }
+
+    #[test]
+    fn linked_entries_map_survives_map_try_insert() {
+        // A successful insert clears the public link, so copy-out rebuilds
+        // from the interned items and includes the new pair rather than
+        // returning the stale linked table.
+        let original = Map::ordered(
+            vec![
+                (Key::String(Arc::new("a".into())), Value::Int(1)),
+                (Key::String(Arc::new("b".into())), Value::Int(2)),
+            ]
+            .into_boxed_slice(),
+        );
+        let value = Value::Map(original.clone());
+        let w = new_map_with_capacity(4) as CelRef;
+        assert!(unsafe { map_try_insert(w, new_string("a") as CelRef, new_int(1) as CelRef,) });
+        assert!(unsafe { map_try_insert(w, new_string("b") as CelRef, new_int(2) as CelRef,) });
+        link_public_handle(w, &value);
+        let leaf = unsafe { &*w.cast::<W_MapObject>() };
+        assert_eq!(leaf.length, 2);
+        assert_eq!(leaf.public_kind, MAP_PUBLIC_ENTRIES);
+        assert_eq!(leaf.public_len, 2);
+        assert!(unsafe { map_try_insert(w, new_string("c") as CelRef, new_int(3) as CelRef,) });
+        let leaf = unsafe { &*w.cast::<W_MapObject>() };
+        assert_eq!(leaf.length, 3, "insert grew the interned table");
+        assert!(leaf.public.is_null(), "mutation cleared the public link");
+        assert_eq!(leaf.public_len, 0);
+        assert_eq!(leaf.public_kind, 0);
+        let back = unsafe { map_from_ref(w) }.expect("unpack");
+        assert!(
+            !original.ptr_eq(&back),
+            "copy-out is a rebuild, not the stale link"
+        );
+        assert_eq!(back.len(), 3);
+        assert_eq!(
+            back.get(&Key::String(Arc::new("c".into()))).as_deref(),
+            Some(&Value::Int(3))
+        );
+    }
+
+    #[test]
+    fn map_copy_out_error_drops_a_written_opaque() {
+        let spy: Arc<dyn Opaque> = Arc::new(HostId(7));
+        let opaque_w = intern_leaf(&Value::Opaque(spy.clone())).expect("opaque intern");
+        let before = Arc::strong_count(&spy);
+        let w = new_map(&[
+            (new_string("k") as CelRef, opaque_w),
+            (
+                new_list(&[new_int(0) as CelRef]) as CelRef,
+                new_int(2) as CelRef,
+            ),
+        ]);
+        let err = unsafe { map_from_ref(w as CelRef) };
+        assert!(matches!(err, Err(ConvertError::Corrupt("map key"))));
+        assert_eq!(
+            Arc::strong_count(&spy),
+            before,
+            "the first pair must be dropped when a later key fails"
+        );
+    }
+
+    #[test]
+    fn a_linked_public_string_unpacks_the_same_arc() {
+        let original = Arc::new("hello".to_string());
+        let value = Value::String(original.clone());
+        let w = intern_leaf(&value).expect("intern");
+        link_public_handle(w, &value);
+        let back = string_from_leaf(unsafe { &*w.cast::<W_StringObject>() }).expect("unpack");
+        assert!(Arc::ptr_eq(&original, &back));
+    }
+}

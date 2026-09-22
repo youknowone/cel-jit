@@ -1,7 +1,6 @@
-use crate::common::types::{CelBool, CelBytes, CelDouble, CelInt, CelNull, CelString, CelUInt};
-use crate::common::value::Val;
-use std::borrow::Cow;
+use crate::objects::Value;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 pub mod operators;
 
@@ -42,26 +41,30 @@ pub enum Expr {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum LiteralValue {
-    Boolean(CelBool),
-    Bytes(CelBytes),
-    Double(CelDouble),
-    Int(CelInt),
+    Boolean(bool),
+    Bytes(Arc<Vec<u8>>),
+    Double(f64),
+    Int(i64),
     Null,
-    String(CelString),
-    UInt(CelUInt),
+    String(Arc<String>),
+    UInt(u64),
 }
 
 impl LiteralValue {
-    pub fn to_val<'a>(&'a self) -> Cow<'a, dyn Val> {
-        // todo refactor to return Cow::Borrowed
-        match &self {
-            LiteralValue::Boolean(b) => Cow::Borrowed(b),
-            LiteralValue::Bytes(b) => Cow::Borrowed(b),
-            LiteralValue::Double(f) => Cow::Borrowed(f),
-            LiteralValue::Int(i) => Cow::Borrowed(i),
-            LiteralValue::Null => Cow::<dyn Val>::Owned(Box::new(CelNull)),
-            LiteralValue::String(s) => Cow::Borrowed(s),
-            LiteralValue::UInt(ui) => Cow::Borrowed(ui),
+    /// The [`Value`] this literal denotes.
+    ///
+    /// A refcount bump for the two owning variants, a copy for the rest. The
+    /// literal holds the same representation [`Value`] does so that evaluating
+    /// one allocates nothing.
+    pub fn to_value(&self) -> Value {
+        match self {
+            LiteralValue::Boolean(b) => Value::Bool(*b),
+            LiteralValue::Bytes(b) => Value::Bytes(b.clone()),
+            LiteralValue::Double(f) => Value::Float(*f),
+            LiteralValue::Int(i) => Value::Int(*i),
+            LiteralValue::Null => Value::Null,
+            LiteralValue::String(s) => Value::String(s.clone()),
+            LiteralValue::UInt(u) => Value::UInt(*u),
         }
     }
 }

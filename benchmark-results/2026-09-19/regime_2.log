@@ -1,0 +1,141 @@
+cel batch machine: interpreter vs compiled trace, by regime
+thread-CPU timing, best batch of >= 20 ms; every tier checked against the walker
+
+== C. Coverage: what lowers, asked with and without the caller's functions
+   `from_program` is what the two existing boards call. `from_program_in` is handed
+   the Context that carries the user's functions.
+
+                     case     from_program  from_program_in   reason it declines
+              conditional           lowers           lowers   
+        nested_arithmetic           lowers           lowers   
+                   policy           lowers           lowers   
+              list_exists           lowers           lowers   
+          custom_function         declines           lowers   bare: unsupported for majit lowering: call `add`
+
+== A. Crossover: the same bound program, interpreted and compiled, per batch size
+   `clean` is the batch machine's interpreter over lowered code; `jit` is the compiled
+   trace. ns/call is the whole call; ns/row divides by the batch size.
+
+conditional  `x > 10 ? x * 2 : x + 5`
+     rows     clean ns       jit ns jit/clean |  clean/row    jit/row | enter/call gfail/call
+        1         13.9        106.4     7.68x |      13.86     106.40 |       1.00       0.00
+        2         22.0        107.2     4.87x |      11.00      53.58 |       1.00       0.00
+        4         34.7        131.2     3.78x |       8.67      32.79 |       1.00       0.00
+        8         79.7        142.7     1.79x |       9.96      17.84 |       1.00       0.00
+       16        141.8        156.9     1.11x |       8.86       9.81 |       1.00       0.00
+       32        268.9        186.1     0.69x |       8.40       5.81 |       1.00       0.00
+       64        545.5        247.9     0.45x |       8.52       3.87 |       1.00       0.00
+      128       1037.5        346.4     0.33x |       8.11       2.71 |       1.00       0.00
+      256       2139.9        541.9     0.25x |       8.36       2.12 |       1.00       0.00
+      512       4219.8       1120.1     0.27x |       8.24       2.19 |       1.00       0.00
+     2048      17732.1       3547.0     0.20x |       8.66       1.73 |       1.00       0.00
+     8192      67024.1      14923.0     0.22x |       8.18       1.82 |       1.00       0.00
+   -> compiling pays from 32 rows up
+
+nested_arithmetic  `((a + b) * (c - d)) / ((e + f) - (g * h))`
+     rows     clean ns       jit ns jit/clean |  clean/row    jit/row | enter/call gfail/call
+        1         20.3        111.7     5.50x |      20.30     111.72 |       1.00       0.00
+        2         35.5        116.2     3.27x |      17.76      58.09 |       1.00       0.00
+        4         74.1        160.8     2.17x |      18.52      40.19 |       1.00       0.00
+        8        128.7        185.1     1.44x |      16.09      23.14 |       1.00       0.00
+       16        240.9        233.4     0.97x |      15.06      14.59 |       1.00       0.00
+       32        468.0        313.2     0.67x |      14.62       9.79 |       1.00       0.00
+       64        896.1        511.1     0.57x |      14.00       7.99 |       1.00       0.00
+      128       1806.9        866.7     0.48x |      14.12       6.77 |       1.00       0.00
+      256       3626.2       1642.8     0.45x |      14.16       6.42 |       1.00       0.00
+      512       7600.0       3150.9     0.41x |      14.84       6.15 |       1.00       0.00
+     2048      30390.5      13645.4     0.45x |      14.84       6.66 |       1.00       0.00
+     8192     126651.4      53513.8     0.42x |      15.46       6.53 |       1.00       0.00
+   -> compiling pays from 16 rows up
+
+policy  `user.age >= 18 && user.role in ["admin", "moderator"] && request.method == "POST" && request.path.startsWith("/api/")`
+     rows     clean ns       jit ns jit/clean |  clean/row    jit/row | enter/call gfail/call
+        1         17.4        105.8     6.09x |      17.37     105.76 |       1.00       0.00
+        2         33.1        107.4     3.25x |      16.54      53.70 |       1.00       0.00
+        4         74.6        147.0     1.97x |      18.66      36.75 |       1.00       0.00
+        8        137.4        160.0     1.16x |      17.17      20.00 |       1.00       0.00
+       16        269.2        171.7     0.64x |      16.83      10.73 |       1.00       0.00
+       32        549.3        212.6     0.39x |      17.16       6.65 |       1.00       0.00
+       64       1141.8        284.2     0.25x |      17.84       4.44 |       1.00       0.00
+      128       2365.8        434.7     0.18x |      18.48       3.40 |       1.00       0.00
+      256       4654.6        723.5     0.16x |      18.18       2.83 |       1.00       0.00
+      512       9100.9       1313.7     0.14x |      17.78       2.57 |       1.00       0.00
+     2048      34593.6       5142.3     0.15x |      16.89       2.51 |       1.00       0.00
+     8192     145607.7      21277.9     0.15x |      17.77       2.60 |       1.00       0.00
+   -> compiling pays from 16 rows up
+
+list_exists  `list.exists(e, e > 100)`
+     rows     clean ns       jit ns jit/clean |  clean/row    jit/row | enter/call gfail/call
+        1         82.4        133.9     1.62x |      82.43     133.95 |       1.00       0.00
+        2        163.1        146.0     0.89x |      81.55      72.98 |       1.00       0.00
+        4        307.3        152.6     0.50x |      76.82      38.15 |       1.00       0.00
+        8        608.0        178.8     0.29x |      76.00      22.36 |       1.00       0.00
+       16       1185.9        234.2     0.20x |      74.12      14.63 |       1.00       0.00
+       32       2395.9        337.9     0.14x |      74.87      10.56 |       1.00       0.00
+       64       4698.8        535.3     0.11x |      73.42       8.36 |       1.00       0.00
+      128       9870.6        959.0     0.10x |      77.11       7.49 |       1.00       0.00
+      256      18875.3       1791.1     0.09x |      73.73       7.00 |       1.00       0.00
+      512      37365.2       3439.9     0.09x |      72.98       6.72 |       1.00       0.00
+     2048     149439.5      13412.9     0.09x |      72.97       6.55 |       1.00       0.00
+     8192     593654.9      53702.2     0.09x |      72.47       6.56 |       1.00       0.00
+   -> compiling pays from 2 rows up
+
+custom_function  `add(x, y) + multiply(a, b)`
+     rows     clean ns       jit ns jit/clean |  clean/row    jit/row | enter/call gfail/call
+        1         16.4        108.6     6.64x |      16.36     108.59 |       1.00       0.00
+        2         28.4        112.0     3.94x |      14.20      56.00 |       1.00       0.00
+        4         59.8        150.2     2.51x |      14.95      37.54 |       1.00       0.00
+        8         96.0        172.1     1.79x |      11.99      21.51 |       1.00       0.00
+       16        178.0        228.3     1.28x |      11.13      14.27 |       1.00       0.00
+       32        336.7        311.8     0.93x |      10.52       9.74 |       1.00       0.00
+       64        679.6        488.3     0.72x |      10.62       7.63 |       1.00       0.00
+      128       1306.2        821.7     0.63x |      10.20       6.42 |       1.00       0.00
+      256       2557.7       1509.7     0.59x |       9.99       5.90 |       1.00       0.00
+      512       5220.1       2930.1     0.56x |      10.20       5.72 |       1.00       0.00
+     2048      20651.3      11458.7     0.55x |      10.08       5.60 |       1.00       0.00
+     8192      87127.6      49818.4     0.57x |      10.64       6.08 |       1.00       0.00
+   -> compiling pays from 32 rows up
+
+== B. Accumulation: one row per call, many calls, no warm-up given
+   The question this answers: a server builds a fresh activation per request and
+   evaluates it once, but the requests keep coming -- does the JIT ever fire?
+   `entries` counts calls that ENTERED compiled code, so a non-zero column is the
+   door firing. The window costs are wall-clock over the window, not best-of.
+
+                     case      calls window ns/call   compiles    entries
+              conditional          1     318459.0          1          0
+                                  10        541.7          1          9
+                                 100        122.2          1         99
+                                1000        111.3          1        999
+                                5000        110.5          1       4999
+                               20000        110.6          1      19999
+                             settled        107.8 settled: clean 13.1 ns, jit 107.8 ns (8.21x)
+        nested_arithmetic          1     593875.0          1          0
+                                  10        439.8          1          9
+                                 100        118.1          1         99
+                                1000        109.3          1        999
+                                5000        109.5          1       4999
+                               20000        109.6          1      19999
+                             settled        111.0 settled: clean 18.0 ns, jit 111.0 ns (6.17x)
+                   policy          1     396042.0          1          0
+                                  10        305.6          1          9
+                                 100        117.6          1         99
+                                1000        109.1          1        999
+                                5000        108.6          1       4999
+                               20000        109.6          1      19999
+                             settled        105.3 settled: clean 17.3 ns, jit 105.3 ns (6.09x)
+              list_exists          1       4458.0          1          2
+                                  10        578.7          1         11
+                                 100        380.6          1        101
+                                1000        324.9          1       1001
+                                5000        142.3          1       5001
+                               20000        144.0          1      20001
+                             settled        137.6 settled: clean 79.6 ns, jit 137.6 ns (1.73x)
+          custom_function          1     338000.0          1          0
+                                  10        365.8          1          9
+                                 100        117.1          1         99
+                                1000        110.9          1        999
+                                5000        111.1          1       4999
+                               20000        111.0          1      19999
+                             settled        108.8 settled: clean 16.7 ns, jit 108.8 ns (6.52x)
+

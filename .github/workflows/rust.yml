@@ -2,9 +2,9 @@ name: Rust
 
 on:
   push:
-    branches: [ "master" ]
+    branches: [ "master", "majit" ]
   pull_request:
-    branches: [ "master" ]
+    branches: [ "master", "majit" ]
 
 env:
   CARGO_TERM_COLOR: always
@@ -18,12 +18,29 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Format
         run: cargo fmt --all -- --check
+      # `-p cel` IS LOAD-BEARING, for the reason spelled out at the tree-walker
+      # step below: this is a virtual workspace and `fuzz/Cargo.toml` takes
+      # `cel` with default features ON, so a root `--no-default-features` turns
+      # off only the *selected packages'* defaults and feature unification puts
+      # every one of them straight back. Measured, without `-p cel` this step
+      # compiles cel with `--cfg 'feature="chrono"' --cfg 'feature="default"'
+      # --cfg 'feature="regex"' --cfg 'feature="vm"'` -- i.e. it builds the
+      # DEFAULT feature set, not a minimal one, and has never once built cel
+      # with its features off. With `-p cel` the same line carries no
+      # `--cfg 'feature=...'` at all.
       - name: Build minimal
-        run: cargo build --verbose --no-default-features
+        run: cargo build --verbose -p cel --no-default-features
       - name: Build with default features
         run: cargo build --verbose
       - name: Build with all features
         run: cargo build --verbose --all-features
+      # Every feature `cel/Cargo.toml` advertises, checked on its own. The
+      # three `cargo test --features {json,regex,chrono}` rows below do not
+      # cover this: they are additive on top of the defaults, and the defaults
+      # are `regex` + `chrono`, so all three build the same feature set as a
+      # bare `cargo test`. No single-feature build was ever compiled.
+      - name: Feature matrix
+        run: scripts/feature-matrix.sh
       - name: Clippy
         run: cargo clippy --all-features --all-targets -- -D warnings
       - name: Run tests
@@ -32,6 +49,69 @@ jobs:
           cargo test --verbose --features json
           cargo test --verbose --features regex
           cargo test --verbose --features chrono
+      # The tree walker as the caller-facing evaluator. `vm` is a default
+      # feature, so every cargo invocation above — and both `jit` legs below —
+      # builds `Program::execute` as the bytecode VM; `--no-default-features`
+      # is the only way it is the walker.
+      #
+      # Without this step no TEST runs `Program::execute` on the walker.
+      # `tests/oracle.rs` and `tests/vm_walker_sweep.rs` reach the walker under
+      # any feature set, but they call `Value::resolve` /
+      # `Value::resolve_value` directly, so the public door's non-default build
+      # would only be COMPILED (`scripts/feature-matrix.sh`, which is
+      # `-p cel`-scoped) and RUN as a seven-binary smoke pass (the `examples`
+      # job below, whose crate takes `cel` with `default-features = false`) —
+      # never asserted on.
+      #
+      # `regex,chrono` are the other two defaults, so this differs from the
+      # bare `cargo test` above in exactly one feature.
+      #
+      # `-p cel` IS LOAD-BEARING, not tidiness. This is a virtual workspace and
+      # `fuzz/Cargo.toml` takes `[dependencies.cel] path = "../cel"` with
+      # default features ON. `--no-default-features` at the root turns off the
+      # *selected packages'* defaults, not that dependency edge, so feature
+      # unification puts `vm` straight back into the single `cel` build every
+      # test binary links. Measured: without `-p cel` this command reports
+      # `features=regex,chrono,vm` in the `allocs_per_eval` header and compares
+      # against `allocs_per_eval.vm.baseline`; with it, `features=regex,chrono`
+      # and `allocs_per_eval.baseline`. A green leg that ran the VM is exactly
+      # the configuration this step exists to stop going unrun.
+      - name: Run tests (tree walker, vm off)
+        run: cargo test -p cel --verbose --no-default-features --features regex,chrono
+  jit:
+    name: JIT tier (${{ matrix.backend }})
+    runs-on: ubuntu-latest
+    strategy:
+      # Both legs always report. A backend-specific miscompile is a thing cel
+      # has actually had twice (#57 const_bits_or_panic, #58 five wrong
+      # answers), and fail-fast would let the first failure hide the second
+      # backend's result — which is the state those two were found in.
+      fail-fast: false
+      matrix:
+        backend: [cranelift, dynasm]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      # `jit-<backend>`, never bare `jit`. The `jit` feature names no backend on
+      # purpose, and `majit-metainterp` turns that into a `compile_error!` so
+      # the tier can never fail open into a silently-not-JITting build;
+      # `scripts/feature-matrix.sh` pins that refusal. This step used to run
+      # bare `--features jit`, which stopped compiling when the backend
+      # selectors were split out and was never swept.
+      #
+      # The majit tier only reaches its compiled trace in a release build (the
+      # tracing interpreter is ~200 ns/row in debug), and its cross-tier
+      # assertions compare a compiled answer against the tree-walker's, so a
+      # debug run would assert on the interpreter tier alone.
+      #
+      # `--no-fail-fast` for the same reason as `fail-fast: false` above, one
+      # scope in: without it `cargo test` stops at the first failing test
+      # TARGET, so the targets after it never run and a red leg reports a
+      # strict subset of what is broken. Measured 2026-08-11 — the first red
+      # target hid a second one on both backends, and the two backends' hidden
+      # failures were not the same test.
+      - name: Run JIT tier tests
+        run: cargo test --release --verbose --features jit-${{ matrix.backend }} --no-fail-fast
   fuzz:
     name: Fuzz
     runs-on: ubuntu-latest

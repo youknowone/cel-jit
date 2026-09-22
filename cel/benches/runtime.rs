@@ -1,5 +1,4 @@
 use cel::context::{Context, VariableResolver};
-use cel::parser::Parser;
 use cel::{Program, Value};
 use criterion::{black_box, criterion_group, BenchmarkId, Criterion};
 use std::collections::HashMap;
@@ -62,14 +61,20 @@ pub fn criterion_benchmark(c: &mut Criterion) {
     let mut execution_group = c.benchmark_group("execute");
     for (name, expr) in black_box(&EXPRESSIONS) {
         execution_group.bench_function(BenchmarkId::from_parameter(name), |b| {
-            let parser = Parser::default();
-            let ast = parser.parse(expr).expect("Parsing failed");
+            // `Program::compile` + `Program::execute`, not `Parser::parse` +
+            // `Value::resolve_value`. cel has two evaluators and the direct
+            // call named one of them, so this row measured the tree walker
+            // even in a build whose `Program::execute` is the bytecode VM.
+            // Compiling outside `b.iter` keeps parsing — and, under `vm`, the
+            // bytecode compile that `Program::compile` also does — out of the
+            // timed region, which is what the direct call did too.
+            let program = Program::compile(expr).expect("Parsing failed");
             let mut ctx = Context::default();
             ctx.add_variable_from_value("foo", HashMap::from([("bar", 1)]));
             ctx.add_variable_from_value("apple", true);
             ctx.add_variable_from_value("a", 1);
             ctx.set_variable_resolver(&Resolver);
-            b.iter(|| Value::resolve_val(&ast, &ctx).expect("Eval failed!"))
+            b.iter(|| program.execute(&ctx).expect("Eval failed!"))
         });
     }
 }
@@ -90,11 +95,12 @@ pub fn map_macro_benchmark(c: &mut Criterion) {
     for size in sizes {
         group.bench_function(format!("map_{size}").as_str(), |b| {
             let list = (0..size).collect::<Vec<_>>();
-            let parser = Parser::default();
-            let ast = parser.parse("list.map(x, x * 2)").expect("Parsing failed");
+            // Through the public door, for the reason given in
+            // `criterion_benchmark` above.
+            let program = Program::compile("list.map(x, x * 2)").expect("Parsing failed");
             let mut ctx = Context::default();
             ctx.add_variable_from_value("list", list);
-            b.iter(|| Value::resolve_val(&ast, &ctx).expect("Eval failed!"))
+            b.iter(|| program.execute(&ctx).expect("Eval failed!"))
         });
     }
     group.finish();
