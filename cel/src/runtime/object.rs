@@ -121,6 +121,8 @@ impl CelClass {
 ///
 /// One word, and declaring no class word beyond it is what admits the fuse's
 /// base-type arm — see the module documentation.
+// Written once, at allocation. A read off a constant object folds.
+#[cfg_attr(feature = "jit", majit_macros::jit_immutable_fields(ob_type))]
 #[repr(C)]
 pub struct CelObject {
     pub ob_type: *const CelClass,
@@ -1313,9 +1315,9 @@ pub fn new_cel_frame(n_slots: i64, max_stack: i64) -> *mut W_CelFrame {
 
 /// Allocate a frame on `heap`.
 ///
-/// The block is `n_slots + max_stack` cells. Locals (`0..n_slots`) start
-/// null so a residual hydrate can scan them; stack cells are written
-/// before they are read and are left uninitialised.
+/// The block is `n_slots + max_stack` cells, every one null. A
+/// virtualizable snapshot reads the whole array (`read_all_boxes`); an
+/// uninitialised slot would be a garbage reference.
 #[inline(always)]
 pub fn new_cel_frame_in(
     heap: &crate::runtime::heap::CelHeap,
@@ -1324,7 +1326,7 @@ pub fn new_cel_frame_in(
 ) -> *mut W_CelFrame {
     let n_slots_us = n_slots.max(0) as usize;
     let cap = n_slots_us.saturating_add(max_stack.max(0) as usize);
-    let items = object_array::new_items_block_with_zeroed_prefix_in(heap, cap, n_slots_us);
+    let items = object_array::new_items_block_zeroed_in(heap, cap);
     heap.alloc(W_CelFrame {
         ob_header: CelObject {
             ob_type: &CEL_FRAME_CLASS,
@@ -1338,8 +1340,8 @@ pub fn new_cel_frame_in(
 }
 
 /// Reset a reused frame so the next execute sees the same initial state as
-/// a freshly allocated one. Locals (`0..n_slots`) are nulled; stack cells
-/// are written before they are read.
+/// a freshly allocated one. Every cell is nulled: a virtualizable snapshot
+/// reads the whole array, including slots the interpreter has not written.
 ///
 /// # Safety
 ///
@@ -1351,10 +1353,11 @@ pub unsafe fn reset_cel_frame(frame: *mut W_CelFrame, n_slots: i64) {
     (*frame).last_instr = -1;
     (*frame).valuestackdepth = n_slots;
     (*frame).n_slots = n_slots;
-    if n_slots > 0 {
+    let cap = crate::runtime::object_array::items_capacity((*frame).locals_stack_w.block);
+    if cap > 0 {
         let base =
             crate::runtime::object_array::items_block_items_base((*frame).locals_stack_w.block);
-        core::ptr::write_bytes(base, 0, n_slots as usize);
+        core::ptr::write_bytes(base, 0, cap);
     }
 }
 
@@ -1379,9 +1382,25 @@ pub unsafe fn cel_frame_slot(frame: *mut W_CelFrame, i: i64) -> *mut CelRef {
 /// `frame` is a live [`W_CelFrame`].
 #[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
 pub unsafe fn force_virtualizable_if_necessary(frame: *mut W_CelFrame) {
-    if (*frame).vable_token != 0 {
-        // Residual: the compiled loop owns the boxes. The interpreter
-        // never sets the token, so this arm is not taken here.
+    // `virtualizable.py` `force_now`: a residual helper that writes the
+    // frame must clear `TOKEN_TRACING_RESCALL` so `vable_after_residual_call`
+    // reloads the boxes. Leaving the token set tells the tracer the
+    // helper did not touch the frame.
+    let token = (*frame).vable_token;
+    if token == 0 {
+        return;
+    }
+    #[cfg(feature = "jit")]
+    {
+        let tracing = majit_metainterp::virtualizable::token_tracing_rescall() as usize;
+        if token == tracing {
+            (*frame).vable_token = 0;
+        } else {
+            // `compile.py ResumeGuardForcedDescr.force_now`: write the
+            // compiled virtual fields back and mark the guard forced.
+            crate::vm::portal::force_portal_driver_token(token as u64);
+            assert_eq!((*frame).vable_token, 0, "force_now must leave TOKEN_NONE");
+        }
     }
 }
 

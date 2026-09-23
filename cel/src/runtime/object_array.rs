@@ -80,7 +80,8 @@ pub struct CelItemsBlock {
     /// Allocated capacity, the length word an array descr reads at offset 0.
     /// Fixed for the block's lifetime.
     pub capacity: usize,
-    items: [CelRef; 0],
+    /// Element 0. Visible to `offset_of!` from the rest of the crate.
+    pub(crate) items: [CelRef; 0],
 }
 
 pub const CEL_ITEMS_BLOCK_ITEMS_OFFSET: usize = core::mem::offset_of!(CelItemsBlock, items);
