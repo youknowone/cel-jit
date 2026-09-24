@@ -1514,19 +1514,33 @@ fn cell_int(w: *mut CelObject) -> i64 {
 }
 
 /// `1` / `0` for a bool leaf, `-1` otherwise.
-#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
-fn cell_bool(w: CelRef) -> i64 {
-    if w.is_null() || unsafe { w_kind(w) } != CelKind::Bool {
+///
+/// Kind and `boolval` are field reads (`rewrite_op_getfield`). A constant
+/// receiver folds both.
+#[majit_macros::jit_inline(
+    int_fields = { W_BoolObject::boolval => i64 },
+    calls = { cell_kind => inline_int },
+)]
+fn cell_bool(w: *mut CelObject) -> i64 {
+    if cell_kind(w) != CelKind::Bool as i64 {
         -1
     } else {
-        i64::from(unsafe { (*w.cast::<W_BoolObject>()).boolval } != 0)
+        let obj = w as *mut W_BoolObject;
+        let bit = unsafe { (*obj).boolval };
+        if bit != 0 {
+            1
+        } else {
+            0
+        }
     }
 }
 
-/// Length of a list leaf.
-#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
-fn cell_list_len(w: CelRef) -> i64 {
-    unsafe { list_len(w) }
+/// Length of a list leaf. `W_ListObject::length` is written once on the
+/// source list the loop reads (`rewrite_op_getfield`).
+#[majit_macros::jit_inline(int_fields = { crate::runtime::object::W_ListObject::length => i64 })]
+fn cell_list_len(w: *mut CelObject) -> i64 {
+    let obj = w as *mut crate::runtime::object::W_ListObject;
+    unsafe { (*obj).length }
 }
 
 /// Concrete `struct_allocs` target for [`box_int`]. Small ints stay the
@@ -1561,10 +1575,18 @@ fn box_int(vm: i64, n: i64) -> *mut CelObject {
     w as *mut W_IntObject as *mut CelObject
 }
 
-/// Box a 0/1 bit as a bool leaf.
-#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
-fn box_bool(bit: i64) -> CelRef {
-    new_bool(bit != 0) as CelRef
+/// Box a 0/1 bit as one of the two prebuilt bool leaves.
+///
+/// The branch is `rewrite_op_same_as` of a constant pointer
+/// (`rewrite_op_cast_pointer`): the taken arm is `new_bool`'s singleton,
+/// not an allocation.
+#[majit_macros::jit_inline]
+fn box_bool(bit: i64) -> *mut CelObject {
+    if bit != 0 {
+        new_bool(true) as *mut CelObject
+    } else {
+        new_bool(false) as *mut CelObject
+    }
 }
 
 #[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
@@ -1587,23 +1609,74 @@ fn alloc_map(vm: i64, cap: i64) -> CelRef {
     new_map_with_capacity_in(vm_heap(vm), cap) as CelRef
 }
 
-#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
-fn index_cell(container: CelRef, key: CelRef) -> CelRef {
-    let item = interned_index(container as i64, key as i64);
-    if item == 0 {
-        core::ptr::null_mut()
+/// Int-column `container[key]`. Anything else is null and the caller
+/// residuals, which is `interned_index`.
+#[majit_macros::jit_inline(calls = {
+    cell_kind => inline_int,
+    cell_int => inline_int,
+    item_cell => inline_ref,
+})]
+fn index_cell(container: *mut CelObject, key: *mut CelObject) -> *mut CelObject {
+    if cell_kind(container) == CelKind::List as i64 {
+        if cell_kind(key) == CelKind::Int as i64 {
+            item_cell(0, container, cell_int(key))
+        } else {
+            core::ptr::null_mut()
+        }
     } else {
-        item as usize as CelRef
+        core::ptr::null_mut()
     }
 }
 
-#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
-fn item_cell(vm: i64, list: CelRef, index: i64) -> CelRef {
-    let item = interned_item(vm, list as i64, index);
-    if item == 0 {
-        core::ptr::null_mut()
+/// Element of an int-column list, boxed (`getarrayitem_gc_i`, then
+/// `new_with_vtable`). Object lists and windows return null; the caller
+/// residuals through `interned_item`.
+#[majit_macros::jit_inline(
+    ref_params = { list: ref(crate::runtime::object::W_ListObject) },
+    ref_fields = {
+        crate::runtime::object::W_ListObject::storage => crate::runtime::object::CelObject,
+    },
+    array_fields = { crate::runtime::object::W_IntColumn::data => i64 },
+    int_fields = {
+        crate::runtime::object::W_ListObject::strategy => u8,
+        crate::runtime::object::W_ListObject::length => i64,
+        crate::runtime::object::W_ListObject::start => i64,
+        crate::runtime::object::W_IntColumn::length => i64,
+    },
+    calls = { box_int => inline_ref },
+)]
+fn item_cell(vm: i64, list: *mut CelObject, index: i64) -> *mut CelObject {
+    let strategy = list.strategy as u8 as i64;
+    let length = list.length;
+    let start = list.start;
+    let storage = list.storage;
+    if strategy == crate::runtime::object::ListStrategy::Ints as i64 {
+        if index >= 0 {
+            if index < length {
+                if (storage as *mut u8) != core::ptr::null_mut() {
+                    let col = storage as *mut crate::runtime::object::W_IntColumn;
+                    let col_len = col.length;
+                    let at = start + index;
+                    if at >= 0 {
+                        if at < col_len {
+                            box_int(vm, col.data[at])
+                        } else {
+                            core::ptr::null_mut()
+                        }
+                    } else {
+                        core::ptr::null_mut()
+                    }
+                } else {
+                    core::ptr::null_mut()
+                }
+            } else {
+                core::ptr::null_mut()
+            }
+        } else {
+            core::ptr::null_mut()
+        }
     } else {
-        item as usize as CelRef
+        core::ptr::null_mut()
     }
 }
 
@@ -1617,23 +1690,72 @@ fn map_keys_cell(vm: i64, w: CelRef) -> CelRef {
     }
 }
 
-#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
-fn opt_is_none_i(w: CelRef) -> i64 {
-    i64::from(interned_optional_is_none(w))
+/// `1` when `w` is an empty optional. A null payload is the none case.
+#[majit_macros::jit_inline(
+    ref_fields = {
+        W_OptionalObject::w_value => CelObject,
+    },
+    calls = { cell_kind => inline_int },
+)]
+fn opt_is_none_i(w: *mut CelObject) -> i64 {
+    if cell_kind(w) == CelKind::Optional as i64 {
+        let obj = w as *mut W_OptionalObject;
+        let inner = unsafe { (*obj).w_value };
+        if inner.is_null() {
+            1
+        } else {
+            0
+        }
+    } else {
+        0
+    }
+}
+
+/// Interned left of `&&` / `||`, as a traced kind + `boolval` read.
+/// `1` short-circuits, `2` falls through, `0` declines.
+#[majit_macros::jit_inline(calls = { cell_bool => inline_int })]
+fn bool_short_i(w: *mut CelObject, is_or: i64) -> i64 {
+    let bit = cell_bool(w);
+    if bit < 0 {
+        0
+    } else if bit != 0 {
+        if is_or != 0 {
+            1
+        } else {
+            2
+        }
+    } else if is_or != 0 {
+        2
+    } else {
+        1
+    }
 }
 
 #[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
-fn bool_short_i(w: CelRef, is_or: i64) -> i64 {
-    interned_bool_short(w, is_or != 0)
+fn keep_right_merge_i(vm: i64, slot: i64, is_or: i64) -> i64 {
+    keep_right_merge(vm, slot, is_or != 0)
 }
 
 /// `1` when an `&&` / `||` merge can keep the right-hand bool.
-#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
-fn and_merge_keep(vm: i64, w: CelRef, slot: i64, is_or: i64) -> i64 {
-    if w.is_null() || unsafe { w_kind(w) } != CelKind::Bool {
-        return 0;
+///
+/// `scratch_bits == 0` is the absent-scratch arm of [`keep_right_merge`]
+/// (`InternalError` → keep). A hydrated slot takes [`keep_right_merge_i`].
+#[majit_macros::jit_inline(calls = {
+    cell_kind => inline_int,
+    keep_right_merge_i => residual_int,
+})]
+fn and_merge_keep(vm: i64, w: *mut CelObject, slot: i64, is_or: i64, scratch_bits: i64) -> i64 {
+    if cell_kind(w) != CelKind::Bool as i64 {
+        0
+    } else if scratch_bits == 0 {
+        1
+    } else {
+        if keep_right_merge_i(vm, slot, is_or) != 0 {
+            1
+        } else {
+            0
+        }
     }
-    i64::from(keep_right_merge(vm, slot, is_or != 0) != 0)
 }
 
 /// Every opcode of one portal step.
@@ -2187,20 +2309,20 @@ fn step_hot(program: &CelCode, pc: usize) -> i64 {
         intern_var => residual_ref,
         cell_kind => inline_int,
         cell_int => inline_int,
-        cell_bool => residual_int_cannot_raise,
-        cell_list_len => residual_int_cannot_raise,
+        cell_bool => inline_int,
+        cell_list_len => inline_int,
         box_int => inline_ref,
-        box_bool => residual_ref,
+        box_bool => inline_ref,
         append_cell => residual_int,
         map_insert_cell => residual_int,
         alloc_list => nursery_alloc_ref,
         alloc_map => nursery_alloc_ref,
-        index_cell => residual_ref,
-        item_cell => residual_ref,
+        index_cell => inline_ref,
+        item_cell => inline_ref,
         map_keys_cell => residual_ref,
-        opt_is_none_i => residual_int_cannot_raise,
-        bool_short_i => residual_int_cannot_raise,
-        and_merge_keep => residual_int,
+        opt_is_none_i => inline_int,
+        bool_short_i => inline_int,
+        and_merge_keep => inline_int,
         interned_field => residual_int,
         interned_has_field => residual_int,
         interned_index => residual_int,
@@ -2471,6 +2593,47 @@ fn run_cel_portal(
                                 } else {
                                     residual_dispatch(vm, here)
                                 }
+                            } else {
+                                residual_dispatch(vm, here)
+                            }
+                        } else {
+                            residual_dispatch(vm, here)
+                        }
+                    } else {
+                        residual_dispatch(vm, here)
+                    }
+                } else {
+                    residual_dispatch(vm, here)
+                };
+                if next >= 0 {
+                    let tgt = next as usize;
+                    if tgt < pc {
+                        can_enter_jit!(driver, tgt, &mut *state, program, || {});
+                    }
+                    pc = tgt;
+                    continue;
+                }
+                state.ret = next;
+                return next;
+            }
+            OP_EQ_LOCAL_K => {
+                state.frame.last_instr = pc as i64;
+                let vm = state.vm;
+                let here = pc as i64;
+                let a = state.frame.locals_stack_w[insn_a(program, pc)];
+                let k = intern_const(program, insn_b(program, pc));
+                let next = if !a.is_null() {
+                    if !k.is_null() {
+                        if cell_kind(a) == CelKind::Int as i64 {
+                            if cell_kind(k) == CelKind::Int as i64 {
+                                let l = cell_int(a);
+                                let rv = cell_int(k);
+                                let bit = if l == rv { 1 } else { 0 };
+                                let r = box_bool(bit);
+                                let depth = state.frame.valuestackdepth;
+                                state.frame.locals_stack_w[depth] = r;
+                                state.frame.valuestackdepth = depth + 1;
+                                here + 1
                             } else {
                                 residual_dispatch(vm, here)
                             }
@@ -3016,7 +3179,8 @@ fn run_cel_portal(
                 let is_or = if opcode == OP_OR_MERGE { 1 } else { 0 };
                 let next = if i >= state.frame.n_slots {
                     let w = state.frame.locals_stack_w[i];
-                    if and_merge_keep(vm, w, insn_a(program, pc), is_or) != 0 {
+                    let bits = state.frame.scratch_bits;
+                    if and_merge_keep(vm, w, insn_a(program, pc), is_or, bits) != 0 {
                         here + 1
                     } else {
                         residual_dispatch(vm, here)

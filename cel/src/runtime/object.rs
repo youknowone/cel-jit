@@ -1259,6 +1259,10 @@ pub struct W_CelFrame {
     /// `getarrayitem_vable_*` matches.
     pub locals_stack_w: VableStack,
     pub n_slots: i64,
+    /// `0` while the evaluator has no scratch. A portal merge reads this
+    /// instead of `Option<Box<_>>`. Not part of the input list; it changes
+    /// when a residual hydrates.
+    pub scratch_bits: i64,
 }
 
 /// The `locals_cells_stack_w[*]` array: a pointer that indexes as a slice.
@@ -1307,6 +1311,7 @@ pub const CELFRAME_VABLE_TOKEN_OFFSET: usize = offset_of!(W_CelFrame, vable_toke
 pub const CELFRAME_LAST_INSTR_OFFSET: usize = offset_of!(W_CelFrame, last_instr);
 pub const CELFRAME_VALUESTACKDEPTH_OFFSET: usize = offset_of!(W_CelFrame, valuestackdepth);
 pub const CELFRAME_LOCALS_STACK_OFFSET: usize = offset_of!(W_CelFrame, locals_stack_w);
+pub const CELFRAME_SCRATCH_BITS_OFFSET: usize = offset_of!(W_CelFrame, scratch_bits);
 
 /// Allocate a frame whose array is `n_slots + max_stack` and never resized.
 pub fn new_cel_frame(n_slots: i64, max_stack: i64) -> *mut W_CelFrame {
@@ -1336,6 +1341,7 @@ pub fn new_cel_frame_in(
         valuestackdepth: n_slots,
         locals_stack_w: VableStack::from_block(items),
         n_slots,
+        scratch_bits: 0,
     })
 }
 
@@ -1353,6 +1359,7 @@ pub unsafe fn reset_cel_frame(frame: *mut W_CelFrame, n_slots: i64) {
     (*frame).last_instr = -1;
     (*frame).valuestackdepth = n_slots;
     (*frame).n_slots = n_slots;
+    (*frame).scratch_bits = 0;
     let cap = crate::runtime::object_array::items_capacity((*frame).locals_stack_w.block);
     if cap > 0 {
         let base =

@@ -707,6 +707,10 @@ fn take_scratch_box() -> Box<Scratch> {
 }
 
 pub(crate) struct Vm<'a> {
+    /// `0` while [`Self::scratch`] is absent, otherwise the scratch box.
+    /// First field so a one-word view reads it. Portal merges test this
+    /// instead of walking `Option<Box<Scratch>>`.
+    pub(crate) scratch_bits: usize,
     pub(crate) code: &'a CelCode,
     ctx: &'a Context<'a>,
     /// The activation record, `| locals | stack |` in ONE array, the layout
@@ -853,7 +857,7 @@ impl<'a> Vm<'a> {
             code.max_stack as i64,
         );
         #[cfg(feature = "jit")]
-        let (frame, scratch) = (Vec::new(), None);
+        let (frame, scratch) = (Vec::new(), None::<Box<Scratch>>);
         #[cfg(not(feature = "jit"))]
         let (frame, scratch) = {
             let mut scratch = take_scratch_box();
@@ -869,7 +873,15 @@ impl<'a> Vm<'a> {
             }
             (frame, Some(scratch))
         };
+        let scratch_bits = scratch
+            .as_ref()
+            .map(|s| &**s as *const Scratch as usize)
+            .unwrap_or(0);
+        unsafe {
+            (*cel_frame).scratch_bits = scratch_bits as i64;
+        }
         Vm {
+            scratch_bits,
             code,
             ctx,
             frame,
@@ -1115,7 +1127,11 @@ impl<'a> Vm<'a> {
                 .resize(self.code.n_logic as usize, Err(CelErr::InternalError));
         }
         self.frame = frame;
+        self.scratch_bits = &*scratch as *const Scratch as usize;
         self.scratch = Some(scratch);
+        unsafe {
+            (*self.cel_frame).scratch_bits = self.scratch_bits as i64;
+        }
     }
 
     #[inline]
