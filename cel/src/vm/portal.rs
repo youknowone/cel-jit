@@ -1294,6 +1294,11 @@ fn fresh_portal_driver(state: &mut PortalState, code: &CelCode) -> JitDriver<Por
     let threshold = portal_threshold();
     let mut driver = JitDriver::new(threshold);
     driver.set_param("function_threshold", i64::from(threshold));
+    // `GcLLDescr_boehm`: vtable at offset 0, `malloc_fixedsize` into CelHeap.
+    // No collector — `collector_installed` stays false and the off-GC
+    // jitframe token path is unchanged.
+    driver.set_vtable_offset(Some(0));
+    majit_gc::set_malloc_fixedsize(Some(crate::runtime::heap::cel_malloc_fixedsize));
     {
         use majit_metainterp::JitState as _;
         state
@@ -1524,10 +1529,36 @@ fn cell_list_len(w: CelRef) -> i64 {
     unsafe { list_len(w) }
 }
 
-/// Box `n` on the VM heap. Small ints are the prebuilt singletons.
-#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
-fn box_int(vm: i64, n: i64) -> CelRef {
-    new_int_in(vm_heap(vm), n) as CelRef
+/// Concrete `struct_allocs` target for [`box_int`]. Small ints stay the
+/// prebuilt singletons; the traced body allocates a fresh leaf instead.
+fn alloc_traced_int(_header: CelObject, intval: i64) -> *mut W_IntObject {
+    crate::runtime::heap::with_heap(|heap| new_int_in(heap, intval))
+}
+
+/// Box `n`. The traced body is `new_with_vtable` of `CEL_INT_CLASS` plus
+/// `setfield_gc` of `intval` (`rewrite_op_malloc`). The concrete body is
+/// [`new_int_in`] via `struct_allocs`, so small ints stay interned.
+#[cfg_attr(
+    feature = "jit",
+    majit_macros::jit_inline(
+        inlined_prefix = {
+            W_IntObject::ob_header => crate::runtime::object::CelObject,
+        },
+        int_fields = { W_IntObject::intval => i64 },
+        struct_allocs = {
+            W_IntObject => alloc_traced_int,
+        },
+    )
+)]
+#[allow(unused_variables)]
+fn box_int(vm: i64, n: i64) -> *mut CelObject {
+    let w = W_IntObject {
+        ob_header: CelObject {
+            ob_type: &CEL_INT_CLASS,
+        },
+        intval: n,
+    };
+    w as *mut W_IntObject as *mut CelObject
 }
 
 /// Box a 0/1 bit as a bool leaf.
@@ -2158,7 +2189,7 @@ fn step_hot(program: &CelCode, pc: usize) -> i64 {
         cell_int => inline_int,
         cell_bool => residual_int_cannot_raise,
         cell_list_len => residual_int_cannot_raise,
-        box_int => nursery_alloc_ref,
+        box_int => inline_ref,
         box_bool => residual_ref,
         append_cell => residual_int,
         map_insert_cell => residual_int,
