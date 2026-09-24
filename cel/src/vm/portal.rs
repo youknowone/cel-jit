@@ -28,10 +28,11 @@ use crate::runtime::convert::{
 use crate::runtime::error::ERROR_SENTINEL;
 use crate::runtime::heap::CelHeap;
 use crate::runtime::object::{
-    bytes_len, interned_list_eq, list_int_at, list_ints_slice, list_len, list_try_append, map_len,
+    bytes_len, interned_list_eq, list_int_at, list_ints_slice, list_len,
+    list_promote_empty_to_ints, list_resize_ge, list_store_int, list_try_append, map_len,
     map_try_insert, new_bool, new_int, new_int_in, new_list_with_capacity_in,
     new_map_with_capacity_in, string_as_str, string_byte_len, w_kind, w_type, CelKind, CelObject,
-    CelRef, W_BoolObject, W_IntObject, W_OptionalObject, CEL_INT_CLASS,
+    CelRef, ListStrategy, W_BoolObject, W_IntObject, W_OptionalObject, CEL_INT_CLASS,
 };
 use crate::runtime::object::{force_virtualizable_if_necessary, W_CelFrame};
 use crate::runtime::optional::{
@@ -1594,6 +1595,94 @@ fn append_cell(list: CelRef, item: CelRef) -> i64 {
     try_append(list as i64, item as i64)
 }
 
+/// `_ll_list_resize_ge`. Grows the int column; the caller stores the word.
+#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+fn list_resize_ge_i(list: *mut CelObject, newsize: i64) -> i64 {
+    if list.is_null() {
+        0
+    } else {
+        unsafe { i64::from(list_resize_ge(list, newsize)) }
+    }
+}
+
+/// First int on an empty list (`EmptyListStrategy.append`) or a grow the
+/// inline path declined. Not on the traced common path.
+#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+fn list_append_int_cold(list: *mut CelObject, word: i64) -> i64 {
+    if list.is_null() {
+        return 0;
+    }
+    unsafe {
+        let strategy = (*list.cast::<crate::runtime::object::W_ListObject>()).strategy;
+        let length = (*list.cast::<crate::runtime::object::W_ListObject>()).length;
+        if strategy == ListStrategy::Ints {
+            i64::from(list_store_int(list, word))
+        } else if strategy == ListStrategy::Object && length == 0 {
+            i64::from(list_promote_empty_to_ints(list, word))
+        } else {
+            0
+        }
+    }
+}
+
+/// `IntegerListStrategy.append`: store the unboxed word.
+///
+/// Common path is a length/capacity read, a guard, `setarrayitem_gc`
+/// (`rewrite_op_setarrayitem`) and `setfield_gc` of `length`
+/// (`rewrite_op_setfield`). The grow is [`list_resize_ge_i`].
+#[majit_macros::jit_inline(
+    ref_params = { list: ref(crate::runtime::object::W_ListObject) },
+    ref_fields = {
+        crate::runtime::object::W_ListObject::storage => crate::runtime::object::CelObject,
+    },
+    array_fields = { crate::runtime::object::W_IntColumn::data => i64 },
+    int_fields = {
+        crate::runtime::object::W_ListObject::strategy => u8,
+        crate::runtime::object::W_ListObject::length => i64,
+        crate::runtime::object::W_IntColumn::length => i64,
+    },
+    calls = {
+        list_resize_ge_i => residual_int,
+        list_append_int_cold => residual_int,
+    },
+)]
+fn append_int_word(list: *mut CelObject, word: i64) -> i64 {
+    let strategy = list.strategy as u8 as i64;
+    if strategy == ListStrategy::Ints as i64 {
+        let storage = list.storage;
+        if (storage as *mut u8) != core::ptr::null_mut() {
+            let col = storage as *mut crate::runtime::object::W_IntColumn;
+            let length = list.length;
+            let cap = col.length;
+            if length >= 0 {
+                if length < cap {
+                    col.data[length] = word;
+                    list.length = length + 1;
+                    1
+                } else if list_resize_ge_i(list, length + 1) != 0 {
+                    let storage2 = list.storage;
+                    if (storage2 as *mut u8) != core::ptr::null_mut() {
+                        let col2 = storage2 as *mut crate::runtime::object::W_IntColumn;
+                        col2.data[length] = word;
+                        list.length = length + 1;
+                        1
+                    } else {
+                        list_append_int_cold(list, word)
+                    }
+                } else {
+                    list_append_int_cold(list, word)
+                }
+            } else {
+                list_append_int_cold(list, word)
+            }
+        } else {
+            list_append_int_cold(list, word)
+        }
+    } else {
+        list_append_int_cold(list, word)
+    }
+}
+
 #[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
 fn map_insert_cell(map: CelRef, key: CelRef, value: CelRef) -> i64 {
     try_map_insert(map as i64, key as i64, value as i64)
@@ -2314,6 +2403,7 @@ fn step_hot(program: &CelCode, pc: usize) -> i64 {
         box_int => inline_ref,
         box_bool => inline_ref,
         append_cell => residual_int,
+        append_int_word => inline_int,
         map_insert_cell => residual_int,
         alloc_list => nursery_alloc_ref,
         alloc_map => nursery_alloc_ref,
@@ -2717,8 +2807,7 @@ fn run_cel_portal(
                                         let rv = cell_int(k);
                                         match l.checked_mul(rv) {
                                             Some(v) => {
-                                                let r = box_int(vm, v);
-                                                if append_cell(list, r) != 0 {
+                                                if append_int_word(list, v) != 0 {
                                                     here + 1
                                                 } else {
                                                     residual_dispatch(vm, here)
@@ -2969,7 +3058,12 @@ fn run_cel_portal(
                 let list = state.frame.locals_stack_w[depth - 2];
                 let next = if !item.is_null() {
                     if !list.is_null() {
-                        if append_cell(list, item) != 0 {
+                        let stored = if cell_kind(item) == CelKind::Int as i64 {
+                            append_int_word(list, cell_int(item))
+                        } else {
+                            append_cell(list, item)
+                        };
+                        if stored != 0 {
                             state.frame.valuestackdepth = depth - 1;
                             here + 1
                         } else {
@@ -3210,7 +3304,12 @@ fn run_cel_portal(
                     let list = state.frame.locals_stack_w[top];
                     if !w.is_null() {
                         if !list.is_null() {
-                            if append_cell(list, w) != 0 {
+                            let stored = if cell_kind(w) == CelKind::Int as i64 {
+                                append_int_word(list, cell_int(w))
+                            } else {
+                                append_cell(list, w)
+                            };
+                            if stored != 0 {
                                 here + 1
                             } else {
                                 residual_dispatch(vm, here)

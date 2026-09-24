@@ -517,7 +517,9 @@ pub enum ListStrategy {
 }
 
 /// An unboxed integer column. Not pointer-traced; the payload is raw `i64`s.
-#[cfg_attr(feature = "jit", majit_macros::jit_immutable_fields(data, length))]
+///
+/// `data` and `length` (the allocated count, `ll_newlist_hint`) are written
+/// again by [`list_resize_ge`], so they are not `_immutable_fields_`.
 #[repr(C)]
 #[allow(non_camel_case_types)]
 pub struct W_IntColumn {
@@ -561,7 +563,7 @@ pub fn new_int_column(values: &[i64]) -> *mut W_IntColumn {
 /// class-family value); int columns and host windows live at `storage`.
 #[cfg_attr(
     feature = "jit",
-    majit_macros::jit_immutable_fields(strategy, storage, items, start, length)
+    majit_macros::jit_immutable_fields(strategy, storage, items, start)
 )]
 #[repr(C)]
 #[allow(non_camel_case_types)]
@@ -794,9 +796,185 @@ pub fn new_list_with_capacity_in(heap: &super::heap::CelHeap, cap: i64) -> *mut 
     })
 }
 
-/// Append `item` to an object-strategy list if the block still has room.
+/// An int column whose `length` is the allocated count (`ll_newlist_hint`).
+fn new_int_column_capacity(cap: i64) -> *mut W_IntColumn {
+    let cap = cap.max(1);
+    let bytes = (cap as usize).saturating_mul(core::mem::size_of::<i64>());
+    super::heap::with_heap(|h| {
+        let data = h.alloc_raw(bytes, align_of::<i64>()) as *mut i64;
+        h.alloc(W_IntColumn {
+            ob_header: CelObject {
+                ob_type: &CEL_INT_COLUMN_CLASS,
+            },
+            data,
+            length: cap,
+        })
+    })
+}
+
+/// Grow an int-column list so its storage holds at least `newsize` words.
 ///
-/// Used while a comprehension fills a list opened by [`new_list_with_capacity`].
+/// `lltypesystem/rlist.py` `_ll_list_resize_ge`: the only residual call on
+/// the append fast path. Logical [`W_ListObject::length`] stays put; the
+/// caller writes the new word and then the length (`ll_append`).
+///
+/// # Safety
+///
+/// `w` is a live [`W_ListObject`].
+pub unsafe fn list_resize_ge(w: CelRef, newsize: i64) -> bool {
+    if newsize < 0 || w_kind(w) != CelKind::List {
+        return false;
+    }
+    let leaf = &mut *w.cast::<W_ListObject>();
+    if leaf.strategy != ListStrategy::Ints || leaf.storage.is_null() {
+        return false;
+    }
+    let col = &mut *leaf.storage.cast::<W_IntColumn>();
+    if newsize <= col.length {
+        return true;
+    }
+    let mut newcap = col.length.saturating_mul(2);
+    if newcap < newsize {
+        newcap = newsize;
+    }
+    if newcap < 4 {
+        newcap = 4;
+    }
+    let nbytes = (newcap as usize).saturating_mul(core::mem::size_of::<i64>());
+    let live = leaf.length.max(0) as usize;
+    let src = col.data;
+    let ptr = super::heap::with_heap(|h| h.alloc_raw(nbytes, align_of::<i64>())) as *mut i64;
+    if live > 0 && !src.is_null() {
+        core::ptr::copy_nonoverlapping(src, ptr, live);
+    }
+    let col = &mut *(*w.cast::<W_ListObject>()).storage.cast::<W_IntColumn>();
+    col.data = ptr;
+    col.length = newcap;
+    true
+}
+
+/// Store `word` at the end of an int-column list, growing when the column
+/// is full. `AbstractUnwrappedStrategy.append` / `ll_append`.
+///
+/// # Safety
+///
+/// `w` is a live [`W_ListObject`] whose strategy is [`ListStrategy::Ints`].
+pub unsafe fn list_store_int(w: CelRef, word: i64) -> bool {
+    if w_kind(w) != CelKind::List {
+        return false;
+    }
+    let length = (*w.cast::<W_ListObject>()).length;
+    let storage = (*w.cast::<W_ListObject>()).storage;
+    if storage.is_null() {
+        return false;
+    }
+    let cap = (*storage.cast::<W_IntColumn>()).length;
+    if length < 0 || (length >= cap && !list_resize_ge(w, length + 1)) {
+        return false;
+    }
+    let leaf = &mut *w.cast::<W_ListObject>();
+    let storage = leaf.storage;
+    if storage.is_null() {
+        return false;
+    }
+    let col = &*storage.cast::<W_IntColumn>();
+    let at = leaf.length;
+    if col.data.is_null() || at < 0 || at >= col.length {
+        return false;
+    }
+    let data = col.data;
+    *data.add(at as usize) = word;
+    leaf.length = at + 1;
+    leaf.public = core::ptr::null();
+    leaf.public_start = 0;
+    leaf.public_len = 0;
+    true
+}
+
+/// `EmptyListStrategy.switch_to_correct_strategy` for a plain int: the
+/// empty object list becomes an int column sized to the hint, then the
+/// word is stored.
+///
+/// # Safety
+///
+/// `w` is a live [`W_ListObject`].
+pub unsafe fn list_promote_empty_to_ints(w: CelRef, word: i64) -> bool {
+    if w_kind(w) != CelKind::List {
+        return false;
+    }
+    let leaf = &*w.cast::<W_ListObject>();
+    if leaf.strategy != ListStrategy::Object || leaf.length != 0 {
+        return false;
+    }
+    let cap = if leaf.items.is_null() {
+        1
+    } else {
+        (crate::runtime::object_array::items_capacity(leaf.items) as i64).max(1)
+    };
+    let col = new_int_column_capacity(cap);
+    let leaf = &mut *w.cast::<W_ListObject>();
+    leaf.strategy = ListStrategy::Ints;
+    leaf.storage = col as CelRef;
+    leaf.items = core::ptr::null_mut();
+    leaf.start = 0;
+    list_store_int(w, word)
+}
+
+/// `switch_to_object_strategy`: box the int column and append `item`.
+///
+/// # Safety
+///
+/// `w` is a live [`W_ListObject`]. `item` is a live value.
+unsafe fn list_switch_to_object_append(w: CelRef, item: CelRef) -> bool {
+    if w_kind(w) != CelKind::List {
+        return false;
+    }
+    let leaf = &*w.cast::<W_ListObject>();
+    if leaf.strategy != ListStrategy::Ints {
+        return false;
+    }
+    let n = leaf.length.max(0) as usize;
+    let col = leaf.storage;
+    let (words, cap_words) = if col.is_null() {
+        (core::ptr::null_mut(), 0i64)
+    } else {
+        let col = &*col.cast::<W_IntColumn>();
+        (col.data, col.length)
+    };
+    if n > 0 && words.is_null() {
+        return false;
+    }
+    let cap = (cap_words.max(0) as usize).max(n + 1);
+    let items = super::heap::with_heap(|h| {
+        crate::runtime::object_array::new_items_block_with_zeroed_prefix_in(h, cap, 0)
+    });
+    let base = crate::runtime::object_array::items_block_items_base(items);
+    if base.is_null() {
+        return false;
+    }
+    let mut i = 0;
+    while i < n {
+        *base.add(i) = new_int(*words.add(i)) as CelRef;
+        i += 1;
+    }
+    *base.add(n) = item;
+    let leaf = &mut *w.cast::<W_ListObject>();
+    leaf.strategy = ListStrategy::Object;
+    leaf.storage = core::ptr::null_mut();
+    leaf.items = items;
+    leaf.start = 0;
+    leaf.length = (n + 1) as i64;
+    leaf.public = core::ptr::null();
+    leaf.public_start = 0;
+    leaf.public_len = 0;
+    true
+}
+
+/// Append `item` to a list opened by [`new_list_with_capacity`].
+///
+/// An int joined to an empty list or to an int column is stored unboxed
+/// (`IntegerListStrategy.append`). Anything else stays on, or switches to,
+/// the object strategy.
 ///
 /// # Safety
 ///
@@ -805,10 +983,20 @@ pub unsafe fn list_try_append(w: CelRef, item: CelRef) -> bool {
     if w_kind(w) != CelKind::List {
         return false;
     }
-    let leaf = &mut *w.cast::<W_ListObject>();
-    if leaf.strategy != ListStrategy::Object {
+    let strategy = (*w.cast::<W_ListObject>()).strategy;
+    if strategy == ListStrategy::Ints {
+        if w_kind(item) == CelKind::Int {
+            return list_store_int(w, (*item.cast::<W_IntObject>()).intval);
+        }
+        return list_switch_to_object_append(w, item);
+    }
+    if strategy != ListStrategy::Object {
         return false;
     }
+    if (*w.cast::<W_ListObject>()).length == 0 && w_kind(item) == CelKind::Int {
+        return list_promote_empty_to_ints(w, (*item.cast::<W_IntObject>()).intval);
+    }
+    let leaf = &mut *w.cast::<W_ListObject>();
     let cap = crate::runtime::object_array::items_capacity(leaf.items);
     if leaf.length < 0 || (leaf.length as usize) >= cap {
         return false;
