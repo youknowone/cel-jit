@@ -4785,33 +4785,37 @@ mod tests {
 
     #[test]
     fn interned_temporal_accessors_and_matches_through_the_vm() {
+        #[cfg(any(feature = "chrono", feature = "regex"))]
         let ctx = Context::default();
-        let hours = cel_eval_loop(
-            &compile(&parse("duration('3661s').getHours()")).expect("compile"),
-            &ctx,
-        )
-        .expect("eval");
-        assert_eq!(hours, Value::Int(1));
-        assert_eq!(
-            crate::runtime::convert::intern_leaf(&hours),
-            Some(crate::runtime::object::new_int(1) as crate::runtime::object::CelRef)
-        );
-        assert_eq!(
-            cel_eval_loop(
-                &compile(&parse("duration('3661s').getMinutes()")).expect("compile"),
-                &ctx
+        #[cfg(feature = "chrono")]
+        {
+            let hours = cel_eval_loop(
+                &compile(&parse("duration('3661s').getHours()")).expect("compile"),
+                &ctx,
             )
-            .expect("eval"),
-            Value::Int(61)
-        );
-        assert_eq!(
-            cel_eval_loop(
-                &compile(&parse("duration('1s').getMilliseconds()")).expect("compile"),
-                &ctx
-            )
-            .expect("eval"),
-            Value::Int(1000)
-        );
+            .expect("eval");
+            assert_eq!(hours, Value::Int(1));
+            assert_eq!(
+                crate::runtime::convert::intern_leaf(&hours),
+                Some(crate::runtime::object::new_int(1) as crate::runtime::object::CelRef)
+            );
+            assert_eq!(
+                cel_eval_loop(
+                    &compile(&parse("duration('3661s').getMinutes()")).expect("compile"),
+                    &ctx
+                )
+                .expect("eval"),
+                Value::Int(61)
+            );
+            assert_eq!(
+                cel_eval_loop(
+                    &compile(&parse("duration('1s').getMilliseconds()")).expect("compile"),
+                    &ctx
+                )
+                .expect("eval"),
+                Value::Int(1000)
+            );
+        }
         #[cfg(feature = "chrono")]
         {
             let ts = "timestamp('2020-01-02T03:04:05.006Z')";
