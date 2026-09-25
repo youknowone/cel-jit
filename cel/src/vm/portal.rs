@@ -747,6 +747,28 @@ fn interned_opt_index(container: i64, key: i64) -> i64 {
     }
 }
 
+/// Optional index as a cell. Null declines (`interned_opt_index` returned 0).
+#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+fn opt_index_cell(container: *mut CelObject, key: *mut CelObject) -> *mut CelObject {
+    let item = interned_opt_index(container as i64, key as i64);
+    if item == 0 {
+        core::ptr::null_mut()
+    } else {
+        item as usize as *mut CelObject
+    }
+}
+
+/// Optional field as a cell. Null declines.
+#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+fn opt_select_cell(recv: *mut CelObject, program: &CelCode, name_idx: i64) -> *mut CelObject {
+    let found = interned_opt_select(recv as i64, program, name_idx);
+    if found == 0 {
+        core::ptr::null_mut()
+    } else {
+        found as usize as *mut CelObject
+    }
+}
+
 /// Optional field. `0` residual, else an optional leaf.
 #[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
 fn interned_opt_select(w: i64, program: &CelCode, name_idx: i64) -> i64 {
@@ -2451,10 +2473,30 @@ fn string_from_cell(w: *mut CelObject) -> *mut CelObject {
     }
 }
 
+/// `listobject.py` `UNROLL_CUTOFF`. A longer column is not unrolled:
+/// `loop_unrolling_heuristic` is false, and `@look_inside_iff` leaves the
+/// scan as one residual call (`contains_int_scan`).
+const CONTAINS_UNROLL_CUTOFF: i64 = 5;
+
+/// The scan `@look_inside_iff` does not enter. Same result as the unrolled
+/// body: `2` hit, `1` miss.
+#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+fn contains_int_scan(data: *mut i64, start: i64, length: i64, want: i64) -> i64 {
+    let mut i = 0;
+    let mut hits = 0;
+    while i < length {
+        let v = unsafe { *data.offset((start + i) as isize) };
+        hits += i64::from(v == want);
+        i += 1;
+    }
+    1 + i64::from(hits != 0)
+}
+
 /// `IntegerListStrategy._safe_contains`: `2` hit, `1` miss, `0` decline.
 ///
-/// Plain scan. A constant column is unrolled by the tracer
-/// (`loop_unrolling_heuristic`), the same way `_safe_find_or_count` is.
+/// A column no longer than [`CONTAINS_UNROLL_CUTOFF`] unrolls
+/// (`_safe_find_or_count`, one `IntEq` per element). Anything longer is
+/// [`contains_int_scan`].
 #[majit_macros::jit_inline(
     ref_params = { list: ref(crate::runtime::object::W_ListObject) },
     ref_fields = {
@@ -2470,6 +2512,7 @@ fn string_from_cell(w: *mut CelObject) -> *mut CelObject {
     calls = {
         cell_kind => inline_int,
         cell_int => inline_int,
+        contains_int_scan => residual_int,
     },
 )]
 fn contains_int_word(list: *mut CelObject, needle: *mut CelObject) -> i64 {
@@ -2494,10 +2537,9 @@ fn contains_int_word(list: *mut CelObject, needle: *mut CelObject) -> i64 {
                     0
                 } else if stop > col_len {
                     0
+                } else if length > CONTAINS_UNROLL_CUTOFF {
+                    contains_int_scan(col.data, start, length, want)
                 } else {
-                    // `_safe_find_or_count`: the compare is a value, so a
-                    // constant column unrolls to one `IntEq` per element
-                    // instead of a side exit that drops the last hit.
                     let mut i = 0;
                     let mut hits = 0;
                     while i < length {
@@ -3438,6 +3480,8 @@ fn slow_pc(vm: i64, here: i64) -> i64 {
         interned_list_indices => residual_int,
         interned_opt_index => residual_int,
         interned_opt_select => residual_int,
+        opt_index_cell => residual_ref,
+        opt_select_cell => residual_ref,
         interned_item => residual_int,
         interned_equals => residual_int,
         interned_not_equals => residual_int,
@@ -5486,6 +5530,79 @@ fn run_cel_portal(
                     if map_opt_insert(map, key, value) != 0 {
                         state.frame.valuestackdepth = depth - 2;
                         here + 1
+                    } else {
+                        slow_pc(vm, here)
+                    }
+                } else {
+                    slow_pc(vm, here)
+                };
+                if next >= 0 {
+                    let tgt = next as usize;
+                    if tgt < pc {
+                        can_enter_jit!(driver, tgt, &mut *state, program, || {});
+                    }
+                    pc = tgt;
+                    continue;
+                }
+                state.ret = next;
+                return next;
+            }
+            OP_OPT_INDEX => {
+                state.frame.last_instr = pc as i64;
+                let vm = state.vm;
+                let here = pc as i64;
+                let depth = state.frame.valuestackdepth;
+                let key_i = depth - 1;
+                let box_i = depth - 2;
+                let next = if box_i >= state.frame.n_slots {
+                    let key = state.frame.locals_stack_w[key_i];
+                    let container = state.frame.locals_stack_w[box_i];
+                    if !container.is_null() {
+                        if !key.is_null() {
+                            let item = opt_index_cell(container, key);
+                            if !item.is_null() {
+                                state.frame.locals_stack_w[box_i] = item;
+                                state.frame.valuestackdepth = depth - 1;
+                                here + 1
+                            } else {
+                                slow_pc(vm, here)
+                            }
+                        } else {
+                            slow_pc(vm, here)
+                        }
+                    } else {
+                        slow_pc(vm, here)
+                    }
+                } else {
+                    slow_pc(vm, here)
+                };
+                if next >= 0 {
+                    let tgt = next as usize;
+                    if tgt < pc {
+                        can_enter_jit!(driver, tgt, &mut *state, program, || {});
+                    }
+                    pc = tgt;
+                    continue;
+                }
+                state.ret = next;
+                return next;
+            }
+            OP_OPT_SELECT => {
+                state.frame.last_instr = pc as i64;
+                let vm = state.vm;
+                let here = pc as i64;
+                let depth = state.frame.valuestackdepth;
+                let i = depth - 1;
+                let next = if i >= state.frame.n_slots {
+                    let recv = state.frame.locals_stack_w[i];
+                    if !recv.is_null() {
+                        let found = opt_select_cell(recv, program, insn_a(program, pc));
+                        if !found.is_null() {
+                            state.frame.locals_stack_w[i] = found;
+                            here + 1
+                        } else {
+                            slow_pc(vm, here)
+                        }
                     } else {
                         slow_pc(vm, here)
                     }
