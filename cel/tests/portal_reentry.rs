@@ -145,3 +145,19 @@ fn compiled_loop_sees_each_resolver_value() {
         );
     }
 }
+
+/// A compiled loop must take a later decline with the frame the trace
+/// still holds in registers.
+///
+/// `100 / (e - 5)` stays on the traced int arm for `e` in `6..=10` and
+/// declines through `slow_pc` at `e == 5` (divisor 0) and for a negative
+/// divisor. Before the residual was `may_force`, execute 25 came back
+/// `InternalError` instead of the walker's `DivisionByZero`.
+#[test]
+fn compiled_decline_after_warmup_matches_the_walker() {
+    // SAFETY: stored before this test builds a driver. The knob is read
+    // once, when that driver is created.
+    unsafe { std::env::set_var("CEL_PORTAL_THRESHOLD", "100") };
+    agree_compiled("list.map(e, list[e])", 40);
+    agree_compiled("list.map(e, 100 / (e - 5))", 40);
+}

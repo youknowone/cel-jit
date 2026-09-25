@@ -786,6 +786,7 @@ fn portal_rare(
     here: i64,
     opcode: i64,
 ) -> i64 {
+    unsafe { force_virtualizable_if_necessary(frame) };
     match opcode {
         OP_HAS_FIELD => match operand_cell(frame, 1) {
             Some(recv) if !recv.is_null() => {
@@ -1226,6 +1227,9 @@ fn vm_sync_pop(vm_bits: i64) {
 #[inline(never)]
 fn residual_dispatch(vm_bits: i64, pc: i64) -> i64 {
     let vm = unsafe { &mut *(vm_bits as usize as *mut Vm<'_>) };
+    // `force_virtualizable_if_necessary`: clear `TOKEN_TRACING_RESCALL`
+    // so `vable_after_residual_call` reloads the boxes this call writes.
+    unsafe { force_virtualizable_if_necessary(vm.cel_frame) };
     let opcode = insn_op(vm.code, pc as usize);
     if opcode == OP_AND || opcode == OP_OR {
         let frame = unsafe { &mut *vm.cel_frame };
@@ -1237,6 +1241,7 @@ fn residual_dispatch(vm_bits: i64, pc: i64) -> i64 {
 #[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
 fn residual_hydrate(vm_bits: i64, pc: i64) -> i64 {
     let vm = unsafe { &mut *(vm_bits as usize as *mut Vm<'_>) };
+    unsafe { force_virtualizable_if_necessary(vm.cel_frame) };
     vm.hydrate_from_cells();
     match vm.dispatch_one(pc as u32) {
         Ok(Step::Next) => pc + 1,
@@ -2872,7 +2877,11 @@ fn step_hot(program: &CelCode, pc: usize) -> i64 {
 /// Each direct `residual_dispatch` site in the dispatch JitCode is its own
 /// word-sized constant. Sharing one callee keeps that pool inside the
 /// 256-wide int index space (`assembler.py` `emit_reg`).
-#[majit_macros::jit_inline(calls = { residual_dispatch => residual_int })]
+///
+/// `VirtualizableAnalyzer` marks a call that can read the virtualizable
+/// `EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE`; `handle_residual_call` records
+/// that as `may_force` so the tracer syncs the vable before the call.
+#[majit_macros::jit_inline(calls = { residual_dispatch => may_force_int })]
 fn slow_pc(vm: i64, here: i64) -> i64 {
     residual_dispatch(vm, here)
 }
@@ -2968,7 +2977,7 @@ fn slow_pc(vm: i64, here: i64) -> i64 {
         interned_optional_state => residual_int,
         interned_optional_inner => residual_int,
         interned_as_bool => residual_int,
-        portal_rare => residual_int,
+        portal_rare => may_force_int,
         interned_map_keys => residual_int,
         interned_list_indices => residual_int,
         interned_opt_index => residual_int,
@@ -2985,8 +2994,8 @@ fn slow_pc(vm: i64, here: i64) -> i64 {
         new_int_in => inline_ref,
         try_append => residual_int,
         new_list_with_capacity_in => inline_ref,
-        residual_dispatch => residual_int,
-        residual_hydrate => residual_int,
+        residual_dispatch => may_force_int,
+        residual_hydrate => may_force_int,
         vm_sync_binop => residual_int,
         vm_sync_replace => residual_int,
         vm_sync_push => residual_int,
