@@ -55,7 +55,5 @@ fn compiled_entries_match_the_walker() {
     // Each call walks a length-10 outer loop, so the back-edge counter
     // passes the threshold well inside this window.
     agree_compiled("list.map(e, [1, 2].map(i, i + e))", 150);
-    // `Sub` has no fused form, so the loop body is the portal match's
-    // fallback, which calls `step_hot`.
     agree_compiled("list.map(e, e - 1)", 150);
 }

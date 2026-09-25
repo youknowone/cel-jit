@@ -540,6 +540,11 @@ fn interned_contains(container: i64, needle: i64) -> i64 {
 
 /// Length of an interned list/map/string/bytes. `-1` means residual.
 #[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+fn interned_len_cell(w: CelRef) -> i64 {
+    interned_len(w as i64)
+}
+
+#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
 fn interned_len(w: i64) -> i64 {
     let Some(w) = slot_leaf(w) else {
         return -1;
@@ -1082,6 +1087,18 @@ fn interned_unary(vm_bits: i64, program: &CelCode, name_idx: i64, w: i64) -> i64
     vm_of(vm_bits).interned_unary_bits(name, w)
 }
 
+/// [`interned_unary`] as a reference, so the portal stores it without an
+/// int-to-ref cast. Null declines.
+#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+fn interned_unary_cell(vm_bits: i64, program: &CelCode, name_idx: i64, w: CelRef) -> CelRef {
+    let out = interned_unary(vm_bits, program, name_idx, w as i64);
+    if out == 0 || out == ERROR_SENTINEL as i64 {
+        core::ptr::null_mut()
+    } else {
+        out as usize as CelRef
+    }
+}
+
 #[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
 fn interned_temporal(vm_bits: i64, program: &CelCode, name_idx: i64, w: i64) -> i64 {
     let Some(w) = slot_leaf(w) else {
@@ -1587,6 +1604,114 @@ fn box_bool(bit: i64) -> *mut CelObject {
         new_bool(true) as *mut CelObject
     } else {
         new_bool(false) as *mut CelObject
+    }
+}
+
+/// `1` / `0` for an int comparison, `-1` when `op` is not one.
+///
+/// `jtransform.py` `rewrite_op_int_lt` / `int_eq` on the unboxed words.
+#[majit_macros::jit_inline]
+fn trace_cmp_bit(op: i64, l: i64, r: i64) -> i64 {
+    if op == OP_EQ {
+        if l == r {
+            1
+        } else {
+            0
+        }
+    } else if op == OP_NE {
+        if l != r {
+            1
+        } else {
+            0
+        }
+    } else if op == OP_LT {
+        if l < r {
+            1
+        } else {
+            0
+        }
+    } else if op == OP_LE {
+        if l <= r {
+            1
+        } else {
+            0
+        }
+    } else if op == OP_GT {
+        if l > r {
+            1
+        } else {
+            0
+        }
+    } else if op == OP_GE {
+        if l >= r {
+            1
+        } else {
+            0
+        }
+    } else {
+        -1
+    }
+}
+
+/// `1` when `op` is an int arithmetic the fast path can finish.
+///
+/// Division and remainder stay on the non-negative side, where floor
+/// division matches truncating division. Overflow and a zero divisor
+/// return `0` so the caller takes [`residual_dispatch`].
+#[majit_macros::jit_inline]
+fn trace_arith_ok(op: i64, l: i64, r: i64) -> i64 {
+    if op == OP_ADD {
+        match l.checked_add(r) {
+            Some(_v) => 1,
+            None => 0,
+        }
+    } else if op == OP_SUB {
+        match l.checked_sub(r) {
+            Some(_v) => 1,
+            None => 0,
+        }
+    } else if op == OP_MUL {
+        match l.checked_mul(r) {
+            Some(_v) => 1,
+            None => 0,
+        }
+    } else if op == OP_DIV || op == OP_MOD {
+        if r > 0 {
+            if l >= 0 {
+                1
+            } else {
+                0
+            }
+        } else {
+            0
+        }
+    } else {
+        0
+    }
+}
+
+/// Unboxed int result. Only called when [`trace_arith_ok`] returned `1`.
+#[majit_macros::jit_inline]
+fn trace_arith_word(op: i64, l: i64, r: i64) -> i64 {
+    if op == OP_ADD {
+        match l.checked_add(r) {
+            Some(v) => v,
+            None => 0,
+        }
+    } else if op == OP_SUB {
+        match l.checked_sub(r) {
+            Some(v) => v,
+            None => 0,
+        }
+    } else if op == OP_MUL {
+        match l.checked_mul(r) {
+            Some(v) => v,
+            None => 0,
+        }
+    } else if op == OP_DIV {
+        l / r
+    } else {
+        l % r
     }
 }
 
@@ -2357,6 +2482,16 @@ fn step_hot(program: &CelCode, pc: usize) -> i64 {
     }
 }
 
+/// One residual for every traced arm that declines.
+///
+/// Each direct `residual_dispatch` site in the dispatch JitCode is its own
+/// word-sized constant. Sharing one callee keeps that pool inside the
+/// 256-wide int index space (`assembler.py` `emit_reg`).
+#[majit_macros::jit_inline(calls = { residual_dispatch => residual_int })]
+fn slow_pc(vm: i64, here: i64) -> i64 {
+    residual_dispatch(vm, here)
+}
+
 #[majit_macros::jit_interp(
     state = PortalState,
     env = CelCode,
@@ -2402,6 +2537,10 @@ fn step_hot(program: &CelCode, pc: usize) -> i64 {
         cell_list_len => inline_int,
         box_int => inline_ref,
         box_bool => inline_ref,
+        trace_cmp_bit => inline_int,
+        trace_arith_ok => inline_int,
+        trace_arith_word => inline_int,
+        slow_pc => inline_int,
         append_cell => residual_int,
         append_int_word => inline_int,
         map_insert_cell => residual_int,
@@ -2418,8 +2557,10 @@ fn step_hot(program: &CelCode, pc: usize) -> i64 {
         interned_index => residual_int,
         interned_contains => residual_int,
         interned_len => residual_int,
+        interned_len_cell => residual_int,
         interned_is_size => residual_int,
         interned_unary => residual_int,
+        interned_unary_cell => residual_ref,
         interned_temporal => residual_int,
         interned_optional_unary => residual_int,
         interned_method1 => residual_int,
@@ -2494,7 +2635,7 @@ fn run_cel_portal(
                 let here = pc as i64;
                 let w = intern_var(vm, program, insn_a(program, pc));
                 let next = if w.is_null() {
-                    residual_dispatch(vm, here)
+                    slow_pc(vm, here)
                 } else {
                     let depth = state.frame.valuestackdepth;
                     state.frame.locals_stack_w[depth] = w;
@@ -2518,7 +2659,7 @@ fn run_cel_portal(
                 let here = pc as i64;
                 let w = intern_const(program, insn_a(program, pc));
                 let next = if w.is_null() {
-                    residual_dispatch(vm, here)
+                    slow_pc(vm, here)
                 } else {
                     let depth = state.frame.valuestackdepth;
                     state.frame.locals_stack_w[depth] = w;
@@ -2542,7 +2683,7 @@ fn run_cel_portal(
                 let here = pc as i64;
                 let w = state.frame.locals_stack_w[insn_a(program, pc)];
                 let next = if w.is_null() {
-                    residual_dispatch(vm, here)
+                    slow_pc(vm, here)
                 } else {
                     let depth = state.frame.valuestackdepth;
                     state.frame.locals_stack_w[depth] = w;
@@ -2567,7 +2708,7 @@ fn run_cel_portal(
                 let depth = state.frame.valuestackdepth;
                 let w = state.frame.locals_stack_w[depth - 1];
                 let next = if w.is_null() {
-                    residual_dispatch(vm, here)
+                    slow_pc(vm, here)
                 } else {
                     let slot = insn_a(program, pc);
                     state.frame.locals_stack_w[slot] = w;
@@ -2592,7 +2733,7 @@ fn run_cel_portal(
                 let depth = state.frame.valuestackdepth;
                 let w = state.frame.locals_stack_w[depth - 1];
                 let next = if w.is_null() {
-                    residual_dispatch(vm, here)
+                    slow_pc(vm, here)
                 } else {
                     vm_park_return(vm, w);
                     PORTAL_DONE
@@ -2629,22 +2770,22 @@ fn run_cel_portal(
                                             state.frame.locals_stack_w[i] = r;
                                             here + 1
                                         }
-                                        None => residual_dispatch(vm, here),
+                                        None => slow_pc(vm, here),
                                     }
                                 } else {
-                                    residual_dispatch(vm, here)
+                                    slow_pc(vm, here)
                                 }
                             } else {
-                                residual_dispatch(vm, here)
+                                slow_pc(vm, here)
                             }
                         } else {
-                            residual_dispatch(vm, here)
+                            slow_pc(vm, here)
                         }
                     } else {
-                        residual_dispatch(vm, here)
+                        slow_pc(vm, here)
                     }
                 } else {
-                    residual_dispatch(vm, here)
+                    slow_pc(vm, here)
                 };
                 if next >= 0 {
                     let tgt = next as usize;
@@ -2678,22 +2819,22 @@ fn run_cel_portal(
                                             state.frame.locals_stack_w[i] = r;
                                             here + 1
                                         }
-                                        None => residual_dispatch(vm, here),
+                                        None => slow_pc(vm, here),
                                     }
                                 } else {
-                                    residual_dispatch(vm, here)
+                                    slow_pc(vm, here)
                                 }
                             } else {
-                                residual_dispatch(vm, here)
+                                slow_pc(vm, here)
                             }
                         } else {
-                            residual_dispatch(vm, here)
+                            slow_pc(vm, here)
                         }
                     } else {
-                        residual_dispatch(vm, here)
+                        slow_pc(vm, here)
                     }
                 } else {
-                    residual_dispatch(vm, here)
+                    slow_pc(vm, here)
                 };
                 if next >= 0 {
                     let tgt = next as usize;
@@ -2725,16 +2866,16 @@ fn run_cel_portal(
                                 state.frame.valuestackdepth = depth + 1;
                                 here + 1
                             } else {
-                                residual_dispatch(vm, here)
+                                slow_pc(vm, here)
                             }
                         } else {
-                            residual_dispatch(vm, here)
+                            slow_pc(vm, here)
                         }
                     } else {
-                        residual_dispatch(vm, here)
+                        slow_pc(vm, here)
                     }
                 } else {
-                    residual_dispatch(vm, here)
+                    slow_pc(vm, here)
                 };
                 if next >= 0 {
                     let tgt = next as usize;
@@ -2766,16 +2907,16 @@ fn run_cel_portal(
                                 state.frame.valuestackdepth = depth + 1;
                                 here + 1
                             } else {
-                                residual_dispatch(vm, here)
+                                slow_pc(vm, here)
                             }
                         } else {
-                            residual_dispatch(vm, here)
+                            slow_pc(vm, here)
                         }
                     } else {
-                        residual_dispatch(vm, here)
+                        slow_pc(vm, here)
                     }
                 } else {
-                    residual_dispatch(vm, here)
+                    slow_pc(vm, here)
                 };
                 if next >= 0 {
                     let tgt = next as usize;
@@ -2810,28 +2951,28 @@ fn run_cel_portal(
                                                 if append_int_word(list, v) != 0 {
                                                     here + 1
                                                 } else {
-                                                    residual_dispatch(vm, here)
+                                                    slow_pc(vm, here)
                                                 }
                                             }
-                                            None => residual_dispatch(vm, here),
+                                            None => slow_pc(vm, here),
                                         }
                                     } else {
-                                        residual_dispatch(vm, here)
+                                        slow_pc(vm, here)
                                     }
                                 } else {
-                                    residual_dispatch(vm, here)
+                                    slow_pc(vm, here)
                                 }
                             } else {
-                                residual_dispatch(vm, here)
+                                slow_pc(vm, here)
                             }
                         } else {
-                            residual_dispatch(vm, here)
+                            slow_pc(vm, here)
                         }
                     } else {
-                        residual_dispatch(vm, here)
+                        slow_pc(vm, here)
                     }
                 } else {
-                    residual_dispatch(vm, here)
+                    slow_pc(vm, here)
                 };
                 if next >= 0 {
                     let tgt = next as usize;
@@ -2862,16 +3003,16 @@ fn run_cel_portal(
                                 state.frame.valuestackdepth = depth - 1;
                                 here + 1
                             } else {
-                                residual_dispatch(vm, here)
+                                slow_pc(vm, here)
                             }
                         } else {
-                            residual_dispatch(vm, here)
+                            slow_pc(vm, here)
                         }
                     } else {
-                        residual_dispatch(vm, here)
+                        slow_pc(vm, here)
                     }
                 } else {
-                    residual_dispatch(vm, here)
+                    slow_pc(vm, here)
                 };
                 if next >= 0 {
                     let tgt = next as usize;
@@ -2894,7 +3035,7 @@ fn run_cel_portal(
                     let w = state.frame.locals_stack_w[i];
                     let bit = cell_bool(w);
                     if bit < 0 {
-                        residual_dispatch(vm, here)
+                        slow_pc(vm, here)
                     } else {
                         state.frame.valuestackdepth = depth - 1;
                         if bit == 0 {
@@ -2904,7 +3045,7 @@ fn run_cel_portal(
                         }
                     }
                 } else {
-                    residual_dispatch(vm, here)
+                    slow_pc(vm, here)
                 };
                 if next >= 0 {
                     let tgt = next as usize;
@@ -2977,16 +3118,16 @@ fn run_cel_portal(
                                 state.frame.valuestackdepth = depth - 2;
                                 here + 1
                             } else {
-                                residual_dispatch(vm, here)
+                                slow_pc(vm, here)
                             }
                         } else {
-                            residual_dispatch(vm, here)
+                            slow_pc(vm, here)
                         }
                     } else {
-                        residual_dispatch(vm, here)
+                        slow_pc(vm, here)
                     }
                 } else {
-                    residual_dispatch(vm, here)
+                    slow_pc(vm, here)
                 };
                 if next >= 0 {
                     let tgt = next as usize;
@@ -3006,13 +3147,13 @@ fn run_cel_portal(
                 let depth = state.frame.valuestackdepth;
                 let w = state.frame.locals_stack_w[depth - 1];
                 let next = if w.is_null() {
-                    residual_dispatch(vm, here)
+                    slow_pc(vm, here)
                 } else if cell_kind(w) == CelKind::List as i64 {
                     here + 1
                 } else {
                     let keys = map_keys_cell(vm, w);
                     if keys.is_null() {
-                        residual_dispatch(vm, here)
+                        slow_pc(vm, here)
                     } else {
                         state.frame.locals_stack_w[depth - 1] = keys;
                         here + 1
@@ -3067,13 +3208,13 @@ fn run_cel_portal(
                             state.frame.valuestackdepth = depth - 1;
                             here + 1
                         } else {
-                            residual_dispatch(vm, here)
+                            slow_pc(vm, here)
                         }
                     } else {
-                        residual_dispatch(vm, here)
+                        slow_pc(vm, here)
                     }
                 } else {
-                    residual_dispatch(vm, here)
+                    slow_pc(vm, here)
                 };
                 if next >= 0 {
                     let tgt = next as usize;
@@ -3098,7 +3239,7 @@ fn run_cel_portal(
                     state.frame.valuestackdepth = depth + 1;
                     here + 1
                 } else {
-                    residual_dispatch(vm, here)
+                    slow_pc(vm, here)
                 };
                 if next >= 0 {
                     let tgt = next as usize;
@@ -3127,10 +3268,10 @@ fn run_cel_portal(
                             here + 1
                         }
                     } else {
-                        residual_dispatch(vm, here)
+                        slow_pc(vm, here)
                     }
                 } else {
-                    residual_dispatch(vm, here)
+                    slow_pc(vm, here)
                 };
                 if next >= 0 {
                     let tgt = next as usize;
@@ -3158,13 +3299,13 @@ fn run_cel_portal(
                             state.frame.locals_stack_w[slot] = item;
                             here + 1
                         } else {
-                            residual_dispatch(vm, here)
+                            slow_pc(vm, here)
                         }
                     } else {
-                        residual_dispatch(vm, here)
+                        slow_pc(vm, here)
                     }
                 } else {
-                    residual_dispatch(vm, here)
+                    slow_pc(vm, here)
                 };
                 if next >= 0 {
                     let tgt = next as usize;
@@ -3191,10 +3332,10 @@ fn run_cel_portal(
                             state.frame.locals_stack_w[slot] = r;
                             insn_b(program, pc)
                         }
-                        None => residual_dispatch(vm, here),
+                        None => slow_pc(vm, here),
                     }
                 } else {
-                    residual_dispatch(vm, here)
+                    slow_pc(vm, here)
                 };
                 if next >= 0 {
                     let tgt = next as usize;
@@ -3217,7 +3358,7 @@ fn run_cel_portal(
                 // `exists` leaves it while the accumulator is true.
                 let leave_on = if opcode == OP_ACCU_LOOP_COND { 0 } else { 1 };
                 let next = if bit < 0 {
-                    residual_dispatch(vm, here)
+                    slow_pc(vm, here)
                 } else if bit == leave_on {
                     insn_b(program, pc)
                 } else {
@@ -3251,7 +3392,7 @@ fn run_cel_portal(
                 } else if code == 2 {
                     here + 1
                 } else {
-                    residual_dispatch(vm, here)
+                    slow_pc(vm, here)
                 };
                 if next >= 0 {
                     let tgt = next as usize;
@@ -3277,10 +3418,10 @@ fn run_cel_portal(
                     if and_merge_keep(vm, w, insn_a(program, pc), is_or, bits) != 0 {
                         here + 1
                     } else {
-                        residual_dispatch(vm, here)
+                        slow_pc(vm, here)
                     }
                 } else {
-                    residual_dispatch(vm, here)
+                    slow_pc(vm, here)
                 };
                 if next >= 0 {
                     let tgt = next as usize;
@@ -3312,16 +3453,504 @@ fn run_cel_portal(
                             if stored != 0 {
                                 here + 1
                             } else {
-                                residual_dispatch(vm, here)
+                                slow_pc(vm, here)
                             }
                         } else {
-                            residual_dispatch(vm, here)
+                            slow_pc(vm, here)
                         }
                     } else {
-                        residual_dispatch(vm, here)
+                        slow_pc(vm, here)
                     }
                 } else {
-                    residual_dispatch(vm, here)
+                    slow_pc(vm, here)
+                };
+                if next >= 0 {
+                    let tgt = next as usize;
+                    if tgt < pc {
+                        can_enter_jit!(driver, tgt, &mut *state, program, || {});
+                    }
+                    pc = tgt;
+                    continue;
+                }
+                state.ret = next;
+                return next;
+            }
+            OP_ADD | OP_SUB | OP_MUL | OP_DIV | OP_MOD | OP_EQ | OP_NE | OP_LT | OP_LE | OP_GT
+            | OP_GE => {
+                state.frame.last_instr = pc as i64;
+                let vm = state.vm;
+                let here = pc as i64;
+                let depth = state.frame.valuestackdepth;
+                let bi = depth - 1;
+                let ai = depth - 2;
+                let next = if ai >= state.frame.n_slots {
+                    let a = state.frame.locals_stack_w[ai];
+                    let b = state.frame.locals_stack_w[bi];
+                    if !a.is_null() {
+                        if !b.is_null() {
+                            if cell_kind(a) == CelKind::Int as i64 {
+                                if cell_kind(b) == CelKind::Int as i64 {
+                                    let l = cell_int(a);
+                                    let rv = cell_int(b);
+                                    let bit = trace_cmp_bit(opcode, l, rv);
+                                    if bit >= 0 {
+                                        let r = box_bool(bit);
+                                        state.frame.locals_stack_w[ai] = r;
+                                        state.frame.valuestackdepth = depth - 1;
+                                        here + 1
+                                    } else if trace_arith_ok(opcode, l, rv) != 0 {
+                                        let v = trace_arith_word(opcode, l, rv);
+                                        let r = box_int(vm, v);
+                                        state.frame.locals_stack_w[ai] = r;
+                                        state.frame.valuestackdepth = depth - 1;
+                                        here + 1
+                                    } else {
+                                        slow_pc(vm, here)
+                                    }
+                                } else {
+                                    slow_pc(vm, here)
+                                }
+                            } else {
+                                slow_pc(vm, here)
+                            }
+                        } else {
+                            slow_pc(vm, here)
+                        }
+                    } else {
+                        slow_pc(vm, here)
+                    }
+                } else {
+                    slow_pc(vm, here)
+                };
+                if next >= 0 {
+                    let tgt = next as usize;
+                    if tgt < pc {
+                        can_enter_jit!(driver, tgt, &mut *state, program, || {});
+                    }
+                    pc = tgt;
+                    continue;
+                }
+                state.ret = next;
+                return next;
+            }
+            OP_EQ_K | OP_NE_K | OP_LT_K | OP_GT_K | OP_GE_K => {
+                state.frame.last_instr = pc as i64;
+                let vm = state.vm;
+                let here = pc as i64;
+                let k = intern_const(program, insn_a(program, pc));
+                let depth = state.frame.valuestackdepth;
+                let i = depth - 1;
+                let cmp_op = if opcode == OP_EQ_K {
+                    OP_EQ
+                } else if opcode == OP_NE_K {
+                    OP_NE
+                } else if opcode == OP_LT_K {
+                    OP_LT
+                } else if opcode == OP_GT_K {
+                    OP_GT
+                } else {
+                    OP_GE
+                };
+                let next = if i >= state.frame.n_slots {
+                    let a = state.frame.locals_stack_w[i];
+                    if !a.is_null() {
+                        if !k.is_null() {
+                            if cell_kind(a) == CelKind::Int as i64 {
+                                if cell_kind(k) == CelKind::Int as i64 {
+                                    let bit = trace_cmp_bit(cmp_op, cell_int(a), cell_int(k));
+                                    if bit < 0 {
+                                        slow_pc(vm, here)
+                                    } else {
+                                        let r = box_bool(bit);
+                                        state.frame.locals_stack_w[i] = r;
+                                        here + 1
+                                    }
+                                } else {
+                                    slow_pc(vm, here)
+                                }
+                            } else {
+                                slow_pc(vm, here)
+                            }
+                        } else {
+                            slow_pc(vm, here)
+                        }
+                    } else {
+                        slow_pc(vm, here)
+                    }
+                } else {
+                    slow_pc(vm, here)
+                };
+                if next >= 0 {
+                    let tgt = next as usize;
+                    if tgt < pc {
+                        can_enter_jit!(driver, tgt, &mut *state, program, || {});
+                    }
+                    pc = tgt;
+                    continue;
+                }
+                state.ret = next;
+                return next;
+            }
+            OP_MOD_LOCAL_K | OP_LT_LOCAL_K | OP_NE_LOCAL_K | OP_GE_LOCAL_K => {
+                state.frame.last_instr = pc as i64;
+                let vm = state.vm;
+                let here = pc as i64;
+                let a = state.frame.locals_stack_w[insn_a(program, pc)];
+                let k = intern_const(program, insn_b(program, pc));
+                let cmp_op = if opcode == OP_MOD_LOCAL_K {
+                    OP_MOD
+                } else if opcode == OP_LT_LOCAL_K {
+                    OP_LT
+                } else if opcode == OP_NE_LOCAL_K {
+                    OP_NE
+                } else {
+                    OP_GE
+                };
+                let next = if !a.is_null() {
+                    if !k.is_null() {
+                        if cell_kind(a) == CelKind::Int as i64 {
+                            if cell_kind(k) == CelKind::Int as i64 {
+                                let l = cell_int(a);
+                                let rv = cell_int(k);
+                                if opcode == OP_MOD_LOCAL_K {
+                                    if rv > 0 {
+                                        if l >= 0 {
+                                            let r = box_int(vm, l % rv);
+                                            let depth = state.frame.valuestackdepth;
+                                            state.frame.locals_stack_w[depth] = r;
+                                            state.frame.valuestackdepth = depth + 1;
+                                            here + 1
+                                        } else {
+                                            slow_pc(vm, here)
+                                        }
+                                    } else {
+                                        slow_pc(vm, here)
+                                    }
+                                } else {
+                                    let bit = trace_cmp_bit(cmp_op, l, rv);
+                                    if bit < 0 {
+                                        slow_pc(vm, here)
+                                    } else {
+                                        let r = box_bool(bit);
+                                        let depth = state.frame.valuestackdepth;
+                                        state.frame.locals_stack_w[depth] = r;
+                                        state.frame.valuestackdepth = depth + 1;
+                                        here + 1
+                                    }
+                                }
+                            } else {
+                                slow_pc(vm, here)
+                            }
+                        } else {
+                            slow_pc(vm, here)
+                        }
+                    } else {
+                        slow_pc(vm, here)
+                    }
+                } else {
+                    slow_pc(vm, here)
+                };
+                if next >= 0 {
+                    let tgt = next as usize;
+                    if tgt < pc {
+                        can_enter_jit!(driver, tgt, &mut *state, program, || {});
+                    }
+                    pc = tgt;
+                    continue;
+                }
+                state.ret = next;
+                return next;
+            }
+            OP_EQ_LOCAL_K_APPEND | OP_GT_LOCAL_K_APPEND | OP_LT_LOCAL_K_APPEND
+            | OP_NE_LOCAL_K_APPEND | OP_GE_LOCAL_K_APPEND => {
+                state.frame.last_instr = pc as i64;
+                let vm = state.vm;
+                let here = pc as i64;
+                let a = state.frame.locals_stack_w[insn_a(program, pc)];
+                let k = intern_const(program, insn_b(program, pc));
+                let depth = state.frame.valuestackdepth;
+                let top = depth - 1;
+                let cmp_op = if opcode == OP_EQ_LOCAL_K_APPEND {
+                    OP_EQ
+                } else if opcode == OP_GT_LOCAL_K_APPEND {
+                    OP_GT
+                } else if opcode == OP_LT_LOCAL_K_APPEND {
+                    OP_LT
+                } else if opcode == OP_NE_LOCAL_K_APPEND {
+                    OP_NE
+                } else {
+                    OP_GE
+                };
+                let next = if top >= state.frame.n_slots {
+                    let list = state.frame.locals_stack_w[top];
+                    if !a.is_null() {
+                        if !k.is_null() {
+                            if !list.is_null() {
+                                if cell_kind(a) == CelKind::Int as i64 {
+                                    if cell_kind(k) == CelKind::Int as i64 {
+                                        let bit = trace_cmp_bit(cmp_op, cell_int(a), cell_int(k));
+                                        if bit < 0 {
+                                            slow_pc(vm, here)
+                                        } else {
+                                            let r = box_bool(bit);
+                                            if append_cell(list, r) != 0 {
+                                                here + 1
+                                            } else {
+                                                slow_pc(vm, here)
+                                            }
+                                        }
+                                    } else {
+                                        slow_pc(vm, here)
+                                    }
+                                } else {
+                                    slow_pc(vm, here)
+                                }
+                            } else {
+                                slow_pc(vm, here)
+                            }
+                        } else {
+                            slow_pc(vm, here)
+                        }
+                    } else {
+                        slow_pc(vm, here)
+                    }
+                } else {
+                    slow_pc(vm, here)
+                };
+                if next >= 0 {
+                    let tgt = next as usize;
+                    if tgt < pc {
+                        can_enter_jit!(driver, tgt, &mut *state, program, || {});
+                    }
+                    pc = tgt;
+                    continue;
+                }
+                state.ret = next;
+                return next;
+            }
+            OP_NEGATE => {
+                state.frame.last_instr = pc as i64;
+                let vm = state.vm;
+                let here = pc as i64;
+                let depth = state.frame.valuestackdepth;
+                let i = depth - 1;
+                let next = if i >= state.frame.n_slots {
+                    let a = state.frame.locals_stack_w[i];
+                    if cell_kind(a) == CelKind::Int as i64 {
+                        let n = cell_int(a);
+                        // `checked_neg` is not an ovf match. `i64::MIN` is
+                        // the only overflow; `IntNeg` covers the rest.
+                        if n != i64::MIN {
+                            let r = box_int(vm, -n);
+                            state.frame.locals_stack_w[i] = r;
+                            here + 1
+                        } else {
+                            slow_pc(vm, here)
+                        }
+                    } else {
+                        slow_pc(vm, here)
+                    }
+                } else {
+                    slow_pc(vm, here)
+                };
+                if next >= 0 {
+                    let tgt = next as usize;
+                    if tgt < pc {
+                        can_enter_jit!(driver, tgt, &mut *state, program, || {});
+                    }
+                    pc = tgt;
+                    continue;
+                }
+                state.ret = next;
+                return next;
+            }
+            OP_NOT => {
+                state.frame.last_instr = pc as i64;
+                let vm = state.vm;
+                let here = pc as i64;
+                let depth = state.frame.valuestackdepth;
+                let i = depth - 1;
+                let next = if i >= state.frame.n_slots {
+                    let a = state.frame.locals_stack_w[i];
+                    let bit = cell_bool(a);
+                    if bit < 0 {
+                        slow_pc(vm, here)
+                    } else {
+                        let flipped = if bit == 0 { 1 } else { 0 };
+                        let r = box_bool(flipped);
+                        state.frame.locals_stack_w[i] = r;
+                        here + 1
+                    }
+                } else {
+                    slow_pc(vm, here)
+                };
+                if next >= 0 {
+                    let tgt = next as usize;
+                    if tgt < pc {
+                        can_enter_jit!(driver, tgt, &mut *state, program, || {});
+                    }
+                    pc = tgt;
+                    continue;
+                }
+                state.ret = next;
+                return next;
+            }
+            OP_JUMP => {
+                state.frame.last_instr = pc as i64;
+                let next = insn_a(program, pc);
+                if next >= 0 {
+                    let tgt = next as usize;
+                    if tgt < pc {
+                        can_enter_jit!(driver, tgt, &mut *state, program, || {});
+                    }
+                    pc = tgt;
+                    continue;
+                }
+                state.ret = next;
+                return next;
+            }
+            OP_AND | OP_OR => {
+                state.frame.last_instr = pc as i64;
+                let vm = state.vm;
+                let here = pc as i64;
+                let depth = state.frame.valuestackdepth;
+                let i = depth - 1;
+                let is_or = if opcode == OP_OR { 1 } else { 0 };
+                let next = if i >= state.frame.n_slots {
+                    let w = state.frame.locals_stack_w[i];
+                    let code = bool_short_i(w, is_or);
+                    if code == 1 {
+                        let r = box_bool(is_or);
+                        state.frame.locals_stack_w[i] = r;
+                        insn_b(program, pc)
+                    } else if code == 2 {
+                        state.frame.valuestackdepth = depth - 1;
+                        here + 1
+                    } else {
+                        slow_pc(vm, here)
+                    }
+                } else {
+                    slow_pc(vm, here)
+                };
+                if next >= 0 {
+                    let tgt = next as usize;
+                    if tgt < pc {
+                        can_enter_jit!(driver, tgt, &mut *state, program, || {});
+                    }
+                    pc = tgt;
+                    continue;
+                }
+                state.ret = next;
+                return next;
+            }
+            OP_CALL_HOST => {
+                state.frame.last_instr = pc as i64;
+                let vm = state.vm;
+                let here = pc as i64;
+                let arity = insn_b(program, pc);
+                let name = insn_a(program, pc);
+                let depth = state.frame.valuestackdepth;
+                let i = depth - 1;
+                let next = if arity == 1 {
+                    if i >= state.frame.n_slots {
+                        let w = state.frame.locals_stack_w[i];
+                        if !w.is_null() {
+                            if interned_is_size(program, name) != 0 {
+                                let n = interned_len_cell(w);
+                                if n < 0 {
+                                    slow_pc(vm, here)
+                                } else {
+                                    let r = box_int(vm, n);
+                                    state.frame.locals_stack_w[i] = r;
+                                    here + 1
+                                }
+                            } else {
+                                let r = interned_unary_cell(vm, program, name, w);
+                                if !r.is_null() {
+                                    state.frame.locals_stack_w[i] = r;
+                                    here + 1
+                                } else {
+                                    slow_pc(vm, here)
+                                }
+                            }
+                        } else {
+                            slow_pc(vm, here)
+                        }
+                    } else {
+                        slow_pc(vm, here)
+                    }
+                } else {
+                    slow_pc(vm, here)
+                };
+                if next >= 0 {
+                    let tgt = next as usize;
+                    if tgt < pc {
+                        can_enter_jit!(driver, tgt, &mut *state, program, || {});
+                    }
+                    pc = tgt;
+                    continue;
+                }
+                state.ret = next;
+                return next;
+            }
+            OP_CALL_METHOD => {
+                state.frame.last_instr = pc as i64;
+                let vm = state.vm;
+                let here = pc as i64;
+                let arity = insn_b(program, pc);
+                let name = insn_a(program, pc);
+                let depth = state.frame.valuestackdepth;
+                let i = depth - 1;
+                let next = if arity == 0 {
+                    if i >= state.frame.n_slots {
+                        let w = state.frame.locals_stack_w[i];
+                        if !w.is_null() {
+                            if interned_is_size(program, name) != 0 {
+                                let n = interned_len_cell(w);
+                                if n < 0 {
+                                    slow_pc(vm, here)
+                                } else {
+                                    let r = box_int(vm, n);
+                                    state.frame.locals_stack_w[i] = r;
+                                    here + 1
+                                }
+                            } else {
+                                slow_pc(vm, here)
+                            }
+                        } else {
+                            slow_pc(vm, here)
+                        }
+                    } else {
+                        slow_pc(vm, here)
+                    }
+                } else {
+                    slow_pc(vm, here)
+                };
+                if next >= 0 {
+                    let tgt = next as usize;
+                    if tgt < pc {
+                        can_enter_jit!(driver, tgt, &mut *state, program, || {});
+                    }
+                    pc = tgt;
+                    continue;
+                }
+                state.ret = next;
+                return next;
+            }
+            OP_CALL_QUALIFIED => {
+                state.frame.last_instr = pc as i64;
+                let vm = state.vm;
+                let here = pc as i64;
+                let kind = interned_qualified_kind(program, insn_a(program, pc));
+                let arity = insn_b(program, pc);
+                let next = if kind == 0 {
+                    if arity == 0 {
+                        here + 1
+                    } else {
+                        slow_pc(vm, here)
+                    }
+                } else {
+                    slow_pc(vm, here)
                 };
                 if next >= 0 {
                     let tgt = next as usize;
