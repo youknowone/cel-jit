@@ -56,6 +56,20 @@ fn compiled_entries_match_the_walker() {
     // passes the threshold well inside this window.
     agree_compiled("list.map(e, [1, 2].map(i, i + e))", 150);
     agree_compiled("list.map(e, e - 1)", 150);
+    agree_compiled("list.filter(e, e in [1, 2, 3])", 150);
+    agree_compiled("list.map(e, e in [1, 2, 3])", 150);
+    agree_compiled("list.map(e, {\"a\": e}.a)", 150);
+    agree_compiled("list.map(e, has({\"a\": e}.a))", 150);
+    agree_compiled("list.map(e, has({\"a\": e}.b))", 150);
+    agree_compiled("list.map(e, list[e % 10])", 150);
+    agree_compiled("list.all(e, e < x + 1000)", 150);
+    agree_compiled("list.map(e, int(e))", 150);
+}
+
+#[test]
+fn compiled_index_miss_matches_the_walker() {
+    unsafe { std::env::set_var("CEL_PORTAL_THRESHOLD", "100") };
+    agree_compiled("list[100]", 150);
 }
 
 /// A resolver that returns a new int on every `x` lookup.

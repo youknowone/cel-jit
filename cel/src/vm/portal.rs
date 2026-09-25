@@ -1887,7 +1887,10 @@ fn index_cell(container: *mut CelObject, key: *mut CelObject) -> *mut CelObject 
     ref_fields = {
         crate::runtime::object::W_ListObject::storage => crate::runtime::object::CelObject,
     },
-    array_fields = { crate::runtime::object::W_IntColumn::data => i64 },
+    array_fields = {
+        crate::runtime::object::W_IntColumn::data => i64,
+        crate::runtime::object::W_ListObject::items => crate::runtime::object::CelRef in crate::runtime::object_array::CelItemsBlock,
+    },
     int_fields = {
         crate::runtime::object::W_ListObject::strategy => u8,
         crate::runtime::object::W_ListObject::length => i64,
@@ -1926,8 +1929,104 @@ fn item_cell(vm: i64, list: *mut CelObject, index: i64) -> *mut CelObject {
         } else {
             core::ptr::null_mut()
         }
+    } else if strategy == crate::runtime::object::ListStrategy::Object as i64 {
+        // `listobject.py` `getitem` / `rlist.ll_getitem_fast`: bounds guard,
+        // then `getarrayitem_gc` of the object column.
+        if index >= 0 {
+            if index < length {
+                let at = start + index;
+                if at >= 0 {
+                    list.items[at]
+                } else {
+                    core::ptr::null_mut()
+                }
+            } else {
+                core::ptr::null_mut()
+            }
+        } else {
+            core::ptr::null_mut()
+        }
     } else {
         core::ptr::null_mut()
+    }
+}
+
+/// `1` when `names[idx]` is `int`.
+#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+fn interned_name_is_int(program: &CelCode, idx: i64) -> i64 {
+    i64::from(program.name(NameId(idx as u32)) == Some("int"))
+}
+
+/// `W_IntObject.int`: the same leaf after the class check. Null declines.
+#[majit_macros::jit_inline(calls = { cell_kind => inline_int })]
+fn int_identity(w: *mut CelObject) -> *mut CelObject {
+    if cell_kind(w) == CelKind::Int as i64 {
+        w
+    } else {
+        core::ptr::null_mut()
+    }
+}
+
+/// `IntegerListStrategy._safe_contains`: `2` hit, `1` miss, `0` decline.
+///
+/// Plain scan. A constant column is unrolled by the tracer
+/// (`loop_unrolling_heuristic`), the same way `_safe_find_or_count` is.
+#[majit_macros::jit_inline(
+    ref_params = { list: ref(crate::runtime::object::W_ListObject) },
+    ref_fields = {
+        crate::runtime::object::W_ListObject::storage => crate::runtime::object::CelObject,
+    },
+    array_fields = { crate::runtime::object::W_IntColumn::data => i64 },
+    int_fields = {
+        crate::runtime::object::W_ListObject::strategy => u8,
+        crate::runtime::object::W_ListObject::length => i64,
+        crate::runtime::object::W_ListObject::start => i64,
+        crate::runtime::object::W_IntColumn::length => i64,
+    },
+    calls = {
+        cell_kind => inline_int,
+        cell_int => inline_int,
+    },
+)]
+fn contains_int_word(list: *mut CelObject, needle: *mut CelObject) -> i64 {
+    if cell_kind(list) != CelKind::List as i64 {
+        0
+    } else if cell_kind(needle) != CelKind::Int as i64 {
+        0
+    } else {
+        let strategy = list.strategy as u8 as i64;
+        if strategy == ListStrategy::Ints as i64 {
+            let length = list.length;
+            let start = list.start;
+            let storage = list.storage;
+            if (storage as *mut u8) == core::ptr::null_mut() {
+                0
+            } else {
+                let col = storage as *mut crate::runtime::object::W_IntColumn;
+                let col_len = col.length;
+                let want = cell_int(needle);
+                let stop = start + length;
+                if start < 0 {
+                    0
+                } else if stop > col_len {
+                    0
+                } else {
+                    // `_safe_find_or_count`: the compare is a value, so a
+                    // constant column unrolls to one `IntEq` per element
+                    // instead of a side exit that drops the last hit.
+                    let mut i = 0;
+                    let mut hits = 0;
+                    while i < length {
+                        let at = start + i;
+                        hits += (col.data[at] == want) as i64;
+                        i += 1;
+                    }
+                    1 + ((hits != 0) as i64)
+                }
+            }
+        } else {
+            0
+        }
     }
 }
 
@@ -2583,6 +2682,9 @@ fn slow_pc(vm: i64, here: i64) -> i64 {
         append_cell => residual_int,
         append_int_word => inline_int,
         map_insert_cell => residual_int,
+        contains_int_word => inline_int,
+        int_identity => inline_ref,
+        interned_name_is_int => elidable_int_cannot_raise,
         alloc_list => nursery_alloc_ref,
         alloc_map => nursery_alloc_ref,
         index_cell => inline_ref,
@@ -3049,7 +3151,10 @@ fn run_cel_portal(
                                 state.frame.valuestackdepth = depth - 1;
                                 here + 1
                             } else {
-                                slow_pc(vm, here)
+                                // A miss has to run the interpreter with the
+                                // frame forced; `slow_pc` leaves the cells
+                                // unflushed and the error comes back internal.
+                                step_hot(program, pc)
                             }
                         } else {
                             slow_pc(vm, here)
@@ -3910,6 +4015,15 @@ fn run_cel_portal(
                                     state.frame.locals_stack_w[i] = r;
                                     here + 1
                                 }
+                            } else if interned_name_is_int(program, name) != 0 {
+                                // `W_IntObject.int`: identity after the class check.
+                                let r = int_identity(w);
+                                if r.is_null() {
+                                    slow_pc(vm, here)
+                                } else {
+                                    state.frame.locals_stack_w[i] = r;
+                                    here + 1
+                                }
                             } else {
                                 let r = interned_unary_cell(vm, program, name, w);
                                 if !r.is_null() {
@@ -3962,6 +4076,47 @@ fn run_cel_portal(
                                 }
                             } else {
                                 slow_pc(vm, here)
+                            }
+                        } else {
+                            slow_pc(vm, here)
+                        }
+                    } else {
+                        slow_pc(vm, here)
+                    }
+                } else {
+                    slow_pc(vm, here)
+                };
+                if next >= 0 {
+                    let tgt = next as usize;
+                    if tgt < pc {
+                        can_enter_jit!(driver, tgt, &mut *state, program, || {});
+                    }
+                    pc = tgt;
+                    continue;
+                }
+                state.ret = next;
+                return next;
+            }
+            OP_IN => {
+                state.frame.last_instr = pc as i64;
+                let vm = state.vm;
+                let here = pc as i64;
+                let depth = state.frame.valuestackdepth;
+                let box_i = depth - 2;
+                let next = if box_i >= state.frame.n_slots {
+                    let container = state.frame.locals_stack_w[depth - 1];
+                    let needle = state.frame.locals_stack_w[box_i];
+                    if !container.is_null() {
+                        if !needle.is_null() {
+                            let found = contains_int_word(container, needle);
+                            if found == 0 {
+                                slow_pc(vm, here)
+                            } else {
+                                let bit = if found == 2 { 1 } else { 0 };
+                                let r = box_bool(bit);
+                                state.frame.locals_stack_w[box_i] = r;
+                                state.frame.valuestackdepth = depth - 1;
+                                here + 1
                             }
                         } else {
                             slow_pc(vm, here)

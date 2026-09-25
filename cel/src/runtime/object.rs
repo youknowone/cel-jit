@@ -1097,7 +1097,7 @@ pub enum MapStrategy {
 /// explode the window.
 #[cfg_attr(
     feature = "jit",
-    majit_macros::jit_immutable_fields(strategy, storage, items, length)
+    majit_macros::jit_immutable_fields(strategy, storage, items)
 )]
 #[repr(C)]
 #[allow(non_camel_case_types)]
