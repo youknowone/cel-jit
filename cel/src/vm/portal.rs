@@ -30,9 +30,10 @@ use crate::runtime::heap::CelHeap;
 use crate::runtime::object::{
     bytes_len, interned_list_eq, list_int_at, list_ints_slice, list_len,
     list_promote_empty_to_ints, list_resize_ge, list_store_int, list_try_append, map_len,
-    map_try_insert, new_bool, new_int, new_int_in, new_list_with_capacity_in,
-    new_map_with_capacity_in, string_as_str, string_byte_len, w_kind, w_type, CelKind, CelObject,
-    CelRef, ListStrategy, W_BoolObject, W_IntObject, W_OptionalObject, CEL_INT_CLASS,
+    map_try_insert, new_bool, new_double_in, new_int, new_int_in, new_list_with_capacity_in,
+    new_map_with_capacity_in, new_string, string_as_str, string_byte_len, w_kind, w_type, CelKind,
+    CelObject, CelRef, ListStrategy, W_BoolObject, W_DoubleObject, W_IntObject, W_OptionalObject,
+    CEL_DOUBLE_CLASS, CEL_INT_CLASS,
 };
 use crate::runtime::object::{force_virtualizable_if_necessary, W_CelFrame};
 use crate::runtime::optional::{
@@ -2088,6 +2089,136 @@ fn int_identity(w: *mut CelObject) -> *mut CelObject {
     }
 }
 
+/// `1` when `names[idx]` is `double`.
+#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+fn interned_is_double(program: &CelCode, idx: i64) -> i64 {
+    i64::from(program.name(NameId(idx as u32)) == Some("double"))
+}
+
+/// `1` when `names[idx]` is `string`.
+#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+fn interned_is_string(program: &CelCode, idx: i64) -> i64 {
+    i64::from(program.name(NameId(idx as u32)) == Some("string"))
+}
+
+/// Concrete `struct_allocs` target for [`box_double`].
+fn alloc_traced_double(_header: CelObject, floatval: f64) -> *mut W_DoubleObject {
+    crate::runtime::heap::with_heap(|heap| new_double_in(heap, floatval))
+}
+
+/// `space.newfloat`: `new_with_vtable` of `CEL_DOUBLE_CLASS` plus
+/// `setfield_gc_f` of `floatval` (`jtransform.py` `rewrite_op_malloc`,
+/// `rewrite_op_setfield`). The concrete body is [`new_double_in`].
+#[cfg_attr(
+    feature = "jit",
+    majit_macros::jit_inline(
+        inlined_prefix = {
+            W_DoubleObject::ob_header => crate::runtime::object::CelObject,
+        },
+        struct_allocs = {
+            W_DoubleObject => alloc_traced_double,
+        },
+    )
+)]
+#[allow(unused_variables)]
+fn box_double(vm: i64, n: f64) -> *mut CelObject {
+    let w = W_DoubleObject {
+        ob_header: CelObject {
+            ob_type: &CEL_DOUBLE_CLASS,
+        },
+        floatval: n,
+    };
+    w as *mut W_DoubleObject as *mut CelObject
+}
+
+/// `W_IntObject.descr_float`: class check, `cast_int_to_float`, `newfloat`.
+/// `W_FloatObject.descr_float` is the same leaf. Null declines.
+#[majit_macros::jit_inline(calls = {
+    cell_kind => inline_int,
+    cell_int => inline_int,
+    box_double => inline_ref,
+})]
+fn double_from_cell(vm: i64, w: *mut CelObject) -> *mut CelObject {
+    if cell_kind(w) == CelKind::Int as i64 {
+        let n = cell_int(w);
+        box_double(vm, n as f64)
+    } else if cell_kind(w) == CelKind::Double as i64 {
+        w
+    } else {
+        core::ptr::null_mut()
+    }
+}
+
+/// `ll_int2dec` (`ll_str.py`): one residual, not traced. The string leaf
+/// comes back directly (`descr_str` → `space.newtext`).
+#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+fn int_to_text(n: i64) -> *mut CelObject {
+    new_string(&n.to_string()) as *mut CelObject
+}
+
+/// `W_StringObject` + `W_StringObject` via `cel_add`. Residual. Null declines.
+#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+fn string_add_cell(a: *mut CelObject, b: *mut CelObject) -> *mut CelObject {
+    let r = unsafe { cel_add(a, b) };
+    if r.is_null() || r == ERROR_SENTINEL {
+        core::ptr::null_mut()
+    } else {
+        r
+    }
+}
+
+/// Two doubles: `cel_div` / ordered compare. Residual so the leaves are
+/// forced before the read (`descr_truediv` / `descr_lt`). Null declines.
+#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+fn double_binop_cell(op: i64, a: *mut CelObject, b: *mut CelObject) -> *mut CelObject {
+    let r = unsafe {
+        if op == OP_DIV {
+            cel_div(a, b)
+        } else if op == OP_ADD {
+            cel_add(a, b)
+        } else if op == OP_SUB {
+            cel_sub(a, b)
+        } else if op == OP_MUL {
+            cel_mul(a, b)
+        } else if op == OP_EQ {
+            cel_equals(a, b)
+        } else if op == OP_NE {
+            cel_not_equals(a, b)
+        } else if op == OP_LT {
+            cel_less(a, b)
+        } else if op == OP_LE {
+            cel_less_equals(a, b)
+        } else if op == OP_GT {
+            cel_greater(a, b)
+        } else if op == OP_GE {
+            cel_greater_equals(a, b)
+        } else {
+            ERROR_SENTINEL
+        }
+    };
+    if r.is_null() || r == ERROR_SENTINEL {
+        core::ptr::null_mut()
+    } else {
+        r
+    }
+}
+
+/// `W_IntObject.descr_str` for an int. A string is the same leaf. Null declines.
+#[majit_macros::jit_inline(calls = {
+    cell_kind => inline_int,
+    cell_int => inline_int,
+    int_to_text => residual_ref,
+})]
+fn string_from_cell(w: *mut CelObject) -> *mut CelObject {
+    if cell_kind(w) == CelKind::Int as i64 {
+        int_to_text(cell_int(w))
+    } else if cell_kind(w) == CelKind::Str as i64 {
+        w
+    } else {
+        core::ptr::null_mut()
+    }
+}
+
 /// `IntegerListStrategy._safe_contains`: `2` hit, `1` miss, `0` decline.
 ///
 /// Plain scan. A constant column is unrolled by the tracer
@@ -2808,6 +2939,14 @@ fn slow_pc(vm: i64, here: i64) -> i64 {
         contains_int_word => inline_int,
         int_identity => inline_ref,
         interned_name_is_int => elidable_int_cannot_raise,
+        interned_is_double => elidable_int_cannot_raise,
+        interned_is_string => elidable_int_cannot_raise,
+        box_double => inline_ref,
+        double_from_cell => inline_ref,
+        int_to_text => residual_ref,
+        string_from_cell => inline_ref,
+        double_binop_cell => residual_ref,
+        string_add_cell => residual_ref,
         alloc_list => nursery_alloc_ref,
         alloc_map => nursery_alloc_ref,
         index_cell => inline_ref,
@@ -3031,7 +3170,19 @@ fn run_cel_portal(
                     let a = state.frame.locals_stack_w[i];
                     if !a.is_null() {
                         if !k.is_null() {
-                            if cell_kind(a) == CelKind::Int as i64 {
+                            if cell_kind(a) == CelKind::Str as i64 {
+                                if cell_kind(k) == CelKind::Str as i64 {
+                                    let r = string_add_cell(a, k);
+                                    if r.is_null() {
+                                        slow_pc(vm, here)
+                                    } else {
+                                        state.frame.locals_stack_w[i] = r;
+                                        here + 1
+                                    }
+                                } else {
+                                    slow_pc(vm, here)
+                                }
+                            } else if cell_kind(a) == CelKind::Int as i64 {
                                 if cell_kind(k) == CelKind::Int as i64 {
                                     let l = cell_int(a);
                                     let rv = cell_int(k);
@@ -3193,7 +3344,21 @@ fn run_cel_portal(
                 let k = intern_const(program, insn_b(program, pc));
                 let next = if !a.is_null() {
                     if !k.is_null() {
-                        if cell_kind(a) == CelKind::Int as i64 {
+                        if cell_kind(a) == CelKind::Double as i64 {
+                            if cell_kind(k) == CelKind::Double as i64 {
+                                let r = double_binop_cell(OP_GT, a, k);
+                                if r.is_null() {
+                                    slow_pc(vm, here)
+                                } else {
+                                    let depth = state.frame.valuestackdepth;
+                                    state.frame.locals_stack_w[depth] = r;
+                                    state.frame.valuestackdepth = depth + 1;
+                                    here + 1
+                                }
+                            } else {
+                                slow_pc(vm, here)
+                            }
+                        } else if cell_kind(a) == CelKind::Int as i64 {
                             if cell_kind(k) == CelKind::Int as i64 {
                                 let l = cell_int(a);
                                 let rv = cell_int(k);
@@ -3788,7 +3953,20 @@ fn run_cel_portal(
                     let b = state.frame.locals_stack_w[bi];
                     if !a.is_null() {
                         if !b.is_null() {
-                            if cell_kind(a) == CelKind::Int as i64 {
+                            if cell_kind(a) == CelKind::Double as i64 {
+                                if cell_kind(b) == CelKind::Double as i64 {
+                                    let r = double_binop_cell(opcode, a, b);
+                                    if r.is_null() {
+                                        slow_pc(vm, here)
+                                    } else {
+                                        state.frame.locals_stack_w[ai] = r;
+                                        state.frame.valuestackdepth = depth - 1;
+                                        here + 1
+                                    }
+                                } else {
+                                    slow_pc(vm, here)
+                                }
+                            } else if cell_kind(a) == CelKind::Int as i64 {
                                 if cell_kind(b) == CelKind::Int as i64 {
                                     let l = cell_int(a);
                                     let rv = cell_int(b);
@@ -3855,7 +4033,19 @@ fn run_cel_portal(
                     let a = state.frame.locals_stack_w[i];
                     if !a.is_null() {
                         if !k.is_null() {
-                            if cell_kind(a) == CelKind::Int as i64 {
+                            if cell_kind(a) == CelKind::Double as i64 {
+                                if cell_kind(k) == CelKind::Double as i64 {
+                                    let r = double_binop_cell(cmp_op, a, k);
+                                    if r.is_null() {
+                                        slow_pc(vm, here)
+                                    } else {
+                                        state.frame.locals_stack_w[i] = r;
+                                        here + 1
+                                    }
+                                } else {
+                                    slow_pc(vm, here)
+                                }
+                            } else if cell_kind(a) == CelKind::Int as i64 {
                                 if cell_kind(k) == CelKind::Int as i64 {
                                     let bit = trace_cmp_bit(cmp_op, cell_int(a), cell_int(k));
                                     if bit < 0 {
@@ -4171,6 +4361,22 @@ fn run_cel_portal(
                             } else if interned_name_is_int(program, name) != 0 {
                                 // `W_IntObject.int`: identity after the class check.
                                 let r = int_identity(w);
+                                if r.is_null() {
+                                    slow_pc(vm, here)
+                                } else {
+                                    state.frame.locals_stack_w[i] = r;
+                                    here + 1
+                                }
+                            } else if interned_is_double(program, name) != 0 {
+                                let r = double_from_cell(vm, w);
+                                if r.is_null() {
+                                    slow_pc(vm, here)
+                                } else {
+                                    state.frame.locals_stack_w[i] = r;
+                                    here + 1
+                                }
+                            } else if interned_is_string(program, name) != 0 {
+                                let r = string_from_cell(w);
                                 if r.is_null() {
                                     slow_pc(vm, here)
                                 } else {

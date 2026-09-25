@@ -64,6 +64,12 @@ fn compiled_entries_match_the_walker() {
     agree_compiled("list.map(e, list[e % 10])", 150);
     agree_compiled("list.all(e, e < x + 1000)", 150);
     agree_compiled("list.map(e, int(e))", 150);
+    agree_compiled("list.map(e, double(e))", 150);
+    agree_compiled("list.map(e, string(e))", 150);
+    agree_compiled("list.map(e, string(e - 500))", 150);
+    agree_compiled("list.map(e, double(e) / 2.0)", 150);
+    agree_compiled("list.map(e, string(e) + \"x\")", 150);
+    agree_compiled("list.map(e, double(e)).filter(f, f > 3.5)", 150);
     agree_compiled("list.map(e, [e, e])", 150);
     agree_compiled("list.map(e, [e][0])", 150);
     agree_compiled("list.map(e, size([e, 1]))", 150);
