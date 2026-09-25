@@ -927,12 +927,20 @@ pub fn with_heap<R>(f: impl FnOnce(&CelHeap) -> R) -> R {
     HEAP.with(f)
 }
 
-/// `GcLLDescr_boehm.malloc_fixedsize`. Compiled and blackhole
-/// `NEW_WITH_VTABLE` call this when the portal publishes it. The block is
-/// this thread's [`CelHeap`], the same owner as [`super::object::new_int_in`].
-/// Bytes are not zeroed; the backend clears them (`malloc_zero_filled`).
+/// `GcLLDescr_boehm.malloc_fixedsize` → `GC_malloc` (`malloc_zero_filled`).
+///
+/// Compiled `NEW_WITH_VTABLE` and blackhole `_bh_malloc` call this when the
+/// portal publishes it. The block is this thread's [`CelHeap`], the same
+/// owner as [`super::object::new_int_in`]. `GC_malloc` returns zero-filled
+/// storage, so this clears the block once and the backend does not clear it
+/// again. The function takes only the size (`gc.py malloc_fixedsize`); the
+/// heap is the one [`heap_ptr`] already cached, the same thread-local
+/// allocator `GC_local_malloc` uses. There is no nursery pointer to bump:
+/// Boehm has no `get_nursery_free_addr`.
 pub extern "C" fn cel_malloc_fixedsize(size: usize) -> *mut u8 {
-    with_heap(|heap| heap.alloc_raw(size, align_of::<u64>()))
+    let ptr = unsafe { (*heap_ptr()).alloc_raw(size, align_of::<u64>()) };
+    unsafe { core::ptr::write_bytes(ptr, 0, size) };
+    ptr
 }
 
 /// Nursery bump captured at outermost entry. Leave compares [`Self::used`]
