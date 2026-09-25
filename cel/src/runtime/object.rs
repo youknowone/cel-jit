@@ -1098,6 +1098,10 @@ pub enum MapStrategy {
 /// Entries of an object map live as interleaved `[k0, v0, …]` references.
 /// A record row parks its schema in the host table so intern does not
 /// explode the window.
+///
+/// `strategy`, `storage` and `items` are written only by the allocating
+/// constructor (`new_map_with_capacity_in` / `new_map_record`). `length`
+/// and the `public*` words change on insert, so they stay mutable.
 #[cfg_attr(
     feature = "jit",
     majit_macros::jit_immutable_fields(strategy, storage, items)

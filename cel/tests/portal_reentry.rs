@@ -70,6 +70,14 @@ fn compiled_entries_match_the_walker() {
     agree_compiled("list.map(e, double(e) / 2.0)", 150);
     agree_compiled("list.map(e, string(e) + \"x\")", 150);
     agree_compiled("list.map(e, double(e)).filter(f, f > 3.5)", 150);
+    agree_compiled("list.map(e, e > 3)", 150);
+    agree_compiled("list.map(e, e == 3)", 150);
+    agree_compiled("list.filter(e, e % 2 == 0)", 150);
+    agree_compiled("list.map(e, (e - 500) % 7)", 150);
+    agree_compiled("list.map(e, (e - 500) / 7)", 150);
+    agree_compiled("list.map(e, list.size())", 150);
+    agree_compiled("list.map(e, {\"k\": e})", 150);
+    agree_compiled("list.map(e, {\"k\": e}.k)", 150);
     agree_compiled("list.map(e, [e, e])", 150);
     agree_compiled("list.map(e, [e][0])", 150);
     agree_compiled("list.map(e, size([e, 1]))", 150);

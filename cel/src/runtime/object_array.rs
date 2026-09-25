@@ -74,6 +74,9 @@ pub struct ArrayToken {
 /// `[CelRef; 0]` rather than a slice or a `Vec`: the items are addressed by
 /// offset from the block, and a fat pointer or an owning container would put a
 /// second header between the length word and item 0.
+// `capacity` is fixed for the block's lifetime (a grow allocates a fresh
+// block). `listobject.py` array length words are `_immutable_fields_`.
+#[cfg_attr(feature = "jit", majit_macros::jit_immutable_fields(capacity))]
 #[repr(C)]
 #[allow(non_camel_case_types)]
 pub struct CelItemsBlock {

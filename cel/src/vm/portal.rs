@@ -1693,9 +1693,10 @@ fn trace_cmp_bit(op: i64, l: i64, r: i64) -> i64 {
 
 /// `1` when `op` is an int arithmetic the fast path can finish.
 ///
-/// Division and remainder stay on the non-negative side, where floor
-/// division matches truncating division. Overflow and a zero divisor
-/// return `0` so the caller takes [`residual_dispatch`].
+/// A positive divisor has no `MIN / -1` overflow, and `checked_div` /
+/// `checked_rem` are the truncating llops (`opimpl.py` `op_int_floordiv`
+/// / `op_int_mod`). A non-positive divisor or an add/sub/mul overflow
+/// returns `0` so the caller takes [`residual_dispatch`].
 #[majit_macros::jit_inline]
 fn trace_arith_ok(op: i64, l: i64, r: i64) -> i64 {
     if op == OP_ADD {
@@ -1715,11 +1716,7 @@ fn trace_arith_ok(op: i64, l: i64, r: i64) -> i64 {
         }
     } else if op == OP_DIV || op == OP_MOD {
         if r > 0 {
-            if l >= 0 {
-                1
-            } else {
-                0
-            }
+            1
         } else {
             0
         }
