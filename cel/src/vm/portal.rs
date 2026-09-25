@@ -3546,8 +3546,13 @@ fn slow_pc(vm: i64, here: i64) -> i64 {
         map_store_pair => inline_int,
         cell_map_len => inline_int,
         trace_len_cell => inline_int,
-        alloc_list => nursery_alloc_ref,
-        alloc_map => nursery_alloc_ref,
+        // Sized `W_ListObject` / `W_MapObject`, not a two-word headerless
+        // node. `nursery_alloc_ref` stamps `RuntimeHelperKind::NurseryAlloc`
+        // and dynasm inlines that as value@0/link@8 whenever
+        // `dynasm_nursery_addrs()` is non-zero. Empty write sets, no helper
+        // tag: `analyze_external_call` `bottom_result`.
+        alloc_list => alloc_ref,
+        alloc_map => alloc_ref,
         index_cell => inline_ref,
         item_cell => inline_ref,
         map_keys_cell => residual_ref,

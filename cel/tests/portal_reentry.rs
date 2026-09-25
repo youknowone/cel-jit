@@ -82,6 +82,11 @@ fn compiled_entries_match_the_walker() {
     agree_compiled("list.map(e, {\"k\": e}.k)", 150);
     agree_compiled("list.map(e, [e, e])", 150);
     agree_compiled("list.map(e, [e][0])", 150);
+    // A two-word nursery bump would publish `(vm, cap)` as the list and
+    // the indexed reads would not be `e` / `e + 1`.
+    agree_compiled("list.map(e, [e, e + 1])", 150);
+    agree_compiled("list.map(e, [e, e + 1][0])", 150);
+    agree_compiled("list.map(e, [e, e + 1][1])", 150);
     agree_compiled("list.map(e, size([e, 1]))", 150);
     agree_compiled("list.map(e, e + 1 == 2 ? \"a\" : \"b\")", 150);
     agree_compiled("list.map(e, [e, \"s\"])", 150);
