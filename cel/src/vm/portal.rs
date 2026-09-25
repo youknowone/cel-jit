@@ -1604,6 +1604,34 @@ fn cell_list_len(w: *mut CelObject) -> i64 {
     unsafe { (*obj).length }
 }
 
+/// Length of a map leaf. `ll_len` / `W_MapObject.length` (`rewrite_op_getfield`).
+#[majit_macros::jit_inline(int_fields = { crate::runtime::object::W_MapObject::length => i64 })]
+fn cell_map_len(w: *mut CelObject) -> i64 {
+    let obj = w as *mut crate::runtime::object::W_MapObject;
+    unsafe { (*obj).length }
+}
+
+/// `list.size` / `size(list)` when the receiver's family is known.
+///
+/// A list or map length is `getfield_gc` (`ll_length`). Anything else stays
+/// on [`interned_len_cell`].
+#[majit_macros::jit_inline(calls = {
+    cell_kind => inline_int,
+    cell_list_len => inline_int,
+    cell_map_len => inline_int,
+    interned_len_cell => residual_int,
+})]
+fn trace_len_cell(w: *mut CelObject) -> i64 {
+    let kind = cell_kind(w);
+    if kind == CelKind::List as i64 {
+        cell_list_len(w)
+    } else if kind == CelKind::Map as i64 {
+        cell_map_len(w)
+    } else {
+        interned_len_cell(w)
+    }
+}
+
 /// Concrete `struct_allocs` target for [`box_int`]. Small ints stay the
 /// prebuilt singletons; the traced body allocates a fresh leaf instead.
 fn alloc_traced_int(_header: CelObject, intval: i64) -> *mut W_IntObject {
@@ -1894,56 +1922,114 @@ fn append_int_word(list: *mut CelObject, word: i64) -> i64 {
     }
 }
 
-#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
-fn map_insert_cell(map: CelRef, key: CelRef, value: CelRef) -> i64 {
-    try_map_insert(map as i64, key as i64, value as i64)
-}
-
-/// Index a string (or other non-int) may be stored at, or `-1`.
+/// `ObjectListStrategy.append` → `rlist.ll_append`.
 ///
-/// The store itself is `setarrayitem_gc` in [`append_ref`].
-#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
-fn object_append_at(list: *mut CelObject) -> i64 {
-    if list.is_null() {
-        return -1;
-    }
-    unsafe {
-        let leaf = &*list.cast::<crate::runtime::object::W_ListObject>();
-        if leaf.strategy != ListStrategy::Object {
-            return -1;
-        }
-        let cap = crate::runtime::object_array::items_capacity(leaf.items) as i64;
-        if leaf.length >= 0 && leaf.length < cap {
-            leaf.length
-        } else {
-            -1
-        }
-    }
-}
-
-/// `ObjectListStrategy.append`: `setarrayitem_gc` plus `setfield` of length.
+/// The item is `setarrayitem_gc` (`rewrite_op_setarrayitem`). The block's
+/// capacity is the length word in front of element 0 (`CelItemsBlock`).
+/// A full block, or a column that is not the object strategy, returns `0`
+/// so the caller can take [`append_int_word`] or [`append_cell`]
+/// (`_ll_list_resize_ge` stays the residual).
 #[majit_macros::jit_inline(
     ref_params = { list: ref(crate::runtime::object::W_ListObject) },
+    ref_fields = {
+        crate::runtime::object::W_ListObject::items => crate::runtime::object_array::CelItemsBlock,
+    },
     array_fields = {
         crate::runtime::object::W_ListObject::items => crate::runtime::object::CelRef in crate::runtime::object_array::CelItemsBlock,
     },
     int_fields = {
+        crate::runtime::object::W_ListObject::strategy => u8,
         crate::runtime::object::W_ListObject::length => i64,
-    },
-    calls = {
-        object_append_at => residual_int,
-        append_cell => residual_int,
+        crate::runtime::object_array::CelItemsBlock::capacity => usize,
     },
 )]
 fn append_ref(list: *mut CelObject, item: *mut CelObject) -> i64 {
-    let at = object_append_at(list);
-    if at >= 0 {
-        list.items[at] = item;
-        list.length = at + 1;
-        1
+    let strategy = list.strategy as u8 as i64;
+    if strategy == ListStrategy::Object as i64 {
+        let items = list.items as *mut crate::runtime::object_array::CelItemsBlock;
+        if (items as *mut u8) != core::ptr::null_mut() {
+            let length = list.length;
+            let cap = items.capacity as i64;
+            if length >= 0 {
+                if length < cap {
+                    list.items[length] = item;
+                    list.length = length + 1;
+                    1
+                } else {
+                    0
+                }
+            } else {
+                0
+            }
+        } else {
+            0
+        }
     } else {
-        append_cell(list, item)
+        0
     }
+}
+
+/// First pair of a fresh object map: two `setarrayitem_gc` and `length`.
+///
+/// `dictmultiobject.py` `setitem` on an empty object map has no lookup.
+/// A map that already has entries stays on [`map_insert_cell`].
+#[majit_macros::jit_inline(
+    ref_params = { map: ref(crate::runtime::object::W_MapObject) },
+    ref_fields = {
+        crate::runtime::object::W_MapObject::items => crate::runtime::object_array::CelItemsBlock,
+    },
+    array_fields = {
+        crate::runtime::object::W_MapObject::items => crate::runtime::object::CelRef in crate::runtime::object_array::CelItemsBlock,
+    },
+    int_fields = {
+        crate::runtime::object::W_MapObject::strategy => u8,
+        crate::runtime::object::W_MapObject::length => i64,
+        crate::runtime::object_array::CelItemsBlock::capacity => usize,
+    },
+    calls = {
+        cell_kind => inline_int,
+        map_insert_cell => residual_int,
+    },
+)]
+fn map_store_pair(map: *mut CelObject, key: *mut CelObject, value: *mut CelObject) -> i64 {
+    let strategy = map.strategy as u8 as i64;
+    if strategy == crate::runtime::object::MapStrategy::Object as i64 {
+        let length = map.length;
+        if length == 0 {
+            let items = map.items as *mut crate::runtime::object_array::CelItemsBlock;
+            if (items as *mut u8) != core::ptr::null_mut() {
+                let cap = items.capacity as i64;
+                let key_kind = cell_kind(key);
+                if cap >= 2 {
+                    if key_kind == CelKind::Str as i64
+                        || key_kind == CelKind::Int as i64
+                        || key_kind == CelKind::Bool as i64
+                        || key_kind == CelKind::UInt as i64
+                    {
+                        map.items[0] = key;
+                        map.items[1] = value;
+                        map.length = 1;
+                        1
+                    } else {
+                        map_insert_cell(map, key, value)
+                    }
+                } else {
+                    map_insert_cell(map, key, value)
+                }
+            } else {
+                map_insert_cell(map, key, value)
+            }
+        } else {
+            map_insert_cell(map, key, value)
+        }
+    } else {
+        map_insert_cell(map, key, value)
+    }
+}
+
+#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+fn map_insert_cell(map: CelRef, key: CelRef, value: CelRef) -> i64 {
+    try_map_insert(map as i64, key as i64, value as i64)
 }
 
 /// `e + 1` as one traced add. Null declines to [`slow_pc`].
@@ -2953,6 +3039,9 @@ fn slow_pc(vm: i64, here: i64) -> i64 {
         string_from_cell => inline_ref,
         double_binop_cell => residual_ref,
         string_add_cell => residual_ref,
+        map_store_pair => inline_int,
+        cell_map_len => inline_int,
+        trace_len_cell => inline_int,
         alloc_list => nursery_alloc_ref,
         alloc_map => nursery_alloc_ref,
         index_cell => inline_ref,
@@ -2968,12 +3057,12 @@ fn slow_pc(vm: i64, here: i64) -> i64 {
         interned_len => residual_int,
         interned_len_cell => residual_int,
         interned_is_size => elidable_int_cannot_raise,
+        interned_qualified_kind => elidable_int_cannot_raise,
         interned_unary => residual_int,
         interned_unary_cell => residual_ref,
         interned_temporal => residual_int,
         interned_optional_unary => residual_int,
         interned_method1 => residual_int,
-        interned_qualified_kind => residual_int,
         interned_optional_state => residual_int,
         interned_optional_inner => residual_int,
         interned_as_bool => residual_int,
@@ -3585,7 +3674,7 @@ fn run_cel_portal(
                 let next = if !value.is_null() {
                     if !key.is_null() {
                         if !map.is_null() {
-                            if map_insert_cell(map, key, value) != 0 {
+                            if map_store_pair(map, key, value) != 0 {
                                 state.frame.valuestackdepth = depth - 2;
                                 here + 1
                             } else {
@@ -3673,7 +3762,12 @@ fn run_cel_portal(
                         let stored = if cell_kind(item) == CelKind::Int as i64 {
                             append_int_word(list, cell_int(item))
                         } else {
-                            append_ref(list, item)
+                            let via_obj = append_ref(list, item);
+                            if via_obj != 0 {
+                                via_obj
+                            } else {
+                                append_cell(list, item)
+                            }
                         };
                         if stored != 0 {
                             state.frame.valuestackdepth = depth - 1;
@@ -3919,7 +4013,12 @@ fn run_cel_portal(
                             let stored = if cell_kind(w) == CelKind::Int as i64 {
                                 append_int_word(list, cell_int(w))
                             } else {
-                                append_ref(list, w)
+                                let via_obj = append_ref(list, w);
+                                if via_obj != 0 {
+                                    via_obj
+                                } else {
+                                    append_cell(list, w)
+                                }
                             };
                             if stored != 0 {
                                 here + 1
@@ -4189,7 +4288,13 @@ fn run_cel_portal(
                                             slow_pc(vm, here)
                                         } else {
                                             let r = box_bool(bit);
-                                            if append_cell(list, r) != 0 {
+                                            let stored = append_ref(list, r);
+                                            let stored = if stored != 0 {
+                                                stored
+                                            } else {
+                                                append_cell(list, r)
+                                            };
+                                            if stored != 0 {
                                                 here + 1
                                             } else {
                                                 slow_pc(vm, here)
@@ -4352,11 +4457,7 @@ fn run_cel_portal(
                         let w = state.frame.locals_stack_w[i];
                         if !w.is_null() {
                             if interned_is_size(program, name) != 0 {
-                                let n = if cell_kind(w) == CelKind::List as i64 {
-                                    cell_list_len(w)
-                                } else {
-                                    interned_len_cell(w)
-                                };
+                                let n = trace_len_cell(w);
                                 if n < 0 {
                                     slow_pc(vm, here)
                                 } else {
@@ -4431,11 +4532,7 @@ fn run_cel_portal(
                         let w = state.frame.locals_stack_w[i];
                         if !w.is_null() {
                             if interned_is_size(program, name) != 0 {
-                                let n = if cell_kind(w) == CelKind::List as i64 {
-                                    cell_list_len(w)
-                                } else {
-                                    interned_len_cell(w)
-                                };
+                                let n = trace_len_cell(w);
                                 if n < 0 {
                                     slow_pc(vm, here)
                                 } else {
