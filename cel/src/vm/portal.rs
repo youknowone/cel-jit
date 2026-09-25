@@ -73,6 +73,25 @@ fn operand_cell(frame: &W_CelFrame, from_top: i64) -> Option<CelRef> {
     Some(w)
 }
 
+/// `PyFrame.popvalue_maybe_none` / `dropvalues`: every popped slot is null.
+///
+/// A dead cell left above `valuestackdepth` is still a virtualizable array
+/// entry, so the loop header records whatever value the last pop abandoned.
+/// Writing null makes that dead slot the same constant on every path.
+macro_rules! pop_cell {
+    ($frame:expr) => {{
+        let depth = $frame.valuestackdepth - 1;
+        $frame.locals_stack_w[depth] = 0 as *mut crate::runtime::object::CelObject;
+        $frame.valuestackdepth = depth;
+    }};
+    ($frame:expr, 2) => {{
+        let depth = $frame.valuestackdepth;
+        $frame.locals_stack_w[depth - 1] = 0 as *mut crate::runtime::object::CelObject;
+        $frame.locals_stack_w[depth - 2] = 0 as *mut crate::runtime::object::CelObject;
+        $frame.valuestackdepth = depth - 2;
+    }};
+}
+
 fn read_cell(frame: &W_CelFrame, i: i64) -> CelRef {
     let w = frame.locals_stack_w[i];
     #[cfg(debug_assertions)]
@@ -175,7 +194,7 @@ macro_rules! interned_binop {
                 } else {
                     let depth = $frame.valuestackdepth;
                     $frame.locals_stack_w[depth - 2] = r;
-                    $frame.valuestackdepth = depth - 1;
+                    pop_cell!($frame);
                     $here + 1
                 }
             }
@@ -194,7 +213,7 @@ macro_rules! interned_arith {
                 } else {
                     let depth = $frame.valuestackdepth;
                     $frame.locals_stack_w[depth - 2] = r;
-                    $frame.valuestackdepth = depth - 1;
+                    pop_cell!($frame);
                     $here + 1
                 }
             }
@@ -433,9 +452,9 @@ fn intern_const(program: &CelCode, idx: i64) -> *mut crate::runtime::object::Cel
         return w;
     }
     let Some(value) = program.konst(idx as u32) else {
-        return core::ptr::null_mut();
+        return 0 as *mut crate::runtime::object::CelObject;
     };
-    intern_leaf(value).unwrap_or(core::ptr::null_mut())
+    intern_leaf(value).unwrap_or(0 as *mut crate::runtime::object::CelObject)
 }
 
 /// Field `names[name_idx]` of interned map/struct `w`. 0 means residual.
@@ -840,7 +859,7 @@ fn portal_rare(
                     let depth = frame.valuestackdepth;
                     let r = item as usize as CelRef;
                     frame.locals_stack_w[depth - 2] = r;
-                    frame.valuestackdepth = depth - 1;
+                    pop_cell!(frame);
                     here + 1
                 }
             }
@@ -879,14 +898,14 @@ fn portal_rare(
             if list.is_null() || state == 0 {
                 residual_dispatch(vm, here)
             } else if state == 2 {
-                frame.valuestackdepth = depth - 1;
+                pop_cell!(frame);
                 here + 1
             } else {
                 let inner = interned_optional_inner(item as i64);
                 if inner == 0 || try_append(list as i64, inner) == 0 {
                     residual_dispatch(vm, here)
                 } else {
-                    frame.valuestackdepth = depth - 1;
+                    pop_cell!(frame);
                     here + 1
                 }
             }
@@ -912,7 +931,7 @@ fn portal_rare(
                     let depth = frame.valuestackdepth;
                     let r = new_bool(found == 2) as CelRef;
                     frame.locals_stack_w[depth - 2] = r;
-                    frame.valuestackdepth = depth - 1;
+                    pop_cell!(frame);
                     here + 1
                 }
             }
@@ -960,7 +979,7 @@ fn portal_rare(
                         insn_b(program, pc)
                     }
                     2 => {
-                        frame.valuestackdepth -= 1;
+                        pop_cell!(frame);
                         here + 1
                     }
                     _ => residual_hydrate(vm, here),
@@ -1013,7 +1032,7 @@ fn portal_rare(
             {
                 residual_dispatch(vm, here)
             } else {
-                frame.valuestackdepth = depth - 2;
+                pop_cell!(frame, 2);
                 here + 1
             }
         }
@@ -1026,14 +1045,14 @@ fn portal_rare(
             if map.is_null() || key.is_null() || state == 0 {
                 residual_dispatch(vm, here)
             } else if state == 2 {
-                frame.valuestackdepth = depth - 2;
+                pop_cell!(frame, 2);
                 here + 1
             } else {
                 let inner = interned_optional_inner(value as i64);
                 if inner == 0 || try_map_insert(map as i64, key as i64, inner) == 0 {
                     residual_dispatch(vm, here)
                 } else {
-                    frame.valuestackdepth = depth - 2;
+                    pop_cell!(frame, 2);
                     here + 1
                 }
             }
@@ -1074,11 +1093,11 @@ interned_int_arith!(interned_rem, checked_rem, cel_rem);
 #[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
 fn intern_var(vm_bits: i64, program: &CelCode, idx: i64) -> CelRef {
     let Some(name) = program.name(NameId(idx as u32)) else {
-        return core::ptr::null_mut();
+        return 0 as *mut crate::runtime::object::CelObject;
     };
     vm_of(vm_bits)
         .intern_context_var(name)
-        .unwrap_or(core::ptr::null_mut())
+        .unwrap_or(0 as *mut crate::runtime::object::CelObject)
 }
 
 /// [`intern_var`] when [`context_lookup_pure`] is true.
@@ -1094,11 +1113,11 @@ fn intern_var_pure(
     idx: i64,
 ) -> *mut crate::runtime::object::CelObject {
     let Some(name) = program.name(NameId(idx as u32)) else {
-        return core::ptr::null_mut();
+        return 0 as *mut crate::runtime::object::CelObject;
     };
     vm_of(vm_bits)
         .intern_context_var_pure(name)
-        .unwrap_or(core::ptr::null_mut())
+        .unwrap_or(0 as *mut crate::runtime::object::CelObject)
 }
 
 /// `1` when no resolver sits on the context chain, else `0`.
@@ -1132,7 +1151,7 @@ fn interned_unary(vm_bits: i64, program: &CelCode, name_idx: i64, w: i64) -> i64
 fn interned_unary_cell(vm_bits: i64, program: &CelCode, name_idx: i64, w: CelRef) -> CelRef {
     let out = interned_unary(vm_bits, program, name_idx, w as i64);
     if out == 0 || out == ERROR_SENTINEL as i64 {
-        core::ptr::null_mut()
+        0 as *mut crate::runtime::object::CelObject
     } else {
         out as usize as CelRef
     }
@@ -2059,20 +2078,20 @@ fn map_insert_cell(map: CelRef, key: CelRef, value: CelRef) -> i64 {
 })]
 fn add_local_const_cell(vm: i64, a: *mut CelObject, k: *mut CelObject) -> *mut CelObject {
     if (a as *mut u8) == core::ptr::null_mut() {
-        core::ptr::null_mut()
+        0 as *mut crate::runtime::object::CelObject
     } else if (k as *mut u8) == core::ptr::null_mut() {
-        core::ptr::null_mut()
+        0 as *mut crate::runtime::object::CelObject
     } else if cell_kind(a) != CelKind::Int as i64 {
-        core::ptr::null_mut()
+        0 as *mut crate::runtime::object::CelObject
     } else if cell_kind(k) != CelKind::Int as i64 {
-        core::ptr::null_mut()
+        0 as *mut crate::runtime::object::CelObject
     } else {
         let l = cell_int(a);
         let rv = cell_int(k);
         if trace_arith_ok(OP_ADD, l, rv) != 0 {
             box_int(vm, trace_arith_word(OP_ADD, l, rv))
         } else {
-            core::ptr::null_mut()
+            0 as *mut crate::runtime::object::CelObject
         }
     }
 }
@@ -2081,7 +2100,7 @@ fn add_local_const_cell(vm: i64, a: *mut CelObject, k: *mut CelObject) -> *mut C
 #[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
 fn field_name_cell(program: &CelCode, name_idx: i64) -> *mut CelObject {
     if name_idx < 0 {
-        return core::ptr::null_mut();
+        return 0 as *mut crate::runtime::object::CelObject;
     }
     program.name_cell(NameId(name_idx as u32))
 }
@@ -2151,7 +2170,7 @@ fn map_object_field(map: *mut CelObject, name: *mut CelObject) -> *mut CelObject
     if found_slot >= 0 {
         map.items[found_slot]
     } else {
-        core::ptr::null_mut()
+        0 as *mut crate::runtime::object::CelObject
     }
 }
 
@@ -2207,10 +2226,10 @@ fn index_cell(container: *mut CelObject, key: *mut CelObject) -> *mut CelObject 
         if cell_kind(key) == CelKind::Int as i64 {
             item_cell(0, container, cell_int(key))
         } else {
-            core::ptr::null_mut()
+            0 as *mut crate::runtime::object::CelObject
         }
     } else {
-        core::ptr::null_mut()
+        0 as *mut crate::runtime::object::CelObject
     }
 }
 
@@ -2250,19 +2269,19 @@ fn item_cell(vm: i64, list: *mut CelObject, index: i64) -> *mut CelObject {
                         if at < col_len {
                             box_int(vm, col.data[at])
                         } else {
-                            core::ptr::null_mut()
+                            0 as *mut crate::runtime::object::CelObject
                         }
                     } else {
-                        core::ptr::null_mut()
+                        0 as *mut crate::runtime::object::CelObject
                     }
                 } else {
-                    core::ptr::null_mut()
+                    0 as *mut crate::runtime::object::CelObject
                 }
             } else {
-                core::ptr::null_mut()
+                0 as *mut crate::runtime::object::CelObject
             }
         } else {
-            core::ptr::null_mut()
+            0 as *mut crate::runtime::object::CelObject
         }
     } else if strategy == crate::runtime::object::ListStrategy::Object as i64 {
         // `listobject.py` `getitem` / `rlist.ll_getitem_fast`: bounds guard,
@@ -2273,16 +2292,16 @@ fn item_cell(vm: i64, list: *mut CelObject, index: i64) -> *mut CelObject {
                 if at >= 0 {
                     list.items[at]
                 } else {
-                    core::ptr::null_mut()
+                    0 as *mut crate::runtime::object::CelObject
                 }
             } else {
-                core::ptr::null_mut()
+                0 as *mut crate::runtime::object::CelObject
             }
         } else {
-            core::ptr::null_mut()
+            0 as *mut crate::runtime::object::CelObject
         }
     } else {
-        core::ptr::null_mut()
+        0 as *mut crate::runtime::object::CelObject
     }
 }
 
@@ -2298,7 +2317,7 @@ fn int_identity(w: *mut CelObject) -> *mut CelObject {
     if cell_kind(w) == CelKind::Int as i64 {
         w
     } else {
-        core::ptr::null_mut()
+        0 as *mut crate::runtime::object::CelObject
     }
 }
 
@@ -2358,7 +2377,7 @@ fn double_from_cell(vm: i64, w: *mut CelObject) -> *mut CelObject {
     } else if cell_kind(w) == CelKind::Double as i64 {
         w
     } else {
-        core::ptr::null_mut()
+        0 as *mut crate::runtime::object::CelObject
     }
 }
 
@@ -2374,7 +2393,7 @@ fn int_to_text(n: i64) -> *mut CelObject {
 fn string_add_cell(a: *mut CelObject, b: *mut CelObject) -> *mut CelObject {
     let r = unsafe { cel_add(a, b) };
     if r.is_null() || r == ERROR_SENTINEL {
-        core::ptr::null_mut()
+        0 as *mut crate::runtime::object::CelObject
     } else {
         r
     }
@@ -2410,7 +2429,7 @@ fn double_binop_cell(op: i64, a: *mut CelObject, b: *mut CelObject) -> *mut CelO
         }
     };
     if r.is_null() || r == ERROR_SENTINEL {
-        core::ptr::null_mut()
+        0 as *mut crate::runtime::object::CelObject
     } else {
         r
     }
@@ -2428,7 +2447,7 @@ fn string_from_cell(w: *mut CelObject) -> *mut CelObject {
     } else if cell_kind(w) == CelKind::Str as i64 {
         w
     } else {
-        core::ptr::null_mut()
+        0 as *mut crate::runtime::object::CelObject
     }
 }
 
@@ -2499,7 +2518,7 @@ fn contains_int_word(list: *mut CelObject, needle: *mut CelObject) -> i64 {
 fn map_keys_cell(vm: i64, w: CelRef) -> CelRef {
     let keys = interned_map_keys(vm, w as i64);
     if keys == 0 {
-        core::ptr::null_mut()
+        0 as *mut crate::runtime::object::CelObject
     } else {
         keys as usize as CelRef
     }
@@ -2862,7 +2881,7 @@ fn step_hot(program: &CelCode, pc: usize) -> i64 {
                     let depth = frame.valuestackdepth;
                     let r = item as usize as CelRef;
                     frame.locals_stack_w[depth - 2] = r;
-                    frame.valuestackdepth = depth - 1;
+                    pop_cell!(frame);
                     here + 1
                 }
             }
@@ -3004,7 +3023,7 @@ fn step_hot(program: &CelCode, pc: usize) -> i64 {
                             let depth = frame.valuestackdepth;
                             let r = out as usize as CelRef;
                             frame.locals_stack_w[depth - 2] = r;
-                            frame.valuestackdepth = depth - 1;
+                            pop_cell!(frame);
                             here + 1
                         }
                     }
@@ -3034,7 +3053,7 @@ fn step_hot(program: &CelCode, pc: usize) -> i64 {
             } else {
                 let slot = insn_a(program, pc);
                 frame.locals_stack_w[slot] = w;
-                frame.valuestackdepth = depth - 1;
+                pop_cell!(frame);
                 here + 1
             }
         }
@@ -3097,8 +3116,7 @@ fn step_hot(program: &CelCode, pc: usize) -> i64 {
         OP_JUMP_IF_FALSE | OP_JUMP_IF_TRUE => match operand_cell(frame, 1) {
             Some(w) if !w.is_null() && unsafe { w_kind(w) } == CelKind::Bool => {
                 let truthy = unsafe { (*w.cast::<W_BoolObject>()).boolval } != 0;
-                let depth = frame.valuestackdepth;
-                frame.valuestackdepth = depth - 1;
+                pop_cell!(frame);
                 let want = opcode == OP_JUMP_IF_TRUE;
                 if truthy == want {
                     insn_a(program, pc)
@@ -3134,7 +3152,7 @@ fn step_hot(program: &CelCode, pc: usize) -> i64 {
             if item.is_null() || list.is_null() || try_append(list as i64, item as i64) == 0 {
                 residual_dispatch(vm, here)
             } else {
-                frame.valuestackdepth = depth - 1;
+                pop_cell!(frame);
                 here + 1
             }
         }
@@ -3574,6 +3592,8 @@ fn run_cel_portal(
                 } else {
                     let slot = insn_a(program, pc);
                     state.frame.locals_stack_w[slot] = w;
+                    state.frame.locals_stack_w[depth - 1] =
+                        0 as *mut crate::runtime::object::CelObject;
                     state.frame.valuestackdepth = depth - 1;
                     here + 1
                 };
@@ -4081,6 +4101,8 @@ fn run_cel_portal(
                             let item = index_cell(container, key);
                             if !item.is_null() {
                                 state.frame.locals_stack_w[box_i] = item;
+                                state.frame.locals_stack_w[depth - 1] =
+                                    0 as *mut crate::runtime::object::CelObject;
                                 state.frame.valuestackdepth = depth - 1;
                                 here + 1
                             } else {
@@ -4121,6 +4143,8 @@ fn run_cel_portal(
                     if bit < 0 {
                         slow_pc(vm, here)
                     } else {
+                        state.frame.locals_stack_w[depth - 1] =
+                            0 as *mut crate::runtime::object::CelObject;
                         state.frame.valuestackdepth = depth - 1;
                         if bit == 0 {
                             insn_a(program, pc)
@@ -4199,6 +4223,10 @@ fn run_cel_portal(
                     if !key.is_null() {
                         if !map.is_null() {
                             if map_store_pair(map, key, value) != 0 {
+                                state.frame.locals_stack_w[depth - 1] =
+                                    0 as *mut crate::runtime::object::CelObject;
+                                state.frame.locals_stack_w[depth - 2] =
+                                    0 as *mut crate::runtime::object::CelObject;
                                 state.frame.valuestackdepth = depth - 2;
                                 here + 1
                             } else {
@@ -4294,6 +4322,8 @@ fn run_cel_portal(
                             }
                         };
                         if stored != 0 {
+                            state.frame.locals_stack_w[depth - 1] =
+                                0 as *mut crate::runtime::object::CelObject;
                             state.frame.valuestackdepth = depth - 1;
                             here + 1
                         } else {
@@ -4589,6 +4619,8 @@ fn run_cel_portal(
                                         slow_pc(vm, here)
                                     } else {
                                         state.frame.locals_stack_w[ai] = r;
+                                        state.frame.locals_stack_w[depth - 1] =
+                                            0 as *mut crate::runtime::object::CelObject;
                                         state.frame.valuestackdepth = depth - 1;
                                         here + 1
                                     }
@@ -4603,12 +4635,16 @@ fn run_cel_portal(
                                     if bit >= 0 {
                                         let r = box_bool(bit);
                                         state.frame.locals_stack_w[ai] = r;
+                                        state.frame.locals_stack_w[depth - 1] =
+                                            0 as *mut crate::runtime::object::CelObject;
                                         state.frame.valuestackdepth = depth - 1;
                                         here + 1
                                     } else if trace_arith_ok(opcode, l, rv) != 0 {
                                         let v = trace_arith_word(opcode, l, rv);
                                         let r = box_int(vm, v);
                                         state.frame.locals_stack_w[ai] = r;
+                                        state.frame.locals_stack_w[depth - 1] =
+                                            0 as *mut crate::runtime::object::CelObject;
                                         state.frame.valuestackdepth = depth - 1;
                                         here + 1
                                     } else {
@@ -4945,6 +4981,8 @@ fn run_cel_portal(
                         state.frame.locals_stack_w[i] = r;
                         insn_b(program, pc)
                     } else if code == 2 {
+                        state.frame.locals_stack_w[depth - 1] =
+                            0 as *mut crate::runtime::object::CelObject;
                         state.frame.valuestackdepth = depth - 1;
                         here + 1
                     } else {
@@ -5101,6 +5139,8 @@ fn run_cel_portal(
                                 let bit = if found == 2 { 1 } else { 0 };
                                 let r = box_bool(bit);
                                 state.frame.locals_stack_w[box_i] = r;
+                                state.frame.locals_stack_w[depth - 1] =
+                                    0 as *mut crate::runtime::object::CelObject;
                                 state.frame.valuestackdepth = depth - 1;
                                 here + 1
                             }
