@@ -561,10 +561,10 @@ pub fn new_int_column(values: &[i64]) -> *mut W_IntColumn {
 /// Strategy tag + storage + window, the `listobject.py` shape. Object
 /// lists keep their items block on the leaf (the block is not a
 /// class-family value); int columns and host windows live at `storage`.
-#[cfg_attr(
-    feature = "jit",
-    majit_macros::jit_immutable_fields(strategy, storage, items, start)
-)]
+///
+/// `strategy`, `storage`, `items` and `start` are written after allocation
+/// (`W_ListObject.__init__`, `EmptyListStrategy.switch_to_correct_strategy`).
+/// They are not `_immutable_fields_`.
 #[repr(C)]
 #[allow(non_camel_case_types)]
 pub struct W_ListObject {
@@ -797,7 +797,10 @@ pub fn new_list_with_capacity_in(heap: &super::heap::CelHeap, cap: i64) -> *mut 
 }
 
 /// An int column whose `length` is the allocated count (`ll_newlist_hint`).
-fn new_int_column_capacity(cap: i64) -> *mut W_IntColumn {
+///
+/// The only allocation on `EmptyListStrategy.switch_to_correct_strategy`
+/// for a plain int. The strategy tag itself is a field write.
+pub(crate) fn new_int_column_capacity(cap: i64) -> *mut W_IntColumn {
     let cap = cap.max(1);
     let bytes = (cap as usize).saturating_mul(core::mem::size_of::<i64>());
     super::heap::with_heap(|h| {

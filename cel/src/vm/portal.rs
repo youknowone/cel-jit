@@ -1767,6 +1767,31 @@ fn list_resize_ge_i(list: *mut CelObject, newsize: i64) -> i64 {
     }
 }
 
+/// Items-block capacity of an empty object list, or 1. The hint
+/// `new_list_with_capacity` stored (`ll_newlist_hint`).
+#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+fn empty_list_hint(list: *mut CelObject) -> i64 {
+    if list.is_null() {
+        return 1;
+    }
+    unsafe {
+        let leaf = &*list.cast::<crate::runtime::object::W_ListObject>();
+        let cap = crate::runtime::object_array::items_capacity(leaf.items) as i64;
+        if cap > 0 {
+            cap
+        } else {
+            1
+        }
+    }
+}
+
+/// `IntegerListStrategy.get_empty_storage`: the one malloc on
+/// `switch_to_correct_strategy`. The strategy tag is written by the caller.
+#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+fn alloc_int_column(cap: i64) -> *mut CelObject {
+    crate::runtime::object::new_int_column_capacity(cap) as *mut CelObject
+}
+
 /// First int on an empty list (`EmptyListStrategy.append`) or a grow the
 /// inline path declined. Not on the traced common path.
 #[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
@@ -1801,11 +1826,14 @@ fn list_append_int_cold(list: *mut CelObject, word: i64) -> i64 {
     int_fields = {
         crate::runtime::object::W_ListObject::strategy => u8,
         crate::runtime::object::W_ListObject::length => i64,
+        crate::runtime::object::W_ListObject::start => i64,
         crate::runtime::object::W_IntColumn::length => i64,
     },
     calls = {
         list_resize_ge_i => residual_int,
         list_append_int_cold => residual_int,
+        empty_list_hint => residual_int,
+        alloc_int_column => residual_ref,
     },
 )]
 fn append_int_word(list: *mut CelObject, word: i64) -> i64 {
@@ -1840,6 +1868,24 @@ fn append_int_word(list: *mut CelObject, word: i64) -> i64 {
         } else {
             list_append_int_cold(list, word)
         }
+    } else if strategy == ListStrategy::Object as i64 && list.length == 0 {
+        // `EmptyListStrategy.switch_to_correct_strategy`: the tag is a
+        // field write; only the column malloc is a call. No object-storage
+        // fill happens first (`get_strategy_from_list_objects` picks Ints
+        // before `init_from_list_w`).
+        let hint = empty_list_hint(list);
+        let col = alloc_int_column(hint);
+        if (col as *mut u8) != core::ptr::null_mut() {
+            list.strategy = ListStrategy::Ints;
+            list.storage = col;
+            list.start = 0;
+            let column = col as *mut crate::runtime::object::W_IntColumn;
+            column.data[0] = word;
+            list.length = 1;
+            1
+        } else {
+            list_append_int_cold(list, word)
+        }
     } else {
         list_append_int_cold(list, word)
     }
@@ -1848,6 +1894,81 @@ fn append_int_word(list: *mut CelObject, word: i64) -> i64 {
 #[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
 fn map_insert_cell(map: CelRef, key: CelRef, value: CelRef) -> i64 {
     try_map_insert(map as i64, key as i64, value as i64)
+}
+
+/// Index a string (or other non-int) may be stored at, or `-1`.
+///
+/// The store itself is `setarrayitem_gc` in [`append_ref`].
+#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+fn object_append_at(list: *mut CelObject) -> i64 {
+    if list.is_null() {
+        return -1;
+    }
+    unsafe {
+        let leaf = &*list.cast::<crate::runtime::object::W_ListObject>();
+        if leaf.strategy != ListStrategy::Object {
+            return -1;
+        }
+        let cap = crate::runtime::object_array::items_capacity(leaf.items) as i64;
+        if leaf.length >= 0 && leaf.length < cap {
+            leaf.length
+        } else {
+            -1
+        }
+    }
+}
+
+/// `ObjectListStrategy.append`: `setarrayitem_gc` plus `setfield` of length.
+#[majit_macros::jit_inline(
+    ref_params = { list: ref(crate::runtime::object::W_ListObject) },
+    array_fields = {
+        crate::runtime::object::W_ListObject::items => crate::runtime::object::CelRef in crate::runtime::object_array::CelItemsBlock,
+    },
+    int_fields = {
+        crate::runtime::object::W_ListObject::length => i64,
+    },
+    calls = {
+        object_append_at => residual_int,
+        append_cell => residual_int,
+    },
+)]
+fn append_ref(list: *mut CelObject, item: *mut CelObject) -> i64 {
+    let at = object_append_at(list);
+    if at >= 0 {
+        list.items[at] = item;
+        list.length = at + 1;
+        1
+    } else {
+        append_cell(list, item)
+    }
+}
+
+/// `e + 1` as one traced add. Null declines to [`slow_pc`].
+#[majit_macros::jit_inline(calls = {
+    cell_kind => inline_int,
+    cell_int => inline_int,
+    box_int => inline_ref,
+    trace_arith_ok => inline_int,
+    trace_arith_word => inline_int,
+})]
+fn add_local_const_cell(vm: i64, a: *mut CelObject, k: *mut CelObject) -> *mut CelObject {
+    if (a as *mut u8) == core::ptr::null_mut() {
+        core::ptr::null_mut()
+    } else if (k as *mut u8) == core::ptr::null_mut() {
+        core::ptr::null_mut()
+    } else if cell_kind(a) != CelKind::Int as i64 {
+        core::ptr::null_mut()
+    } else if cell_kind(k) != CelKind::Int as i64 {
+        core::ptr::null_mut()
+    } else {
+        let l = cell_int(a);
+        let rv = cell_int(k);
+        if trace_arith_ok(OP_ADD, l, rv) != 0 {
+            box_int(vm, trace_arith_word(OP_ADD, l, rv))
+        } else {
+            core::ptr::null_mut()
+        }
+    }
 }
 
 #[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
@@ -2681,6 +2802,8 @@ fn slow_pc(vm: i64, here: i64) -> i64 {
         slow_pc => inline_int,
         append_cell => residual_int,
         append_int_word => inline_int,
+        append_ref => inline_int,
+        add_local_const_cell => inline_ref,
         map_insert_cell => residual_int,
         contains_int_word => inline_int,
         int_identity => inline_ref,
@@ -2699,7 +2822,7 @@ fn slow_pc(vm: i64, here: i64) -> i64 {
         interned_contains => residual_int,
         interned_len => residual_int,
         interned_len_cell => residual_int,
-        interned_is_size => residual_int,
+        interned_is_size => elidable_int_cannot_raise,
         interned_unary => residual_int,
         interned_unary_cell => residual_ref,
         interned_temporal => residual_int,
@@ -2983,6 +3106,32 @@ fn run_cel_portal(
                     }
                 } else {
                     slow_pc(vm, here)
+                };
+                if next >= 0 {
+                    let tgt = next as usize;
+                    if tgt < pc {
+                        can_enter_jit!(driver, tgt, &mut *state, program, || {});
+                    }
+                    pc = tgt;
+                    continue;
+                }
+                state.ret = next;
+                return next;
+            }
+            OP_ADD_LOCAL_K => {
+                state.frame.last_instr = pc as i64;
+                let vm = state.vm;
+                let here = pc as i64;
+                let a = state.frame.locals_stack_w[insn_a(program, pc)];
+                let k = intern_const(program, insn_b(program, pc));
+                let r = add_local_const_cell(vm, a, k);
+                let next = if r.is_null() {
+                    slow_pc(vm, here)
+                } else {
+                    let depth = state.frame.valuestackdepth;
+                    state.frame.locals_stack_w[depth] = r;
+                    state.frame.valuestackdepth = depth + 1;
+                    here + 1
                 };
                 if next >= 0 {
                     let tgt = next as usize;
@@ -3353,7 +3502,7 @@ fn run_cel_portal(
                         let stored = if cell_kind(item) == CelKind::Int as i64 {
                             append_int_word(list, cell_int(item))
                         } else {
-                            append_cell(list, item)
+                            append_ref(list, item)
                         };
                         if stored != 0 {
                             state.frame.valuestackdepth = depth - 1;
@@ -3599,7 +3748,7 @@ fn run_cel_portal(
                             let stored = if cell_kind(w) == CelKind::Int as i64 {
                                 append_int_word(list, cell_int(w))
                             } else {
-                                append_cell(list, w)
+                                append_ref(list, w)
                             };
                             if stored != 0 {
                                 here + 1
@@ -4007,7 +4156,11 @@ fn run_cel_portal(
                         let w = state.frame.locals_stack_w[i];
                         if !w.is_null() {
                             if interned_is_size(program, name) != 0 {
-                                let n = interned_len_cell(w);
+                                let n = if cell_kind(w) == CelKind::List as i64 {
+                                    cell_list_len(w)
+                                } else {
+                                    interned_len_cell(w)
+                                };
                                 if n < 0 {
                                     slow_pc(vm, here)
                                 } else {
@@ -4066,7 +4219,11 @@ fn run_cel_portal(
                         let w = state.frame.locals_stack_w[i];
                         if !w.is_null() {
                             if interned_is_size(program, name) != 0 {
-                                let n = interned_len_cell(w);
+                                let n = if cell_kind(w) == CelKind::List as i64 {
+                                    cell_list_len(w)
+                                } else {
+                                    interned_len_cell(w)
+                                };
                                 if n < 0 {
                                     slow_pc(vm, here)
                                 } else {
