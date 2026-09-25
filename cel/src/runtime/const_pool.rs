@@ -27,6 +27,10 @@ use std::sync::Arc;
 #[derive(Default)]
 pub struct ConstPool {
     blocks: Vec<Block>,
+    /// Keeps the `Arc` named by a string leaf's `public` word alive for the
+    /// pool's lifetime. The leaf is immortal; the pointer is written once
+    /// here, before the pool is shared.
+    strings: Vec<Arc<String>>,
 }
 
 struct Block {
@@ -127,13 +131,15 @@ impl ConstPool {
             Value::Bool(_) | Value::Null => core::ptr::null_mut(),
             Value::String(s) => {
                 let chars = self.alloc_bytes_block(s.as_bytes());
+                let public = Arc::as_ptr(s) as *const ();
+                self.strings.push(Arc::clone(s));
                 self.alloc(W_StringObject {
                     ob_header: CelObject {
                         ob_type: &CEL_STRING_CLASS,
                     },
                     chars,
                     byte_len: s.len() as i64,
-                    public: core::ptr::null(),
+                    public,
                 }) as CelRef
             }
             Value::Bytes(b) => {

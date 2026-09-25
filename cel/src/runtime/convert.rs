@@ -233,6 +233,9 @@ pub fn value_to_ref(v: &Value) -> Result<CelRef, ConvertError> {
 /// # Safety
 ///
 /// `w` must point at a live object this thread's heap still owns.
+// Default inlining leaves this call in the list fill. The hot match has to
+// be in the element loop; the rare arms stay in [`ref_to_value_cold`].
+#[inline(always)]
 pub unsafe fn ref_to_value(w: CelRef) -> Result<Value, ConvertError> {
     if w.is_null() {
         return Err(ConvertError::Corrupt("null pointer"));
@@ -263,6 +266,20 @@ pub unsafe fn ref_to_value(w: CelRef) -> Result<Value, ConvertError> {
         }
         CelKind::List if class == &CEL_LIST_CLASS => Ok(Value::List(unsafe { list_from_ref(w)? })),
         CelKind::Map if class == &CEL_MAP_CLASS => Ok(Value::Map(unsafe { map_from_ref(w)? })),
+        _ => unsafe { ref_to_value_cold(w, kind, class) },
+    }
+}
+
+/// Struct, optional, type, opaque, timestamp, duration. Out of line so the
+/// scalar/string/list/map arms of [`ref_to_value`] stay small enough to inline.
+#[cold]
+#[inline(never)]
+unsafe fn ref_to_value_cold(
+    w: CelRef,
+    kind: CelKind,
+    class: *const CelClass,
+) -> Result<Value, ConvertError> {
+    match kind {
         #[cfg(feature = "structs")]
         CelKind::Struct if class == &CEL_STRUCT_CLASS => {
             let leaf = unsafe { &*w.cast::<W_StructObject>() };
