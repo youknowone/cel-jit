@@ -3525,6 +3525,61 @@ fn run_cel_portal(
                 state.ret = next;
                 return next;
             }
+            OP_MOD_K => {
+                state.frame.last_instr = pc as i64;
+                let vm = state.vm;
+                let here = pc as i64;
+                let k = intern_const(program, insn_a(program, pc));
+                let depth = state.frame.valuestackdepth;
+                let i = depth - 1;
+                let next = if i >= state.frame.n_slots {
+                    let a = state.frame.locals_stack_w[i];
+                    if !a.is_null() {
+                        if !k.is_null() {
+                            if cell_kind(a) == CelKind::Int as i64 {
+                                if cell_kind(k) == CelKind::Int as i64 {
+                                    let l = cell_int(a);
+                                    let rv = cell_int(k);
+                                    // `ll_int_py_mod_zer` raises on zero.
+                                    // `ll_int_py_mod_ovf` raises on
+                                    // `MIN % -1` (Rust `%` panics there).
+                                    // Every other pair records `int.py_mod`
+                                    // plus the truncation adjustment
+                                    // (`support.py` `_ll_2_int_mod`).
+                                    if rv != 0 && (l != i64::MIN || rv != -1) {
+                                        let v = l % rv;
+                                        let r = box_int(vm, v);
+                                        state.frame.locals_stack_w[i] = r;
+                                        here + 1
+                                    } else {
+                                        slow_pc(vm, here)
+                                    }
+                                } else {
+                                    slow_pc(vm, here)
+                                }
+                            } else {
+                                slow_pc(vm, here)
+                            }
+                        } else {
+                            slow_pc(vm, here)
+                        }
+                    } else {
+                        slow_pc(vm, here)
+                    }
+                } else {
+                    slow_pc(vm, here)
+                };
+                if next >= 0 {
+                    let tgt = next as usize;
+                    if tgt < pc {
+                        can_enter_jit!(driver, tgt, &mut *state, program, || {});
+                    }
+                    pc = tgt;
+                    continue;
+                }
+                state.ret = next;
+                return next;
+            }
             OP_EQ_LOCAL_K => {
                 state.frame.last_instr = pc as i64;
                 let vm = state.vm;
@@ -3647,6 +3702,118 @@ fn run_cel_portal(
                                                 }
                                             }
                                             None => slow_pc(vm, here),
+                                        }
+                                    } else {
+                                        slow_pc(vm, here)
+                                    }
+                                } else {
+                                    slow_pc(vm, here)
+                                }
+                            } else {
+                                slow_pc(vm, here)
+                            }
+                        } else {
+                            slow_pc(vm, here)
+                        }
+                    } else {
+                        slow_pc(vm, here)
+                    }
+                } else {
+                    slow_pc(vm, here)
+                };
+                if next >= 0 {
+                    let tgt = next as usize;
+                    if tgt < pc {
+                        can_enter_jit!(driver, tgt, &mut *state, program, || {});
+                    }
+                    pc = tgt;
+                    continue;
+                }
+                state.ret = next;
+                return next;
+            }
+            OP_ADD_LOCAL_K_APPEND => {
+                state.frame.last_instr = pc as i64;
+                let vm = state.vm;
+                let here = pc as i64;
+                let a = state.frame.locals_stack_w[insn_a(program, pc)];
+                let k = intern_const(program, insn_b(program, pc));
+                let depth = state.frame.valuestackdepth;
+                let top = depth - 1;
+                let next = if top >= state.frame.n_slots {
+                    let list = state.frame.locals_stack_w[top];
+                    if !a.is_null() {
+                        if !k.is_null() {
+                            if !list.is_null() {
+                                if cell_kind(a) == CelKind::Int as i64 {
+                                    if cell_kind(k) == CelKind::Int as i64 {
+                                        let l = cell_int(a);
+                                        let rv = cell_int(k);
+                                        match l.checked_add(rv) {
+                                            Some(v) => {
+                                                if append_int_word(list, v) != 0 {
+                                                    here + 1
+                                                } else {
+                                                    slow_pc(vm, here)
+                                                }
+                                            }
+                                            None => slow_pc(vm, here),
+                                        }
+                                    } else {
+                                        slow_pc(vm, here)
+                                    }
+                                } else {
+                                    slow_pc(vm, here)
+                                }
+                            } else {
+                                slow_pc(vm, here)
+                            }
+                        } else {
+                            slow_pc(vm, here)
+                        }
+                    } else {
+                        slow_pc(vm, here)
+                    }
+                } else {
+                    slow_pc(vm, here)
+                };
+                if next >= 0 {
+                    let tgt = next as usize;
+                    if tgt < pc {
+                        can_enter_jit!(driver, tgt, &mut *state, program, || {});
+                    }
+                    pc = tgt;
+                    continue;
+                }
+                state.ret = next;
+                return next;
+            }
+            OP_MOD_LOCAL_K_APPEND => {
+                state.frame.last_instr = pc as i64;
+                let vm = state.vm;
+                let here = pc as i64;
+                let a = state.frame.locals_stack_w[insn_a(program, pc)];
+                let k = intern_const(program, insn_b(program, pc));
+                let depth = state.frame.valuestackdepth;
+                let top = depth - 1;
+                let next = if top >= state.frame.n_slots {
+                    let list = state.frame.locals_stack_w[top];
+                    if !a.is_null() {
+                        if !k.is_null() {
+                            if !list.is_null() {
+                                if cell_kind(a) == CelKind::Int as i64 {
+                                    if cell_kind(k) == CelKind::Int as i64 {
+                                        let l = cell_int(a);
+                                        let rv = cell_int(k);
+                                        if rv != 0 && (l != i64::MIN || rv != -1) {
+                                            let v = l % rv;
+                                            if append_int_word(list, v) != 0 {
+                                                here + 1
+                                            } else {
+                                                slow_pc(vm, here)
+                                            }
+                                        } else {
+                                            slow_pc(vm, here)
                                         }
                                     } else {
                                         slow_pc(vm, here)
@@ -4343,16 +4510,12 @@ fn run_cel_portal(
                                 let l = cell_int(a);
                                 let rv = cell_int(k);
                                 if opcode == OP_MOD_LOCAL_K {
-                                    if rv > 0 {
-                                        if l >= 0 {
-                                            let r = box_int(vm, l % rv);
-                                            let depth = state.frame.valuestackdepth;
-                                            state.frame.locals_stack_w[depth] = r;
-                                            state.frame.valuestackdepth = depth + 1;
-                                            here + 1
-                                        } else {
-                                            slow_pc(vm, here)
-                                        }
+                                    if rv != 0 && (l != i64::MIN || rv != -1) {
+                                        let r = box_int(vm, l % rv);
+                                        let depth = state.frame.valuestackdepth;
+                                        state.frame.locals_stack_w[depth] = r;
+                                        state.frame.valuestackdepth = depth + 1;
+                                        here + 1
                                     } else {
                                         slow_pc(vm, here)
                                     }

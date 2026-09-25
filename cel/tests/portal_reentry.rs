@@ -75,6 +75,8 @@ fn compiled_entries_match_the_walker() {
     agree_compiled("list.filter(e, e % 2 == 0)", 150);
     agree_compiled("list.map(e, (e - 500) % 7)", 150);
     agree_compiled("list.map(e, (e - 500) / 7)", 150);
+    agree_compiled("list.map(e, e % 7)", 150);
+    agree_compiled("list.map(e, -e % 3)", 150);
     agree_compiled("list.map(e, list.size())", 150);
     agree_compiled("list.map(e, {\"k\": e})", 150);
     agree_compiled("list.map(e, {\"k\": e}.k)", 150);
