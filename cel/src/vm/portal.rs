@@ -2573,6 +2573,204 @@ fn and_merge_keep(vm: i64, w: *mut CelObject, slot: i64, is_or: i64, scratch_bit
     }
 }
 
+/// Slot times a literal. Null declines to [`slow_pc`].
+#[majit_macros::jit_inline(calls = {
+    cell_kind => inline_int,
+    cell_int => inline_int,
+    box_int => inline_ref,
+    trace_arith_ok => inline_int,
+    trace_arith_word => inline_int,
+})]
+fn mul_local_const_cell(vm: i64, a: *mut CelObject, k: *mut CelObject) -> *mut CelObject {
+    if (a as *mut u8) == core::ptr::null_mut() {
+        core::ptr::null_mut()
+    } else if (k as *mut u8) == core::ptr::null_mut() {
+        core::ptr::null_mut()
+    } else if cell_kind(a) != CelKind::Int as i64 {
+        core::ptr::null_mut()
+    } else if cell_kind(k) != CelKind::Int as i64 {
+        core::ptr::null_mut()
+    } else {
+        let l = cell_int(a);
+        let rv = cell_int(k);
+        if trace_arith_ok(OP_MUL, l, rv) != 0 {
+            box_int(vm, trace_arith_word(OP_MUL, l, rv))
+        } else {
+            core::ptr::null_mut()
+        }
+    }
+}
+
+/// Field of a slot, given the name cell. Null declines.
+#[majit_macros::jit_inline(calls = { map_object_field => inline_ref })]
+fn field_of_slot(recv: *mut CelObject, name: *mut CelObject) -> *mut CelObject {
+    if (recv as *mut u8) == core::ptr::null_mut() {
+        core::ptr::null_mut()
+    } else if (name as *mut u8) == core::ptr::null_mut() {
+        core::ptr::null_mut()
+    } else {
+        map_object_field(recv, name)
+    }
+}
+
+/// `has` on a slot: a bool leaf, or null to decline.
+#[majit_macros::jit_inline(calls = {
+    map_object_field => inline_ref,
+    map_object_known => inline_int,
+    box_bool => inline_ref,
+})]
+fn has_field_slot(recv: *mut CelObject, name: *mut CelObject) -> *mut CelObject {
+    if (recv as *mut u8) == core::ptr::null_mut() {
+        core::ptr::null_mut()
+    } else if (name as *mut u8) == core::ptr::null_mut() {
+        core::ptr::null_mut()
+    } else {
+        let found = map_object_field(recv, name);
+        if (found as *mut u8) != core::ptr::null_mut() {
+            box_bool(1)
+        } else if map_object_known(recv) != 0 {
+            box_bool(0)
+        } else {
+            core::ptr::null_mut()
+        }
+    }
+}
+
+/// Append a slot's field onto `list`. `0` declines.
+#[majit_macros::jit_inline(calls = {
+    field_of_slot => inline_ref,
+    cell_kind => inline_int,
+    cell_int => inline_int,
+    append_int_word => inline_int,
+    append_ref => inline_int,
+    append_cell => residual_int,
+})]
+fn append_named_field(list: *mut CelObject, recv: *mut CelObject, name: *mut CelObject) -> i64 {
+    if (list as *mut u8) == core::ptr::null_mut() {
+        0
+    } else {
+        let found = field_of_slot(recv, name);
+        if (found as *mut u8) == core::ptr::null_mut() {
+            0
+        } else if cell_kind(found) == CelKind::Int as i64 {
+            append_int_word(list, cell_int(found))
+        } else {
+            let via = append_ref(list, found);
+            if via != 0 {
+                via
+            } else {
+                append_cell(list, found)
+            }
+        }
+    }
+}
+
+/// Append `has(slot.field)` onto `list`. `0` declines.
+#[majit_macros::jit_inline(calls = {
+    has_field_slot => inline_ref,
+    append_ref => inline_int,
+    append_cell => residual_int,
+})]
+fn append_has_field(list: *mut CelObject, recv: *mut CelObject, name: *mut CelObject) -> i64 {
+    if (list as *mut u8) == core::ptr::null_mut() {
+        0
+    } else {
+        let bit = has_field_slot(recv, name);
+        if (bit as *mut u8) == core::ptr::null_mut() {
+            0
+        } else {
+            let via = append_ref(list, bit);
+            if via != 0 {
+                via
+            } else {
+                append_cell(list, bit)
+            }
+        }
+    }
+}
+
+/// Payload of `optional.of`, or null when `w` is not a some.
+#[majit_macros::jit_inline(
+    ref_fields = {
+        W_OptionalObject::w_value => CelObject,
+    },
+    calls = { cell_kind => inline_int },
+)]
+fn opt_some_inner(w: *mut CelObject) -> *mut CelObject {
+    if cell_kind(w) == CelKind::Optional as i64 {
+        let obj = w as *mut W_OptionalObject;
+        let inner = unsafe { (*obj).w_value };
+        if inner.is_null() {
+            core::ptr::null_mut()
+        } else {
+            inner
+        }
+    } else {
+        core::ptr::null_mut()
+    }
+}
+
+/// `MapInsertOptional`. `1` consumed the optional, `0` declines.
+#[majit_macros::jit_inline(calls = {
+    opt_is_none_i => inline_int,
+    opt_some_inner => inline_ref,
+    map_store_pair => inline_int,
+})]
+fn map_opt_insert(map: *mut CelObject, key: *mut CelObject, value: *mut CelObject) -> i64 {
+    if (map as *mut u8) == core::ptr::null_mut() {
+        0
+    } else if (key as *mut u8) == core::ptr::null_mut() {
+        0
+    } else if (value as *mut u8) == core::ptr::null_mut() {
+        0
+    } else if opt_is_none_i(value) != 0 {
+        1
+    } else {
+        let inner = opt_some_inner(value);
+        if (inner as *mut u8) == core::ptr::null_mut() {
+            0
+        } else if map_store_pair(map, key, inner) != 0 {
+            1
+        } else {
+            0
+        }
+    }
+}
+
+/// `ListAppendOptional`. `1` consumed the optional, `0` declines.
+#[majit_macros::jit_inline(calls = {
+    opt_is_none_i => inline_int,
+    opt_some_inner => inline_ref,
+    cell_kind => inline_int,
+    cell_int => inline_int,
+    append_int_word => inline_int,
+    append_ref => inline_int,
+    append_cell => residual_int,
+})]
+fn list_opt_append(list: *mut CelObject, item: *mut CelObject) -> i64 {
+    if (list as *mut u8) == core::ptr::null_mut() {
+        0
+    } else if (item as *mut u8) == core::ptr::null_mut() {
+        0
+    } else if opt_is_none_i(item) != 0 {
+        1
+    } else {
+        let inner = opt_some_inner(item);
+        if (inner as *mut u8) == core::ptr::null_mut() {
+            0
+        } else if cell_kind(inner) == CelKind::Int as i64 {
+            append_int_word(list, cell_int(inner))
+        } else {
+            let via = append_ref(list, inner);
+            if via != 0 {
+                via
+            } else {
+                append_cell(list, inner)
+            }
+        }
+    }
+}
+
 /// Every opcode of one portal step.
 ///
 /// The dispatch JitCode lowers the match arm, not these bodies. The
@@ -3244,6 +3442,14 @@ fn slow_pc(vm: i64, here: i64) -> i64 {
         vm_sync_pop => residual_int,
         vm_park_return => residual_void,
         step_hot => may_force_int,
+        map_opt_insert => inline_int,
+        list_opt_append => inline_int,
+        mul_local_const_cell => inline_ref,
+        field_of_slot => inline_ref,
+        has_field_slot => inline_ref,
+        append_named_field => inline_int,
+        append_has_field => inline_int,
+
         new_int => inline_ref,
         new_bool => inline_ref,
         cel_add => inline_ref,
@@ -5014,6 +5220,240 @@ fn run_cel_portal(
                         } else {
                             slow_pc(vm, here)
                         }
+                    } else {
+                        slow_pc(vm, here)
+                    }
+                } else {
+                    slow_pc(vm, here)
+                };
+                if next >= 0 {
+                    let tgt = next as usize;
+                    if tgt < pc {
+                        can_enter_jit!(driver, tgt, &mut *state, program, || {});
+                    }
+                    pc = tgt;
+                    continue;
+                }
+                state.ret = next;
+                return next;
+            }
+            OP_MUL_LOCAL_K => {
+                state.frame.last_instr = pc as i64;
+                let vm = state.vm;
+                let here = pc as i64;
+                let a = state.frame.locals_stack_w[insn_a(program, pc)];
+                let k = intern_const(program, insn_b(program, pc));
+                let r = mul_local_const_cell(vm, a, k);
+                let next = if r.is_null() {
+                    slow_pc(vm, here)
+                } else {
+                    let depth = state.frame.valuestackdepth;
+                    state.frame.locals_stack_w[depth] = r;
+                    state.frame.valuestackdepth = depth + 1;
+                    here + 1
+                };
+                if next >= 0 {
+                    let tgt = next as usize;
+                    if tgt < pc {
+                        can_enter_jit!(driver, tgt, &mut *state, program, || {});
+                    }
+                    pc = tgt;
+                    continue;
+                }
+                state.ret = next;
+                return next;
+            }
+            OP_GET_FIELD_LOCAL => {
+                state.frame.last_instr = pc as i64;
+                let vm = state.vm;
+                let here = pc as i64;
+                let recv = state.frame.locals_stack_w[insn_a(program, pc)];
+                let name = field_name_cell(program, insn_b(program, pc));
+                let found = field_of_slot(recv, name);
+                let next = if found.is_null() {
+                    slow_pc(vm, here)
+                } else {
+                    let depth = state.frame.valuestackdepth;
+                    state.frame.locals_stack_w[depth] = found;
+                    state.frame.valuestackdepth = depth + 1;
+                    here + 1
+                };
+                if next >= 0 {
+                    let tgt = next as usize;
+                    if tgt < pc {
+                        can_enter_jit!(driver, tgt, &mut *state, program, || {});
+                    }
+                    pc = tgt;
+                    continue;
+                }
+                state.ret = next;
+                return next;
+            }
+            OP_HAS_FIELD_LOCAL => {
+                state.frame.last_instr = pc as i64;
+                let vm = state.vm;
+                let here = pc as i64;
+                let recv = state.frame.locals_stack_w[insn_a(program, pc)];
+                let name = field_name_cell(program, insn_b(program, pc));
+                let bit = has_field_slot(recv, name);
+                let next = if bit.is_null() {
+                    slow_pc(vm, here)
+                } else {
+                    let depth = state.frame.valuestackdepth;
+                    state.frame.locals_stack_w[depth] = bit;
+                    state.frame.valuestackdepth = depth + 1;
+                    here + 1
+                };
+                if next >= 0 {
+                    let tgt = next as usize;
+                    if tgt < pc {
+                        can_enter_jit!(driver, tgt, &mut *state, program, || {});
+                    }
+                    pc = tgt;
+                    continue;
+                }
+                state.ret = next;
+                return next;
+            }
+            OP_GET_FIELD_LOCAL_APPEND => {
+                state.frame.last_instr = pc as i64;
+                let vm = state.vm;
+                let here = pc as i64;
+                let recv = state.frame.locals_stack_w[insn_a(program, pc)];
+                let depth = state.frame.valuestackdepth;
+                let top = depth - 1;
+                let next = if top >= state.frame.n_slots {
+                    let list = state.frame.locals_stack_w[top];
+                    let name = field_name_cell(program, insn_b(program, pc));
+                    if append_named_field(list, recv, name) != 0 {
+                        here + 1
+                    } else {
+                        slow_pc(vm, here)
+                    }
+                } else {
+                    slow_pc(vm, here)
+                };
+                if next >= 0 {
+                    let tgt = next as usize;
+                    if tgt < pc {
+                        can_enter_jit!(driver, tgt, &mut *state, program, || {});
+                    }
+                    pc = tgt;
+                    continue;
+                }
+                state.ret = next;
+                return next;
+            }
+            OP_HAS_FIELD_LOCAL_APPEND => {
+                state.frame.last_instr = pc as i64;
+                let vm = state.vm;
+                let here = pc as i64;
+                let recv = state.frame.locals_stack_w[insn_a(program, pc)];
+                let depth = state.frame.valuestackdepth;
+                let top = depth - 1;
+                let next = if top >= state.frame.n_slots {
+                    let list = state.frame.locals_stack_w[top];
+                    let name = field_name_cell(program, insn_b(program, pc));
+                    if append_has_field(list, recv, name) != 0 {
+                        here + 1
+                    } else {
+                        slow_pc(vm, here)
+                    }
+                } else {
+                    slow_pc(vm, here)
+                };
+                if next >= 0 {
+                    let tgt = next as usize;
+                    if tgt < pc {
+                        can_enter_jit!(driver, tgt, &mut *state, program, || {});
+                    }
+                    pc = tgt;
+                    continue;
+                }
+                state.ret = next;
+                return next;
+            }
+            OP_ITER_KEYS => {
+                state.frame.last_instr = pc as i64;
+                let vm = state.vm;
+                let here = pc as i64;
+                let depth = state.frame.valuestackdepth;
+                let w = state.frame.locals_stack_w[depth - 1];
+                let next = if w.is_null() {
+                    slow_pc(vm, here)
+                } else if cell_kind(w) == CelKind::List as i64 {
+                    let keys = interned_list_indices(vm, w as i64);
+                    if keys == 0 {
+                        slow_pc(vm, here)
+                    } else {
+                        state.frame.locals_stack_w[depth - 1] = keys as usize as CelRef;
+                        here + 1
+                    }
+                } else {
+                    let keys = map_keys_cell(vm, w);
+                    if keys.is_null() {
+                        slow_pc(vm, here)
+                    } else {
+                        state.frame.locals_stack_w[depth - 1] = keys;
+                        here + 1
+                    }
+                };
+                if next >= 0 {
+                    let tgt = next as usize;
+                    if tgt < pc {
+                        can_enter_jit!(driver, tgt, &mut *state, program, || {});
+                    }
+                    pc = tgt;
+                    continue;
+                }
+                state.ret = next;
+                return next;
+            }
+            OP_LIST_APPEND_OPTIONAL => {
+                state.frame.last_instr = pc as i64;
+                let vm = state.vm;
+                let here = pc as i64;
+                let depth = state.frame.valuestackdepth;
+                let item_i = depth - 1;
+                let list_i = depth - 2;
+                let next = if list_i >= state.frame.n_slots {
+                    let item = state.frame.locals_stack_w[item_i];
+                    let list = state.frame.locals_stack_w[list_i];
+                    if list_opt_append(list, item) != 0 {
+                        state.frame.valuestackdepth = depth - 1;
+                        here + 1
+                    } else {
+                        slow_pc(vm, here)
+                    }
+                } else {
+                    slow_pc(vm, here)
+                };
+                if next >= 0 {
+                    let tgt = next as usize;
+                    if tgt < pc {
+                        can_enter_jit!(driver, tgt, &mut *state, program, || {});
+                    }
+                    pc = tgt;
+                    continue;
+                }
+                state.ret = next;
+                return next;
+            }
+            OP_MAP_INSERT_OPTIONAL => {
+                state.frame.last_instr = pc as i64;
+                let vm = state.vm;
+                let here = pc as i64;
+                let depth = state.frame.valuestackdepth;
+                let value_i = depth - 1;
+                let key_i = depth - 2;
+                let map_i = depth - 3;
+                let next = if map_i >= state.frame.n_slots {
+                    let value = state.frame.locals_stack_w[value_i];
+                    let key = state.frame.locals_stack_w[key_i];
+                    let map = state.frame.locals_stack_w[map_i];
+                    if map_opt_insert(map, key, value) != 0 {
+                        state.frame.valuestackdepth = depth - 2;
+                        here + 1
                     } else {
                         slow_pc(vm, here)
                     }

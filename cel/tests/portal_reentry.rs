@@ -86,6 +86,51 @@ fn compiled_entries_match_the_walker() {
     agree_compiled("list.map(e, e + 1 == 2 ? \"a\" : \"b\")", 150);
     agree_compiled("list.map(e, [e, \"s\"])", 150);
     agree_compiled("list.map(e, [e, 1.5])", 150);
+    agree_compiled("list.map(e, e * 3 + 1)", 150);
+    agree_compiled("list.map(e, string(e)).map(s, s * 2)", 150);
+    agree_compiled("list.map(e, {\"a\": e}).filter(m, m.a > 0)", 150);
+    agree_compiled("list.map(e, {\"a\": e}).map(m, m.missing)", 150);
+    agree_compiled("list.map(e, {\"a\": e}).filter(m, has(m.a))", 150);
+    agree_compiled("list.map(e, {\"a\": e}).filter(m, has(m.z))", 150);
+    agree_compiled("list.map(e, has(e.a))", 150);
+    agree_compiled("list.map(e, {\"a\": e}).map(m, m.a)", 150);
+    agree_compiled("list.map(e, {\"a\": e}).map(m, has(m.a))", 150);
+    agree_compiled("list.map(e, {\"a\": e}).map(m, has(m.z))", 150);
+    agree_compiled("list.map(e, [10, 20].exists(i, v, i == e))", 150);
+    agree_compiled("list.map(e, {\"a\": e}.exists(k, v, k == \"a\"))", 150);
+}
+
+fn agree_optional(src: &str, times: usize) {
+    let parser = Parser::default().enable_optional_syntax(true);
+    let expr = parser
+        .parse(src)
+        .unwrap_or_else(|e| panic!("parse {src}: {e}"));
+    let ctx = ctx();
+    let walker = Value::resolve_value(&expr, &ctx);
+    let code = cel::vm::compile(&expr).unwrap_or_else(|e| panic!("compile {src}: {e}"));
+    for i in 0..times {
+        let vm = cel::vm::cel_eval_loop(&code, &ctx);
+        assert_eq!(show(&walker), show(&vm), "`{src}` execute {i}");
+        if let (Ok(a), Ok(b)) = (&walker, &vm) {
+            assert_eq!(a, b, "`{src}` execute {i} value");
+        }
+    }
+}
+
+#[test]
+fn compiled_optional_opcodes_match_the_walker() {
+    unsafe { std::env::set_var("CEL_PORTAL_THRESHOLD", "100") };
+    agree_optional("list.map(e, [e, 1][?0])", 150);
+    agree_optional("list.map(e, [1][?5])", 150);
+    agree_optional("list.map(e, {\"a\": e}).map(m, m.?a)", 150);
+    agree_optional("list.map(e, {\"a\": e}).map(m, m.?missing)", 150);
+    agree_optional("list.map(e, e.?a)", 150);
+    agree_optional("list.map(e, [?optional.of(e)])", 150);
+    agree_optional("list.map(e, [?optional.none()])", 150);
+    agree_optional("list.map(e, [?e])", 150);
+    agree_optional("list.map(e, {?\"k\": optional.of(e)})", 150);
+    agree_optional("list.map(e, {?\"k\": optional.none()})", 150);
+    agree_optional("list.map(e, {?\"k\": e})", 150);
 }
 
 #[test]
