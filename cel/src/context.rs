@@ -113,6 +113,13 @@ fn retain_public(ctx: &mut Context, value: Value) {
     }
 }
 
+fn leaf_of(v: &Value) -> Option<crate::runtime::object::CelRef> {
+    match v {
+        Value::Interned(w) => Some(*w),
+        other => crate::runtime::convert::intern_leaf(other),
+    }
+}
+
 /// The public form of a bound value. Interned leaves unpack through the
 /// public link when one exists, so a bound list is `Value::List` again.
 fn public_form(v: Value) -> Value {
@@ -264,12 +271,6 @@ impl<'a> Context<'a> {
     /// The interned leaf stored under `name`, without cloning the public
     /// [`Value`]. A miss, or a binding with no leaf, is `None`.
     pub(crate) fn lookup_interned(&self, name: &str) -> Option<crate::runtime::object::CelRef> {
-        fn leaf_of(v: &Value) -> Option<crate::runtime::object::CelRef> {
-            match v {
-                Value::Interned(w) => Some(*w),
-                other => crate::runtime::convert::intern_leaf(other),
-            }
-        }
         let from_resolver =
             |resolver: &Option<&'a dyn VariableResolver>| resolver.and_then(|r| r.resolve(name));
         match self {
@@ -295,6 +296,45 @@ impl<'a> Context<'a> {
                 if let Some(v) = from_resolver(resolver) {
                     return leaf_of(&v);
                 }
+                variables.get(name).and_then(leaf_of).or_else(|| {
+                    crate::common::types::r#type::type_ident(name)
+                        .as_ref()
+                        .and_then(leaf_of)
+                })
+            }
+        }
+    }
+
+    /// `true` when no [`VariableResolver`] sits on this context or an ancestor.
+    ///
+    /// The context is borrowed immutably for one evaluation, so the answer
+    /// does not change between iterations. Callers treat it as
+    /// `effectinfo.py` `EF_ELIDABLE_CANNOT_RAISE` (`pure.py` `OptPure`).
+    pub(crate) fn lookup_is_pure(&self) -> bool {
+        match self {
+            Context::Child {
+                resolver, parent, ..
+            } => resolver.is_none() && parent.lookup_is_pure(),
+            Context::Root { resolver, .. } => resolver.is_none(),
+        }
+    }
+
+    /// [`lookup_interned`] without consulting any resolver on the chain.
+    ///
+    /// Sound only when [`lookup_is_pure`] is true: a resolver can return a
+    /// different value on every call.
+    pub(crate) fn lookup_interned_pure(
+        &self,
+        name: &str,
+    ) -> Option<crate::runtime::object::CelRef> {
+        match self {
+            Context::Child {
+                variables, parent, ..
+            } => variables
+                .get(name)
+                .and_then(leaf_of)
+                .or_else(|| parent.lookup_interned_pure(name)),
+            Context::Root { variables, .. } => {
                 variables.get(name).and_then(leaf_of).or_else(|| {
                     crate::common::types::r#type::type_ident(name)
                         .as_ref()

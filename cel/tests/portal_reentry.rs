@@ -57,3 +57,57 @@ fn compiled_entries_match_the_walker() {
     agree_compiled("list.map(e, [1, 2].map(i, i + e))", 150);
     agree_compiled("list.map(e, e - 1)", 150);
 }
+
+/// A resolver that returns a new int on every `x` lookup.
+struct CountingResolver {
+    n: std::cell::Cell<i64>,
+}
+
+impl cel::context::VariableResolver for CountingResolver {
+    fn resolve(&self, name: &str) -> Option<Value> {
+        if name != "x" {
+            return None;
+        }
+        let n = self.n.get();
+        self.n.set(n + 1);
+        Some(Value::Int(n))
+    }
+}
+
+fn list_ints(v: &Value) -> Vec<i64> {
+    let Value::List(list) = v else {
+        panic!("not a list: {v:?}");
+    };
+    list.iter()
+        .map(|e| match e {
+            Value::Int(n) => n,
+            other => panic!("not an int: {other:?}"),
+        })
+        .collect()
+}
+
+/// The compiled loop must keep the residual lookup: each element sees the
+/// next resolver value, including after the portal has compiled.
+#[test]
+fn compiled_loop_sees_each_resolver_value() {
+    unsafe { std::env::set_var("CEL_PORTAL_THRESHOLD", "100") };
+    let resolver = CountingResolver {
+        n: std::cell::Cell::new(0),
+    };
+    let mut ctx = Context::default();
+    ctx.add_variable_from_value("list", vec![1i64, 2, 3]);
+    ctx.set_variable_resolver(&resolver);
+    let program = Program::compile("list.map(e, x)").unwrap();
+    for i in 0..150 {
+        let start = resolver.n.get();
+        let got = program
+            .execute(&ctx)
+            .unwrap_or_else(|e| panic!("execute {i}: {e:?}"));
+        let nums = list_ints(&got);
+        assert_eq!(
+            nums,
+            vec![start, start + 1, start + 2],
+            "execute {i} cached a resolver value"
+        );
+    }
+}

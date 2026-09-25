@@ -1066,6 +1066,9 @@ interned_int_arith!(interned_div, checked_div, cel_div);
 interned_int_arith!(interned_rem, checked_rem, cel_rem);
 
 /// Intern the context variable named `names[idx]`. Null means miss.
+///
+/// Residual: a [`crate::context::VariableResolver`] on the chain may
+/// return a different value on every call.
 #[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
 fn intern_var(vm_bits: i64, program: &CelCode, idx: i64) -> CelRef {
     let Some(name) = program.name(NameId(idx as u32)) else {
@@ -1074,6 +1077,40 @@ fn intern_var(vm_bits: i64, program: &CelCode, idx: i64) -> CelRef {
     vm_of(vm_bits)
         .intern_context_var(name)
         .unwrap_or(core::ptr::null_mut())
+}
+
+/// [`intern_var`] when [`context_lookup_pure`] is true.
+///
+/// `effectinfo.py` `EF_ELIDABLE_CANNOT_RAISE` (`jtransform.py`
+/// `_do_builtin_call` / `call.py` `EF_ELIDABLE_CANNOT_RAISE`).
+/// Loop-invariant arguments reuse the preamble result (`pure.py` `OptPure`),
+/// the same shape as `celldict.py` `_getdictvalue_no_unwrapping_pure`.
+#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+fn intern_var_pure(
+    vm_bits: i64,
+    program: &CelCode,
+    idx: i64,
+) -> *mut crate::runtime::object::CelObject {
+    let Some(name) = program.name(NameId(idx as u32)) else {
+        return core::ptr::null_mut();
+    };
+    vm_of(vm_bits)
+        .intern_context_var_pure(name)
+        .unwrap_or(core::ptr::null_mut())
+}
+
+/// `1` when no resolver sits on the context chain, else `0`.
+///
+/// Elidable (`EF_ELIDABLE_CANNOT_RAISE`), not a residual call per iteration:
+/// the context is borrowed immutably for the evaluation, so the bit is
+/// loop-invariant and `OptPure` keeps it in the preamble.
+#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+fn context_lookup_pure(vm_bits: i64) -> i64 {
+    if vm_of(vm_bits).context_lookup_pure() {
+        1
+    } else {
+        0
+    }
 }
 
 #[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
@@ -2531,6 +2568,8 @@ fn slow_pc(vm: i64, here: i64) -> i64 {
         insn_c => elidable_int_cannot_raise,
         intern_const => elidable_ref_cannot_raise_wrapped,
         intern_var => residual_ref,
+        intern_var_pure => elidable_ref_cannot_raise_wrapped,
+        context_lookup_pure => elidable_int_cannot_raise,
         cell_kind => inline_int,
         cell_int => inline_int,
         cell_bool => inline_int,
@@ -2633,7 +2672,14 @@ fn run_cel_portal(
                 state.frame.last_instr = pc as i64;
                 let vm = state.vm;
                 let here = pc as i64;
-                let w = intern_var(vm, program, insn_a(program, pc));
+                let name_idx = insn_a(program, pc);
+                // `context_lookup_pure` is elidable (`EF_ELIDABLE_CANNOT_RAISE`).
+                // The pure arm is `intern_var_pure`; a resolver stays residual.
+                let w = if context_lookup_pure(vm) != 0 {
+                    intern_var_pure(vm, program, name_idx)
+                } else {
+                    intern_var(vm, program, name_idx)
+                };
                 let next = if w.is_null() {
                     slow_pc(vm, here)
                 } else {
