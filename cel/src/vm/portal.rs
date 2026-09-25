@@ -3002,6 +3002,29 @@ fn slow_pc(vm: i64, here: i64) -> i64 {
     // Cells are pointer elements after the block's capacity word.
     array_fields = {
         W_CelFrame::locals_stack_w => CelRef in crate::runtime::object_array::CelItemsBlock,
+        crate::runtime::object::W_IntColumn::data => i64,
+    },
+    int_fields = {
+        crate::runtime::object::W_ListObject::strategy => u8,
+        crate::runtime::object::W_ListObject::length => i64,
+        crate::runtime::object::W_ListObject::start => i64,
+        crate::runtime::object::W_IntColumn::length => i64,
+    },
+    ref_fields = {
+        crate::runtime::object::W_ListObject::storage => crate::runtime::object::CelObject,
+    },
+    // `append_cell` / `list_resize_ge_i` are `dont_look_inside`, so their
+    // calldescr would otherwise be `can_raise_effect_info` (empty write
+    // set). `list_switch_to_object_append` reads the int column the traced
+    // store just filled, and `_ll_list_resize_really` replaces `data`.
+    residual_writes = {
+        col.data[] @ crate::runtime::object::W_IntColumn => [append_cell, list_resize_ge_i],
+        col.data @ crate::runtime::object::W_IntColumn => [list_resize_ge_i],
+        col.length @ crate::runtime::object::W_IntColumn => [list_resize_ge_i],
+        list.strategy @ crate::runtime::object::W_ListObject => [append_cell],
+        list.storage @ crate::runtime::object::W_ListObject => [append_cell],
+        list.length @ crate::runtime::object::W_ListObject => [append_cell],
+        list.start @ crate::runtime::object::W_ListObject => [append_cell],
     },
     auto_calls = true,
     calls = {
