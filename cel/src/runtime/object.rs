@@ -519,7 +519,11 @@ pub enum ListStrategy {
 /// An unboxed integer column. Not pointer-traced; the payload is raw `i64`s.
 ///
 /// `data` and `length` (the allocated count, `ll_newlist_hint`) are written
-/// again by [`list_resize_ge`], so they are not `_immutable_fields_`.
+/// once, when the column is allocated. [`list_resize_ge`] allocates a new
+/// column and stores it in [`W_ListObject::storage`] (`_ll_list_resize_really`
+/// replaces `l.items`; the array's length is not rewritten in place), so both
+/// fields are `_immutable_fields_`.
+#[cfg_attr(feature = "jit", majit_macros::jit_immutable_fields(data, length))]
 #[repr(C)]
 #[allow(non_camel_case_types)]
 pub struct W_IntColumn {
@@ -846,13 +850,23 @@ pub unsafe fn list_resize_ge(w: CelRef, newsize: i64) -> bool {
     let nbytes = (newcap as usize).saturating_mul(core::mem::size_of::<i64>());
     let live = leaf.length.max(0) as usize;
     let src = col.data;
-    let ptr = super::heap::with_heap(|h| h.alloc_raw(nbytes, align_of::<i64>())) as *mut i64;
-    if live > 0 && !src.is_null() {
-        core::ptr::copy_nonoverlapping(src, ptr, live);
-    }
-    let col = &mut *(*w.cast::<W_ListObject>()).storage.cast::<W_IntColumn>();
-    col.data = ptr;
-    col.length = newcap;
+    // `_ll_list_resize_really` allocates a new items array and stores it
+    // into the mutable list field. The column's `data` / `length` stay
+    // write-once (`_immutable_fields_`).
+    let new_col = super::heap::with_heap(|h| {
+        let ptr = h.alloc_raw(nbytes, align_of::<i64>()) as *mut i64;
+        if live > 0 && !src.is_null() {
+            core::ptr::copy_nonoverlapping(src, ptr, live);
+        }
+        h.alloc(W_IntColumn {
+            ob_header: CelObject {
+                ob_type: &CEL_INT_COLUMN_CLASS,
+            },
+            data: ptr,
+            length: newcap,
+        })
+    });
+    (*w.cast::<W_ListObject>()).storage = new_col as CelRef;
     true
 }
 

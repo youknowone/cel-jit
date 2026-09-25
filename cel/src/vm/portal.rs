@@ -1800,24 +1800,41 @@ fn list_resize_ge_i(list: *mut CelObject, newsize: i64) -> i64 {
 
 /// Items-block capacity of an empty object list, or 1. The hint
 /// `new_list_with_capacity` stored (`ll_newlist_hint`).
-#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+///
+/// `CelItemsBlock.capacity` is `_immutable_fields_`, so the read is
+/// `getfield_gc_pure` (`rewrite_op_getfield`).
+#[majit_macros::jit_inline(
+    ref_params = { list: ref(crate::runtime::object::W_ListObject) },
+    ref_fields = {
+        crate::runtime::object::W_ListObject::items => crate::runtime::object_array::CelItemsBlock,
+    },
+    int_fields = {
+        crate::runtime::object_array::CelItemsBlock::capacity => usize,
+    },
+)]
 fn empty_list_hint(list: *mut CelObject) -> i64 {
-    if list.is_null() {
-        return 1;
-    }
-    unsafe {
-        let leaf = &*list.cast::<crate::runtime::object::W_ListObject>();
-        let cap = crate::runtime::object_array::items_capacity(leaf.items) as i64;
-        if cap > 0 {
-            cap
-        } else {
+    if (list as *mut u8).is_null() {
+        1
+    } else {
+        let items = list.items as *mut crate::runtime::object_array::CelItemsBlock;
+        if (items as *mut u8).is_null() {
             1
+        } else {
+            let cap = items.capacity as i64;
+            if cap > 0 {
+                cap
+            } else {
+                1
+            }
         }
     }
 }
 
 /// `IntegerListStrategy.get_empty_storage`: the one malloc on
 /// `switch_to_correct_strategy`. The strategy tag is written by the caller.
+///
+/// Empty write sets (`analyze_external_call` `bottom_result`): the column
+/// is fresh, so the call does not flush fields the loop already cached.
 #[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
 fn alloc_int_column(cap: i64) -> *mut CelObject {
     crate::runtime::object::new_int_column_capacity(cap) as *mut CelObject
@@ -1863,8 +1880,8 @@ fn list_append_int_cold(list: *mut CelObject, word: i64) -> i64 {
     calls = {
         list_resize_ge_i => residual_int,
         list_append_int_cold => residual_int,
-        empty_list_hint => residual_int,
-        alloc_int_column => residual_ref,
+        empty_list_hint => inline_int,
+        alloc_int_column => alloc_ref,
     },
 )]
 fn append_int_word(list: *mut CelObject, word: i64) -> i64 {
@@ -3126,11 +3143,10 @@ fn slow_pc(vm: i64, here: i64) -> i64 {
     // set). `list_switch_to_object_append` reads the int column the traced
     // store just filled, and `_ll_list_resize_really` replaces `data`.
     residual_writes = {
-        col.data[] @ crate::runtime::object::W_IntColumn => [append_cell, list_resize_ge_i],
-        col.data @ crate::runtime::object::W_IntColumn => [list_resize_ge_i],
-        col.length @ crate::runtime::object::W_IntColumn => [list_resize_ge_i],
+        col.data[] @ crate::runtime::object::W_IntColumn => [append_cell],
         list.strategy @ crate::runtime::object::W_ListObject => [append_cell],
-        list.storage @ crate::runtime::object::W_ListObject => [append_cell],
+        // `list_resize_ge` stores a new column (`_ll_list_resize_really`).
+        list.storage @ crate::runtime::object::W_ListObject => [append_cell, list_resize_ge_i],
         list.length @ crate::runtime::object::W_ListObject => [append_cell],
         list.start @ crate::runtime::object::W_ListObject => [append_cell],
     },
