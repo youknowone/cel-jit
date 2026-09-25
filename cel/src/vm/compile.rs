@@ -142,7 +142,17 @@ struct Compiler {
 }
 
 impl Compiler {
-    fn finish(self) -> Result<CelCode, CompileError> {
+    fn finish(mut self) -> Result<CelCode, CompileError> {
+        // `PyCode.co_names_w`: one string leaf per name, in this code
+        // object's pool, before the pool moves into `InternedConsts`.
+        let names_w = self
+            .names
+            .iter()
+            .map(|n| {
+                self.const_pool
+                    .intern(&Value::String(std::sync::Arc::new(n.to_string())))
+            })
+            .collect();
         Ok(CelCode {
             insns: self.insns,
             consts: self.consts,
@@ -150,6 +160,7 @@ impl Compiler {
                 self.const_pool,
                 self.const_leaves,
             ),
+            names_w,
             names: self.names,
             n_slots: self.n_slots,
             max_stack: u32::try_from(self.max_stack).unwrap_or(u32::MAX),

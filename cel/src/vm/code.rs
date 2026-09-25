@@ -145,6 +145,12 @@ pub struct CelCode {
     pub(crate) interned: crate::runtime::const_pool::InternedConsts,
     /// Identifiers, field names and function names, indexed by [`NameId`].
     pub names: Vec<Box<str>>,
+    /// One prebuilt string cell per [`Self::names`] entry.
+    ///
+    /// `PyCode.co_names_w`, built once when the code object is created
+    /// (`PyCode.__init__`, `space.new_interned_str`). A folded load is a
+    /// constant address owned by this code object.
+    pub(crate) names_w: Vec<crate::runtime::object::CelRef>,
     /// Size of the activation record -- the high-water mark of the compiler's
     /// scope stack, so sibling comprehensions share slots and only nested
     /// ones occupy distinct ranges.
@@ -187,6 +193,16 @@ impl CelCode {
     /// The name behind a [`NameId`].
     pub fn name(&self, id: NameId) -> Option<&str> {
         self.names.get(id.0 as usize).map(|n| &**n)
+    }
+
+    /// The prebuilt string cell for [`NameId`], or null when the index misses.
+    ///
+    /// Same object on every call. `PyCode.co_names_w`.
+    pub fn name_cell(&self, id: NameId) -> crate::runtime::object::CelRef {
+        self.names_w
+            .get(id.0 as usize)
+            .copied()
+            .unwrap_or(core::ptr::null_mut())
     }
 
     /// The literal behind a `LoadConst` operand.

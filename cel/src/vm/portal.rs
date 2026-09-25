@@ -2060,6 +2060,114 @@ fn add_local_const_cell(vm: i64, a: *mut CelObject, k: *mut CelObject) -> *mut C
     }
 }
 
+/// Interned string for green `names[name_idx]`. Null when the index misses.
+#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+fn field_name_cell(program: &CelCode, name_idx: i64) -> *mut CelObject {
+    if name_idx < 0 {
+        return core::ptr::null_mut();
+    }
+    program.name_cell(NameId(name_idx as u32))
+}
+
+/// `1` when both cells are strings with the same bytes.
+///
+/// Elidable: string payloads are immutable.
+#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+fn str_cells_eq(left: *mut CelObject, right: *mut CelObject) -> i64 {
+    match (unsafe { string_as_str(left) }, unsafe {
+        string_as_str(right)
+    }) {
+        (Some(a), Some(b)) if a == b => 1,
+        _ => 0,
+    }
+}
+
+/// Object-strategy map field. Null means miss or "not this strategy".
+///
+/// `dictmultiobject.py` walks the interleaved entry array. A full scan
+/// that misses still returns null; [`map_object_known`] tells a miss
+/// from a map this loop did not scan.
+#[majit_macros::jit_inline(
+    ref_params = { map: ref(crate::runtime::object::W_MapObject) },
+    ref_fields = {
+        crate::runtime::object::W_MapObject::items => crate::runtime::object_array::CelItemsBlock,
+    },
+    array_fields = {
+        crate::runtime::object::W_MapObject::items => crate::runtime::object::CelRef in crate::runtime::object_array::CelItemsBlock,
+    },
+    int_fields = {
+        crate::runtime::object::W_MapObject::strategy => u8,
+        crate::runtime::object::W_MapObject::length => i64,
+        crate::runtime::object_array::CelItemsBlock::capacity => usize,
+    },
+    calls = {
+        str_cells_eq => elidable_int_cannot_raise,
+    },
+)]
+fn map_object_field(map: *mut CelObject, name: *mut CelObject) -> *mut CelObject {
+    let mut found_slot = -1i64;
+    let strategy = map.strategy as u8 as i64;
+    if strategy == crate::runtime::object::MapStrategy::Object as i64 {
+        let items = map.items as *mut crate::runtime::object_array::CelItemsBlock;
+        if (items as *mut u8) != core::ptr::null_mut() {
+            let length = map.length;
+            let cap = items.capacity as i64;
+            let mut i = 0i64;
+            while i < length {
+                let slot = i + i;
+                let val_at = slot + 1;
+                if val_at < cap {
+                    let key = map.items[slot];
+                    if str_cells_eq(key, name) != 0 {
+                        let delta = val_at - found_slot;
+                        found_slot += delta;
+                        i += length;
+                    } else {
+                        i += 1;
+                    }
+                } else {
+                    i += length;
+                }
+            }
+        }
+    }
+    if found_slot >= 0 {
+        map.items[found_slot]
+    } else {
+        core::ptr::null_mut()
+    }
+}
+
+/// `1` when [`map_object_field`] scanned an object-strategy map.
+#[majit_macros::jit_inline(
+    ref_params = { map: ref(crate::runtime::object::W_MapObject) },
+    ref_fields = {
+        crate::runtime::object::W_MapObject::items => crate::runtime::object_array::CelItemsBlock,
+    },
+    int_fields = {
+        crate::runtime::object::W_MapObject::strategy => u8,
+        crate::runtime::object::W_MapObject::length => i64,
+    },
+)]
+fn map_object_known(map: *mut CelObject) -> i64 {
+    let strategy = map.strategy as u8 as i64;
+    if strategy == crate::runtime::object::MapStrategy::Object as i64 {
+        let items = map.items as *mut crate::runtime::object_array::CelItemsBlock;
+        if (items as *mut u8) != core::ptr::null_mut() {
+            let length = map.length;
+            if length >= 0 {
+                1
+            } else {
+                0
+            }
+        } else {
+            0
+        }
+    } else {
+        0
+    }
+}
+
 #[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
 fn alloc_list(vm: i64, cap: i64) -> CelRef {
     new_list_with_capacity_in(vm_heap(vm), cap) as CelRef
@@ -3074,6 +3182,10 @@ fn slow_pc(vm: i64, here: i64) -> i64 {
         bool_short_i => inline_int,
         and_merge_keep => inline_int,
         interned_field => residual_int,
+        field_name_cell => elidable_ref_cannot_raise_wrapped,
+        str_cells_eq => elidable_int_cannot_raise,
+        map_object_field => inline_ref,
+        map_object_known => inline_int,
         interned_has_field => residual_int,
         interned_index => residual_int,
         interned_contains => residual_int,
@@ -4636,6 +4748,93 @@ fn run_cel_portal(
                 let next = if kind == 0 {
                     if arity == 0 {
                         here + 1
+                    } else {
+                        slow_pc(vm, here)
+                    }
+                } else {
+                    slow_pc(vm, here)
+                };
+                if next >= 0 {
+                    let tgt = next as usize;
+                    if tgt < pc {
+                        can_enter_jit!(driver, tgt, &mut *state, program, || {});
+                    }
+                    pc = tgt;
+                    continue;
+                }
+                state.ret = next;
+                return next;
+            }
+            OP_HAS_FIELD => {
+                state.frame.last_instr = pc as i64;
+                let vm = state.vm;
+                let here = pc as i64;
+                let depth = state.frame.valuestackdepth;
+                let i = depth - 1;
+                let name = field_name_cell(program, insn_a(program, pc));
+                let next = if i >= state.frame.n_slots {
+                    let recv = state.frame.locals_stack_w[i];
+                    if !recv.is_null() {
+                        if cell_kind(recv) == CelKind::Map as i64 {
+                            if !name.is_null() {
+                                let found = map_object_field(recv, name);
+                                if !found.is_null() {
+                                    state.frame.locals_stack_w[i] = box_bool(1);
+                                    here + 1
+                                } else if map_object_known(recv) != 0 {
+                                    state.frame.locals_stack_w[i] = box_bool(0);
+                                    here + 1
+                                } else {
+                                    slow_pc(vm, here)
+                                }
+                            } else {
+                                slow_pc(vm, here)
+                            }
+                        } else {
+                            slow_pc(vm, here)
+                        }
+                    } else {
+                        slow_pc(vm, here)
+                    }
+                } else {
+                    slow_pc(vm, here)
+                };
+                if next >= 0 {
+                    let tgt = next as usize;
+                    if tgt < pc {
+                        can_enter_jit!(driver, tgt, &mut *state, program, || {});
+                    }
+                    pc = tgt;
+                    continue;
+                }
+                state.ret = next;
+                return next;
+            }
+            OP_GET_FIELD => {
+                state.frame.last_instr = pc as i64;
+                let vm = state.vm;
+                let here = pc as i64;
+                let depth = state.frame.valuestackdepth;
+                let i = depth - 1;
+                let name = field_name_cell(program, insn_a(program, pc));
+                let next = if i >= state.frame.n_slots {
+                    let recv = state.frame.locals_stack_w[i];
+                    if !recv.is_null() {
+                        if cell_kind(recv) == CelKind::Map as i64 {
+                            if !name.is_null() {
+                                let found = map_object_field(recv, name);
+                                if !found.is_null() {
+                                    state.frame.locals_stack_w[i] = found;
+                                    here + 1
+                                } else {
+                                    slow_pc(vm, here)
+                                }
+                            } else {
+                                slow_pc(vm, here)
+                            }
+                        } else {
+                            slow_pc(vm, here)
+                        }
                     } else {
                         slow_pc(vm, here)
                     }

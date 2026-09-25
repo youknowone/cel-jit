@@ -161,3 +161,70 @@ fn compiled_decline_after_warmup_matches_the_walker() {
     agree_compiled("list.map(e, list[e])", 40);
     agree_compiled("list.map(e, 100 / (e - 5))", 40);
 }
+
+/// Object-strategy map literal, then a field select, inside `list.map`.
+///
+/// Threshold 100. The first executions match the walker. Once the loop
+/// is compiled, execute 32 used to come back `InternalError`.
+#[test]
+fn compiled_map_field_select_matches_the_walker() {
+    // SAFETY: stored before this test builds a driver. The knob is read
+    // once, when that driver is created.
+    unsafe { std::env::set_var("CEL_PORTAL_THRESHOLD", "100") };
+    agree_compiled("list.map(e, {\"a\": e}.a)", 40);
+    agree_compiled("list.map(e, {\"a\": e, \"b\": e}.b)", 40);
+    agree_compiled("list.map(e, {\"b\": 1, \"a\": e}.a)", 40);
+    agree_compiled("list.map(e, has({\"a\": e}.a))", 40);
+    agree_compiled("list.map(e, has({\"a\": e}.missing))", 40);
+    agree_compiled("list.map(e, {\"a\": e}.missing)", 40);
+}
+
+/// The folded field name is one immortal cell on the code object.
+///
+/// `field_name_cell` used to call `new_string`, so each call was a fresh
+/// nursery pointer and `is_immortal` was false. A trace that folded that
+/// pointer kept it after `rewind_nursery`.
+#[test]
+fn compiled_field_name_is_one_immortal_cell() {
+    let expr = Parser::default()
+        .parse("{\"a\": x}.a")
+        .unwrap_or_else(|e| panic!("parse: {e}"));
+    let code = cel::vm::compile(&expr).expect("compile");
+    let mut idx = None;
+    let mut i = 0u32;
+    loop {
+        match code.name(cel::vm::NameId(i)) {
+            Some("a") => {
+                idx = Some(i);
+                break;
+            }
+            None => break,
+            _ => i += 1,
+        }
+    }
+    let id = cel::vm::NameId(idx.expect("name a"));
+    let first = code.name_cell(id);
+    let second = code.name_cell(id);
+    assert!(!first.is_null(), "name a has a cell");
+    assert_eq!(first, second, "co_names_w is one cell");
+    assert!(
+        cel::runtime::lltype::is_immortal(first as *const u8),
+        "name cell {first:p} is not immortal"
+    );
+    let chars = unsafe { (*first.cast::<cel::runtime::object::W_StringObject>()).chars };
+    assert!(
+        cel::runtime::lltype::is_immortal(chars as *const u8),
+        "character block {chars:p} is not immortal"
+    );
+    assert_eq!(
+        unsafe { cel::runtime::object::string_as_str(first) },
+        Some("a")
+    );
+    unsafe { std::env::set_var("CEL_PORTAL_THRESHOLD", "100") };
+    agree_compiled("list.map(e, {\"a\": e}.a)", 40);
+    assert_eq!(code.name_cell(id), first);
+    assert_eq!(
+        unsafe { cel::runtime::object::string_as_str(first) },
+        Some("a")
+    );
+}
