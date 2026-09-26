@@ -68,6 +68,9 @@ fn compiled_entries_match_the_walker() {
     agree_compiled("list.map(e, double(e))[3]", 150);
     agree_compiled("list.map(e, e > 2 ? double(e) : 1)", 150);
     agree_compiled("size(list.map(e, double(e - 500)))", 150);
+    agree_compiled("list.map(e, e > 2 ? \"x\" : 1)", 150);
+    agree_compiled("list.map(e, string(e))[7]", 150);
+    agree_compiled("size(list.map(e, e % 3 == 0 ? \"p\" : \"q\"))", 150);
     agree_compiled("list.map(e, string(e))", 150);
     agree_compiled("list.map(e, string(e - 500))", 150);
     agree_compiled("list.map(e, double(e) / 2.0)", 150);

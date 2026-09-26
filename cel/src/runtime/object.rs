@@ -1158,6 +1158,102 @@ pub unsafe fn list_store_float(w: CelRef, word: f64) -> bool {
     true
 }
 
+/// Grow a string-strategy list so its items block holds at least `newsize`
+/// leaves. Same shape as [`list_resize_ge`] (`_ll_list_resize_ge`): a new
+/// block, the live leaves copied, the pointer stored on the list.
+///
+/// # Safety
+///
+/// `w` is a live [`W_ListObject`].
+pub unsafe fn list_resize_ge_strs(w: CelRef, newsize: i64) -> bool {
+    if newsize < 0 || w_kind(w) != CelKind::List {
+        return false;
+    }
+    let leaf = &*w.cast::<W_ListObject>();
+    if leaf.strategy != ListStrategy::Strs || leaf.items.is_null() {
+        return false;
+    }
+    let cap = crate::runtime::object_array::items_capacity(leaf.items) as i64;
+    if newsize <= cap {
+        return true;
+    }
+    let mut newcap = cap.saturating_mul(2);
+    if newcap < newsize {
+        newcap = newsize;
+    }
+    if newcap < 4 {
+        newcap = 4;
+    }
+    let live = leaf.length.max(0) as usize;
+    let src = leaf.items;
+    let new_items = super::heap::with_heap(|h| {
+        crate::runtime::object_array::new_items_block_with_zeroed_prefix_in(h, newcap as usize, 0)
+    });
+    if live > 0 {
+        let src_base = crate::runtime::object_array::items_block_items_base(src);
+        let dst_base = crate::runtime::object_array::items_block_items_base(new_items);
+        if !src_base.is_null() && !dst_base.is_null() {
+            core::ptr::copy_nonoverlapping(src_base, dst_base, live);
+        }
+    }
+    (*w.cast::<W_ListObject>()).items = new_items;
+    true
+}
+
+/// `AsciiListStrategy.append`: store the string leaf, growing the items
+/// block when it is full.
+///
+/// # Safety
+///
+/// `w` is a live [`W_ListObject`] whose strategy is [`ListStrategy::Strs`].
+/// `item` is a live string leaf.
+pub unsafe fn list_store_str(w: CelRef, item: CelRef) -> bool {
+    if w_kind(w) != CelKind::List {
+        return false;
+    }
+    let length = (*w.cast::<W_ListObject>()).length;
+    let items = (*w.cast::<W_ListObject>()).items;
+    if items.is_null() {
+        return false;
+    }
+    let cap = crate::runtime::object_array::items_capacity(items) as i64;
+    if length < 0 || (length >= cap && !list_resize_ge_strs(w, length + 1)) {
+        return false;
+    }
+    list_append_item_ref(w, item)
+}
+
+/// Empty or `Size` list becomes a string items block, then `item` is stored.
+///
+/// # Safety
+///
+/// `w` is a live [`W_ListObject`]. `item` is a live string leaf.
+pub unsafe fn list_promote_empty_to_strs(w: CelRef, item: CelRef) -> bool {
+    if w_kind(w) != CelKind::List {
+        return false;
+    }
+    let leaf = &*w.cast::<W_ListObject>();
+    let size_hint = leaf.strategy == ListStrategy::Size;
+    if !(size_hint || (leaf.strategy == ListStrategy::Object && leaf.length == 0)) {
+        return false;
+    }
+    let cap = if size_hint {
+        leaf.start.max(1)
+    } else if leaf.items.is_null() {
+        1
+    } else {
+        (crate::runtime::object_array::items_capacity(leaf.items) as i64).max(1)
+    };
+    let items = super::heap::with_heap(|h| {
+        crate::runtime::object_array::new_items_block_zeroed_in(h, cap as usize)
+    });
+    let leaf = &mut *w.cast::<W_ListObject>();
+    leaf.strategy = ListStrategy::Strs;
+    leaf.items = items;
+    leaf.start = 0;
+    list_append_item_ref(w, item)
+}
+
 /// Empty object list becomes a float column, then the word is stored.
 ///
 /// `EmptyListStrategy.switch_to_correct_strategy` for a float.
@@ -1360,7 +1456,7 @@ pub unsafe fn list_try_append(w: CelRef, item: CelRef) -> bool {
     }
     if strategy == ListStrategy::Strs {
         if kind == CelKind::Str {
-            return list_append_item_ref(w, item);
+            return list_store_str(w, item);
         }
         return list_switch_strs_to_object(w, item);
     }

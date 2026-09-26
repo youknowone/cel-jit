@@ -2223,6 +2223,124 @@ fn append_float_word(list: *mut CelObject, word: f64) -> i64 {
     }
 }
 
+/// `AsciiListStrategy.get_empty_storage`: the items block sized to the hint.
+#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+fn alloc_str_items(cap: i64) -> *mut crate::runtime::object_array::CelItemsBlock {
+    let n = if cap > 0 { cap } else { 1 } as usize;
+    crate::runtime::heap::with_heap(|heap| {
+        crate::runtime::object_array::new_items_block_zeroed_in(heap, n)
+    })
+}
+
+/// `_ll_list_resize_ge` for a string items block. Not on the traced common path.
+#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+fn list_resize_ge_s(list: *mut CelObject, newsize: i64) -> i64 {
+    if list.is_null() {
+        0
+    } else {
+        unsafe { i64::from(crate::runtime::object::list_resize_ge_strs(list, newsize)) }
+    }
+}
+
+/// First string on an empty or Size list, or a grow the inline path declined.
+#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+fn list_append_str_cold(list: *mut CelObject, leaf: *mut CelObject) -> i64 {
+    if list.is_null() || leaf.is_null() {
+        return 0;
+    }
+    unsafe {
+        let strategy = (*list.cast::<crate::runtime::object::W_ListObject>()).strategy;
+        let length = (*list.cast::<crate::runtime::object::W_ListObject>()).length;
+        if strategy == ListStrategy::Strs {
+            i64::from(crate::runtime::object::list_store_str(list, leaf))
+        } else if strategy == ListStrategy::Size
+            || (strategy == ListStrategy::Object && length == 0)
+        {
+            i64::from(crate::runtime::object::list_promote_empty_to_strs(
+                list, leaf,
+            ))
+        } else {
+            0
+        }
+    }
+}
+
+/// `AsciiListStrategy.append`: store the string leaf.
+///
+/// Same shape as [`append_int_word`]: length/capacity guard,
+/// `setarrayitem_gc` of the leaf, `setfield_gc` of `length`. The grow is
+/// [`list_resize_ge_s`]. An empty or Size list switches to Strs
+/// (`switch_to_correct_strategy`) and allocates the items block with the hint.
+#[majit_macros::jit_inline(
+    ref_params = { list: ref(crate::runtime::object::W_ListObject) },
+    ref_fields = {
+        crate::runtime::object::W_ListObject::items => crate::runtime::object_array::CelItemsBlock,
+    },
+    array_fields = {
+        crate::runtime::object::W_ListObject::items => crate::runtime::object::CelRef in crate::runtime::object_array::CelItemsBlock,
+    },
+    int_fields = {
+        crate::runtime::object::W_ListObject::strategy => u8,
+        crate::runtime::object::W_ListObject::length => i64,
+        crate::runtime::object::W_ListObject::start => i64,
+    },
+    calls = {
+        list_resize_ge_s => residual_int,
+        list_append_str_cold => residual_int,
+        empty_list_hint => inline_int,
+        alloc_str_items => alloc_ref,
+    },
+)]
+fn append_str_word(list: *mut CelObject, leaf: *mut CelObject) -> i64 {
+    let strategy = list.strategy as u8 as i64;
+    if strategy == ListStrategy::Strs as i64 {
+        let items = list.items;
+        if (items as *mut u8) != core::ptr::null_mut() {
+            let length = list.length;
+            let cap = items.capacity as i64;
+            if length >= 0 {
+                if length < cap {
+                    list.items[length] = leaf;
+                    list.length = length + 1;
+                    1
+                } else if list_resize_ge_s(list, length + 1) != 0 {
+                    let items2 = list.items;
+                    if (items2 as *mut u8) != core::ptr::null_mut() {
+                        list.items[length] = leaf;
+                        list.length = length + 1;
+                        1
+                    } else {
+                        list_append_str_cold(list, leaf)
+                    }
+                } else {
+                    list_append_str_cold(list, leaf)
+                }
+            } else {
+                list_append_str_cold(list, leaf)
+            }
+        } else {
+            list_append_str_cold(list, leaf)
+        }
+    } else if strategy == ListStrategy::Size as i64
+        || (strategy == ListStrategy::Object as i64 && list.length == 0)
+    {
+        let hint = empty_list_hint(list);
+        let block = alloc_str_items(hint);
+        if (block as *mut u8) != core::ptr::null_mut() {
+            list.strategy = ListStrategy::Strs;
+            list.items = block;
+            list.start = 0;
+            list.items[0] = leaf;
+            list.length = 1;
+            1
+        } else {
+            list_append_str_cold(list, leaf)
+        }
+    } else {
+        list_append_str_cold(list, leaf)
+    }
+}
+
 /// `ObjectListStrategy.append` → `rlist.ll_append`.
 ///
 /// The item is `setarrayitem_gc` (`rewrite_op_setarrayitem`). The block's
@@ -3154,6 +3272,7 @@ fn has_field_slot(recv: *mut CelObject, name: *mut CelObject) -> *mut CelObject 
     cell_float => inline_float,
     append_int_word => inline_int,
     append_float_word => inline_int,
+    append_str_word => inline_int,
     append_ref => inline_int,
     append_cell => residual_int,
 })]
@@ -3168,6 +3287,13 @@ fn append_named_field(list: *mut CelObject, recv: *mut CelObject, name: *mut Cel
             append_int_word(list, cell_int(found))
         } else if cell_kind(found) == CelKind::Double as i64 {
             append_float_word(list, cell_float(found))
+        } else if cell_kind(found) == CelKind::Str as i64 {
+            let via = append_str_word(list, found);
+            if via != 0 {
+                via
+            } else {
+                append_cell(list, found)
+            }
         } else {
             let via = append_ref(list, found);
             if via != 0 {
@@ -3260,6 +3386,7 @@ fn map_opt_insert(map: *mut CelObject, key: *mut CelObject, value: *mut CelObjec
     cell_float => inline_float,
     append_int_word => inline_int,
     append_float_word => inline_int,
+    append_str_word => inline_int,
     append_ref => inline_int,
     append_cell => residual_int,
 })]
@@ -3278,6 +3405,13 @@ fn list_opt_append(list: *mut CelObject, item: *mut CelObject) -> i64 {
             append_int_word(list, cell_int(inner))
         } else if cell_kind(inner) == CelKind::Double as i64 {
             append_float_word(list, cell_float(inner))
+        } else if cell_kind(inner) == CelKind::Str as i64 {
+            let via = append_str_word(list, inner);
+            if via != 0 {
+                via
+            } else {
+                append_cell(list, inner)
+            }
         } else {
             let via = append_ref(list, inner);
             if via != 0 {
@@ -3850,6 +3984,7 @@ fn slow_pc(vm: i64, here: i64) -> i64 {
         W_CelFrame::locals_stack_w => CelRef in crate::runtime::object_array::CelItemsBlock,
         crate::runtime::object::W_IntColumn::data => i64,
         crate::runtime::object::W_FloatColumn::data => f64,
+        crate::runtime::object::W_ListObject::items => crate::runtime::object::CelRef in crate::runtime::object_array::CelItemsBlock,
     },
     int_fields = {
         crate::runtime::object::W_ListObject::strategy => u8,
@@ -3860,6 +3995,7 @@ fn slow_pc(vm: i64, here: i64) -> i64 {
     },
     ref_fields = {
         crate::runtime::object::W_ListObject::storage => crate::runtime::object::CelObject,
+        crate::runtime::object::W_ListObject::items => crate::runtime::object_array::CelItemsBlock,
     },
     // `append_cell` / `list_resize_ge_i` are `dont_look_inside`, so their
     // calldescr would otherwise be `can_raise_effect_info` (empty write
@@ -3870,6 +4006,7 @@ fn slow_pc(vm: i64, here: i64) -> i64 {
         list.strategy @ crate::runtime::object::W_ListObject => [append_cell],
         // `list_resize_ge` stores a new column (`_ll_list_resize_really`).
         list.storage @ crate::runtime::object::W_ListObject => [append_cell, list_resize_ge_i, list_resize_ge_f],
+        list.items @ crate::runtime::object::W_ListObject => [list_resize_ge_s],
         col.data[] @ crate::runtime::object::W_FloatColumn => [list_resize_ge_f],
         list.length @ crate::runtime::object::W_ListObject => [append_cell],
         list.start @ crate::runtime::object::W_ListObject => [append_cell],
@@ -3899,6 +4036,7 @@ fn slow_pc(vm: i64, here: i64) -> i64 {
         append_cell => residual_int,
         append_int_word => inline_int,
         append_float_word => inline_int,
+        append_str_word => inline_int,
         cell_float => inline_float,
         append_ref => inline_int,
         add_local_const_cell => inline_ref,
@@ -4835,6 +4973,13 @@ fn run_cel_portal(
                             append_int_word(list, cell_int(item))
                         } else if cell_kind(item) == CelKind::Double as i64 {
                             append_float_word(list, cell_float(item))
+                        } else if cell_kind(item) == CelKind::Str as i64 {
+                            let via_str = append_str_word(list, item);
+                            if via_str != 0 {
+                                via_str
+                            } else {
+                                append_cell(list, item)
+                            }
                         } else {
                             let via_obj = append_ref(list, item);
                             if via_obj != 0 {
@@ -5089,6 +5234,13 @@ fn run_cel_portal(
                                 append_int_word(list, cell_int(w))
                             } else if cell_kind(w) == CelKind::Double as i64 {
                                 append_float_word(list, cell_float(w))
+                            } else if cell_kind(w) == CelKind::Str as i64 {
+                                let via_str = append_str_word(list, w);
+                                if via_str != 0 {
+                                    via_str
+                                } else {
+                                    append_cell(list, w)
+                                }
                             } else {
                                 let via_obj = append_ref(list, w);
                                 if via_obj != 0 {
