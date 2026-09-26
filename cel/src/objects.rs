@@ -3994,7 +3994,10 @@ fn interned_list_items(w: CelRef) -> Result<IterItems, ExecutionError> {
         if leaf.strategy == ListStrategy::Ints && !leaf.storage.is_null() {
             let col = &*leaf.storage.cast::<W_IntColumn>();
             if !col.data.is_null() && start.saturating_add(n) <= col.length as usize {
-                let ints = std::slice::from_raw_parts(col.data.add(start), n);
+                let ints = std::slice::from_raw_parts(
+                    crate::runtime::object_array::int_words_base(col.data).add(start),
+                    n,
+                );
                 return Ok(IterItems::InternedInts { ints, i: 0 });
             }
         }

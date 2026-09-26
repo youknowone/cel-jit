@@ -608,7 +608,12 @@ unsafe fn list_from_ref(w: CelRef) -> Result<ListRef, ConvertError> {
                 }
                 return ListRef::try_fill_ints::<ConvertError>(0, |_| Ok(None));
             }
-            let ints = unsafe { std::slice::from_raw_parts(col.data.add(start), n) };
+            let ints = unsafe {
+                std::slice::from_raw_parts(
+                    crate::runtime::object_array::int_words_base(col.data).add(start),
+                    n,
+                )
+            };
             ListRef::try_fill_ints(n, |i| Ok(Some(ints[i])))
         }
         ListStrategy::Window => {

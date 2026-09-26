@@ -14,8 +14,8 @@ use super::object::{
     CEL_LIST_CLASS, CEL_MAP_CLASS, CEL_STRING_CLASS, CEL_UINT_CLASS,
 };
 use super::object_array::{
-    bytes_base, items_block_items_base, CelBytesBlock, CelItemsBlock, CEL_BYTES_BLOCK_ITEMS_OFFSET,
-    CEL_ITEMS_BLOCK_ITEMS_OFFSET,
+    bytes_base, int_words_base, items_block_items_base, CelBytesBlock, CelIntWords, CelItemsBlock,
+    CEL_BYTES_BLOCK_ITEMS_OFFSET, CEL_INT_WORDS_ITEMS_OFFSET, CEL_ITEMS_BLOCK_ITEMS_OFFSET,
 };
 use crate::objects::{Key, ListRef, Map, MapStorage};
 use crate::Value;
@@ -229,9 +229,13 @@ impl ConstPool {
         let data = if n == 0 {
             core::ptr::null_mut()
         } else {
-            let raw = self.alloc_raw(std::mem::size_of_val(ints), align_of::<i64>()) as *mut i64;
-            unsafe { core::ptr::copy_nonoverlapping(ints.as_ptr(), raw, n) };
-            raw
+            let bytes = CEL_INT_WORDS_ITEMS_OFFSET + n * size_of::<i64>();
+            let block = self.alloc_raw(bytes, align_of::<CelIntWords>()) as *mut CelIntWords;
+            unsafe {
+                (*block).capacity = n;
+                core::ptr::copy_nonoverlapping(ints.as_ptr(), int_words_base(block), n);
+            }
+            block
         };
         let col = self.alloc(W_IntColumn {
             ob_header: CelObject {

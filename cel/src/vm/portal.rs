@@ -32,7 +32,8 @@ use crate::runtime::object::{
     list_promote_empty_to_ints, list_resize_ge, list_store_int, list_try_append, map_len,
     map_try_insert, new_bool, new_double_in, new_int, new_int_in, string_as_str, string_byte_len,
     w_kind, w_type, CelKind, CelObject, CelRef, ListStrategy, W_BoolObject, W_DoubleObject,
-    W_IntObject, W_OptionalObject, CEL_DOUBLE_CLASS, CEL_INT_CLASS, CEL_LIST_CLASS, CEL_MAP_CLASS,
+    W_IntObject, W_OptionalObject, CEL_DOUBLE_CLASS, CEL_INT_CLASS, CEL_INT_COLUMN_CLASS,
+    CEL_LIST_CLASS, CEL_MAP_CLASS,
 };
 use crate::runtime::object::{force_virtualizable_if_necessary, W_CelFrame};
 use crate::runtime::optional::{
@@ -1982,14 +1983,70 @@ fn empty_list_hint(list: *mut CelObject) -> i64 {
     }
 }
 
-/// `IntegerListStrategy.get_empty_storage`: the one malloc on
-/// `switch_to_correct_strategy`. The strategy tag is written by the caller.
-///
-/// Empty write sets (`analyze_external_call` `bottom_result`): the column
-/// is fresh, so the call does not flush fields the loop already cached.
-#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+/// Concrete `struct_allocs` target for the words of [`alloc_int_column`].
+fn alloc_traced_int_words(
+    capacity: usize,
+    _items: [i64; 0],
+) -> *mut crate::runtime::object_array::CelIntWords {
+    crate::runtime::heap::with_heap(|heap| {
+        crate::runtime::object_array::new_int_words_in(heap, capacity)
+    })
+}
+
+/// Concrete `struct_allocs` target for [`alloc_int_column`].
+fn alloc_traced_int_column(
+    header: crate::runtime::object::CelObject,
+    data: *mut crate::runtime::object_array::CelIntWords,
+    length: i64,
+) -> *mut crate::runtime::object::W_IntColumn {
+    crate::runtime::heap::with_heap(|heap| {
+        heap.alloc(crate::runtime::object::W_IntColumn {
+            ob_header: header,
+            data,
+            length,
+        })
+    })
+}
+
+/// `IntegerListStrategy.get_empty_storage`: `new_array` of the words and
+/// `new_with_vtable` of the column (`rewrite_op_malloc_varsize`,
+/// `rewrite_op_malloc`). The strategy tag is written by the caller.
+#[cfg_attr(
+    feature = "jit",
+    majit_macros::jit_inline(
+        inlined_prefix = {
+            crate::runtime::object::W_IntColumn::ob_header => crate::runtime::object::CelObject,
+        },
+        ref_fields = {
+            crate::runtime::object::W_IntColumn::data => crate::runtime::object_array::CelIntWords,
+        },
+        array_fields = {
+            crate::runtime::object::W_IntColumn::data => i64 in crate::runtime::object_array::CelIntWords,
+        },
+        int_fields = {
+            crate::runtime::object::W_IntColumn::length => i64,
+            crate::runtime::object_array::CelIntWords::capacity => usize,
+        },
+        struct_allocs = {
+            crate::runtime::object_array::CelIntWords => alloc_traced_int_words,
+            crate::runtime::object::W_IntColumn => alloc_traced_int_column,
+        },
+    )
+)]
 fn alloc_int_column(cap: i64) -> *mut CelObject {
-    crate::runtime::object::new_int_column_capacity(cap) as *mut CelObject
+    let n = if cap > 0 { cap } else { 1 };
+    let words = crate::runtime::object_array::CelIntWords {
+        capacity: n as usize,
+        items: [] as [i64; 0],
+    };
+    let col = crate::runtime::object::W_IntColumn {
+        ob_header: crate::runtime::object::CelObject {
+            ob_type: &CEL_INT_COLUMN_CLASS,
+        },
+        data: words,
+        length: n,
+    };
+    col as *mut crate::runtime::object::W_IntColumn as *mut CelObject
 }
 
 /// First int on an empty list (`EmptyListStrategy.append`) or a grow the
@@ -2023,8 +2080,11 @@ fn list_append_int_cold(list: *mut CelObject, word: i64) -> i64 {
     ref_params = { list: ref(crate::runtime::object::W_ListObject) },
     ref_fields = {
         crate::runtime::object::W_ListObject::storage => crate::runtime::object::CelObject,
+        crate::runtime::object::W_IntColumn::data => crate::runtime::object_array::CelIntWords,
     },
-    array_fields = { crate::runtime::object::W_IntColumn::data => i64 },
+    array_fields = {
+        crate::runtime::object::W_IntColumn::data => i64 in crate::runtime::object_array::CelIntWords,
+    },
     int_fields = {
         crate::runtime::object::W_ListObject::strategy => u8,
         crate::runtime::object::W_ListObject::length => i64,
@@ -2035,7 +2095,7 @@ fn list_append_int_cold(list: *mut CelObject, word: i64) -> i64 {
         list_resize_ge_i => residual_int,
         list_append_int_cold => residual_int,
         empty_list_hint => inline_int,
-        alloc_int_column => alloc_ref,
+        alloc_int_column => inline_ref,
     },
 )]
 fn append_int_word(list: *mut CelObject, word: i64) -> i64 {
@@ -2796,9 +2856,10 @@ fn index_cell(container: *mut CelObject, key: *mut CelObject) -> *mut CelObject 
     ref_params = { list: ref(crate::runtime::object::W_ListObject) },
     ref_fields = {
         crate::runtime::object::W_ListObject::storage => crate::runtime::object::CelObject,
+        crate::runtime::object::W_IntColumn::data => crate::runtime::object_array::CelIntWords,
     },
     array_fields = {
-        crate::runtime::object::W_IntColumn::data => i64,
+        crate::runtime::object::W_IntColumn::data => i64 in crate::runtime::object_array::CelIntWords,
         crate::runtime::object::W_FloatColumn::data => f64,
         crate::runtime::object::W_ListObject::items => crate::runtime::object::CelRef in crate::runtime::object_array::CelItemsBlock,
     },
@@ -3048,7 +3109,13 @@ const CONTAINS_UNROLL_CUTOFF: i64 = 5;
 /// The scan `@look_inside_iff` does not enter. Same result as the unrolled
 /// body: `2` hit, `1` miss.
 #[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
-fn contains_int_scan(data: *mut i64, start: i64, length: i64, want: i64) -> i64 {
+fn contains_int_scan(
+    col: *mut crate::runtime::object::W_IntColumn,
+    start: i64,
+    length: i64,
+    want: i64,
+) -> i64 {
+    let data = unsafe { crate::runtime::object_array::int_words_base((*col).data) };
     let mut i = 0;
     let mut hits = 0;
     while i < length {
@@ -3068,8 +3135,11 @@ fn contains_int_scan(data: *mut i64, start: i64, length: i64, want: i64) -> i64 
     ref_params = { list: ref(crate::runtime::object::W_ListObject) },
     ref_fields = {
         crate::runtime::object::W_ListObject::storage => crate::runtime::object::CelObject,
+        crate::runtime::object::W_IntColumn::data => crate::runtime::object_array::CelIntWords,
     },
-    array_fields = { crate::runtime::object::W_IntColumn::data => i64 },
+    array_fields = {
+        crate::runtime::object::W_IntColumn::data => i64 in crate::runtime::object_array::CelIntWords,
+    },
     int_fields = {
         crate::runtime::object::W_ListObject::strategy => u8,
         crate::runtime::object::W_ListObject::length => i64,
@@ -3105,7 +3175,7 @@ fn contains_int_word(list: *mut CelObject, needle: *mut CelObject) -> i64 {
                 } else if stop > col_len {
                     0
                 } else if length > CONTAINS_UNROLL_CUTOFF {
-                    contains_int_scan(col.data, start, length, want)
+                    contains_int_scan(col, start, length, want)
                 } else {
                     let mut i = 0;
                     let mut hits = 0;
@@ -3982,7 +4052,7 @@ fn slow_pc(vm: i64, here: i64) -> i64 {
     // Cells are pointer elements after the block's capacity word.
     array_fields = {
         W_CelFrame::locals_stack_w => CelRef in crate::runtime::object_array::CelItemsBlock,
-        crate::runtime::object::W_IntColumn::data => i64,
+        crate::runtime::object::W_IntColumn::data => i64 in crate::runtime::object_array::CelIntWords,
         crate::runtime::object::W_FloatColumn::data => f64,
         crate::runtime::object::W_ListObject::items => crate::runtime::object::CelRef in crate::runtime::object_array::CelItemsBlock,
     },

@@ -591,7 +591,9 @@ pub enum ListStrategy {
 #[allow(non_camel_case_types)]
 pub struct W_IntColumn {
     pub ob_header: CelObject,
-    pub data: *mut i64,
+    /// [`CelIntWords`]: capacity at offset 0, then the `i64`s.
+    /// `data` and [`Self::length`] are write-once.
+    pub data: *mut crate::runtime::object_array::CelIntWords,
     pub length: i64,
 }
 
@@ -643,12 +645,17 @@ pub fn new_int_column(values: &[i64]) -> *mut W_IntColumn {
     let data = if values.is_empty() {
         core::ptr::null_mut()
     } else {
-        let bytes = core::mem::size_of_val(values);
-        let ptr = super::heap::with_heap(|h| h.alloc_raw(bytes, align_of::<i64>())) as *mut i64;
-        unsafe {
-            core::ptr::copy_nonoverlapping(values.as_ptr(), ptr, values.len());
-        }
-        ptr
+        super::heap::with_heap(|h| {
+            let block = crate::runtime::object_array::new_int_words_in(h, values.len());
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    values.as_ptr(),
+                    crate::runtime::object_array::int_words_base(block),
+                    values.len(),
+                );
+            }
+            block
+        })
     };
     lltype::malloc_typed(W_IntColumn {
         ob_header: CelObject {
@@ -785,7 +792,10 @@ pub unsafe fn list_get(w: CelRef, index: i64) -> Option<CelRef> {
             if col.data.is_null() || at < 0 || at >= col.length {
                 return None;
             }
-            Some(new_int(*col.data.add(at as usize)) as CelRef)
+            Some(
+                new_int(*crate::runtime::object_array::int_words_base(col.data).add(at as usize))
+                    as CelRef,
+            )
         }
         ListStrategy::Floats => list_float_at(w, index).map(|f| new_double(f) as CelRef),
         ListStrategy::Strs => {
@@ -822,7 +832,7 @@ pub unsafe fn list_int_at(w: CelRef, index: i64) -> Option<i64> {
     if col.data.is_null() || at < 0 || at >= col.length {
         return None;
     }
-    Some(*col.data.add(at as usize))
+    Some(*crate::runtime::object_array::int_words_base(col.data).add(at as usize))
 }
 
 /// The unboxed float at `index` of a Floats-strategy list.
@@ -870,7 +880,10 @@ pub unsafe fn list_ints_slice<'a>(w: CelRef) -> Option<&'a [i64]> {
     if col.data.is_null() || start.saturating_add(n) > col.length as usize {
         return None;
     }
-    Some(std::slice::from_raw_parts(col.data.add(start), n))
+    Some(std::slice::from_raw_parts(
+        crate::runtime::object_array::int_words_base(col.data).add(start),
+        n,
+    ))
 }
 
 /// Equality of two interned lists when at least one is an Ints column.
@@ -941,9 +954,8 @@ pub fn new_list_with_capacity_in(heap: &super::heap::CelHeap, cap: i64) -> *mut 
 /// for a plain int. The strategy tag itself is a field write.
 pub(crate) fn new_int_column_capacity(cap: i64) -> *mut W_IntColumn {
     let cap = cap.max(1);
-    let bytes = (cap as usize).saturating_mul(core::mem::size_of::<i64>());
     super::heap::with_heap(|h| {
-        let data = h.alloc_raw(bytes, align_of::<i64>()) as *mut i64;
+        let data = crate::runtime::object_array::new_int_words_in(h, cap as usize);
         h.alloc(W_IntColumn {
             ob_header: CelObject {
                 ob_type: &CEL_INT_COLUMN_CLASS,
@@ -982,16 +994,19 @@ pub unsafe fn list_resize_ge(w: CelRef, newsize: i64) -> bool {
     if newcap < 4 {
         newcap = 4;
     }
-    let nbytes = (newcap as usize).saturating_mul(core::mem::size_of::<i64>());
     let live = leaf.length.max(0) as usize;
     let src = col.data;
     // `_ll_list_resize_really` allocates a new items array and stores it
     // into the mutable list field. The column's `data` / `length` stay
     // write-once (`_immutable_fields_`).
     let new_col = super::heap::with_heap(|h| {
-        let ptr = h.alloc_raw(nbytes, align_of::<i64>()) as *mut i64;
+        let ptr = crate::runtime::object_array::new_int_words_in(h, newcap as usize);
         if live > 0 && !src.is_null() {
-            core::ptr::copy_nonoverlapping(src, ptr, live);
+            core::ptr::copy_nonoverlapping(
+                crate::runtime::object_array::int_words_base(src),
+                crate::runtime::object_array::int_words_base(ptr),
+                live,
+            );
         }
         h.alloc(W_IntColumn {
             ob_header: CelObject {
@@ -1034,7 +1049,7 @@ pub unsafe fn list_store_int(w: CelRef, word: i64) -> bool {
     if col.data.is_null() || at < 0 || at >= col.length {
         return false;
     }
-    let data = col.data;
+    let data = crate::runtime::object_array::int_words_base(col.data);
     *data.add(at as usize) = word;
     leaf.length = at + 1;
     leaf.public = core::ptr::null();
@@ -1305,7 +1320,10 @@ unsafe fn list_switch_to_object_append(w: CelRef, item: CelRef) -> bool {
         (core::ptr::null_mut(), 0i64)
     } else {
         let col = &*col.cast::<W_IntColumn>();
-        (col.data, col.length)
+        (
+            crate::runtime::object_array::int_words_base(col.data),
+            col.length,
+        )
     };
     if n > 0 && words.is_null() {
         return false;

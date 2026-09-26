@@ -128,6 +128,52 @@ pub const CEL_BYTES_BLOCK_TOKEN: ArrayToken = ArrayToken {
     len_offset: CEL_BYTES_BLOCK_LEN_OFFSET,
 };
 
+/// Unboxed `i64`s for an int column: capacity word, then the words.
+///
+/// Same body as [`CelItemsBlock`]. `new_array` can build it; a raw
+/// `*mut i64` cannot, because the array descr needs the length word.
+#[cfg_attr(feature = "jit", majit_macros::jit_immutable_fields(capacity))]
+#[repr(C)]
+#[allow(non_camel_case_types)]
+pub struct CelIntWords {
+    pub capacity: usize,
+    pub(crate) items: [i64; 0],
+}
+
+pub const CEL_INT_WORDS_ITEMS_OFFSET: usize = core::mem::offset_of!(CelIntWords, items);
+pub const CEL_INT_WORDS_LEN_OFFSET: usize = core::mem::offset_of!(CelIntWords, capacity);
+
+const _: () = {
+    assert!(CEL_INT_WORDS_LEN_OFFSET == 0);
+};
+
+/// Word 0 of an int-words block, or null.
+///
+/// # Safety
+///
+/// `block` is null or points at a live [`CelIntWords`].
+#[inline]
+pub unsafe fn int_words_base(block: *mut CelIntWords) -> *mut i64 {
+    if block.is_null() {
+        return core::ptr::null_mut();
+    }
+    unsafe { (block as *mut u8).add(CEL_INT_WORDS_ITEMS_OFFSET) as *mut i64 }
+}
+
+/// Allocate `cap` unboxed words. The slots are not zeroed; the caller
+/// writes each one before a read (`new_array`, not `new_array_clear`).
+pub fn new_int_words_in(heap: &super::heap::CelHeap, cap: usize) -> *mut CelIntWords {
+    unsafe {
+        alloc_block_in(
+            heap,
+            CEL_INT_WORDS_ITEMS_OFFSET,
+            core::mem::size_of::<i64>(),
+            core::mem::align_of::<CelIntWords>(),
+            cap,
+        ) as *mut CelIntWords
+    }
+}
+
 /// Allocate a block and write its length word.
 ///
 /// Deliberately NOT in [`super::lltype`] and deliberately not named
