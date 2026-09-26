@@ -481,25 +481,50 @@ const _: () = {
     assert!(offset_of!(W_StringObject, ob_header) == 0);
 };
 
+/// One bump for a fresh string: the leaf, then its [`CelBytesBlock`].
+///
+/// `chars` points at the block that follows the leaf. The block is not a
+/// second heap object. Constructors that wrap a block allocated elsewhere
+/// stay on [`object_array::new_bytes_block`].
+fn alloc_fresh_string(nbytes: usize) -> (*mut W_StringObject, *mut u8) {
+    let heap = unsafe { &*super::heap::heap_ptr() };
+    let leaf_size = core::mem::size_of::<W_StringObject>();
+    let block_align = align_of::<CelBytesBlock>();
+    let block_off = (leaf_size + block_align - 1) & !(block_align - 1);
+    let block_bytes = object_array::CEL_BYTES_BLOCK_ITEMS_OFFSET + nbytes;
+    let total = block_off + block_bytes;
+    let align = align_of::<W_StringObject>().max(block_align);
+    let raw = heap.alloc_raw(total, align);
+    let chars = unsafe { raw.add(block_off) as *mut CelBytesBlock };
+    unsafe {
+        (*chars).capacity = nbytes;
+        let base = object_array::bytes_base(chars);
+        let leaf = raw as *mut W_StringObject;
+        leaf.write(W_StringObject {
+            ob_header: CelObject {
+                ob_type: &CEL_STRING_CLASS,
+            },
+            chars,
+            byte_len: nbytes as i64,
+            public: core::ptr::null(),
+        });
+        (leaf, base)
+    }
+}
+
 /// Box `s` as a CEL `string`.
 pub fn new_string(s: &str) -> *mut W_StringObject {
-    let chars = object_array::new_bytes_block(s.as_bytes());
-    let byte_len = s.len() as i64;
-    lltype::malloc_typed(W_StringObject {
-        ob_header: CelObject {
-            ob_type: &CEL_STRING_CLASS,
-        },
-        chars,
-        byte_len,
-        public: core::ptr::null(),
-    })
+    let (leaf, base) = alloc_fresh_string(s.len());
+    unsafe {
+        core::ptr::copy_nonoverlapping(s.as_ptr(), base, s.len());
+    }
+    leaf
 }
 
 /// `ll_str.py` `ll_int2dec`: count the digits, `mallocstr` of that exact
 /// length, then write the digits from the end into the block. The leaf
-/// and its bytes block come from one heap access. The bytes are ASCII
-/// digits (and an optional leading `-`) by construction, so nothing
-/// validates them as UTF-8.
+/// and its bytes are one `alloc_raw`. The bytes are ASCII digits (and an
+/// optional leading `-`) by construction, so nothing validates them as UTF-8.
 ///
 /// `i64::MIN` negates in `u64` (`ll_unsigned(-val)`): its magnitude is `2^63`,
 /// nineteen digits, and the sign is the twentieth byte.
@@ -519,10 +544,8 @@ pub fn string_from_int(n: i64) -> *mut W_StringObject {
         probe /= 10;
     }
     let total = len + usize::from(neg) + usize::from(val == 0);
-    let heap = unsafe { &*super::heap::heap_ptr() };
-    let chars = object_array::new_bytes_block_uninit_in(heap, total);
+    let (leaf, p) = alloc_fresh_string(total);
     unsafe {
-        let p = object_array::bytes_base(chars);
         if neg {
             *p = b'-';
         } else if val == 0 {
@@ -534,29 +557,19 @@ pub fn string_from_int(n: i64) -> *mut W_StringObject {
             val /= 10;
             j += 1;
         }
-        heap.alloc(W_StringObject {
-            ob_header: CelObject {
-                ob_type: &CEL_STRING_CLASS,
-            },
-            chars,
-            byte_len: total as i64,
-            public: core::ptr::null(),
-        })
     }
+    leaf
 }
 
 /// Box the concatenation of two UTF-8 slices as a CEL `string`.
 pub fn new_string_concat(left: &[u8], right: &[u8]) -> *mut W_StringObject {
-    let chars = object_array::new_bytes_block_concat(left, right);
-    let byte_len = (left.len() + right.len()) as i64;
-    lltype::malloc_typed(W_StringObject {
-        ob_header: CelObject {
-            ob_type: &CEL_STRING_CLASS,
-        },
-        chars,
-        byte_len,
-        public: core::ptr::null(),
-    })
+    let n = left.len() + right.len();
+    let (leaf, base) = alloc_fresh_string(n);
+    unsafe {
+        core::ptr::copy_nonoverlapping(left.as_ptr(), base, left.len());
+        core::ptr::copy_nonoverlapping(right.as_ptr(), base.add(left.len()), right.len());
+    }
+    leaf
 }
 
 /// How a [`W_ListObject`] holds its elements.
@@ -2496,6 +2509,47 @@ mod tests {
             check(-p);
             p *= 10;
         }
+    }
+
+    /// A fresh string is one heap object: the leaf and the block after it.
+    /// `new_bytes` still allocates the block and the leaf separately.
+    #[test]
+    fn a_fresh_string_is_one_heap_object() {
+        let objects = || crate::runtime::heap::with_heap(|h| h.allocated_objects());
+        let before = objects();
+        let w = string_from_int(42);
+        assert_eq!(objects(), before + 1);
+        let s = new_string("hi");
+        let cat = new_string_concat(b"ab", b"c");
+        let empty = new_string("");
+        assert_eq!(objects(), before + 4);
+        unsafe {
+            use crate::runtime::object_array::{bytes_base, bytes_capacity};
+            let gap = (*w).chars as usize - w as usize;
+            let leaf = core::mem::size_of::<W_StringObject>();
+            let block_align = core::mem::align_of::<crate::runtime::object_array::CelBytesBlock>();
+            assert!(gap >= leaf);
+            assert!(gap < leaf + block_align);
+            assert_eq!((*(*w).chars).capacity, 2);
+            assert_eq!((*s).chars as usize - s as usize, gap);
+            assert_eq!((*cat).byte_len, 3);
+            assert_eq!(bytes_capacity((*cat).chars), 3);
+            let base = bytes_base((*cat).chars);
+            assert_eq!(core::slice::from_raw_parts(base, 3), b"abc");
+            assert_eq!((*empty).byte_len, 0);
+            assert_eq!(bytes_capacity((*empty).chars), 0);
+            crate::runtime::heap::with_heap(|h| {
+                assert!(h.contains(w as *const u8));
+                assert!(h.contains((*w).chars as *const u8));
+                assert_eq!(
+                    h.is_young(w as *const u8),
+                    h.is_young((*w).chars as *const u8)
+                );
+            });
+        }
+        let b0 = objects();
+        let _b = new_bytes(b"zz");
+        assert_eq!(objects(), b0 + 2);
     }
 
     /// The variable-length leaves keep their live length on the leaf and their
