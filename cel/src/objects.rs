@@ -3998,6 +3998,9 @@ fn interned_list_items(w: CelRef) -> Result<IterItems, ExecutionError> {
                 return Ok(IterItems::InternedInts { ints, i: 0 });
             }
         }
+        if leaf.strategy == ListStrategy::Size && n == 0 {
+            return Ok(IterItems::InternedRefs { refs: &[], i: 0 });
+        }
         if leaf.strategy == ListStrategy::Object || leaf.strategy == ListStrategy::Strs {
             if n == 0 {
                 return Ok(IterItems::InternedRefs { refs: &[], i: 0 });
@@ -4029,9 +4032,10 @@ fn interned_list_item(w: CelRef, index: i64) -> Option<Value> {
             ListStrategy::Floats => {
                 crate::runtime::object::list_float_at(w, index).map(Value::Float)
             }
-            ListStrategy::Object | ListStrategy::Strs | ListStrategy::Window => {
-                interned_list_get(w, index).map(Value::from_interned)
-            }
+            ListStrategy::Object
+            | ListStrategy::Strs
+            | ListStrategy::Window
+            | ListStrategy::Size => interned_list_get(w, index).map(Value::from_interned),
         }
     }
 }

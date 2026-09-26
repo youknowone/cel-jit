@@ -618,6 +618,10 @@ pub fn install_cel_gc<S: majit_metainterp::JitState>(
     driver.set_gc_allocator(gc);
     driver.set_new_via_gc(true);
     driver.set_vtable_offset(Some(0));
+    driver.set_subclassrange_min_offset(Some(core::mem::offset_of!(
+        crate::runtime::object::CelClass,
+        subclassrange_min
+    )));
     JITFRAME_GC_INSTALLED.with(|installed| installed.set(true));
     ids
 }

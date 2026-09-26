@@ -100,20 +100,27 @@ pub enum CelKind {
 /// address, which requires the class to be a prebuilt whose address is known
 /// at compile time.
 ///
-/// The collector's type id and the `subclassrange_{min,max}` pair that
-/// `freeze_types()` assigns are deliberately **absent**. They arrive with the
-/// registration mechanism that fills them; declaring them now as immutable
-/// fields nothing can write would be a shape that has to be undone.
+/// `subclassrange_min` / `subclassrange_max` are the `rclass.OBJECT_VTABLE`
+/// fields. A flat family of leaf classes gets `min = 2 * id`, `max = min + 1`
+/// (`assign_inheritance_ids`: the span's `max` is not another class's `min`).
 #[repr(C)]
 #[derive(Debug)]
 pub struct CelClass {
+    pub subclassrange_min: i64,
+    pub subclassrange_max: i64,
     pub name: &'static str,
     pub kind: CelKind,
 }
 
 impl CelClass {
-    const fn new(name: &'static str, kind: CelKind) -> Self {
-        CelClass { name, kind }
+    const fn new(name: &'static str, kind: CelKind, id: i64) -> Self {
+        let subclassrange_min = id * 2;
+        CelClass {
+            subclassrange_min,
+            subclassrange_max: subclassrange_min + 1,
+            name,
+            kind,
+        }
     }
 }
 
@@ -186,7 +193,7 @@ macro_rules! scalar_leaf {
         $(#[$leaf_doc:meta])*
         $leaf:ident { $payload:ident : $pty:ty }
         $(#[$class_doc:meta])*
-        $class:ident = ($name:literal, $kind:expr)
+        $class:ident = ($name:literal, $kind:expr, $id:literal)
         $(#[$ctor_doc:meta])*
         $ctor:ident
     ) => {
@@ -204,7 +211,7 @@ macro_rules! scalar_leaf {
         }
 
         $(#[$class_doc])*
-        pub static $class: CelClass = CelClass::new($name, $kind);
+        pub static $class: CelClass = CelClass::new($name, $kind, $id);
 
         // Condition 3: the class word must be at offset 0.
         const _: () = {
@@ -225,7 +232,7 @@ macro_rules! scalar_leaf {
 scalar_leaf! {
     /// A CEL `int`: a signed 64-bit integer.
     W_IntObject { intval: i64 }
-    CEL_INT_CLASS = ("int", CelKind::Int)
+    CEL_INT_CLASS = ("int", CelKind::Int, 0)
     /// Allocate a fresh `int`. The interned range goes through [`new_int`].
     new_int_raw
 }
@@ -233,7 +240,7 @@ scalar_leaf! {
 scalar_leaf! {
     /// A CEL `uint`: an unsigned 64-bit integer, a distinct type from `int`.
     W_UIntObject { uintval: u64 }
-    CEL_UINT_CLASS = ("uint", CelKind::UInt)
+    CEL_UINT_CLASS = ("uint", CelKind::UInt, 1)
     /// Box `value` as a CEL `uint`.
     new_uint
 }
@@ -241,7 +248,7 @@ scalar_leaf! {
 scalar_leaf! {
     /// A CEL `double`.
     W_DoubleObject { floatval: f64 }
-    CEL_DOUBLE_CLASS = ("double", CelKind::Double)
+    CEL_DOUBLE_CLASS = ("double", CelKind::Double, 2)
     /// Box `value` as a CEL `double`.
     new_double
 }
@@ -254,7 +261,7 @@ scalar_leaf! {
     /// need a widening read on every access for no space saved once the header
     /// is present.
     W_BoolObject { boolval: i64 }
-    CEL_BOOL_CLASS = ("bool", CelKind::Bool)
+    CEL_BOOL_CLASS = ("bool", CelKind::Bool, 3)
     /// Box `value` as a CEL `bool`.
     new_bool_raw
 }
@@ -266,7 +273,7 @@ scalar_leaf! {
     /// arithmetic operation on a duration would otherwise have to normalise,
     /// and the range at 64 bits is ±292 years.
     W_DurationObject { nanos: i64 }
-    CEL_DURATION_CLASS = ("duration", CelKind::Duration)
+    CEL_DURATION_CLASS = ("duration", CelKind::Duration, 4)
     /// Box `nanos` as a CEL `duration`.
     new_duration
 }
@@ -285,7 +292,7 @@ scalar_leaf! {
     /// would name this field arrives with the registration mechanism that fills
     /// it.
     W_OptionalObject { w_value: CelRef }
-    CEL_OPTIONAL_CLASS = ("optional_type", CelKind::Optional)
+    CEL_OPTIONAL_CLASS = ("optional_type", CelKind::Optional, 5)
     /// Wrap `value` as a present CEL `optional`.
     ///
     /// The none case is [`new_optional_none`], not this function called with a
@@ -322,7 +329,7 @@ pub struct W_NullObject {
 }
 
 /// The class of [`W_NullObject`].
-pub static CEL_NULL_CLASS: CelClass = CelClass::new("null_type", CelKind::Null);
+pub static CEL_NULL_CLASS: CelClass = CelClass::new("null_type", CelKind::Null, 6);
 
 const _: () = {
     assert!(offset_of!(W_NullObject, ob_header) == 0);
@@ -360,7 +367,7 @@ pub struct W_TimestampObject {
 }
 
 /// The class of [`W_TimestampObject`].
-pub static CEL_TIMESTAMP_CLASS: CelClass = CelClass::new("timestamp", CelKind::Timestamp);
+pub static CEL_TIMESTAMP_CLASS: CelClass = CelClass::new("timestamp", CelKind::Timestamp, 7);
 
 const _: () = {
     assert!(offset_of!(W_TimestampObject, ob_header) == 0);
@@ -407,7 +414,7 @@ pub struct W_BytesObject {
     pub public: *const (),
 }
 
-pub static CEL_BYTES_CLASS: CelClass = CelClass::new("bytes", CelKind::Bytes);
+pub static CEL_BYTES_CLASS: CelClass = CelClass::new("bytes", CelKind::Bytes, 8);
 
 const _: () = {
     assert!(offset_of!(W_BytesObject, ob_header) == 0);
@@ -465,7 +472,7 @@ pub struct W_StringObject {
     pub public: *const (),
 }
 
-pub static CEL_STRING_CLASS: CelClass = CelClass::new("string", CelKind::Str);
+pub static CEL_STRING_CLASS: CelClass = CelClass::new("string", CelKind::Str, 9);
 
 const _: () = {
     assert!(offset_of!(W_StringObject, ob_header) == 0);
@@ -562,6 +569,11 @@ pub enum ListStrategy {
     /// `AsciiListStrategy`: the list holds the string, and `wrap` is the leaf
     /// already produced by `ll_str`.
     Strs = 4,
+    /// `SizeListStrategy`: no storage and no items block. `start` holds
+    /// the capacity hint (`W_ListObject.newlist_hint`); the first append
+    /// switches strategy (`EmptyListStrategy.switch_to_correct_strategy`).
+    /// Window is the only other reader of `start`.
+    Size = 5,
 }
 
 /// An unboxed integer column. Not pointer-traced; the payload is raw `i64`s.
@@ -580,7 +592,7 @@ pub struct W_IntColumn {
     pub length: i64,
 }
 
-pub static CEL_INT_COLUMN_CLASS: CelClass = CelClass::new("int_column", CelKind::List);
+pub static CEL_INT_COLUMN_CLASS: CelClass = CelClass::new("int_column", CelKind::List, 10);
 
 /// An unboxed float column. `FloatListStrategy` storage: raw `f64`s, not
 /// `W_DoubleObject`s. `data` and `length` are write-once, same as
@@ -596,7 +608,7 @@ pub struct W_FloatColumn {
     pub length: i64,
 }
 
-pub static CEL_FLOAT_COLUMN_CLASS: CelClass = CelClass::new("float_column", CelKind::List);
+pub static CEL_FLOAT_COLUMN_CLASS: CelClass = CelClass::new("float_column", CelKind::List, 17);
 
 const _: () = {
     assert!(offset_of!(W_FloatColumn, ob_header) == 0);
@@ -661,6 +673,8 @@ pub struct W_ListObject {
     /// [`W_IntColumn`] or a [`W_OpaqueObject`] holding a window host.
     pub storage: CelRef,
     pub items: *mut CelItemsBlock,
+    /// Window offset, or the `SizeListStrategy` capacity hint. Other
+    /// strategies leave it at 0. `start` is not an items-block length.
     pub start: i64,
     pub length: i64,
     /// Non-owning pointer at the public list buffer this leaf was wrapped
@@ -671,7 +685,7 @@ pub struct W_ListObject {
     pub public_len: u32,
 }
 
-pub static CEL_LIST_CLASS: CelClass = CelClass::new("list", CelKind::List);
+pub static CEL_LIST_CLASS: CelClass = CelClass::new("list", CelKind::List, 11);
 
 const _: () = {
     assert!(offset_of!(W_ListObject, ob_header) == 0);
@@ -778,7 +792,7 @@ pub unsafe fn list_get(w: CelRef, index: i64) -> Option<CelRef> {
             }
             Some(*base.add(at as usize))
         }
-        ListStrategy::Window => None,
+        ListStrategy::Window | ListStrategy::Size => None,
     }
 }
 
@@ -1038,10 +1052,13 @@ pub unsafe fn list_promote_empty_to_ints(w: CelRef, word: i64) -> bool {
         return false;
     }
     let leaf = &*w.cast::<W_ListObject>();
-    if leaf.strategy != ListStrategy::Object || leaf.length != 0 {
+    let size_hint = leaf.strategy == ListStrategy::Size;
+    if !(size_hint || (leaf.strategy == ListStrategy::Object && leaf.length == 0)) {
         return false;
     }
-    let cap = if leaf.items.is_null() {
+    let cap = if size_hint {
+        leaf.start.max(1)
+    } else if leaf.items.is_null() {
         1
     } else {
         (crate::runtime::object_array::items_capacity(leaf.items) as i64).max(1)
@@ -1150,10 +1167,13 @@ pub unsafe fn list_promote_empty_to_floats(w: CelRef, word: f64) -> bool {
         return false;
     }
     let leaf = &*w.cast::<W_ListObject>();
-    if leaf.strategy != ListStrategy::Object || leaf.length != 0 {
+    let size_hint = leaf.strategy == ListStrategy::Size;
+    if !(size_hint || (leaf.strategy == ListStrategy::Object && leaf.length == 0)) {
         return false;
     }
-    let cap = if leaf.items.is_null() {
+    let cap = if size_hint {
+        leaf.start.max(1)
+    } else if leaf.items.is_null() {
         1
     } else {
         (crate::runtime::object_array::items_capacity(leaf.items) as i64).max(1)
@@ -1341,20 +1361,36 @@ pub unsafe fn list_try_append(w: CelRef, item: CelRef) -> bool {
         }
         return list_switch_strs_to_object(w, item);
     }
-    if strategy != ListStrategy::Object {
-        return false;
-    }
-    if (*w.cast::<W_ListObject>()).length == 0 {
+    let size_hint = strategy == ListStrategy::Size;
+    let empty_object = strategy == ListStrategy::Object && (*w.cast::<W_ListObject>()).length == 0;
+    if size_hint || empty_object {
         if kind == CelKind::Int {
             return list_promote_empty_to_ints(w, (*item.cast::<W_IntObject>()).intval);
         }
         if kind == CelKind::Double {
             return list_promote_empty_to_floats(w, (*item.cast::<W_DoubleObject>()).floatval);
         }
+        if size_hint {
+            let hint = (*w.cast::<W_ListObject>()).start.max(1) as usize;
+            let items = super::heap::with_heap(|h| {
+                crate::runtime::object_array::new_items_block_zeroed_in(h, hint.max(1))
+            });
+            let leaf = &mut *w.cast::<W_ListObject>();
+            leaf.items = items;
+            leaf.start = 0;
+            leaf.strategy = if kind == CelKind::Str {
+                ListStrategy::Strs
+            } else {
+                ListStrategy::Object
+            };
+            return list_append_item_ref(w, item);
+        }
         if kind == CelKind::Str {
             (*w.cast::<W_ListObject>()).strategy = ListStrategy::Strs;
             return list_append_item_ref(w, item);
         }
+    } else if strategy != ListStrategy::Object {
+        return false;
     }
     list_append_item_ref(w, item)
 }
@@ -1470,7 +1506,7 @@ pub struct W_MapObject {
     pub public_len: u32,
 }
 
-pub static CEL_MAP_CLASS: CelClass = CelClass::new("map", CelKind::Map);
+pub static CEL_MAP_CLASS: CelClass = CelClass::new("map", CelKind::Map, 12);
 
 const _: () = {
     assert!(offset_of!(W_MapObject, ob_header) == 0);
@@ -1722,7 +1758,7 @@ pub struct W_StructObject {
 }
 
 #[cfg(feature = "structs")]
-pub static CEL_STRUCT_CLASS: CelClass = CelClass::new("struct", CelKind::Struct);
+pub static CEL_STRUCT_CLASS: CelClass = CelClass::new("struct", CelKind::Struct, 13);
 
 #[cfg(feature = "structs")]
 const _: () = {
@@ -1774,7 +1810,7 @@ pub struct W_TypeObject {
 }
 
 /// The class of [`W_TypeObject`] — the type of a type.
-pub static CEL_TYPE_CLASS: CelClass = CelClass::new("type", CelKind::Type);
+pub static CEL_TYPE_CLASS: CelClass = CelClass::new("type", CelKind::Type, 14);
 
 const _: () = {
     assert!(offset_of!(W_TypeObject, ob_header) == 0);
@@ -1839,7 +1875,7 @@ impl core::ops::IndexMut<i64> for VableStack {
     }
 }
 
-pub static CEL_FRAME_CLASS: CelClass = CelClass::new("frame", CelKind::Frame);
+pub static CEL_FRAME_CLASS: CelClass = CelClass::new("frame", CelKind::Frame, 15);
 
 const _: () = {
     assert!(offset_of!(W_CelFrame, ob_header) == 0);
@@ -1977,7 +2013,7 @@ pub struct W_OpaqueObject {
 }
 
 /// The class of [`W_OpaqueObject`].
-pub static CEL_OPAQUE_CLASS: CelClass = CelClass::new("opaque", CelKind::Opaque);
+pub static CEL_OPAQUE_CLASS: CelClass = CelClass::new("opaque", CelKind::Opaque, 16);
 
 const _: () = {
     assert!(offset_of!(W_OpaqueObject, ob_header) == 0);

@@ -30,10 +30,9 @@ use crate::runtime::heap::CelHeap;
 use crate::runtime::object::{
     bytes_len, interned_list_eq, list_int_at, list_ints_slice, list_len,
     list_promote_empty_to_ints, list_resize_ge, list_store_int, list_try_append, map_len,
-    map_try_insert, new_bool, new_double_in, new_int, new_int_in, new_list_with_capacity_in,
-    new_map_with_capacity_in, string_as_str, string_byte_len, w_kind, w_type, CelKind, CelObject,
-    CelRef, ListStrategy, W_BoolObject, W_DoubleObject, W_IntObject, W_OptionalObject,
-    CEL_DOUBLE_CLASS, CEL_INT_CLASS,
+    map_try_insert, new_bool, new_double_in, new_int, new_int_in, string_as_str, string_byte_len,
+    w_kind, w_type, CelKind, CelObject, CelRef, ListStrategy, W_BoolObject, W_DoubleObject,
+    W_IntObject, W_OptionalObject, CEL_DOUBLE_CLASS, CEL_INT_CLASS, CEL_LIST_CLASS, CEL_MAP_CLASS,
 };
 use crate::runtime::object::{force_virtualizable_if_necessary, W_CelFrame};
 use crate::runtime::optional::{
@@ -1046,7 +1045,7 @@ fn portal_rare(
             _ => residual_dispatch(vm, here),
         },
         OP_NEW_MAP => {
-            let w = new_map_with_capacity_in(vm_heap(vm), insn_a(program, pc)) as CelRef;
+            let w = alloc_map(vm, insn_a(program, pc));
             let depth = frame.valuestackdepth;
             frame.locals_stack_w[depth] = w;
             frame.valuestackdepth = depth + 1;
@@ -1484,6 +1483,10 @@ fn fresh_portal_driver(state: &mut PortalState, code: &CelCode) -> JitDriver<Por
     // No collector — `collector_installed` stays false and the off-GC
     // jitframe token path is unchanged.
     driver.set_vtable_offset(Some(0));
+    driver.set_subclassrange_min_offset(Some(core::mem::offset_of!(
+        crate::runtime::object::CelClass,
+        subclassrange_min
+    )));
     majit_gc::set_malloc_fixedsize(Some(crate::runtime::heap::cel_malloc_fixedsize));
     {
         use majit_metainterp::JitState as _;
@@ -1663,11 +1666,13 @@ pub(crate) fn eval_through_portal(
 }
 
 /// [`CelClass`] with `kind` spelled as the byte it is, so the field read
-/// registers that width. The name word in front is the same one [`CelClass`]
-/// carries; the asserts pin the two layouts together.
+/// registers that width. The range words and the name word in front are the
+/// same ones [`CelClass`] carries; the asserts pin the two layouts together.
 #[majit_macros::jit_immutable_fields(kind)]
 #[repr(C)]
 struct ClassKindView {
+    _subclassrange_min: i64,
+    _subclassrange_max: i64,
     _name: &'static str,
     kind: u8,
 }
@@ -1944,16 +1949,25 @@ fn list_resize_ge_i(list: *mut CelObject, newsize: i64) -> i64 {
         crate::runtime::object::W_ListObject::items => crate::runtime::object_array::CelItemsBlock,
     },
     int_fields = {
-        crate::runtime::object_array::CelItemsBlock::capacity => usize,
+        crate::runtime::object::W_ListObject::start => i64,
+    },
+    array_fields = {
+        crate::runtime::object_array::CelItemsBlock::items => crate::runtime::object::CelRef in crate::runtime::object_array::CelItemsBlock,
     },
 )]
 fn empty_list_hint(list: *mut CelObject) -> i64 {
     if (list as *mut u8).is_null() {
         1
     } else {
-        let items = list.items as *mut crate::runtime::object_array::CelItemsBlock;
+        let items = list.items;
         if (items as *mut u8).is_null() {
-            1
+            // `SizeListStrategy` keeps the hint in `start`.
+            let hint = list.start;
+            if hint > 0 {
+                hint
+            } else {
+                1
+            }
         } else {
             let cap = items.capacity as i64;
             if cap > 0 {
@@ -1987,7 +2001,9 @@ fn list_append_int_cold(list: *mut CelObject, word: i64) -> i64 {
         let length = (*list.cast::<crate::runtime::object::W_ListObject>()).length;
         if strategy == ListStrategy::Ints {
             i64::from(list_store_int(list, word))
-        } else if strategy == ListStrategy::Object && length == 0 {
+        } else if strategy == ListStrategy::Size
+            || (strategy == ListStrategy::Object && length == 0)
+        {
             i64::from(list_promote_empty_to_ints(list, word))
         } else {
             0
@@ -2051,7 +2067,9 @@ fn append_int_word(list: *mut CelObject, word: i64) -> i64 {
         } else {
             list_append_int_cold(list, word)
         }
-    } else if strategy == ListStrategy::Object as i64 && list.length == 0 {
+    } else if strategy == ListStrategy::Size as i64
+        || (strategy == ListStrategy::Object as i64 && list.length == 0)
+    {
         // `EmptyListStrategy.switch_to_correct_strategy`: the tag is a
         // field write; only the column malloc is a call. No object-storage
         // fill happens first (`get_strategy_from_list_objects` picks Ints
@@ -2092,13 +2110,12 @@ fn append_int_word(list: *mut CelObject, word: i64) -> i64 {
     int_fields = {
         crate::runtime::object::W_ListObject::strategy => u8,
         crate::runtime::object::W_ListObject::length => i64,
-        crate::runtime::object_array::CelItemsBlock::capacity => usize,
     },
 )]
 fn append_ref(list: *mut CelObject, item: *mut CelObject) -> i64 {
     let strategy = list.strategy as u8 as i64;
     if strategy == ListStrategy::Object as i64 {
-        let items = list.items as *mut crate::runtime::object_array::CelItemsBlock;
+        let items = list.items;
         if (items as *mut u8) != core::ptr::null_mut() {
             let length = list.length;
             let cap = items.capacity as i64;
@@ -2320,14 +2337,172 @@ fn map_object_known(map: *mut CelObject) -> i64 {
     }
 }
 
-#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
-fn alloc_list(vm: i64, cap: i64) -> CelRef {
-    new_list_with_capacity_in(vm_heap(vm), cap) as CelRef
+/// Concrete `struct_allocs` target for the items block of [`alloc_list`]
+/// and [`alloc_map`]. Zeroed slots: `new_array_clear`
+/// (`rewrite_op_malloc_varsize` on a pointer `GcArray`).
+fn alloc_traced_items(
+    capacity: usize,
+    _items: [crate::runtime::object::CelRef; 0],
+) -> *mut crate::runtime::object_array::CelItemsBlock {
+    crate::runtime::heap::with_heap(|heap| {
+        crate::runtime::object_array::new_items_block_zeroed_in(heap, capacity)
+    })
 }
 
-#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
-fn alloc_map(vm: i64, cap: i64) -> CelRef {
-    new_map_with_capacity_in(vm_heap(vm), cap) as CelRef
+/// Concrete `struct_allocs` target for [`alloc_list`].
+///
+/// `listobject.py` `get_strategy_from_list_object` picks the strategy from
+/// the elements. An empty block (no elements yet) is the object strategy;
+/// the first append switches it (`EmptyListStrategy.switch_to_correct_strategy`).
+fn alloc_traced_list(
+    header: crate::runtime::object::CelObject,
+    strategy: i64,
+    storage: CelRef,
+    items: *mut crate::runtime::object_array::CelItemsBlock,
+    start: i64,
+    length: i64,
+) -> *mut crate::runtime::object::W_ListObject {
+    let strategy = match strategy {
+        1 => crate::runtime::object::ListStrategy::Ints,
+        2 => crate::runtime::object::ListStrategy::Window,
+        3 => crate::runtime::object::ListStrategy::Floats,
+        4 => crate::runtime::object::ListStrategy::Strs,
+        5 => crate::runtime::object::ListStrategy::Size,
+        _ => crate::runtime::object::ListStrategy::Object,
+    };
+    crate::runtime::heap::with_heap(|heap| {
+        heap.alloc(crate::runtime::object::W_ListObject {
+            ob_header: header,
+            strategy,
+            storage,
+            items,
+            start,
+            length,
+            public: core::ptr::null(),
+            public_start: 0,
+            public_len: 0,
+        })
+    })
+}
+
+/// Concrete `struct_allocs` target for [`alloc_map`].
+fn alloc_traced_map(
+    header: crate::runtime::object::CelObject,
+    strategy: i64,
+    storage: CelRef,
+    items: *mut crate::runtime::object_array::CelItemsBlock,
+    length: i64,
+) -> *mut crate::runtime::object::W_MapObject {
+    let strategy = if strategy == 1 {
+        crate::runtime::object::MapStrategy::Record
+    } else {
+        crate::runtime::object::MapStrategy::Object
+    };
+    crate::runtime::heap::with_heap(|heap| {
+        heap.alloc(crate::runtime::object::W_MapObject {
+            ob_header: header,
+            strategy,
+            storage,
+            items,
+            length,
+            public: core::ptr::null(),
+            public_kind: 0,
+            public_len: 0,
+        })
+    })
+}
+
+/// Empty list with room for `cap` elements.
+///
+/// Traced body: `new_with_vtable` of `W_ListObject` (`rewrite_op_malloc`)
+/// and `new_array_clear` of the items block (`rewrite_op_malloc_varsize`).
+/// The concrete body is [`alloc_traced_list`] / [`alloc_traced_items`].
+#[cfg_attr(
+    feature = "jit",
+    majit_macros::jit_inline(
+        inlined_prefix = {
+            crate::runtime::object::W_ListObject::ob_header => crate::runtime::object::CelObject,
+        },
+        ref_fields = {
+            crate::runtime::object::W_ListObject::storage => crate::runtime::object::CelObject,
+            crate::runtime::object::W_ListObject::items => crate::runtime::object_array::CelItemsBlock,
+        },
+        array_fields = {
+            crate::runtime::object_array::CelItemsBlock::items => crate::runtime::object::CelRef in crate::runtime::object_array::CelItemsBlock,
+        },
+        int_fields = {
+            crate::runtime::object::W_ListObject::strategy => u8,
+            crate::runtime::object::W_ListObject::length => i64,
+            crate::runtime::object::W_ListObject::start => i64,
+        },
+        struct_allocs = {
+            crate::runtime::object::W_ListObject => alloc_traced_list,
+        },
+    )
+)]
+#[allow(unused_variables)]
+fn alloc_list(vm: i64, cap: i64) -> *mut CelObject {
+    let n = if cap > 0 { cap } else { 0 };
+    // `SizeListStrategy` / `newlist_hint`: no items block until the first
+    // append. The hint lives in `start`.
+    let w = crate::runtime::object::W_ListObject {
+        ob_header: crate::runtime::object::CelObject {
+            ob_type: &CEL_LIST_CLASS,
+        },
+        strategy: 5i64,
+        storage: core::ptr::null_mut(),
+        items: core::ptr::null_mut(),
+        start: n,
+        length: 0i64,
+    };
+    w as *mut crate::runtime::object::W_ListObject as *mut CelObject
+}
+
+/// Empty map with room for `cap` entries (two refs each).
+///
+/// Same split as [`alloc_list`]: header via `new_with_vtable`, items via
+/// `new_array_clear`. Object strategy until a later insert says otherwise.
+#[cfg_attr(
+    feature = "jit",
+    majit_macros::jit_inline(
+        inlined_prefix = {
+            crate::runtime::object::W_MapObject::ob_header => crate::runtime::object::CelObject,
+        },
+        ref_fields = {
+            crate::runtime::object::W_MapObject::storage => crate::runtime::object::CelObject,
+            crate::runtime::object::W_MapObject::items => crate::runtime::object_array::CelItemsBlock,
+        },
+        array_fields = {
+            crate::runtime::object_array::CelItemsBlock::items => crate::runtime::object::CelRef in crate::runtime::object_array::CelItemsBlock,
+        },
+        int_fields = {
+            crate::runtime::object::W_MapObject::strategy => u8,
+            crate::runtime::object::W_MapObject::length => i64,
+        },
+        struct_allocs = {
+            crate::runtime::object_array::CelItemsBlock => alloc_traced_items,
+            crate::runtime::object::W_MapObject => alloc_traced_map,
+        },
+    )
+)]
+#[allow(unused_variables)]
+fn alloc_map(vm: i64, cap: i64) -> *mut CelObject {
+    let n = if cap > 0 { cap } else { 0 };
+    let slots = n + n;
+    let items = crate::runtime::object_array::CelItemsBlock {
+        capacity: slots as usize,
+        items: [] as [crate::runtime::object::CelRef; 0],
+    };
+    let w = crate::runtime::object::W_MapObject {
+        ob_header: crate::runtime::object::CelObject {
+            ob_type: &CEL_MAP_CLASS,
+        },
+        strategy: 0i64,
+        storage: core::ptr::null_mut(),
+        items,
+        length: 0i64,
+    };
+    w as *mut crate::runtime::object::W_MapObject as *mut CelObject
 }
 
 /// Int-column `container[key]`. Anything else is null and the caller
@@ -3266,7 +3441,7 @@ fn step_hot(program: &CelCode, pc: usize) -> i64 {
             _ => residual_dispatch(vm, here),
         },
         OP_NEW_LIST => {
-            let w = new_list_with_capacity_in(vm_heap(vm), insn_a(program, pc)) as CelRef;
+            let w = alloc_list(vm, insn_a(program, pc));
             let depth = frame.valuestackdepth;
             frame.locals_stack_w[depth] = w;
             frame.valuestackdepth = depth + 1;
@@ -3277,7 +3452,7 @@ fn step_hot(program: &CelCode, pc: usize) -> i64 {
             if src.is_null() || unsafe { w_kind(src) } != CelKind::List {
                 residual_dispatch(vm, here)
             } else {
-                let w = new_list_with_capacity_in(vm_heap(vm), unsafe { list_len(src) }) as CelRef;
+                let w = alloc_list(vm, unsafe { list_len(src) });
                 let depth = frame.valuestackdepth;
                 frame.locals_stack_w[depth] = w;
                 frame.valuestackdepth = depth + 1;
@@ -3554,8 +3729,8 @@ fn slow_pc(vm: i64, here: i64) -> i64 {
         // and dynasm inlines that as value@0/link@8 whenever
         // `dynasm_nursery_addrs()` is non-zero. Empty write sets, no helper
         // tag: `analyze_external_call` `bottom_result`.
-        alloc_list => alloc_ref,
-        alloc_map => alloc_ref,
+        alloc_list => inline_ref,
+        alloc_map => inline_ref,
         index_cell => inline_ref,
         item_cell => inline_ref,
         map_keys_cell => residual_ref,
@@ -3600,7 +3775,6 @@ fn slow_pc(vm: i64, here: i64) -> i64 {
         vm_heap => inline_ref,
         new_int_in => inline_ref,
         try_append => residual_int,
-        new_list_with_capacity_in => inline_ref,
         residual_dispatch => may_force_int,
         residual_hydrate => may_force_int,
         vm_sync_binop => residual_int,

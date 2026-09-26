@@ -262,6 +262,9 @@ unsafe fn append_interned_ints(out: &mut Vec<i64>, w: CelRef) -> bool {
         return false;
     }
     let leaf = &*w.cast::<super::object::W_ListObject>();
+    if leaf.strategy == super::object::ListStrategy::Size && leaf.length == 0 {
+        return true;
+    }
     if leaf.strategy != super::object::ListStrategy::Object {
         return false;
     }

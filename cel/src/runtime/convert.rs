@@ -614,6 +614,7 @@ unsafe fn list_from_ref(w: CelRef) -> Result<ListRef, ConvertError> {
         ListStrategy::Window => {
             host_list_ref(opaque_host_index(leaf.storage)).ok_or(ConvertError::Corrupt("list"))
         }
+        ListStrategy::Size => ListRef::try_fill_values(0, |_| Ok(None)),
     }
 }
 

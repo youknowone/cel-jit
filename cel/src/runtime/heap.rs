@@ -939,7 +939,19 @@ pub fn with_heap<R>(f: impl FnOnce(&CelHeap) -> R) -> R {
 /// Boehm has no `get_nursery_free_addr`.
 pub extern "C" fn cel_malloc_fixedsize(size: usize) -> *mut u8 {
     let ptr = unsafe { (*heap_ptr()).alloc_raw(size, align_of::<u64>()) };
-    unsafe { core::ptr::write_bytes(ptr, 0, size) };
+    unsafe {
+        // Small blocks: word stores. `write_bytes` is `bzero`.
+        if size <= 256 && size % 8 == 0 {
+            let words = ptr.cast::<u64>();
+            let mut i = 0;
+            while i < size / 8 {
+                words.add(i).write(0);
+                i += 1;
+            }
+        } else {
+            core::ptr::write_bytes(ptr, 0, size);
+        }
+    }
     ptr
 }
 
