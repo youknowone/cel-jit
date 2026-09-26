@@ -3063,7 +3063,8 @@ fn double_binop_cell(op: i64, a: *mut CelObject, b: *mut CelObject) -> *mut CelO
 #[majit_macros::jit_inline(calls = {
     cell_kind => inline_int,
     cell_int => inline_int,
-    int_to_text => residual_ref,
+    // Fresh string only. Empty write sets, so cached fields stay.
+    int_to_text => alloc_ref,
 })]
 fn string_from_cell(w: *mut CelObject) -> *mut CelObject {
     if cell_kind(w) == CelKind::Int as i64 {
@@ -4190,7 +4191,8 @@ fn slow_pc(vm: i64, here: i64) -> i64 {
         interned_is_string => elidable_int_cannot_raise,
         box_double => inline_ref,
         double_from_cell => inline_ref,
-        int_to_text => residual_ref,
+        // `ll_int2dec`: writes only the string it just allocated.
+        int_to_text => alloc_ref,
         string_from_cell => inline_ref,
         double_binop_cell => residual_ref,
         string_add_cell => residual_ref,

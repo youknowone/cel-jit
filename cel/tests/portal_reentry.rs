@@ -22,14 +22,17 @@ fn ctx() -> Context<'static> {
 }
 
 fn agree_compiled(src: &str, times: usize) {
+    agree_compiled_in(src, &ctx(), times);
+}
+
+fn agree_compiled_in(src: &str, ctx: &Context, times: usize) {
     let expr = Parser::default()
         .parse(src)
         .unwrap_or_else(|e| panic!("parse {src}: {e}"));
-    let ctx = ctx();
-    let walker = Value::resolve_value(&expr, &ctx);
+    let walker = Value::resolve_value(&expr, ctx);
     let program = Program::compile(src).unwrap_or_else(|e| panic!("compile {src}: {e}"));
     for i in 0..times {
-        let vm = program.execute(&ctx);
+        let vm = program.execute(ctx);
         assert_eq!(show(&walker), show(&vm), "`{src}` execute {i}");
         if let (Ok(a), Ok(b)) = (&walker, &vm) {
             assert_eq!(a, b, "`{src}` execute {i} value");
@@ -128,6 +131,30 @@ fn compiled_entries_match_the_walker() {
     agree_compiled("list.map(e, {\"a\": e}).map(m, has(m.z))", 150);
     agree_compiled("list.map(e, [10, 20].exists(i, v, i == e))", 150);
     agree_compiled("list.map(e, {\"a\": e}.exists(k, v, k == \"a\"))", 150);
+}
+
+/// `string(e)` over negatives and zero, string concat, and a list whose
+/// elements are not all ints.
+#[test]
+fn compiled_string_map_covers_sign_zero_and_mixed_kinds() {
+    unsafe { std::env::set_var("CEL_PORTAL_THRESHOLD", "100") };
+    let mut signed = Context::default();
+    signed.add_variable_from_value("x", 15i64);
+    signed.add_variable_from_value("list", vec![-2i64, -1, 0, 1, 7]);
+    agree_compiled_in("list.map(e, string(e))", &signed, 150);
+    agree_compiled_in("list.map(e, string(e) + \"x\")", &signed, 150);
+
+    let mut mixed = Context::default();
+    mixed.add_variable_from_value("x", 15i64);
+    mixed.add_variable_from_value(
+        "list",
+        cel::objects::ListRef::from(vec![
+            Value::Float(1.5),
+            Value::String(std::sync::Arc::new("ab".to_string())),
+            Value::Int(-3),
+        ]),
+    );
+    agree_compiled_in("list.map(e, string(e))", &mixed, 150);
 }
 
 fn agree_optional(src: &str, times: usize) {
