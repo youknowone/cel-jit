@@ -58,6 +58,17 @@ fn compiled_entries_match_the_walker() {
     agree_compiled("list.map(e, e - 1)", 150);
     agree_compiled("list.filter(e, e in [1, 2, 3])", 150);
     agree_compiled("list.map(e, e in [1, 2, 3])", 150);
+    agree_compiled("list.map(e, !(e in [1, 2, 3]))", 150);
+    agree_compiled("list.map(e, e in [1, 2.0, \"a\"])", 150);
+    agree_compiled("list.map(e, e in [])", 150);
+    agree_compiled("list.map(e, e in [x])", 150);
+    agree_compiled(
+        "list.map(e, e in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20])",
+        150,
+    );
+    agree_compiled("list.map(e, \"a\" in [\"a\", \"b\"])", 150);
+    agree_compiled("list.map(e, 2u in [1, 2])", 150);
+    agree_compiled("list.map(e, e in [1, 2, 3])", 150);
     agree_compiled("list.map(e, {\"a\": e}.a)", 150);
     agree_compiled("list.map(e, has({\"a\": e}.a))", 150);
     agree_compiled("list.map(e, has({\"a\": e}.b))", 150);

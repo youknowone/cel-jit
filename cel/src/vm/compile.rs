@@ -263,6 +263,25 @@ impl Compiler {
         Ok(index)
     }
 
+    /// `codegen.py` `_tuple_of_consts` for the right operand of `in`.
+    /// Every element must be a constant; the items are the interned leaves.
+    /// `None` keeps today's list path.
+    fn intern_in_tuple(&mut self, list: &ListExpr) -> Option<CelRef> {
+        if !list.optional_indices.is_empty() {
+            return None;
+        }
+        let mut items = Vec::with_capacity(list.elements.len());
+        for element in &list.elements {
+            let value = const_expr(&element.expr)?;
+            let leaf = self.const_pool.intern_elem(&value);
+            if leaf.is_null() {
+                return None;
+            }
+            items.push(leaf);
+        }
+        Some(self.const_pool.intern_tuple(&items))
+    }
+
     /// A compile-time value and its pool leaf, or `None` if `expr` is not
     /// constant. Map literals intern with [`map_try_insert`] in source order.
     fn intern_const(&mut self, expr: &Expr) -> Option<(Value, CelRef)> {
@@ -821,6 +840,21 @@ impl Compiler {
                 // order the helpers are called with, and `1 - x` is not
                 // `x - 1`.
                 if arity == 2 {
+                    // `codegen.py` `_optimize_comparator`: `in` / `not in`
+                    // whose right operand is a list literal of constants
+                    // loads one tuple (`_tuple_of_consts` + `load_const`).
+                    // A non-constant element keeps the list.
+                    if op == OpCode::In {
+                        if let Expr::List(list) = &call.args[1].expr {
+                            if let Some(leaf) = self.intern_in_tuple(list) {
+                                self.expr(&call.args[0])?;
+                                let index = self.add_const_leaf(Value::Null, leaf, id)?;
+                                self.emit(OpCode::LoadConst, &[index], id)?;
+                                self.emit(OpCode::In, &[], id)?;
+                                return Ok(());
+                            }
+                        }
+                    }
                     // The LEFT operand folds in as well when it is a slot,
                     // leaving the whole binary in one instruction.
                     if let Some(decided) = self.binary_local_const(op, &call.args, id)? {

@@ -12,8 +12,8 @@ use crate::runtime::convert::{
 use crate::runtime::error::{take_error, CelErrCode, ERROR_SENTINEL};
 use crate::runtime::object::{
     bytes_len, list_int_at, list_len, map_len, new_optional, new_optional_none, string_byte_len,
-    w_kind, CelKind, CelRef, ListStrategy, W_BoolObject, W_DoubleObject, W_IntColumn, W_IntObject,
-    W_ListObject, W_OptionalObject, W_UIntObject,
+    tuple_item, tuple_len, w_kind, w_type, CelKind, CelRef, ListStrategy, W_BoolObject,
+    W_DoubleObject, W_IntColumn, W_IntObject, W_ListObject, W_OptionalObject, W_UIntObject,
 };
 use crate::runtime::object_array::{items_block_items_base, items_capacity};
 use crate::ExecutionError::NoSuchOverload;
@@ -3558,7 +3558,7 @@ fn interned_value_type(w: CelRef) -> ValueType {
         CelKind::Optional | CelKind::Type | CelKind::Opaque => ValueType::Opaque,
         #[cfg(feature = "structs")]
         CelKind::Struct => ValueType::Struct,
-        CelKind::Frame => ValueType::Null,
+        CelKind::Frame | CelKind::Tuple => ValueType::Null,
     }
 }
 
@@ -3809,6 +3809,9 @@ pub(crate) fn value_contains(container: &Value, needle: &Value) -> Result<bool, 
 /// ints-list answers only for an int needle; any other kind is a miss.
 #[inline]
 pub(crate) fn interned_contains(container: CelRef, needle: CelRef) -> Result<bool, ExecutionError> {
+    if unsafe { w_type(container) } == &crate::runtime::object::CEL_TUPLE_CLASS {
+        return Ok(unsafe { tuple_contains_eq(container, needle) });
+    }
     match unsafe { w_kind(container) } {
         CelKind::List => {
             if let Some(ints) = interned_ints_slice(container) {
@@ -3855,6 +3858,22 @@ pub(crate) fn interned_opt_select(w: CelRef, field: &str) -> Result<CelRef, Exec
         None if optional => Ok(new_optional(new_optional_none() as CelRef) as CelRef),
         None => Err(ExecutionError::NoSuchKey(Arc::new(field.to_string()))),
     }
+}
+
+/// `W_TupleObject.descr_contains`, with [`values_equal`] (heterogeneous
+/// numeric equality included). Same result as the list scan.
+pub(crate) unsafe fn tuple_contains_eq(container: CelRef, needle: CelRef) -> bool {
+    let n = tuple_len(container);
+    let mut i = 0i64;
+    while i < n {
+        if let Some(item) = tuple_item(container, i) {
+            if values_equal(item, needle) {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
 }
 
 /// Scan without copying the list into a buffer. A hit at index *k* costs *k*

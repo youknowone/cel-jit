@@ -92,6 +92,9 @@ pub enum CelKind {
     Opaque = 14,
     /// The activation record. Not a CEL value; `type()` never answers this.
     Frame = 15,
+    /// `W_TupleObject`. Not a CEL value: only `In` receives it.
+    /// `type()`, equality, printing and conversion never see it.
+    Tuple = 16,
 }
 
 /// One value class.
@@ -705,6 +708,62 @@ pub static CEL_LIST_CLASS: CelClass = CelClass::new("list", CelKind::List, 11);
 const _: () = {
     assert!(offset_of!(W_ListObject, ob_header) == 0);
 };
+
+/// `W_TupleObject` (`tupleobject.py`).
+///
+/// Header first. `length` and `items` are written once, at allocation.
+/// `_immutable_fields_ = ['length', 'items[*]']`: the pointer does not
+/// change, and `rewrite_op_getarrayitem` reads the `CelRef`s with
+/// `getarrayitem_gc_pure`. The block is a `GcArray` (`CelItemsBlock`):
+/// length word, then the items. Only `In` consumes one; it is not a CEL value.
+#[cfg_attr(
+    feature = "jit",
+    majit_macros::jit_immutable_fields(length, "items[*]")
+)]
+#[repr(C)]
+#[allow(non_camel_case_types)]
+pub struct W_TupleObject {
+    pub ob_header: CelObject,
+    pub length: i64,
+    /// `wrappeditems`. Items begin at [`CelItemsBlock::items`].
+    pub items: *mut crate::runtime::object_array::CelItemsBlock,
+}
+
+/// `W_TupleObject.typedef`, named `tuple`.
+pub static CEL_TUPLE_CLASS: CelClass = CelClass::new("tuple", CelKind::Tuple, 18);
+
+const _: () = {
+    assert!(offset_of!(W_TupleObject, ob_header) == 0);
+};
+
+/// Live length of a tuple leaf.
+///
+/// # Safety
+///
+/// `w` is a live [`W_TupleObject`].
+pub unsafe fn tuple_len(w: CelRef) -> i64 {
+    (*w.cast::<W_TupleObject>()).length
+}
+
+/// Item `index` of a tuple leaf, or `None` if out of range.
+///
+/// # Safety
+///
+/// `w` is a live [`W_TupleObject`].
+pub unsafe fn tuple_item(w: CelRef, index: i64) -> Option<CelRef> {
+    if index < 0 {
+        return None;
+    }
+    let leaf = &*w.cast::<W_TupleObject>();
+    if index >= leaf.length || leaf.items.is_null() {
+        return None;
+    }
+    let base = crate::runtime::object_array::items_block_items_base(leaf.items);
+    if base.is_null() {
+        return None;
+    }
+    Some(*base.add(index as usize))
+}
 
 /// ⚠ Immutable in the sense the JIT means: written once at allocation, so a
 /// read may fold. CEL lists are immutable values, so this is not the bet it

@@ -10,8 +10,9 @@ use super::heap::{
 use super::object::{
     new_bool, new_null, prebuilt_int, CelObject, CelRef, ListStrategy, MapStrategy, W_BytesObject,
     W_DoubleObject, W_IntColumn, W_IntObject, W_ListObject, W_MapObject, W_StringObject,
-    W_UIntObject, CEL_BYTES_CLASS, CEL_DOUBLE_CLASS, CEL_INT_CLASS, CEL_INT_COLUMN_CLASS,
-    CEL_LIST_CLASS, CEL_MAP_CLASS, CEL_STRING_CLASS, CEL_UINT_CLASS,
+    W_TupleObject, W_UIntObject, CEL_BYTES_CLASS, CEL_DOUBLE_CLASS, CEL_INT_CLASS,
+    CEL_INT_COLUMN_CLASS, CEL_LIST_CLASS, CEL_MAP_CLASS, CEL_STRING_CLASS, CEL_TUPLE_CLASS,
+    CEL_UINT_CLASS,
 };
 use super::object_array::{
     bytes_base, int_words_base, items_block_items_base, CelBytesBlock, CelIntWords, CelItemsBlock,
@@ -182,6 +183,29 @@ impl ConstPool {
                 .unwrap_or(core::ptr::null_mut()),
             _ => core::ptr::null_mut(),
         }
+    }
+
+    /// `W_TupleObject` of `items`. The items are already interned leaves.
+    /// Only `In` consumes the result; it is not a CEL value.
+    pub(crate) fn intern_tuple(&mut self, items: &[CelRef]) -> CelRef {
+        let n = items.len();
+        let size = CEL_ITEMS_BLOCK_ITEMS_OFFSET
+            .checked_add(n.saturating_mul(size_of::<CelRef>()))
+            .expect("tuple items fit");
+        let block = self.alloc_raw(size, align_of::<CelItemsBlock>()) as *mut CelItemsBlock;
+        unsafe {
+            (*block).capacity = n;
+            if n != 0 {
+                core::ptr::copy_nonoverlapping(items.as_ptr(), items_block_items_base(block), n);
+            }
+        }
+        self.alloc(W_TupleObject {
+            ob_header: CelObject {
+                ob_type: &CEL_TUPLE_CLASS,
+            },
+            length: n as i64,
+            items: block,
+        }) as CelRef
     }
 
     /// A list element: pool intern, or the immortal prebuilt [`new_int`] /

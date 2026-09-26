@@ -20,7 +20,7 @@ use super::interp::{interned_optional_is_none, Step, Vm};
 use super::opcode::OpCode;
 use crate::runtime::binop::{
     cel_add, cel_div, cel_equals, cel_greater, cel_greater_equals, cel_less, cel_less_equals,
-    cel_mul, cel_negate, cel_not_equals, cel_rem, cel_sub,
+    cel_mul, cel_negate, cel_not_equals, cel_rem, cel_sub, values_equal,
 };
 use crate::runtime::convert::{
     intern_leaf, interned_as_keyref, interned_list_get, interned_map_get,
@@ -957,7 +957,15 @@ fn portal_rare(
         }
         OP_IN => match (operand_cell(frame, 2), operand_cell(frame, 1)) {
             (Some(needle), Some(container)) if !needle.is_null() && !container.is_null() => {
-                let found = interned_contains(container as i64, needle as i64);
+                // `descr_contains` dispatches on the container's class.
+                // A `W_TupleObject` is `_descr_contains_unroll_safe` /
+                // `_descr_contains_jmp` (`tuple_contains`). Anything else
+                // stays on the list/map residual.
+                let found = if is_tuple_cell(container) != 0 {
+                    tuple_contains(container, needle)
+                } else {
+                    interned_contains(container as i64, needle as i64)
+                };
                 if found == 0 {
                     residual_dispatch(vm, here)
                 } else {
@@ -3070,7 +3078,100 @@ fn string_from_cell(w: *mut CelObject) -> *mut CelObject {
 /// `listobject.py` `UNROLL_CUTOFF`. A longer column is not unrolled:
 /// `loop_unrolling_heuristic` is false, and `@look_inside_iff` leaves the
 /// scan as one residual call (`contains_int_scan`).
+/// `W_TupleObject._unroll_condition` is the same test
+/// (`loop_unrolling_heuristic(wrappeditems, length(), UNROLL_CUTOFF)`).
 const CONTAINS_UNROLL_CUTOFF: i64 = 5;
+
+/// Class word of `w` is `CEL_TUPLE_CLASS`. `0` otherwise.
+///
+/// `ob_type` is immutable, so a constant container folds the compare.
+#[majit_macros::jit_inline(calls = { cell_kind => inline_int })]
+fn is_tuple_cell(w: *mut CelObject) -> i64 {
+    if cell_kind(w) == CelKind::Tuple as i64 {
+        1
+    } else {
+        0
+    }
+}
+
+/// The scan `loop_unrolling_heuristic` does not enter
+/// (`_descr_contains_jmp`). `2` hit, `1` miss.
+#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+fn tuple_contains_scan(tup: *mut CelObject, needle: *mut CelObject) -> i64 {
+    if tup.is_null() || needle.is_null() {
+        return 0;
+    }
+    1 + i64::from(unsafe { crate::objects::tuple_contains_eq(tup, needle) })
+}
+
+/// One item equality that is not the int fast path. `values_equal`,
+/// including heterogeneous numeric equality. `1` hit, `0` miss.
+#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+fn tuple_item_eq(item: *mut CelObject, needle: *mut CelObject) -> i64 {
+    if item.is_null() || needle.is_null() {
+        return 0;
+    }
+    i64::from(unsafe { values_equal(item, needle) })
+}
+
+/// `W_TupleObject.descr_contains`. `2` hit, `1` miss, `0` decline.
+///
+/// `loop_unrolling_heuristic`: length at most [`CONTAINS_UNROLL_CUTOFF`]
+/// takes the `@jit.unroll_safe` body (`_descr_contains_unroll_safe`),
+/// one `cell_kind` / `cell_int` compare per item, with [`tuple_item_eq`]
+/// for a non-int item. A longer tuple is [`tuple_contains_scan`].
+#[majit_macros::jit_inline(
+    ref_params = { tup: ref(crate::runtime::object::W_TupleObject) },
+    array_fields = {
+        crate::runtime::object::W_TupleObject::items => crate::runtime::object::CelRef in crate::runtime::object_array::CelItemsBlock,
+    },
+    int_fields = {
+        crate::runtime::object::W_TupleObject::length => i64,
+    },
+    calls = {
+        cell_kind => inline_int,
+        cell_int => inline_int,
+        tuple_contains_scan => residual_int,
+        tuple_item_eq => residual_int,
+    },
+)]
+fn tuple_contains(tup: *mut CelObject, needle: *mut CelObject) -> i64 {
+    if (tup as *mut u8) == core::ptr::null_mut() {
+        0
+    } else if (needle as *mut u8) == core::ptr::null_mut() {
+        0
+    } else {
+        let length = tup.length;
+        if length > CONTAINS_UNROLL_CUTOFF {
+            tuple_contains_scan(tup, needle)
+        } else if cell_kind(needle) != CelKind::Int as i64 {
+            tuple_contains_scan(tup, needle)
+        } else {
+            // `_descr_contains_unroll_safe`: each index is a literal
+            // (`loop_unrolling_heuristic`, cutoff `UNROLL_CUTOFF`). A hit
+            // stores 2; the miss trace does not take that arm, so each
+            // compare stays `int_eq` + `guard_false` on the constant item.
+            let want = cell_int(needle);
+            let mut result = 1;
+            for i in 0..5 {
+                if i < length {
+                    let item = tup.items[i];
+                    if cell_kind(item) == CelKind::Int as i64 {
+                        if cell_int(item) == want {
+                            result = 2;
+                        }
+                    } else {
+                        let eq = tuple_item_eq(item, needle);
+                        if eq != 0 {
+                            result = 2;
+                        }
+                    }
+                }
+            }
+            result
+        }
+    }
+}
 
 /// The scan `@look_inside_iff` does not enter. Same result as the unrolled
 /// body: `2` hit, `1` miss.
@@ -4079,6 +4180,10 @@ fn slow_pc(vm: i64, here: i64) -> i64 {
         add_local_const_cell => inline_ref,
         map_insert_cell => residual_int,
         contains_int_word => inline_int,
+        is_tuple_cell => inline_int,
+        tuple_contains => inline_int,
+        tuple_contains_scan => residual_int,
+        tuple_item_eq => residual_int,
         int_identity => inline_ref,
         interned_name_is_int => elidable_int_cannot_raise,
         interned_is_double => elidable_int_cannot_raise,
@@ -5843,7 +5948,15 @@ fn run_cel_portal(
                     let needle = state.frame.locals_stack_w[box_i];
                     if !container.is_null() {
                         if !needle.is_null() {
-                            let found = contains_int_word(container, needle);
+                            // `descr_contains` on the container's class.
+                            // `W_TupleObject` is the unrolled scan
+                            // (`tuple_contains`); an int column stays
+                            // `contains_int_word`.
+                            let found = if is_tuple_cell(container) != 0 {
+                                tuple_contains(container, needle)
+                            } else {
+                                contains_int_word(container, needle)
+                            };
                             if found == 0 {
                                 slow_pc(vm, here)
                             } else {
