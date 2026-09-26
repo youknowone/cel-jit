@@ -1479,14 +1479,17 @@ fn fresh_portal_driver(state: &mut PortalState, code: &CelCode) -> JitDriver<Por
     let threshold = portal_threshold();
     let mut driver = JitDriver::new(threshold);
     driver.set_param("function_threshold", i64::from(threshold));
-    // `GcLLDescr_boehm`: vtable at offset 0, `malloc_fixedsize` into CelHeap.
-    // No collector — `collector_installed` stays false and the off-GC
-    // jitframe token path is unchanged.
+    // `GcLLDescr_framework` with a headerless nursery: vtable at offset 0.
+    // `gen_malloc_nursery` bakes this thread's `nursery_free` / `nursery_top`.
+    // Objects past the segment size still use `malloc_fixedsize`. The slow
+    // path opens a segment and does not collect, so frames stay host blocks
+    // (`jitframe_type_id` is unset).
     driver.set_vtable_offset(Some(0));
     driver.set_subclassrange_min_offset(Some(core::mem::offset_of!(
         crate::runtime::object::CelClass,
         subclassrange_min
     )));
+    driver.set_gc_allocator(Box::new(crate::runtime::heap::CelGc));
     majit_gc::set_malloc_fixedsize(Some(crate::runtime::heap::cel_malloc_fixedsize));
     {
         use majit_metainterp::JitState as _;
@@ -2489,6 +2492,9 @@ fn alloc_traced_list(
     items: *mut crate::runtime::object_array::CelItemsBlock,
     start: i64,
     length: i64,
+    _public: *const (),
+    public_start: u32,
+    public_len: u32,
 ) -> *mut crate::runtime::object::W_ListObject {
     let strategy = match strategy {
         1 => crate::runtime::object::ListStrategy::Ints,
@@ -2507,8 +2513,8 @@ fn alloc_traced_list(
             start,
             length,
             public: core::ptr::null(),
-            public_start: 0,
-            public_len: 0,
+            public_start,
+            public_len,
         })
     })
 }
@@ -2520,6 +2526,9 @@ fn alloc_traced_map(
     storage: CelRef,
     items: *mut crate::runtime::object_array::CelItemsBlock,
     length: i64,
+    _public: *const (),
+    public_kind: u32,
+    public_len: u32,
 ) -> *mut crate::runtime::object::W_MapObject {
     let strategy = if strategy == 1 {
         crate::runtime::object::MapStrategy::Record
@@ -2534,8 +2543,8 @@ fn alloc_traced_map(
             items,
             length,
             public: core::ptr::null(),
-            public_kind: 0,
-            public_len: 0,
+            public_kind,
+            public_len,
         })
     })
 }
@@ -2562,6 +2571,8 @@ fn alloc_traced_map(
             crate::runtime::object::W_ListObject::strategy => u8,
             crate::runtime::object::W_ListObject::length => i64,
             crate::runtime::object::W_ListObject::start => i64,
+            crate::runtime::object::W_ListObject::public_start => u32,
+            crate::runtime::object::W_ListObject::public_len => u32,
         },
         struct_allocs = {
             crate::runtime::object::W_ListObject => alloc_traced_list,
@@ -2582,6 +2593,9 @@ fn alloc_list(vm: i64, cap: i64) -> *mut CelObject {
         items: core::ptr::null_mut(),
         start: n,
         length: 0i64,
+        public: core::ptr::null(),
+        public_start: 0u32,
+        public_len: 0u32,
     };
     w as *mut crate::runtime::object::W_ListObject as *mut CelObject
 }
@@ -2606,6 +2620,8 @@ fn alloc_list(vm: i64, cap: i64) -> *mut CelObject {
         int_fields = {
             crate::runtime::object::W_MapObject::strategy => u8,
             crate::runtime::object::W_MapObject::length => i64,
+            crate::runtime::object::W_MapObject::public_kind => u32,
+            crate::runtime::object::W_MapObject::public_len => u32,
         },
         struct_allocs = {
             crate::runtime::object_array::CelItemsBlock => alloc_traced_items,
@@ -2629,6 +2645,9 @@ fn alloc_map(vm: i64, cap: i64) -> *mut CelObject {
         storage: core::ptr::null_mut(),
         items,
         length: 0i64,
+        public: core::ptr::null(),
+        public_kind: 0u32,
+        public_len: 0u32,
     };
     w as *mut crate::runtime::object::W_MapObject as *mut CelObject
 }

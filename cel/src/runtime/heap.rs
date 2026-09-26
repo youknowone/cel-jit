@@ -493,6 +493,14 @@ pub struct CelHeap {
     snap_hosts: Cell<usize>,
     young_host_n: Cell<usize>,
     nursery_high_water: Cell<u64>,
+    /// `incminimark.py` `nursery_free`. Absolute pointer into the open
+    /// nursery segment. Compiled code bakes the address of this cell
+    /// (`gc.py get_nursery_free_addr`). The cell stays put for the life of
+    /// the heap; `bump_grow`, rewind and `reset_nursery` store the new
+    /// pointer into it.
+    nursery_free: Cell<*mut u8>,
+    /// `incminimark.py` `nursery_top`. One past the open segment.
+    nursery_top: Cell<*mut u8>,
     /// Host objects behind [`super::object::W_OpaqueObject::host_index`].
     ///
     /// A side table, not a `Drop` payload on the leaf — `alloc` refuses types
@@ -524,6 +532,8 @@ impl CelHeap {
             snap_hosts: Cell::new(0),
             young_host_n: Cell::new(0),
             nursery_high_water: Cell::new(0),
+            nursery_free: Cell::new(null_mut()),
+            nursery_top: Cell::new(null_mut()),
             hosts: RefCell::new(Vec::new()),
             young_hosts: RefCell::new(Vec::new()),
             bind_region: Cell::new(null_mut()),
@@ -650,6 +660,7 @@ impl CelHeap {
 
     /// Rewind the open bump. Same segment count, no young hosts.
     fn rewind_nursery(&self) {
+        self.flush_nursery_bump();
         #[cfg(debug_assertions)]
         {
             let from = self.snap_used.get();
@@ -664,9 +675,11 @@ impl CelHeap {
         self.nursery.open_used.set(self.snap_used.get());
         self.nursery.bytes.set(self.snap_bytes.get());
         self.nursery.objects.set(self.snap_objects.get());
+        self.publish_nursery_bounds();
     }
 
     fn reset_nursery(&self) {
+        self.flush_nursery_bump();
         let snap_len = self.snap_len.get();
         let snap_used = self.snap_used.get();
         let mut segs = self.nursery.segments.borrow_mut();
@@ -697,6 +710,7 @@ impl CelHeap {
         self.young_host_n.set(self.snap_hosts.get());
         drop(segs);
         self.nursery.sync_open();
+        self.publish_nursery_bounds();
     }
 
     /// Allocate `value` in this heap and return a pointer to it.
@@ -731,9 +745,76 @@ impl CelHeap {
     #[inline]
     pub fn alloc_raw(&self, size: usize, align: usize) -> *mut u8 {
         if self.in_nursery() {
-            self.nursery.bump(size, align)
+            self.bump_nursery(size, align)
         } else {
             self.alloc_raw_slow(size, align)
+        }
+    }
+
+    /// Bump [`Self::nursery_free`] inside the open segment, or open another.
+    ///
+    /// Compiled code performs the same two-word bump inline. Both sides
+    /// read and write these cells, so a segment that filled under one is
+    /// full for the other.
+    #[inline]
+    fn bump_nursery(&self, size: usize, align: usize) -> *mut u8 {
+        let free = self.nursery_free.get() as usize;
+        let top = self.nursery_top.get() as usize;
+        if free != 0 {
+            let start = (free + align - 1) & !(align - 1);
+            if let Some(end) = start.checked_add(size) {
+                if end <= top {
+                    self.nursery_free.set(end as *mut u8);
+                    let base = self.nursery.open_base.get() as usize;
+                    self.nursery.open_used.set(end - base);
+                    self.nursery.objects.set(self.nursery.objects.get() + 1);
+                    self.nursery
+                        .bytes
+                        .set(self.nursery.bytes.get() + size as u64);
+                    return start as *mut u8;
+                }
+            }
+        }
+        // Compiled code may have advanced `nursery_free` without updating
+        // the segment's `used`. Record that cursor before the segment is
+        // closed.
+        self.flush_nursery_bump();
+        let ptr = self.nursery.bump_grow(size, align);
+        self.publish_nursery_bounds();
+        ptr
+    }
+
+    /// Store the open segment's cursor into [`Self::nursery_free`] /
+    /// [`Self::nursery_top`].
+    fn publish_nursery_bounds(&self) {
+        let base = self.nursery.open_base.get();
+        if base.is_null() {
+            self.nursery_free.set(null_mut());
+            self.nursery_top.set(null_mut());
+            return;
+        }
+        let used = self.nursery.open_used.get();
+        let cap = self.nursery.open_cap.get();
+        self.nursery_free.set(unsafe { base.add(used) });
+        self.nursery_top.set(unsafe { base.add(cap) });
+    }
+
+    /// Compiled bumps move [`Self::nursery_free`] and leave the segment's
+    /// `used` behind. Copy the cursor back before a rewind or reset reads it.
+    fn flush_nursery_bump(&self) {
+        let base = self.nursery.open_base.get();
+        if base.is_null() {
+            return;
+        }
+        let free = self.nursery_free.get() as usize;
+        let base_u = base as usize;
+        if free < base_u {
+            return;
+        }
+        let used = free - base_u;
+        self.nursery.open_used.set(used);
+        if let Some(open) = self.nursery.segments.borrow_mut().last_mut() {
+            open.used = used;
         }
     }
 
@@ -860,7 +941,7 @@ impl CelHeap {
     pub fn contains(&self, ptr: *const u8) -> bool {
         let p = ptr as usize;
         self.old.contains(p)
-            || self.nursery.contains(p)
+            || self.nursery_contains(p)
             || self
                 .regions
                 .borrow()
@@ -869,8 +950,25 @@ impl CelHeap {
     }
 
     /// Whether `ptr` is live nursery memory.
+    ///
+    /// The open segment's end is [`Self::nursery_free`], which compiled
+    /// code advances without touching the segment vector.
     pub fn is_young(&self, ptr: *const u8) -> bool {
-        self.nursery.contains(ptr as usize)
+        self.nursery_contains(ptr as usize)
+    }
+
+    fn nursery_contains(&self, p: usize) -> bool {
+        let segs = self.nursery.segments.borrow();
+        let last = segs.len().saturating_sub(1);
+        let free = self.nursery_free.get() as usize;
+        segs.iter().enumerate().any(|(i, seg)| {
+            if i == last {
+                let base = seg.base as usize;
+                p >= base && p < free
+            } else {
+                seg.contains(p)
+            }
+        })
     }
 }
 
@@ -927,32 +1025,114 @@ pub fn with_heap<R>(f: impl FnOnce(&CelHeap) -> R) -> R {
     HEAP.with(f)
 }
 
-/// `GcLLDescr_boehm.malloc_fixedsize` → `GC_malloc` (`malloc_zero_filled`).
+/// `GcLLDescr_framework.malloc_fixedsize` for an object the nursery declined.
 ///
-/// Compiled `NEW_WITH_VTABLE` and blackhole `_bh_malloc` call this when the
-/// portal publishes it. The block is this thread's [`CelHeap`], the same
-/// owner as [`super::object::new_int_in`]. `GC_malloc` returns zero-filled
-/// storage, so this clears the block once and the backend does not clear it
-/// again. The function takes only the size (`gc.py malloc_fixedsize`); the
-/// heap is the one [`heap_ptr`] already cached, the same thread-local
-/// allocator `GC_local_malloc` uses. There is no nursery pointer to bump:
-/// Boehm has no `get_nursery_free_addr`.
+/// The block is this thread's [`CelHeap`], the same owner as
+/// [`super::object::new_int_in`]. `rewrite.py` `malloc_zero_filled` is false
+/// for a framework descr, so this does not clear the block: the rewriter
+/// emits the NULL stores `clear_gc_fields` owes, and the constructor writes
+/// every other field. The function takes only the size
+/// (`gc.py malloc_fixedsize`); the heap is the one [`heap_ptr`] already cached.
 pub extern "C" fn cel_malloc_fixedsize(size: usize) -> *mut u8 {
-    let ptr = unsafe { (*heap_ptr()).alloc_raw(size, align_of::<u64>()) };
-    unsafe {
-        // Small blocks: word stores. `write_bytes` is `bzero`.
-        if size <= 256 && size % 8 == 0 {
-            let words = ptr.cast::<u64>();
-            let mut i = 0;
-            while i < size / 8 {
-                words.add(i).write(0);
-                i += 1;
-            }
-        } else {
-            core::ptr::write_bytes(ptr, 0, size);
-        }
+    unsafe { (*heap_ptr()).alloc_raw(size, align_of::<u64>()) }
+}
+
+/// Headerless nursery descr for this thread's [`CelHeap`].
+///
+/// `gc.py get_nursery_free_addr` / `get_nursery_top_addr` name the two cells
+/// on the heap. The slow path is `bump_grow`: a new segment, never a
+/// collection, so no root walker is consulted and nothing moves.
+#[cfg(feature = "jit")]
+pub struct CelGc;
+
+#[cfg(feature = "jit")]
+impl majit_gc::GcAllocator for CelGc {
+    fn alloc_nursery(&mut self, size: usize) -> majit_ir::GcRef {
+        self.alloc_nursery_headerless(size)
     }
-    ptr
+
+    fn alloc_nursery_no_collect(&mut self, size: usize) -> majit_ir::GcRef {
+        self.alloc_nursery_headerless(size)
+    }
+
+    fn alloc_varsize(
+        &mut self,
+        base_size: usize,
+        item_size: usize,
+        length: usize,
+    ) -> majit_ir::GcRef {
+        let Some(bytes) = item_size
+            .checked_mul(length)
+            .and_then(|n| base_size.checked_add(n))
+        else {
+            return majit_ir::GcRef(0);
+        };
+        self.alloc_nursery_headerless(bytes)
+    }
+
+    fn alloc_varsize_no_collect(
+        &mut self,
+        base_size: usize,
+        item_size: usize,
+        length: usize,
+    ) -> majit_ir::GcRef {
+        self.alloc_varsize(base_size, item_size, length)
+    }
+
+    /// Overflow of an inline headerless bump.
+    ///
+    /// Opens a nursery segment via [`CelHeap::bump_nursery`] and returns the
+    /// block. This does not collect: cel objects do not move, and there is
+    /// no root walker because nothing here would need one.
+    fn alloc_nursery_headerless(&mut self, size: usize) -> majit_ir::GcRef {
+        let ptr = unsafe { (*heap_ptr()).bump_nursery(size, align_of::<u64>()) };
+        majit_ir::GcRef(ptr as usize)
+    }
+
+    fn write_barrier(&mut self, _obj: majit_ir::GcRef) {}
+
+    fn jit_remember_young_pointer(&mut self, _obj: majit_ir::GcRef) {}
+
+    fn jit_remember_young_pointer_from_array(&mut self, _obj: majit_ir::GcRef) {}
+
+    fn remember_young_pointer_from_array2(
+        &mut self,
+        _obj: majit_ir::GcRef,
+        _index: usize,
+        _card_page_shift: u32,
+    ) {
+    }
+
+    fn collect_nursery(&mut self) {}
+
+    fn collect_full(&mut self) {}
+
+    fn nursery_free(&self) -> *mut u8 {
+        unsafe { (*heap_ptr()).nursery_free.get() }
+    }
+
+    fn nursery_free_addr(&self) -> usize {
+        unsafe { core::ptr::addr_of!((*heap_ptr()).nursery_free) as usize }
+    }
+
+    fn nursery_top(&self) -> *const u8 {
+        unsafe { (*heap_ptr()).nursery_top.get() }
+    }
+
+    fn nursery_top_addr(&self) -> usize {
+        unsafe { core::ptr::addr_of!((*heap_ptr()).nursery_top) as usize }
+    }
+
+    fn max_nursery_object_size(&self) -> usize {
+        SEGMENT_BYTES
+    }
+
+    /// Fixed-size cel objects carry the vtable at offset 0 and no
+    /// `GcHeader`. `rewrite.py gen_malloc_nursery` must emit
+    /// `CALL_MALLOC_NURSERY` in its headerless form.
+    fn headerless_fixedsize(&self) -> bool {
+        true
+    }
 }
 
 /// Nursery bump captured at outermost entry. Leave compares [`Self::used`]

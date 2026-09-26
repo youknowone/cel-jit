@@ -114,3 +114,54 @@ fn created_on_a_evaluated_on_b_then_a_dropped_on_a() {
     assert_eq!(program.0.execute(&ctx).expect("A"), Value::Int(31));
     drop(program);
 }
+
+/// Restores `CEL_PORTAL_THRESHOLD` even if the test panics. The variable is
+/// process-global; this binary must run with `--test-threads=1` so a sibling
+/// test does not compile against the lowered threshold.
+struct ThresholdGuard {
+    prev: Option<String>,
+}
+
+impl ThresholdGuard {
+    fn set_100() -> Self {
+        let prev = std::env::var("CEL_PORTAL_THRESHOLD").ok();
+        unsafe { std::env::set_var("CEL_PORTAL_THRESHOLD", "100") };
+        ThresholdGuard { prev }
+    }
+}
+
+impl Drop for ThresholdGuard {
+    fn drop(&mut self) {
+        unsafe {
+            match self.prev.take() {
+                Some(v) => std::env::set_var("CEL_PORTAL_THRESHOLD", v),
+                None => std::env::remove_var("CEL_PORTAL_THRESHOLD"),
+            }
+        }
+    }
+}
+
+/// Two threads each compile and run an allocating loop. Machine code bakes
+/// the compiling thread's `nursery_free` address, so each thread must run
+/// only the loops its own driver compiled.
+#[test]
+fn compiled_allocating_loop_on_two_threads() {
+    let _threshold = ThresholdGuard::set_100();
+    let program = Arc::new(SharedProgram(
+        Program::compile(r#"list.map(e, {"k": e})"#).expect("compiles"),
+    ));
+    let mut joins = Vec::new();
+    for _ in 0..2 {
+        let program = Arc::clone(&program);
+        joins.push(thread::spawn(move || {
+            let ctx = ctx_with_x_and_list();
+            let once = program.0.execute(&ctx).expect("once");
+            for _ in 0..300 {
+                assert_eq!(program.0.execute(&ctx).expect("loop"), once);
+            }
+        }));
+    }
+    for j in joins {
+        j.join().expect("thread");
+    }
+}
