@@ -628,10 +628,30 @@ impl CelHeap {
         if !outermost {
             return;
         }
-        if self.nursery.open_used.get() == snap.used && self.young_host_n.get() == snap.hosts {
+        // Compiled bumps and the nursery fast path advance `nursery_free`
+        // and leave `open_used` for [`flush_nursery_bump`]. Compare the
+        // live cursor, or an evaluation that only bumped the pointer
+        // looks empty and skips the rewind.
+        if self.live_nursery_used() == snap.used && self.young_host_n.get() == snap.hosts {
             return;
         }
         self.leave_slow(snap);
+    }
+
+    /// Bytes handed out of the open nursery segment.
+    ///
+    /// [`Self::nursery_free`] is the cursor both sides bump. `open_used`
+    /// catches up in [`Self::flush_nursery_bump`], so a read in between
+    /// has to use the pointer.
+    #[inline(always)]
+    fn live_nursery_used(&self) -> usize {
+        let base = self.nursery.open_base.get() as usize;
+        let free = self.nursery_free.get() as usize;
+        if base != 0 && free >= base {
+            free - base
+        } else {
+            self.nursery.open_used.get()
+        }
     }
 
     #[cold]
@@ -755,8 +775,10 @@ impl CelHeap {
     ///
     /// Compiled code performs the same two-word bump inline. Both sides
     /// read and write these cells, so a segment that filled under one is
-    /// full for the other.
-    #[inline]
+    /// full for the other. The fast path does not touch the segment
+    /// vector or `open_used`; [`Self::flush_nursery_bump`] copies the
+    /// cursor back before a rewind, a reset, or a new segment.
+    #[inline(always)]
     fn bump_nursery(&self, size: usize, align: usize) -> *mut u8 {
         let free = self.nursery_free.get() as usize;
         let top = self.nursery_top.get() as usize;
@@ -765,8 +787,6 @@ impl CelHeap {
             if let Some(end) = start.checked_add(size) {
                 if end <= top {
                     self.nursery_free.set(end as *mut u8);
-                    let base = self.nursery.open_base.get() as usize;
-                    self.nursery.open_used.set(end - base);
                     self.nursery.objects.set(self.nursery.objects.get() + 1);
                     self.nursery
                         .bytes
@@ -775,9 +795,14 @@ impl CelHeap {
                 }
             }
         }
-        // Compiled code may have advanced `nursery_free` without updating
-        // the segment's `used`. Record that cursor before the segment is
-        // closed.
+        self.bump_nursery_grow(size, align)
+    }
+
+    /// Open a nursery segment. The fast path's cursor lives only in
+    /// [`Self::nursery_free`] until this copies it onto the segment.
+    #[cold]
+    #[inline(never)]
+    fn bump_nursery_grow(&self, size: usize, align: usize) -> *mut u8 {
         self.flush_nursery_bump();
         let ptr = self.nursery.bump_grow(size, align);
         self.publish_nursery_bounds();
@@ -801,6 +826,8 @@ impl CelHeap {
 
     /// Compiled bumps move [`Self::nursery_free`] and leave the segment's
     /// `used` behind. Copy the cursor back before a rewind or reset reads it.
+    #[cold]
+    #[inline(never)]
     fn flush_nursery_bump(&self) {
         let base = self.nursery.open_base.get();
         if base.is_null() {
@@ -1006,7 +1033,7 @@ thread_local! {
 
 /// This thread's heap, resolved once.
 #[inline]
-fn heap_ptr() -> *const CelHeap {
+pub(crate) fn heap_ptr() -> *const CelHeap {
     HEAP_PTR.with(|p| {
         let cached = p.get();
         if cached.is_null() {

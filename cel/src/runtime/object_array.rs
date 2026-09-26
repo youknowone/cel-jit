@@ -187,6 +187,7 @@ pub fn new_int_words_in(heap: &super::heap::CelHeap, cap: usize) -> *mut CelIntW
 /// # Safety
 ///
 /// The caller writes `cap` items before anything reads them.
+#[inline(always)]
 unsafe fn alloc_block_in(
     heap: &super::heap::CelHeap,
     base: usize,
@@ -197,6 +198,8 @@ unsafe fn alloc_block_in(
     let size = base + item_size * cap;
     let raw = heap.alloc_raw(size, align);
     // The length word first, so a block is never observable without one.
+    // The item bytes are left uninitialised: callers write every live
+    // byte, and zeroing here is a per-call `memset` the readers never need.
     unsafe { (raw as *mut usize).write(cap) };
     raw
 }
@@ -334,6 +337,24 @@ pub fn new_items_block_zeroed_in(heap: &super::heap::CelHeap, cap: usize) -> *mu
 /// An items block of `cap` null slots on this thread's heap.
 pub fn new_items_block_zeroed(cap: usize) -> *mut CelItemsBlock {
     super::heap::with_heap(|h| new_items_block_zeroed_in(h, cap))
+}
+
+/// A byte block of `len` uninitialised bytes on `heap`.
+///
+/// The capacity word is written. The bytes are not: `ll_int2dec` stores
+/// each digit itself, and a `memcpy` from a stack buffer is the copy
+/// this exists to avoid.
+#[inline(always)]
+pub fn new_bytes_block_uninit_in(heap: &super::heap::CelHeap, len: usize) -> *mut CelBytesBlock {
+    unsafe {
+        alloc_block_in(
+            heap,
+            CEL_BYTES_BLOCK_TOKEN.base_size,
+            CEL_BYTES_BLOCK_TOKEN.item_size,
+            core::mem::align_of::<CelBytesBlock>(),
+            len,
+        ) as *mut CelBytesBlock
+    }
 }
 
 /// A block holding `bytes` on `heap`.

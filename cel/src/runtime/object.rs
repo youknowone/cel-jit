@@ -495,48 +495,54 @@ pub fn new_string(s: &str) -> *mut W_StringObject {
     })
 }
 
-/// `ll_str.py` `ll_int2dec`: one digit pass, from the end, into a stack
-/// buffer, then `mallocstr` of that exact length. The leaf and its bytes
-/// block come from one heap access. The bytes are ASCII digits (and an
-/// optional leading `-`) by construction, so nothing validates them as UTF-8.
+/// `ll_str.py` `ll_int2dec`: count the digits, `mallocstr` of that exact
+/// length, then write the digits from the end into the block. The leaf
+/// and its bytes block come from one heap access. The bytes are ASCII
+/// digits (and an optional leading `-`) by construction, so nothing
+/// validates them as UTF-8.
 ///
 /// `i64::MIN` negates in `u64` (`ll_unsigned(-val)`): its magnitude is `2^63`,
-/// nineteen digits, and the sign fills the twentieth byte of the buffer.
+/// nineteen digits, and the sign is the twentieth byte.
 pub fn string_from_int(n: i64) -> *mut W_StringObject {
-    let mut buf = [0u8; 20];
-    let mut start = buf.len();
     let neg = n < 0;
     let mut val = if neg {
         (n as u64).wrapping_neg()
     } else {
         n as u64
     };
-    if val == 0 {
-        start -= 1;
-        buf[start] = b'0';
-    } else {
-        while val != 0 {
-            start -= 1;
-            buf[start] = b'0' + (val % 10) as u8;
-            val /= 10;
+    // `ll_int2dec`: `len` is the magnitude's digits; zero contributes
+    // its single `'0'` through `int(val == 0)`, not through this loop.
+    let mut len = 0usize;
+    let mut probe = val;
+    while probe != 0 {
+        len += 1;
+        probe /= 10;
+    }
+    let total = len + usize::from(neg) + usize::from(val == 0);
+    let heap = unsafe { &*super::heap::heap_ptr() };
+    let chars = object_array::new_bytes_block_uninit_in(heap, total);
+    unsafe {
+        let p = object_array::bytes_base(chars);
+        if neg {
+            *p = b'-';
+        } else if val == 0 {
+            *p = b'0';
         }
-    }
-    if neg {
-        start -= 1;
-        buf[start] = b'-';
-    }
-    let bytes = &buf[start..];
-    super::heap::with_heap(|h| {
-        let chars = object_array::new_bytes_block_in(h, bytes);
-        h.alloc(W_StringObject {
+        let mut j = 0usize;
+        while j < len {
+            *p.add(total - j - 1) = b'0' + (val % 10) as u8;
+            val /= 10;
+            j += 1;
+        }
+        heap.alloc(W_StringObject {
             ob_header: CelObject {
                 ob_type: &CEL_STRING_CLASS,
             },
             chars,
-            byte_len: bytes.len() as i64,
+            byte_len: total as i64,
             public: core::ptr::null(),
         })
-    })
+    }
 }
 
 /// Box the concatenation of two UTF-8 slices as a CEL `string`.
@@ -2462,6 +2468,8 @@ mod tests {
         check(0);
         check(9);
         check(10);
+        check(99);
+        check(100);
         check(-1);
         check(-10);
         check(i64::MAX);
