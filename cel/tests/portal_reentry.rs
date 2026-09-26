@@ -275,3 +275,74 @@ fn compiled_field_name_is_one_immortal_cell() {
         Some("a")
     );
 }
+
+fn as_int(v: &Value) -> i64 {
+    match v {
+        Value::Int(n) => *n,
+        other => panic!("not an int: {other:?}"),
+    }
+}
+
+/// Same `Context`, rebind `x` after the loop compiled. The leaf is keyed
+/// on the version, so the next evaluation must return the new value.
+#[test]
+fn compiled_rebind_changes_the_leaf() {
+    unsafe { std::env::set_var("CEL_PORTAL_THRESHOLD", "100") };
+    let mut ctx = Context::default();
+    ctx.add_variable_from_value("x", 15i64);
+    let program = Program::compile("x").unwrap();
+    for i in 0..150 {
+        let got = program
+            .execute(&ctx)
+            .unwrap_or_else(|e| panic!("{i}: {e:?}"));
+        assert_eq!(as_int(&got), 15, "warmup {i}");
+    }
+    ctx.add_variable_from_value("x", 99i64);
+    let got = program.execute(&ctx).unwrap_or_else(|e| panic!("{e:?}"));
+    assert_eq!(as_int(&got), 99, "rebind kept the traced leaf");
+}
+
+/// Drop the context and allocate another. The address may be reused; the
+/// result must follow the new binding.
+#[test]
+fn compiled_fresh_context_is_not_the_old_leaf() {
+    unsafe { std::env::set_var("CEL_PORTAL_THRESHOLD", "100") };
+    let program = Program::compile("x").unwrap();
+    {
+        let mut ctx = Context::default();
+        ctx.add_variable_from_value("x", 15i64);
+        for i in 0..150 {
+            let got = program
+                .execute(&ctx)
+                .unwrap_or_else(|e| panic!("{i}: {e:?}"));
+            assert_eq!(as_int(&got), 15, "warmup {i}");
+        }
+    }
+    for n in 0..64 {
+        let mut ctx = Context::default();
+        let want = 1000 + n;
+        ctx.add_variable_from_value("x", want);
+        let got = program
+            .execute(&ctx)
+            .unwrap_or_else(|e| panic!("{n}: {e:?}"));
+        assert_eq!(as_int(&got), want, "fresh context {n}");
+    }
+}
+
+/// A resolver context must not bake the leaf observed on the first call.
+#[test]
+fn compiled_resolver_context_stays_live() {
+    unsafe { std::env::set_var("CEL_PORTAL_THRESHOLD", "100") };
+    let resolver = CountingResolver {
+        n: std::cell::Cell::new(0),
+    };
+    let mut ctx = Context::default();
+    ctx.set_variable_resolver(&resolver);
+    let program = Program::compile("x").unwrap();
+    for i in 0..150 {
+        let got = program
+            .execute(&ctx)
+            .unwrap_or_else(|e| panic!("{i}: {e:?}"));
+        assert_eq!(as_int(&got), i, "resolver execute {i}");
+    }
+}

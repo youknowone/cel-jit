@@ -46,6 +46,9 @@ use crate::{ExecutionError, Value};
 const PORTAL_DONE: i64 = -1;
 /// `dispatch_one` failed with no handler.
 const PORTAL_FAIL: i64 = -2;
+/// Sign bit on a finished leaf pointer. Userspace pointers leave it clear,
+/// so the word stays negative and is not taken as a bytecode pc.
+const PORTAL_LEAF_TAG: i64 = i64::MIN;
 
 /// A published interned leaf, or `None` when the cell is null.
 fn slot_leaf(w: i64) -> Option<CelRef> {
@@ -341,6 +344,13 @@ macro_rules! interned_arith_local_k_append {
 struct PortalState {
     frame: usize,
     vm: i64,
+    /// Context address. The leaf is not keyed on this: a rebind keeps the
+    /// address and a new context can reuse it.
+    ctx: i64,
+    /// `VersionTag` id and pointer, read from the context at entry.
+    /// `ModuleDictStrategy._version` (`_immutable_fields_ = ["version?"]`).
+    version_id: i64,
+    version_ptr: i64,
     ret: i64,
 }
 
@@ -1122,24 +1132,81 @@ fn intern_var(vm_bits: i64, program: &CelCode, idx: i64) -> CelRef {
         .unwrap_or(core::ptr::null_mut())
 }
 
-/// [`intern_var`] when [`context_lookup_pure`] is true.
+/// [`intern_var`] when the context has no resolver.
 ///
-/// `effectinfo.py` `EF_ELIDABLE_CANNOT_RAISE` (`jtransform.py`
-/// `_do_builtin_call` / `call.py` `EF_ELIDABLE_CANNOT_RAISE`).
-/// Loop-invariant arguments reuse the preamble result (`pure.py` `OptPure`),
-/// the same shape as `celldict.py` `_getdictvalue_no_unwrapping_pure`.
-#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+/// `jit_inline` cannot record a quasi-immutable field: `jit_interp` has
+/// no `RecordQuasiImmutField` (that op lives in `quasiimmut.rs`
+/// `QuasiImmutDescr`, below this macro). The fallback promotes the
+/// version id and the version pointer read at portal entry
+/// (`getdictvalue_no_unwrapping` promotes `version` before
+/// `_getdictvalue_no_unwrapping_pure`). The id is never reused, so a
+/// context or version box allocated at a stale address fails the guard.
+/// The context pointer is promoted only so `OptPure` can fold the lookup;
+/// it is not the key.
+#[majit_macros::jit_inline(
+    ref_params = { program: ref(CelCode) },
+    calls = {
+        context_is_pure => elidable_int_cannot_raise,
+        intern_version_pure => elidable_ref_cannot_raise_wrapped,
+        intern_var_ptr => residual_ref,
+    },
+)]
 fn intern_var_pure(
+    version_id: i64,
+    version_ptr: i64,
+    ctx_bits: i64,
     vm_bits: i64,
-    program: &CelCode,
+    program: *const CelCode,
     idx: i64,
 ) -> *mut crate::runtime::object::CelObject {
+    let version_id = majit_ir::jit::promote(version_id);
+    let version_ptr = majit_ir::jit::promote(version_ptr);
+    let ctx_bits = majit_ir::jit::promote(ctx_bits);
+    if context_is_pure(version_id, version_ptr, ctx_bits) != 0 {
+        intern_version_pure(version_id, version_ptr, ctx_bits, program, idx)
+    } else {
+        intern_var_ptr(vm_bits, program, idx)
+    }
+}
+
+#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+fn intern_var_ptr(vm_bits: i64, program: *const CelCode, idx: i64) -> CelRef {
+    intern_var(vm_bits, unsafe { &*program }, idx)
+}
+
+/// [`intern_var_pure`] keyed on the version, not the context address.
+///
+/// `_getdictvalue_no_unwrapping_pure(version, w_dict, key)` is
+/// `@jit.elidable_promote`. A version id that does not match the pointer
+/// yields null, so the pure cache cannot replay another generation's leaf.
+#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+fn intern_version_pure(
+    version_id: i64,
+    version_ptr: i64,
+    ctx_bits: i64,
+    program: *const CelCode,
+    idx: i64,
+) -> *mut crate::runtime::object::CelObject {
+    let ctx = ctx_bits as usize as *const crate::context::Context;
+    if !unsafe { (*ctx).version_matches(version_id, version_ptr) } {
+        return core::ptr::null_mut();
+    }
+    let program = unsafe { &*program };
     let Some(name) = program.name(NameId(idx as u32)) else {
         return core::ptr::null_mut();
     };
-    vm_of(vm_bits)
-        .intern_context_var_pure(name)
-        .unwrap_or(core::ptr::null_mut())
+    unsafe { (*ctx).lookup_interned_pure(name) }.unwrap_or(core::ptr::null_mut())
+}
+
+/// `1` when no resolver sits on `ctx` for this version, else `0`.
+#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+fn context_is_pure(version_id: i64, version_ptr: i64, ctx_bits: i64) -> i64 {
+    let ctx = ctx_bits as usize as *const crate::context::Context;
+    if unsafe { (*ctx).version_matches(version_id, version_ptr) && (*ctx).lookup_is_pure() } {
+        1
+    } else {
+        0
+    }
 }
 
 /// `1` when no resolver sits on the context chain, else `0`.
@@ -1242,6 +1309,23 @@ fn vm_sync_store(vm_bits: i64, slot: i64, w: i64) {
 #[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
 fn vm_park_return(vm_bits: i64, w: CelRef) {
     vm_of(vm_bits).park_return(w);
+}
+
+/// Sign-tag a leaf so `OP_RETURN` can hand it back as the portal word.
+///
+/// `finish_return_for` only builds `DoneWithThisFrameDescrInt` and the
+/// float descr (`FinishReturnKind::Int` / `Float`). A ref-returning
+/// portal (`DoneWithThisFrameDescrRef`) is not expressible from
+/// `jit_interp`, and that macro is outside this change. The finish word
+/// is an integer register, not a GC ref. The leaf stays alive because it
+/// is an immortal immediate or a bind-region object owned by the live
+/// `Context` (`retained` / `BindRegionSlot`). `Value::from_interned` then
+/// `scope.finish` copies it to a public `Value` before nursery rewind.
+/// No collection runs on this thread between the finish and that copy.
+/// Elidable: a constant leaf becomes a constant finish value.
+#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+fn tag_leaf(w: CelRef) -> i64 {
+    (w as usize as i64) | PORTAL_LEAF_TAG
 }
 
 #[allow(dead_code)]
@@ -1511,9 +1595,13 @@ pub(crate) fn eval_through_portal(
     vm: &mut Vm<'_>,
     code: &CelCode,
 ) -> Result<Value, ExecutionError> {
+    let (version_id, version_ptr) = vm.ctx.portal_version();
     let mut state = PortalState {
         frame: vm.cel_frame as usize,
         vm: vm as *mut Vm<'_> as i64,
+        ctx: vm.ctx as *const crate::context::Context as usize as i64,
+        version_id,
+        version_ptr,
         ret: 0,
     };
     // A host call can re-enter this function on the same thread. The nested
@@ -1548,6 +1636,12 @@ pub(crate) fn eval_through_portal(
     } else {
         run_table_driver(code, &mut state)
     };
+    if bits < PORTAL_FAIL {
+        let w = ((bits as u64) ^ (PORTAL_LEAF_TAG as u64)) as usize as CelRef;
+        if !w.is_null() {
+            return Ok(Value::from_interned(w));
+        }
+    }
     match bits {
         PORTAL_DONE => match vm.portal_ret.take() {
             Some(Ok(value)) => Ok(value),
@@ -3362,6 +3456,9 @@ fn slow_pc(vm: i64, here: i64) -> i64 {
     state_fields = {
         frame: ref(W_CelFrame),
         vm: int,
+        ctx: int,
+        version_id: int,
+        version_ptr: int,
         ret: int,
     },
     // `interp_jit.py` `_virtualizable_` on the frame, `virtualizables=['frame']`.
@@ -3416,7 +3513,9 @@ fn slow_pc(vm: i64, here: i64) -> i64 {
         insn_c => elidable_int_cannot_raise,
         intern_const => elidable_ref_cannot_raise_wrapped,
         intern_var => residual_ref,
-        intern_var_pure => elidable_ref_cannot_raise_wrapped,
+        intern_var_pure => inline_ref,
+        intern_version_pure => elidable_ref_cannot_raise_wrapped,
+        context_is_pure => elidable_int_cannot_raise,
         context_lookup_pure => elidable_int_cannot_raise,
         cell_kind => inline_int,
         cell_int => inline_int,
@@ -3503,6 +3602,7 @@ fn slow_pc(vm: i64, here: i64) -> i64 {
         vm_sync_write_local => residual_int,
         vm_sync_pop => residual_int,
         vm_park_return => residual_void,
+        tag_leaf => elidable_int_cannot_raise,
         step_hot => may_force_int,
         map_opt_insert => inline_int,
         list_opt_append => inline_int,
@@ -3551,13 +3651,17 @@ fn run_cel_portal(
                 let vm = state.vm;
                 let here = pc as i64;
                 let name_idx = insn_a(program, pc);
-                // `context_lookup_pure` is elidable (`EF_ELIDABLE_CANNOT_RAISE`).
-                // The pure arm is `intern_var_pure`; a resolver stays residual.
-                let w = if context_lookup_pure(vm) != 0 {
-                    intern_var_pure(vm, program, name_idx)
-                } else {
-                    intern_var(vm, program, name_idx)
-                };
+                // `intern_var_pure` promotes the version and folds the leaf.
+                // The impure resolver arm lives inside that helper, so the
+                // dispatch does not also call `context_lookup_pure`.
+                let w = intern_var_pure(
+                    state.version_id,
+                    state.version_ptr,
+                    state.ctx,
+                    vm,
+                    program,
+                    name_idx,
+                );
                 let next = if w.is_null() {
                     slow_pc(vm, here)
                 } else {
@@ -3657,11 +3761,13 @@ fn run_cel_portal(
                 let here = pc as i64;
                 let depth = state.frame.valuestackdepth;
                 let w = state.frame.locals_stack_w[depth - 1];
+                // `tag_leaf` packs the leaf into the int finish
+                // (`DoneWithThisFrameDescrInt`). See `tag_leaf` for why this
+                // is not `DoneWithThisFrameDescrRef`.
                 let next = if w.is_null() {
                     slow_pc(vm, here)
                 } else {
-                    vm_park_return(vm, w);
-                    PORTAL_DONE
+                    tag_leaf(w)
                 };
                 if next >= 0 {
                     let tgt = next as usize;

@@ -3,7 +3,26 @@ use crate::objects::{Opaque, TryIntoValue, Value};
 use crate::parser::Expression;
 use crate::{Env, ExecutionError};
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+
+/// Identity of one binding generation.
+///
+/// `ModuleDictStrategy.mutated` installs a fresh `VersionTag`. The id
+/// never repeats, so a freed tag whose address the allocator hands out
+/// again is still a different generation. `jit_interp` has no
+/// quasi-immutable field (`QuasiImmutDescr` / `record_quasi_immutable_field`
+/// are not reachable from `jit_inline`), so the portal promotes this id.
+pub(crate) struct VersionTag {
+    id: u64,
+}
+
+fn fresh_version() -> Box<VersionTag> {
+    static NEXT_VERSION: AtomicU64 = AtomicU64::new(1);
+    Box::new(VersionTag {
+        id: NEXT_VERSION.fetch_add(1, Ordering::Relaxed),
+    })
+}
 
 /// Context is a collection of variables and functions that can be used
 /// by the interpreter to resolve expressions.
@@ -59,6 +78,10 @@ pub enum Context<'a> {
         /// dropped with the Context. A child created for a comprehension
         /// never wraps, so it stays empty.
         region: crate::runtime::heap::BindRegionSlot,
+        /// Replaced on every binding change. Quasi-immutable `version?`
+        /// on `ModuleDictStrategy`, spelled as a fresh box because
+        /// `jit_inline` cannot record `RecordQuasiImmutField`.
+        version: Box<VersionTag>,
     },
     Child {
         parent: &'a Context<'a>,
@@ -66,6 +89,7 @@ pub enum Context<'a> {
         resolver: Option<&'a dyn VariableResolver>,
         retained: Vec<Value>,
         region: crate::runtime::heap::BindRegionSlot,
+        version: Box<VersionTag>,
     },
 }
 
@@ -174,11 +198,51 @@ impl<'a> Context<'a> {
     where
         S: AsRef<str>,
     {
+        self.bump_version();
         let variables = match self {
             Context::Root { variables, .. } => variables,
             Context::Child { variables, .. } => variables,
         };
         store(variables, name, value);
+    }
+
+    fn bump_version(&mut self) {
+        let slot = match self {
+            Context::Root { version, .. } | Context::Child { version, .. } => version,
+        };
+        *slot = fresh_version();
+    }
+
+    /// `(id, pointer)` read once per portal entry.
+    ///
+    /// The id is the guard. The pointer is the version object
+    /// `getdictvalue_no_unwrapping` would promote; a rebind replaces it.
+    pub(crate) fn portal_version(&self) -> (i64, i64) {
+        let version = match self {
+            Context::Root { version, .. } | Context::Child { version, .. } => version.as_ref(),
+        };
+        (
+            version.id as i64,
+            version as *const VersionTag as usize as i64,
+        )
+    }
+
+    /// `version_ptr` still carries `version_id`.
+    ///
+    /// Both arguments are pure-call keys. A mismatch returns false so a
+    /// reused box address cannot publish the previous generation's leaf.
+    pub(crate) fn version_matches(&self, version_id: i64, version_ptr: i64) -> bool {
+        let version = version_ptr as usize as *const VersionTag;
+        !version.is_null()
+            && std::ptr::eq(
+                version,
+                match self {
+                    Context::Root { version, .. } | Context::Child { version, .. } => {
+                        version.as_ref() as *const VersionTag
+                    }
+                },
+            )
+            && unsafe { (*version).id as i64 } == version_id
     }
 
     fn retained_mut(&mut self) -> &mut Vec<Value> {
@@ -228,6 +292,7 @@ impl<'a> Context<'a> {
     }
 
     pub fn set_variable_resolver(&mut self, r: &'a dyn VariableResolver) {
+        self.bump_version();
         match self {
             Context::Root { resolver, .. } => {
                 *resolver = Some(r);
@@ -494,6 +559,7 @@ impl<'a> Context<'a> {
             resolver: None,
             retained: Vec::new(),
             region: crate::runtime::heap::BindRegionSlot::empty(),
+            version: fresh_version(),
         }
     }
 
@@ -516,6 +582,7 @@ impl<'a> Context<'a> {
             resolver: None,
             retained: Vec::new(),
             region: crate::runtime::heap::BindRegionSlot::empty(),
+            version: fresh_version(),
         }
     }
 
@@ -527,6 +594,7 @@ impl<'a> Context<'a> {
             resolver: None,
             retained: Vec::new(),
             region: crate::runtime::heap::BindRegionSlot::empty(),
+            version: fresh_version(),
         }
     }
 }
@@ -540,6 +608,7 @@ impl Default for Context<'_> {
             resolver: None,
             retained: Vec::new(),
             region: crate::runtime::heap::BindRegionSlot::empty(),
+            version: fresh_version(),
         }
     }
 }

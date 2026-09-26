@@ -712,7 +712,9 @@ pub(crate) struct Vm<'a> {
     /// instead of walking `Option<Box<Scratch>>`.
     pub(crate) scratch_bits: usize,
     pub(crate) code: &'a CelCode,
-    ctx: &'a Context<'a>,
+    /// Borrowed for the evaluation. The address is stable across calls that
+    /// share one context; the `Vm` that holds it is not.
+    pub(crate) ctx: &'a Context<'a>,
     /// The activation record, `| locals | stack |` in ONE array, the layout
     /// `PyFrame.__init__` gives `locals_cells_stack_w`. A local is read at
     /// its slot index; the operand stack is the tail from `stack_base` up,
