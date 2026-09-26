@@ -485,6 +485,47 @@ pub fn new_string(s: &str) -> *mut W_StringObject {
     })
 }
 
+/// `ll_int2dec`: digits go straight into the string leaf. No intermediate
+/// `String` allocation.
+pub fn string_from_int(n: i64) -> *mut W_StringObject {
+    if n == i64::MIN {
+        return new_string("-9223372036854775808");
+    }
+    let neg = n < 0;
+    let mut val = if neg {
+        n.wrapping_neg() as u64
+    } else {
+        n as u64
+    };
+    let mut digits = 0usize;
+    let mut probe = val;
+    while probe > 0 {
+        digits += 1;
+        probe /= 10;
+    }
+    if val == 0 {
+        digits = 1;
+    }
+    let total = digits + usize::from(neg);
+    let mut buf = [0u8; 20];
+    if neg {
+        buf[0] = b'-';
+    }
+    if val == 0 {
+        buf[usize::from(neg)] = b'0';
+    } else {
+        let mut j = 0;
+        while j < digits {
+            buf[total - j - 1] = b'0' + (val % 10) as u8;
+            val /= 10;
+            j += 1;
+        }
+    }
+    let bytes = &buf[..total];
+    let s = core::str::from_utf8(bytes).unwrap();
+    new_string(s)
+}
+
 /// Box the concatenation of two UTF-8 slices as a CEL `string`.
 pub fn new_string_concat(left: &[u8], right: &[u8]) -> *mut W_StringObject {
     let chars = object_array::new_bytes_block_concat(left, right);
@@ -514,6 +555,13 @@ pub enum ListStrategy {
     /// A column or record window parked in the heap host table. The
     /// schema/buffer stays shared; `start`/`length` are the window.
     Window = 2,
+    /// Unboxed `f64`s in a [`W_FloatColumn`] at [`W_ListObject::storage`].
+    /// `FloatListStrategy`: `append` stores `unwrap` (`float_w`), not the box.
+    Floats = 3,
+    /// String leaves in [`W_ListObject::items`]. `BytesListStrategy` /
+    /// `AsciiListStrategy`: the list holds the string, and `wrap` is the leaf
+    /// already produced by `ll_str`.
+    Strs = 4,
 }
 
 /// An unboxed integer column. Not pointer-traced; the payload is raw `i64`s.
@@ -533,6 +581,42 @@ pub struct W_IntColumn {
 }
 
 pub static CEL_INT_COLUMN_CLASS: CelClass = CelClass::new("int_column", CelKind::List);
+
+/// An unboxed float column. `FloatListStrategy` storage: raw `f64`s, not
+/// `W_DoubleObject`s. `data` and `length` are write-once, same as
+/// [`W_IntColumn`].
+#[cfg_attr(feature = "jit", majit_macros::jit_immutable_fields(data, length))]
+#[repr(C)]
+#[allow(non_camel_case_types)]
+pub struct W_FloatColumn {
+    pub ob_header: CelObject,
+    /// `f64` bits. The inline array store is `setarrayitem_gc` of a word
+    /// (`add_raw_int_array_descr_signed`); `f64::from_bits` recovers the float.
+    pub data: *mut i64,
+    pub length: i64,
+}
+
+pub static CEL_FLOAT_COLUMN_CLASS: CelClass = CelClass::new("float_column", CelKind::List);
+
+const _: () = {
+    assert!(offset_of!(W_FloatColumn, ob_header) == 0);
+};
+
+/// A float column whose `length` is the allocated count (`ll_newlist_hint`).
+pub(crate) fn new_float_column_capacity(cap: i64) -> *mut W_FloatColumn {
+    let cap = cap.max(1);
+    let bytes = (cap as usize).saturating_mul(core::mem::size_of::<i64>());
+    super::heap::with_heap(|h| {
+        let data = h.alloc_raw(bytes, align_of::<i64>()) as *mut i64;
+        h.alloc(W_FloatColumn {
+            ob_header: CelObject {
+                ob_type: &CEL_FLOAT_COLUMN_CLASS,
+            },
+            data,
+            length: cap,
+        })
+    })
+}
 
 const _: () = {
     assert!(offset_of!(W_IntColumn, ob_header) == 0);
@@ -686,6 +770,14 @@ pub unsafe fn list_get(w: CelRef, index: i64) -> Option<CelRef> {
             }
             Some(new_int(*col.data.add(at as usize)) as CelRef)
         }
+        ListStrategy::Floats => list_float_at(w, index).map(|f| new_double(f) as CelRef),
+        ListStrategy::Strs => {
+            let base = crate::runtime::object_array::items_block_items_base(leaf.items);
+            if base.is_null() {
+                return None;
+            }
+            Some(*base.add(at as usize))
+        }
         ListStrategy::Window => None,
     }
 }
@@ -714,6 +806,32 @@ pub unsafe fn list_int_at(w: CelRef, index: i64) -> Option<i64> {
         return None;
     }
     Some(*col.data.add(at as usize))
+}
+
+/// The unboxed float at `index` of a Floats-strategy list.
+///
+/// `FloatListStrategy.getitem` wraps on the way out; this is the storage read.
+///
+/// # Safety
+///
+/// `w` is a live [`W_ListObject`].
+pub unsafe fn list_float_at(w: CelRef, index: i64) -> Option<f64> {
+    if index < 0 {
+        return None;
+    }
+    let leaf = &*w.cast::<W_ListObject>();
+    if leaf.strategy != ListStrategy::Floats || index >= leaf.length {
+        return None;
+    }
+    if leaf.storage.is_null() {
+        return None;
+    }
+    let col = &*leaf.storage.cast::<W_FloatColumn>();
+    let at = leaf.start + index;
+    if col.data.is_null() || at < 0 || at >= col.length {
+        return None;
+    }
+    Some(f64::from_bits(*col.data.add(at as usize) as u64))
 }
 
 /// The int column of an Ints-strategy list, or `None` if `w` is not one.
@@ -937,6 +1055,118 @@ pub unsafe fn list_promote_empty_to_ints(w: CelRef, word: i64) -> bool {
     list_store_int(w, word)
 }
 
+/// Grow a float-column list so its storage holds at least `newsize` words.
+///
+/// Same shape as [`list_resize_ge`] (`_ll_list_resize_ge`).
+///
+/// # Safety
+///
+/// `w` is a live [`W_ListObject`].
+pub unsafe fn list_resize_ge_float(w: CelRef, newsize: i64) -> bool {
+    if newsize < 0 || w_kind(w) != CelKind::List {
+        return false;
+    }
+    let leaf = &mut *w.cast::<W_ListObject>();
+    if leaf.strategy != ListStrategy::Floats || leaf.storage.is_null() {
+        return false;
+    }
+    let col = &mut *leaf.storage.cast::<W_FloatColumn>();
+    if newsize <= col.length {
+        return true;
+    }
+    let mut newcap = col.length.saturating_mul(2);
+    if newcap < newsize {
+        newcap = newsize;
+    }
+    if newcap < 4 {
+        newcap = 4;
+    }
+    let nbytes = (newcap as usize).saturating_mul(core::mem::size_of::<i64>());
+    let live = leaf.length.max(0) as usize;
+    let src = col.data;
+    let new_col = super::heap::with_heap(|h| {
+        let ptr = h.alloc_raw(nbytes, align_of::<i64>()) as *mut i64;
+        if live > 0 && !src.is_null() {
+            core::ptr::copy_nonoverlapping(src, ptr, live);
+        }
+        h.alloc(W_FloatColumn {
+            ob_header: CelObject {
+                ob_type: &CEL_FLOAT_COLUMN_CLASS,
+            },
+            data: ptr,
+            length: newcap,
+        })
+    });
+    (*w.cast::<W_ListObject>()).storage = new_col as CelRef;
+    true
+}
+
+/// `FloatListStrategy.append`: store the unboxed float.
+///
+/// # Safety
+///
+/// `w` is a live [`W_ListObject`] whose strategy is [`ListStrategy::Floats`].
+pub unsafe fn list_store_float(w: CelRef, word: f64) -> bool {
+    if w_kind(w) != CelKind::List {
+        return false;
+    }
+    let length = (*w.cast::<W_ListObject>()).length;
+    let storage = (*w.cast::<W_ListObject>()).storage;
+    if storage.is_null() {
+        return false;
+    }
+    let cap = (*storage.cast::<W_FloatColumn>()).length;
+    if length < 0 || (length >= cap && !list_resize_ge_float(w, length + 1)) {
+        return false;
+    }
+    let leaf = &mut *w.cast::<W_ListObject>();
+    let storage = leaf.storage;
+    if storage.is_null() {
+        return false;
+    }
+    let col = &*storage.cast::<W_FloatColumn>();
+    let at = leaf.length;
+    if col.data.is_null() || at < 0 || at >= col.length {
+        return false;
+    }
+    let data = col.data;
+    *data.add(at as usize) = word.to_bits() as i64;
+    leaf.length = at + 1;
+    leaf.public = core::ptr::null();
+    leaf.public_start = 0;
+    leaf.public_len = 0;
+    true
+}
+
+/// Empty object list becomes a float column, then the word is stored.
+///
+/// `EmptyListStrategy.switch_to_correct_strategy` for a float.
+///
+/// # Safety
+///
+/// `w` is a live [`W_ListObject`].
+pub unsafe fn list_promote_empty_to_floats(w: CelRef, word: f64) -> bool {
+    if w_kind(w) != CelKind::List {
+        return false;
+    }
+    let leaf = &*w.cast::<W_ListObject>();
+    if leaf.strategy != ListStrategy::Object || leaf.length != 0 {
+        return false;
+    }
+    let cap = if leaf.items.is_null() {
+        1
+    } else {
+        (crate::runtime::object_array::items_capacity(leaf.items) as i64).max(1)
+    };
+    let col = new_float_column_capacity(cap);
+    let leaf = &mut *w.cast::<W_ListObject>();
+    leaf.strategy = ListStrategy::Floats;
+    leaf.storage = col as CelRef;
+    leaf.items = core::ptr::null_mut();
+    leaf.start = 0;
+    list_store_float(w, word)
+}
+
 /// `switch_to_object_strategy`: box the int column and append `item`.
 ///
 /// # Safety
@@ -987,32 +1217,80 @@ unsafe fn list_switch_to_object_append(w: CelRef, item: CelRef) -> bool {
     true
 }
 
-/// Append `item` to a list opened by [`new_list_with_capacity`].
+/// `switch_to_object_strategy` from a float column: box each float, then append.
 ///
-/// An int joined to an empty list or to an int column is stored unboxed
-/// (`IntegerListStrategy.append`). Anything else stays on, or switches to,
-/// the object strategy.
+/// # Safety
+///
+/// `w` is a live [`W_ListObject`]. `item` is a live value.
+unsafe fn list_switch_floats_to_object(w: CelRef, item: CelRef) -> bool {
+    if w_kind(w) != CelKind::List {
+        return false;
+    }
+    let leaf = &*w.cast::<W_ListObject>();
+    if leaf.strategy != ListStrategy::Floats {
+        return false;
+    }
+    let n = leaf.length.max(0) as usize;
+    let col = leaf.storage;
+    let (words, cap_words) = if col.is_null() {
+        (core::ptr::null_mut(), 0i64)
+    } else {
+        let col = &*col.cast::<W_FloatColumn>();
+        (col.data, col.length)
+    };
+    if n > 0 && words.is_null() {
+        return false;
+    }
+    let cap = (cap_words.max(0) as usize).max(n + 1);
+    let items = super::heap::with_heap(|h| {
+        crate::runtime::object_array::new_items_block_with_zeroed_prefix_in(h, cap, 0)
+    });
+    let base = crate::runtime::object_array::items_block_items_base(items);
+    if base.is_null() {
+        return false;
+    }
+    let mut i = 0;
+    while i < n {
+        *base.add(i) = new_double(f64::from_bits(*words.add(i) as u64)) as CelRef;
+        i += 1;
+    }
+    *base.add(n) = item;
+    let leaf = &mut *w.cast::<W_ListObject>();
+    leaf.strategy = ListStrategy::Object;
+    leaf.storage = core::ptr::null_mut();
+    leaf.items = items;
+    leaf.start = 0;
+    leaf.length = (n + 1) as i64;
+    leaf.public = core::ptr::null();
+    leaf.public_start = 0;
+    leaf.public_len = 0;
+    true
+}
+
+/// A string-strategy list is already an items block. A non-string switches
+/// the tag to [`ListStrategy::Object`] (`switch_to_object_strategy`).
 ///
 /// # Safety
 ///
 /// `w` is a live [`W_ListObject`].
-pub unsafe fn list_try_append(w: CelRef, item: CelRef) -> bool {
+unsafe fn list_switch_strs_to_object(w: CelRef, item: CelRef) -> bool {
     if w_kind(w) != CelKind::List {
         return false;
     }
-    let strategy = (*w.cast::<W_ListObject>()).strategy;
-    if strategy == ListStrategy::Ints {
-        if w_kind(item) == CelKind::Int {
-            return list_store_int(w, (*item.cast::<W_IntObject>()).intval);
-        }
-        return list_switch_to_object_append(w, item);
-    }
-    if strategy != ListStrategy::Object {
+    let leaf = &mut *w.cast::<W_ListObject>();
+    if leaf.strategy != ListStrategy::Strs {
         return false;
     }
-    if (*w.cast::<W_ListObject>()).length == 0 && w_kind(item) == CelKind::Int {
-        return list_promote_empty_to_ints(w, (*item.cast::<W_IntObject>()).intval);
-    }
+    leaf.strategy = ListStrategy::Object;
+    list_append_item_ref(w, item)
+}
+
+/// Store `item` into an object or string items block.
+///
+/// # Safety
+///
+/// `w` is a live list whose items block has a free slot.
+unsafe fn list_append_item_ref(w: CelRef, item: CelRef) -> bool {
     let leaf = &mut *w.cast::<W_ListObject>();
     let cap = crate::runtime::object_array::items_capacity(leaf.items);
     if leaf.length < 0 || (leaf.length as usize) >= cap {
@@ -1028,6 +1306,57 @@ pub unsafe fn list_try_append(w: CelRef, item: CelRef) -> bool {
     leaf.public_start = 0;
     leaf.public_len = 0;
     true
+}
+
+/// Append `item` to a list opened by [`new_list_with_capacity`].
+///
+/// An int, float, or string joined to an empty list or to a matching column
+/// is stored unboxed (`IntegerListStrategy.append`, `FloatListStrategy.append`,
+/// `AsciiListStrategy.append`). A mismatch switches to the object strategy.
+///
+/// # Safety
+///
+/// `w` is a live [`W_ListObject`].
+pub unsafe fn list_try_append(w: CelRef, item: CelRef) -> bool {
+    if w_kind(w) != CelKind::List {
+        return false;
+    }
+    let strategy = (*w.cast::<W_ListObject>()).strategy;
+    let kind = w_kind(item);
+    if strategy == ListStrategy::Ints {
+        if kind == CelKind::Int {
+            return list_store_int(w, (*item.cast::<W_IntObject>()).intval);
+        }
+        return list_switch_to_object_append(w, item);
+    }
+    if strategy == ListStrategy::Floats {
+        if kind == CelKind::Double {
+            return list_store_float(w, (*item.cast::<W_DoubleObject>()).floatval);
+        }
+        return list_switch_floats_to_object(w, item);
+    }
+    if strategy == ListStrategy::Strs {
+        if kind == CelKind::Str {
+            return list_append_item_ref(w, item);
+        }
+        return list_switch_strs_to_object(w, item);
+    }
+    if strategy != ListStrategy::Object {
+        return false;
+    }
+    if (*w.cast::<W_ListObject>()).length == 0 {
+        if kind == CelKind::Int {
+            return list_promote_empty_to_ints(w, (*item.cast::<W_IntObject>()).intval);
+        }
+        if kind == CelKind::Double {
+            return list_promote_empty_to_floats(w, (*item.cast::<W_DoubleObject>()).floatval);
+        }
+        if kind == CelKind::Str {
+            (*w.cast::<W_ListObject>()).strategy = ListStrategy::Strs;
+            return list_append_item_ref(w, item);
+        }
+    }
+    list_append_item_ref(w, item)
 }
 
 pub fn new_list(values: &[CelRef]) -> *mut W_ListObject {

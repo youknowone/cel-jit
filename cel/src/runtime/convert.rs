@@ -27,11 +27,9 @@ use crate::common::types::{
     Kind, Type, TypeValue, BOOL_TYPE, BYTES_TYPE, DOUBLE_TYPE, INT_TYPE, LIST_TYPE, MAP_TYPE,
     NULL_TYPE, OPTIONAL_TYPE, STRING_TYPE, TYPE_TYPE, UINT_TYPE,
 };
-#[cfg(test)]
-use crate::objects::ListStorage;
 use crate::objects::{
-    map_get_by_key, map_has_exact_key, try_build_map, Key, KeyRef, ListRef, Map, MapStorage,
-    Opaque, OptionalValue,
+    map_get_by_key, map_has_exact_key, try_build_map, Key, KeyRef, ListRef, ListStorage, Map,
+    MapStorage, Opaque, OptionalValue, ScalarBank, ValueColumn,
 };
 use crate::Value;
 
@@ -539,6 +537,21 @@ unsafe fn interned_object_list_ints(leaf: &W_ListObject) -> Option<ListRef> {
     .ok()
 }
 
+/// Items-block list → one [`Value`] per element.
+///
+/// Object lists and string-strategy lists share this path.
+unsafe fn values_from_items(leaf: &W_ListObject) -> Result<ListRef, ConvertError> {
+    let n = leaf.length as usize;
+    let base = items_block_items_base(leaf.items);
+    if base.is_null() && n != 0 {
+        return Err(ConvertError::Corrupt("list"));
+    }
+    let start = leaf.start as usize;
+    ListRef::try_fill_values(n, |i| {
+        Ok(Some(unsafe { ref_to_value(*base.add(start + i))? }))
+    })
+}
+
 unsafe fn list_from_ref(w: CelRef) -> Result<ListRef, ConvertError> {
     let leaf = &*w.cast::<W_ListObject>();
     if let Some(buf) = unsafe { ListRef::clone_from_public(leaf.public) } {
@@ -553,16 +566,35 @@ unsafe fn list_from_ref(w: CelRef) -> Result<ListRef, ConvertError> {
             if let Some(ints) = interned_object_list_ints(leaf) {
                 return Ok(ints);
             }
-            let n = leaf.length as usize;
-            let base = items_block_items_base(leaf.items);
-            if base.is_null() && n != 0 {
-                return Err(ConvertError::Corrupt("list"));
-            }
-            let start = leaf.start as usize;
-            ListRef::try_fill_values(n, |i| {
-                Ok(Some(unsafe { ref_to_value(*base.add(start + i))? }))
-            })
+            values_from_items(leaf)
         }
+        ListStrategy::Floats => {
+            if leaf.storage.is_null() {
+                return Ok(ListRef::from(Vec::new()));
+            }
+            let col = &*leaf.storage.cast::<super::object::W_FloatColumn>();
+            let start = leaf.start as usize;
+            let n = leaf.length as usize;
+            if n == 0 || col.data.is_null() {
+                if n != 0 {
+                    return Err(ConvertError::Corrupt("list"));
+                }
+                return Ok(ListRef::from(Vec::new()));
+            }
+            let mut bits = Vec::with_capacity(n);
+            let mut i = 0;
+            while i < n {
+                bits.push(unsafe { *col.data.add(start + i) });
+                i += 1;
+            }
+            Ok(ListRef::whole(Arc::new(ListStorage::Column(
+                ValueColumn::Scalar {
+                    bank: ScalarBank::Float,
+                    words: Arc::from(bits),
+                },
+            ))))
+        }
+        ListStrategy::Strs => values_from_items(leaf),
         ListStrategy::Ints => {
             if leaf.storage.is_null() {
                 return Ok(ListRef::from(Vec::new()));

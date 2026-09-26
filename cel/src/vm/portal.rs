@@ -31,8 +31,8 @@ use crate::runtime::object::{
     bytes_len, interned_list_eq, list_int_at, list_ints_slice, list_len,
     list_promote_empty_to_ints, list_resize_ge, list_store_int, list_try_append, map_len,
     map_try_insert, new_bool, new_double_in, new_int, new_int_in, new_list_with_capacity_in,
-    new_map_with_capacity_in, new_string, string_as_str, string_byte_len, w_kind, w_type, CelKind,
-    CelObject, CelRef, ListStrategy, W_BoolObject, W_DoubleObject, W_IntObject, W_OptionalObject,
+    new_map_with_capacity_in, string_as_str, string_byte_len, w_kind, w_type, CelKind, CelObject,
+    CelRef, ListStrategy, W_BoolObject, W_DoubleObject, W_IntObject, W_OptionalObject,
     CEL_DOUBLE_CLASS, CEL_INT_CLASS,
 };
 use crate::runtime::object::{force_virtualizable_if_necessary, W_CelFrame};
@@ -2501,7 +2501,7 @@ fn double_from_cell(vm: i64, w: *mut CelObject) -> *mut CelObject {
 /// comes back directly (`descr_str` → `space.newtext`).
 #[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
 fn int_to_text(n: i64) -> *mut CelObject {
-    new_string(&n.to_string()) as *mut CelObject
+    crate::runtime::object::string_from_int(n) as *mut CelObject
 }
 
 /// `W_StringObject` + `W_StringObject` via `cel_add`. Residual. Null declines.
@@ -5607,6 +5607,7 @@ fn run_cel_portal(
                     let item = state.frame.locals_stack_w[item_i];
                     let list = state.frame.locals_stack_w[list_i];
                     if list_opt_append(list, item) != 0 {
+                        state.frame.locals_stack_w[item_i] = core::ptr::null_mut();
                         state.frame.valuestackdepth = depth - 1;
                         here + 1
                     } else {
