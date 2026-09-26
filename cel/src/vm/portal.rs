@@ -11,6 +11,7 @@
 //! `getarrayitem_vable_*` shape — and call `cel_add` / `cel_equals`
 //! with no `Result`. Everything else is residual [`Vm::dispatch_one`].
 
+use majit_metainterp::intrinsics::majit_uint_lt;
 use majit_metainterp::JitDriver;
 
 use super::code::CelCode;
@@ -1748,6 +1749,12 @@ fn cell_list_len(w: *mut CelObject) -> i64 {
     unsafe { (*obj).length }
 }
 
+/// `ll_getitem`'s range test: one unsigned compare. A negative index fails it.
+#[majit_macros::jit_inline]
+fn index_in_range(index: i64, len: i64) -> i64 {
+    majit_uint_lt(index, len)
+}
+
 /// Length of a map leaf. `ll_len` / `W_MapObject.length` (`rewrite_op_getfield`).
 #[majit_macros::jit_inline(int_fields = { crate::runtime::object::W_MapObject::length => i64 })]
 fn cell_map_len(w: *mut CelObject) -> i64 {
@@ -2880,70 +2887,29 @@ fn item_cell(vm: i64, list: *mut CelObject, index: i64) -> *mut CelObject {
     let length = list.length;
     let start = list.start;
     let storage = list.storage;
-    if strategy == crate::runtime::object::ListStrategy::Ints as i64 {
-        if index >= 0 {
-            if index < length {
-                if (storage as *mut u8) != core::ptr::null_mut() {
-                    let col = storage as *mut crate::runtime::object::W_IntColumn;
-                    let col_len = col.length;
-                    let at = start + index;
-                    if at >= 0 {
-                        if at < col_len {
-                            box_int(vm, col.data[at])
-                        } else {
-                            core::ptr::null_mut()
-                        }
-                    } else {
-                        core::ptr::null_mut()
-                    }
-                } else {
-                    core::ptr::null_mut()
-                }
+    // `ll_getitem`: one unsigned compare against `length`. A negative
+    // index fails it (`r_uint`). The load is `ll_getitem_fast`: no second
+    // check, because `0 <= start` and `start + length <= capacity`.
+    if majit_uint_lt(index, length) != 0 {
+        let at = start + index;
+        if strategy == crate::runtime::object::ListStrategy::Ints as i64 {
+            if (storage as *mut u8) != core::ptr::null_mut() {
+                let col = storage as *mut crate::runtime::object::W_IntColumn;
+                box_int(vm, col.data[at])
             } else {
                 core::ptr::null_mut()
             }
-        } else {
-            core::ptr::null_mut()
-        }
-    } else if strategy == crate::runtime::object::ListStrategy::Floats as i64 {
-        if index >= 0 {
-            if index < length {
-                if (storage as *mut u8) != core::ptr::null_mut() {
-                    let col = storage as *mut crate::runtime::object::W_FloatColumn;
-                    let col_len = col.length;
-                    let at = start + index;
-                    if at >= 0 {
-                        if at < col_len {
-                            box_double(vm, col.data[at])
-                        } else {
-                            core::ptr::null_mut()
-                        }
-                    } else {
-                        core::ptr::null_mut()
-                    }
-                } else {
-                    core::ptr::null_mut()
-                }
+        } else if strategy == crate::runtime::object::ListStrategy::Floats as i64 {
+            if (storage as *mut u8) != core::ptr::null_mut() {
+                let col = storage as *mut crate::runtime::object::W_FloatColumn;
+                box_double(vm, col.data[at])
             } else {
                 core::ptr::null_mut()
             }
-        } else {
-            core::ptr::null_mut()
-        }
-    } else if strategy == crate::runtime::object::ListStrategy::Object as i64 {
-        // `listobject.py` `getitem` / `rlist.ll_getitem_fast`: bounds guard,
-        // then `getarrayitem_gc` of the object column.
-        if index >= 0 {
-            if index < length {
-                let at = start + index;
-                if at >= 0 {
-                    list.items[at]
-                } else {
-                    core::ptr::null_mut()
-                }
-            } else {
-                core::ptr::null_mut()
-            }
+        } else if strategy == crate::runtime::object::ListStrategy::Object as i64 {
+            list.items[at]
+        } else if strategy == crate::runtime::object::ListStrategy::Strs as i64 {
+            list.items[at]
         } else {
             core::ptr::null_mut()
         }
@@ -4097,6 +4063,7 @@ fn slow_pc(vm: i64, here: i64) -> i64 {
         cell_int => inline_int,
         cell_bool => inline_int,
         cell_list_len => inline_int,
+        index_in_range => inline_int,
         box_int => inline_ref,
         box_bool => inline_ref,
         trace_cmp_bit => inline_int,
@@ -5117,7 +5084,7 @@ fn run_cel_portal(
                     if cell_kind(src) == CelKind::List as i64 {
                         let index = cell_int(idx_w);
                         let len = cell_list_len(src);
-                        if index >= len {
+                        if index_in_range(index, len) == 0 {
                             insn_c(program, pc)
                         } else {
                             here + 1

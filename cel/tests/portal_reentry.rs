@@ -62,6 +62,11 @@ fn compiled_entries_match_the_walker() {
     agree_compiled("list.map(e, has({\"a\": e}.a))", 150);
     agree_compiled("list.map(e, has({\"a\": e}.b))", 150);
     agree_compiled("list.map(e, list[e % 10])", 150);
+    agree_compiled("list.map(e, list[size(list) - 1 - e])", 150);
+    agree_compiled("list.map(e, list[e + 1000])", 150);
+    agree_compiled("list.map(e, list[e - 1])", 150);
+    agree_compiled("list.filter(e, e % 2 == 0).map(e, e * 2)", 150);
+    agree_compiled("{\"a\": x, \"b\": x}.map(k, k)", 150);
     agree_compiled("list.all(e, e < x + 1000)", 150);
     agree_compiled("list.map(e, int(e))", 150);
     agree_compiled("list.map(e, double(e))", 150);
@@ -147,10 +152,32 @@ fn compiled_optional_opcodes_match_the_walker() {
     agree_optional("list.map(e, {?\"k\": e})", 150);
 }
 
+fn agree_compiled_list(src: &str, list: Vec<i64>, times: usize) {
+    let expr = Parser::default()
+        .parse(src)
+        .unwrap_or_else(|e| panic!("parse {src}: {e}"));
+    let mut ctx = Context::default();
+    ctx.add_variable_from_value("x", 15i64);
+    ctx.add_variable_from_value("list", list);
+    let walker = Value::resolve_value(&expr, &ctx);
+    let program = Program::compile(src).unwrap_or_else(|e| panic!("compile {src}: {e}"));
+    for i in 0..times {
+        let vm = program.execute(&ctx);
+        assert_eq!(show(&walker), show(&vm), "`{src}` execute {i}");
+        if let (Ok(a), Ok(b)) = (&walker, &vm) {
+            assert_eq!(a, b, "`{src}` execute {i} value");
+        }
+    }
+}
+
 #[test]
 fn compiled_index_miss_matches_the_walker() {
     unsafe { std::env::set_var("CEL_PORTAL_THRESHOLD", "100") };
     agree_compiled("list[100]", 150);
+    // `1..=10` makes `e - 1` the indexes `0..=9`. A list that contains `0`
+    // makes the first index `-1`, and the compiled tier must raise the
+    // same error as the walker.
+    agree_compiled_list("list.map(e, list[e - 1])", (0..10).collect(), 40);
 }
 
 /// A resolver that returns a new int on every `x` lookup.

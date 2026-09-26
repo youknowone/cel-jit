@@ -685,6 +685,11 @@ pub struct W_ListObject {
     pub items: *mut CelItemsBlock,
     /// Window offset, or the `SizeListStrategy` capacity hint. Other
     /// strategies leave it at 0. `start` is not an items-block length.
+    ///
+    /// Invariant for Ints, Floats, Object and Strs (`ll_getitem_fast`):
+    /// `0 <= start` and `start + length <= capacity` of the column or
+    /// items block. A traced item read compares the index with `length`
+    /// once and loads `start + index` with no further check.
     pub start: i64,
     pub length: i64,
     /// Non-owning pointer at the public list buffer this leaf was wrapped
@@ -762,6 +767,39 @@ pub unsafe fn bytes_len(w: CelRef) -> i64 {
     (*w.cast::<W_BytesObject>()).length
 }
 
+/// `0 <= start` and `start + length <= capacity` (`ll_getitem_fast`).
+///
+/// # Safety
+///
+/// `leaf` is a live [`W_ListObject`].
+unsafe fn debug_assert_list_window(leaf: &W_ListObject) {
+    debug_assert!(leaf.start >= 0, "list start is negative");
+    let end = leaf.start.saturating_add(leaf.length);
+    match leaf.strategy {
+        ListStrategy::Ints => {
+            if leaf.storage.is_null() {
+                debug_assert!(leaf.length == 0, "int list has no column");
+            } else {
+                let cap = (*leaf.storage.cast::<W_IntColumn>()).length;
+                debug_assert!(end <= cap, "int list window exceeds the column");
+            }
+        }
+        ListStrategy::Floats => {
+            if leaf.storage.is_null() {
+                debug_assert!(leaf.length == 0, "float list has no column");
+            } else {
+                let cap = (*leaf.storage.cast::<W_FloatColumn>()).length;
+                debug_assert!(end <= cap, "float list window exceeds the column");
+            }
+        }
+        ListStrategy::Object | ListStrategy::Strs => {
+            let cap = crate::runtime::object_array::items_capacity(leaf.items) as i64;
+            debug_assert!(end <= cap, "list window exceeds the items block");
+        }
+        ListStrategy::Window | ListStrategy::Size => {}
+    }
+}
+
 /// Item `index` of a list leaf, or null if out of range.
 ///
 /// # Safety
@@ -772,6 +810,7 @@ pub unsafe fn list_get(w: CelRef, index: i64) -> Option<CelRef> {
         return None;
     }
     let leaf = &*w.cast::<W_ListObject>();
+    debug_assert_list_window(leaf);
     if index >= leaf.length {
         return None;
     }
@@ -821,6 +860,7 @@ pub unsafe fn list_int_at(w: CelRef, index: i64) -> Option<i64> {
         return None;
     }
     let leaf = &*w.cast::<W_ListObject>();
+    debug_assert_list_window(leaf);
     if leaf.strategy != ListStrategy::Ints || index >= leaf.length {
         return None;
     }
@@ -847,6 +887,7 @@ pub unsafe fn list_float_at(w: CelRef, index: i64) -> Option<f64> {
         return None;
     }
     let leaf = &*w.cast::<W_ListObject>();
+    debug_assert_list_window(leaf);
     if leaf.strategy != ListStrategy::Floats || index >= leaf.length {
         return None;
     }
@@ -923,6 +964,9 @@ unsafe fn object_list_eq_ints(w: CelRef, ints: &[i64]) -> bool {
 }
 
 /// An empty list whose items block has room for `cap` appends.
+///
+/// `start` is 0 and `length` stays `<=` the items capacity
+/// (`ll_getitem_fast`).
 pub fn new_list_with_capacity(cap: i64) -> *mut W_ListObject {
     super::heap::with_heap(|h| new_list_with_capacity_in(h, cap))
 }
@@ -1512,6 +1556,7 @@ pub unsafe fn list_try_append(w: CelRef, item: CelRef) -> bool {
     list_append_item_ref(w, item)
 }
 
+/// `start == 0` and `length <=` the items-block capacity (`ll_getitem_fast`).
 pub fn new_list(values: &[CelRef]) -> *mut W_ListObject {
     let items = object_array::new_items_block(values);
     let length = values.len() as i64;
@@ -1531,6 +1576,9 @@ pub fn new_list(values: &[CelRef]) -> *mut W_ListObject {
 }
 
 /// Box unboxed integers as a CEL list.
+///
+/// `start == 0` and `length <=` the column's allocated count
+/// (`ll_getitem_fast`).
 pub fn new_list_ints(values: &[i64]) -> *mut W_ListObject {
     let storage = new_int_column(values) as CelRef;
     let length = values.len() as i64;
