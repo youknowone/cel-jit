@@ -5206,10 +5206,10 @@ fn run_cel_portal(
                     if cell_kind(src) == CelKind::List as i64 {
                         let index = cell_int(idx_w);
                         let len = cell_list_len(src);
-                        if index_in_range(index, len) == 0 {
-                            insn_c(program, pc)
-                        } else {
+                        if index_in_range(index, len) != 0 {
                             here + 1
+                        } else {
+                            insn_c(program, pc)
                         }
                     } else {
                         slow_pc(vm, here)
