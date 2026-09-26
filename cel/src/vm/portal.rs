@@ -3113,7 +3113,10 @@ fn step_hot(program: &CelCode, pc: usize) -> i64 {
             if arity == unary_arity && interned_is_size(program, name) != 0 {
                 match operand_cell(frame, 1) {
                     Some(w) if !w.is_null() => {
-                        let n = interned_len(w as i64);
+                        // List/map length is a field load (`trace_len_cell`).
+                        // `interned_len` is `dont_look_inside`, so it stayed a
+                        // call on every finish.
+                        let n = trace_len_cell(w);
                         if n < 0 {
                             residual_dispatch(vm, here)
                         } else {
