@@ -1107,6 +1107,14 @@ impl majit_gc::GcAllocator for CelGc {
 
     fn collect_full(&mut self) {}
 
+    /// `GcLLDescr_boehm.gcrootmap` is `None`. Nothing here moves, and
+    /// `collect_nursery` / `collect_full` are no-ops, so no walker has to
+    /// find live jitframes. `assembler.py` `_call_header_shadowstack` stays
+    /// off when `gcrootmap` is missing.
+    fn has_gcrootmap(&self) -> bool {
+        false
+    }
+
     fn nursery_free(&self) -> *mut u8 {
         unsafe { (*heap_ptr()).nursery_free.get() }
     }
