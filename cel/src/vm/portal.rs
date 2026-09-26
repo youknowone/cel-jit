@@ -4066,14 +4066,11 @@ fn step_hot(program: &CelCode, pc: usize) -> i64 {
                 residual_dispatch(vm, here)
             } else {
                 let n = unsafe { (*w.cast::<W_IntObject>()).intval };
-                match n.checked_add(1) {
-                    None => residual_dispatch(vm, here),
-                    Some(next) => {
-                        let r = new_int_in(vm_heap(vm), next) as CelRef;
-                        frame.locals_stack_w[slot] = r;
-                        insn_b(program, pc)
-                    }
-                }
+                // Read already proved `n < length`, so `n + 1` cannot overflow.
+                let next = n.wrapping_add(1);
+                let r = new_int_in(vm_heap(vm), next) as CelRef;
+                frame.locals_stack_w[slot] = r;
+                insn_b(program, pc)
             }
         }
         OP_RETURN => {
@@ -5273,14 +5270,11 @@ fn run_cel_portal(
                 let w = state.frame.locals_stack_w[slot];
                 let next = if cell_kind(w) == CelKind::Int as i64 {
                     let n = cell_int(w);
-                    match n.checked_add(1) {
-                        Some(v) => {
-                            let r = box_int(vm, v);
-                            state.frame.locals_stack_w[slot] = r;
-                            insn_b(program, pc)
-                        }
-                        None => slow_pc(vm, here),
-                    }
+                    // Read already proved `n < length`, so `n + 1` cannot overflow.
+                    let v = n.wrapping_add(1);
+                    let r = box_int(vm, v);
+                    state.frame.locals_stack_w[slot] = r;
+                    insn_b(program, pc)
                 } else {
                     slow_pc(vm, here)
                 };
