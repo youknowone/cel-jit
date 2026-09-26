@@ -290,10 +290,11 @@ pub fn new_items_block_zeroed(cap: usize) -> *mut CelItemsBlock {
     super::heap::with_heap(|h| new_items_block_zeroed_in(h, cap))
 }
 
-/// A block holding `bytes`.
-pub fn new_bytes_block(bytes: &[u8]) -> *mut CelBytesBlock {
+/// A block holding `bytes` on `heap`.
+pub fn new_bytes_block_in(heap: &super::heap::CelHeap, bytes: &[u8]) -> *mut CelBytesBlock {
     let block = unsafe {
-        alloc_block(
+        alloc_block_in(
+            heap,
             CEL_BYTES_BLOCK_TOKEN.base_size,
             CEL_BYTES_BLOCK_TOKEN.item_size,
             core::mem::align_of::<CelBytesBlock>(),
@@ -304,6 +305,11 @@ pub fn new_bytes_block(bytes: &[u8]) -> *mut CelBytesBlock {
         core::ptr::copy_nonoverlapping(bytes.as_ptr(), bytes_base(block), bytes.len());
     }
     block
+}
+
+/// A block holding `bytes`.
+pub fn new_bytes_block(bytes: &[u8]) -> *mut CelBytesBlock {
+    super::heap::with_heap(|h| new_bytes_block_in(h, bytes))
 }
 
 /// A block holding `a` then `b`, written in place so concat does not

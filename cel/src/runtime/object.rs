@@ -492,45 +492,48 @@ pub fn new_string(s: &str) -> *mut W_StringObject {
     })
 }
 
-/// `ll_int2dec`: digits go straight into the string leaf. No intermediate
-/// `String` allocation.
+/// `ll_str.py` `ll_int2dec`: one digit pass, from the end, into a stack
+/// buffer, then `mallocstr` of that exact length. The leaf and its bytes
+/// block come from one heap access. The bytes are ASCII digits (and an
+/// optional leading `-`) by construction, so nothing validates them as UTF-8.
+///
+/// `i64::MIN` negates in `u64` (`ll_unsigned(-val)`): its magnitude is `2^63`,
+/// nineteen digits, and the sign fills the twentieth byte of the buffer.
 pub fn string_from_int(n: i64) -> *mut W_StringObject {
-    if n == i64::MIN {
-        return new_string("-9223372036854775808");
-    }
+    let mut buf = [0u8; 20];
+    let mut start = buf.len();
     let neg = n < 0;
     let mut val = if neg {
-        n.wrapping_neg() as u64
+        (n as u64).wrapping_neg()
     } else {
         n as u64
     };
-    let mut digits = 0usize;
-    let mut probe = val;
-    while probe > 0 {
-        digits += 1;
-        probe /= 10;
-    }
     if val == 0 {
-        digits = 1;
-    }
-    let total = digits + usize::from(neg);
-    let mut buf = [0u8; 20];
-    if neg {
-        buf[0] = b'-';
-    }
-    if val == 0 {
-        buf[usize::from(neg)] = b'0';
+        start -= 1;
+        buf[start] = b'0';
     } else {
-        let mut j = 0;
-        while j < digits {
-            buf[total - j - 1] = b'0' + (val % 10) as u8;
+        while val != 0 {
+            start -= 1;
+            buf[start] = b'0' + (val % 10) as u8;
             val /= 10;
-            j += 1;
         }
     }
-    let bytes = &buf[..total];
-    let s = core::str::from_utf8(bytes).unwrap();
-    new_string(s)
+    if neg {
+        start -= 1;
+        buf[start] = b'-';
+    }
+    let bytes = &buf[start..];
+    super::heap::with_heap(|h| {
+        let chars = object_array::new_bytes_block_in(h, bytes);
+        h.alloc(W_StringObject {
+            ob_header: CelObject {
+                ob_type: &CEL_STRING_CLASS,
+            },
+            chars,
+            byte_len: bytes.len() as i64,
+            public: core::ptr::null(),
+        })
+    })
 }
 
 /// Box the concatenation of two UTF-8 slices as a CEL `string`.
@@ -2217,6 +2220,37 @@ mod tests {
             new_struct(new_string("T"), &[]) as CelRef,
             &CEL_STRUCT_CLASS,
         );
+    }
+
+    #[test]
+    fn string_from_int_writes_decimal_digits() {
+        fn check(n: i64) {
+            let w = string_from_int(n);
+            let text = n.to_string();
+            unsafe {
+                assert_eq!((*w).byte_len, text.len() as i64);
+                assert_eq!(
+                    crate::runtime::object_array::bytes_capacity((*w).chars),
+                    text.len()
+                );
+                let base = crate::runtime::object_array::bytes_base((*w).chars);
+                let got = core::slice::from_raw_parts(base, text.len());
+                assert_eq!(got, text.as_bytes());
+            }
+        }
+        check(0);
+        check(9);
+        check(10);
+        check(-1);
+        check(-10);
+        check(i64::MAX);
+        check(i64::MIN);
+        let mut p: i64 = 1;
+        for _ in 0..18 {
+            check(p);
+            check(-p);
+            p *= 10;
+        }
     }
 
     /// The variable-length leaves keep their live length on the leaf and their
