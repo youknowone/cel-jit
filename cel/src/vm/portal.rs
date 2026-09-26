@@ -1801,8 +1801,17 @@ fn trace_len_cell(w: *mut CelObject) -> i64 {
 
 /// Concrete `struct_allocs` target for [`box_int`]. Small ints stay the
 /// prebuilt singletons; the traced body allocates a fresh leaf instead.
+///
+/// The prebuilt range does not consult thread-local storage. A miss
+/// allocates on the heap [`heap_ptr`](crate::runtime::heap::heap_ptr)
+/// already cached, which is the same heap [`new_int_in`] writes.
 fn alloc_traced_int(_header: CelObject, intval: i64) -> *mut W_IntObject {
-    crate::runtime::heap::with_heap(|heap| new_int_in(heap, intval))
+    if (crate::runtime::object::PREBUILT_INT_FROM..crate::runtime::object::PREBUILT_INT_TO)
+        .contains(&intval)
+    {
+        return new_int(intval);
+    }
+    new_int_in(unsafe { &*crate::runtime::heap::heap_ptr() }, intval)
 }
 
 /// Box `n`. The traced body is `new_with_vtable` of `CEL_INT_CLASS` plus
