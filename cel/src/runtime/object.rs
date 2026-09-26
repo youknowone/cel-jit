@@ -605,9 +605,9 @@ pub static CEL_INT_COLUMN_CLASS: CelClass = CelClass::new("int_column", CelKind:
 #[allow(non_camel_case_types)]
 pub struct W_FloatColumn {
     pub ob_header: CelObject,
-    /// `f64` bits. The inline array store is `setarrayitem_gc` of a word
-    /// (`add_raw_int_array_descr_signed`); `f64::from_bits` recovers the float.
-    pub data: *mut i64,
+    /// `lltype.Float` elements. Reads and writes are `getarrayitem_gc_f` /
+    /// `setarrayitem_gc_f`.
+    pub data: *mut f64,
     pub length: i64,
 }
 
@@ -620,9 +620,9 @@ const _: () = {
 /// A float column whose `length` is the allocated count (`ll_newlist_hint`).
 pub(crate) fn new_float_column_capacity(cap: i64) -> *mut W_FloatColumn {
     let cap = cap.max(1);
-    let bytes = (cap as usize).saturating_mul(core::mem::size_of::<i64>());
+    let bytes = (cap as usize).saturating_mul(core::mem::size_of::<f64>());
     super::heap::with_heap(|h| {
-        let data = h.alloc_raw(bytes, align_of::<i64>()) as *mut i64;
+        let data = h.alloc_raw(bytes, align_of::<f64>()) as *mut f64;
         h.alloc(W_FloatColumn {
             ob_header: CelObject {
                 ob_type: &CEL_FLOAT_COLUMN_CLASS,
@@ -848,7 +848,7 @@ pub unsafe fn list_float_at(w: CelRef, index: i64) -> Option<f64> {
     if col.data.is_null() || at < 0 || at >= col.length {
         return None;
     }
-    Some(f64::from_bits(*col.data.add(at as usize) as u64))
+    Some(*col.data.add(at as usize))
 }
 
 /// The int column of an Ints-strategy list, or `None` if `w` is not one.
@@ -1101,11 +1101,11 @@ pub unsafe fn list_resize_ge_float(w: CelRef, newsize: i64) -> bool {
     if newcap < 4 {
         newcap = 4;
     }
-    let nbytes = (newcap as usize).saturating_mul(core::mem::size_of::<i64>());
+    let nbytes = (newcap as usize).saturating_mul(core::mem::size_of::<f64>());
     let live = leaf.length.max(0) as usize;
     let src = col.data;
     let new_col = super::heap::with_heap(|h| {
-        let ptr = h.alloc_raw(nbytes, align_of::<i64>()) as *mut i64;
+        let ptr = h.alloc_raw(nbytes, align_of::<f64>()) as *mut f64;
         if live > 0 && !src.is_null() {
             core::ptr::copy_nonoverlapping(src, ptr, live);
         }
@@ -1150,7 +1150,7 @@ pub unsafe fn list_store_float(w: CelRef, word: f64) -> bool {
         return false;
     }
     let data = col.data;
-    *data.add(at as usize) = word.to_bits() as i64;
+    *data.add(at as usize) = word;
     leaf.length = at + 1;
     leaf.public = core::ptr::null();
     leaf.public_start = 0;
@@ -1256,7 +1256,7 @@ unsafe fn list_switch_floats_to_object(w: CelRef, item: CelRef) -> bool {
     let n = leaf.length.max(0) as usize;
     let col = leaf.storage;
     let (words, cap_words) = if col.is_null() {
-        (core::ptr::null_mut(), 0i64)
+        (core::ptr::null_mut::<f64>(), 0i64)
     } else {
         let col = &*col.cast::<W_FloatColumn>();
         (col.data, col.length)
@@ -1274,7 +1274,7 @@ unsafe fn list_switch_floats_to_object(w: CelRef, item: CelRef) -> bool {
     }
     let mut i = 0;
     while i < n {
-        *base.add(i) = new_double(f64::from_bits(*words.add(i) as u64)) as CelRef;
+        *base.add(i) = new_double(*words.add(i)) as CelRef;
         i += 1;
     }
     *base.add(n) = item;

@@ -584,7 +584,7 @@ unsafe fn list_from_ref(w: CelRef) -> Result<ListRef, ConvertError> {
             let mut bits = Vec::with_capacity(n);
             let mut i = 0;
             while i < n {
-                bits.push(unsafe { *col.data.add(start + i) });
+                bits.push(unsafe { (*col.data.add(start + i)).to_bits() as i64 });
                 i += 1;
             }
             Ok(ListRef::whole(Arc::new(ListStorage::Column(

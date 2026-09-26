@@ -2092,6 +2092,134 @@ fn append_int_word(list: *mut CelObject, word: i64) -> i64 {
     }
 }
 
+/// `FloatListStrategy.get_empty_storage`. Fresh column; empty write set.
+#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+fn alloc_float_column(cap: i64) -> *mut CelObject {
+    crate::runtime::object::new_float_column_capacity(cap) as *mut CelObject
+}
+
+/// `_ll_list_resize_ge` for a float column. Not on the traced common path.
+#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+fn list_resize_ge_f(list: *mut CelObject, newsize: i64) -> i64 {
+    if list.is_null() {
+        0
+    } else {
+        unsafe { i64::from(crate::runtime::object::list_resize_ge_float(list, newsize)) }
+    }
+}
+
+/// First float on an empty or Size list, or a grow the inline path declined.
+#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+fn list_append_float_cold(list: *mut CelObject, word: f64) -> i64 {
+    if list.is_null() {
+        return 0;
+    }
+    unsafe {
+        let strategy = (*list.cast::<crate::runtime::object::W_ListObject>()).strategy;
+        let length = (*list.cast::<crate::runtime::object::W_ListObject>()).length;
+        if strategy == ListStrategy::Floats {
+            i64::from(crate::runtime::object::list_store_float(list, word))
+        } else if strategy == ListStrategy::Size
+            || (strategy == ListStrategy::Object && length == 0)
+        {
+            i64::from(crate::runtime::object::list_promote_empty_to_floats(
+                list, word,
+            ))
+        } else {
+            0
+        }
+    }
+}
+
+/// `W_DoubleObject.floatval`. A virtual box folds this to the float register.
+#[majit_macros::jit_inline(
+    ref_params = { w: ref(W_DoubleObject) },
+    int_fields = {
+        W_DoubleObject::floatval => f64,
+    },
+)]
+fn cell_float(w: *mut CelObject) -> f64 {
+    w.floatval
+}
+
+/// `FloatListStrategy.append`: store the unboxed double.
+///
+/// Same shape as [`append_int_word`]: length/capacity guard,
+/// `setarrayitem_gc_f`, `setfield_gc` of `length`. The grow is
+/// [`list_resize_ge_f`]. An empty or Size list switches to Floats
+/// (`switch_to_correct_strategy`) and allocates the column with the hint.
+#[majit_macros::jit_inline(
+    ref_params = { list: ref(crate::runtime::object::W_ListObject) },
+    ref_fields = {
+        crate::runtime::object::W_ListObject::storage => crate::runtime::object::CelObject,
+    },
+    array_fields = { crate::runtime::object::W_FloatColumn::data => f64 },
+    int_fields = {
+        crate::runtime::object::W_ListObject::strategy => u8,
+        crate::runtime::object::W_ListObject::length => i64,
+        crate::runtime::object::W_ListObject::start => i64,
+        crate::runtime::object::W_FloatColumn::length => i64,
+    },
+    calls = {
+        list_resize_ge_f => residual_int,
+        list_append_float_cold => residual_int,
+        empty_list_hint => inline_int,
+        alloc_float_column => alloc_ref,
+    },
+)]
+fn append_float_word(list: *mut CelObject, word: f64) -> i64 {
+    let strategy = list.strategy as u8 as i64;
+    if strategy == ListStrategy::Floats as i64 {
+        let storage = list.storage;
+        if (storage as *mut u8) != core::ptr::null_mut() {
+            let col = storage as *mut crate::runtime::object::W_FloatColumn;
+            let length = list.length;
+            let cap = col.length;
+            if length >= 0 {
+                if length < cap {
+                    col.data[length] = word;
+                    list.length = length + 1;
+                    1
+                } else if list_resize_ge_f(list, length + 1) != 0 {
+                    let storage2 = list.storage;
+                    if (storage2 as *mut u8) != core::ptr::null_mut() {
+                        let col2 = storage2 as *mut crate::runtime::object::W_FloatColumn;
+                        col2.data[length] = word;
+                        list.length = length + 1;
+                        1
+                    } else {
+                        list_append_float_cold(list, word)
+                    }
+                } else {
+                    list_append_float_cold(list, word)
+                }
+            } else {
+                list_append_float_cold(list, word)
+            }
+        } else {
+            list_append_float_cold(list, word)
+        }
+    } else if strategy == ListStrategy::Size as i64
+        || (strategy == ListStrategy::Object as i64 && list.length == 0)
+    {
+        let hint = empty_list_hint(list);
+        let col = alloc_float_column(hint);
+        if (col as *mut u8) != core::ptr::null_mut() {
+            list.strategy = ListStrategy::Floats;
+            list.storage = col;
+            list.start = 0;
+            let column = col as *mut crate::runtime::object::W_FloatColumn;
+            column.data[0] = word;
+            list.length = 1;
+            1
+        } else {
+            list_append_float_cold(list, word)
+        }
+    } else {
+        list_append_float_cold(list, word)
+    }
+}
+
 /// `ObjectListStrategy.append` → `rlist.ll_append`.
 ///
 /// The item is `setarrayitem_gc` (`rewrite_op_setarrayitem`). The block's
@@ -2534,6 +2662,7 @@ fn index_cell(container: *mut CelObject, key: *mut CelObject) -> *mut CelObject 
     },
     array_fields = {
         crate::runtime::object::W_IntColumn::data => i64,
+        crate::runtime::object::W_FloatColumn::data => f64,
         crate::runtime::object::W_ListObject::items => crate::runtime::object::CelRef in crate::runtime::object_array::CelItemsBlock,
     },
     int_fields = {
@@ -2541,8 +2670,12 @@ fn index_cell(container: *mut CelObject, key: *mut CelObject) -> *mut CelObject 
         crate::runtime::object::W_ListObject::length => i64,
         crate::runtime::object::W_ListObject::start => i64,
         crate::runtime::object::W_IntColumn::length => i64,
+        crate::runtime::object::W_FloatColumn::length => i64,
     },
-    calls = { box_int => inline_ref },
+    calls = {
+        box_int => inline_ref,
+        box_double => inline_ref,
+    },
 )]
 fn item_cell(vm: i64, list: *mut CelObject, index: i64) -> *mut CelObject {
     let strategy = list.strategy as u8 as i64;
@@ -2559,6 +2692,31 @@ fn item_cell(vm: i64, list: *mut CelObject, index: i64) -> *mut CelObject {
                     if at >= 0 {
                         if at < col_len {
                             box_int(vm, col.data[at])
+                        } else {
+                            core::ptr::null_mut()
+                        }
+                    } else {
+                        core::ptr::null_mut()
+                    }
+                } else {
+                    core::ptr::null_mut()
+                }
+            } else {
+                core::ptr::null_mut()
+            }
+        } else {
+            core::ptr::null_mut()
+        }
+    } else if strategy == crate::runtime::object::ListStrategy::Floats as i64 {
+        if index >= 0 {
+            if index < length {
+                if (storage as *mut u8) != core::ptr::null_mut() {
+                    let col = storage as *mut crate::runtime::object::W_FloatColumn;
+                    let col_len = col.length;
+                    let at = start + index;
+                    if at >= 0 {
+                        if at < col_len {
+                            box_double(vm, col.data[at])
                         } else {
                             core::ptr::null_mut()
                         }
@@ -2637,6 +2795,9 @@ fn alloc_traced_double(_header: CelObject, floatval: f64) -> *mut W_DoubleObject
     majit_macros::jit_inline(
         inlined_prefix = {
             W_DoubleObject::ob_header => crate::runtime::object::CelObject,
+        },
+        int_fields = {
+            W_DoubleObject::floatval => f64,
         },
         struct_allocs = {
             W_DoubleObject => alloc_traced_double,
@@ -2971,7 +3132,9 @@ fn has_field_slot(recv: *mut CelObject, name: *mut CelObject) -> *mut CelObject 
     field_of_slot => inline_ref,
     cell_kind => inline_int,
     cell_int => inline_int,
+    cell_float => inline_float,
     append_int_word => inline_int,
+    append_float_word => inline_int,
     append_ref => inline_int,
     append_cell => residual_int,
 })]
@@ -2984,6 +3147,8 @@ fn append_named_field(list: *mut CelObject, recv: *mut CelObject, name: *mut Cel
             0
         } else if cell_kind(found) == CelKind::Int as i64 {
             append_int_word(list, cell_int(found))
+        } else if cell_kind(found) == CelKind::Double as i64 {
+            append_float_word(list, cell_float(found))
         } else {
             let via = append_ref(list, found);
             if via != 0 {
@@ -3073,7 +3238,9 @@ fn map_opt_insert(map: *mut CelObject, key: *mut CelObject, value: *mut CelObjec
     opt_some_inner => inline_ref,
     cell_kind => inline_int,
     cell_int => inline_int,
+    cell_float => inline_float,
     append_int_word => inline_int,
+    append_float_word => inline_int,
     append_ref => inline_int,
     append_cell => residual_int,
 })]
@@ -3090,6 +3257,8 @@ fn list_opt_append(list: *mut CelObject, item: *mut CelObject) -> i64 {
             0
         } else if cell_kind(inner) == CelKind::Int as i64 {
             append_int_word(list, cell_int(inner))
+        } else if cell_kind(inner) == CelKind::Double as i64 {
+            append_float_word(list, cell_float(inner))
         } else {
             let via = append_ref(list, inner);
             if via != 0 {
@@ -3661,12 +3830,14 @@ fn slow_pc(vm: i64, here: i64) -> i64 {
     array_fields = {
         W_CelFrame::locals_stack_w => CelRef in crate::runtime::object_array::CelItemsBlock,
         crate::runtime::object::W_IntColumn::data => i64,
+        crate::runtime::object::W_FloatColumn::data => f64,
     },
     int_fields = {
         crate::runtime::object::W_ListObject::strategy => u8,
         crate::runtime::object::W_ListObject::length => i64,
         crate::runtime::object::W_ListObject::start => i64,
         crate::runtime::object::W_IntColumn::length => i64,
+        crate::runtime::object::W_FloatColumn::length => i64,
     },
     ref_fields = {
         crate::runtime::object::W_ListObject::storage => crate::runtime::object::CelObject,
@@ -3679,7 +3850,8 @@ fn slow_pc(vm: i64, here: i64) -> i64 {
         col.data[] @ crate::runtime::object::W_IntColumn => [append_cell],
         list.strategy @ crate::runtime::object::W_ListObject => [append_cell],
         // `list_resize_ge` stores a new column (`_ll_list_resize_really`).
-        list.storage @ crate::runtime::object::W_ListObject => [append_cell, list_resize_ge_i],
+        list.storage @ crate::runtime::object::W_ListObject => [append_cell, list_resize_ge_i, list_resize_ge_f],
+        col.data[] @ crate::runtime::object::W_FloatColumn => [list_resize_ge_f],
         list.length @ crate::runtime::object::W_ListObject => [append_cell],
         list.start @ crate::runtime::object::W_ListObject => [append_cell],
     },
@@ -3707,6 +3879,8 @@ fn slow_pc(vm: i64, here: i64) -> i64 {
         slow_pc => inline_int,
         append_cell => residual_int,
         append_int_word => inline_int,
+        append_float_word => inline_int,
+        cell_float => inline_float,
         append_ref => inline_int,
         add_local_const_cell => inline_ref,
         map_insert_cell => residual_int,
@@ -4640,6 +4814,8 @@ fn run_cel_portal(
                     if !list.is_null() {
                         let stored = if cell_kind(item) == CelKind::Int as i64 {
                             append_int_word(list, cell_int(item))
+                        } else if cell_kind(item) == CelKind::Double as i64 {
+                            append_float_word(list, cell_float(item))
                         } else {
                             let via_obj = append_ref(list, item);
                             if via_obj != 0 {
@@ -4892,6 +5068,8 @@ fn run_cel_portal(
                         if !list.is_null() {
                             let stored = if cell_kind(w) == CelKind::Int as i64 {
                                 append_int_word(list, cell_int(w))
+                            } else if cell_kind(w) == CelKind::Double as i64 {
+                                append_float_word(list, cell_float(w))
                             } else {
                                 let via_obj = append_ref(list, w);
                                 if via_obj != 0 {
