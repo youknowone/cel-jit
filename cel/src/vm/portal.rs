@@ -365,6 +365,14 @@ fn insn_op(program: &CelCode, pc: usize) -> i64 {
         .unwrap_or(-1)
 }
 
+/// `co_nlocals` of this code object. The frame is sized from it once;
+/// the value does not change, so a traced compare against a constant
+/// index folds away (`ll_getitem_nonneg` has no runtime check).
+#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+fn code_n_slots(program: &CelCode) -> i64 {
+    i64::from(program.n_slots)
+}
+
 /// Operand `a` of the instruction at `pc`.
 #[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
 fn insn_a(program: &CelCode, pc: usize) -> i64 {
@@ -4153,6 +4161,7 @@ fn slow_pc(vm: i64, here: i64) -> i64 {
     calls = {
         insn_op => elidable_int_cannot_raise,
         insn_a => elidable_int_cannot_raise,
+        code_n_slots => elidable_int_cannot_raise,
         insn_b => elidable_int_cannot_raise,
         insn_c => elidable_int_cannot_raise,
         intern_const => elidable_ref_cannot_raise_wrapped,
@@ -4444,7 +4453,7 @@ fn run_cel_portal(
                 let k = intern_const(program, insn_a(program, pc));
                 let depth = state.frame.valuestackdepth;
                 let i = depth - 1;
-                let next = if i >= state.frame.n_slots {
+                let next = if i >= code_n_slots(program) {
                     let a = state.frame.locals_stack_w[i];
                     if !a.is_null() {
                         if !k.is_null() {
@@ -4505,7 +4514,7 @@ fn run_cel_portal(
                 let k = intern_const(program, insn_a(program, pc));
                 let depth = state.frame.valuestackdepth;
                 let i = depth - 1;
-                let next = if i >= state.frame.n_slots {
+                let next = if i >= code_n_slots(program) {
                     let a = state.frame.locals_stack_w[i];
                     if !a.is_null() {
                         if !k.is_null() {
@@ -4580,7 +4589,7 @@ fn run_cel_portal(
                 let k = intern_const(program, insn_a(program, pc));
                 let depth = state.frame.valuestackdepth;
                 let i = depth - 1;
-                let next = if i >= state.frame.n_slots {
+                let next = if i >= code_n_slots(program) {
                     let a = state.frame.locals_stack_w[i];
                     if !a.is_null() {
                         if !k.is_null() {
@@ -4732,7 +4741,7 @@ fn run_cel_portal(
                 let k = intern_const(program, insn_b(program, pc));
                 let depth = state.frame.valuestackdepth;
                 let top = depth - 1;
-                let next = if top >= state.frame.n_slots {
+                let next = if top >= code_n_slots(program) {
                     let list = state.frame.locals_stack_w[top];
                     if !a.is_null() {
                         if !k.is_null() {
@@ -4788,7 +4797,7 @@ fn run_cel_portal(
                 let k = intern_const(program, insn_b(program, pc));
                 let depth = state.frame.valuestackdepth;
                 let top = depth - 1;
-                let next = if top >= state.frame.n_slots {
+                let next = if top >= code_n_slots(program) {
                     let list = state.frame.locals_stack_w[top];
                     if !a.is_null() {
                         if !k.is_null() {
@@ -4844,7 +4853,7 @@ fn run_cel_portal(
                 let k = intern_const(program, insn_b(program, pc));
                 let depth = state.frame.valuestackdepth;
                 let top = depth - 1;
-                let next = if top >= state.frame.n_slots {
+                let next = if top >= code_n_slots(program) {
                     let list = state.frame.locals_stack_w[top];
                     if !a.is_null() {
                         if !k.is_null() {
@@ -4899,7 +4908,7 @@ fn run_cel_portal(
                 let depth = state.frame.valuestackdepth;
                 let key_i = depth - 1;
                 let box_i = depth - 2;
-                let next = if box_i >= state.frame.n_slots {
+                let next = if box_i >= code_n_slots(program) {
                     let key = state.frame.locals_stack_w[key_i];
                     let container = state.frame.locals_stack_w[box_i];
                     if !container.is_null() {
@@ -4942,7 +4951,7 @@ fn run_cel_portal(
                 let here = pc as i64;
                 let depth = state.frame.valuestackdepth;
                 let i = depth - 1;
-                let next = if i >= state.frame.n_slots {
+                let next = if i >= code_n_slots(program) {
                     let w = state.frame.locals_stack_w[i];
                     let bit = cell_bool(w);
                     if bit < 0 {
@@ -5341,7 +5350,7 @@ fn run_cel_portal(
                 let depth = state.frame.valuestackdepth;
                 let i = depth - 1;
                 let is_or = if opcode == OP_OR_MERGE { 1 } else { 0 };
-                let next = if i >= state.frame.n_slots {
+                let next = if i >= code_n_slots(program) {
                     let w = state.frame.locals_stack_w[i];
                     let bits = state.frame.scratch_bits;
                     if and_merge_keep(vm, w, insn_a(program, pc), is_or, bits) != 0 {
@@ -5370,7 +5379,7 @@ fn run_cel_portal(
                 let w = state.frame.locals_stack_w[insn_a(program, pc)];
                 let depth = state.frame.valuestackdepth;
                 let top = depth - 1;
-                let next = if top >= state.frame.n_slots {
+                let next = if top >= code_n_slots(program) {
                     let list = state.frame.locals_stack_w[top];
                     if !w.is_null() {
                         if !list.is_null() {
@@ -5426,7 +5435,7 @@ fn run_cel_portal(
                 let depth = state.frame.valuestackdepth;
                 let bi = depth - 1;
                 let ai = depth - 2;
-                let next = if ai >= state.frame.n_slots {
+                let next = if ai >= code_n_slots(program) {
                     let a = state.frame.locals_stack_w[ai];
                     let b = state.frame.locals_stack_w[bi];
                     if !a.is_null() {
@@ -5513,7 +5522,7 @@ fn run_cel_portal(
                 } else {
                     OP_GE
                 };
-                let next = if i >= state.frame.n_slots {
+                let next = if i >= code_n_slots(program) {
                     let a = state.frame.locals_stack_w[i];
                     if !a.is_null() {
                         if !k.is_null() {
@@ -5651,7 +5660,7 @@ fn run_cel_portal(
                 } else {
                     OP_GE
                 };
-                let next = if top >= state.frame.n_slots {
+                let next = if top >= code_n_slots(program) {
                     let list = state.frame.locals_stack_w[top];
                     if !a.is_null() {
                         if !k.is_null() {
@@ -5710,7 +5719,7 @@ fn run_cel_portal(
                 let here = pc as i64;
                 let depth = state.frame.valuestackdepth;
                 let i = depth - 1;
-                let next = if i >= state.frame.n_slots {
+                let next = if i >= code_n_slots(program) {
                     let a = state.frame.locals_stack_w[i];
                     if cell_kind(a) == CelKind::Int as i64 {
                         let n = cell_int(a);
@@ -5746,7 +5755,7 @@ fn run_cel_portal(
                 let here = pc as i64;
                 let depth = state.frame.valuestackdepth;
                 let i = depth - 1;
-                let next = if i >= state.frame.n_slots {
+                let next = if i >= code_n_slots(program) {
                     let a = state.frame.locals_stack_w[i];
                     let bit = cell_bool(a);
                     if bit < 0 {
@@ -5792,7 +5801,7 @@ fn run_cel_portal(
                 let depth = state.frame.valuestackdepth;
                 let i = depth - 1;
                 let is_or = if opcode == OP_OR { 1 } else { 0 };
-                let next = if i >= state.frame.n_slots {
+                let next = if i >= code_n_slots(program) {
                     let w = state.frame.locals_stack_w[i];
                     let code = bool_short_i(w, is_or);
                     if code == 1 {
@@ -5829,7 +5838,7 @@ fn run_cel_portal(
                 let depth = state.frame.valuestackdepth;
                 let i = depth - 1;
                 let next = if arity == 1 {
-                    if i >= state.frame.n_slots {
+                    if i >= code_n_slots(program) {
                         let w = state.frame.locals_stack_w[i];
                         if !w.is_null() {
                             if interned_is_size(program, name) != 0 {
@@ -5904,7 +5913,7 @@ fn run_cel_portal(
                 let depth = state.frame.valuestackdepth;
                 let i = depth - 1;
                 let next = if arity == 0 {
-                    if i >= state.frame.n_slots {
+                    if i >= code_n_slots(program) {
                         let w = state.frame.locals_stack_w[i];
                         if !w.is_null() {
                             if interned_is_size(program, name) != 0 {
@@ -5945,7 +5954,7 @@ fn run_cel_portal(
                 let here = pc as i64;
                 let depth = state.frame.valuestackdepth;
                 let box_i = depth - 2;
-                let next = if box_i >= state.frame.n_slots {
+                let next = if box_i >= code_n_slots(program) {
                     let container = state.frame.locals_stack_w[depth - 1];
                     let needle = state.frame.locals_stack_w[box_i];
                     if !container.is_null() {
@@ -6022,7 +6031,7 @@ fn run_cel_portal(
                 let depth = state.frame.valuestackdepth;
                 let i = depth - 1;
                 let name = field_name_cell(program, insn_a(program, pc));
-                let next = if i >= state.frame.n_slots {
+                let next = if i >= code_n_slots(program) {
                     let recv = state.frame.locals_stack_w[i];
                     if !recv.is_null() {
                         if cell_kind(recv) == CelKind::Map as i64 {
@@ -6067,7 +6076,7 @@ fn run_cel_portal(
                 let depth = state.frame.valuestackdepth;
                 let i = depth - 1;
                 let name = field_name_cell(program, insn_a(program, pc));
-                let next = if i >= state.frame.n_slots {
+                let next = if i >= code_n_slots(program) {
                     let recv = state.frame.locals_stack_w[i];
                     if !recv.is_null() {
                         if cell_kind(recv) == CelKind::Map as i64 {
@@ -6187,7 +6196,7 @@ fn run_cel_portal(
                 let recv = state.frame.locals_stack_w[insn_a(program, pc)];
                 let depth = state.frame.valuestackdepth;
                 let top = depth - 1;
-                let next = if top >= state.frame.n_slots {
+                let next = if top >= code_n_slots(program) {
                     let list = state.frame.locals_stack_w[top];
                     let name = field_name_cell(program, insn_b(program, pc));
                     if append_named_field(list, recv, name) != 0 {
@@ -6216,7 +6225,7 @@ fn run_cel_portal(
                 let recv = state.frame.locals_stack_w[insn_a(program, pc)];
                 let depth = state.frame.valuestackdepth;
                 let top = depth - 1;
-                let next = if top >= state.frame.n_slots {
+                let next = if top >= code_n_slots(program) {
                     let list = state.frame.locals_stack_w[top];
                     let name = field_name_cell(program, insn_b(program, pc));
                     if append_has_field(list, recv, name) != 0 {
@@ -6281,7 +6290,7 @@ fn run_cel_portal(
                 let depth = state.frame.valuestackdepth;
                 let item_i = depth - 1;
                 let list_i = depth - 2;
-                let next = if list_i >= state.frame.n_slots {
+                let next = if list_i >= code_n_slots(program) {
                     let item = state.frame.locals_stack_w[item_i];
                     let list = state.frame.locals_stack_w[list_i];
                     if list_opt_append(list, item) != 0 {
@@ -6313,7 +6322,7 @@ fn run_cel_portal(
                 let value_i = depth - 1;
                 let key_i = depth - 2;
                 let map_i = depth - 3;
-                let next = if map_i >= state.frame.n_slots {
+                let next = if map_i >= code_n_slots(program) {
                     let value = state.frame.locals_stack_w[value_i];
                     let key = state.frame.locals_stack_w[key_i];
                     let map = state.frame.locals_stack_w[map_i];
@@ -6344,7 +6353,7 @@ fn run_cel_portal(
                 let depth = state.frame.valuestackdepth;
                 let key_i = depth - 1;
                 let box_i = depth - 2;
-                let next = if box_i >= state.frame.n_slots {
+                let next = if box_i >= code_n_slots(program) {
                     let key = state.frame.locals_stack_w[key_i];
                     let container = state.frame.locals_stack_w[box_i];
                     if !container.is_null() {
@@ -6383,7 +6392,7 @@ fn run_cel_portal(
                 let here = pc as i64;
                 let depth = state.frame.valuestackdepth;
                 let i = depth - 1;
-                let next = if i >= state.frame.n_slots {
+                let next = if i >= code_n_slots(program) {
                     let recv = state.frame.locals_stack_w[i];
                     if !recv.is_null() {
                         let found = opt_select_cell(recv, program, insn_a(program, pc));

@@ -2088,9 +2088,23 @@ impl VableStack {
     }
 }
 
+impl VableStack {
+    /// `ll_getitem_nonneg`: the block was sized from `n_slots + max_stack`.
+    /// Release builds do not check; a wrong compiler size fails here in debug.
+    #[inline(always)]
+    fn debug_slot(&self, i: i64) {
+        debug_assert!(
+            i >= 0 && (i as usize) < self.capacity(),
+            "frame slot {i} outside 0..{}",
+            self.capacity()
+        );
+    }
+}
+
 impl core::ops::Index<i64> for VableStack {
     type Output = CelRef;
     fn index(&self, i: i64) -> &CelRef {
+        self.debug_slot(i);
         unsafe {
             &*crate::runtime::object_array::items_block_items_base(self.block).add(i as usize)
         }
@@ -2099,6 +2113,7 @@ impl core::ops::Index<i64> for VableStack {
 
 impl core::ops::IndexMut<i64> for VableStack {
     fn index_mut(&mut self, i: i64) -> &mut CelRef {
+        self.debug_slot(i);
         unsafe {
             &mut *crate::runtime::object_array::items_block_items_base(self.block).add(i as usize)
         }
@@ -2178,6 +2193,7 @@ pub unsafe fn reset_cel_frame(frame: *mut W_CelFrame, n_slots: i64) {
 ///
 /// `frame` is a live [`W_CelFrame`] and `i` is in range.
 pub unsafe fn cel_frame_slot(frame: *mut W_CelFrame, i: i64) -> *mut CelRef {
+    (*frame).locals_stack_w.debug_slot(i);
     crate::runtime::object_array::items_block_items_base((*frame).locals_stack_w.block)
         .add(i as usize)
 }
