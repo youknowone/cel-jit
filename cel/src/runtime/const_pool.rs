@@ -9,10 +9,10 @@ use super::heap::{
 };
 use super::object::{
     new_bool, new_null, prebuilt_int, CelObject, CelRef, ListStrategy, MapStrategy, W_BytesObject,
-    W_DoubleObject, W_IntColumn, W_IntObject, W_ListObject, W_MapObject, W_StringObject,
-    W_TupleObject, W_UIntObject, CEL_BYTES_CLASS, CEL_DOUBLE_CLASS, CEL_INT_CLASS,
-    CEL_INT_COLUMN_CLASS, CEL_LIST_CLASS, CEL_MAP_CLASS, CEL_STRING_CLASS, CEL_TUPLE_CLASS,
-    CEL_UINT_CLASS,
+    W_DoubleObject, W_HostListObject, W_IntColumn, W_IntObject, W_ListObject, W_MapObject,
+    W_StringObject, W_TupleObject, W_UIntObject, CEL_BYTES_CLASS, CEL_DOUBLE_CLASS,
+    CEL_HOST_LIST_CLASS, CEL_INT_CLASS, CEL_INT_COLUMN_CLASS, CEL_MAP_CLASS, CEL_STRING_CLASS,
+    CEL_TUPLE_CLASS, CEL_UINT_CLASS,
 };
 use super::object_array::{
     bytes_base, int_words_base, items_block_items_base, CelBytesBlock, CelIntWords, CelItemsBlock,
@@ -268,15 +268,17 @@ impl ConstPool {
             data,
             length: n as i64,
         }) as CelRef;
-        self.alloc(W_ListObject {
-            ob_header: CelObject {
-                ob_type: &CEL_LIST_CLASS,
+        self.alloc(W_HostListObject {
+            base: W_ListObject {
+                ob_header: CelObject {
+                    ob_type: &CEL_HOST_LIST_CLASS,
+                },
+                strategy: ListStrategy::Ints,
+                storage: col,
+                items: core::ptr::null_mut(),
+                start: 0,
+                length: n as i64,
             },
-            strategy: ListStrategy::Ints,
-            storage: col,
-            items: core::ptr::null_mut(),
-            start: 0,
-            length: n as i64,
             public: core::ptr::null(),
             public_start: 0,
             public_len: 0,
@@ -380,15 +382,17 @@ impl ConstPool {
                 core::ptr::copy_nonoverlapping(items.as_ptr(), items_block_items_base(block), n);
             }
         }
-        self.alloc(W_ListObject {
-            ob_header: CelObject {
-                ob_type: &CEL_LIST_CLASS,
+        self.alloc(W_HostListObject {
+            base: W_ListObject {
+                ob_header: CelObject {
+                    ob_type: &CEL_HOST_LIST_CLASS,
+                },
+                strategy: ListStrategy::Object,
+                storage: core::ptr::null_mut(),
+                items: block,
+                start: 0,
+                length: n as i64,
             },
-            strategy: ListStrategy::Object,
-            storage: core::ptr::null_mut(),
-            items: block,
-            start: 0,
-            length: n as i64,
             public: core::ptr::null(),
             public_start: 0,
             public_len: 0,

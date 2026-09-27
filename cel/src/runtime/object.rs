@@ -726,19 +726,48 @@ pub struct W_ListObject {
     /// once and loads `start + index` with no further check.
     pub start: i64,
     pub length: i64,
+}
+
+pub static CEL_LIST_CLASS: CelClass = CelClass::new("list", CelKind::List, 11);
+
+/// A list wrapped from a host value.
+///
+/// The link back to that value's buffer is three fields after
+/// [`W_ListObject`]. A list the VM allocates is a [`W_ListObject`] and has
+/// no link. `kind` stays [`CelKind::List`], so a family test accepts both.
+#[repr(C)]
+#[allow(non_camel_case_types)]
+pub struct W_HostListObject {
+    pub base: W_ListObject,
     /// Non-owning pointer at the public list buffer this leaf was wrapped
-    /// from, or null if the list was allocated by the VM. The Context that
-    /// performed the wrap keeps the owning handle alive.
+    /// from. The Context that performed the wrap keeps the owning handle alive.
     pub public: *const (),
     pub public_start: u32,
     pub public_len: u32,
 }
 
-pub static CEL_LIST_CLASS: CelClass = CelClass::new("list", CelKind::List, 11);
+pub static CEL_HOST_LIST_CLASS: CelClass = CelClass::new("list", CelKind::List, 19);
 
 const _: () = {
     assert!(offset_of!(W_ListObject, ob_header) == 0);
+    assert!(offset_of!(W_HostListObject, base) == 0);
+    assert!(size_of::<W_ListObject>() == 48);
 };
+
+/// Drop the host buffer link. A VM list has none.
+///
+/// # Safety
+///
+/// `w` is a live list.
+pub(crate) unsafe fn list_clear_public_link(w: CelRef) {
+    if (*w).ob_type != &CEL_HOST_LIST_CLASS {
+        return;
+    }
+    let leaf = &mut *w.cast::<W_HostListObject>();
+    leaf.public = core::ptr::null();
+    leaf.public_start = 0;
+    leaf.public_len = 0;
+}
 
 /// `W_TupleObject` (`tupleobject.py`).
 ///
@@ -1076,9 +1105,6 @@ pub fn new_list_with_capacity_in(heap: &super::heap::CelHeap, cap: i64) -> *mut 
         items,
         start: 0,
         length: 0,
-        public: core::ptr::null(),
-        public_start: 0,
-        public_len: 0,
     })
 }
 
@@ -1186,9 +1212,7 @@ pub unsafe fn list_store_int(w: CelRef, word: i64) -> bool {
     let data = crate::runtime::object_array::int_words_base(col.data);
     *data.add(at as usize) = word;
     leaf.length = at + 1;
-    leaf.public = core::ptr::null();
-    leaf.public_start = 0;
-    leaf.public_len = 0;
+    list_clear_public_link(w);
     true
 }
 
@@ -1301,9 +1325,7 @@ pub unsafe fn list_store_float(w: CelRef, word: f64) -> bool {
     let data = col.data;
     *data.add(at as usize) = word;
     leaf.length = at + 1;
-    leaf.public = core::ptr::null();
-    leaf.public_start = 0;
-    leaf.public_len = 0;
+    list_clear_public_link(w);
     true
 }
 
@@ -1482,9 +1504,7 @@ unsafe fn list_switch_to_object_append(w: CelRef, item: CelRef) -> bool {
     leaf.items = items;
     leaf.start = 0;
     leaf.length = (n + 1) as i64;
-    leaf.public = core::ptr::null();
-    leaf.public_start = 0;
-    leaf.public_len = 0;
+    list_clear_public_link(w);
     true
 }
 
@@ -1532,9 +1552,7 @@ unsafe fn list_switch_floats_to_object(w: CelRef, item: CelRef) -> bool {
     leaf.items = items;
     leaf.start = 0;
     leaf.length = (n + 1) as i64;
-    leaf.public = core::ptr::null();
-    leaf.public_start = 0;
-    leaf.public_len = 0;
+    list_clear_public_link(w);
     true
 }
 
@@ -1573,9 +1591,7 @@ unsafe fn list_append_item_ref(w: CelRef, item: CelRef) -> bool {
     }
     *base.add(leaf.length as usize) = item;
     leaf.length += 1;
-    leaf.public = core::ptr::null();
-    leaf.public_start = 0;
-    leaf.public_len = 0;
+    list_clear_public_link(w);
     true
 }
 
@@ -1659,9 +1675,6 @@ pub fn new_list(values: &[CelRef]) -> *mut W_ListObject {
         items,
         start: 0,
         length,
-        public: core::ptr::null(),
-        public_start: 0,
-        public_len: 0,
     })
 }
 
@@ -1681,9 +1694,6 @@ pub fn new_list_ints(values: &[i64]) -> *mut W_ListObject {
         items: core::ptr::null_mut(),
         start: 0,
         length,
-        public: core::ptr::null(),
-        public_start: 0,
-        public_len: 0,
     })
 }
 
@@ -1698,10 +1708,72 @@ pub fn new_list_window(storage: CelRef, start: i64, length: i64) -> *mut W_ListO
         items: core::ptr::null_mut(),
         start,
         length,
+    })
+}
+
+fn host_list_leaf(
+    strategy: ListStrategy,
+    storage: CelRef,
+    items: *mut CelItemsBlock,
+    start: i64,
+    length: i64,
+) -> W_HostListObject {
+    W_HostListObject {
+        base: W_ListObject {
+            ob_header: CelObject {
+                ob_type: &CEL_HOST_LIST_CLASS,
+            },
+            strategy,
+            storage,
+            items,
+            start,
+            length,
+        },
         public: core::ptr::null(),
         public_start: 0,
         public_len: 0,
-    })
+    }
+}
+
+/// [`new_list`] for a list wrapped from a host value.
+pub(crate) fn new_host_list(values: &[CelRef]) -> *mut W_HostListObject {
+    let items = object_array::new_items_block(values);
+    let length = values.len() as i64;
+    lltype::malloc_typed(host_list_leaf(
+        ListStrategy::Object,
+        core::ptr::null_mut(),
+        items,
+        0,
+        length,
+    ))
+}
+
+/// [`new_list_ints`] for a list wrapped from a host value.
+pub(crate) fn new_host_list_ints(values: &[i64]) -> *mut W_HostListObject {
+    let storage = new_int_column(values) as CelRef;
+    let length = values.len() as i64;
+    lltype::malloc_typed(host_list_leaf(
+        ListStrategy::Ints,
+        storage,
+        core::ptr::null_mut(),
+        0,
+        length,
+    ))
+}
+
+/// [`new_list_window`] for a list wrapped from a host value.
+pub(crate) fn new_host_list_window(
+    storage: CelRef,
+    start: i64,
+    length: i64,
+) -> *mut W_HostListObject {
+    lltype::malloc_typed(host_list_leaf(
+        ListStrategy::Window,
+        storage,
+        core::ptr::null_mut(),
+        start,
+        length,
+    ))
 }
 
 /// Flatten `[k, v]` pairs into one items block. Shared by map and struct so

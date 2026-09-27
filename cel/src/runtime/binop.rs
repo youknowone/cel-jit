@@ -60,9 +60,9 @@ use super::object::{
     list_ints_slice, new_bool, new_bytes_concat, new_double, new_duration, new_int, new_list,
     new_list_ints, new_null, new_string_concat, new_timestamp, new_uint, CelClass, CelRef,
     W_BytesObject, W_MapObject, W_StringObject, CEL_BOOL_CLASS, CEL_BYTES_CLASS, CEL_DOUBLE_CLASS,
-    CEL_DURATION_CLASS, CEL_INT_CLASS, CEL_LIST_CLASS, CEL_MAP_CLASS, CEL_NULL_CLASS,
-    CEL_OPAQUE_CLASS, CEL_OPTIONAL_CLASS, CEL_STRING_CLASS, CEL_TIMESTAMP_CLASS, CEL_TYPE_CLASS,
-    CEL_UINT_CLASS,
+    CEL_DURATION_CLASS, CEL_HOST_LIST_CLASS, CEL_INT_CLASS, CEL_LIST_CLASS, CEL_MAP_CLASS,
+    CEL_NULL_CLASS, CEL_OPAQUE_CLASS, CEL_OPTIONAL_CLASS, CEL_STRING_CLASS, CEL_TIMESTAMP_CLASS,
+    CEL_TYPE_CLASS, CEL_UINT_CLASS,
 };
 use super::object_array::{bytes_base, items_block_items_base};
 
@@ -74,6 +74,10 @@ use super::object_array::{bytes_base, items_block_items_base};
 #[inline]
 unsafe fn class_of(w: CelRef) -> *const CelClass {
     (*w).ob_type
+}
+
+fn is_list_class(t: *const CelClass) -> bool {
+    t == &CEL_LIST_CLASS as *const CelClass || t == &CEL_HOST_LIST_CLASS as *const CelClass
 }
 
 use super::object::payload;
@@ -619,6 +623,7 @@ pub unsafe fn cel_add(a: CelRef, b: CelRef) -> CelRef {
             CEL_STRING_CLASS => w_string_add,
             CEL_BYTES_CLASS => w_bytes_add,
             CEL_LIST_CLASS => w_list_add,
+            CEL_HOST_LIST_CLASS => w_list_add,
         );
     }
     cel_add_slow(a, b, ta, tb)
@@ -630,6 +635,9 @@ pub unsafe fn cel_add(a: CelRef, b: CelRef) -> CelRef {
 ///
 /// As [`cel_add`].
 unsafe fn cel_add_slow(a: CelRef, b: CelRef, ta: *const CelClass, tb: *const CelClass) -> CelRef {
+    if is_list_class(ta) && is_list_class(tb) {
+        return w_list_add(a, b);
+    }
     let ts = &CEL_TIMESTAMP_CLASS as *const CelClass;
     let dur = &CEL_DURATION_CLASS as *const CelClass;
     if ta == ts && tb == dur {
@@ -1076,6 +1084,7 @@ pub unsafe fn values_equal(a: CelRef, b: CelRef) -> bool {
             CEL_STRING_CLASS => w_string_eq,
             CEL_BYTES_CLASS => w_bytes_eq,
             CEL_LIST_CLASS => w_list_eq,
+            CEL_HOST_LIST_CLASS => w_list_eq,
             CEL_MAP_CLASS => w_map_eq,
             CEL_OPAQUE_CLASS => w_opaque_eq,
         );
@@ -1095,6 +1104,9 @@ unsafe fn values_equal_mixed(
     ta: *const CelClass,
     tb: *const CelClass,
 ) -> bool {
+    if is_list_class(ta) && is_list_class(tb) {
+        return w_list_eq(a, b);
+    }
     let int = &CEL_INT_CLASS as *const CelClass;
     let uint = &CEL_UINT_CLASS as *const CelClass;
     let double = &CEL_DOUBLE_CLASS as *const CelClass;

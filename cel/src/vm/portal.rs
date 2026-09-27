@@ -2724,9 +2724,6 @@ fn alloc_traced_list(
     items: *mut crate::runtime::object_array::CelItemsBlock,
     start: i64,
     length: i64,
-    _public: *const (),
-    public_start: u32,
-    public_len: u32,
 ) -> *mut crate::runtime::object::W_ListObject {
     let strategy = match strategy {
         1 => crate::runtime::object::ListStrategy::Ints,
@@ -2744,9 +2741,6 @@ fn alloc_traced_list(
             items,
             start,
             length,
-            public: core::ptr::null(),
-            public_start,
-            public_len,
         })
     })
 }
@@ -2803,8 +2797,6 @@ fn alloc_traced_map(
             crate::runtime::object::W_ListObject::strategy => u8,
             crate::runtime::object::W_ListObject::length => i64,
             crate::runtime::object::W_ListObject::start => i64,
-            crate::runtime::object::W_ListObject::public_start => u32,
-            crate::runtime::object::W_ListObject::public_len => u32,
         },
         struct_allocs = {
             crate::runtime::object::W_ListObject => alloc_traced_list,
@@ -2825,9 +2817,6 @@ fn alloc_list(vm: i64, cap: i64) -> *mut CelObject {
         items: core::ptr::null_mut(),
         start: n,
         length: 0i64,
-        public: core::ptr::null(),
-        public_start: 0u32,
-        public_len: 0u32,
     };
     w as *mut crate::runtime::object::W_ListObject as *mut CelObject
 }

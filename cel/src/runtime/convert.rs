@@ -13,14 +13,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::object::{
-    new_bool, new_bytes, new_double, new_int, new_list, new_list_ints, new_list_window, new_map,
-    new_map_record, new_null, new_opaque, new_optional, new_optional_none, new_string, new_type,
-    new_uint, opaque_host_index, w_kind, w_type, CelClass, CelKind, CelRef, ListStrategy,
-    MapStrategy, W_BoolObject, W_BytesObject, W_DoubleObject, W_IntColumn, W_IntObject,
-    W_ListObject, W_MapObject, W_OptionalObject, W_StringObject, W_TypeObject, W_UIntObject,
-    CEL_BOOL_CLASS, CEL_BYTES_CLASS, CEL_DOUBLE_CLASS, CEL_INT_CLASS, CEL_LIST_CLASS,
-    CEL_MAP_CLASS, CEL_NULL_CLASS, CEL_OPAQUE_CLASS, CEL_OPTIONAL_CLASS, CEL_STRING_CLASS,
-    CEL_TYPE_CLASS, CEL_UINT_CLASS,
+    new_bool, new_bytes, new_double, new_host_list, new_host_list_ints, new_host_list_window,
+    new_int, new_map, new_map_record, new_null, new_opaque, new_optional, new_optional_none,
+    new_string, new_type, new_uint, opaque_host_index, w_kind, w_type, CelClass, CelKind, CelRef,
+    ListStrategy, MapStrategy, W_BoolObject, W_BytesObject, W_DoubleObject, W_HostListObject,
+    W_IntColumn, W_IntObject, W_ListObject, W_MapObject, W_OptionalObject, W_StringObject,
+    W_TypeObject, W_UIntObject, CEL_BOOL_CLASS, CEL_BYTES_CLASS, CEL_DOUBLE_CLASS,
+    CEL_HOST_LIST_CLASS, CEL_INT_CLASS, CEL_LIST_CLASS, CEL_MAP_CLASS, CEL_NULL_CLASS,
+    CEL_OPAQUE_CLASS, CEL_OPTIONAL_CLASS, CEL_STRING_CLASS, CEL_TYPE_CLASS, CEL_UINT_CLASS,
 };
 use super::object_array::{bytes_base, items_block_items_base};
 use crate::common::types::{
@@ -88,7 +88,10 @@ pub(crate) fn interned_linked(w: CelRef) -> Option<Value> {
     unsafe {
         match w_kind(w) {
             CelKind::List => {
-                let leaf = &*w.cast::<W_ListObject>();
+                if w_type(w) != &CEL_HOST_LIST_CLASS {
+                    return None;
+                }
+                let leaf = &*w.cast::<W_HostListObject>();
                 ListRef::clone_from_public(leaf.public).map(|buf| {
                     Value::List(ListRef::from_linked(
                         buf,
@@ -262,7 +265,9 @@ pub unsafe fn ref_to_value(w: CelRef) -> Result<Value, ConvertError> {
             let leaf = unsafe { &*w.cast::<W_BytesObject>() };
             Ok(Value::Bytes(bytes_from_leaf(leaf)?))
         }
-        CelKind::List if class == &CEL_LIST_CLASS => Ok(Value::List(unsafe { list_from_ref(w)? })),
+        CelKind::List if class == &CEL_LIST_CLASS || class == &CEL_HOST_LIST_CLASS => {
+            Ok(Value::List(unsafe { list_from_ref(w)? }))
+        }
         CelKind::Map if class == &CEL_MAP_CLASS => Ok(Value::Map(unsafe { map_from_ref(w)? })),
         _ => unsafe { ref_to_value_cold(w, kind, class) },
     }
@@ -375,7 +380,7 @@ fn type_from_class(cls: *const CelClass) -> Option<Type> {
     if std::ptr::eq(cls, &CEL_NULL_CLASS) {
         return Some(NULL_TYPE.to_owned());
     }
-    if std::ptr::eq(cls, &CEL_LIST_CLASS) {
+    if std::ptr::eq(cls, &CEL_LIST_CLASS) || std::ptr::eq(cls, &CEL_HOST_LIST_CLASS) {
         return Some(LIST_TYPE.to_owned());
     }
     if std::ptr::eq(cls, &CEL_MAP_CLASS) {
@@ -405,19 +410,19 @@ fn intern_list(list: &ListRef) -> CelRef {
     if let Some(values) = list.ints_slice() {
         let start = list.window_start();
         let end = start + list.len();
-        new_list_ints(&values[start..end]) as CelRef
+        new_host_list_ints(&values[start..end]) as CelRef
     } else if list.is_whole() && list.object_slice().is_some() {
         if let Some(ints) = object_list_as_ints(list) {
-            return new_list_ints(&ints) as CelRef;
+            return new_host_list_ints(&ints) as CelRef;
         }
         let mut items = Vec::with_capacity(list.len());
         for elt in list.iter() {
             items.push(value_to_ref(&elt).unwrap_or_else(|_| new_null() as CelRef));
         }
-        new_list(&items) as CelRef
+        new_host_list(&items) as CelRef
     } else {
         let host = intern_host_any(Box::new(list.clone()));
-        new_list_window(host, 0, list.len() as i64) as CelRef
+        new_host_list_window(host, 0, list.len() as i64) as CelRef
     }
 }
 
@@ -450,10 +455,10 @@ pub(crate) fn link_public_handle(w: CelRef, value: &Value) {
     unsafe {
         match value {
             Value::List(list) => {
-                if w_kind(w) != CelKind::List {
+                if w_type(w) != &CEL_HOST_LIST_CLASS {
                     return;
                 }
-                let leaf = &mut *w.cast::<W_ListObject>();
+                let leaf = &mut *w.cast::<W_HostListObject>();
                 leaf.public = list.public_ptr();
                 leaf.public_start = list.window_start() as u32;
                 leaf.public_len = list.len() as u32;
@@ -553,14 +558,17 @@ unsafe fn values_from_items(leaf: &W_ListObject) -> Result<ListRef, ConvertError
 }
 
 unsafe fn list_from_ref(w: CelRef) -> Result<ListRef, ConvertError> {
-    let leaf = &*w.cast::<W_ListObject>();
-    if let Some(buf) = unsafe { ListRef::clone_from_public(leaf.public) } {
-        return Ok(ListRef::from_linked(
-            buf,
-            leaf.public_start,
-            leaf.public_len,
-        ));
+    if unsafe { w_type(w) } == &CEL_HOST_LIST_CLASS {
+        let host = &*w.cast::<W_HostListObject>();
+        if let Some(buf) = unsafe { ListRef::clone_from_public(host.public) } {
+            return Ok(ListRef::from_linked(
+                buf,
+                host.public_start,
+                host.public_len,
+            ));
+        }
     }
+    let leaf = &*w.cast::<W_ListObject>();
     match leaf.strategy {
         ListStrategy::Object => {
             if let Some(ints) = interned_object_list_ints(leaf) {
@@ -933,7 +941,7 @@ fn ref_to_key(w: CelRef) -> Result<Key, ConvertError> {
 mod tests {
     use super::*;
     use crate::objects::MapEntries;
-    use crate::runtime::object::{map_try_insert, new_map_with_capacity};
+    use crate::runtime::object::{map_try_insert, new_list, new_map_with_capacity};
 
     fn roundtrip(v: Value) -> Value {
         let w = value_to_ref(&v).expect("to_ref");
@@ -1205,16 +1213,16 @@ mod tests {
         let value = Value::List(original.clone());
         let w = intern_leaf(&value).expect("intern");
         link_public_handle(w, &value);
+        assert_eq!(unsafe { w_type(w) }, &CEL_HOST_LIST_CLASS as *const _);
         let back = unsafe { list_from_ref(w) }.expect("unpack");
         assert!(original.ptr_eq(&back));
     }
 
     #[test]
     fn a_vm_born_list_has_no_public_link() {
-        let value = Value::List(ListRef::from(vec![Value::Int(1)]));
-        let w = intern_leaf(&value).expect("intern");
-        let leaf = unsafe { &*w.cast::<W_ListObject>() };
-        assert!(leaf.public.is_null());
+        let w = new_list(&[new_int(1) as CelRef]) as CelRef;
+        assert_eq!(unsafe { w_type(w) }, &CEL_LIST_CLASS as *const _);
+        assert_ne!(unsafe { w_type(w) }, &CEL_HOST_LIST_CLASS as *const _);
     }
 
     #[test]

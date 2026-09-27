@@ -49,7 +49,8 @@ use crate::runtime::object::{
     new_list, new_list_ints, new_list_with_capacity_in, new_map_with_capacity_in, new_null,
     new_optional, new_optional_none, new_string, new_type, new_uint, opaque_host_index,
     reset_cel_frame, string_as_str, string_byte_len, w_kind, w_type, CelKind, CelRef, W_BoolObject,
-    W_CelFrame, W_DoubleObject, W_IntObject, W_UIntObject, CEL_OPAQUE_CLASS, CEL_TYPE_CLASS,
+    W_CelFrame, W_DoubleObject, W_IntObject, W_UIntObject, CEL_HOST_LIST_CLASS, CEL_LIST_CLASS,
+    CEL_OPAQUE_CLASS, CEL_TYPE_CLASS,
 };
 use crate::runtime::optional::{
     cel_optional_has_value, cel_optional_none, cel_optional_of, cel_optional_of_non_zero_value,
@@ -3634,7 +3635,12 @@ fn interned_type_of(w: CelRef) -> CelRef {
                     .unwrap_or(new_type(&CEL_OPAQUE_CLASS) as CelRef);
             }
         }
-        new_type(&*w_type(w)) as CelRef
+        let cls = if w_type(w) == &CEL_HOST_LIST_CLASS {
+            &CEL_LIST_CLASS
+        } else {
+            &*w_type(w)
+        };
+        new_type(cls) as CelRef
     }
 }
 

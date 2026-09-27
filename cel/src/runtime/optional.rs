@@ -32,9 +32,9 @@ use super::object::{
     bytes_len, list_len, map_len, new_bool, new_optional, new_optional_none, payload,
     string_byte_len, w_type, CelClass, CelRef, W_BoolObject, W_DoubleObject, W_DurationObject,
     W_IntObject, W_OptionalObject, W_TimestampObject, W_UIntObject, CEL_BOOL_CLASS,
-    CEL_BYTES_CLASS, CEL_DOUBLE_CLASS, CEL_DURATION_CLASS, CEL_INT_CLASS, CEL_LIST_CLASS,
-    CEL_MAP_CLASS, CEL_NULL_CLASS, CEL_OPTIONAL_CLASS, CEL_STRING_CLASS, CEL_TIMESTAMP_CLASS,
-    CEL_UINT_CLASS,
+    CEL_BYTES_CLASS, CEL_DOUBLE_CLASS, CEL_DURATION_CLASS, CEL_HOST_LIST_CLASS, CEL_INT_CLASS,
+    CEL_LIST_CLASS, CEL_MAP_CLASS, CEL_NULL_CLASS, CEL_OPTIONAL_CLASS, CEL_STRING_CLASS,
+    CEL_TIMESTAMP_CLASS, CEL_UINT_CLASS,
 };
 
 /// The `optional` class, as the receiver tests read it.
@@ -115,7 +115,7 @@ unsafe fn is_zero(v: CelRef) -> bool {
     if t == (&CEL_BYTES_CLASS as *const CelClass) {
         return bytes_len(v) == 0;
     }
-    if t == (&CEL_LIST_CLASS as *const CelClass) {
+    if t == (&CEL_LIST_CLASS as *const CelClass) || t == (&CEL_HOST_LIST_CLASS as *const CelClass) {
         return list_len(v) == 0;
     }
     if t == (&CEL_MAP_CLASS as *const CelClass) {
