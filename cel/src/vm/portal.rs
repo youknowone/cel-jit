@@ -1467,16 +1467,6 @@ impl PortalTable {
 }
 
 thread_local! {
-    /// Vm pointer for [`step_hot`]. The dispatch arm only passes the
-    /// portal greens `program` and `pc`.
-    static PORTAL_VM: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
-    /// The `JitDriver` [`run_cel_portal`] is running. `step_hot` forces a
-    /// compiled token through this pointer: the driver is already borrowed
-    /// by the portal loop, so the force cannot take a second `RefCell` borrow.
-    static ACTIVE_PORTAL_DRIVER: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    /// Address of this byte is this thread's owner token. Const-initialised,
-    /// so the first `with` is a TLS lookup, not a constructor.
-    static OWNER_TOKEN: u8 = const { 0u8 };
     /// Drivers for programs this thread did not claim. Keyed by code id.
     /// `JitDriver` is not `Send`; a program another thread owns is reached
     /// through this table instead of the code-owned pointer.
@@ -1484,9 +1474,16 @@ thread_local! {
         const { std::cell::RefCell::new(PortalTable::new()) };
 }
 
+/// Owner token for `code`'s driver slot. The heap address is stable for
+/// the thread and is already in hand on the execute path.
 #[inline(always)]
-fn thread_owner_token() -> usize {
-    OWNER_TOKEN.with(|b| b as *const u8 as usize)
+fn thread_owner_token(heap: *const crate::runtime::heap::CelHeap) -> usize {
+    heap as usize
+}
+
+#[inline(always)]
+fn portal_heap(vm_bits: i64) -> *const crate::runtime::heap::CelHeap {
+    unsafe { vm_of(vm_bits).heap }
 }
 
 pub(crate) fn driver_table_len() -> usize {
@@ -1537,7 +1534,7 @@ unsafe fn driver_on_code<'a>(
 ) -> &'a mut JitDriver<PortalState> {
     let slot = &mut *jit.driver.get();
     if *slot == 0 {
-        let boxed = Box::new(fresh_portal_driver(state, code));
+        let boxed = boxed_portal_driver(state, code);
         jit.drop_fn.set(Some(drop_portal_driver));
         *slot = Box::into_raw(boxed) as usize;
     }
@@ -1553,18 +1550,21 @@ unsafe fn driver_on_code<'a>(
 /// `token` is a live force token, and [`run_cel_portal`] has published its
 /// driver for this thread.
 pub(crate) unsafe fn force_portal_driver_token(token: u64) {
-    let ptr = ACTIVE_PORTAL_DRIVER.with(|cell| cell.get());
+    let ptr = unsafe { (*crate::runtime::heap::heap_ptr()).active_driver.get() };
     assert!(ptr != 0, "may_force residual with no portal driver");
     unsafe {
         (*(ptr as *mut JitDriver<PortalState>)).force_virtualizable_token(token);
     }
 }
 
-struct ActiveDriverGuard(usize);
+struct ActiveDriverGuard {
+    heap: *const crate::runtime::heap::CelHeap,
+    prev: usize,
+}
 
 impl Drop for ActiveDriverGuard {
     fn drop(&mut self) {
-        ACTIVE_PORTAL_DRIVER.with(|cell| cell.set(self.0));
+        unsafe { (*self.heap).active_driver.set(self.prev) };
     }
 }
 
@@ -1573,17 +1573,34 @@ fn call_portal(
     code: &CelCode,
     state: &mut PortalState,
 ) -> i64 {
-    let prev = ACTIVE_PORTAL_DRIVER
-        .with(|cell| cell.replace(driver as *mut JitDriver<PortalState> as usize));
-    let _guard = ActiveDriverGuard(prev);
+    let heap = portal_heap(state.vm);
+    let prev = unsafe {
+        (*heap)
+            .active_driver
+            .replace(driver as *mut JitDriver<PortalState> as usize)
+    };
+    let _guard = ActiveDriverGuard { heap, prev };
     run_cel_portal(driver, code, state, 0)
 }
 
-#[inline(always)]
+/// Build a driver off the hot frame. Returning the box keeps the large
+/// `JitDriver` out of every caller's stack.
+#[cold]
+#[inline(never)]
+fn boxed_portal_driver(state: &mut PortalState, code: &CelCode) -> Box<JitDriver<PortalState>> {
+    Box::new(fresh_portal_driver(state, code))
+}
+
+#[cold]
+#[inline(never)]
+fn run_reentrant_driver(code: &CelCode, state: &mut PortalState) -> i64 {
+    let mut driver = boxed_portal_driver(state, code);
+    call_portal(&mut driver, code, state)
+}
+
 fn run_owned_driver(jit: &super::code::CodeJit, code: &CelCode, state: &mut PortalState) -> i64 {
     if jit.in_use.get() {
-        let mut driver = fresh_portal_driver(state, code);
-        return call_portal(&mut driver, code, state);
+        return run_reentrant_driver(code, state);
     }
     jit.in_use.set(true);
     let in_use = &jit.in_use as *const std::cell::Cell<bool>;
@@ -1606,10 +1623,7 @@ fn run_table_driver(code: &CelCode, state: &mut PortalState) -> i64 {
             let i = table.index_for(id, live, state, code);
             call_portal(&mut table.entries[i].driver, code, state)
         }
-        Err(_) => {
-            let mut driver = fresh_portal_driver(state, code);
-            call_portal(&mut driver, code, state)
-        }
+        Err(_) => run_reentrant_driver(code, state),
     })
 }
 
@@ -1629,20 +1643,28 @@ pub(crate) fn eval_through_portal(
         ret: 0,
     };
     // A host call can re-enter this function on the same thread. The nested
-    // evaluation must not leave its VM in the thread-local, or the outer
+    // evaluation must not leave its VM in the heap slot, or the outer
     // `RETURN` parks on that VM and this one finishes with no result.
-    let prev_vm = PORTAL_VM.with(|cell| cell.replace(state.vm));
-    struct PortalVmGuard(i64);
+    // The heap pointer was resolved when the scope opened.
+    let heap = vm.heap;
+    let prev_vm = unsafe { (*heap).portal_vm.replace(state.vm) };
+    struct PortalVmGuard {
+        heap: *const crate::runtime::heap::CelHeap,
+        prev: i64,
+    }
     impl Drop for PortalVmGuard {
         fn drop(&mut self) {
-            PORTAL_VM.with(|cell| cell.set(self.0));
+            unsafe { (*self.heap).portal_vm.set(self.prev) };
         }
     }
-    let _portal_vm = PortalVmGuard(prev_vm);
+    let _portal_vm = PortalVmGuard {
+        heap,
+        prev: prev_vm,
+    };
     // Census is not installed here — that hook is process-global and
     // would clobber the columnar machine.
     let jit = &code.identity.live.jit;
-    let token = thread_owner_token();
+    let token = thread_owner_token(heap);
     let owner = jit.owner.load(std::sync::atomic::Ordering::Acquire);
     let bits = if owner == token {
         run_owned_driver(jit, code, &mut state)
@@ -3586,7 +3608,7 @@ fn list_opt_append(list: *mut CelObject, item: *mut CelObject) -> i64 {
 /// loop would repeat one opcode.
 #[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
 fn step_hot(program: &CelCode, pc: usize) -> i64 {
-    let vm = PORTAL_VM.with(|cell| cell.get());
+    let vm = unsafe { (*crate::runtime::heap::heap_ptr()).portal_vm.get() };
     let here = pc as i64;
     let opcode = insn_op(program, pc);
     let frame = unsafe { &mut *vm_of(vm).cel_frame };

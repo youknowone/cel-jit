@@ -516,6 +516,13 @@ pub struct CelHeap {
     next_region_id: Cell<u32>,
     /// Detached, rewound regions waiting for the next Context on this thread.
     spare_regions: RefCell<Vec<NonNull<BindRegion>>>,
+    /// VM word [`crate::vm::portal`] publishes for a re-entering step.
+    /// The heap is already resolved for the call; this is not a second
+    /// thread-local.
+    pub(crate) portal_vm: Cell<i64>,
+    /// Driver [`crate::vm::portal`] is inside, so a `may_force` residual
+    /// can reach it without another thread-local.
+    pub(crate) active_driver: Cell<usize>,
 }
 
 impl CelHeap {
@@ -540,6 +547,8 @@ impl CelHeap {
             regions: RefCell::new(Vec::new()),
             next_region_id: Cell::new(0),
             spare_regions: RefCell::new(Vec::new()),
+            portal_vm: Cell::new(0),
+            active_driver: Cell::new(0),
         }
     }
 
@@ -635,7 +644,41 @@ impl CelHeap {
         if self.live_nursery_used() == snap.used && self.young_host_n.get() == snap.hosts {
             return;
         }
+        // Same open segment, no young hosts: the cursor moved and comes
+        // back. `segment.used` is refreshed by [`Self::flush_nursery_bump`]
+        // before a grow or a reset reads it, so this path does not borrow
+        // the segment vector.
+        if self.nursery.n_segs.get() == snap.len && self.young_host_n.get() == snap.hosts {
+            self.rewind_same_segment(snap);
+            return;
+        }
         self.leave_slow(snap);
+    }
+
+    /// Rewind the open cursor. The segment list is unchanged.
+    fn rewind_same_segment(&self, snap: NurserySnap) {
+        let live = self.nursery.bytes.get();
+        if live > self.nursery_high_water.get() {
+            self.nursery_high_water.set(live);
+        }
+        self.install_snap(snap);
+        #[cfg(debug_assertions)]
+        self.flush_nursery_bump();
+        #[cfg(debug_assertions)]
+        {
+            let from = self.snap_used.get();
+            let to = self.nursery.open_used.get();
+            let base = self.nursery.open_base.get();
+            if !base.is_null() && to > from {
+                unsafe {
+                    core::ptr::write_bytes(base.add(from), NURSERY_POISON, to - from);
+                }
+            }
+        }
+        self.nursery.open_used.set(self.snap_used.get());
+        self.nursery.bytes.set(self.snap_bytes.get());
+        self.nursery.objects.set(self.snap_objects.get());
+        self.publish_nursery_bounds();
     }
 
     /// Bytes handed out of the open nursery segment.
@@ -1292,10 +1335,16 @@ pub fn enter_eval_for(ctx: &crate::context::Context) -> EvalScope {
     }
 }
 
-#[inline]
+#[inline(always)]
 fn to_public(v: crate::Value) -> crate::Value {
     match v {
-        crate::Value::Interned(w) => crate::runtime::convert::interned_to_public(w),
+        crate::Value::Interned(w) => {
+            if let Some(scalar) = crate::runtime::convert::interned_immediate(w) {
+                scalar
+            } else {
+                crate::runtime::convert::interned_to_public(w)
+            }
+        }
         other => other,
     }
 }
