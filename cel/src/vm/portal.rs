@@ -34,7 +34,7 @@ use crate::runtime::object::{
     map_try_insert, new_bool, new_double_in, new_int, new_int_in, string_as_str, string_byte_len,
     w_kind, w_type, CelKind, CelObject, CelRef, ListStrategy, W_BoolObject, W_DoubleObject,
     W_IntObject, W_OptionalObject, CEL_DOUBLE_CLASS, CEL_INT_CLASS, CEL_INT_COLUMN_CLASS,
-    CEL_LIST_CLASS, CEL_MAP_CLASS,
+    CEL_LIST_CLASS, CEL_MAP_CLASS, CEL_STRING_CLASS,
 };
 use crate::runtime::object::{force_virtualizable_if_necessary, W_CelFrame};
 use crate::runtime::optional::{
@@ -3051,6 +3051,11 @@ fn int_to_text(n: i64) -> *mut CelObject {
     crate::runtime::object::string_from_int(n) as *mut CelObject
 }
 
+/// `CEL_STRING_CLASS` pointer. The int cast is at the hint, not here:
+/// a pointer has no integer value during const eval, and `record_exact_class`
+/// takes the class on the int bank (`record_exact_class/ri`).
+const STRING_CLASS_PTR: *const crate::runtime::object::CelClass = &CEL_STRING_CLASS;
+
 /// `W_StringObject` + `W_StringObject` via `cel_add`. Residual. Null declines.
 #[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
 fn string_add_cell(a: *mut CelObject, b: *mut CelObject) -> *mut CelObject {
@@ -3107,7 +3112,10 @@ fn double_binop_cell(op: i64, a: *mut CelObject, b: *mut CelObject) -> *mut CelO
 })]
 fn string_from_cell(w: *mut CelObject) -> *mut CelObject {
     if cell_kind(w) == CelKind::Int as i64 {
-        int_to_text(cell_int(w))
+        let text = int_to_text(cell_int(w));
+        // Fresh `W_StringObject` on every non-error path (`ll_int2dec`).
+        majit_metainterp::jit::record_exact_class(text, STRING_CLASS_PTR as usize);
+        text
     } else if cell_kind(w) == CelKind::Str as i64 {
         w
     } else {
