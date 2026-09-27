@@ -793,6 +793,7 @@ pub(crate) struct Vm<'a> {
 /// Nested execute (a host re-entering while this frame is live) must not
 /// reuse the cached pointer. A larger code object abandons the previous
 /// frame inside the region; rewind and drop reclaim it with the region.
+#[inline]
 fn frame_for_execute(
     ctx: &Context,
     heap: &crate::runtime::heap::CelHeap,
@@ -884,6 +885,7 @@ impl<'a> Vm<'a> {
     /// the operand stack the compiler proved it needs, as one array. On a
     /// thread that has evaluated anything before, the capacity is already
     /// there and none of this allocates.
+    #[inline]
     fn new(
         code: &'a CelCode,
         ctx: &'a Context<'a>,
