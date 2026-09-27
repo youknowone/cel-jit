@@ -825,8 +825,22 @@ fn frame_for_execute(
 /// panic from a host function called mid-evaluation. Taking them out and
 /// putting them back is also what keeps re-entry sound: the slot is empty for
 /// exactly as long as a run holds it.
+///
+/// Inlined, with the hand-back out of line: a run that never hydrated holds no
+/// box, and the test is then the whole drop.
 impl Drop for Vm<'_> {
+    #[inline(always)]
     fn drop(&mut self) {
+        if self.scratch.is_some() {
+            self.return_scratch();
+        }
+    }
+}
+
+impl Vm<'_> {
+    #[cold]
+    #[inline(never)]
+    fn return_scratch(&mut self) {
         if let Some(mut scratch) = self.scratch.take() {
             scratch.frame = std::mem::take(&mut self.frame);
             scratch.release();

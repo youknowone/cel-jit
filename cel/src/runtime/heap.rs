@@ -1339,6 +1339,9 @@ pub fn enter_eval_for(ctx: &crate::context::Context) -> EvalScope {
 fn to_public(v: crate::Value) -> crate::Value {
     match v {
         crate::Value::Interned(w) => {
+            // `Interned` owns nothing, but the matched value is still live
+            // here and its drop is an out-of-line glue call over every variant.
+            core::mem::forget(v);
             if let Some(scalar) = crate::runtime::convert::interned_immediate(w) {
                 scalar
             } else {
