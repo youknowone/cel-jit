@@ -18,7 +18,8 @@
 //! # What this does NOT do
 //!
 //! **It does not walk objects.** The nursery is reclaimed by resetting a bump
-//! pointer when the outermost evaluation on this thread finishes; old space
+//! pointer when the open segment is half used (`incminimark.py`
+//! `collect_and_reserve`), not after every outermost evaluation; old space
 //! is not reclaimed until the heap is dropped. Objects wrapped at bind live
 //! in a [`BindRegion`] owned by the [`crate::Context`] that bound them and
 //! are released when that Context is dropped. There is still no root walker,
@@ -476,9 +477,10 @@ unsafe fn free_region(region: NonNull<BindRegion>) {
 /// One thread's value heap.
 ///
 /// Not `Send` and not `Sync`. Two spaces: old lives until the heap is
-/// dropped; the nursery is reset when the outermost evaluation on this
-/// thread finishes. Bind-wrapped objects live in [`BindRegion`]s attached
-/// here so [`contains`] can see them while the owning Context lives.
+/// dropped; the nursery is reclaimed when the open segment is half used,
+/// not when each outermost evaluation finishes. Bind-wrapped objects live
+/// in [`BindRegion`]s attached here so [`contains`] can see them while the
+/// owning Context lives.
 pub struct CelHeap {
     old: Space,
     nursery: Space,
@@ -644,11 +646,20 @@ impl CelHeap {
         if self.live_nursery_used() == snap.used && self.young_host_n.get() == snap.hosts {
             return;
         }
-        // Same open segment, no young hosts: the cursor moved and comes
-        // back. `segment.used` is refreshed by [`Self::flush_nursery_bump`]
-        // before a grow or a reset reads it, so this path does not borrow
-        // the segment vector.
+        // Same open segment, no young hosts: the cursor moved. `segment.used`
+        // is refreshed by [`Self::flush_nursery_bump`] before a grow or a
+        // reset reads it, so this path does not borrow the segment vector.
+        // `incminimark.py` `collect_and_reserve`: the nursery is reclaimed
+        // when it fills, not per evaluation. Dead bytes stay until the open
+        // segment is half used; `open_used` is left at the last rewind.
+        // The inline bump adds a fixed size and does not realign, so a cursor
+        // that is not a multiple of 8 is rewound now. `publish_nursery_bounds`
+        // then restores `base + open_used`, which stays aligned.
         if self.nursery.n_segs.get() == snap.len && self.young_host_n.get() == snap.hosts {
+            let live = self.live_nursery_used();
+            if live % align_of::<u64>() == 0 && live <= self.nursery.open_cap.get() / 2 {
+                return;
+            }
             self.rewind_same_segment(snap);
             return;
         }
@@ -1215,8 +1226,9 @@ impl majit_gc::GcAllocator for CelGc {
 
 /// Nursery bump captured at outermost entry. Leave compares [`Self::used`]
 /// with the live bump; a match means this evaluation allocated nothing young.
-/// `len` / `bytes` / `objects` are filled on the moved path from this
-/// snapshot plus zeros: an outermost enter always sees a rewound nursery.
+/// `used` is `open_used`, which stays at the last rewind: bumps move
+/// `nursery_free` only, and [`CelHeap::flush_nursery_bump`] either feeds a
+/// rewind that stores this base back or opens a segment (`n_segs` changes).
 #[derive(Clone, Copy)]
 struct NurserySnap {
     used: usize,
@@ -1630,11 +1642,45 @@ mod tests {
         unsafe { assert_eq!(*p, 7) };
     }
 
-    /// An outermost scope reclaims nursery memory; old space is untouched.
+    /// Open one nursery segment and rewind it, so later leaves take the
+    /// same-segment path instead of the first-allocation reset.
+    fn prime_open_nursery(heap: &CelHeap) {
+        assert!(heap.enter());
+        let _ = heap.alloc(0u64);
+        heap.leave(true);
+        assert_eq!(heap.nursery.n_segs.get(), 1);
+        assert_eq!(heap.nursery.open_used.get(), 0);
+        assert_eq!(heap.nursery.bytes.get(), 0);
+    }
+
+    /// Drive same-segment evaluations until the open segment is past half,
+    /// which is the leave that rewinds to `base_used`.
+    fn fill_past_half(heap: &CelHeap, base_used: usize) {
+        let half = heap.nursery.open_cap.get() / 2;
+        loop {
+            assert!(heap.enter());
+            let _ = heap.alloc(1u64);
+            let over = heap.live_nursery_used() > half;
+            heap.leave(true);
+            assert_eq!(heap.nursery.n_segs.get(), 1);
+            if over {
+                assert_eq!(heap.nursery.open_used.get(), base_used);
+                assert_eq!(heap.nursery.bytes.get(), 0);
+                return;
+            }
+            assert!(heap.live_nursery_used() <= half);
+            assert!(heap.nursery.bytes.get() > 0);
+        }
+    }
+
+    /// An outermost scope reclaims nursery memory once the open segment is
+    /// half used; a smaller leave leaves the bump. Old space is untouched.
     #[test]
     fn outermost_scope_resets_the_nursery() {
         let heap = CelHeap::new();
         let old = heap.alloc(1u64);
+        prime_open_nursery(&heap);
+        let base_bytes = heap.allocated_bytes();
         assert!(heap.enter());
         let young = heap.alloc(2u64);
         assert!(heap.contains(young as *const u8));
@@ -1643,19 +1689,27 @@ mod tests {
         let bytes_during = heap.allocated_bytes();
         heap.leave(true);
         assert!(heap.contains(old as *const u8));
+        assert!(heap.contains(young as *const u8));
+        assert_eq!(heap.allocated_bytes(), bytes_during);
+        assert_eq!(heap.nursery.n_segs.get(), 1);
+        fill_past_half(&heap, 0);
+        assert!(heap.contains(old as *const u8));
         assert!(!heap.contains(young as *const u8));
-        assert!(heap.allocated_bytes() < bytes_during);
+        assert_eq!(heap.allocated_bytes(), base_bytes);
+        assert!(heap.nursery_high_water() <= heap.nursery.open_cap.get() as u64);
         unsafe { assert_eq!(*old, 1) };
     }
 
     /// A young fixed-size allocation updates the live counters by one object
     /// and `size_of` bytes, including when many fit in the open segment.
+    /// Counters drop on the leave that passes half the segment, not before.
     #[test]
     fn young_fixed_size_counts_stay_exact() {
         let heap = CelHeap::new();
-        assert!(heap.enter());
+        prime_open_nursery(&heap);
         let before_n = heap.allocated_objects();
         let before_b = heap.allocated_bytes();
+        assert!(heap.enter());
         for i in 0..64u64 {
             heap.alloc(i);
         }
@@ -1665,14 +1719,24 @@ mod tests {
             before_b + 64 * size_of::<u64>() as u64
         );
         heap.leave(true);
+        assert_eq!(heap.allocated_objects(), before_n + 64);
+        assert_eq!(
+            heap.allocated_bytes(),
+            before_b + 64 * size_of::<u64>() as u64
+        );
+        assert_eq!(heap.nursery.n_segs.get(), 1);
+        fill_past_half(&heap, 0);
         assert_eq!(heap.allocated_objects(), before_n);
         assert_eq!(heap.allocated_bytes(), before_b);
+        assert_eq!(heap.nursery.n_segs.get(), 1);
     }
 
-    /// Nested scopes do not reset; only the outermost does.
+    /// Nested scopes do not reset. The outermost leave rewinds only once the
+    /// open segment is half used.
     #[test]
     fn nested_scope_does_not_reset() {
         let heap = CelHeap::new();
+        prime_open_nursery(&heap);
         assert!(heap.enter());
         let a = heap.alloc(1u64);
         assert!(!heap.enter());
@@ -1681,8 +1745,46 @@ mod tests {
         assert!(heap.contains(a as *const u8));
         assert!(heap.contains(b as *const u8));
         heap.leave(true);
+        assert!(heap.contains(a as *const u8));
+        assert!(heap.contains(b as *const u8));
+        assert_eq!(heap.nursery.n_segs.get(), 1);
+        fill_past_half(&heap, 0);
         assert!(!heap.contains(a as *const u8));
         assert!(!heap.contains(b as *const u8));
+        assert_eq!(heap.nursery.n_segs.get(), 1);
+    }
+
+    /// A one-byte bump leaves the cursor off an 8-byte boundary. Leave rewinds
+    /// it; the inline nursery bump does not realign.
+    #[test]
+    fn an_unaligned_cursor_rewinds_immediately() {
+        let heap = CelHeap::new();
+        prime_open_nursery(&heap);
+        assert!(heap.enter());
+        let _ = heap.alloc_raw(1, 1);
+        assert_ne!(heap.live_nursery_used() % align_of::<u64>(), 0);
+        heap.leave(true);
+        assert_eq!(heap.nursery.open_used.get(), 0);
+        assert_eq!(heap.nursery.bytes.get(), 0);
+        assert_eq!(heap.live_nursery_used() % align_of::<u64>(), 0);
+        assert_eq!(heap.nursery.n_segs.get(), 1);
+    }
+
+    /// Small outermost evaluations share one segment. The rewind waits until
+    /// the open segment is half used, so the bump never opens a second one.
+    #[test]
+    fn many_small_evals_stay_inside_one_segment() {
+        let heap = CelHeap::new();
+        let cap = SEGMENT_BYTES as u64;
+        for _ in 0..100_000 {
+            let scope = enter_eval_on(&heap);
+            let _ = heap.alloc(1u64);
+            scope.finish(crate::Value::Int(0));
+            assert_eq!(heap.nursery.n_segs.get(), 1);
+        }
+        assert_eq!(heap.nursery.n_segs.get(), 1);
+        assert!(heap.nursery_high_water() <= cap);
+        assert!(heap.nursery_high_water() <= heap.nursery.open_cap.get() as u64);
     }
 
     #[test]

@@ -1,4 +1,5 @@
-//! The evaluation nursery is reset when the outermost evaluation finishes.
+//! The evaluation nursery is reclaimed when the open segment is half used,
+//! not when each outermost evaluation finishes.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -60,6 +61,7 @@ fn ten_thousand_maps_leave_old_space_flat() {
     let old_bytes = with_heap(|h| h.old_allocated_bytes());
     let old_segs = with_heap(|h| h.old_segments());
     let water = with_heap(|h| h.nursery_high_water());
+    let nursery_segs = with_heap(|h| h.segments() - h.old_segments());
 
     for _ in 0..10_000 {
         program.execute(&ctx).expect("evaluates");
@@ -75,10 +77,19 @@ fn ten_thousand_maps_leave_old_space_flat() {
         old_segs,
         "old-space segments grew across 10000 maps"
     );
+    // One map sits under half a segment, so later maps share it until the
+    // bump passes half and the leave rewinds. Segment count stays at the
+    // warmup's, and the high-water stays within one segment of that base.
     assert_eq!(
-        with_heap(|h| h.nursery_high_water()),
-        water,
-        "nursery high-water grew after the first map"
+        with_heap(|h| h.segments() - h.old_segments()),
+        nursery_segs,
+        "nursery segment count grew across the map loop"
+    );
+    let high = with_heap(|h| h.nursery_high_water());
+    assert!(high >= water, "nursery high-water went backwards");
+    assert!(
+        high <= water.max(64 * 1024),
+        "nursery high-water passed one segment"
     );
 }
 
