@@ -3047,8 +3047,8 @@ fn double_from_cell(vm: i64, w: *mut CelObject) -> *mut CelObject {
 /// `ll_int2dec` (`ll_str.py`): one residual, not traced. The string leaf
 /// comes back directly (`descr_str` → `space.newtext`).
 #[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
-fn int_to_text(n: i64) -> *mut CelObject {
-    crate::runtime::object::string_from_int(n) as *mut CelObject
+fn int_to_text(vm: i64, n: i64) -> *mut CelObject {
+    crate::runtime::object::string_from_int_in(vm_heap(vm), n) as *mut CelObject
 }
 
 /// `CEL_STRING_CLASS` pointer. The int cast is at the hint, not here:
@@ -3110,9 +3110,9 @@ fn double_binop_cell(op: i64, a: *mut CelObject, b: *mut CelObject) -> *mut CelO
     // Fresh string only. Empty write sets, so cached fields stay.
     int_to_text => alloc_ref,
 })]
-fn string_from_cell(w: *mut CelObject) -> *mut CelObject {
+fn string_from_cell(vm: i64, w: *mut CelObject) -> *mut CelObject {
     if cell_kind(w) == CelKind::Int as i64 {
-        let text = int_to_text(cell_int(w));
+        let text = int_to_text(vm, cell_int(w));
         // Fresh `W_StringObject` on every non-error path (`ll_int2dec`).
         majit_metainterp::jit::record_exact_class(text, STRING_CLASS_PTR as usize);
         text
@@ -5901,7 +5901,7 @@ fn run_cel_portal(
                                     here + 1
                                 }
                             } else if interned_is_string(program, name) != 0 {
-                                let r = string_from_cell(w);
+                                let r = string_from_cell(vm, w);
                                 if r.is_null() {
                                     slow_pc(vm, here)
                                 } else {

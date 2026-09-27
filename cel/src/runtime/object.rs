@@ -487,7 +487,14 @@ const _: () = {
 /// second heap object. Constructors that wrap a block allocated elsewhere
 /// stay on [`object_array::new_bytes_block`].
 fn alloc_fresh_string(nbytes: usize) -> (*mut W_StringObject, *mut u8) {
-    let heap = unsafe { &*super::heap::heap_ptr() };
+    alloc_fresh_string_in(unsafe { &*super::heap::heap_ptr() }, nbytes)
+}
+
+/// [`alloc_fresh_string`] on a heap the caller already resolved.
+fn alloc_fresh_string_in(
+    heap: &super::heap::CelHeap,
+    nbytes: usize,
+) -> (*mut W_StringObject, *mut u8) {
     let leaf_size = core::mem::size_of::<W_StringObject>();
     let block_align = align_of::<CelBytesBlock>();
     let block_off = (leaf_size + block_align - 1) & !(block_align - 1);
@@ -529,6 +536,11 @@ pub fn new_string(s: &str) -> *mut W_StringObject {
 /// `i64::MIN` negates in `u64` (`ll_unsigned(-val)`): its magnitude is `2^63`,
 /// nineteen digits, and the sign is the twentieth byte.
 pub fn string_from_int(n: i64) -> *mut W_StringObject {
+    string_from_int_in(unsafe { &*super::heap::heap_ptr() }, n)
+}
+
+/// [`string_from_int`] on a heap the caller already resolved.
+pub fn string_from_int_in(heap: &super::heap::CelHeap, n: i64) -> *mut W_StringObject {
     let neg = n < 0;
     let mut val = if neg {
         (n as u64).wrapping_neg()
@@ -544,7 +556,7 @@ pub fn string_from_int(n: i64) -> *mut W_StringObject {
         probe /= 10;
     }
     let total = len + usize::from(neg) + usize::from(val == 0);
-    let (leaf, p) = alloc_fresh_string(total);
+    let (leaf, p) = alloc_fresh_string_in(heap, total);
     unsafe {
         if neg {
             *p = b'-';
