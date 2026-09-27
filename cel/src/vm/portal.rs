@@ -47,9 +47,6 @@ use crate::{ExecutionError, Value};
 const PORTAL_DONE: i64 = -1;
 /// `dispatch_one` failed with no handler.
 const PORTAL_FAIL: i64 = -2;
-/// Sign bit on a finished leaf pointer. Userspace pointers leave it clear,
-/// so the word stays negative and is not taken as a bytecode pc.
-const PORTAL_LEAF_TAG: i64 = i64::MIN;
 
 /// A published interned leaf, or `None` when the cell is null.
 fn slot_leaf(w: i64) -> Option<CelRef> {
@@ -1328,23 +1325,6 @@ fn vm_park_return(vm_bits: i64, w: CelRef) {
     vm_of(vm_bits).park_return(w);
 }
 
-/// Sign-tag a leaf so `OP_RETURN` can hand it back as the portal word.
-///
-/// `finish_return_for` only builds `DoneWithThisFrameDescrInt` and the
-/// float descr (`FinishReturnKind::Int` / `Float`). A ref-returning
-/// portal (`DoneWithThisFrameDescrRef`) is not expressible from
-/// `jit_interp`, and that macro is outside this change. The finish word
-/// is an integer register, not a GC ref. The leaf stays alive because it
-/// is an immortal immediate or a bind-region object owned by the live
-/// `Context` (`retained` / `BindRegionSlot`). `Value::from_interned` then
-/// `scope.finish` copies it to a public `Value` before nursery rewind.
-/// No collection runs on this thread between the finish and that copy.
-/// Elidable: a constant leaf becomes a constant finish value.
-#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
-fn tag_leaf(w: CelRef) -> i64 {
-    (w as usize as i64) | PORTAL_LEAF_TAG
-}
-
 #[allow(dead_code)]
 #[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
 fn vm_sync_write_local(vm_bits: i64, slot: i64, w: i64) {
@@ -1494,6 +1474,10 @@ fn fresh_portal_driver(state: &mut PortalState, code: &CelCode) -> JitDriver<Por
     let threshold = portal_threshold();
     let mut driver = JitDriver::new(threshold);
     driver.set_param("function_threshold", i64::from(threshold));
+    // `warmspot.py` sets `jd.result_type` from the portal return kind.
+    // This portal returns `*mut CelObject`, so the finish descr is
+    // `compile.py DoneWithThisFrameDescrRef`.
+    driver.set_result_type(majit_ir::Type::Ref);
     // `GcLLDescr_framework` with a headerless nursery: vtable at offset 0.
     // `gen_malloc_nursery` bakes this thread's `nursery_free` / `nursery_top`.
     // Objects past the segment size still use `malloc_fixedsize`. The slow
@@ -1572,7 +1556,7 @@ fn call_portal(
     driver: &mut JitDriver<PortalState>,
     code: &CelCode,
     state: &mut PortalState,
-) -> i64 {
+) -> *mut CelObject {
     let heap = portal_heap(state.vm);
     let prev = unsafe {
         (*heap)
@@ -1593,12 +1577,16 @@ fn boxed_portal_driver(state: &mut PortalState, code: &CelCode) -> Box<JitDriver
 
 #[cold]
 #[inline(never)]
-fn run_reentrant_driver(code: &CelCode, state: &mut PortalState) -> i64 {
+fn run_reentrant_driver(code: &CelCode, state: &mut PortalState) -> *mut CelObject {
     let mut driver = boxed_portal_driver(state, code);
     call_portal(&mut driver, code, state)
 }
 
-fn run_owned_driver(jit: &super::code::CodeJit, code: &CelCode, state: &mut PortalState) -> i64 {
+fn run_owned_driver(
+    jit: &super::code::CodeJit,
+    code: &CelCode,
+    state: &mut PortalState,
+) -> *mut CelObject {
     if jit.in_use.get() {
         return run_reentrant_driver(code, state);
     }
@@ -1615,7 +1603,7 @@ fn run_owned_driver(jit: &super::code::CodeJit, code: &CelCode, state: &mut Port
     call_portal(driver, code, state)
 }
 
-fn run_table_driver(code: &CelCode, state: &mut PortalState) -> i64 {
+fn run_table_driver(code: &CelCode, state: &mut PortalState) -> *mut CelObject {
     let id = code.identity.id;
     let live = &code.identity.live;
     PORTAL_DRIVER.with(|slot| match slot.try_borrow_mut() {
@@ -1666,7 +1654,7 @@ pub(crate) fn eval_through_portal(
     let jit = &code.identity.live.jit;
     let token = thread_owner_token(heap);
     let owner = jit.owner.load(std::sync::atomic::Ordering::Acquire);
-    let bits = if owner == token {
+    let leaf = if owner == token {
         run_owned_driver(jit, code, &mut state)
     } else if owner == 0 {
         match jit.owner.compare_exchange(
@@ -1682,29 +1670,19 @@ pub(crate) fn eval_through_portal(
     } else {
         run_table_driver(code, &mut state)
     };
-    if bits < PORTAL_FAIL {
-        let w = ((bits as u64) ^ (PORTAL_LEAF_TAG as u64)) as usize as CelRef;
-        if !w.is_null() {
-            return Ok(Value::from_interned(w));
-        }
+    // Non-null is `DoneWithThisFrameDescrRef`. Null is not a leaf:
+    // `vm.portal_ret` was set by the exit (`residual_hydrate` /
+    // `vm_park_return`). `state.ret` is not read here — a compiled FINISH
+    // does not write it back (`warmstate.py execute_assembler`).
+    if !leaf.is_null() {
+        return Ok(Value::from_interned(leaf));
     }
-    match bits {
-        PORTAL_DONE => match vm.portal_ret.take() {
-            Some(Ok(value)) => Ok(value),
-            Some(Err(err)) => Err(vm.public_error(err)),
-            None => Err(ExecutionError::InternalError(
-                "portal done without a result".into(),
-            )),
-        },
-        PORTAL_FAIL => match vm.portal_ret.take() {
-            Some(Err(err)) => Err(vm.public_error(err)),
-            other => Err(ExecutionError::InternalError(format!(
-                "portal fail without an error: {other:?}"
-            ))),
-        },
-        _ => Err(ExecutionError::InternalError(format!(
-            "portal returned unexpected pc {bits}"
-        ))),
+    match vm.portal_ret.take() {
+        Some(Ok(value)) => Ok(value),
+        Some(Err(err)) => Err(vm.public_error(err)),
+        None => Err(ExecutionError::InternalError(
+            "portal done without a result".into(),
+        )),
     }
 }
 
@@ -4293,7 +4271,6 @@ fn slow_pc(vm: i64, here: i64) -> i64 {
         vm_sync_write_local => residual_int,
         vm_sync_pop => residual_int,
         vm_park_return => residual_void,
-        tag_leaf => elidable_int_cannot_raise,
         step_hot => may_force_int,
         map_opt_insert => inline_int,
         list_opt_append => inline_int,
@@ -4327,7 +4304,7 @@ fn run_cel_portal(
     program: &CelCode,
     state: &mut PortalState,
     mut pc: usize,
-) -> i64 {
+) -> *mut CelObject {
     loop {
         jit_merge_point!(driver, program, pc; *state);
         let opcode = insn_op(program, pc);
@@ -4370,7 +4347,7 @@ fn run_cel_portal(
                     continue;
                 }
                 state.ret = next;
-                return next;
+                return core::ptr::null_mut();
             }
             OP_LOAD_CONST => {
                 state.frame.last_instr = pc as i64;
@@ -4394,7 +4371,7 @@ fn run_cel_portal(
                     continue;
                 }
                 state.ret = next;
-                return next;
+                return core::ptr::null_mut();
             }
             OP_LOAD_LOCAL => {
                 state.frame.last_instr = pc as i64;
@@ -4418,7 +4395,7 @@ fn run_cel_portal(
                     continue;
                 }
                 state.ret = next;
-                return next;
+                return core::ptr::null_mut();
             }
             OP_STORE_LOCAL => {
                 state.frame.last_instr = pc as i64;
@@ -4444,7 +4421,7 @@ fn run_cel_portal(
                     continue;
                 }
                 state.ret = next;
-                return next;
+                return core::ptr::null_mut();
             }
             OP_RETURN => {
                 state.frame.last_instr = pc as i64;
@@ -4452,24 +4429,22 @@ fn run_cel_portal(
                 let here = pc as i64;
                 let depth = state.frame.valuestackdepth;
                 let w = state.frame.locals_stack_w[depth - 1];
-                // `tag_leaf` packs the leaf into the int finish
-                // (`DoneWithThisFrameDescrInt`). See `tag_leaf` for why this
-                // is not `DoneWithThisFrameDescrRef`.
-                let next = if w.is_null() {
-                    slow_pc(vm, here)
-                } else {
-                    tag_leaf(w)
-                };
-                if next >= 0 {
-                    let tgt = next as usize;
-                    if tgt < pc {
-                        can_enter_jit!(driver, tgt, &mut *state, program, || {});
+                // `compile.py DoneWithThisFrameDescrRef`: a non-null leaf is
+                // the portal result. Null is not a leaf; `slow_pc` leaves
+                // `vm.portal_ret` set and the caller reads that.
+                if w.is_null() {
+                    let next = slow_pc(vm, here);
+                    if next >= 0 {
+                        let tgt = next as usize;
+                        if tgt < pc {
+                            can_enter_jit!(driver, tgt, &mut *state, program, || {});
+                        }
+                        pc = tgt;
+                        continue;
                     }
-                    pc = tgt;
-                    continue;
+                    state.ret = next;
                 }
-                state.ret = next;
-                return next;
+                return w;
             }
             OP_ADD_K => {
                 state.frame.last_instr = pc as i64;
@@ -4530,7 +4505,7 @@ fn run_cel_portal(
                     continue;
                 }
                 state.ret = next;
-                return next;
+                return core::ptr::null_mut();
             }
             OP_MUL_K => {
                 state.frame.last_instr = pc as i64;
@@ -4579,7 +4554,7 @@ fn run_cel_portal(
                     continue;
                 }
                 state.ret = next;
-                return next;
+                return core::ptr::null_mut();
             }
             OP_ADD_LOCAL_K => {
                 state.frame.last_instr = pc as i64;
@@ -4605,7 +4580,7 @@ fn run_cel_portal(
                     continue;
                 }
                 state.ret = next;
-                return next;
+                return core::ptr::null_mut();
             }
             OP_MOD_K => {
                 state.frame.last_instr = pc as i64;
@@ -4660,7 +4635,7 @@ fn run_cel_portal(
                     continue;
                 }
                 state.ret = next;
-                return next;
+                return core::ptr::null_mut();
             }
             OP_EQ_LOCAL_K => {
                 state.frame.last_instr = pc as i64;
@@ -4701,7 +4676,7 @@ fn run_cel_portal(
                     continue;
                 }
                 state.ret = next;
-                return next;
+                return core::ptr::null_mut();
             }
             OP_GT_LOCAL_K => {
                 state.frame.last_instr = pc as i64;
@@ -4756,7 +4731,7 @@ fn run_cel_portal(
                     continue;
                 }
                 state.ret = next;
-                return next;
+                return core::ptr::null_mut();
             }
             OP_MUL_LOCAL_K_APPEND => {
                 state.frame.last_instr = pc as i64;
@@ -4812,7 +4787,7 @@ fn run_cel_portal(
                     continue;
                 }
                 state.ret = next;
-                return next;
+                return core::ptr::null_mut();
             }
             OP_ADD_LOCAL_K_APPEND => {
                 state.frame.last_instr = pc as i64;
@@ -4868,7 +4843,7 @@ fn run_cel_portal(
                     continue;
                 }
                 state.ret = next;
-                return next;
+                return core::ptr::null_mut();
             }
             OP_MOD_LOCAL_K_APPEND => {
                 state.frame.last_instr = pc as i64;
@@ -4924,7 +4899,7 @@ fn run_cel_portal(
                     continue;
                 }
                 state.ret = next;
-                return next;
+                return core::ptr::null_mut();
             }
             OP_INDEX => {
                 state.frame.last_instr = pc as i64;
@@ -4968,7 +4943,7 @@ fn run_cel_portal(
                     continue;
                 }
                 state.ret = next;
-                return next;
+                return core::ptr::null_mut();
             }
             OP_JUMP_IF_FALSE => {
                 state.frame.last_instr = pc as i64;
@@ -5002,7 +4977,7 @@ fn run_cel_portal(
                     continue;
                 }
                 state.ret = next;
-                return next;
+                return core::ptr::null_mut();
             }
             OP_JUMP_IF_OPT_NONE => {
                 state.frame.last_instr = pc as i64;
@@ -5027,7 +5002,7 @@ fn run_cel_portal(
                     continue;
                 }
                 state.ret = next;
-                return next;
+                return core::ptr::null_mut();
             }
             OP_NEW_MAP => {
                 state.frame.last_instr = pc as i64;
@@ -5047,7 +5022,7 @@ fn run_cel_portal(
                     continue;
                 }
                 state.ret = next;
-                return next;
+                return core::ptr::null_mut();
             }
             OP_MAP_INSERT => {
                 state.frame.last_instr = pc as i64;
@@ -5086,7 +5061,7 @@ fn run_cel_portal(
                     continue;
                 }
                 state.ret = next;
-                return next;
+                return core::ptr::null_mut();
             }
             OP_ITER_ELEMS => {
                 state.frame.last_instr = pc as i64;
@@ -5116,7 +5091,7 @@ fn run_cel_portal(
                     continue;
                 }
                 state.ret = next;
-                return next;
+                return core::ptr::null_mut();
             }
             OP_NEW_LIST => {
                 state.frame.last_instr = pc as i64;
@@ -5136,7 +5111,7 @@ fn run_cel_portal(
                     continue;
                 }
                 state.ret = next;
-                return next;
+                return core::ptr::null_mut();
             }
             OP_LIST_APPEND => {
                 state.frame.last_instr = pc as i64;
@@ -5188,7 +5163,7 @@ fn run_cel_portal(
                     continue;
                 }
                 state.ret = next;
-                return next;
+                return core::ptr::null_mut();
             }
             OP_NEW_LIST_FROM_ARG => {
                 state.frame.last_instr = pc as i64;
@@ -5213,7 +5188,7 @@ fn run_cel_portal(
                     continue;
                 }
                 state.ret = next;
-                return next;
+                return core::ptr::null_mut();
             }
             OP_ITER_GUARD => {
                 state.frame.last_instr = pc as i64;
@@ -5245,7 +5220,7 @@ fn run_cel_portal(
                     continue;
                 }
                 state.ret = next;
-                return next;
+                return core::ptr::null_mut();
             }
             OP_ITER_BIND => {
                 state.frame.last_instr = pc as i64;
@@ -5279,7 +5254,7 @@ fn run_cel_portal(
                     continue;
                 }
                 state.ret = next;
-                return next;
+                return core::ptr::null_mut();
             }
             OP_ITER_ADVANCE => {
                 state.frame.last_instr = pc as i64;
@@ -5306,7 +5281,7 @@ fn run_cel_portal(
                     continue;
                 }
                 state.ret = next;
-                return next;
+                return core::ptr::null_mut();
             }
             OP_ACCU_LOOP_COND | OP_ACCU_LOOP_COND_NOT => {
                 state.frame.last_instr = pc as i64;
@@ -5333,7 +5308,7 @@ fn run_cel_portal(
                     continue;
                 }
                 state.ret = next;
-                return next;
+                return core::ptr::null_mut();
             }
             OP_AND_LOCAL | OP_OR_LOCAL => {
                 state.frame.last_instr = pc as i64;
@@ -5363,7 +5338,7 @@ fn run_cel_portal(
                     continue;
                 }
                 state.ret = next;
-                return next;
+                return core::ptr::null_mut();
             }
             OP_AND_MERGE | OP_OR_MERGE => {
                 state.frame.last_instr = pc as i64;
@@ -5392,7 +5367,7 @@ fn run_cel_portal(
                     continue;
                 }
                 state.ret = next;
-                return next;
+                return core::ptr::null_mut();
             }
             OP_LOAD_LOCAL_APPEND => {
                 state.frame.last_instr = pc as i64;
@@ -5447,7 +5422,7 @@ fn run_cel_portal(
                     continue;
                 }
                 state.ret = next;
-                return next;
+                return core::ptr::null_mut();
             }
             OP_ADD | OP_SUB | OP_MUL | OP_DIV | OP_MOD | OP_EQ | OP_NE | OP_LT | OP_LE | OP_GT
             | OP_GE => {
@@ -5524,7 +5499,7 @@ fn run_cel_portal(
                     continue;
                 }
                 state.ret = next;
-                return next;
+                return core::ptr::null_mut();
             }
             OP_EQ_K | OP_NE_K | OP_LT_K | OP_GT_K | OP_GE_K => {
                 state.frame.last_instr = pc as i64;
@@ -5594,7 +5569,7 @@ fn run_cel_portal(
                     continue;
                 }
                 state.ret = next;
-                return next;
+                return core::ptr::null_mut();
             }
             OP_MOD_LOCAL_K | OP_LT_LOCAL_K | OP_NE_LOCAL_K | OP_GE_LOCAL_K => {
                 state.frame.last_instr = pc as i64;
@@ -5660,7 +5635,7 @@ fn run_cel_portal(
                     continue;
                 }
                 state.ret = next;
-                return next;
+                return core::ptr::null_mut();
             }
             OP_EQ_LOCAL_K_APPEND | OP_GT_LOCAL_K_APPEND | OP_LT_LOCAL_K_APPEND
             | OP_NE_LOCAL_K_APPEND | OP_GE_LOCAL_K_APPEND => {
@@ -5733,7 +5708,7 @@ fn run_cel_portal(
                     continue;
                 }
                 state.ret = next;
-                return next;
+                return core::ptr::null_mut();
             }
             OP_NEGATE => {
                 state.frame.last_instr = pc as i64;
@@ -5769,7 +5744,7 @@ fn run_cel_portal(
                     continue;
                 }
                 state.ret = next;
-                return next;
+                return core::ptr::null_mut();
             }
             OP_NOT => {
                 state.frame.last_instr = pc as i64;
@@ -5800,7 +5775,7 @@ fn run_cel_portal(
                     continue;
                 }
                 state.ret = next;
-                return next;
+                return core::ptr::null_mut();
             }
             OP_JUMP => {
                 state.frame.last_instr = pc as i64;
@@ -5814,7 +5789,7 @@ fn run_cel_portal(
                     continue;
                 }
                 state.ret = next;
-                return next;
+                return core::ptr::null_mut();
             }
             OP_AND | OP_OR => {
                 state.frame.last_instr = pc as i64;
@@ -5849,7 +5824,7 @@ fn run_cel_portal(
                     continue;
                 }
                 state.ret = next;
-                return next;
+                return core::ptr::null_mut();
             }
             OP_CALL_HOST => {
                 state.frame.last_instr = pc as i64;
@@ -5924,7 +5899,7 @@ fn run_cel_portal(
                     continue;
                 }
                 state.ret = next;
-                return next;
+                return core::ptr::null_mut();
             }
             OP_CALL_METHOD => {
                 state.frame.last_instr = pc as i64;
@@ -5968,7 +5943,7 @@ fn run_cel_portal(
                     continue;
                 }
                 state.ret = next;
-                return next;
+                return core::ptr::null_mut();
             }
             OP_IN => {
                 state.frame.last_instr = pc as i64;
@@ -6018,7 +5993,7 @@ fn run_cel_portal(
                     continue;
                 }
                 state.ret = next;
-                return next;
+                return core::ptr::null_mut();
             }
             OP_CALL_QUALIFIED => {
                 state.frame.last_instr = pc as i64;
@@ -6044,7 +6019,7 @@ fn run_cel_portal(
                     continue;
                 }
                 state.ret = next;
-                return next;
+                return core::ptr::null_mut();
             }
             OP_HAS_FIELD => {
                 state.frame.last_instr = pc as i64;
@@ -6089,7 +6064,7 @@ fn run_cel_portal(
                     continue;
                 }
                 state.ret = next;
-                return next;
+                return core::ptr::null_mut();
             }
             OP_GET_FIELD => {
                 state.frame.last_instr = pc as i64;
@@ -6131,7 +6106,7 @@ fn run_cel_portal(
                     continue;
                 }
                 state.ret = next;
-                return next;
+                return core::ptr::null_mut();
             }
             OP_MUL_LOCAL_K => {
                 state.frame.last_instr = pc as i64;
@@ -6157,7 +6132,7 @@ fn run_cel_portal(
                     continue;
                 }
                 state.ret = next;
-                return next;
+                return core::ptr::null_mut();
             }
             OP_GET_FIELD_LOCAL => {
                 state.frame.last_instr = pc as i64;
@@ -6183,7 +6158,7 @@ fn run_cel_portal(
                     continue;
                 }
                 state.ret = next;
-                return next;
+                return core::ptr::null_mut();
             }
             OP_HAS_FIELD_LOCAL => {
                 state.frame.last_instr = pc as i64;
@@ -6209,7 +6184,7 @@ fn run_cel_portal(
                     continue;
                 }
                 state.ret = next;
-                return next;
+                return core::ptr::null_mut();
             }
             OP_GET_FIELD_LOCAL_APPEND => {
                 state.frame.last_instr = pc as i64;
@@ -6238,7 +6213,7 @@ fn run_cel_portal(
                     continue;
                 }
                 state.ret = next;
-                return next;
+                return core::ptr::null_mut();
             }
             OP_HAS_FIELD_LOCAL_APPEND => {
                 state.frame.last_instr = pc as i64;
@@ -6267,7 +6242,7 @@ fn run_cel_portal(
                     continue;
                 }
                 state.ret = next;
-                return next;
+                return core::ptr::null_mut();
             }
             OP_ITER_KEYS => {
                 state.frame.last_instr = pc as i64;
@@ -6303,7 +6278,7 @@ fn run_cel_portal(
                     continue;
                 }
                 state.ret = next;
-                return next;
+                return core::ptr::null_mut();
             }
             OP_LIST_APPEND_OPTIONAL => {
                 state.frame.last_instr = pc as i64;
@@ -6334,7 +6309,7 @@ fn run_cel_portal(
                     continue;
                 }
                 state.ret = next;
-                return next;
+                return core::ptr::null_mut();
             }
             OP_MAP_INSERT_OPTIONAL => {
                 state.frame.last_instr = pc as i64;
@@ -6366,7 +6341,7 @@ fn run_cel_portal(
                     continue;
                 }
                 state.ret = next;
-                return next;
+                return core::ptr::null_mut();
             }
             OP_OPT_INDEX => {
                 state.frame.last_instr = pc as i64;
@@ -6406,7 +6381,7 @@ fn run_cel_portal(
                     continue;
                 }
                 state.ret = next;
-                return next;
+                return core::ptr::null_mut();
             }
             OP_OPT_SELECT => {
                 state.frame.last_instr = pc as i64;
@@ -6439,7 +6414,7 @@ fn run_cel_portal(
                     continue;
                 }
                 state.ret = next;
-                return next;
+                return core::ptr::null_mut();
             }
             _ => {
                 let next = step_hot(program, pc);
@@ -6452,13 +6427,15 @@ fn run_cel_portal(
                     continue;
                 }
                 state.ret = next;
-                return next;
+                return core::ptr::null_mut();
             }
         }
     }
     // The merge point's compiled-run close `break`s out of this loop.
-    // That path has no `return` of its own, so the value lives here.
-    state.ret
+    // A ref FINISH was already returned by `take_single_pass_finish_ref`.
+    // What reaches here is not a leaf: the caller reads `vm.portal_ret`.
+    // `state.ret` stays for the interpreter path that still reads it.
+    core::ptr::null_mut()
 }
 
 #[cfg(test)]
