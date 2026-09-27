@@ -736,11 +736,14 @@ pub(crate) struct Vm<'a> {
     ///
     /// Taken out of the pool's box by residual hydrate and put back by
     /// [`Drop`]. Interned-only evaluation never constructs this vector.
-    frame: Vec<Operand>,
+    ///
+    /// [`ManuallyDrop`]: the steady [`Drop`] is one test, and this field's
+    /// glue runs only from [`Vm::drop_owned`].
+    frame: core::mem::ManuallyDrop<Vec<Operand>>,
     /// The pool's box. `None` until a residual instruction hydrates, so an
     /// interned-only evaluation does not take or return the thread-local
     /// pool.
-    scratch: Option<Box<Scratch>>,
+    scratch: core::mem::ManuallyDrop<Option<Box<Scratch>>>,
     /// Where the operand stack begins in `frame`: `n_slots`.
     stack_base: usize,
     /// `PyFrame` virtualizable: `last_instr`, `valuestackdepth`,
@@ -750,7 +753,7 @@ pub(crate) struct Vm<'a> {
     /// use it instead of re-entering thread-local storage.
     pub(crate) heap: *const crate::runtime::heap::CelHeap,
     /// Result parked by the JIT portal when `dispatch_one` returns.
-    pub(crate) portal_ret: Option<CelResult<Value>>,
+    pub(crate) portal_ret: core::mem::ManuallyDrop<Option<CelResult<Value>>>,
     /// Arguments a missed [`OpCode::CallQualified`] popped, held for the
     /// [`OpCode::CallMethod`] the compiler emitted right after it.
     ///
@@ -765,7 +768,7 @@ pub(crate) struct Vm<'a> {
     /// both ways out: taken by [`OpCode::CallMethod`], and dropped by
     /// [`Vm::unwind`], which is where that load's error goes when a `&&`/`||`
     /// absorbs it and the method call never runs.
-    pending_args: Option<Vec<Value>>,
+    pending_args: core::mem::ManuallyDrop<Option<Vec<Value>>>,
     /// Which lowering the probe's sites take. Probe only; see [`ProbePolicy`].
     #[cfg(feature = "__drop-arm-probe")]
     probe: ProbePolicy,
@@ -826,13 +829,18 @@ fn frame_for_execute(
 /// putting them back is also what keeps re-entry sound: the slot is empty for
 /// exactly as long as a run holds it.
 ///
-/// Inlined, with the hand-back out of line: a run that never hydrated holds no
-/// box, and the test is then the whole drop.
+/// Inlined, with the hand-back out of line. `frame`, `scratch`, `portal_ret`
+/// and `pending_args` are [`core::mem::ManuallyDrop`], so an interned-only run
+/// — empty frame, no box, nothing parked — pays one test and no field glue.
 impl Drop for Vm<'_> {
     #[inline(always)]
     fn drop(&mut self) {
-        if self.scratch.is_some() {
-            self.return_scratch();
+        if self.scratch_bits != 0
+            || self.frame.capacity() != 0
+            || self.portal_ret.is_some()
+            || self.pending_args.is_some()
+        {
+            self.drop_owned();
         }
     }
 }
@@ -840,9 +848,26 @@ impl Drop for Vm<'_> {
 impl Vm<'_> {
     #[cold]
     #[inline(never)]
+    fn drop_owned(&mut self) {
+        // Hand the box back before dropping `frame`: the hand-back moves the
+        // vector into the pool's scratch.
+        if self.scratch.is_some() {
+            self.return_scratch();
+        }
+        // SAFETY: each field is dropped once, here, and nowhere else.
+        unsafe {
+            core::mem::ManuallyDrop::drop(&mut self.frame);
+            core::mem::ManuallyDrop::drop(&mut self.scratch);
+            core::mem::ManuallyDrop::drop(&mut self.portal_ret);
+            core::mem::ManuallyDrop::drop(&mut self.pending_args);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
     fn return_scratch(&mut self) {
         if let Some(mut scratch) = self.scratch.take() {
-            scratch.frame = std::mem::take(&mut self.frame);
+            scratch.frame = std::mem::take(&mut *self.frame);
             scratch.release();
             // Dropped rather than pooled where the slot is already gone; see
             // `SCRATCH`.
@@ -901,13 +926,13 @@ impl<'a> Vm<'a> {
             scratch_bits,
             code,
             ctx,
-            frame,
-            scratch,
+            frame: core::mem::ManuallyDrop::new(frame),
+            scratch: core::mem::ManuallyDrop::new(scratch),
             stack_base,
             cel_frame,
             heap: heap as *const crate::runtime::heap::CelHeap,
-            portal_ret: None,
-            pending_args: None,
+            portal_ret: core::mem::ManuallyDrop::new(None),
+            pending_args: core::mem::ManuallyDrop::new(None),
             #[cfg(feature = "__drop-arm-probe")]
             probe: ProbePolicy::default(),
             #[cfg(feature = "__elem-attr-probe")]
@@ -1023,7 +1048,7 @@ impl<'a> Vm<'a> {
     }
 
     pub(crate) fn park_return(&mut self, w: CelRef) {
-        self.portal_ret = Some(Ok(crate::Value::from_interned(w)));
+        *self.portal_ret = Some(Ok(crate::Value::from_interned(w)));
     }
 
     pub(crate) fn public_error(&self, err: CelErr) -> ExecutionError {
@@ -1154,9 +1179,9 @@ impl<'a> Vm<'a> {
                 .logic
                 .resize(self.code.n_logic as usize, Err(CelErr::InternalError));
         }
-        self.frame = frame;
+        *self.frame = frame;
         self.scratch_bits = &*scratch as *const Scratch as usize;
-        self.scratch = Some(scratch);
+        *self.scratch = Some(scratch);
         unsafe {
             (*self.cel_frame).scratch_bits = self.scratch_bits as i64;
         }
@@ -2006,7 +2031,7 @@ impl<'a> Vm<'a> {
         // that this error has just decided will not run -- whether the handler
         // below absorbs it and lands in the right operand, or nothing catches
         // and the evaluation ends.
-        self.pending_args = None;
+        *self.pending_args = None;
         let Some(&Handler {
             land, logic, depth, ..
         }) = self.code.handler_for(pc)
@@ -3370,7 +3395,8 @@ impl<'a> Vm<'a> {
             let w = refs[0];
             let len = unsafe { list_len(w) };
             if len == 0 {
-                self.frame.truncate(self.frame.len() - n);
+                let end = self.frame.len() - n;
+                self.frame.truncate(end);
                 self.push_operand(Operand::Interned(new_null() as CelRef));
                 return Ok(true);
             }
@@ -3387,7 +3413,8 @@ impl<'a> Vm<'a> {
         let Some(best) = interned_extremum(&items, keep_greater) else {
             return Ok(false);
         };
-        self.frame.truncate(self.frame.len() - n);
+        let end = self.frame.len() - n;
+        self.frame.truncate(end);
         self.push_operand(Operand::Interned(best));
         Ok(true)
     }
@@ -3541,7 +3568,7 @@ impl<'a> Vm<'a> {
             return op(args).map(Some).map_err(|e| self.park(e));
         }
         let Some(func) = self.ctx.get_function(name) else {
-            self.pending_args = Some(args);
+            *self.pending_args = Some(args);
             return Ok(None);
         };
         let mut fctx = crate::FunctionContext::new(name, None, self.ctx, args);

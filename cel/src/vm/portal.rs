@@ -1389,11 +1389,11 @@ fn residual_hydrate(vm_bits: i64, pc: i64) -> i64 {
         Ok(Step::Next) => pc + 1,
         Ok(Step::Jump(target)) => i64::from(target),
         Ok(Step::Return(value)) => {
-            vm.portal_ret = Some(Ok(value));
+            *vm.portal_ret = Some(Ok(value));
             PORTAL_DONE
         }
         Err(err) => {
-            vm.portal_ret = Some(Err(err));
+            *vm.portal_ret = Some(Err(err));
             PORTAL_FAIL
         }
     }
