@@ -408,6 +408,23 @@ fn compiled_fresh_context_is_not_the_old_leaf() {
     }
 }
 
+/// A compiled function-entry run that fails a guard resumes in the bridge
+/// walk. When that walk reaches the portal return it publishes the result
+/// on the single-pass finish latch and the driver reports `usize::MAX`.
+/// The function-entry door drained only the back-edge latch, then skipped
+/// the loop and ran the epilogue, which returned null
+/// (`InternalError("portal done without a result")`).
+#[test]
+fn function_entry_guard_resume_returns_the_bridge_finish() {
+    // SAFETY: stored before this test builds a driver. The knob is read
+    // once, when that driver is created.
+    unsafe { std::env::set_var("CEL_PORTAL_THRESHOLD", "100") };
+    agree_compiled("list.all(e, e > 0)", 1000);
+    agree_compiled("list.exists(e, e == x)", 1000);
+    agree_compiled("list.exists(e, e == 5)", 1000);
+    agree_compiled("list.all(e, e < x + 1000)", 1000);
+}
+
 /// A resolver context must not bake the leaf observed on the first call.
 #[test]
 fn compiled_resolver_context_stays_live() {
