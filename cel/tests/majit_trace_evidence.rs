@@ -1068,11 +1068,18 @@ fn nested_list_loop_deopt_census() {
              + {WARMING_SLACK} part-warmed + 1 final exit) — that is a per-row \
              bail back to the interpreter"
         );
-        let expected_compiles = if per_row < 2 { 1 } else { 2 };
+        // At 2 elements the inner back-edge fires once per row, as often as
+        // the row loop's, and reaches the bound first. Its trace crosses the
+        // row back-edge and closes at the next row's inner header, so one loop
+        // covers every row; `bound_reached` then decays every counter
+        // (warmstate.py bound_reached: jitcounter.decay_all_counters), and the
+        // row loop's counter never reaches the bound. From 3 elements the inner
+        // loop closes on its own back-edge and the row loop compiles too.
+        let expected_compiles = if per_row < 3 { 1 } else { 2 };
         assert_eq!(
             compiles, expected_compiles,
-            "per_row={per_row}: the row loop compiles, and from 2 elements the \
-             inner element loop's own back-edge gets hot and compiles too"
+            "per_row={per_row}: one loop through 2 elements, then the inner \
+             element loop and the row loop compile separately"
         );
     }
     majit_ir::opref_audit::report_summary();
