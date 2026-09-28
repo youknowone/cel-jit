@@ -36,9 +36,10 @@
 //! `NewWithVtable` allocates from `MiniMarkGC`'s nursery while everything the
 //! interpreter builds comes from here. A collector walking either one cannot
 //! see the objects in the other, and neither side would report the split — it
-//! would show up as a freed live value. `install_cel_gc` has no caller today,
-//! so the split is not live; it has to be closed *before* it gets one, by
-//! making this heap the collector's rather than by adding a second walker.
+//! would show up as a freed live value. `install_cel_gc` has no caller.
+//! [`cel_malloc_fixedsize`] is the closure instead: `GcLLDescr_boehm`'s
+//! `malloc_fixedsize` (`rewrite.py gen_malloc_fixedsize`), published through
+//! `majit_gc::set_malloc_fixedsize`. That hook does not install a collector.
 //!
 //! # Values must not need dropping
 //!
@@ -924,6 +925,14 @@ fn heap_ptr() -> *const CelHeap {
 #[inline]
 pub fn with_heap<R>(f: impl FnOnce(&CelHeap) -> R) -> R {
     HEAP.with(f)
+}
+
+/// `GcLLDescr_boehm.malloc_fixedsize`. Compiled and blackhole
+/// `NEW_WITH_VTABLE` call this when the portal publishes it. The block is
+/// this thread's [`CelHeap`], the same owner as [`super::object::new_int_in`].
+/// Bytes are not zeroed; the backend clears them (`malloc_zero_filled`).
+pub extern "C" fn cel_malloc_fixedsize(size: usize) -> *mut u8 {
+    with_heap(|heap| heap.alloc_raw(size, align_of::<u64>()))
 }
 
 /// Nursery bump captured at outermost entry. Leave compares [`Self::used`]
