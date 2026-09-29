@@ -4015,6 +4015,10 @@ pub mod float_bank {
         num_fregs: usize,
         threshold: u32,
     ) -> i64 {
+        // One scope per call. Compiled frames are `CelGc` nursery objects and
+        // are reclaimed when the outermost scope leaves. The result is an
+        // `i64`, already copied out before that leave.
+        let _eval = crate::runtime::heap::enter_eval();
         let mut driver = new_driver_f(threshold, init_regs.len(), num_fregs);
         // No entry door here, and the driver is the reason: it dies with the
         // call, so an entry artifact this call minted could never be entered by
@@ -4567,6 +4571,10 @@ pub mod float_bank {
         num_fregs: usize,
         threshold: u32,
     ) -> i64 {
+        // One scope per call, not per row. Compiled frames are `CelGc` nursery
+        // objects and are reclaimed when the outermost scope leaves. The
+        // result is an `i64`, already copied out before that leave.
+        let _eval = crate::runtime::heap::enter_eval();
         let key = (init_regs.len(), num_fregs, threshold);
         let addr = program.as_ptr() as usize;
         // Read once per call, ahead of every stage, so no stage's difference

@@ -40,18 +40,16 @@
 //! The live length lives on the owning leaf, as `("length", Signed)` does
 //! upstream. A block is never resized in place; growing allocates a fresh one.
 //!
-//! # Registered, but nothing is allocated under the registration
+//! # Registered, and allocated under that registration
 //!
-//! [`super::registration`] now registers both blocks as varsize types, from
-//! [`CEL_ITEMS_BLOCK_TOKEN`] and [`CEL_BYTES_BLOCK_TOKEN`] unchanged — the
-//! reference block with its items traced, the byte block as a leaf. So the
-//! shape a collector would walk is on record and tested against a real minor
-//! collection.
+//! [`super::registration`] registers every block as a varsize type, from its
+//! [`ArrayToken`] — the reference block with its items traced, the byte,
+//! int-word and float-word blocks as leaves. Each allocation writes that
+//! type id in the header word in front of the block.
 //!
 //! The blocks are reserved on this thread's value heap with the leaves.
-//! They still do not carry a collector type id on the allocated body; that
-//! moves with the leaves.
 
+use super::lltype::CelGcType;
 use super::object::CelRef;
 
 /// The three numbers describing an inline-varsize body.
@@ -103,6 +101,13 @@ pub const CEL_ITEMS_BLOCK_TOKEN: ArrayToken = ArrayToken {
     len_offset: CEL_ITEMS_BLOCK_LEN_OFFSET,
 };
 
+impl CelGcType for CelItemsBlock {
+    #[cfg(not(feature = "structs"))]
+    const TYPE_ID: u32 = 20;
+    #[cfg(feature = "structs")]
+    const TYPE_ID: u32 = 21;
+}
+
 /// A block of bytes: `capacity`, then the bytes.
 ///
 /// Its own type and its own token rather than a generic one over the item type.
@@ -128,6 +133,13 @@ pub const CEL_BYTES_BLOCK_TOKEN: ArrayToken = ArrayToken {
     len_offset: CEL_BYTES_BLOCK_LEN_OFFSET,
 };
 
+impl CelGcType for CelBytesBlock {
+    #[cfg(not(feature = "structs"))]
+    const TYPE_ID: u32 = 21;
+    #[cfg(feature = "structs")]
+    const TYPE_ID: u32 = 22;
+}
+
 /// Unboxed `i64`s for an int column: capacity word, then the words.
 ///
 /// Same body as [`CelItemsBlock`]. `new_array` can build it; a raw
@@ -146,6 +158,51 @@ pub const CEL_INT_WORDS_LEN_OFFSET: usize = core::mem::offset_of!(CelIntWords, c
 const _: () = {
     assert!(CEL_INT_WORDS_LEN_OFFSET == 0);
 };
+
+pub const CEL_INT_WORDS_TOKEN: ArrayToken = ArrayToken {
+    base_size: CEL_INT_WORDS_ITEMS_OFFSET,
+    item_size: core::mem::size_of::<i64>(),
+    len_offset: CEL_INT_WORDS_LEN_OFFSET,
+};
+
+impl CelGcType for CelIntWords {
+    #[cfg(not(feature = "structs"))]
+    const TYPE_ID: u32 = 22;
+    #[cfg(feature = "structs")]
+    const TYPE_ID: u32 = 23;
+}
+
+/// Unboxed `f64`s for a float column: capacity word, then the words.
+///
+/// Same body as [`CelIntWords`]. The array descr reads the length at
+/// offset 0, so the payload cannot be a raw `*mut f64`.
+#[cfg_attr(feature = "jit", majit_macros::jit_immutable_fields(capacity))]
+#[repr(C)]
+#[allow(non_camel_case_types)]
+pub struct CelFloatWords {
+    pub capacity: usize,
+    pub(crate) items: [f64; 0],
+}
+
+pub const CEL_FLOAT_WORDS_ITEMS_OFFSET: usize = core::mem::offset_of!(CelFloatWords, items);
+pub const CEL_FLOAT_WORDS_LEN_OFFSET: usize = core::mem::offset_of!(CelFloatWords, capacity);
+
+const _: () = {
+    assert!(CEL_FLOAT_WORDS_LEN_OFFSET == 0);
+};
+
+pub const CEL_FLOAT_WORDS_TOKEN: ArrayToken = ArrayToken {
+    base_size: CEL_FLOAT_WORDS_ITEMS_OFFSET,
+    item_size: core::mem::size_of::<f64>(),
+    len_offset: CEL_FLOAT_WORDS_LEN_OFFSET,
+};
+
+impl CelGcType for CelFloatWords {
+    #[cfg(not(feature = "structs"))]
+    const TYPE_ID: u32 = 23;
+    #[cfg(feature = "structs")]
+    const TYPE_ID: u32 = 24;
+}
 
 /// Word 0 of an int-words block, or null.
 ///
@@ -166,11 +223,39 @@ pub fn new_int_words_in(heap: &super::heap::CelHeap, cap: usize) -> *mut CelIntW
     unsafe {
         alloc_block_in(
             heap,
+            CelIntWords::TYPE_ID,
             CEL_INT_WORDS_ITEMS_OFFSET,
             core::mem::size_of::<i64>(),
             core::mem::align_of::<CelIntWords>(),
             cap,
         ) as *mut CelIntWords
+    }
+}
+
+/// Word 0 of a float-words block, or null.
+///
+/// # Safety
+///
+/// `block` is null or points at a live [`CelFloatWords`].
+#[inline]
+pub unsafe fn float_words_base(block: *mut CelFloatWords) -> *mut f64 {
+    if block.is_null() {
+        return core::ptr::null_mut();
+    }
+    unsafe { (block as *mut u8).add(CEL_FLOAT_WORDS_ITEMS_OFFSET) as *mut f64 }
+}
+
+/// Allocate `cap` unboxed floats. The slots are not zeroed.
+pub fn new_float_words_in(heap: &super::heap::CelHeap, cap: usize) -> *mut CelFloatWords {
+    unsafe {
+        alloc_block_in(
+            heap,
+            CelFloatWords::TYPE_ID,
+            CEL_FLOAT_WORDS_ITEMS_OFFSET,
+            core::mem::size_of::<f64>(),
+            core::mem::align_of::<CelFloatWords>(),
+            cap,
+        ) as *mut CelFloatWords
     }
 }
 
@@ -190,13 +275,14 @@ pub fn new_int_words_in(heap: &super::heap::CelHeap, cap: usize) -> *mut CelIntW
 #[inline(always)]
 unsafe fn alloc_block_in(
     heap: &super::heap::CelHeap,
+    type_id: u32,
     base: usize,
     item_size: usize,
     align: usize,
     cap: usize,
 ) -> *mut u8 {
     let size = base + item_size * cap;
-    let raw = heap.alloc_raw(size, align);
+    let raw = heap.alloc_raw_typed(type_id, size, align);
     // The length word first, so a block is never observable without one.
     // The item bytes are left uninitialised: callers write every live
     // byte, and zeroing here is a per-call `memset` the readers never need.
@@ -204,8 +290,14 @@ unsafe fn alloc_block_in(
     raw
 }
 
-unsafe fn alloc_block(base: usize, item_size: usize, align: usize, cap: usize) -> *mut u8 {
-    super::heap::with_heap(|h| alloc_block_in(h, base, item_size, align, cap))
+unsafe fn alloc_block(
+    type_id: u32,
+    base: usize,
+    item_size: usize,
+    align: usize,
+    cap: usize,
+) -> *mut u8 {
+    super::heap::with_heap(|h| alloc_block_in(h, type_id, base, item_size, align, cap))
 }
 
 /// A block holding `values` on `heap`.
@@ -213,6 +305,7 @@ pub fn new_items_block_in(heap: &super::heap::CelHeap, values: &[CelRef]) -> *mu
     let block = unsafe {
         alloc_block_in(
             heap,
+            CelItemsBlock::TYPE_ID,
             CEL_ITEMS_BLOCK_TOKEN.base_size,
             CEL_ITEMS_BLOCK_TOKEN.item_size,
             core::mem::align_of::<CelItemsBlock>(),
@@ -306,6 +399,7 @@ pub fn new_items_block_with_zeroed_prefix_in(
     let block = unsafe {
         alloc_block_in(
             heap,
+            CelItemsBlock::TYPE_ID,
             CEL_ITEMS_BLOCK_TOKEN.base_size,
             CEL_ITEMS_BLOCK_TOKEN.item_size,
             core::mem::align_of::<CelItemsBlock>(),
@@ -349,6 +443,7 @@ pub fn new_bytes_block_uninit_in(heap: &super::heap::CelHeap, len: usize) -> *mu
     unsafe {
         alloc_block_in(
             heap,
+            CelBytesBlock::TYPE_ID,
             CEL_BYTES_BLOCK_TOKEN.base_size,
             CEL_BYTES_BLOCK_TOKEN.item_size,
             core::mem::align_of::<CelBytesBlock>(),
@@ -362,6 +457,7 @@ pub fn new_bytes_block_in(heap: &super::heap::CelHeap, bytes: &[u8]) -> *mut Cel
     let block = unsafe {
         alloc_block_in(
             heap,
+            CelBytesBlock::TYPE_ID,
             CEL_BYTES_BLOCK_TOKEN.base_size,
             CEL_BYTES_BLOCK_TOKEN.item_size,
             core::mem::align_of::<CelBytesBlock>(),
@@ -385,6 +481,7 @@ pub fn new_bytes_block_concat(a: &[u8], b: &[u8]) -> *mut CelBytesBlock {
     let n = a.len() + b.len();
     let block = unsafe {
         alloc_block(
+            CelBytesBlock::TYPE_ID,
             CEL_BYTES_BLOCK_TOKEN.base_size,
             CEL_BYTES_BLOCK_TOKEN.item_size,
             core::mem::align_of::<CelBytesBlock>(),
@@ -484,6 +581,14 @@ mod tests {
         assert_eq!(CEL_BYTES_BLOCK_TOKEN.len_offset, 0);
         assert_eq!(CEL_BYTES_BLOCK_TOKEN.base_size, size_of::<usize>());
         assert_eq!(CEL_BYTES_BLOCK_TOKEN.item_size, 1);
+
+        assert_eq!(CEL_INT_WORDS_TOKEN.len_offset, 0);
+        assert_eq!(CEL_INT_WORDS_TOKEN.base_size, size_of::<usize>());
+        assert_eq!(CEL_INT_WORDS_TOKEN.item_size, size_of::<i64>());
+
+        assert_eq!(CEL_FLOAT_WORDS_TOKEN.len_offset, 0);
+        assert_eq!(CEL_FLOAT_WORDS_TOKEN.base_size, size_of::<usize>());
+        assert_eq!(CEL_FLOAT_WORDS_TOKEN.item_size, size_of::<f64>());
     }
 
     #[test]
@@ -531,6 +636,8 @@ mod tests {
         unsafe {
             assert!(items_block_items_base(core::ptr::null_mut()).is_null());
             assert!(bytes_base(core::ptr::null_mut()).is_null());
+            assert!(int_words_base(core::ptr::null_mut()).is_null());
+            assert!(float_words_base(core::ptr::null_mut()).is_null());
             assert_eq!(items_capacity(core::ptr::null_mut()), 0);
             assert_eq!(bytes_capacity(core::ptr::null_mut()), 0);
         }

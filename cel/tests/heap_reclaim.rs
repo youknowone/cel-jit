@@ -14,8 +14,8 @@ fn eval_scope_is_active_during_execute() {
     let mut ctx = Context::default();
     ctx.add_function("depth", || eval_depth() as i64);
     ctx.add_function("young_alloc", || {
-        let p = with_heap(|h| h.alloc(7u64));
-        i64::from(is_young(p as *const u8))
+        let p = with_heap(|h| h.alloc_raw(8, 8));
+        i64::from(is_young(p))
     });
     let d = eval_vm("depth()", &ctx);
     let y = eval_vm("young_alloc()", &ctx);

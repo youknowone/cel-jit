@@ -1478,18 +1478,21 @@ fn fresh_portal_driver(state: &mut PortalState, code: &CelCode) -> JitDriver<Por
     // This portal returns `*mut CelObject`, so the finish descr is
     // `compile.py DoneWithThisFrameDescrRef`.
     driver.set_result_type(majit_ir::Type::Ref);
-    // `GcLLDescr_framework` with a headerless nursery: vtable at offset 0.
+    // `gc.py GcLLDescr_framework`: type-id header at `payload - GcHeader::SIZE`.
+    // `supports_guard_gc_type` is true, so a portal loop may unroll.
     // `gen_malloc_nursery` bakes this thread's `nursery_free` / `nursery_top`.
-    // Objects past the segment size still use `malloc_fixedsize`. The slow
-    // path opens a segment and does not collect, so frames stay host blocks
-    // (`jitframe_type_id` is unset).
+    // The slow path opens a segment and does not collect. `JITFRAME` is
+    // registered on the descr (`jitframe.py` `jitframe_allocate`) so the
+    // type table can be installed; the frame is an off-GC host block, not
+    // a nursery object. Descrs are published before the driver
+    // traces, so a `NewWithVtable` stamps the registry's type id.
     driver.set_vtable_offset(Some(0));
     driver.set_subclassrange_min_offset(Some(core::mem::offset_of!(
         crate::runtime::object::CelClass,
         subclassrange_min
     )));
-    driver.set_gc_allocator(Box::new(crate::runtime::heap::CelGc));
-    majit_gc::set_malloc_fixedsize(Some(crate::runtime::heap::cel_malloc_fixedsize));
+    crate::runtime::registration::publish_cel_descrs_once();
+    driver.set_gc_allocator(Box::new(crate::runtime::heap::CelGc::new()));
     {
         use majit_metainterp::JitState as _;
         state
@@ -2230,8 +2233,11 @@ fn cell_float(w: *mut CelObject) -> f64 {
     ref_params = { list: ref(crate::runtime::object::W_ListObject) },
     ref_fields = {
         crate::runtime::object::W_ListObject::storage => crate::runtime::object::CelObject,
+        crate::runtime::object::W_FloatColumn::data => crate::runtime::object_array::CelFloatWords,
     },
-    array_fields = { crate::runtime::object::W_FloatColumn::data => f64 },
+    array_fields = {
+        crate::runtime::object::W_FloatColumn::data => f64 in crate::runtime::object_array::CelFloatWords,
+    },
     int_fields = {
         crate::runtime::object::W_ListObject::strategy => u8,
         crate::runtime::object::W_ListObject::length => i64,
@@ -2861,10 +2867,11 @@ fn index_cell(container: *mut CelObject, key: *mut CelObject) -> *mut CelObject 
     ref_fields = {
         crate::runtime::object::W_ListObject::storage => crate::runtime::object::CelObject,
         crate::runtime::object::W_IntColumn::data => crate::runtime::object_array::CelIntWords,
+        crate::runtime::object::W_FloatColumn::data => crate::runtime::object_array::CelFloatWords,
     },
     array_fields = {
         crate::runtime::object::W_IntColumn::data => i64 in crate::runtime::object_array::CelIntWords,
-        crate::runtime::object::W_FloatColumn::data => f64,
+        crate::runtime::object::W_FloatColumn::data => f64 in crate::runtime::object_array::CelFloatWords,
         crate::runtime::object::W_ListObject::items => crate::runtime::object::CelRef in crate::runtime::object_array::CelItemsBlock,
     },
     int_fields = {
@@ -4115,7 +4122,7 @@ fn slow_pc(vm: i64, here: i64) -> i64 {
     array_fields = {
         W_CelFrame::locals_stack_w => CelRef in crate::runtime::object_array::CelItemsBlock,
         crate::runtime::object::W_IntColumn::data => i64 in crate::runtime::object_array::CelIntWords,
-        crate::runtime::object::W_FloatColumn::data => f64,
+        crate::runtime::object::W_FloatColumn::data => f64 in crate::runtime::object_array::CelFloatWords,
         crate::runtime::object::W_ListObject::items => crate::runtime::object::CelRef in crate::runtime::object_array::CelItemsBlock,
     },
     int_fields = {

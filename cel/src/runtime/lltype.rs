@@ -22,6 +22,16 @@
 
 use super::heap;
 
+/// Fixed GC type id of a leaf or a payload block.
+///
+/// `TypeRegistry::register` hands ids out in registration order, and that
+/// order is the one [`super::registration`] walks. The consts here are those
+/// ids as literals, so a header word can be written in a build that does not
+/// link `majit_gc`.
+pub trait CelGcType {
+    const TYPE_ID: u32;
+}
+
 /// Allocate `value` on this thread's heap and return a raw pointer to it.
 ///
 /// # Safety of the returned pointer
@@ -30,7 +40,7 @@ use super::heap;
 /// collects yet, because the root set the design enumerates has no walker. See
 /// [`super::heap`] for what that bounds and what it does not.
 #[inline]
-pub fn malloc_typed<T>(value: T) -> *mut T {
+pub fn malloc_typed<T: CelGcType>(value: T) -> *mut T {
     heap::with_heap(|h| h.alloc(value))
 }
 
@@ -40,7 +50,7 @@ pub fn malloc_typed<T>(value: T) -> *mut T {
 /// heap will eventually route them differently — one to the collector's
 /// managed old-gen, one to an immortal region. They are the same call today.
 #[inline]
-pub fn malloc_typed_managed<T>(value: T) -> *mut T {
+pub fn malloc_typed_managed<T: CelGcType>(value: T) -> *mut T {
     heap::with_heap(|h| h.alloc(value))
 }
 
@@ -50,7 +60,7 @@ pub fn malloc_typed_managed<T>(value: T) -> *mut T {
 /// address, not a `NewWithVtable`. The header word in front of the
 /// payload is what `guard_is_object` reads at `obj - 8`; a Rust
 /// `static` would put that load off the object.
-pub fn malloc_typed_immortal<T>(value: T) -> *mut T {
+pub fn malloc_typed_immortal<T: CelGcType>(value: T) -> *mut T {
     heap::alloc_immortal(value)
 }
 

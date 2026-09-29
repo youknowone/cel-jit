@@ -4,9 +4,8 @@
 //! by [`super::heap::is_immortal`], and freed only when the last code object
 //! sharing this pool drops.
 
-use super::heap::{
-    register_const_span, unregister_const_span, IMMORTAL_HEADER_SIZE, IMMORTAL_MARK,
-};
+use super::heap::{headered_total, register_const_span, unregister_const_span, GC_HEADER_SIZE};
+use super::lltype::CelGcType;
 use super::object::{
     new_bool, new_null, prebuilt_int, CelObject, CelRef, ListStrategy, MapStrategy, W_BytesObject,
     W_DoubleObject, W_HostListObject, W_IntColumn, W_IntObject, W_ListObject, W_MapObject,
@@ -58,19 +57,18 @@ impl std::fmt::Debug for ConstPool {
 }
 
 impl ConstPool {
-    fn alloc_raw(&mut self, size: usize, align: usize) -> *mut u8 {
-        let align = align.max(align_of::<usize>());
-        let header = IMMORTAL_HEADER_SIZE;
-        let total = header.checked_add(size).expect("const payload fits usize");
+    fn alloc_raw_typed(&mut self, type_id: u32, size: usize, align: usize) -> *mut u8 {
+        let align = align.max(GC_HEADER_SIZE);
+        let total = headered_total(size);
         let layout = Layout::from_size_align(total, align).expect("const layout");
         let base = unsafe { std::alloc::alloc(layout) };
         if base.is_null() {
             std::alloc::handle_alloc_error(layout);
         }
         unsafe {
-            (base as *mut usize).write(IMMORTAL_MARK);
+            (base as *mut u64).write(u64::from(type_id));
         }
-        let payload = unsafe { base.add(header) };
+        let payload = unsafe { base.add(GC_HEADER_SIZE) };
         register_const_span(payload, size);
         self.blocks.push(Block {
             base,
@@ -80,8 +78,8 @@ impl ConstPool {
         payload
     }
 
-    fn alloc<T>(&mut self, value: T) -> *mut T {
-        let ptr = self.alloc_raw(size_of::<T>(), align_of::<T>()) as *mut T;
+    fn alloc<T: CelGcType>(&mut self, value: T) -> *mut T {
+        let ptr = self.alloc_raw_typed(T::TYPE_ID, size_of::<T>(), align_of::<T>()) as *mut T;
         unsafe { ptr.write(value) };
         ptr
     }
@@ -91,7 +89,7 @@ impl ConstPool {
         let size = CEL_BYTES_BLOCK_ITEMS_OFFSET
             .checked_add(cap)
             .expect("bytes block fits");
-        let raw = self.alloc_raw(size, align_of::<CelBytesBlock>());
+        let raw = self.alloc_raw_typed(CelBytesBlock::TYPE_ID, size, align_of::<CelBytesBlock>());
         let block = raw as *mut CelBytesBlock;
         unsafe {
             (*block).capacity = cap;
@@ -192,7 +190,8 @@ impl ConstPool {
         let size = CEL_ITEMS_BLOCK_ITEMS_OFFSET
             .checked_add(n.saturating_mul(size_of::<CelRef>()))
             .expect("tuple items fit");
-        let block = self.alloc_raw(size, align_of::<CelItemsBlock>()) as *mut CelItemsBlock;
+        let block = self.alloc_raw_typed(CelItemsBlock::TYPE_ID, size, align_of::<CelItemsBlock>())
+            as *mut CelItemsBlock;
         unsafe {
             (*block).capacity = n;
             if n != 0 {
@@ -254,7 +253,8 @@ impl ConstPool {
             core::ptr::null_mut()
         } else {
             let bytes = CEL_INT_WORDS_ITEMS_OFFSET + n * size_of::<i64>();
-            let block = self.alloc_raw(bytes, align_of::<CelIntWords>()) as *mut CelIntWords;
+            let block = self.alloc_raw_typed(CelIntWords::TYPE_ID, bytes, align_of::<CelIntWords>())
+                as *mut CelIntWords;
             unsafe {
                 (*block).capacity = n;
                 core::ptr::copy_nonoverlapping(ints.as_ptr(), int_words_base(block), n);
@@ -292,7 +292,8 @@ impl ConstPool {
         let size = CEL_ITEMS_BLOCK_ITEMS_OFFSET
             .checked_add(nrefs.saturating_mul(size_of::<CelRef>()))
             .expect("items block fits");
-        let block = self.alloc_raw(size, align_of::<CelItemsBlock>()) as *mut CelItemsBlock;
+        let block = self.alloc_raw_typed(CelItemsBlock::TYPE_ID, size, align_of::<CelItemsBlock>())
+            as *mut CelItemsBlock;
         unsafe {
             (*block).capacity = nrefs;
         }
@@ -343,7 +344,8 @@ impl ConstPool {
         let size = CEL_ITEMS_BLOCK_ITEMS_OFFSET
             .checked_add(nrefs.saturating_mul(size_of::<CelRef>()))
             .expect("items block fits");
-        let block = self.alloc_raw(size, align_of::<CelItemsBlock>()) as *mut CelItemsBlock;
+        let block = self.alloc_raw_typed(CelItemsBlock::TYPE_ID, size, align_of::<CelItemsBlock>())
+            as *mut CelItemsBlock;
         unsafe {
             (*block).capacity = nrefs;
             if nrefs != 0 {
@@ -375,7 +377,8 @@ impl ConstPool {
         let size = CEL_ITEMS_BLOCK_ITEMS_OFFSET
             .checked_add(n.saturating_mul(size_of::<CelRef>()))
             .expect("items block fits");
-        let block = self.alloc_raw(size, align_of::<CelItemsBlock>()) as *mut CelItemsBlock;
+        let block = self.alloc_raw_typed(CelItemsBlock::TYPE_ID, size, align_of::<CelItemsBlock>())
+            as *mut CelItemsBlock;
         unsafe {
             (*block).capacity = n;
             if n != 0 {

@@ -32,15 +32,14 @@
 //! `crate::Value` yet, so only the second comparison describes anything that
 //! runs.
 //!
-//! ⛔ **Two heaps would be two universes.** [`super::registration`]'s
-//! `install_cel_gc` turns on `set_new_via_gc`, after which a compiled
-//! `NewWithVtable` allocates from `MiniMarkGC`'s nursery while everything the
-//! interpreter builds comes from here. A collector walking either one cannot
-//! see the objects in the other, and neither side would report the split — it
-//! would show up as a freed live value. `install_cel_gc` has no caller.
-//! [`cel_malloc_fixedsize`] is the closure instead: `GcLLDescr_boehm`'s
-//! `malloc_fixedsize` (`rewrite.py gen_malloc_fixedsize`), published through
-//! `majit_gc::set_malloc_fixedsize`. That hook does not install a collector.
+//! ⛔ **`install_cel_gc` is a second heap.** It installs `MiniMarkGC` and
+//! turns on `set_new_via_gc`, after which a compiled `NewWithVtable` allocates
+//! from that nursery while the interpreter builds values here. The portal
+//! does not call it. The portal's collector is [`CelGc`]: `gc.py`
+//! `GcLLDescr_framework` over this same heap. Every value carries the
+//! type-id header, `supports_guard_gc_type` is true, and compiled
+//! `CALL_MALLOC_NURSERY` bumps [`CelHeap::nursery_free`]. Nothing collects
+//! and nothing moves.
 //!
 //! # Values must not need dropping
 //!
@@ -57,12 +56,38 @@ use core::cell::{Cell, RefCell};
 use core::marker::PhantomData;
 use core::ptr::{null_mut, NonNull};
 
+use super::lltype::CelGcType;
+
 /// Bytes per segment.
 ///
 /// Segments are the unit of `alloc`/`dealloc`, not of collection, so the size
 /// trades header overhead against how much a mostly-empty last segment wastes.
-/// One 64 KiB segment holds ~4000 two-word leaves.
+/// One 64 KiB segment holds a few thousand headered leaves.
 const SEGMENT_BYTES: usize = 64 * 1024;
+
+/// Bytes in front of every cel payload.
+///
+/// The type id lives in the low bits of this word. `gc.py`
+/// `GcLLDescr_framework` reads it at `obj - GC_HEADER_SIZE`. A build
+/// without `majit_gc` stores the same `u64`.
+pub const GC_HEADER_SIZE: usize = 8;
+
+#[cfg(feature = "jit")]
+const _: () = {
+    assert!(GC_HEADER_SIZE == majit_gc::header::GcHeader::SIZE);
+};
+
+/// `GC_HEADER_SIZE + size`, rounded up to a multiple of 8 so a nursery
+/// bump leaves `nursery_free` 8-aligned. The compiled inline bump does
+/// not realign.
+pub(crate) fn headered_total(size: usize) -> usize {
+    try_headered_total(size).expect("allocation fits")
+}
+
+fn try_headered_total(size: usize) -> Option<usize> {
+    let total = GC_HEADER_SIZE.checked_add(size)?;
+    Some(total.checked_add(7)? & !7)
+}
 
 /// Nursery segments kept after a reset. A huge evaluation may have opened
 /// more; those extras are released so they do not pin memory for the rest
@@ -787,28 +812,62 @@ impl CelHeap {
         self.publish_nursery_bounds();
     }
 
-    /// Allocate `value` in this heap and return a pointer to it.
+    /// Allocate `value` in this heap and return a pointer to the payload.
     ///
-    /// During an evaluation the pointer is nursery memory and is invalid
-    /// after the outermost scope resets, unless it was allocated through
-    /// [`alloc_old`].
+    /// The type-id word sits at `payload - GC_HEADER_SIZE`. During an
+    /// evaluation the pointer is nursery memory and is invalid after the
+    /// outermost scope resets, unless it was allocated through [`alloc_old`].
     #[inline]
-    pub fn alloc<T>(&self, value: T) -> *mut T {
+    pub fn alloc<T: super::lltype::CelGcType>(&self, value: T) -> *mut T {
         let () = AssertNoDrop::<T>::OK;
-        let ptr = self.alloc_raw(size_of::<T>(), align_of::<T>()) as *mut T;
-        // SAFETY: `alloc_raw` returns an address with `T`'s size and alignment
-        // that nothing else has been handed. The bytes are written here, so
-        // the bump does not zero them.
+        let ptr = self.alloc_headered(
+            u64::from(<T as CelGcType>::TYPE_ID),
+            size_of::<T>(),
+            align_of::<T>(),
+            false,
+        ) as *mut T;
+        // SAFETY: `alloc_headered` returns a payload with `T`'s size and
+        // alignment that nothing else has been handed. The bytes are written
+        // here, so the bump does not zero them.
         unsafe { ptr.write(value) };
         ptr
     }
 
     /// Allocate `value` in old space even if an evaluation is running.
-    pub fn alloc_old<T>(&self, value: T) -> *mut T {
+    pub fn alloc_old<T: super::lltype::CelGcType>(&self, value: T) -> *mut T {
         let () = AssertNoDrop::<T>::OK;
-        let ptr = self.alloc_old_raw(size_of::<T>(), align_of::<T>()) as *mut T;
+        let ptr = self.alloc_headered(
+            u64::from(<T as CelGcType>::TYPE_ID),
+            size_of::<T>(),
+            align_of::<T>(),
+            true,
+        ) as *mut T;
         unsafe { ptr.write(value) };
         ptr
+    }
+
+    /// Header plus `size` payload bytes. Returns the payload.
+    ///
+    /// Block allocations ([`super::object_array`]) go through here. The
+    /// reservation is a multiple of 8 so [`Self::nursery_free`] stays aligned.
+    #[inline]
+    pub fn alloc_raw_typed(&self, type_id: u32, size: usize, align: usize) -> *mut u8 {
+        self.alloc_headered(u64::from(type_id), size, align, false)
+    }
+
+    /// Reserve a header word and `size` payload bytes. `old` forces old space.
+    fn alloc_headered(&self, header: u64, size: usize, align: usize, old: bool) -> *mut u8 {
+        let align = align.max(GC_HEADER_SIZE);
+        let total = headered_total(size);
+        let raw = if old {
+            self.alloc_old_raw(total, align)
+        } else {
+            self.alloc_raw(total, align)
+        };
+        // SAFETY: `raw` is uniquely owned, aligned for `u64`, and `total`
+        // covers the header word.
+        unsafe { (raw as *mut u64).write(header) };
+        unsafe { raw.add(GC_HEADER_SIZE) }
     }
 
     /// Reserve `size` bytes at `align`, growing the heap if the open segment
@@ -1106,34 +1165,122 @@ pub fn with_heap<R>(f: impl FnOnce(&CelHeap) -> R) -> R {
     HEAP.with(f)
 }
 
-/// `GcLLDescr_framework.malloc_fixedsize` for an object the nursery declined.
+/// Framework GC descr (`gc.py GcLLDescr_framework`) over this thread's
+/// [`CelHeap`].
 ///
-/// The block is this thread's [`CelHeap`], the same owner as
-/// [`super::object::new_int_in`]. `rewrite.py` `malloc_zero_filled` is false
-/// for a framework descr, so this does not clear the block: the rewriter
-/// emits the NULL stores `clear_gc_fields` owes, and the constructor writes
-/// every other field. The function takes only the size
-/// (`gc.py malloc_fixedsize`); the heap is the one [`heap_ptr`] already cached.
-pub extern "C" fn cel_malloc_fixedsize(size: usize) -> *mut u8 {
-    unsafe { (*heap_ptr()).alloc_raw(size, align_of::<u64>()) }
+/// Every object carries a type-id word at `payload - GcHeader::SIZE`.
+/// `supports_guard_gc_type` is true, so a portal loop may unroll.
+/// `gc.py get_nursery_free_addr` / `get_nursery_top_addr` name the two
+/// cells on the heap. Allocation bumps the nursery and never collects.
+/// `JITFRAME` is registered after the cel types (`jitframe.py`
+/// `jitframe_allocate`): a type table cannot be installed without that id.
+/// The frame itself is a nursery object, reclaimed with the rest of the
+/// evaluation's young objects.
+#[cfg(feature = "jit")]
+pub struct CelGc {
+    types: majit_gc::trace::TypeRegistry,
+    jitframe_type_id: Option<u32>,
 }
 
-/// Headerless nursery descr for this thread's [`CelHeap`].
-///
-/// `gc.py get_nursery_free_addr` / `get_nursery_top_addr` name the two cells
-/// on the heap. The slow path is `bump_grow`: a new segment, never a
-/// collection, so no root walker is consulted and nothing moves.
 #[cfg(feature = "jit")]
-pub struct CelGc;
+impl CelGc {
+    /// Register the root, every class and every block, then freeze.
+    ///
+    /// Ids are the [`super::lltype::CelGcType`] literals.
+    /// [`super::registration::register_cel_classes_unfrozen`] checks that.
+    pub fn new() -> CelGc {
+        let mut gc = CelGc {
+            types: majit_gc::trace::TypeRegistry::new(),
+            jitframe_type_id: None,
+        };
+        let _ids = super::registration::register_cel_classes_unfrozen(&mut gc);
+        // After the cel types, so [`super::lltype::CelGcType::TYPE_ID`]
+        // stays the literal. `check_jitframe_descr` refuses the install
+        // when this id is missing.
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            majit_metainterp::register_active_backend_jitframe_gc_type(&mut gc);
+        }
+        majit_gc::GcAllocator::freeze_types(&mut gc);
+        gc
+    }
+
+    /// Payload of `payload` bytes. `header` is the word at `payload - 8`.
+    ///
+    /// `0` is a zero header: the compiled nursery slow path stores the
+    /// type id itself. A nonzero word is `u64::from(type_id)`, which is
+    /// what `GcHeader::new` stores.
+    fn bump_payload(&mut self, header: u64, payload: usize) -> majit_ir::GcRef {
+        let Some(total) = try_headered_total(payload) else {
+            return majit_ir::GcRef(0);
+        };
+        let raw = unsafe { (*heap_ptr()).bump_nursery(total, GC_HEADER_SIZE) };
+        unsafe { (raw as *mut u64).write(header) };
+        majit_ir::GcRef(unsafe { raw.add(GC_HEADER_SIZE) } as usize)
+    }
+
+    fn bump_typed(&mut self, type_id: u32, payload: usize) -> majit_ir::GcRef {
+        // Frames are nursery objects (`jitframe.py jitframe_allocate`),
+        // reclaimed with the rest of the evaluation's young objects.
+        self.bump_payload(u64::from(type_id), payload)
+    }
+}
 
 #[cfg(feature = "jit")]
 impl majit_gc::GcAllocator for CelGc {
     fn alloc_nursery(&mut self, size: usize) -> majit_ir::GcRef {
-        self.alloc_nursery_headerless(size)
+        self.bump_payload(0, size)
     }
 
     fn alloc_nursery_no_collect(&mut self, size: usize) -> majit_ir::GcRef {
-        self.alloc_nursery_headerless(size)
+        self.bump_payload(0, size)
+    }
+
+    fn alloc_nursery_typed(&mut self, type_id: u32, size: usize) -> majit_ir::GcRef {
+        self.bump_typed(type_id, size)
+    }
+
+    fn alloc_nursery_no_collect_typed(&mut self, type_id: u32, size: usize) -> majit_ir::GcRef {
+        self.bump_typed(type_id, size)
+    }
+
+    fn try_alloc_nursery_no_collect_typed(&mut self, type_id: u32, size: usize) -> majit_ir::GcRef {
+        self.bump_typed(type_id, size)
+    }
+
+    unsafe fn try_alloc_nursery_no_collect_typed_with_placement(
+        &mut self,
+        type_id: u32,
+        size: usize,
+        needs_write_barrier: *mut bool,
+    ) -> majit_ir::GcRef {
+        // Every result is nursery. A young pointer stored into it needs
+        // no creation barrier, and this descr never collects.
+        unsafe { *needs_write_barrier = false };
+        self.try_alloc_nursery_no_collect_typed(type_id, size)
+    }
+
+    unsafe fn alloc_nursery_collecting_typed_rooted(
+        &mut self,
+        type_id: u32,
+        size: usize,
+        _root: *mut majit_ir::GcRef,
+        needs_write_barrier: *mut bool,
+    ) -> majit_ir::GcRef {
+        unsafe { *needs_write_barrier = false };
+        self.alloc_nursery_typed(type_id, size)
+    }
+
+    unsafe fn alloc_fast_nursery_collecting_typed_roots(
+        &mut self,
+        type_id: u32,
+        size: usize,
+        _roots: *mut majit_ir::GcRef,
+        _root_count: usize,
+        needs_write_barrier: *mut bool,
+    ) -> majit_ir::GcRef {
+        unsafe { *needs_write_barrier = false };
+        self.alloc_nursery_typed(type_id, size)
     }
 
     fn alloc_varsize(
@@ -1148,7 +1295,8 @@ impl majit_gc::GcAllocator for CelGc {
         else {
             return majit_ir::GcRef(0);
         };
-        self.alloc_nursery_headerless(bytes)
+        // Untyped: header word stays 0, and the length word is not written.
+        self.bump_payload(0, bytes)
     }
 
     fn alloc_varsize_no_collect(
@@ -1160,14 +1308,40 @@ impl majit_gc::GcAllocator for CelGc {
         self.alloc_varsize(base_size, item_size, length)
     }
 
-    /// Overflow of an inline headerless bump.
-    ///
-    /// Opens a nursery segment via [`CelHeap::bump_nursery`] and returns the
-    /// block. This does not collect: cel objects do not move, and there is
-    /// no root walker because nothing here would need one.
-    fn alloc_nursery_headerless(&mut self, size: usize) -> majit_ir::GcRef {
-        let ptr = unsafe { (*heap_ptr()).bump_nursery(size, align_of::<u64>()) };
-        majit_ir::GcRef(ptr as usize)
+    fn alloc_varsize_typed(
+        &mut self,
+        type_id: u32,
+        base_size: usize,
+        item_size: usize,
+        length: usize,
+    ) -> majit_ir::GcRef {
+        let Some(payload) = item_size
+            .checked_mul(length)
+            .and_then(|n| base_size.checked_add(n))
+        else {
+            return majit_ir::GcRef(0);
+        };
+        if (type_id as usize) >= self.types.len() {
+            return majit_ir::GcRef(0);
+        }
+        let info = self.types.get(type_id);
+        let registered_varsize = info.item_size != 0;
+        let length_offset = info.length_offset;
+        let obj = self.bump_typed(type_id, payload);
+        // `malloc_varsize` writes the length when the registered shape is
+        // varsize. A fixed type leaves its first word to the caller.
+        if !obj.is_null() && registered_varsize {
+            unsafe { *((obj.0 + length_offset) as *mut usize) = length };
+        }
+        obj
+    }
+
+    fn alloc_oldgen_typed(&mut self, type_id: u32, size: usize) -> majit_ir::GcRef {
+        self.bump_typed(type_id, size)
+    }
+
+    fn alloc_young_nonmoving_typed(&mut self, type_id: u32, size: usize) -> majit_ir::GcRef {
+        self.bump_typed(type_id, size)
     }
 
     fn write_barrier(&mut self, _obj: majit_ir::GcRef) {}
@@ -1188,10 +1362,10 @@ impl majit_gc::GcAllocator for CelGc {
 
     fn collect_full(&mut self) {}
 
-    /// `GcLLDescr_boehm.gcrootmap` is `None`. Nothing here moves, and
-    /// `collect_nursery` / `collect_full` are no-ops, so no walker has to
-    /// find live jitframes. `assembler.py` `_call_header_shadowstack` stays
-    /// off when `gcrootmap` is missing.
+    /// Nothing moves, and [`Self::collect_nursery`] / [`Self::collect_full`]
+    /// are no-ops, so no walker has to find live jitframes.
+    /// `assembler.py` `_call_header_shadowstack` stays off when
+    /// `gcrootmap` is missing.
     fn has_gcrootmap(&self) -> bool {
         false
     }
@@ -1216,11 +1390,139 @@ impl majit_gc::GcAllocator for CelGc {
         SEGMENT_BYTES
     }
 
-    /// Fixed-size cel objects carry the vtable at offset 0 and no
-    /// `GcHeader`. `rewrite.py gen_malloc_nursery` must emit
-    /// `CALL_MALLOC_NURSERY` in its headerless form.
-    fn headerless_fixedsize(&self) -> bool {
+    /// `gc.py GcLLDescr_framework.supports_guard_gc_type`.
+    fn supports_guard_gc_type(&self) -> bool {
         true
+    }
+
+    fn register_type(&mut self, info: majit_gc::TypeInfo) -> u32 {
+        self.types.register(info)
+    }
+
+    fn freeze_types(&mut self) {
+        self.types.freeze_types();
+    }
+
+    fn assign_inheritance_ids_now(&mut self) {
+        self.types.assign_inheritance_ids_now();
+    }
+
+    fn types_frozen(&self) -> bool {
+        self.types.is_frozen()
+    }
+
+    fn has_type_registry(&self) -> bool {
+        true
+    }
+
+    fn set_jitframe_type_id(&mut self, id: u32) {
+        assert!(
+            (id as usize) < self.types.len(),
+            "JITFRAME type id {id} is not registered on this collector"
+        );
+        self.jitframe_type_id = Some(id);
+    }
+
+    fn jitframe_type_id(&self) -> Option<u32> {
+        self.jitframe_type_id
+    }
+
+    fn type_count(&self) -> usize {
+        self.types.len()
+    }
+
+    fn type_size(&self, type_id: u32) -> Option<usize> {
+        if (type_id as usize) < self.types.len() {
+            Some(self.types.get(type_id).size)
+        } else {
+            None
+        }
+    }
+
+    fn varsize_layout(&self, obj: majit_ir::GcRef) -> Option<majit_gc::GcVarSizeLayout> {
+        let type_id = self.get_actual_typeid(obj)?;
+        if type_id as usize >= self.types.len() {
+            return None;
+        }
+        let info = self.types.get(type_id);
+        (info.item_size != 0).then_some(majit_gc::GcVarSizeLayout {
+            base_size: info.size,
+            item_size: info.item_size,
+            items_have_gc_ptrs: info.items_have_gc_ptrs,
+        })
+    }
+
+    fn get_typeid_from_classptr_if_gcremovetypeptr(&self, classptr: usize) -> Option<u32> {
+        super::registration::type_id_for_classptr(classptr)
+    }
+
+    fn get_translated_info_for_typeinfo(&self) -> (usize, u8, usize) {
+        let table = self.types.type_info_table();
+        (
+            table.as_ptr() as usize,
+            majit_gc::trace::TypeEntry::SHIFT_BY,
+            majit_gc::trace::TypeInfoLayout::SIZE_OF_TI,
+        )
+    }
+
+    /// `gc.py _setup_guard_is_object` then
+    /// `get_translated_info_for_guard_is_object`: the infobits byte that
+    /// holds `T_IS_RPYTHON_INSTANCE`.
+    fn get_translated_info_for_guard_is_object(&self) -> (usize, u8) {
+        let infobits_offset = majit_gc::trace::TypeInfoLayout::INFOBITS_OFFSET;
+        let mask = majit_gc::trace::TypeInfoLayout::T_IS_RPYTHON_INSTANCE.to_le_bytes();
+        let mut plus = 0usize;
+        while plus < mask.len() && mask[plus] == 0 {
+            plus += 1;
+        }
+        (infobits_offset + plus, mask[plus])
+    }
+
+    fn check_is_object(&self, gcref: majit_ir::GcRef) -> bool {
+        if gcref.is_null() {
+            return false;
+        }
+        let Some(typeid) = self.get_actual_typeid(gcref) else {
+            return false;
+        };
+        let (base_type_info, shift_by, _sizeof_ti) = self.get_translated_info_for_typeinfo();
+        let (infobits_offset, is_object_flag) = self.get_translated_info_for_guard_is_object();
+        let typeid = typeid as usize;
+        if typeid >= self.types.len() {
+            return false;
+        }
+        let p = base_type_info + (typeid << shift_by) + infobits_offset;
+        let byte = unsafe { *(p as *const u8) };
+        (byte & is_object_flag) != 0
+    }
+
+    fn get_actual_typeid(&self, gcref: majit_ir::GcRef) -> Option<u32> {
+        if gcref.is_null() {
+            return None;
+        }
+        let header_addr = gcref.0.wrapping_sub(majit_gc::header::GcHeader::SIZE);
+        let header = unsafe { *(header_addr as *const majit_gc::header::GcHeader) };
+        Some(header.type_id())
+    }
+
+    fn typeid_is_object(&self, typeid: u32) -> Option<bool> {
+        if (typeid as usize) >= self.types.len() {
+            return None;
+        }
+        Some(self.types.get(typeid).is_object)
+    }
+
+    fn subclassrange_min_offset(&self) -> usize {
+        core::mem::offset_of!(super::object::CelClass, subclassrange_min)
+    }
+
+    fn subclass_range(&self, classptr: usize) -> Option<(i64, i64)> {
+        let cls = super::registration::class_at_ptr(classptr)?;
+        Some((cls.subclassrange_min, cls.subclassrange_max))
+    }
+
+    fn typeid_subclass_range(&self, typeid: u32) -> Option<(i64, i64)> {
+        super::registration::class_subclass_range(typeid)
     }
 }
 
@@ -1424,10 +1726,10 @@ pub fn eval_depth() -> u32 {
     unsafe { (*heap_ptr()).depth.get() }
 }
 
-/// Bytes preceding an immortal payload. The backend reads
-/// `[obj - HEADER_SIZE]` for `guard_is_object`; a plain Rust `static`
-/// would put that load in rodata or unmapped memory.
-pub const IMMORTAL_HEADER_SIZE: usize = core::mem::size_of::<usize>();
+/// Bytes preceding an immortal payload. Same word as [`GC_HEADER_SIZE`]:
+/// the type id, which `guard_is_object` reads at `obj - GC_HEADER_SIZE`.
+/// A plain Rust `static` would put that load in rodata or unmapped memory.
+pub const IMMORTAL_HEADER_SIZE: usize = GC_HEADER_SIZE;
 
 /// Payloads handed out by [`alloc_immortal`]. The tripwire that a
 /// prebuilt is not a Rust `static` asserts against this list.
@@ -1437,8 +1739,6 @@ static IMMORTAL_PAYLOADS: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(V
 /// `(payload, payload+len)` so [`is_immortal`] treats them like prebuilts
 /// until the pool drops.
 static CONST_SPANS: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
-
-pub(crate) const IMMORTAL_MARK: usize = 0xC3_11_07_7A;
 
 /// Register a constant-pool payload so [`is_immortal`] accepts it.
 pub(crate) fn register_const_span(payload: *mut u8, len: usize) {
@@ -1461,31 +1761,28 @@ pub(crate) fn unregister_const_span(payload: *mut u8) {
         .retain(|(s, _)| *s != start);
 }
 
-/// Allocate `value` for process lifetime, with a header word in front
-/// of the payload.
+/// Allocate `value` for process lifetime, with its type-id header in
+/// front of the payload.
 ///
 /// Pointer-free leaves only: a reference field written at construction
-/// has no write barrier, and the immortal flag would then let a major
-/// walk it into freed memory. `W_OptionalObject` and anything holding a
+/// has no write barrier, and a major walk would then follow it into
+/// freed memory. `W_OptionalObject` and anything holding a
 /// [`super::object::CelRef`] stay on [`CelHeap::alloc`].
-pub fn alloc_immortal<T>(value: T) -> *mut T {
+pub fn alloc_immortal<T: CelGcType>(value: T) -> *mut T {
     let () = AssertNoDrop::<T>::OK;
-    let align = align_of::<T>().max(align_of::<usize>());
-    let header = IMMORTAL_HEADER_SIZE;
-    let size = header
-        .checked_add(size_of::<T>())
-        .expect("immortal layout fits usize");
-    let layout = Layout::from_size_align(size, align).expect("immortal layout is valid");
-    // SAFETY: `size` is at least the header word.
+    let align = align_of::<T>().max(GC_HEADER_SIZE);
+    let total = headered_total(size_of::<T>());
+    let layout = Layout::from_size_align(total, align).expect("immortal layout is valid");
+    // SAFETY: `total` covers the header word and `T`.
     let base = unsafe { std::alloc::alloc(layout) };
     if base.is_null() {
         std::alloc::handle_alloc_error(layout);
     }
-    // SAFETY: `base` is aligned for `usize` and owned uniquely here.
+    // SAFETY: `base` is aligned for `u64` and owned uniquely here.
     unsafe {
-        (base as *mut usize).write(IMMORTAL_MARK);
+        (base as *mut u64).write(u64::from(<T as CelGcType>::TYPE_ID));
     }
-    let payload = unsafe { base.add(header) as *mut T };
+    let payload = unsafe { base.add(GC_HEADER_SIZE) as *mut T };
     unsafe {
         payload.write(value);
     }
@@ -1533,19 +1830,28 @@ pub fn is_immortal(ptr: *const u8) -> bool {
 /// # Safety
 ///
 /// `ptr` must have come from [`alloc_immortal`].
-pub unsafe fn immortal_header(ptr: *const u8) -> usize {
-    unsafe { *(ptr.sub(IMMORTAL_HEADER_SIZE) as *const usize) }
+pub unsafe fn immortal_header(ptr: *const u8) -> u64 {
+    unsafe { *(ptr.sub(GC_HEADER_SIZE) as *const u64) }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn test_int(n: i64) -> crate::runtime::object::W_IntObject {
+        crate::runtime::object::W_IntObject {
+            ob_header: crate::runtime::object::CelObject {
+                ob_type: &crate::runtime::object::CEL_INT_CLASS,
+            },
+            intval: n,
+        }
+    }
+
     /// `contains` is true only for addresses this heap handed out.
     #[test]
     fn contains_reports_this_heaps_payloads() {
         let heap = CelHeap::new();
-        let a = heap.alloc(1u64) as *const u8;
+        let a = heap.alloc(test_int(1)) as *const u8;
         assert!(heap.contains(a));
         assert!(!heap.contains(core::ptr::null()));
         let other = CelHeap::new();
@@ -1557,14 +1863,20 @@ mod tests {
     #[test]
     fn allocations_do_not_overlap() {
         let heap = CelHeap::new();
-        let a = heap.alloc(1u64);
-        let b = heap.alloc(2u64);
+        let a = heap.alloc(test_int(1));
+        let b = heap.alloc(test_int(2));
         assert_ne!(a, b);
         unsafe {
-            assert_eq!(*a, 1);
-            assert_eq!(*b, 2);
+            assert_eq!((*a).intval, 1);
+            assert_eq!((*b).intval, 2);
+            assert_eq!(
+                *((a as *const u8).sub(GC_HEADER_SIZE) as *const u64),
+                u64::from(crate::runtime::object::W_IntObject::TYPE_ID)
+            );
         }
-        assert!((a as usize).abs_diff(b as usize) >= size_of::<u64>());
+        assert!(
+            (a as usize).abs_diff(b as usize) >= size_of::<crate::runtime::object::W_IntObject>()
+        );
     }
 
     /// The counter counts objects, not segments — a heap that served a
@@ -1572,12 +1884,15 @@ mod tests {
     #[test]
     fn the_counter_counts_objects_not_segments() {
         let heap = CelHeap::new();
-        for i in 0..1000u64 {
-            heap.alloc(i);
+        for i in 0..1000 {
+            heap.alloc(test_int(i));
         }
         assert_eq!(heap.allocated_objects(), 1000);
-        assert_eq!(heap.allocated_bytes(), 1000 * size_of::<u64>() as u64);
-        assert_eq!(heap.segments(), 1, "1000 words fit in one segment");
+        assert_eq!(
+            heap.allocated_bytes(),
+            1000 * (GC_HEADER_SIZE + size_of::<crate::runtime::object::W_IntObject>()) as u64
+        );
+        assert_eq!(heap.segments(), 1, "1000 headered ints fit in one segment");
     }
 
     /// A request larger than a whole segment is served rather than refused,
@@ -1636,17 +1951,17 @@ mod tests {
     #[test]
     fn the_thread_local_heap_persists_across_calls() {
         let before = with_heap(|h| h.allocated_objects());
-        let p = with_heap(|h| h.alloc(7u64));
+        let p = with_heap(|h| h.alloc(test_int(7)));
         let after = with_heap(|h| h.allocated_objects());
         assert_eq!(after, before + 1);
-        unsafe { assert_eq!(*p, 7) };
+        unsafe { assert_eq!((*p).intval, 7) };
     }
 
     /// Open one nursery segment and rewind it, so later leaves take the
     /// same-segment path instead of the first-allocation reset.
     fn prime_open_nursery(heap: &CelHeap) {
         assert!(heap.enter());
-        let _ = heap.alloc(0u64);
+        let _ = heap.alloc(test_int(0));
         heap.leave(true);
         assert_eq!(heap.nursery.n_segs.get(), 1);
         assert_eq!(heap.nursery.open_used.get(), 0);
@@ -1659,7 +1974,7 @@ mod tests {
         let half = heap.nursery.open_cap.get() / 2;
         loop {
             assert!(heap.enter());
-            let _ = heap.alloc(1u64);
+            let _ = heap.alloc(test_int(1));
             let over = heap.live_nursery_used() > half;
             heap.leave(true);
             assert_eq!(heap.nursery.n_segs.get(), 1);
@@ -1678,11 +1993,11 @@ mod tests {
     #[test]
     fn outermost_scope_resets_the_nursery() {
         let heap = CelHeap::new();
-        let old = heap.alloc(1u64);
+        let old = heap.alloc(test_int(1));
         prime_open_nursery(&heap);
         let base_bytes = heap.allocated_bytes();
         assert!(heap.enter());
-        let young = heap.alloc(2u64);
+        let young = heap.alloc(test_int(2));
         assert!(heap.contains(young as *const u8));
         assert!(heap.is_young(young as *const u8));
         assert!(!heap.is_young(old as *const u8));
@@ -1697,11 +2012,11 @@ mod tests {
         assert!(!heap.contains(young as *const u8));
         assert_eq!(heap.allocated_bytes(), base_bytes);
         assert!(heap.nursery_high_water() <= heap.nursery.open_cap.get() as u64);
-        unsafe { assert_eq!(*old, 1) };
+        unsafe { assert_eq!((*old).intval, 1) };
     }
 
     /// A young fixed-size allocation updates the live counters by one object
-    /// and `size_of` bytes, including when many fit in the open segment.
+    /// and the headered size, including when many fit in the open segment.
     /// Counters drop on the leave that passes half the segment, not before.
     #[test]
     fn young_fixed_size_counts_stay_exact() {
@@ -1710,19 +2025,22 @@ mod tests {
         let before_n = heap.allocated_objects();
         let before_b = heap.allocated_bytes();
         assert!(heap.enter());
-        for i in 0..64u64 {
-            heap.alloc(i);
+        for i in 0..64 {
+            heap.alloc(test_int(i));
         }
+        assert_eq!(heap.nursery_free.get() as usize % 8, 0);
         assert_eq!(heap.allocated_objects(), before_n + 64);
         assert_eq!(
             heap.allocated_bytes(),
-            before_b + 64 * size_of::<u64>() as u64
+            before_b
+                + 64 * (GC_HEADER_SIZE + size_of::<crate::runtime::object::W_IntObject>()) as u64
         );
         heap.leave(true);
         assert_eq!(heap.allocated_objects(), before_n + 64);
         assert_eq!(
             heap.allocated_bytes(),
-            before_b + 64 * size_of::<u64>() as u64
+            before_b
+                + 64 * (GC_HEADER_SIZE + size_of::<crate::runtime::object::W_IntObject>()) as u64
         );
         assert_eq!(heap.nursery.n_segs.get(), 1);
         fill_past_half(&heap, 0);
@@ -1738,9 +2056,9 @@ mod tests {
         let heap = CelHeap::new();
         prime_open_nursery(&heap);
         assert!(heap.enter());
-        let a = heap.alloc(1u64);
+        let a = heap.alloc(test_int(1));
         assert!(!heap.enter());
-        let b = heap.alloc(2u64);
+        let b = heap.alloc(test_int(2));
         heap.leave(false);
         assert!(heap.contains(a as *const u8));
         assert!(heap.contains(b as *const u8));
@@ -1778,7 +2096,7 @@ mod tests {
         let cap = SEGMENT_BYTES as u64;
         for _ in 0..100_000 {
             let scope = enter_eval_on(&heap);
-            let _ = heap.alloc(1u64);
+            let _ = heap.alloc(test_int(1));
             scope.finish(crate::Value::Int(0));
             assert_eq!(heap.nursery.n_segs.get(), 1);
         }
@@ -1801,13 +2119,13 @@ mod tests {
     #[test]
     fn no_young_allocation_skips_reset() {
         let heap = CelHeap::new();
-        let old = heap.alloc(1u64);
+        let old = heap.alloc(test_int(1));
         let bytes = heap.allocated_bytes();
         assert!(heap.enter());
         heap.leave(true);
         assert_eq!(heap.allocated_bytes(), bytes);
         assert!(heap.contains(old as *const u8));
-        unsafe { assert_eq!(*old, 1) };
+        unsafe { assert_eq!((*old).intval, 1) };
     }
 
     /// A bind region is live for `contains` until it is dropped, and its
@@ -1827,5 +2145,16 @@ mod tests {
         drop(slot);
         assert!(!heap.contains(p as *const u8));
         assert_eq!(heap.allocated_objects(), 0);
+    }
+
+    /// `GcHeader::new` stores the type id in the low bits and nothing else.
+    #[cfg(feature = "jit")]
+    #[test]
+    fn gc_header_word_is_the_type_id() {
+        let id = crate::runtime::object::W_IntObject::TYPE_ID;
+        let header = majit_gc::header::GcHeader::new(id);
+        assert_eq!(header.tid_and_flags, u64::from(id));
+        assert_eq!(header.type_id(), id);
+        assert_eq!(GC_HEADER_SIZE, majit_gc::header::GcHeader::SIZE);
     }
 }

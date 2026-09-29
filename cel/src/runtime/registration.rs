@@ -21,32 +21,41 @@
 //!    `New` allocates through the backend's `malloc` stub and the object never
 //!    enters the traced heap. See [`cel_gc`].
 //!
-//! Besides the twelve fixed-size classes there are the two payload blocks,
+//! Besides the fixed-size classes there are the payload blocks
+//! (`CelItemsBlock`, `CelBytesBlock`, `CelIntWords`, `CelFloatWords`),
 //! registered as **varsize** types from the tokens [`super::object_array`]
 //! carries — see [`varsize_block`].
 //!
-//! # What this does not do yet
-//!
-//! Nothing allocates a cel value through the collector today: [`super::lltype`]
-//! leaks, and no evaluator has been moved onto the class family. So this module
-//! registers a family nothing has yet asked the collector about. That is the
-//! point of landing it separately — the recipe is verifiable on its own, by the
-//! tests below, before anything depends on it being right.
+//! The portal's [`super::heap::CelGc`] registers this same family.
+//! [`super::lltype`] allocates on [`super::heap::CelHeap`] and writes the
+//! type id this registration hands out. Nothing here collects. The recipe
+//! is still checked on its own by the tests below.
+
+use core::mem::offset_of;
 
 use majit_gc::collector::{GcConfig, MiniMarkGC};
 use majit_gc::{GcAllocator, TypeInfo};
 use majit_ir::descr::{ArrayFlag, SimpleFieldDescrSpec};
 use majit_ir::Type;
 
-use super::object_array::{ArrayToken, CEL_BYTES_BLOCK_TOKEN, CEL_ITEMS_BLOCK_TOKEN};
+use super::lltype::CelGcType;
+use super::object_array::{
+    ArrayToken, CelBytesBlock, CelFloatWords, CelIntWords, CelItemsBlock, CEL_BYTES_BLOCK_TOKEN,
+    CEL_FLOAT_WORDS_TOKEN, CEL_INT_WORDS_TOKEN, CEL_ITEMS_BLOCK_TOKEN,
+};
 
 use super::object::{
-    CelClass, CelObject, W_BoolObject, W_BytesObject, W_DoubleObject, W_DurationObject,
-    W_IntObject, W_ListObject, W_NullObject, W_OptionalObject, W_StringObject, W_TimestampObject,
-    W_TypeObject, W_UIntObject, CEL_BOOL_CLASS, CEL_BYTES_CLASS, CEL_DOUBLE_CLASS,
-    CEL_DURATION_CLASS, CEL_INT_CLASS, CEL_LIST_CLASS, CEL_NULL_CLASS, CEL_OPTIONAL_CLASS,
-    CEL_STRING_CLASS, CEL_TIMESTAMP_CLASS, CEL_TYPE_CLASS, CEL_UINT_CLASS,
+    CelClass, CelObject, W_BoolObject, W_BytesObject, W_CelFrame, W_DoubleObject, W_DurationObject,
+    W_FloatColumn, W_HostListObject, W_IntColumn, W_IntObject, W_ListObject, W_MapObject,
+    W_NullObject, W_OpaqueObject, W_OptionalObject, W_StringObject, W_TimestampObject,
+    W_TupleObject, W_TypeObject, W_UIntObject, CEL_BOOL_CLASS, CEL_BYTES_CLASS, CEL_DOUBLE_CLASS,
+    CEL_DURATION_CLASS, CEL_FLOAT_COLUMN_CLASS, CEL_FRAME_CLASS, CEL_HOST_LIST_CLASS,
+    CEL_INT_CLASS, CEL_INT_COLUMN_CLASS, CEL_LIST_CLASS, CEL_MAP_CLASS, CEL_NULL_CLASS,
+    CEL_OPAQUE_CLASS, CEL_OPTIONAL_CLASS, CEL_STRING_CLASS, CEL_TIMESTAMP_CLASS, CEL_TUPLE_CLASS,
+    CEL_TYPE_CLASS, CEL_UINT_CLASS,
 };
+#[cfg(feature = "structs")]
+use super::object::{W_StructObject, CEL_STRUCT_CLASS};
 
 /// One payload field, as both registrations need to see it.
 pub struct FieldLayout {
@@ -90,6 +99,24 @@ const fn scalar(name: &'static str, size: usize, ty: Type, signed: bool) -> Fiel
         ty,
         signed,
         immutable: true,
+    }
+}
+
+const fn field(
+    name: &'static str,
+    offset: usize,
+    size: usize,
+    ty: Type,
+    signed: bool,
+    immutable: bool,
+) -> FieldLayout {
+    FieldLayout {
+        name,
+        offset,
+        size,
+        ty,
+        signed,
+        immutable,
     }
 }
 
@@ -264,6 +291,331 @@ pub static CEL_CLASS_LAYOUTS: &[ClassLayout] = &[
             },
         ],
     },
+    // Appended after `list`. Existing ids stay put; these take the next ones.
+    ClassLayout {
+        class: &CEL_INT_COLUMN_CLASS,
+        size: size_of::<W_IntColumn>(),
+        gc_ptr_offsets: &[offset_of!(W_IntColumn, data)],
+        fields: &[
+            field(
+                "data",
+                offset_of!(W_IntColumn, data),
+                WORD,
+                Type::Ref,
+                false,
+                true,
+            ),
+            field(
+                "length",
+                offset_of!(W_IntColumn, length),
+                WORD,
+                Type::Int,
+                true,
+                true,
+            ),
+        ],
+    },
+    ClassLayout {
+        class: &CEL_FLOAT_COLUMN_CLASS,
+        size: size_of::<W_FloatColumn>(),
+        gc_ptr_offsets: &[offset_of!(W_FloatColumn, data)],
+        fields: &[
+            field(
+                "data",
+                offset_of!(W_FloatColumn, data),
+                WORD,
+                Type::Ref,
+                false,
+                true,
+            ),
+            field(
+                "length",
+                offset_of!(W_FloatColumn, length),
+                WORD,
+                Type::Int,
+                true,
+                true,
+            ),
+        ],
+    },
+    ClassLayout {
+        class: &CEL_HOST_LIST_CLASS,
+        size: size_of::<W_HostListObject>(),
+        // `public` is a host buffer, not a heap cel object.
+        gc_ptr_offsets: &[
+            offset_of!(W_ListObject, storage),
+            offset_of!(W_ListObject, items),
+        ],
+        fields: &[
+            field(
+                "strategy",
+                offset_of!(W_ListObject, strategy),
+                WORD,
+                Type::Int,
+                false,
+                true,
+            ),
+            field(
+                "storage",
+                offset_of!(W_ListObject, storage),
+                WORD,
+                Type::Ref,
+                false,
+                true,
+            ),
+            field(
+                "items",
+                offset_of!(W_ListObject, items),
+                WORD,
+                Type::Ref,
+                false,
+                true,
+            ),
+            field(
+                "start",
+                offset_of!(W_ListObject, start),
+                WORD,
+                Type::Int,
+                true,
+                true,
+            ),
+            field(
+                "length",
+                offset_of!(W_ListObject, length),
+                WORD,
+                Type::Int,
+                true,
+                true,
+            ),
+            field(
+                "public",
+                offset_of!(W_HostListObject, public),
+                WORD,
+                Type::Int,
+                false,
+                false,
+            ),
+            field(
+                "public_start",
+                offset_of!(W_HostListObject, public_start),
+                size_of::<u32>(),
+                Type::Int,
+                false,
+                false,
+            ),
+            field(
+                "public_len",
+                offset_of!(W_HostListObject, public_len),
+                size_of::<u32>(),
+                Type::Int,
+                false,
+                false,
+            ),
+        ],
+    },
+    ClassLayout {
+        class: &CEL_TUPLE_CLASS,
+        size: size_of::<W_TupleObject>(),
+        gc_ptr_offsets: &[offset_of!(W_TupleObject, items)],
+        fields: &[
+            field(
+                "length",
+                offset_of!(W_TupleObject, length),
+                WORD,
+                Type::Int,
+                true,
+                true,
+            ),
+            field(
+                "items",
+                offset_of!(W_TupleObject, items),
+                WORD,
+                Type::Ref,
+                false,
+                true,
+            ),
+        ],
+    },
+    ClassLayout {
+        class: &CEL_MAP_CLASS,
+        size: size_of::<W_MapObject>(),
+        gc_ptr_offsets: &[
+            offset_of!(W_MapObject, storage),
+            offset_of!(W_MapObject, items),
+        ],
+        fields: &[
+            field(
+                "strategy",
+                offset_of!(W_MapObject, strategy),
+                WORD,
+                Type::Int,
+                false,
+                true,
+            ),
+            field(
+                "storage",
+                offset_of!(W_MapObject, storage),
+                WORD,
+                Type::Ref,
+                false,
+                true,
+            ),
+            field(
+                "items",
+                offset_of!(W_MapObject, items),
+                WORD,
+                Type::Ref,
+                false,
+                true,
+            ),
+            field(
+                "length",
+                offset_of!(W_MapObject, length),
+                WORD,
+                Type::Int,
+                true,
+                false,
+            ),
+            field(
+                "public",
+                offset_of!(W_MapObject, public),
+                WORD,
+                Type::Int,
+                false,
+                false,
+            ),
+            field(
+                "public_kind",
+                offset_of!(W_MapObject, public_kind),
+                size_of::<u32>(),
+                Type::Int,
+                false,
+                false,
+            ),
+            field(
+                "public_len",
+                offset_of!(W_MapObject, public_len),
+                size_of::<u32>(),
+                Type::Int,
+                false,
+                false,
+            ),
+        ],
+    },
+    ClassLayout {
+        class: &CEL_FRAME_CLASS,
+        size: size_of::<W_CelFrame>(),
+        // `vable_token` is a host token, not a heap object.
+        gc_ptr_offsets: &[offset_of!(W_CelFrame, locals_stack_w)],
+        fields: &[
+            field(
+                "vable_token",
+                offset_of!(W_CelFrame, vable_token),
+                WORD,
+                Type::Int,
+                false,
+                false,
+            ),
+            field(
+                "last_instr",
+                offset_of!(W_CelFrame, last_instr),
+                WORD,
+                Type::Int,
+                true,
+                false,
+            ),
+            field(
+                "valuestackdepth",
+                offset_of!(W_CelFrame, valuestackdepth),
+                WORD,
+                Type::Int,
+                true,
+                false,
+            ),
+            field(
+                "locals_stack_w",
+                offset_of!(W_CelFrame, locals_stack_w),
+                WORD,
+                Type::Ref,
+                false,
+                false,
+            ),
+            field(
+                "n_slots",
+                offset_of!(W_CelFrame, n_slots),
+                WORD,
+                Type::Int,
+                true,
+                false,
+            ),
+            field(
+                "scratch_bits",
+                offset_of!(W_CelFrame, scratch_bits),
+                WORD,
+                Type::Int,
+                true,
+                false,
+            ),
+        ],
+    },
+    ClassLayout {
+        class: &CEL_OPAQUE_CLASS,
+        size: size_of::<W_OpaqueObject>(),
+        gc_ptr_offsets: &[offset_of!(W_OpaqueObject, w_type)],
+        fields: &[
+            field(
+                "w_type",
+                offset_of!(W_OpaqueObject, w_type),
+                WORD,
+                Type::Ref,
+                false,
+                true,
+            ),
+            field(
+                "host_index",
+                offset_of!(W_OpaqueObject, host_index),
+                WORD,
+                Type::Int,
+                true,
+                true,
+            ),
+        ],
+    },
+    #[cfg(feature = "structs")]
+    ClassLayout {
+        class: &CEL_STRUCT_CLASS,
+        size: size_of::<W_StructObject>(),
+        gc_ptr_offsets: &[
+            offset_of!(W_StructObject, name),
+            offset_of!(W_StructObject, fields),
+        ],
+        fields: &[
+            field(
+                "name",
+                offset_of!(W_StructObject, name),
+                WORD,
+                Type::Ref,
+                false,
+                true,
+            ),
+            field(
+                "fields",
+                offset_of!(W_StructObject, fields),
+                WORD,
+                Type::Ref,
+                false,
+                true,
+            ),
+            field(
+                "length",
+                offset_of!(W_StructObject, length),
+                WORD,
+                Type::Int,
+                true,
+                true,
+            ),
+        ],
+    },
 ];
 
 /// What one class got registered as.
@@ -298,6 +650,10 @@ pub struct CelTypeIds {
     /// The byte payload block, `CelBytesBlock`. As [`Self::items_block`], with
     /// leaf items.
     pub bytes_block: u32,
+    /// Unboxed `i64` payload of an int column, `CelIntWords`.
+    pub int_words: u32,
+    /// Unboxed `f64` payload of a float column, `CelFloatWords`.
+    pub float_words: u32,
 }
 
 impl CelTypeIds {
@@ -337,24 +693,29 @@ fn varsize_block(token: &ArrayToken, items_have_gc_ptrs: bool) -> TypeInfo {
     )
 }
 
-/// Register every class and both payload blocks with `gc`, then freeze the
-/// registry.
+/// Register the root, every class and every payload block with `gc`.
 ///
-/// The blocks come after the classes so that adding them renumbers nothing:
-/// `register_type` hands out ids by position, and [`publish_cel_descrs`] zips
-/// `CEL_CLASS_LAYOUTS` against `classes` by position too. They take no
-/// `register_vtable_for_type` — a block has a length word at offset 0, not a
-/// class word, so an address-to-id lookup over blocks would be reading a
-/// capacity as a class pointer.
+/// Not frozen. [`register_cel_classes`] and [`super::heap::CelGc::new`]
+/// freeze; a caller that still has a type to add (the jitframe) does that
+/// before freezing. `freeze_types` is what assigns `subclassrange_{min,max}`
+/// on the registry. The blocks declare no subclass range.
 ///
-/// Frozen on the way out, deliberately. `freeze_types` is what assigns
-/// `subclassrange_{min,max}`, and a caller that forgot it would get a family
-/// whose `GuardSubclass` ranges are all `0..0` — which does not fail, it just
-/// answers "no" to every subclass test. The blocks are unaffected either way:
-/// `assign_inheritance_ids` walks only the types that declare a subclass range,
-/// and a varsize type declares none.
-fn register_cel_classes_unfrozen(gc: &mut MiniMarkGC) -> CelTypeIds {
+/// Order is the [`super::lltype::CelGcType`] literals: root, then
+/// [`CEL_CLASS_LAYOUTS`], then the blocks. The returned ids are checked
+/// against those literals. Blocks come after the classes so that adding one
+/// renumbers nothing: `register_type` hands out ids by position, and
+/// [`publish_cel_descrs`] zips `CEL_CLASS_LAYOUTS` against `classes` by
+/// position too. Blocks take no `register_vtable_for_type` — a block has a
+/// length word at offset 0, not a class word, so an address-to-id lookup
+/// over blocks would be reading a capacity as a class pointer.
+///
+/// The reference block's items are managed edges. The byte, int-word and
+/// float-word blocks are not. Separate type ids, because one id carries one
+/// varsize shape and these disagree on the item size and on whether the
+/// items are traced.
+pub(crate) fn register_cel_classes_unfrozen(gc: &mut dyn GcAllocator) -> CelTypeIds {
     let root = gc.register_type(TypeInfo::object(size_of::<CelObject>()));
+    assert_eq!(root, CelObject::TYPE_ID, "root type id");
     let mut classes = Vec::with_capacity(CEL_CLASS_LAYOUTS.len());
     for layout in CEL_CLASS_LAYOUTS {
         let info = if layout.gc_ptr_offsets.is_empty() {
@@ -367,6 +728,12 @@ fn register_cel_classes_unfrozen(gc: &mut MiniMarkGC) -> CelTypeIds {
             )
         };
         let type_id = gc.register_type(info);
+        assert_eq!(
+            type_id,
+            cel_class_type_id(layout.class),
+            "type id for {}",
+            layout.class.name
+        );
         let registered = RegisteredClass {
             class: layout.class,
             type_id,
@@ -375,18 +742,21 @@ fn register_cel_classes_unfrozen(gc: &mut MiniMarkGC) -> CelTypeIds {
         GcAllocator::register_vtable_for_type(gc, registered.vtable(), type_id);
         classes.push(registered);
     }
-    // The reference block's items ARE managed edges; the byte block's are
-    // bytes. Two type ids rather than one for two blocks that agree on
-    // `base_size` and `len_offset`, because one id carries one varsize shape
-    // and these two disagree on the item size and on whether the items are
-    // traced at all.
     let items_block = gc.register_type(varsize_block(&CEL_ITEMS_BLOCK_TOKEN, true));
     let bytes_block = gc.register_type(varsize_block(&CEL_BYTES_BLOCK_TOKEN, false));
+    let int_words = gc.register_type(varsize_block(&CEL_INT_WORDS_TOKEN, false));
+    let float_words = gc.register_type(varsize_block(&CEL_FLOAT_WORDS_TOKEN, false));
+    assert_eq!(items_block, CelItemsBlock::TYPE_ID, "items block type id");
+    assert_eq!(bytes_block, CelBytesBlock::TYPE_ID, "bytes block type id");
+    assert_eq!(int_words, CelIntWords::TYPE_ID, "int words type id");
+    assert_eq!(float_words, CelFloatWords::TYPE_ID, "float words type id");
     CelTypeIds {
         root,
         classes,
         items_block,
         bytes_block,
+        int_words,
+        float_words,
     }
 }
 
@@ -474,6 +844,20 @@ pub fn publish_cel_descrs(ids: &CelTypeIds) {
     }
 }
 
+/// Publish descrs once per process, before a portal driver traces.
+///
+/// The ids come from a scratch [`MiniMarkGC`] walked by
+/// [`register_cel_classes_unfrozen`], the same order [`super::heap::CelGc::new`]
+/// uses, so a compiled `NewWithVtable` stamps the id the header carries.
+pub fn publish_cel_descrs_once() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let mut gc = MiniMarkGC::new();
+        let ids = register_cel_classes_unfrozen(&mut gc);
+        publish_cel_descrs(&ids);
+    });
+}
+
 /// The leaf struct a class describes.
 ///
 /// A match on the class address rather than a field on [`ClassLayout`],
@@ -503,7 +887,97 @@ static CEL_LEAF_STRUCT_NAMES: &[(&CelClass, &str)] = &[
     (&CEL_BYTES_CLASS, "W_BytesObject"),
     (&CEL_STRING_CLASS, "W_StringObject"),
     (&CEL_LIST_CLASS, "W_ListObject"),
+    (&CEL_INT_COLUMN_CLASS, "W_IntColumn"),
+    (&CEL_FLOAT_COLUMN_CLASS, "W_FloatColumn"),
+    (&CEL_HOST_LIST_CLASS, "W_HostListObject"),
+    (&CEL_TUPLE_CLASS, "W_TupleObject"),
+    (&CEL_MAP_CLASS, "W_MapObject"),
+    (&CEL_FRAME_CLASS, "W_CelFrame"),
+    (&CEL_OPAQUE_CLASS, "W_OpaqueObject"),
+    #[cfg(feature = "structs")]
+    (&CEL_STRUCT_CLASS, "W_StructObject"),
 ];
+
+/// GC type id of a class static, by pointer identity.
+///
+/// The answer is the leaf's [`CelGcType::TYPE_ID`], not the class's kind id.
+pub(crate) fn cel_class_type_id(class: &'static CelClass) -> u32 {
+    let p = class as *const CelClass;
+    if core::ptr::eq(p, &CEL_NULL_CLASS) {
+        W_NullObject::TYPE_ID
+    } else if core::ptr::eq(p, &CEL_BOOL_CLASS) {
+        W_BoolObject::TYPE_ID
+    } else if core::ptr::eq(p, &CEL_INT_CLASS) {
+        W_IntObject::TYPE_ID
+    } else if core::ptr::eq(p, &CEL_UINT_CLASS) {
+        W_UIntObject::TYPE_ID
+    } else if core::ptr::eq(p, &CEL_DOUBLE_CLASS) {
+        W_DoubleObject::TYPE_ID
+    } else if core::ptr::eq(p, &CEL_DURATION_CLASS) {
+        W_DurationObject::TYPE_ID
+    } else if core::ptr::eq(p, &CEL_TIMESTAMP_CLASS) {
+        W_TimestampObject::TYPE_ID
+    } else if core::ptr::eq(p, &CEL_TYPE_CLASS) {
+        W_TypeObject::TYPE_ID
+    } else if core::ptr::eq(p, &CEL_OPTIONAL_CLASS) {
+        W_OptionalObject::TYPE_ID
+    } else if core::ptr::eq(p, &CEL_BYTES_CLASS) {
+        W_BytesObject::TYPE_ID
+    } else if core::ptr::eq(p, &CEL_STRING_CLASS) {
+        W_StringObject::TYPE_ID
+    } else if core::ptr::eq(p, &CEL_LIST_CLASS) {
+        W_ListObject::TYPE_ID
+    } else if core::ptr::eq(p, &CEL_INT_COLUMN_CLASS) {
+        W_IntColumn::TYPE_ID
+    } else if core::ptr::eq(p, &CEL_FLOAT_COLUMN_CLASS) {
+        W_FloatColumn::TYPE_ID
+    } else if core::ptr::eq(p, &CEL_HOST_LIST_CLASS) {
+        W_HostListObject::TYPE_ID
+    } else if core::ptr::eq(p, &CEL_TUPLE_CLASS) {
+        W_TupleObject::TYPE_ID
+    } else if core::ptr::eq(p, &CEL_MAP_CLASS) {
+        W_MapObject::TYPE_ID
+    } else if core::ptr::eq(p, &CEL_FRAME_CLASS) {
+        W_CelFrame::TYPE_ID
+    } else if core::ptr::eq(p, &CEL_OPAQUE_CLASS) {
+        W_OpaqueObject::TYPE_ID
+    } else {
+        #[cfg(feature = "structs")]
+        if core::ptr::eq(p, &CEL_STRUCT_CLASS) {
+            return W_StructObject::TYPE_ID;
+        }
+        panic!("class {} is not a cel class static", class.name);
+    }
+}
+
+/// Type id of a class address, scanning [`CEL_CLASS_LAYOUTS`].
+pub(crate) fn type_id_for_classptr(classptr: usize) -> Option<u32> {
+    class_at_ptr(classptr).map(cel_class_type_id)
+}
+
+/// The class static at `classptr`, if it is one of [`CEL_CLASS_LAYOUTS`].
+pub(crate) fn class_at_ptr(classptr: usize) -> Option<&'static CelClass> {
+    CEL_CLASS_LAYOUTS.iter().find_map(|layout| {
+        (layout.class as *const CelClass as usize == classptr).then_some(layout.class)
+    })
+}
+
+/// Subclass range stored on the class whose GC type id is `typeid`.
+///
+/// Class ids are the registration order: root is 0, then
+/// [`CEL_CLASS_LAYOUTS`] in table order. A block id and the root have no
+/// class object.
+pub(crate) fn class_subclass_range(typeid: u32) -> Option<(i64, i64)> {
+    let index = typeid.checked_sub(1)? as usize;
+    let layout = CEL_CLASS_LAYOUTS.get(index)?;
+    if cel_class_type_id(layout.class) != typeid {
+        return None;
+    }
+    Some((
+        layout.class.subclassrange_min,
+        layout.class.subclassrange_max,
+    ))
+}
 
 /// `get_type_flag(FIELDTYPE)`.
 fn array_flag(ty: Type, signed: bool) -> ArrayFlag {
@@ -532,23 +1006,24 @@ pub fn cel_gc(config: GcConfig) -> (Box<dyn GcAllocator>, CelTypeIds) {
 }
 
 thread_local! {
-    /// Whether this execution thread has installed its scalar-tier collector.
+    /// Whether this execution thread has installed its [`super::heap::CelGc`].
     ///
-    /// This is deliberately execution-context state: the collector owns only
-    /// temporary JITFRAMEs, deadframes are thread-confined, and no CEL object
-    /// identity or root is duplicated. Once CEL values move onto this heap,
-    /// `install_cel_gc` replaces this temporary boundary with their real owner.
+    /// Every cel tier shares that collector. The backend's active-GC slot
+    /// lives as long as the execution thread, and dropping a driver does not
+    /// clear it. Frames are [`super::heap::CelGc`] objects, reclaimed at the
+    /// outermost eval-scope leave.
     static JITFRAME_GC_INSTALLED: core::cell::Cell<bool> = const {
         core::cell::Cell::new(false)
     };
 }
 
-/// Install the smallest collector the scalar compiled tier needs.
+/// Install this thread's [`super::heap::CelGc`] into the backend's active-GC slot.
 ///
-/// RPython's `gc_ll_descr.malloc_jitframe` allocates every entry frame as a
-/// typed GC object. The scalar tier constructs no CEL heap object yet, so its
-/// collector needs exactly that one type. Installation is once per execution
-/// thread because the selected native backend owns its active allocator there.
+/// Every cel tier shares that collector. The slot lives as long as the
+/// execution thread: dropping a driver does not clear it. Frames are
+/// [`super::heap::CelGc`] objects (`gc_ll_descr.malloc_jitframe`) and are
+/// reclaimed when the outermost eval scope leaves. Installation runs once
+/// per thread; the native backend keeps a single allocator there.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn install_jitframe_gc<S: majit_metainterp::JitState>(
     driver: &mut majit_metainterp::JitDriver<S>,
@@ -557,13 +1032,19 @@ pub fn install_jitframe_gc<S: majit_metainterp::JitState>(
         if installed.get() {
             return;
         }
-        let mut gc = MiniMarkGC::new();
-        majit_metainterp::register_active_backend_jitframe_gc_type(&mut gc);
-        driver.set_gc_allocator(Box::new(gc));
+        driver.set_gc_allocator(Box::new(crate::runtime::heap::CelGc::new()));
         installed.set(true);
     });
 }
 
+/// Install this thread's [`super::heap::CelGc`] into the backend's active-GC slot.
+///
+/// Every cel tier shares that collector. The slot lives as long as the
+/// execution thread: dropping a driver does not clear it. Frames are
+/// [`super::heap::CelGc`] objects (`gc_ll_descr.malloc_jitframe`) and are
+/// reclaimed when the outermost eval scope leaves. Installation runs once
+/// per thread; the native backend keeps a single allocator there. This
+/// target has no native backend slot, so the call is a no-op.
 #[cfg(target_arch = "wasm32")]
 pub fn install_jitframe_gc<S: majit_metainterp::JitState>(
     _driver: &mut majit_metainterp::JitDriver<S>,
@@ -765,6 +1246,8 @@ mod tests {
         assert!(ids.root < last_class);
         assert!(ids.items_block > last_class);
         assert!(ids.bytes_block > ids.items_block);
+        assert!(ids.int_words > ids.bytes_block);
+        assert!(ids.float_words > ids.int_words);
     }
 
     /// A block is not a value: nothing maps a class address to its id, and
@@ -777,7 +1260,71 @@ mod tests {
                 GcAllocator::get_typeid_from_classptr_if_gcremovetypeptr(&gc, registered.vtable());
             assert_ne!(resolved, Some(ids.items_block));
             assert_ne!(resolved, Some(ids.bytes_block));
+            assert_ne!(resolved, Some(ids.int_words));
+            assert_ne!(resolved, Some(ids.float_words));
         }
+    }
+
+    /// Registration order is the [`CelGcType`] literals, and every class
+    /// static is in the table once. A duplicate would still get one id; the
+    /// count is what catches it.
+    #[test]
+    fn register_returns_each_cel_gc_type_id_once() {
+        let statics = all_class_statics();
+        assert_eq!(CEL_CLASS_LAYOUTS.len(), statics.len());
+        for class in &statics {
+            let hits = CEL_CLASS_LAYOUTS
+                .iter()
+                .filter(|layout| core::ptr::eq(layout.class, *class))
+                .count();
+            assert_eq!(hits, 1, "{} appears {hits} times", class.name);
+        }
+        let mut gc = MiniMarkGC::new();
+        let ids = register_cel_classes_unfrozen(&mut gc);
+        assert_eq!(ids.root, CelObject::TYPE_ID);
+        assert_eq!(ids.items_block, CelItemsBlock::TYPE_ID);
+        assert_eq!(ids.bytes_block, CelBytesBlock::TYPE_ID);
+        assert_eq!(ids.int_words, CelIntWords::TYPE_ID);
+        assert_eq!(ids.float_words, CelFloatWords::TYPE_ID);
+        assert_eq!(ids.classes.len(), statics.len());
+        for (index, registered) in ids.classes.iter().enumerate() {
+            assert_eq!(registered.type_id, (index as u32) + 1);
+            assert_eq!(registered.type_id, cel_class_type_id(registered.class));
+            assert!(
+                statics
+                    .iter()
+                    .any(|class| core::ptr::eq(*class, registered.class)),
+                "{} is not a class static",
+                registered.class.name
+            );
+        }
+    }
+
+    fn all_class_statics() -> Vec<&'static CelClass> {
+        let mut classes = vec![
+            &CEL_NULL_CLASS,
+            &CEL_BOOL_CLASS,
+            &CEL_INT_CLASS,
+            &CEL_UINT_CLASS,
+            &CEL_DOUBLE_CLASS,
+            &CEL_DURATION_CLASS,
+            &CEL_TIMESTAMP_CLASS,
+            &CEL_TYPE_CLASS,
+            &CEL_OPTIONAL_CLASS,
+            &CEL_BYTES_CLASS,
+            &CEL_STRING_CLASS,
+            &CEL_LIST_CLASS,
+            &CEL_INT_COLUMN_CLASS,
+            &CEL_FLOAT_COLUMN_CLASS,
+            &CEL_HOST_LIST_CLASS,
+            &CEL_TUPLE_CLASS,
+            &CEL_MAP_CLASS,
+            &CEL_FRAME_CLASS,
+            &CEL_OPAQUE_CLASS,
+        ];
+        #[cfg(feature = "structs")]
+        classes.push(&CEL_STRUCT_CLASS);
+        classes
     }
 
     /// The registration's whole point, end to end: a block allocated at

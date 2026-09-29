@@ -481,32 +481,42 @@ const _: () = {
     assert!(offset_of!(W_StringObject, ob_header) == 0);
 };
 
-/// One bump for a fresh string: the leaf, then its [`CelBytesBlock`].
+/// One allocation holding two headered objects: the leaf, then its
+/// [`CelBytesBlock`].
 ///
 /// `chars` points at the block that follows the leaf. The block is not a
-/// second heap object. Constructors that wrap a block allocated elsewhere
-/// stay on [`object_array::new_bytes_block`].
+/// second bump. Constructors that wrap a block allocated elsewhere stay on
+/// [`object_array::new_bytes_block`].
 fn alloc_fresh_string(nbytes: usize) -> (*mut W_StringObject, *mut u8) {
     alloc_fresh_string_in(unsafe { &*super::heap::heap_ptr() }, nbytes)
 }
 
 /// [`alloc_fresh_string`] on a heap the caller already resolved.
+///
+/// ```text
+/// [hdr = W_StringObject::TYPE_ID][leaf][pad to 8]
+///     [hdr = CelBytesBlock::TYPE_ID][block: capacity, bytes]
+/// ```
 fn alloc_fresh_string_in(
     heap: &super::heap::CelHeap,
     nbytes: usize,
 ) -> (*mut W_StringObject, *mut u8) {
+    let header = super::heap::GC_HEADER_SIZE;
     let leaf_size = core::mem::size_of::<W_StringObject>();
     let block_align = align_of::<CelBytesBlock>();
-    let block_off = (leaf_size + block_align - 1) & !(block_align - 1);
+    let block_hdr = (header + leaf_size + block_align - 1) & !(block_align - 1);
+    let chars_off = block_hdr + header;
     let block_bytes = object_array::CEL_BYTES_BLOCK_ITEMS_OFFSET + nbytes;
-    let total = block_off + block_bytes;
-    let align = align_of::<W_StringObject>().max(block_align);
+    let total = chars_off + block_bytes;
+    let align = align_of::<W_StringObject>().max(block_align).max(header);
     let raw = heap.alloc_raw(total, align);
-    let chars = unsafe { raw.add(block_off) as *mut CelBytesBlock };
     unsafe {
+        (raw as *mut u64).write(u64::from(<W_StringObject as lltype::CelGcType>::TYPE_ID));
+        (raw.add(block_hdr) as *mut u64)
+            .write(u64::from(<CelBytesBlock as lltype::CelGcType>::TYPE_ID));
+        let chars = raw.add(chars_off) as *mut CelBytesBlock;
         (*chars).capacity = nbytes;
-        let base = object_array::bytes_base(chars);
-        let leaf = raw as *mut W_StringObject;
+        let leaf = raw.add(header) as *mut W_StringObject;
         leaf.write(W_StringObject {
             ob_header: CelObject {
                 ob_type: &CEL_STRING_CLASS,
@@ -515,7 +525,7 @@ fn alloc_fresh_string_in(
             byte_len: nbytes as i64,
             public: core::ptr::null(),
         });
-        (leaf, base)
+        (leaf, object_array::bytes_base(chars))
     }
 }
 
@@ -529,9 +539,10 @@ pub fn new_string(s: &str) -> *mut W_StringObject {
 }
 
 /// `ll_str.py` `ll_int2dec`: count the digits, `mallocstr` of that exact
-/// length, then write the digits from the end into the block. The leaf
-/// and its bytes are one `alloc_raw`. The bytes are ASCII digits (and an
-/// optional leading `-`) by construction, so nothing validates them as UTF-8.
+/// length, then write the digits from the end into the block. One
+/// allocation holding two headered objects. The bytes are ASCII
+/// digits (and an optional leading `-`) by construction, so nothing
+/// validates them as UTF-8.
 ///
 /// `i64::MIN` negates in `u64` (`ll_unsigned(-val)`): its magnitude is `2^63`,
 /// nineteen digits, and the sign is the twentieth byte.
@@ -641,9 +652,9 @@ pub static CEL_INT_COLUMN_CLASS: CelClass = CelClass::new("int_column", CelKind:
 #[allow(non_camel_case_types)]
 pub struct W_FloatColumn {
     pub ob_header: CelObject,
-    /// `lltype.Float` elements. Reads and writes are `getarrayitem_gc_f` /
-    /// `setarrayitem_gc_f`.
-    pub data: *mut f64,
+    /// [`CelFloatWords`]: capacity at offset 0, then the `f64`s.
+    /// Reads and writes are `getarrayitem_gc_f` / `setarrayitem_gc_f`.
+    pub data: *mut crate::runtime::object_array::CelFloatWords,
     pub length: i64,
 }
 
@@ -656,9 +667,8 @@ const _: () = {
 /// A float column whose `length` is the allocated count (`ll_newlist_hint`).
 pub(crate) fn new_float_column_capacity(cap: i64) -> *mut W_FloatColumn {
     let cap = cap.max(1);
-    let bytes = (cap as usize).saturating_mul(core::mem::size_of::<f64>());
     super::heap::with_heap(|h| {
-        let data = h.alloc_raw(bytes, align_of::<f64>()) as *mut f64;
+        let data = crate::runtime::object_array::new_float_words_in(h, cap as usize);
         h.alloc(W_FloatColumn {
             ob_header: CelObject {
                 ob_type: &CEL_FLOAT_COLUMN_CLASS,
@@ -1018,7 +1028,7 @@ pub unsafe fn list_float_at(w: CelRef, index: i64) -> Option<f64> {
     if col.data.is_null() || at < 0 || at >= col.length {
         return None;
     }
-    Some(*col.data.add(at as usize))
+    Some(*crate::runtime::object_array::float_words_base(col.data).add(at as usize))
 }
 
 /// The int column of an Ints-strategy list, or `None` if `w` is not one.
@@ -1274,19 +1284,22 @@ pub unsafe fn list_resize_ge_float(w: CelRef, newsize: i64) -> bool {
     if newcap < 4 {
         newcap = 4;
     }
-    let nbytes = (newcap as usize).saturating_mul(core::mem::size_of::<f64>());
     let live = leaf.length.max(0) as usize;
     let src = col.data;
     let new_col = super::heap::with_heap(|h| {
-        let ptr = h.alloc_raw(nbytes, align_of::<f64>()) as *mut f64;
+        let data = crate::runtime::object_array::new_float_words_in(h, newcap as usize);
         if live > 0 && !src.is_null() {
-            core::ptr::copy_nonoverlapping(src, ptr, live);
+            core::ptr::copy_nonoverlapping(
+                crate::runtime::object_array::float_words_base(src),
+                crate::runtime::object_array::float_words_base(data),
+                live,
+            );
         }
         h.alloc(W_FloatColumn {
             ob_header: CelObject {
                 ob_type: &CEL_FLOAT_COLUMN_CLASS,
             },
-            data: ptr,
+            data,
             length: newcap,
         })
     });
@@ -1322,7 +1335,7 @@ pub unsafe fn list_store_float(w: CelRef, word: f64) -> bool {
     if col.data.is_null() || at < 0 || at >= col.length {
         return false;
     }
-    let data = col.data;
+    let data = crate::runtime::object_array::float_words_base(col.data);
     *data.add(at as usize) = word;
     leaf.length = at + 1;
     list_clear_public_link(w);
@@ -1527,7 +1540,10 @@ unsafe fn list_switch_floats_to_object(w: CelRef, item: CelRef) -> bool {
         (core::ptr::null_mut::<f64>(), 0i64)
     } else {
         let col = &*col.cast::<W_FloatColumn>();
-        (col.data, col.length)
+        (
+            crate::runtime::object_array::float_words_base(col.data),
+            col.length,
+        )
     };
     if n > 0 && words.is_null() {
         return false;
@@ -2491,6 +2507,115 @@ pub fn new_double_in(heap: &super::heap::CelHeap, value: f64) -> *mut W_DoubleOb
     })
 }
 
+// Registration order in `CEL_CLASS_LAYOUTS`: root, then the table, then blocks.
+// These literals are the ids that order hands out. A 64-bit leaf whose size
+// moved would also fail the asserts below.
+impl lltype::CelGcType for CelObject {
+    const TYPE_ID: u32 = 0;
+}
+impl lltype::CelGcType for W_NullObject {
+    const TYPE_ID: u32 = 1;
+}
+impl lltype::CelGcType for W_BoolObject {
+    const TYPE_ID: u32 = 2;
+}
+impl lltype::CelGcType for W_IntObject {
+    const TYPE_ID: u32 = 3;
+}
+impl lltype::CelGcType for W_UIntObject {
+    const TYPE_ID: u32 = 4;
+}
+impl lltype::CelGcType for W_DoubleObject {
+    const TYPE_ID: u32 = 5;
+}
+impl lltype::CelGcType for W_DurationObject {
+    const TYPE_ID: u32 = 6;
+}
+impl lltype::CelGcType for W_TimestampObject {
+    const TYPE_ID: u32 = 7;
+}
+impl lltype::CelGcType for W_TypeObject {
+    const TYPE_ID: u32 = 8;
+}
+impl lltype::CelGcType for W_OptionalObject {
+    const TYPE_ID: u32 = 9;
+}
+impl lltype::CelGcType for W_BytesObject {
+    const TYPE_ID: u32 = 10;
+}
+impl lltype::CelGcType for W_StringObject {
+    const TYPE_ID: u32 = 11;
+}
+impl lltype::CelGcType for W_ListObject {
+    const TYPE_ID: u32 = 12;
+}
+impl lltype::CelGcType for W_IntColumn {
+    const TYPE_ID: u32 = 13;
+}
+impl lltype::CelGcType for W_FloatColumn {
+    const TYPE_ID: u32 = 14;
+}
+impl lltype::CelGcType for W_HostListObject {
+    const TYPE_ID: u32 = 15;
+}
+impl lltype::CelGcType for W_TupleObject {
+    const TYPE_ID: u32 = 16;
+}
+impl lltype::CelGcType for W_MapObject {
+    const TYPE_ID: u32 = 17;
+}
+impl lltype::CelGcType for W_CelFrame {
+    const TYPE_ID: u32 = 18;
+}
+impl lltype::CelGcType for W_OpaqueObject {
+    const TYPE_ID: u32 = 19;
+}
+#[cfg(feature = "structs")]
+impl lltype::CelGcType for W_StructObject {
+    const TYPE_ID: u32 = 20;
+}
+
+const _: () = {
+    assert!(size_of::<W_IntColumn>() == 24);
+    assert!(offset_of!(W_IntColumn, data) == 8);
+    assert!(offset_of!(W_IntColumn, length) == 16);
+    assert!(size_of::<W_FloatColumn>() == 24);
+    assert!(offset_of!(W_FloatColumn, data) == 8);
+    assert!(offset_of!(W_FloatColumn, length) == 16);
+    assert!(size_of::<W_HostListObject>() == 64);
+    assert!(offset_of!(W_HostListObject, public) == 48);
+    assert!(offset_of!(W_HostListObject, public_start) == 56);
+    assert!(offset_of!(W_HostListObject, public_len) == 60);
+    assert!(size_of::<W_TupleObject>() == 24);
+    assert!(offset_of!(W_TupleObject, length) == 8);
+    assert!(offset_of!(W_TupleObject, items) == 16);
+    assert!(size_of::<W_MapObject>() == 56);
+    assert!(offset_of!(W_MapObject, strategy) == 8);
+    assert!(offset_of!(W_MapObject, storage) == 16);
+    assert!(offset_of!(W_MapObject, items) == 24);
+    assert!(offset_of!(W_MapObject, length) == 32);
+    assert!(offset_of!(W_MapObject, public) == 40);
+    assert!(offset_of!(W_MapObject, public_kind) == 48);
+    assert!(offset_of!(W_MapObject, public_len) == 52);
+    assert!(size_of::<W_CelFrame>() == 56);
+    assert!(offset_of!(W_CelFrame, vable_token) == 8);
+    assert!(offset_of!(W_CelFrame, last_instr) == 16);
+    assert!(offset_of!(W_CelFrame, valuestackdepth) == 24);
+    assert!(offset_of!(W_CelFrame, locals_stack_w) == 32);
+    assert!(offset_of!(W_CelFrame, n_slots) == 40);
+    assert!(offset_of!(W_CelFrame, scratch_bits) == 48);
+    assert!(size_of::<W_OpaqueObject>() == 24);
+    assert!(offset_of!(W_OpaqueObject, w_type) == 8);
+    assert!(offset_of!(W_OpaqueObject, host_index) == 16);
+};
+#[cfg(feature = "structs")]
+const _: () = {
+    assert!(size_of::<W_StructObject>() == 32);
+    assert!(offset_of!(W_StructObject, name) == 8);
+    assert!(offset_of!(W_StructObject, fields) == 16);
+    assert!(offset_of!(W_StructObject, length) == 24);
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2595,7 +2720,7 @@ mod tests {
         }
     }
 
-    /// A fresh string is one heap object: the leaf and the block after it.
+    /// A fresh string is one allocation holding two headered objects.
     /// `new_bytes` still allocates the block and the leaf separately.
     #[test]
     fn a_fresh_string_is_one_heap_object() {
@@ -2608,14 +2733,25 @@ mod tests {
         let empty = new_string("");
         assert_eq!(objects(), before + 4);
         unsafe {
-            use crate::runtime::object_array::{bytes_base, bytes_capacity};
+            use crate::runtime::heap::GC_HEADER_SIZE;
+            use crate::runtime::lltype::CelGcType;
+            use crate::runtime::object_array::{bytes_base, bytes_capacity, CelBytesBlock};
             let gap = (*w).chars as usize - w as usize;
             let leaf = core::mem::size_of::<W_StringObject>();
-            let block_align = core::mem::align_of::<crate::runtime::object_array::CelBytesBlock>();
-            assert!(gap >= leaf);
-            assert!(gap < leaf + block_align);
-            assert_eq!((*(*w).chars).capacity, 2);
+            let block_align = core::mem::align_of::<CelBytesBlock>();
+            assert!(gap >= leaf + GC_HEADER_SIZE);
+            assert!(gap < leaf + GC_HEADER_SIZE + block_align);
             assert_eq!((*s).chars as usize - s as usize, gap);
+            assert_eq!(
+                *((w as *const u8).sub(GC_HEADER_SIZE) as *const u64),
+                u64::from(W_StringObject::TYPE_ID)
+            );
+            assert_eq!(
+                *(((*w).chars as *const u8).sub(GC_HEADER_SIZE) as *const u64),
+                u64::from(CelBytesBlock::TYPE_ID)
+            );
+            assert_eq!((*(*w).chars).capacity, 2);
+            assert_eq!((*s).byte_len, 2);
             assert_eq!((*cat).byte_len, 3);
             assert_eq!(bytes_capacity((*cat).chars), 3);
             let base = bytes_base((*cat).chars);
