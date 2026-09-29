@@ -15,8 +15,8 @@ static NEXT_CODE_ID: AtomicU64 = AtomicU64::new(1);
 ///
 /// `owner` is claimed once by compare-exchange of a per-thread token.
 /// That thread reaches the driver through one load; every other thread
-/// uses the portal's per-thread table. `in_use` is the owner thread's
-/// re-entry flag and is never read or written by any other thread.
+/// uses the portal's per-thread table. Nested evaluations on the owner
+/// thread reuse the same driver.
 ///
 /// The pointer is a `Box<JitDriver<PortalState>>`. The portal installs the
 /// drop glue; this type does not name that driver.
@@ -24,15 +24,15 @@ static NEXT_CODE_ID: AtomicU64 = AtomicU64::new(1);
 pub(crate) struct CodeJit {
     pub(crate) owner: AtomicUsize,
     pub(crate) driver: UnsafeCell<usize>,
-    pub(crate) in_use: Cell<bool>,
     pub(crate) drop_fn: Cell<Option<unsafe fn(usize)>>,
 }
 
-// SAFETY: `owner` is atomic. `driver` and `in_use` are accessed only by
-// the thread whose token equals `owner` (the winner of the compare-exchange),
-// or by `Drop` when the last `Arc` is gone and no evaluation can hold a
-// borrow of the driver. Other threads never touch those fields; they keep
-// their own driver in the per-thread table.
+// SAFETY: `owner` is atomic. `driver` is accessed only by the thread whose
+// token equals `owner` (the winner of the compare-exchange), or by `Drop`
+// when the last `Arc` is gone and no evaluation can hold a borrow of the
+// driver. Other threads never touch that field; they keep their own driver
+// in the per-thread table. Nested evaluations on the owner thread reuse the
+// same driver.
 #[cfg(feature = "jit")]
 unsafe impl Send for CodeJit {}
 #[cfg(feature = "jit")]
@@ -44,7 +44,6 @@ impl Default for CodeJit {
         CodeJit {
             owner: AtomicUsize::new(0),
             driver: UnsafeCell::new(0),
-            in_use: Cell::new(false),
             drop_fn: Cell::new(None),
         }
     }

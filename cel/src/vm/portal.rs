@@ -1394,7 +1394,7 @@ fn portal_threshold() -> u32 {
 struct DriverEntry {
     id: u64,
     live: std::sync::Weak<super::code::CodeLive>,
-    driver: JitDriver<PortalState>,
+    driver: Box<JitDriver<PortalState>>,
 }
 
 struct PortalTable {
@@ -1438,7 +1438,7 @@ impl PortalTable {
         self.entries.push(DriverEntry {
             id,
             live: std::sync::Arc::downgrade(live),
-            driver: fresh_portal_driver(state, code),
+            driver: boxed_portal_driver(state, code),
         });
         self.last_id = id;
         self.last_idx = self.entries.len() - 1;
@@ -1507,9 +1507,8 @@ unsafe fn drop_portal_driver(ptr: usize) {
 ///
 /// # Safety
 ///
-/// The caller is the owner thread and `jit.in_use` is true for the
-/// duration of the returned borrow, so no other call holds a mutable
-/// reference to the same driver.
+/// The caller is the owner thread. A nested evaluation on that thread
+/// reuses the same driver the way a recursive portal call does.
 #[allow(clippy::mut_from_ref)]
 unsafe fn driver_on_code<'a>(
     jit: &'a super::code::CodeJit,
@@ -1575,30 +1574,11 @@ fn boxed_portal_driver(state: &mut PortalState, code: &CelCode) -> Box<JitDriver
     Box::new(fresh_portal_driver(state, code))
 }
 
-#[cold]
-#[inline(never)]
-fn run_reentrant_driver(code: &CelCode, state: &mut PortalState) -> *mut CelObject {
-    let mut driver = boxed_portal_driver(state, code);
-    call_portal(&mut driver, code, state)
-}
-
 fn run_owned_driver(
     jit: &super::code::CodeJit,
     code: &CelCode,
     state: &mut PortalState,
 ) -> *mut CelObject {
-    if jit.in_use.get() {
-        return run_reentrant_driver(code, state);
-    }
-    jit.in_use.set(true);
-    let in_use = &jit.in_use as *const std::cell::Cell<bool>;
-    struct Guard(*const std::cell::Cell<bool>);
-    impl Drop for Guard {
-        fn drop(&mut self) {
-            unsafe { (*self.0).set(false) };
-        }
-    }
-    let _g = Guard(in_use);
     let driver = unsafe { driver_on_code(jit, state, code) };
     call_portal(driver, code, state)
 }
@@ -1606,13 +1586,16 @@ fn run_owned_driver(
 fn run_table_driver(code: &CelCode, state: &mut PortalState) -> *mut CelObject {
     let id = code.identity.id;
     let live = &code.identity.live;
-    PORTAL_DRIVER.with(|slot| match slot.try_borrow_mut() {
-        Ok(mut table) => {
-            let i = table.index_for(id, live, state, code);
-            call_portal(&mut table.entries[i].driver, code, state)
-        }
-        Err(_) => run_reentrant_driver(code, state),
-    })
+    // The Box keeps the driver address stable if the Vec grows.
+    // `sweep_dead` only drops entries whose `live` Weak has no strong
+    // count, and the running code holds a strong reference, so the
+    // running entry is never dropped.
+    let ptr = PORTAL_DRIVER.with(|slot| {
+        let mut table = slot.borrow_mut();
+        let i = table.index_for(id, live, state, code);
+        &mut *table.entries[i].driver as *mut JitDriver<PortalState>
+    });
+    call_portal(unsafe { &mut *ptr }, code, state)
 }
 
 /// Evaluate `code` through the portal loop.
