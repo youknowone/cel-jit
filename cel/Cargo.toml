@@ -31,16 +31,9 @@ pastey = "0.2.1"
 # sibling checkout that made every cargo command — `fmt --check` included —
 # fail on a clean clone. A git revision resolves for anyone.
 #
-# `rev` is pyre's `cel` branch as of 2026-08-09, NOT `main`. It has to be:
-# `run_mainloop_f`'s `jit_merge_point!(driver, program, pc; state)` needs two
-# majit fixes that are on `cel` and not yet on `main` —
-# `VirtualizableTracker::identity_input_ref` (`optimizeopt/virtualize.rs`),
-# without which `VmStateF`'s two virtual arrays beside the `ret` scalar make
-# every trace abort with `VirtualStatesCantMatch`, and the label-entered deopt
-# resuming at the blackhole's green pc rather than the loop header
-# (`back_edge_internal`, `jitdriver.rs`). The last `main` rev,
-# `eba36d13ed9`, has neither. Move this back to a `main` commit once they land
-# there.
+# `rev` is pyre `main` at 871f1f281f8 (2026-09-30). A fresh pin was needed
+# because cel's `CelGc` registers typed headers through the `GcAllocator`
+# surface added there.
 #
 # Bump it deliberately: it is the only thing pinning the JIT tier's behaviour —
 # and a stale pin is silent. Two measured instances of that silence, both found
@@ -59,21 +52,22 @@ pastey = "0.2.1"
 # redirects these four crates to the enclosing worktree, which is what every
 # local measurement then runs against. So the pin's own effect is only ever
 # tested where that file is absent — a clean clone, and CI.
-# The revision is a commit on pyre's `cel` branch rather than `main`:
-# `majit_trace_evidence.rs` and the two `rca_*` examples read
-# `Census::compiled_opcode_log`, which that branch carries and `main` does not.
+# The revision is pyre `main` at 871f1f281f8. `main` carries
+# `Census::compiled_opcode_log` (`majit/majit-metainterp/src/embed.rs`),
+# which `majit_trace_evidence.rs` and the two `rca_*` examples read, and
+# the `GcAllocator` surface cel's `CelGc` uses to register typed headers.
 # `jit-audits`: majit-ir gates `opref_audit`/`reg_write_audit` out of production
 # builds (#1215); `majit_trace_evidence.rs` consumes both, and an integration
 # test does not see majit-ir's own `cfg(test)`.
-majit-ir = { git = "https://github.com/youknowone/pyre.git", rev = "f3aac994a9131466318964afca728a7b3a037472", optional = true, features = ["jit-audits"] }
+majit-ir = { git = "https://github.com/youknowone/pyre.git", rev = "871f1f281f8df72a15eb8bcc757a5fba30b28feb", optional = true, features = ["jit-audits"] }
 # Direct, not through `majit-metainterp`: it depends on `majit-gc` but re-exports
 # none of it, and `MiniMarkGC` / `TypeInfo` / the `GcAllocator` trait are what
 # class registration is spelled in. Same revision as its siblings — a different
 # one would give `set_gc_allocator` a `Box<dyn GcAllocator>` from a second copy
 # of the trait, which does not typecheck.
-majit-gc = { git = "https://github.com/youknowone/pyre.git", rev = "f3aac994a9131466318964afca728a7b3a037472", optional = true }
-majit-macros = { git = "https://github.com/youknowone/pyre.git", rev = "f3aac994a9131466318964afca728a7b3a037472", optional = true }
-majit-metainterp = { git = "https://github.com/youknowone/pyre.git", rev = "f3aac994a9131466318964afca728a7b3a037472", default-features = false, optional = true }
+majit-gc = { git = "https://github.com/youknowone/pyre.git", rev = "871f1f281f8df72a15eb8bcc757a5fba30b28feb", optional = true }
+majit-macros = { git = "https://github.com/youknowone/pyre.git", rev = "871f1f281f8df72a15eb8bcc757a5fba30b28feb", optional = true }
+majit-metainterp = { git = "https://github.com/youknowone/pyre.git", rev = "871f1f281f8df72a15eb8bcc757a5fba30b28feb", default-features = false, optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.5.1", features = ["html_reports"] }
