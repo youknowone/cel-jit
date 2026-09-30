@@ -1392,18 +1392,34 @@ fn residual_hydrate(vm_bits: i64, pc: i64) -> i64 {
     }
 }
 
-/// Back-edge and function-entry threshold for this process.
+fn env_u32(name: &str) -> Option<u32> {
+    std::env::var(name).ok().and_then(|s| s.parse().ok())
+}
+
+/// Back-edge threshold (`rlib/jit.py` `PARAMETERS` `threshold`).
 ///
-/// `rlib/jit.py` `PARAMETERS` sets `threshold` to 1039, a prime just above
-/// 1024. 101 is a prime just above 100, so one pass of a 100-element loop
-/// does not trace and the next pass does. `fresh_portal_driver` installs
-/// the same number as `function_threshold`. `CEL_PORTAL_THRESHOLD`
-/// overrides it.
+/// Upstream is 1039, a prime just above 1024. 101 is a prime just above
+/// 100, so one pass of a 100-element loop does not trace and the next
+/// pass does. `CEL_PORTAL_THRESHOLD` overrides it.
 fn portal_threshold() -> u32 {
-    std::env::var("CEL_PORTAL_THRESHOLD")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(101)
+    env_u32("CEL_PORTAL_THRESHOLD").unwrap_or(101)
+}
+
+/// Function-entry threshold (`rlib/jit.py` `PARAMETERS` `function_threshold`).
+///
+/// Upstream is 1619, a higher prime than `threshold` 1039. 157 is the
+/// prime nearest `101 * 1619 / 1039`, so this door stays above the
+/// back-edge door. `CEL_PORTAL_FUNCTION_THRESHOLD` overrides it. When
+/// that variable is unset and `CEL_PORTAL_THRESHOLD` is set, this door
+/// uses the loop knob too.
+fn portal_function_threshold() -> u32 {
+    if let Some(n) = env_u32("CEL_PORTAL_FUNCTION_THRESHOLD") {
+        return n;
+    }
+    if std::env::var_os("CEL_PORTAL_THRESHOLD").is_some() {
+        return portal_threshold();
+    }
+    157
 }
 
 struct DriverEntry {
@@ -1486,9 +1502,8 @@ pub(crate) fn driver_table_len() -> usize {
 }
 
 fn fresh_portal_driver(state: &mut PortalState, code: &CelCode) -> JitDriver<PortalState> {
-    let threshold = portal_threshold();
-    let mut driver = JitDriver::new(threshold);
-    driver.set_param("function_threshold", i64::from(threshold));
+    let mut driver = JitDriver::new(portal_threshold());
+    driver.set_param("function_threshold", i64::from(portal_function_threshold()));
     // `warmspot.py` sets `jd.result_type` from the portal return kind.
     // This portal returns `*mut CelObject`, so the finish descr is
     // `compile.py DoneWithThisFrameDescrRef`.
