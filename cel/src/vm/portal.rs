@@ -1392,16 +1392,18 @@ fn residual_hydrate(vm_bits: i64, pc: i64) -> i64 {
     }
 }
 
-/// Back-edge / function-entry threshold for this process.
+/// Back-edge and function-entry threshold for this process.
 ///
-/// Default `1_000_000` keeps unit tests on the native portal loop.
-/// `CEL_PORTAL_THRESHOLD` overrides both counters, the same single-knob
-/// shape `new_driver_f` uses.
+/// `rlib/jit.py` `PARAMETERS` sets `threshold` to 1039, a prime just above
+/// 1024. 101 is a prime just above 100, so one pass of a 100-element loop
+/// does not trace and the next pass does. `fresh_portal_driver` installs
+/// the same number as `function_threshold`. `CEL_PORTAL_THRESHOLD`
+/// overrides it.
 fn portal_threshold() -> u32 {
     std::env::var("CEL_PORTAL_THRESHOLD")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(1_000_000)
+        .unwrap_or(101)
 }
 
 struct DriverEntry {
