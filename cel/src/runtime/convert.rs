@@ -13,16 +13,18 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::object::{
-    new_bool, new_bytes, new_double, new_host_list, new_host_list_ints, new_host_list_window,
-    new_int, new_map, new_map_record, new_null, new_opaque, new_optional, new_optional_none,
-    new_string, new_type, new_uint, opaque_host_index, w_kind, w_type, CelClass, CelKind, CelRef,
+    mapdict_get, mapdict_layout_for_names, mapdict_name_at, new_bool, new_bytes, new_double,
+    new_host_list, new_host_list_ints, new_host_list_window, new_int, new_map, new_map_mapdict,
+    new_map_record, new_null, new_opaque, new_optional, new_optional_none, new_string, new_type,
+    new_uint, opaque_host_index, prepare_mapdict_rows, w_kind, w_type, CelClass, CelKind, CelRef,
     ListStrategy, MapStrategy, W_BoolObject, W_BytesObject, W_DoubleObject, W_HostListObject,
     W_IntColumn, W_IntObject, W_ListObject, W_MapObject, W_OptionalObject, W_StringObject,
     W_TypeObject, W_UIntObject, CEL_BOOL_CLASS, CEL_BYTES_CLASS, CEL_DOUBLE_CLASS,
     CEL_HOST_LIST_CLASS, CEL_INT_CLASS, CEL_LIST_CLASS, CEL_MAP_CLASS, CEL_NULL_CLASS,
     CEL_OPAQUE_CLASS, CEL_OPTIONAL_CLASS, CEL_STRING_CLASS, CEL_TYPE_CLASS, CEL_UINT_CLASS,
+    MAPDICT_MAX_ENTRIES,
 };
-use super::object_array::{bytes_base, items_block_items_base};
+use super::object_array::{bytes_base, items_block_items_base, items_capacity};
 use crate::common::types::{
     Kind, Type, TypeValue, BOOL_TYPE, BYTES_TYPE, DOUBLE_TYPE, INT_TYPE, LIST_TYPE, MAP_TYPE,
     NULL_TYPE, OPTIONAL_TYPE, STRING_TYPE, TYPE_TYPE, UINT_TYPE,
@@ -692,6 +694,10 @@ pub unsafe fn interned_map_get(w: CelRef, needle: KeyRef<'_>) -> Option<CelRef> 
     let leaf = &*w.cast::<W_MapObject>();
     match leaf.strategy {
         MapStrategy::Object => map_get_by_key(|k| interned_object_get_exact(w, k), needle),
+        MapStrategy::Mapdict => match needle {
+            KeyRef::String(s) => mapdict_get(leaf, s.as_bytes()),
+            _ => None,
+        },
         MapStrategy::Record => {
             let map = host_map(opaque_host_index(leaf.storage))?;
             intern_leaf(map.get(&needle)?.as_ref())
@@ -712,6 +718,10 @@ pub unsafe fn interned_map_contains(w: CelRef, needle: KeyRef<'_>) -> bool {
         MapStrategy::Object => {
             map_has_exact_key(|k| interned_object_get_exact(w, k).is_some(), needle)
         }
+        MapStrategy::Mapdict => match needle {
+            KeyRef::String(s) => mapdict_get(leaf, s.as_bytes()).is_some(),
+            _ => false,
+        },
         MapStrategy::Record => host_map(opaque_host_index(leaf.storage))
             .map(|m| m.contains_key(&needle))
             .unwrap_or(false),
@@ -746,12 +756,55 @@ pub unsafe fn interned_list_get(w: CelRef, index: i64) -> Option<CelRef> {
 
 fn intern_map(map: &Map) -> Result<CelRef, ConvertError> {
     match map.storage() {
-        MapStorage::Object(_) | MapStorage::Entries(_) => Ok(new_map(&map_pairs(map)?) as CelRef),
+        MapStorage::Object(_) | MapStorage::Entries(_) => {
+            if let Some(w) = intern_string_key_mapdict(map)? {
+                return Ok(w);
+            }
+            Ok(new_map(&map_pairs(map)?) as CelRef)
+        }
         MapStorage::Record { .. } => {
             let host = intern_host_any(Box::new(map.clone()));
             Ok(new_map_record(host, map.len() as i64) as CelRef)
         }
     }
+}
+
+/// Mapdict when every key is a string and the map is small enough.
+///
+/// `Ok(None)` means "use the object strategy". A value that fails to intern
+/// is `Err` and does not fall through: the caller would intern it again.
+fn intern_string_key_mapdict(map: &Map) -> Result<Option<CelRef>, ConvertError> {
+    if map.len() > MAPDICT_MAX_ENTRIES {
+        return Ok(None);
+    }
+    // One pass. A `HashMap` does not walk in the same order twice, and the
+    // order is per-instance random.
+    let mut rows: Vec<(&str, &Value)> = Vec::with_capacity(map.len());
+    for (k, v) in map.iter() {
+        let Key::String(s) = k else {
+            return Ok(None);
+        };
+        // `Cow::as_ref` would borrow the loop temporary. Object and entries
+        // maps yield `Borrowed`; an owned value stays on the object strategy.
+        let std::borrow::Cow::Borrowed(value) = v else {
+            return Ok(None);
+        };
+        rows.push((s.as_str(), value));
+    }
+    // Attribute order is the byte order of the key, so the same key set
+    // shares one layout (`mapdict.py` `_get_new_attr`).
+    if !prepare_mapdict_rows(&mut rows) {
+        return Ok(None);
+    }
+    let mut names = Vec::with_capacity(rows.len());
+    let mut values = Vec::with_capacity(rows.len());
+    for (name, value) in &rows {
+        let w = value_to_ref(value)?;
+        names.push(name.as_bytes());
+        values.push(w);
+    }
+    let layout = mapdict_layout_for_names(&names);
+    Ok(Some(new_map_mapdict(layout, &values) as CelRef))
 }
 
 /// `W_MapObject::public` addresses a [`HashMap<Key, Value>`].
@@ -805,6 +858,25 @@ unsafe fn map_from_ref(w: CelRef) -> Result<Map, ConvertError> {
             try_build_map::<_, false>(n, |i| {
                 let key = unsafe { ref_to_key(*base.add(2 * i))? };
                 let value = unsafe { ref_to_value(*base.add(2 * i + 1))? };
+                Ok(Some((key, value)))
+            })
+        }
+        MapStrategy::Mapdict => {
+            let n_i = leaf.length;
+            if n_i < 0 {
+                return Err(ConvertError::Corrupt("map"));
+            }
+            let n = n_i as usize;
+            let base = items_block_items_base(leaf.items);
+            if n != 0 && (base.is_null() || unsafe { items_capacity(leaf.items) } < n) {
+                return Err(ConvertError::Corrupt("map"));
+            }
+            try_build_map::<_, false>(n, |i| {
+                let name =
+                    mapdict_name_at(leaf.layout, i as i64).ok_or(ConvertError::Corrupt("map"))?;
+                let text = std::str::from_utf8(name).map_err(|_| ConvertError::Corrupt("map"))?;
+                let key = Key::String(Arc::new(text.to_owned()));
+                let value = unsafe { ref_to_value(*base.add(i))? };
                 Ok(Some((key, value)))
             })
         }

@@ -439,6 +439,7 @@ pub static CEL_CLASS_LAYOUTS: &[ClassLayout] = &[
     ClassLayout {
         class: &CEL_MAP_CLASS,
         size: size_of::<W_MapObject>(),
+        // `layout` is a leaked mapdict node address, not a managed edge.
         gc_ptr_offsets: &[
             offset_of!(W_MapObject, storage),
             offset_of!(W_MapObject, items),
@@ -499,6 +500,14 @@ pub static CEL_CLASS_LAYOUTS: &[ClassLayout] = &[
                 Type::Int,
                 false,
                 false,
+            ),
+            field(
+                "layout",
+                offset_of!(W_MapObject, layout),
+                WORD,
+                Type::Int,
+                true,
+                true,
             ),
         ],
     },

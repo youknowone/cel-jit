@@ -57,12 +57,12 @@
 
 use super::error::{raise, CelErrCode, ERROR_SENTINEL};
 use super::object::{
-    list_ints_slice, new_bool, new_bytes_concat, new_double, new_duration, new_int, new_list,
-    new_list_ints, new_null, new_string_concat, new_timestamp, new_uint, CelClass, CelRef,
-    W_BytesObject, W_MapObject, W_StringObject, CEL_BOOL_CLASS, CEL_BYTES_CLASS, CEL_DOUBLE_CLASS,
-    CEL_DURATION_CLASS, CEL_HOST_LIST_CLASS, CEL_INT_CLASS, CEL_LIST_CLASS, CEL_MAP_CLASS,
-    CEL_NULL_CLASS, CEL_OPAQUE_CLASS, CEL_OPTIONAL_CLASS, CEL_STRING_CLASS, CEL_TIMESTAMP_CLASS,
-    CEL_TYPE_CLASS, CEL_UINT_CLASS,
+    list_ints_slice, mapdict_pair_refs, new_bool, new_bytes_concat, new_double, new_duration,
+    new_int, new_list, new_list_ints, new_null, new_string_concat, new_timestamp, new_uint,
+    CelClass, CelRef, W_BytesObject, W_MapObject, W_StringObject, CEL_BOOL_CLASS, CEL_BYTES_CLASS,
+    CEL_DOUBLE_CLASS, CEL_DURATION_CLASS, CEL_HOST_LIST_CLASS, CEL_INT_CLASS, CEL_LIST_CLASS,
+    CEL_MAP_CLASS, CEL_NULL_CLASS, CEL_OPAQUE_CLASS, CEL_OPTIONAL_CLASS, CEL_STRING_CLASS,
+    CEL_TIMESTAMP_CLASS, CEL_TYPE_CLASS, CEL_UINT_CLASS,
 };
 use super::object_array::{bytes_base, items_block_items_base};
 
@@ -330,6 +330,7 @@ unsafe fn map_pairs(w: CelRef) -> Vec<CelRef> {
                 std::slice::from_raw_parts(base, n).to_vec()
             }
         }
+        super::object::MapStrategy::Mapdict => mapdict_pair_refs(leaf),
         super::object::MapStrategy::Record => {
             let Ok(Value::Map(map)) = super::convert::ref_to_value(w) else {
                 return Vec::new();

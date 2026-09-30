@@ -2594,11 +2594,24 @@ fn str_cells_eq(left: *mut CelObject, right: *mut CelObject) -> i64 {
     }
 }
 
-/// Object-strategy map field. Null means miss or "not this strategy".
+/// Index of `name` on a mapdict layout, or `-1`.
 ///
-/// `dictmultiobject.py` walks the interleaved entry array. A full scan
-/// that misses still returns null; [`map_object_known`] tells a miss
-/// from a map this loop did not scan.
+/// Elidable (`mapdict.py` `find_map_attr`). A promoted layout and a folded
+/// name cell make the index a constant. The walk compares raw string bytes.
+#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+fn mapdict_find(layout: i64, name: *mut CelObject) -> i64 {
+    unsafe { crate::runtime::object::mapdict_find_cell(layout, name) }
+}
+
+/// Field of an object-strategy or mapdict map. Null means miss or
+/// "not a strategy this loop reads".
+///
+/// Object maps walk interleaved entries. Mapdict maps guard the strategy,
+/// promote the layout word (`mapdict.py` `_get_mapdict_map`), then
+/// [`mapdict_find`]. The index is the value slot. [`field_of_slot`],
+/// [`has_field_slot`], [`append_named_field`], and [`append_has_field`]
+/// all come through here. A full scan that misses still returns null;
+/// [`map_object_known`] tells a miss from a map this loop did not read.
 #[majit_macros::jit_inline(
     ref_params = { map: ref(crate::runtime::object::W_MapObject) },
     ref_fields = {
@@ -2610,16 +2623,34 @@ fn str_cells_eq(left: *mut CelObject, right: *mut CelObject) -> i64 {
     int_fields = {
         crate::runtime::object::W_MapObject::strategy => u8,
         crate::runtime::object::W_MapObject::length => i64,
+        crate::runtime::object::W_MapObject::layout => i64,
         crate::runtime::object_array::CelItemsBlock::capacity => usize,
     },
     calls = {
         str_cells_eq => elidable_int_cannot_raise,
+        mapdict_find => elidable_int_cannot_raise,
     },
 )]
 fn map_object_field(map: *mut CelObject, name: *mut CelObject) -> *mut CelObject {
     let mut found_slot = -1i64;
     let strategy = map.strategy as u8 as i64;
-    if strategy == crate::runtime::object::MapStrategy::Object as i64 {
+    if strategy == crate::runtime::object::MapStrategy::Mapdict as i64 {
+        let layout = map.layout;
+        let layout = majit_ir::jit::promote(layout);
+        let idx = mapdict_find(layout, name);
+        if idx >= 0 {
+            let items = map.items as *mut crate::runtime::object_array::CelItemsBlock;
+            if (items as *mut u8) != core::ptr::null_mut() {
+                let length = map.length;
+                let cap = items.capacity as i64;
+                if idx < length {
+                    if idx < cap {
+                        found_slot = idx;
+                    }
+                }
+            }
+        }
+    } else if strategy == crate::runtime::object::MapStrategy::Object as i64 {
         let items = map.items as *mut crate::runtime::object_array::CelItemsBlock;
         if (items as *mut u8) != core::ptr::null_mut() {
             let length = map.length;
@@ -2650,7 +2681,10 @@ fn map_object_field(map: *mut CelObject, name: *mut CelObject) -> *mut CelObject
     }
 }
 
-/// `1` when [`map_object_field`] scanned an object-strategy map.
+/// `1` when [`map_object_field`] read an object-strategy or mapdict map.
+///
+/// A mapdict miss is a real miss (`has` boxes false), including an empty
+/// map whose items block is absent.
 #[majit_macros::jit_inline(
     ref_params = { map: ref(crate::runtime::object::W_MapObject) },
     ref_fields = {
@@ -2663,7 +2697,21 @@ fn map_object_field(map: *mut CelObject, name: *mut CelObject) -> *mut CelObject
 )]
 fn map_object_known(map: *mut CelObject) -> i64 {
     let strategy = map.strategy as u8 as i64;
-    if strategy == crate::runtime::object::MapStrategy::Object as i64 {
+    if strategy == crate::runtime::object::MapStrategy::Mapdict as i64 {
+        let length = map.length;
+        if length < 0 {
+            0
+        } else if length == 0 {
+            1
+        } else {
+            let items = map.items as *mut crate::runtime::object_array::CelItemsBlock;
+            if (items as *mut u8) != core::ptr::null_mut() {
+                1
+            } else {
+                0
+            }
+        }
+    } else if strategy == crate::runtime::object::MapStrategy::Object as i64 {
         let items = map.items as *mut crate::runtime::object_array::CelItemsBlock;
         if (items as *mut u8) != core::ptr::null_mut() {
             let length = map.length;
@@ -2735,11 +2783,12 @@ fn alloc_traced_map(
     _public: *const (),
     public_kind: u32,
     public_len: u32,
+    layout: i64,
 ) -> *mut crate::runtime::object::W_MapObject {
-    let strategy = if strategy == 1 {
-        crate::runtime::object::MapStrategy::Record
-    } else {
-        crate::runtime::object::MapStrategy::Object
+    let strategy = match strategy {
+        1 => crate::runtime::object::MapStrategy::Record,
+        2 => crate::runtime::object::MapStrategy::Mapdict,
+        _ => crate::runtime::object::MapStrategy::Object,
     };
     crate::runtime::heap::with_heap(|heap| {
         heap.alloc(crate::runtime::object::W_MapObject {
@@ -2751,6 +2800,7 @@ fn alloc_traced_map(
             public: core::ptr::null(),
             public_kind,
             public_len,
+            layout,
         })
     })
 }
@@ -2823,6 +2873,7 @@ fn alloc_list(vm: i64, cap: i64) -> *mut CelObject {
             crate::runtime::object::W_MapObject::length => i64,
             crate::runtime::object::W_MapObject::public_kind => u32,
             crate::runtime::object::W_MapObject::public_len => u32,
+            crate::runtime::object::W_MapObject::layout => i64,
         },
         struct_allocs = {
             crate::runtime::object_array::CelItemsBlock => alloc_traced_items,
@@ -2849,6 +2900,7 @@ fn alloc_map(vm: i64, cap: i64) -> *mut CelObject {
         public: core::ptr::null(),
         public_kind: 0u32,
         public_len: 0u32,
+        layout: 0i64,
     };
     w as *mut crate::runtime::object::W_MapObject as *mut CelObject
 }
@@ -4230,6 +4282,7 @@ fn slow_pc(vm: i64, here: i64) -> i64 {
         interned_field => residual_int,
         field_name_cell => elidable_ref_cannot_raise_wrapped,
         str_cells_eq => elidable_int_cannot_raise,
+        mapdict_find => elidable_int_cannot_raise,
         map_object_field => inline_ref,
         map_object_known => inline_int,
         interned_has_field => residual_int,

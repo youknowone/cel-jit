@@ -7,11 +7,12 @@
 use super::heap::{headered_total, register_const_span, unregister_const_span, GC_HEADER_SIZE};
 use super::lltype::CelGcType;
 use super::object::{
-    new_bool, new_null, prebuilt_int, CelObject, CelRef, ListStrategy, MapStrategy, W_BytesObject,
-    W_DoubleObject, W_HostListObject, W_IntColumn, W_IntObject, W_ListObject, W_MapObject,
-    W_StringObject, W_TupleObject, W_UIntObject, CEL_BYTES_CLASS, CEL_DOUBLE_CLASS,
-    CEL_HOST_LIST_CLASS, CEL_INT_CLASS, CEL_INT_COLUMN_CLASS, CEL_MAP_CLASS, CEL_STRING_CLASS,
-    CEL_TUPLE_CLASS, CEL_UINT_CLASS,
+    mapdict_layout_for_names, new_bool, new_null, prebuilt_int, prepare_mapdict_rows, CelObject,
+    CelRef, ListStrategy, MapStrategy, W_BytesObject, W_DoubleObject, W_HostListObject,
+    W_IntColumn, W_IntObject, W_ListObject, W_MapObject, W_StringObject, W_TupleObject,
+    W_UIntObject, CEL_BYTES_CLASS, CEL_DOUBLE_CLASS, CEL_HOST_LIST_CLASS, CEL_INT_CLASS,
+    CEL_INT_COLUMN_CLASS, CEL_MAP_CLASS, CEL_STRING_CLASS, CEL_TUPLE_CLASS, CEL_UINT_CLASS,
+    MAPDICT_MAX_ENTRIES,
 };
 use super::object_array::{
     bytes_base, int_words_base, items_block_items_base, CelBytesBlock, CelIntWords, CelItemsBlock,
@@ -308,25 +309,107 @@ impl ConstPool {
             public: core::ptr::null(),
             public_kind: 0,
             public_len: 0,
+            layout: 0,
         }) as CelRef
     }
 
     fn intern_map(&mut self, map: &Map) -> CelRef {
         match map.storage() {
             MapStorage::Record { .. } => core::ptr::null_mut(),
-            MapStorage::Object(_) | MapStorage::Entries(_) => {
-                let mut pairs = Vec::with_capacity(map.len());
-                for (k, v) in map.iter() {
-                    let key = self.intern_key(k);
-                    let value = self.intern_elem(v.as_ref());
-                    if key.is_null() || value.is_null() {
-                        return core::ptr::null_mut();
-                    }
-                    pairs.push((key, value));
+            MapStorage::Object(_) | MapStorage::Entries(_) => self.intern_public_map(map),
+        }
+    }
+
+    /// Mapdict when every key is a string and the map is small enough.
+    /// A value that fails to intern returns null immediately.
+    fn intern_public_map(&mut self, map: &Map) -> CelRef {
+        if map.len() > MAPDICT_MAX_ENTRIES {
+            return self.intern_object_from_public(map);
+        }
+        // One pass. A `HashMap` walks in a per-instance random order, and a
+        // second pass is not the same order.
+        let mut rows: Vec<(&str, CelRef)> = Vec::with_capacity(map.len());
+        for (k, v) in map.iter() {
+            let Key::String(s) = k else {
+                return self.intern_object_from_public(map);
+            };
+            let value = self.intern_elem(v.as_ref());
+            if value.is_null() {
+                return core::ptr::null_mut();
+            }
+            rows.push((s.as_str(), value));
+        }
+        // Key-byte order, so the same key set shares one layout
+        // (`mapdict.py` `_get_new_attr`).
+        if !prepare_mapdict_rows(&mut rows) {
+            return self.object_map_from_string_rows(&rows);
+        }
+        let mut names = Vec::with_capacity(rows.len());
+        let mut values = Vec::with_capacity(rows.len());
+        for (name, value) in &rows {
+            names.push(name.as_bytes());
+            values.push(*value);
+        }
+        let layout = mapdict_layout_for_names(&names);
+        self.alloc_mapdict(layout, &values)
+    }
+
+    fn intern_object_from_public(&mut self, map: &Map) -> CelRef {
+        let mut pairs = Vec::with_capacity(map.len());
+        for (k, v) in map.iter() {
+            let key = self.intern_key(k);
+            let value = self.intern_elem(v.as_ref());
+            if key.is_null() || value.is_null() {
+                return core::ptr::null_mut();
+            }
+            pairs.push((key, value));
+        }
+        self.intern_object_map(&pairs)
+    }
+
+    fn object_map_from_string_rows(&mut self, rows: &[(&str, CelRef)]) -> CelRef {
+        let mut pairs = Vec::with_capacity(rows.len());
+        for (name, value) in rows {
+            let key = self.intern(&Value::String(Arc::new((*name).to_owned())));
+            if key.is_null() {
+                return core::ptr::null_mut();
+            }
+            pairs.push((key, *value));
+        }
+        self.intern_object_map(&pairs)
+    }
+
+    fn alloc_mapdict(&mut self, layout: i64, values: &[CelRef]) -> CelRef {
+        let n = values.len();
+        let size = CEL_ITEMS_BLOCK_ITEMS_OFFSET
+            .checked_add(n.saturating_mul(size_of::<CelRef>()))
+            .expect("items block fits");
+        let block = self.alloc_raw_typed(CelItemsBlock::TYPE_ID, size, align_of::<CelItemsBlock>())
+            as *mut CelItemsBlock;
+        unsafe {
+            (*block).capacity = n;
+            if n != 0 {
+                let dest = items_block_items_base(block);
+                let mut i = 0;
+                while i < n {
+                    *dest.add(i) = values[i];
+                    i += 1;
                 }
-                self.intern_object_map(&pairs)
             }
         }
+        self.alloc(W_MapObject {
+            ob_header: CelObject {
+                ob_type: &CEL_MAP_CLASS,
+            },
+            strategy: MapStrategy::Mapdict,
+            storage: core::ptr::null_mut(),
+            items: block,
+            length: n as i64,
+            public: core::ptr::null(),
+            public_kind: 0,
+            public_len: 0,
+            layout,
+        }) as CelRef
     }
 
     fn intern_key(&mut self, key: &Key) -> CelRef {
@@ -369,6 +452,7 @@ impl ConstPool {
             public: core::ptr::null(),
             public_kind: 0,
             public_len: 0,
+            layout: 0,
         }) as CelRef
     }
 

@@ -1806,27 +1806,40 @@ fn interleaved_pair_block(pairs: &[(CelRef, CelRef)]) -> *mut CelItemsBlock {
     object_array::new_items_block(&items)
 }
 
+/// String-key maps at or below this entry count share a layout.
+/// Larger maps stay on [`MapStrategy::Object`].
+pub const MAPDICT_MAX_ENTRIES: usize = 16;
+
 /// How a [`W_MapObject`] holds its entries. D4, same as [`ListStrategy`].
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MapStrategy {
+    /// Interleaved `[k0, v0, …]` references in [`W_MapObject::items`].
     Object = 0,
     /// One record row. The schema lives in the heap host table at `storage`.
     Record = 1,
+    /// Values only, in layout-index order. String keys, at most
+    /// [`MAPDICT_MAX_ENTRIES`]. The chain lives at [`W_MapObject::layout`].
+    Mapdict = 2,
 }
 
 /// A CEL `map`.
 ///
-/// Entries of an object map live as interleaved `[k0, v0, …]` references.
-/// A record row parks its schema in the host table so intern does not
-/// explode the window.
+/// An object map stores interleaved `[k0, v0, …]` references. A record row
+/// parks its schema in the host table. A mapdict map stores values only,
+/// one per layout index.
 ///
-/// `strategy`, `storage` and `items` are written only by the allocating
-/// constructor (`new_map_with_capacity_in` / `new_map_record`). `length`
-/// and the `public*` words change on insert, so they stay mutable.
+/// [`Self::layout`] is the address bits of a leaked layout node
+/// (`mapdict.py` `AbstractAttribute`), or 0 when the strategy is not
+/// [`MapStrategy::Mapdict`]. The node is not a GC object, so the word is
+/// absent from `gc_ptr_offsets`. [`Self::storage`] stays the record
+/// strategy's host opaque and is traced.
+///
+/// `strategy`, `storage`, `items`, and `layout` are written only by the
+/// allocating constructors. `length` and the `public*` words change on insert.
 #[cfg_attr(
     feature = "jit",
-    majit_macros::jit_immutable_fields(strategy, storage, items)
+    majit_macros::jit_immutable_fields(strategy, storage, items, layout)
 )]
 #[repr(C)]
 #[allow(non_camel_case_types)]
@@ -1847,6 +1860,8 @@ pub struct W_MapObject {
     /// Slice length for [`Self::public`] when [`Self::public_kind`] is 1.
     /// Independent of [`Self::length`], which interned inserts may change.
     pub public_len: u32,
+    /// Mapdict layout address bits. Not a managed edge. See the struct doc.
+    pub layout: i64,
 }
 
 pub static CEL_MAP_CLASS: CelClass = CelClass::new("map", CelKind::Map, 12);
@@ -1861,11 +1876,11 @@ const _: () = {
 ///
 /// `w` is a live [`W_MapObject`].
 pub unsafe fn map_lookup_string(w: CelRef, field: &str) -> Option<CelRef> {
-    lookup_string_pairs(
-        (*w.cast::<W_MapObject>()).items,
-        (*w.cast::<W_MapObject>()).length,
-        field,
-    )
+    let leaf = &*w.cast::<W_MapObject>();
+    if leaf.strategy == MapStrategy::Mapdict {
+        return mapdict_get(leaf, field.as_bytes());
+    }
+    lookup_string_pairs(leaf.items, leaf.length, field)
 }
 
 unsafe fn lookup_string_pairs(
@@ -1923,12 +1938,17 @@ pub fn new_map_with_capacity_in(heap: &super::heap::CelHeap, cap: i64) -> *mut W
         public: core::ptr::null(),
         public_kind: 0,
         public_len: 0,
+        layout: 0,
     })
 }
 
 /// Insert `(key, value)` into an object-strategy map: overwrite the value of
 /// an existing pair whose key is the same [`crate::objects::Key`] (same
 /// kind, same payload), otherwise append if the block still has room.
+///
+/// A mapdict map overwrites the value of a string key already on its layout
+/// and returns `false` for any other key. The strategy stays. A record map
+/// returns `false`.
 ///
 /// A key that is not Int/UInt/Bool/Str is refused so the residual path
 /// raises through [`crate::objects::value_key`].
@@ -1946,6 +1966,21 @@ pub unsafe fn map_try_insert(w: CelRef, key: CelRef, value: CelRef) -> bool {
         _ => return false,
     }
     let leaf = &mut *w.cast::<W_MapObject>();
+    if leaf.strategy == MapStrategy::Mapdict {
+        if w_kind(key) == CelKind::Str {
+            let idx = mapdict_find_cell(leaf.layout, key);
+            if idx >= 0 && idx < leaf.length {
+                let base = crate::runtime::object_array::items_block_items_base(leaf.items);
+                let cap = crate::runtime::object_array::items_capacity(leaf.items);
+                if !base.is_null() && (idx as usize) < cap {
+                    *base.add(idx as usize) = value;
+                    clear_map_public(leaf);
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
     if leaf.strategy != MapStrategy::Object {
         return false;
     }
@@ -1963,9 +1998,7 @@ pub unsafe fn map_try_insert(w: CelRef, key: CelRef, value: CelRef) -> bool {
         while i < n {
             if interned_same_map_key(*base.add(2 * i), key) {
                 *base.add(2 * i + 1) = value;
-                leaf.public = core::ptr::null();
-                leaf.public_kind = 0;
-                leaf.public_len = 0;
+                clear_map_public(leaf);
                 return true;
             }
             i += 1;
@@ -1985,10 +2018,14 @@ pub unsafe fn map_try_insert(w: CelRef, key: CelRef, value: CelRef) -> bool {
     *base.add(used) = key;
     *base.add(used + 1) = value;
     leaf.length += 1;
+    clear_map_public(leaf);
+    true
+}
+
+fn clear_map_public(leaf: &mut W_MapObject) {
     leaf.public = core::ptr::null();
     leaf.public_kind = 0;
     leaf.public_len = 0;
-    true
 }
 
 /// Exact [`crate::objects::Key`] equality on two interned leaves: kind and
@@ -2053,6 +2090,7 @@ pub fn new_map(pairs: &[(CelRef, CelRef)]) -> *mut W_MapObject {
         public: core::ptr::null(),
         public_kind: 0,
         public_len: 0,
+        layout: 0,
     })
 }
 
@@ -2069,7 +2107,286 @@ pub fn new_map_record(storage: CelRef, length: i64) -> *mut W_MapObject {
         public: core::ptr::null(),
         public_kind: 0,
         public_len: 0,
+        layout: 0,
     })
+}
+
+/// One node of a mapdict layout chain (`mapdict.py` `AbstractAttribute`).
+///
+/// Immortal: leaked to `'static`, never freed, never a GC object. `back` is
+/// the previous node's address, or 0 for the terminator (`Terminator`).
+/// `index` is the storage slot (`storageindex`); the terminator uses -1 so
+/// an empty name does not match it. `length` is the attribute count from
+/// the root through this node.
+///
+/// `transitions` caches [`mapdict_add_attr`] (`mapdict.py` `_get_new_attr`)
+/// on the node itself. The mutex is per node, so two threads can extend
+/// different chains without a VM-wide lock. A reader of `name` / `index` /
+/// `back` does not take it: those words are written before the node's
+/// address is published.
+struct MapdictLayout {
+    back: usize,
+    name: &'static [u8],
+    index: i64,
+    length: i64,
+    transitions: std::sync::Mutex<Vec<(&'static [u8], usize)>>,
+}
+
+static MAPDICT_TERMINATOR: MapdictLayout = MapdictLayout {
+    back: 0,
+    name: b"",
+    index: -1,
+    length: 0,
+    transitions: std::sync::Mutex::new(Vec::new()),
+};
+
+const MAPDICT_WALK_CAP: i64 = 4096;
+
+/// Address bits of the root terminator.
+pub(crate) fn mapdict_terminator_bits() -> i64 {
+    &MAPDICT_TERMINATOR as *const MapdictLayout as usize as i64
+}
+
+fn mapdict_node(bits: i64) -> Option<&'static MapdictLayout> {
+    if bits == 0 {
+        return None;
+    }
+    let addr = bits as usize;
+    if addr == 0 {
+        return None;
+    }
+    Some(unsafe { &*(addr as *const MapdictLayout) })
+}
+
+fn mapdict_walk_limit(start: &MapdictLayout) -> i64 {
+    let mut limit = start.length.saturating_add(1);
+    if limit < 1 {
+        limit = 1;
+    }
+    if limit > MAPDICT_WALK_CAP {
+        limit = MAPDICT_WALK_CAP;
+    }
+    limit
+}
+
+/// `mapdict.py` `find_map_attr`: walk `back` until `name` matches an
+/// attribute. `-1` is a miss. The terminator's empty name does not match.
+pub(crate) fn mapdict_find_bytes(layout_bits: i64, name: &[u8]) -> i64 {
+    let Some(start) = mapdict_node(layout_bits) else {
+        return -1;
+    };
+    let limit = mapdict_walk_limit(start);
+    let mut node = start;
+    let mut steps = 0i64;
+    loop {
+        if node.index >= 0 && node.name == name {
+            return node.index;
+        }
+        steps += 1;
+        if steps >= limit || node.back == 0 {
+            return -1;
+        }
+        let Some(prev) = mapdict_node(node.back as i64) else {
+            return -1;
+        };
+        node = prev;
+    }
+}
+
+/// [`mapdict_find_bytes`] against a string cell's raw bytes.
+///
+/// A null, non-string, or corrupt cell is a miss. The compare does not
+/// decode UTF-8.
+///
+/// # Safety
+///
+/// `name` is null or a live value.
+pub(crate) unsafe fn mapdict_find_cell(layout_bits: i64, name: CelRef) -> i64 {
+    if name.is_null() || w_kind(name) != CelKind::Str {
+        return -1;
+    }
+    let leaf = &*name.cast::<W_StringObject>();
+    if leaf.byte_len < 0 {
+        return -1;
+    }
+    let n = leaf.byte_len as usize;
+    let base = object_array::bytes_base(leaf.chars);
+    if base.is_null() {
+        if n == 0 {
+            return mapdict_find_bytes(layout_bits, b"");
+        }
+        return -1;
+    }
+    mapdict_find_bytes(layout_bits, std::slice::from_raw_parts(base, n))
+}
+
+/// Name bytes stored at `index`, walking from `layout_bits`.
+pub(crate) fn mapdict_name_at(layout_bits: i64, index: i64) -> Option<&'static [u8]> {
+    if index < 0 {
+        return None;
+    }
+    let Some(start) = mapdict_node(layout_bits) else {
+        return None;
+    };
+    let limit = mapdict_walk_limit(start);
+    let mut node = start;
+    let mut steps = 0i64;
+    loop {
+        if node.index == index {
+            return Some(node.name);
+        }
+        steps += 1;
+        if steps >= limit || node.back == 0 {
+            return None;
+        }
+        let Some(prev) = mapdict_node(node.back as i64) else {
+            return None;
+        };
+        node = prev;
+    }
+}
+
+/// Value at a layout index.
+///
+/// # Safety
+///
+/// `leaf` is a live mapdict map.
+pub(crate) unsafe fn mapdict_get(leaf: &W_MapObject, name: &[u8]) -> Option<CelRef> {
+    let idx = mapdict_find_bytes(leaf.layout, name);
+    if idx < 0 || idx >= leaf.length {
+        return None;
+    }
+    let base = object_array::items_block_items_base(leaf.items);
+    if base.is_null() {
+        return None;
+    }
+    let idx = idx as usize;
+    if idx >= object_array::items_capacity(leaf.items) {
+        return None;
+    }
+    Some(*base.add(idx))
+}
+
+/// Transition `parent` + `name` (`mapdict.py` `add_attr` / `_get_new_attr`).
+///
+/// The new node's address is cached on the parent's `transitions` under
+/// that parent's lock. The same name on the same parent returns the same
+/// node. Only this lock is held.
+pub(crate) fn mapdict_add_attr(parent_bits: i64, name: &[u8]) -> i64 {
+    let parent_bits = if parent_bits == 0 {
+        mapdict_terminator_bits()
+    } else {
+        parent_bits
+    };
+    let Some(parent) = mapdict_node(parent_bits) else {
+        return mapdict_terminator_bits();
+    };
+    let mut guard = parent
+        .transitions
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    let mut i = 0;
+    while i < guard.len() {
+        if guard[i].0 == name {
+            return guard[i].1 as i64;
+        }
+        i += 1;
+    }
+    let name_static: &'static [u8] = Box::leak(name.to_vec().into_boxed_slice());
+    let child = Box::leak(Box::new(MapdictLayout {
+        back: parent as *const MapdictLayout as usize,
+        name: name_static,
+        index: parent.length,
+        length: parent.length.saturating_add(1),
+        transitions: std::sync::Mutex::new(Vec::new()),
+    }));
+    let bits = child as *const MapdictLayout as usize;
+    guard.push((name_static, bits));
+    bits as i64
+}
+
+/// Layout reached by adding `names` in order, starting at the terminator.
+pub(crate) fn mapdict_layout_for_names(names: &[&[u8]]) -> i64 {
+    let mut layout = mapdict_terminator_bits();
+    let mut i = 0;
+    while i < names.len() {
+        layout = mapdict_add_attr(layout, names[i]);
+        i += 1;
+    }
+    layout
+}
+
+/// Sort `rows` into key-byte order.
+///
+/// `false` when there are more than [`MAPDICT_MAX_ENTRIES`] rows or two
+/// keys have the same bytes. A public `HashMap` iterates in a per-instance
+/// random order; callers sort so one key set shares one layout
+/// (`mapdict.py` `_get_new_attr`).
+pub(crate) fn prepare_mapdict_rows<T>(rows: &mut [(&str, T)]) -> bool {
+    if rows.len() > MAPDICT_MAX_ENTRIES {
+        return false;
+    }
+    rows.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+    let mut i = 1;
+    while i < rows.len() {
+        if rows[i].0.as_bytes() == rows[i - 1].0.as_bytes() {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// A mapdict map. `values[i]` is the value of layout index `i`.
+pub fn new_map_mapdict(layout: i64, values: &[CelRef]) -> *mut W_MapObject {
+    let items = object_array::new_items_block(values);
+    lltype::malloc_typed(W_MapObject {
+        ob_header: CelObject {
+            ob_type: &CEL_MAP_CLASS,
+        },
+        strategy: MapStrategy::Mapdict,
+        storage: core::ptr::null_mut(),
+        items,
+        length: values.len() as i64,
+        public: core::ptr::null(),
+        public_kind: 0,
+        public_len: 0,
+        layout,
+    })
+}
+
+/// Interleaved `[key, value, …]` rebuilt from the layout names.
+///
+/// An unreadable name or a non-UTF-8 name yields an empty vec so equality
+/// fails closed.
+///
+/// # Safety
+///
+/// `leaf` is a live mapdict map.
+pub(crate) unsafe fn mapdict_pair_refs(leaf: &W_MapObject) -> Vec<CelRef> {
+    if leaf.length < 0 {
+        return Vec::new();
+    }
+    let n = leaf.length as usize;
+    let base = object_array::items_block_items_base(leaf.items);
+    if n != 0 && (base.is_null() || object_array::items_capacity(leaf.items) < n) {
+        return Vec::new();
+    }
+    let mut pairs = Vec::with_capacity(n.saturating_mul(2));
+    let mut i = 0;
+    while i < n {
+        let value = *base.add(i);
+        let Some(name) = mapdict_name_at(leaf.layout, i as i64) else {
+            return Vec::new();
+        };
+        let Ok(text) = std::str::from_utf8(name) else {
+            return Vec::new();
+        };
+        pairs.push(new_string(text) as CelRef);
+        pairs.push(value);
+        i += 1;
+    }
+    pairs
 }
 
 /// A CEL `struct`.
@@ -2589,7 +2906,7 @@ const _: () = {
     assert!(size_of::<W_TupleObject>() == 24);
     assert!(offset_of!(W_TupleObject, length) == 8);
     assert!(offset_of!(W_TupleObject, items) == 16);
-    assert!(size_of::<W_MapObject>() == 56);
+    assert!(size_of::<W_MapObject>() == 64);
     assert!(offset_of!(W_MapObject, strategy) == 8);
     assert!(offset_of!(W_MapObject, storage) == 16);
     assert!(offset_of!(W_MapObject, items) == 24);
@@ -2597,6 +2914,7 @@ const _: () = {
     assert!(offset_of!(W_MapObject, public) == 40);
     assert!(offset_of!(W_MapObject, public_kind) == 48);
     assert!(offset_of!(W_MapObject, public_len) == 52);
+    assert!(offset_of!(W_MapObject, layout) == 56);
     assert!(size_of::<W_CelFrame>() == 56);
     assert!(offset_of!(W_CelFrame, vable_token) == 8);
     assert!(offset_of!(W_CelFrame, last_instr) == 16);
