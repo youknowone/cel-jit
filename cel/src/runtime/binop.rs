@@ -297,6 +297,14 @@ unsafe fn append_interned_ints(out: &mut Vec<i64>, w: CelRef) -> bool {
 ///
 /// Both operands are live strings.
 pub unsafe fn w_string_eq(a: CelRef, b: CelRef) -> bool {
+    if a == b {
+        return true;
+    }
+    let left = &*a.cast::<W_StringObject>();
+    let right = &*b.cast::<W_StringObject>();
+    if left.byte_len != right.byte_len {
+        return false;
+    }
     string_bytes(a) == string_bytes(b)
 }
 
@@ -1307,7 +1315,9 @@ mod tests {
     use super::*;
     use crate::objects::compare_values;
     use crate::runtime::error::{clear_error, take_error};
-    use crate::runtime::object::{new_null, new_optional, new_optional_none, new_type, w_type};
+    use crate::runtime::object::{
+        new_null, new_optional, new_optional_none, new_string, new_type, w_type,
+    };
     use crate::{ExecutionError, Value};
 
     /// Every test starts with an empty channel, so a leaked error from an
@@ -1319,6 +1329,25 @@ mod tests {
     unsafe fn int_of(w: CelRef) -> i64 {
         assert_eq!(w_type(w), &CEL_INT_CLASS as *const CelClass);
         payload!(w, W_IntObject, intval)
+    }
+
+    #[test]
+    fn string_eq_checks_identity_then_length_then_bytes() {
+        fresh();
+        unsafe {
+            let a = new_string("n1") as CelRef;
+            let b = new_string("n1") as CelRef;
+            let c = new_string("n12") as CelRef;
+            let d = new_string("n2") as CelRef;
+            let empty = new_string("") as CelRef;
+            let empty_2 = new_string("") as CelRef;
+            assert!(w_string_eq(a, a));
+            assert!(w_string_eq(a, b));
+            assert!(!w_string_eq(a, c));
+            assert!(!w_string_eq(a, d));
+            assert!(w_string_eq(empty, empty_2));
+            assert!(!w_string_eq(empty, a));
+        }
     }
 
     #[test]

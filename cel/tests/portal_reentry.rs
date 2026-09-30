@@ -442,3 +442,61 @@ fn compiled_resolver_context_stays_live() {
         assert_eq!(as_int(&got), i, "resolver execute {i}");
     }
 }
+
+fn record_items() -> Value {
+    let items: Vec<Value> = (0..8i64)
+        .map(|i| {
+            let mut map = std::collections::HashMap::new();
+            map.insert("price", Value::Int(i));
+            map.insert("name", Value::from(format!("n{i}")));
+            Value::from(map)
+        })
+        .collect();
+    Value::list(items)
+}
+
+fn filtered_without_n1() -> Value {
+    let items: Vec<Value> = (0..8i64)
+        .filter(|i| *i != 1)
+        .map(|i| {
+            let mut map = std::collections::HashMap::new();
+            map.insert("price", Value::Int(i));
+            map.insert("name", Value::from(format!("n{i}")));
+            Value::from(map)
+        })
+        .collect();
+    Value::list(items)
+}
+
+/// `i.name == "zz"` / `== "n3"` / `!= "n1"` stay correct after the portal loop
+/// compiles. The constant used to be re-interned on every element, and the
+/// string compare used to leave the traced loop.
+#[test]
+fn record_name_equality_answers_after_the_portal_compiles() {
+    // SAFETY: stored before this test builds a driver. The knob is read
+    // once, when that driver is created.
+    unsafe { std::env::set_var("CEL_PORTAL_THRESHOLD", "100") };
+    let mut ctx = Context::default();
+    ctx.add_variable_from_value("items", record_items());
+    let absent = Program::compile(r#"items.exists(i, i.name == "zz")"#).unwrap();
+    let present = Program::compile(r#"items.exists(i, i.name == "n3")"#).unwrap();
+    let kept = Program::compile(r#"items.filter(i, i.name != "n1")"#).unwrap();
+    let want_kept = filtered_without_n1();
+    for i in 0..200 {
+        assert_eq!(
+            absent.execute(&ctx).expect("exists zz"),
+            Value::Bool(false),
+            "exists zz {i}"
+        );
+        assert_eq!(
+            present.execute(&ctx).expect("exists n3"),
+            Value::Bool(true),
+            "exists n3 {i}"
+        );
+        assert_eq!(
+            kept.execute(&ctx).expect("filter"),
+            want_kept,
+            "filter != n1 {i}"
+        );
+    }
+}

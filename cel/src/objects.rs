@@ -3905,6 +3905,11 @@ fn interned_eq_public(w: CelRef, other: &Value) -> bool {
             return public_list_eq_ints(list, ints);
         }
     }
+    // The public string is already bytes. Interning it would copy the constant
+    // onto the nursery on every compare.
+    if let Value::String(s) = other {
+        return unsafe { crate::runtime::object::string_eq_str(w, s) };
+    }
     match intern_leaf(other) {
         Some(b) => interned_eq(w, b),
         None => match unsafe { crate::runtime::convert::ref_to_value(w) } {
@@ -4319,6 +4324,28 @@ mod tests {
     use crate::{objects::Key, Context, ExecutionError, Program, Value};
     use std::collections::HashMap;
     use std::sync::Arc;
+
+    #[test]
+    fn interned_string_equals_public_string_by_bytes() {
+        let zz = crate::runtime::object::new_string("zz") as crate::runtime::object::CelRef;
+        let again = crate::runtime::object::new_string("zz") as crate::runtime::object::CelRef;
+        let other = crate::runtime::object::new_string("n3") as crate::runtime::object::CelRef;
+        let empty = crate::runtime::object::new_string("") as crate::runtime::object::CelRef;
+        let public_zz = Value::String(Arc::new("zz".to_string()));
+        let public_n3 = Value::String(Arc::new("n3".to_string()));
+        let public_empty = Value::String(Arc::new(String::new()));
+        assert_eq!(Value::from_interned(zz), public_zz.clone());
+        assert_eq!(public_zz, Value::from_interned(again));
+        assert_eq!(Value::from_interned(zz), Value::from_interned(zz));
+        assert_ne!(Value::from_interned(zz), public_n3);
+        assert_ne!(Value::from_interned(other), public_zz);
+        assert_ne!(Value::from_interned(zz), Value::Int(0));
+        assert_eq!(Value::from_interned(empty), public_empty);
+        let number = Value::from_interned(
+            crate::runtime::object::new_int(1) as crate::runtime::object::CelRef
+        );
+        assert_ne!(number, Value::String(Arc::new("1".to_string())));
+    }
 
     #[test]
     fn concat_of_two_int_lists_stays_ints() {

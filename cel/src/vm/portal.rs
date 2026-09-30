@@ -20,7 +20,7 @@ use super::interp::{interned_optional_is_none, Step, Vm};
 use super::opcode::OpCode;
 use crate::runtime::binop::{
     cel_add, cel_div, cel_equals, cel_greater, cel_greater_equals, cel_less, cel_less_equals,
-    cel_mul, cel_negate, cel_not_equals, cel_rem, cel_sub, values_equal,
+    cel_mul, cel_negate, cel_not_equals, cel_rem, cel_sub, values_equal, w_string_eq,
 };
 use crate::runtime::convert::{
     intern_leaf, interned_as_keyref, interned_list_get, interned_map_get,
@@ -2570,14 +2570,27 @@ fn field_name_cell(program: &CelCode, name_idx: i64) -> *mut CelObject {
 
 /// `1` when both cells are strings with the same bytes.
 ///
-/// Elidable: string payloads are immutable.
+/// Elidable: string payloads are immutable. Same pointer answers first, then
+/// the lengths, then the raw bytes. A null or non-string cell answers `0`.
 #[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
 fn str_cells_eq(left: *mut CelObject, right: *mut CelObject) -> i64 {
-    match (unsafe { string_as_str(left) }, unsafe {
-        string_as_str(right)
-    }) {
-        (Some(a), Some(b)) if a == b => 1,
-        _ => 0,
+    if !left.is_null() && left == right {
+        if unsafe { w_kind(left) } == CelKind::Str {
+            return 1;
+        }
+        return 0;
+    }
+    if left.is_null()
+        || right.is_null()
+        || unsafe { w_kind(left) } != CelKind::Str
+        || unsafe { w_kind(right) } != CelKind::Str
+    {
+        return 0;
+    }
+    if unsafe { w_string_eq(left, right) } {
+        1
+    } else {
+        0
     }
 }
 
@@ -5468,6 +5481,31 @@ fn run_cel_portal(
                                 } else {
                                     slow_pc(vm, here)
                                 }
+                            } else if cell_kind(a) == CelKind::Str as i64 {
+                                if cell_kind(b) == CelKind::Str as i64 {
+                                    if opcode == OP_EQ || opcode == OP_NE {
+                                        let eq = str_cells_eq(a, b);
+                                        let bit = if opcode == OP_NE {
+                                            if eq == 0 {
+                                                1
+                                            } else {
+                                                0
+                                            }
+                                        } else {
+                                            eq
+                                        };
+                                        let r = box_bool(bit);
+                                        state.frame.locals_stack_w[ai] = r;
+                                        state.frame.locals_stack_w[depth - 1] =
+                                            core::ptr::null_mut();
+                                        state.frame.valuestackdepth = depth - 1;
+                                        here + 1
+                                    } else {
+                                        slow_pc(vm, here)
+                                    }
+                                } else {
+                                    slow_pc(vm, here)
+                                }
                             } else {
                                 slow_pc(vm, here)
                             }
@@ -5534,6 +5572,28 @@ fn run_cel_portal(
                                         let r = box_bool(bit);
                                         state.frame.locals_stack_w[i] = r;
                                         here + 1
+                                    }
+                                } else {
+                                    slow_pc(vm, here)
+                                }
+                            } else if cell_kind(a) == CelKind::Str as i64 {
+                                if cell_kind(k) == CelKind::Str as i64 {
+                                    if cmp_op == OP_EQ || cmp_op == OP_NE {
+                                        let eq = str_cells_eq(a, k);
+                                        let bit = if cmp_op == OP_NE {
+                                            if eq == 0 {
+                                                1
+                                            } else {
+                                                0
+                                            }
+                                        } else {
+                                            eq
+                                        };
+                                        let r = box_bool(bit);
+                                        state.frame.locals_stack_w[i] = r;
+                                        here + 1
+                                    } else {
+                                        slow_pc(vm, here)
                                     }
                                 } else {
                                     slow_pc(vm, here)
