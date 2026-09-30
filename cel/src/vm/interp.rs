@@ -2685,6 +2685,9 @@ impl<'a> Vm<'a> {
                 if b == 1 && self.try_interned_unary_host(NameId(a), op)? {
                     return Ok(Step::Next);
                 }
+                if b == 2 && self.try_scalar_int2(NameId(a))? {
+                    return Ok(Step::Next);
+                }
                 let args = self.pop_n(b as usize)?;
                 let value = self.call_global(NameId(a), args)?;
                 self.push(value);
@@ -3535,6 +3538,38 @@ impl<'a> Vm<'a> {
         self.push_operand(other);
         self.push_operand(receiver);
         Ok(false)
+    }
+
+    /// Two interned ints into a registered [`crate::magic::ScalarFn::Int2`].
+    ///
+    /// Any other signature, a non-int operand, or a stdlib overload for the
+    /// name keeps the erased [`Vm::call_global`] path: the same `Vec`, the
+    /// same `unpack`, the same error.
+    fn try_scalar_int2(&mut self, name: NameId) -> CelResult<bool> {
+        if self.depth() < 2 {
+            return Ok(false);
+        }
+        let len = self.frame.len();
+        let Some(b) = interned_int(&self.frame[len - 1]) else {
+            return Ok(false);
+        };
+        let Some(a) = interned_int(&self.frame[len - 2]) else {
+            return Ok(false);
+        };
+        // A bad name id is the erased path's error. Leaving the operands
+        // in place keeps that path's stack effect.
+        let Some(func_name) = self.code.name(name) else {
+            return Ok(false);
+        };
+        let Some(entry) = self.ctx.int2_entry(func_name) else {
+            return Ok(false);
+        };
+        let _ = self.pop_operand();
+        let _ = self.pop_operand();
+        // `entry` is the `Int2` word `Context::int2_entry` just resolved.
+        let n = unsafe { crate::magic::ScalarFn::call_int2(entry, a, b) };
+        self.push_operand(Operand::Interned(self.box_int(n)));
+        Ok(true)
     }
 
     fn call_global(&mut self, name: NameId, args: Vec<Value>) -> CelResult<Value> {

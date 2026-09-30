@@ -3885,6 +3885,30 @@ fn step_hot(program: &CelCode, pc: usize) -> i64 {
                     }
                     _ => residual_dispatch(vm, here),
                 }
+            } else if opcode == OP_CALL_HOST && arity == 2 {
+                // Two int cells, registered `ScalarFn::Int2`. A null result
+                // is not that convention: the erased path still runs.
+                match (operand_cell(frame, 2), operand_cell(frame, 1)) {
+                    (Some(left), Some(right))
+                        if !left.is_null()
+                            && !right.is_null()
+                            && cell_kind(left) == CelKind::Int as i64
+                            && cell_kind(right) == CelKind::Int as i64 =>
+                    {
+                        let ctx_bits =
+                            vm_of(vm).ctx as *const crate::context::Context as usize as i64;
+                        let r = host_int2_cell(ctx_bits, vm, program, name, left, right);
+                        if r.is_null() {
+                            residual_dispatch(vm, here)
+                        } else {
+                            let depth = frame.valuestackdepth;
+                            frame.locals_stack_w[depth - 2] = r;
+                            pop_cell!(frame);
+                            here + 1
+                        }
+                    }
+                    _ => residual_dispatch(vm, here),
+                }
             } else {
                 residual_dispatch(vm, here)
             }
@@ -4166,6 +4190,59 @@ fn slow_pc(vm: i64, here: i64) -> i64 {
     residual_dispatch(vm, here)
 }
 
+/// Two interned int cells into a registered `ScalarFn::Int2`.
+///
+/// Null means this call is not that convention: the erased path in
+/// `slow_pc` still runs, including its argument errors. A hit does not
+/// build an argument `Vec` and does not hydrate the frame.
+#[majit_macros::jit_inline(
+    ref_params = { program: ref(CelCode) },
+    calls = {
+        host_int2_entry => residual_int_cannot_raise,
+        host_call2_i => residual_int_cannot_raise,
+        cell_int => inline_int,
+        box_int => inline_ref,
+    },
+)]
+fn host_int2_cell(
+    ctx_bits: i64,
+    vm: i64,
+    program: *const CelCode,
+    name: i64,
+    left: *mut CelObject,
+    right: *mut CelObject,
+) -> *mut CelObject {
+    let entry = host_int2_entry(ctx_bits, program, name);
+    if entry == 0 {
+        core::ptr::null_mut()
+    } else {
+        let n = host_call2_i(entry, cell_int(left), cell_int(right));
+        box_int(vm, n)
+    }
+}
+
+/// Entry word of the two-int scalar for `name`, or `0` when the erased
+/// path must run. Reads the registry on every call, so a generation bump
+/// from `add_function` is visible to the next call.
+#[cfg_attr(feature = "jit", majit_macros::dont_look_inside_cannot_raise)]
+fn host_int2_entry(ctx_bits: i64, program: *const CelCode, name: i64) -> i64 {
+    if ctx_bits == 0 || program.is_null() {
+        return 0;
+    }
+    let ctx = unsafe { &*(ctx_bits as usize as *const crate::context::Context) };
+    let program = unsafe { &*program };
+    let Some(name) = program.name(NameId(name as u32)) else {
+        return 0;
+    };
+    ctx.int2_entry(name).unwrap_or(0)
+}
+
+/// `ScalarFn::Int2` at `entry`. The word is [`crate::magic::ScalarFn::entry_word`].
+#[cfg_attr(feature = "jit", majit_macros::dont_look_inside_cannot_raise)]
+fn host_call2_i(entry: i64, a: i64, b: i64) -> i64 {
+    unsafe { crate::magic::ScalarFn::call_int2(entry, a, b) }
+}
+
 #[majit_macros::jit_interp(
     state = PortalState,
     env = CelCode,
@@ -4307,6 +4384,9 @@ fn slow_pc(vm: i64, here: i64) -> i64 {
         interned_qualified_kind => elidable_int_cannot_raise,
         interned_unary => residual_int,
         interned_unary_cell => residual_ref,
+        host_int2_cell => inline_ref,
+        host_int2_entry => residual_int_cannot_raise,
+        host_call2_i => residual_int_cannot_raise,
         interned_temporal => residual_int,
         interned_optional_unary => residual_int,
         interned_method1 => residual_int,
@@ -5996,6 +6076,48 @@ fn run_cel_portal(
                                 } else {
                                     slow_pc(vm, here)
                                 }
+                            }
+                        } else {
+                            slow_pc(vm, here)
+                        }
+                    } else {
+                        slow_pc(vm, here)
+                    }
+                } else if arity == 2 {
+                    // Nested tests, not `&&`. A logical-and in this value
+                    // is not a short-circuit the lowerer can keep, and the
+                    // whole arm then becomes an abort stub: tracing `int`
+                    // or `string` aborts inside it and the frame comes back
+                    // as an internal error.
+                    let right_i = i;
+                    let left_i = depth - 2;
+                    if left_i >= code_n_slots(program) {
+                        let right = state.frame.locals_stack_w[right_i];
+                        let left = state.frame.locals_stack_w[left_i];
+                        if !left.is_null() {
+                            if !right.is_null() {
+                                if cell_kind(left) == CelKind::Int as i64 {
+                                    if cell_kind(right) == CelKind::Int as i64 {
+                                        let r = host_int2_cell(
+                                            state.ctx, vm, program, name, left, right,
+                                        );
+                                        if r.is_null() {
+                                            slow_pc(vm, here)
+                                        } else {
+                                            state.frame.locals_stack_w[left_i] = r;
+                                            state.frame.locals_stack_w[right_i] =
+                                                core::ptr::null_mut();
+                                            state.frame.valuestackdepth = depth - 1;
+                                            here + 1
+                                        }
+                                    } else {
+                                        slow_pc(vm, here)
+                                    }
+                                } else {
+                                    slow_pc(vm, here)
+                                }
+                            } else {
+                                slow_pc(vm, here)
                             }
                         } else {
                             slow_pc(vm, here)

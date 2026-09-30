@@ -1,4 +1,4 @@
-use crate::magic::{Function, FunctionRegistry, IntoFunction};
+use crate::magic::{Function, FunctionRegistry, IntoFunction, ScalarFn};
 use crate::objects::{Opaque, TryIntoValue, Value};
 use crate::parser::Expression;
 use crate::{Env, ExecutionError};
@@ -524,6 +524,44 @@ impl<'a> Context<'a> {
             Context::Root { functions, .. } => functions.get(name),
             Context::Child { parent, .. } => parent.get_function(name),
         }
+    }
+
+    fn registry_and_env(&self) -> (&FunctionRegistry, &Env) {
+        match self {
+            Context::Root { functions, env, .. } => (functions, env.as_ref()),
+            Context::Child { parent, .. } => parent.registry_and_env(),
+        }
+    }
+
+    /// Entry word of a two-int scalar under `name`, when the stdlib has no
+    /// matching overload.
+    ///
+    /// The decision is stored on the registry entry and reused while
+    /// [`FunctionRegistry::generation`] is unchanged. `add_function` bumps
+    /// that generation, so the next call resolves again. A miss, a non-int
+    /// signature, or a stdlib hit returns `None` and the erased path runs.
+    pub(crate) fn int2_entry(&self, name: &str) -> Option<i64> {
+        let (registry, env) = self.registry_and_env();
+        let func = registry.get(name)?;
+        let generation = registry.generation();
+        if let Some(entry) = func.int2_cache(generation) {
+            return (entry != 0).then_some(entry);
+        }
+        let entry = if env
+            .find_overload(name, &[Value::Int(0), Value::Int(0)])
+            .is_some()
+        {
+            0
+        } else if let Some(scalar) = func.scalar() {
+            match &**scalar {
+                ScalarFn::Int2(_) => scalar.entry_word(),
+                _ => 0,
+            }
+        } else {
+            0
+        };
+        func.set_int2_cache(generation, entry);
+        (entry != 0).then_some(entry)
     }
 
     /// [`Context::get_function`] for a namespaced name, without joining the two

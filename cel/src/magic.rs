@@ -3,6 +3,7 @@ use crate::objects::{ListRef, Opaque};
 use crate::resolvers::{AllArguments, Argument};
 use crate::{ExecutionError, FunctionContext, ResolveResult, Value};
 use std::any::Any;
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -278,9 +279,21 @@ impl_handler!(C1, C2, C3, C4, C5, C6, C7, C8, C9);
 // Heavily inspired by https://users.rust-lang.org/t/common-data-type-for-functions-with-different-parameters-e-g-axum-route-handlers/90207/6
 // and https://play.rust-lang.org/?version=stable&mode=debug&edition=2021&gist=c6744c27c2358ec1d1196033a0ec11e4
 
-#[derive(Default)]
 pub struct FunctionRegistry {
     functions: BTreeMap<String, Function>,
+    /// Bumped by every [`FunctionRegistry::add`]. Distinct from the binding
+    /// [`crate::context::VersionTag`], which `add_function` does not touch.
+    /// `0` is reserved: a [`Function`] cache of generation `0` is unchecked.
+    generation: u64,
+}
+
+impl Default for FunctionRegistry {
+    fn default() -> Self {
+        FunctionRegistry {
+            functions: BTreeMap::new(),
+            generation: 1,
+        }
+    }
 }
 
 impl FunctionRegistry {
@@ -289,8 +302,16 @@ impl FunctionRegistry {
         F: IntoFunction<T> + 'static,
         T: 'static,
     {
+        self.generation = self.generation.wrapping_add(1);
+        if self.generation == 0 {
+            self.generation = 1;
+        }
         self.functions
             .insert(name.to_string(), function.into_function());
+    }
+
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
     }
 
     #[allow(dead_code)]
@@ -318,6 +339,14 @@ pub type ErasedFunction = Box<dyn Fn(&mut FunctionContext) -> ResolveResult>;
 pub struct Function {
     erased: ErasedFunction,
     scalar: Option<Arc<ScalarFn>>,
+    /// Registry generation at which [`Self::int2_entry`] was decided.
+    /// `0` means the decision has not been made. A later `add` replaces this
+    /// function and bumps the registry, so a surviving entry recomputes.
+    int2_generation: Cell<u64>,
+    /// `ScalarFn::Int2` entry word when the stdlib has no two-int overload
+    /// under this name, otherwise `0` (take the erased path). Meaningful
+    /// only while [`Self::int2_generation`] matches the registry.
+    int2_entry: Cell<i64>,
 }
 
 impl Function {
@@ -326,6 +355,8 @@ impl Function {
         Function {
             erased,
             scalar: None,
+            int2_generation: Cell::new(0),
+            int2_entry: Cell::new(0),
         }
     }
 
@@ -335,7 +366,24 @@ impl Function {
         Function {
             erased,
             scalar: ScalarFn::from_any(typed).map(Arc::new),
+            int2_generation: Cell::new(0),
+            int2_entry: Cell::new(0),
         }
+    }
+
+    /// Cached two-int resolution for `generation`, if this entry was filled
+    /// then. `Some(0)` is a filled miss (erased path). `None` is unchecked.
+    pub(crate) fn int2_cache(&self, generation: u64) -> Option<i64> {
+        if self.int2_generation.get() == generation {
+            Some(self.int2_entry.get())
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn set_int2_cache(&self, generation: u64, entry: i64) {
+        self.int2_entry.set(entry);
+        self.int2_generation.set(generation);
     }
 
     /// The scalar form, when the closure had one of [`ScalarFn`]'s signatures.
@@ -403,6 +451,18 @@ impl ScalarFn {
 }
 
 impl ScalarFn {
+    /// Call an [`ScalarFn::Int2`] whose [`ScalarFn::entry_word`] is `entry`.
+    ///
+    /// # Safety
+    ///
+    /// `entry` is the entry word of an `Int2` arm, and that `ScalarFn` is
+    /// still alive (the registry entry that produced the word has not been
+    /// replaced).
+    pub(crate) unsafe fn call_int2(entry: i64, a: i64, b: i64) -> i64 {
+        let f = unsafe { &*(entry as usize as *const Box<dyn Fn(i64, i64) -> i64>) };
+        f(a, b)
+    }
+
     /// The address of this closure's `Box`, as one machine word.
     ///
     /// The batch machine's `host_call_*` helpers (`majit/bytecode.rs`) read
