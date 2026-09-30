@@ -1,0 +1,10 @@
+board_1:  0:54  up 1 day, 23:32, 52 users, load averages: 113.25 143.16 132.35  1:09  up 1 day, 23:47, 52 users, load averages: 11.84 33.95 66.62 
+ck_1:  1:09  up 1 day, 23:47, 52 users, load averages: 11.84 33.95 66.62  1:21  up 1 day, 23:58, 52 users, load averages: 8.78 14.33 36.63 
+regime_1:  1:21  up 1 day, 23:58, 52 users, load averages: 8.78 14.33 36.63  1:22  up 1 day, 23:59, 52 users, load averages: 7.02 13.27 35.34 
+board_2:  1:22  up 1 day, 23:59, 52 users, load averages: 7.02 13.27 35.34  1:36  up 2 days, 13 mins, 52 users, load averages: 11.23 21.12 29.58 
+ck_2:  1:36  up 2 days, 13 mins, 52 users, load averages: 11.23 21.12 29.58  1:48  up 2 days, 26 mins, 52 users, load averages: 7.56 12.22 20.65 
+regime_2:  1:48  up 2 days, 26 mins, 52 users, load averages: 7.56 12.22 20.65  1:49  up 2 days, 26 mins, 52 users, load averages: 7.62 11.76 20.15 
+board_3:  1:49  up 2 days, 26 mins, 52 users, load averages: 7.62 11.76 20.15  2:02  up 2 days, 39 mins, 52 users, load averages: 7.31 9.98 14.02 
+ck_3:  2:02  up 2 days, 39 mins, 52 users, load averages: 7.31 9.98 14.02  2:13  up 2 days, 50 mins, 52 users, load averages: 8.24 8.88 11.24 
+regime_3:  2:13  up 2 days, 50 mins, 52 users, load averages: 8.24 8.88 11.24  2:13  up 2 days, 51 mins, 52 users, load averages: 10.41 9.28 11.28 
+board_old:  2:18  up 2 days, 55 mins, 52 users, load averages: 6.44 8.04 10.26  2:31  up 2 days,  1:08, 52 users, load averages: 10.13 11.15 10.77 

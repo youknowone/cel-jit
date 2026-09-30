@@ -1,0 +1,583 @@
+cometkim's benchmark expressions in his own regime (cel-jit PR #233)
+one expression, one FIXED activation, ONE evaluation timed; best of 30 batches of >= 20 CPU-ms.
+Every ns figure below is USER CPU on the measuring thread, NOT wall clock:
+time spent descheduled by other work on the box is not charged to it.
+
+Which evaluator each column runs is printed below, not described here:
+re-stating it in prose is what produced four mislabels in this file.
+
+EVALUATOR COLUMNS -- what each one actually runs:
+  stock ns   `Value::resolve_value` -- the tree walker, called DIRECTLY
+             ! the NON-DEFAULT build. A caller who names no features does not reach this.
+  exec ns    `Program::execute` -- the door a caller who names nothing goes through
+             ! cel::vm::cel_eval_loop, the bytecode VM
+  clean ns   `BoundBatch::collect_on(Tier::Clean)` -- the batch machine's UNTRACED interpreter
+             ! NOT `cel::vm`. A plain `match` interpreter over LOWERED COLUMNAR code: registers and banks over flattened `ColumnRef` buffers, no `Value`, no `Arc`, no stack. The VM on this board is `exec`, and it is the only column about `interp.rs`.
+  majit ns   `BoundBatch::collect_on(Tier::Jit)` -- the compiled trace
+             ! printed only where the settled window entered compiled code on EVERY call; otherwise the cell reads `not entered` and no ratio is derived from it.
+  auto ns    `BoundBatch::collect_on(Tier::Auto)` -- the tier the machine picks itself
+  raw ns     the batch machine with the bind step already paid
+
+case                            stock ns     exec ns    clean ns    majit ns    auto ns   route     words   save ns  stock/auto   exec/auto  enter/call  jit/row ns  jit fix ns  stock/majit     raw ns    bind ns  compiles  aborts/call  gfails/call  bridges/call
+simple_arithmetic                   66.8       125.9         7.5       121.2        5.8   clean        16         2      11.60x      21.84x        1.00         0.4       196.5        0.55x      109.4       72.7         1         0.00         0.00          0.00
+comparison                          44.6       125.3         5.7       111.9        6.3   clean        16         2       7.12x      20.02x        1.00         0.3       160.7        0.40x      115.0       63.3         1         0.00         0.00          0.00
+conditional                         37.2        88.2        18.3       150.2       20.5   clean        39         4       1.81x       4.30x        1.00         0.9       173.1        0.25x      126.2       89.7         1         0.00         0.00          0.00
+nested_expression                  173.6       274.4        22.6       122.6       25.2   clean        83         6       6.89x      10.89x        1.00         7.8        -3.7        1.42x      121.9      333.9         1         0.00         0.00          0.00
+variable_access/hashmap              6.6        67.4         5.8       111.5        5.6   clean        20         3       1.17x      11.97x        1.00         0.3       165.7        0.06x      109.4       81.7         1         0.00         0.00          0.00
+variable_access/resolver             4.8        58.3         5.7       115.3        5.9   clean        20         3       0.82x       9.94x        1.00         0.4       197.0        0.04x      110.8       87.3         1         0.00         0.00          0.00
+member_access                      120.5       438.6        17.7       131.4       17.9   clean        29         3       6.75x      24.57x        1.00         0.7       188.0        0.92x      128.4      153.8         1         0.00         0.00          0.00
+list_indexing                       92.9       497.7        25.1       128.5       25.0   clean        55        19       3.71x      19.90x        1.00         1.6       155.2        0.72x      127.2      315.7         1         0.00         0.00          0.00
+list_filter                        556.4       794.9       117.5       192.9      104.7   clean       106         8       5.32x       7.59x        1.00         6.9       177.4        2.88x      157.6       93.2         1         0.00         0.00          0.00
+list_map                           365.0       428.9        88.0       191.9       97.7   clean        41         4       3.73x       4.39x        1.00         1.4       172.3        1.90x      170.5      102.3         1         0.00         0.00          0.00
+all_comprehension                  416.1       543.8         5.7       122.2        6.2   clean        16         2      67.48x      88.18x        1.00         0.3       174.3        3.41x      109.5       63.6         1         0.00         0.00          0.00
+exists_comprehension               371.7       462.7         6.8       124.7        7.1   clean        16         2      52.34x      65.15x        1.00         0.3       151.1        2.98x      133.6       68.1         1         0.00         0.00          0.00
+map_list_scaling/1                 180.6       243.9        86.5       205.1      101.4   clean        69         7       1.78x       2.40x        1.00         1.2       233.5        0.88x      157.2      186.0         1         0.00         0.00          0.00
+map_list_scaling/10                421.0       640.4       156.7       246.4      165.2   clean       267        32       2.55x       3.88x        1.00         9.0       194.6        1.71x      202.0      200.7         1         0.00         0.00          0.00
+map_list_scaling/100              2645.6      4704.7       682.1       341.9      318.0     jit      2247       278       8.32x      14.80x        1.00        76.6       105.5        7.74x      279.3      220.4         1         0.00         0.00          0.00
+map_list_scaling/1000            23833.5     49328.5      4683.3      1001.2      967.0     jit     22047      2742      24.65x      51.01x        1.00       713.7     -1582.2       23.81x      868.2      332.6         1         0.00         0.00          0.00
+map_list_scaling/10000          223427.9    483476.8     44064.4      7126.4     7082.9     jit    220047     27384      31.54x      68.26x        1.00      8482.3     -1162.4       31.35x     6549.0      472.4         1         0.00         0.00          0.00
+filter_list_scaling/1              207.4       225.7        95.7       194.8       96.7   clean        73         7       2.14x       2.33x        1.00         1.9       205.3        1.06x      147.2      248.0         1         0.00         0.00          0.00
+filter_list_scaling/10             607.9       830.8       214.1       256.7      222.1   clean       307        34       2.74x       3.74x        1.00         9.2       153.2        2.37x      237.2      240.6         1         0.00         0.00          0.00
+filter_list_scaling/100           4162.3      6904.5      1172.7       331.4      303.9     jit      2647       302      13.70x      22.72x        1.00        68.2       519.9       12.56x      263.2      220.2         1         0.00         0.00          0.00
+filter_list_scaling/1000         35266.6     58714.4      9349.3       977.3      962.9     jit     26047      2982      36.63x      60.98x        1.00       627.4      -369.6       36.09x      872.2      354.9         1         0.00         0.00          0.00
+filter_list_scaling/10000       350292.4    581154.4     78258.8      7068.8     7337.0     jit    260047     29784      47.74x      79.21x        1.00      6144.1       128.9       49.55x     6352.5      499.1         1         0.00         0.00          0.00
+comprehension_scaling/10           729.7       848.9       150.1       211.4      145.6   clean       357        37       5.01x       5.83x        1.00        10.2       258.3        3.45x      247.1      249.6         1         0.00         0.00          0.00
+comprehension_scaling/50          3021.4      4371.9       609.5       312.0      315.4     jit      1597       168       9.58x      13.86x        1.00        39.6       278.5        9.68x      262.7      245.1         1         0.00         0.00          0.00
+comprehension_scaling/100         5139.1      8625.7      1563.7       381.6      387.9     jit      3147       332      13.25x      22.24x        1.00       101.3     -1547.1       13.47x      336.6      263.2         1         0.00         0.00          0.00
+comprehension_scaling/500        24558.6     40843.5      5759.6       802.3      821.7     jit     15547      1643      29.89x      49.71x        1.00       486.9       773.1       30.61x      706.5      305.3         1         0.00         0.00          0.00
+string_operations                  217.2       258.1         5.3       109.9        5.5   clean        16         2      39.42x      46.84x        1.00         0.3       146.3        1.98x      109.6       60.1         1         0.00         0.00          0.00
+custom_function                    123.4       250.5           -      walker          -       -         -         -           -           -           -           -           -            -          -          -         -            -            -             -
+real_world_policy                  352.3       981.5        22.1       111.9       21.1   clean        84         6      16.69x      46.48x        1.00         2.2       142.6        3.15x      111.7      668.9         1         0.00         0.00          0.00
+map_body/x                       10473.8     36868.6      3509.6       651.9      654.5     jit     17047      2442      16.00x      56.34x        1.00       441.1      -739.6       16.07x      523.7      305.8         1         0.00         0.00          0.00
+map_body/x*2                     20762.7     53725.2      5747.8      1168.6     1164.7     jit     22047      2742      17.83x      46.13x        1.00       875.8       308.8       17.77x     1051.6      357.1         1         0.00         0.00          0.00
+map_body/x*2+1                   41303.7     74306.6      6529.6      1295.1     1281.1     jit     27047      3042      32.24x      58.00x        1.00       919.6     -2272.7       31.89x     1153.3      373.6         1         0.00         0.00          0.00
+map_body/x*2+1-3                 51726.9     78209.9      5786.0       956.3      937.5     jit     32047      3342      55.18x      83.43x        1.00       867.3     -8637.2       54.09x      818.8      311.2         1         0.00         0.00          0.00
+record_map_scaling/1               169.7       221.7        75.3       152.8       68.8   clean        64         7       2.47x       3.22x        1.00         0.9       162.6        1.11x      115.9      172.3         1         0.00         0.00          0.00
+record_map_scaling/10              588.9       853.6       129.8       201.0      145.2   clean       217        29       4.06x       5.88x        1.00         8.2        55.5        2.93x      194.3      231.9         1         0.00         0.00          0.00
+record_map_scaling/100            5902.0      8772.8       488.2       229.3      227.2     jit      1747       248      25.98x      38.62x        1.00        39.4      -172.7       25.74x      187.1      180.0         1         0.00         0.00          0.00
+record_map_scaling/1000          49102.8     78788.6      3123.7       570.3      572.6     jit     17047      2442      85.76x     137.60x        1.00       426.9      1030.8       86.11x      468.1      304.7         1         0.00         0.00          0.00
+record_map_scaling/10000        539388.4   1020696.2     36430.1      5320.5     6195.1     jit    170047     24384      87.07x     164.76x        1.00      5066.0      1156.3      101.38x     5307.4      476.9         1         0.00         0.00          0.00
+record_filter                    67152.1    129261.1      9395.9      1013.6     1016.1     jit     22047      2742      66.09x     127.22x        1.00       624.7      -161.6       66.25x      791.9      368.3         1         0.00         0.00          0.00
+record_exists_int/1                192.9       361.7        30.3       134.8       28.0   clean        63         7       6.90x      12.93x        1.00         1.3       165.2        1.43x      125.0      189.0         1         0.00         0.00          0.00
+record_exists_int/10              1103.3      2280.5        95.2       186.3       97.8   clean       243        30      11.28x      23.31x        1.00         6.4       133.2        5.92x      193.6      188.9         1         0.00         0.00          0.00
+record_exists_int/100             9373.9     20765.9       641.0       231.6      229.3     jit      2043       266      40.88x      90.57x        1.00        38.6       174.3       40.47x      220.3      182.4         1         0.00         0.00          0.00
+record_exists_int/1000           81500.3    164034.7      4977.1       486.2      511.2     jit     20043      2622     159.42x     320.86x        1.00       445.5      -132.2      167.64x      566.9      186.6         1         0.00         0.00          0.00
+record_exists_int/10000        1013806.4   2144976.6     42736.1      3503.6     3065.3     jit    200043     26184     330.74x     699.76x        1.00      3045.3      1135.5      289.36x     3480.5      167.9         1         0.00         0.00          0.00
+record_exists_str/1                174.6       346.2        31.8       111.6       22.6   clean        63         7       7.74x      15.35x        1.00         0.7       157.3        1.56x      101.4      193.5         1         0.00         0.00          0.00
+record_exists_str/10               994.3      2440.6       113.1       177.7      104.6   clean       243        30       9.51x      23.34x        1.00         5.9        95.8        5.59x      192.8      288.7         1         0.00         0.00          0.00
+record_exists_str/100             8154.4     16076.1       576.1       164.6      171.2     jit      2043       266      47.62x      93.88x        1.00        33.8         6.0       49.55x      169.2      293.5         1         0.00         0.00          0.00
+record_exists_str/1000           79562.8    162508.9      5223.1       424.2      431.5     jit     20043      2622     184.38x     376.61x        1.00       294.2       -33.0      187.55x      434.4      961.1         1         0.00         0.00          0.00
+record_exists_str/10000         776890.4   1628468.8     56284.7      2781.1     2858.2     jit    200043     26184     271.81x     569.75x        1.00      2846.0       295.5      279.35x     2910.3     7797.4         1         0.00         0.00          0.00
+scalar_exists/1                    133.8       181.4        21.0       103.7       21.9   clean        63         7       6.12x       8.30x        1.00         0.8       141.2        1.29x      105.0      135.8         1         0.00         0.00          0.00
+scalar_exists/10                   661.6       749.6        83.5       154.0       86.3   clean       243        30       7.67x       8.69x        1.00         5.0       181.7        4.30x      156.6      139.1         1         0.00         0.00          0.00
+scalar_exists/100                 5746.8      6673.0       570.1       180.0      178.1     jit      2043       266      32.27x      37.47x        1.00        30.4       148.4       31.93x      173.9      134.4         1         0.00         0.00          0.00
+scalar_exists/1000               54993.8     67504.2      5123.4       467.5      467.0     jit     20043      2622     117.75x     144.54x        1.00       310.5       307.8      117.63x      453.7      137.3         1         0.00         0.00          0.00
+scalar_exists/10000             538220.1    679625.0     29583.4      2791.6     2839.0     jit    200043     26184     189.58x     239.39x        1.00      2824.6       -91.3      192.80x     2796.1      127.3         1         0.00         0.00          0.00
+
+coverage: 53/54 lower to the compiled tier; 54/54 are answered
+  custom_function              declines: unsupported for majit lowering: call `add`
+
+per-row cost BY TIER — one replicated-batch slope, run on three tiers.
+`interp` is the traced portal with its trace threshold at `u32::MAX`, so it can
+never compile: that column is the per-row cost BEFORE compiling and `jit` is the
+same row AFTER. `clean` is the same columnar program on the batch machine's
+UNTRACED interpreter, the floor under both.
+
+⚠ `clean` is NOT `cel::vm`. It is `BoundBatch::collect_on(Tier::Clean)`, a plain
+`match` interpreter over the LOWERED columnar code — registers and banks over
+flattened `ColumnRef` buffers. No `Value`, no `Arc`, no stack. The VM column on
+this board is `exec`, and it is the only one whose cost is about `interp.rs`.
+case                          clean/row  interp/row   jit/row    jit earns  clean fix  interp fix   jit fix   drv fix
+simple_arithmetic                   0.1        21.3       0.4       55.63x        1.9        44.2     196.5     194.6
+comparison                          0.1        21.3       0.3       63.03x        3.1      -284.4     160.7     157.6
+conditional                         9.2        22.5       0.9       25.32x      118.9       244.1     173.1      54.2
+nested_expression                  17.6        49.9       7.8        6.38x      539.7     -1070.4      -3.7    -543.4
+variable_access/hashmap             0.1        18.7       0.3       53.51x        2.9       -82.2     165.7     162.8
+variable_access/resolver            0.1        23.6       0.4       62.61x        3.1       -12.2     197.0     193.9
+member_access                       6.8        25.0       0.7       36.32x       19.8        45.1     188.0     168.2
+list_indexing                      11.7        32.1       1.6       20.32x       26.1        16.5     155.2     129.1
+list_filter                        31.8        59.0       6.9        8.53x      464.0        67.9     177.4    -286.6
+list_map                           10.1        31.8       1.4       22.60x      103.2      -443.4     172.3      69.0
+all_comprehension                   0.1        19.6       0.3       56.59x        2.0       -72.5     174.3     172.3
+exists_comprehension                0.1        18.6       0.3       55.69x        2.5      -119.3     151.1     148.6
+map_list_scaling/1                 20.8        32.1       1.2       25.71x      -22.1       120.0     233.5     255.6
+map_list_scaling/10                86.3       228.1       9.0       25.40x     -365.5      -237.4     194.6     560.2
+map_list_scaling/100              602.6      2096.5      76.6       27.36x    -5042.4      5717.7     105.5    5147.8
+map_list_scaling/1000            4801.9     19075.7     713.7       26.73x    -5343.3     -6768.4   -1582.2    3761.1
+map_list_scaling/10000          61213.8    255893.8    8482.3       30.17x   -11022.6    -52492.1   -1162.4    9860.2
+filter_list_scaling/1              27.0        43.0       1.9       22.86x     -266.3         5.3     205.3     471.5
+filter_list_scaling/10            117.3       255.1       9.2       27.60x     1292.7      -220.2     153.2   -1139.4
+filter_list_scaling/100          1057.7      2077.0      68.2       30.46x      441.0      7864.4     519.9      78.9
+filter_list_scaling/1000         6961.3     19398.9     627.4       30.92x   -13877.9       517.5    -369.6   13508.3
+filter_list_scaling/10000       60363.1    186574.4    6144.1       30.37x    22395.2    -21204.3     128.9  -22266.3
+comprehension_scaling/10          120.7       262.1      10.2       25.75x    -2241.9      -500.4     258.3    2500.1
+comprehension_scaling/50          502.2      1214.6      39.6       30.68x     -778.2     -4335.0     278.5    1056.7
+comprehension_scaling/100         840.1      2609.3     101.3       25.76x    75316.7      -625.6   -1547.1  -76863.8
+comprehension_scaling/500        6351.8     11089.3     486.9       22.77x  -144136.7     84499.5     773.1  144909.8
+string_operations                   0.1        15.0       0.3       47.56x       -1.2        70.0     146.3     147.4
+real_world_policy                  24.1        42.8       2.2       19.85x     -315.2      -348.8     142.6     457.8
+map_body/x                       3580.0     17323.8     441.1       39.27x     -782.8    -13062.2    -739.6      43.2
+map_body/x*2                     4716.8     23995.7     875.8       27.40x   -14721.1      4011.2     308.8   15029.9
+map_body/x*2+1                   5936.5     21715.3     919.6       23.61x      884.1     18710.5   -2272.7   -3156.8
+map_body/x*2+1-3                 5487.0     19334.0     867.3       22.29x    11839.5     15742.3   -8637.2  -20476.7
+record_map_scaling/1               16.6        24.6       0.9       28.23x      187.4        14.4     162.6     -24.8
+record_map_scaling/10              85.2       248.4       8.2       30.29x     1836.0      -872.3      55.5   -1780.5
+record_map_scaling/100            447.0      1512.4      39.4       38.35x     1626.1     11637.5    -172.7   -1798.8
+record_map_scaling/1000          4440.6     22008.3     426.9       51.56x     -293.0   -177089.1    1030.8    1323.8
+record_map_scaling/10000        43565.4    208425.4    5066.0       41.14x     -917.3     14886.9    1156.3    2073.6
+record_filter                    9462.2     23564.8     624.7       37.72x    14455.3    -15770.9    -161.6  -14616.9
+record_exists_int/1                22.5        37.5       1.3       28.37x     -109.8      -230.0     165.2     275.0
+record_exists_int/10               78.5       194.3       6.4       30.45x     -511.2      3926.4     133.2     644.5
+record_exists_int/100             627.1      1741.1      38.6       45.08x     6167.2      7955.3     174.3   -5992.9
+record_exists_int/1000           5703.7     23533.5     445.5       52.83x   -21483.8    -13898.8    -132.2   21351.7
+record_exists_int/10000         46355.4    179134.0    3045.3       58.82x    40298.4    -48470.1    1135.5  -39162.9
+record_exists_str/1                17.7        25.7       0.7       35.21x      128.6       187.6     157.3      28.7
+record_exists_str/10               85.2       182.0       5.9       30.89x     -471.2        -0.2      95.8     567.0
+record_exists_str/100             571.0      1584.4      33.8       46.94x      905.0      8482.2       6.0    -898.9
+record_exists_str/1000           5629.6     15900.2     294.2       54.04x    -9027.4     -2234.7     -33.0    8994.3
+record_exists_str/10000         50422.8    155141.4    2846.0       54.51x    27271.8     31307.9     295.5  -26976.3
+scalar_exists/1                    19.2        24.5       0.8       30.11x     -157.7       104.2     141.2     298.9
+scalar_exists/10                   76.0       174.7       5.0       34.69x       50.7      1005.5     181.7     131.0
+scalar_exists/100                 573.6      1553.7      30.4       51.16x    -2040.0     29513.2     148.4    2188.4
+scalar_exists/1000               5478.5     15909.7     310.5       51.24x   -11752.8     -5688.0     307.8   12060.5
+scalar_exists/10000             41152.2    161462.4    2824.6       57.16x    13393.5    -40110.5     -91.3  -13484.8
+
+`jit earns` is `interp/row / jit/row` — what compiling bought for ONE activation,
+with the call's fixed cost differenced out of both sides. It is the only ratio in
+this file that compares two of OUR tiers on one unit, and so the only one that
+says whether the compiler is doing its job independently of how the call is
+entered.
+
+`drv fix` is `jit fix - clean fix`. `Tier::Clean` dispatches straight to the plain
+interpreter and takes no driver at all, so this difference is the pooled-driver
+path's own per-call cost — the pool lookup, the program-table insert, the state
+republish, the per-call state buffers — measured rather than itemised.
+
+⚠ `interp fix` and `jit fix` both still CONTAIN one interpreted row: the batch
+loop is bottom-tested, so row 0 runs before the first back edge on every tier.
+That row's cost scales with the expression, which is why these intercepts differ
+per case while `drv fix` is the part that does not.
+
+⚠ `jit earns` is not a claim about a single call. It compares two per-ROW slopes,
+and a call in cometkim's regime carries one row: whether that call is on the
+`interp/row` side or the `jit/row` side is what `enter/call` reports per case, and
+it is not the same answer for every case any more. A case whose `enter/call` is 0
+pays `interp/row`; one that enters through the function-entry door does not.
+
+`bind ns` split into the two halves it is made of, and what each does to the
+single-shot comparison. `bind ns` itself is unchanged — it is the same whole
+`bind_per_row` the main table prints, timed the same way.
+case                            bind ns  resolve ns  encode ns   res+enc  split err  exec/auto  exec/a+bind  exec/a+res
+simple_arithmetic                  72.7        12.4       60.5      72.9       0.3%     21.84x        1.60x       6.95x
+comparison                         63.3        10.2       54.3      64.5       1.8%     20.02x        1.80x       7.64x
+conditional                        89.7        26.4       60.1      86.5      -3.6%      4.30x        0.80x       1.88x
+nested_expression                 333.9       163.0      146.6     309.7      -7.3%     10.89x        0.76x       1.46x
+variable_access/hashmap            81.7        26.9       56.8      83.8       2.5%     11.97x        0.77x       2.07x
+variable_access/resolver           87.3        28.2       58.0      86.2      -1.2%      9.94x        0.63x       1.71x
+member_access                     153.8        65.5       85.3     150.8      -1.9%     24.57x        2.56x       5.26x
+list_indexing                     315.7       126.9      175.6     302.5      -4.2%     19.90x        1.46x       3.28x
+list_filter                        93.2        11.2       84.2      95.4       2.4%      7.59x        4.02x       6.86x
+list_map                          102.3        12.5       88.6     101.1      -1.2%      4.39x        2.14x       3.89x
+all_comprehension                  63.6        12.4       63.3      75.7      19.1%     88.18x        7.80x      29.26x
+exists_comprehension               68.1        11.1       51.0      62.1      -8.7%     65.15x        6.16x      25.41x
+map_list_scaling/1                186.0        45.7      138.2     183.9      -1.2%      2.40x        0.85x       1.66x
+map_list_scaling/10               200.7        48.9      146.9     195.8      -2.4%      3.88x        1.75x       2.99x
+map_list_scaling/100              220.4        53.7      171.0     224.7       2.0%     14.80x        8.74x      12.66x
+map_list_scaling/1000             332.6        53.5      276.0     329.4      -0.9%     51.01x       37.96x      48.34x
+map_list_scaling/10000            472.4        49.8      420.4     470.2      -0.5%     68.26x       63.99x      67.78x
+filter_list_scaling/1             248.0        67.7      184.4     252.1       1.6%      2.33x        0.65x       1.37x
+filter_list_scaling/10            240.6        59.8      160.6     220.4      -8.4%      3.74x        1.80x       2.95x
+filter_list_scaling/100           220.2        57.2      166.8     224.0       1.7%     22.72x       13.17x      19.12x
+filter_list_scaling/1000          354.9        57.5      271.7     329.2      -7.2%     60.98x       44.56x      57.54x
+filter_list_scaling/10000         499.1        50.6      884.0     934.7      87.3%     79.21x       74.16x      78.67x
+comprehension_scaling/10          249.6        64.7      168.9     233.6      -6.4%      5.83x        2.15x       4.04x
+comprehension_scaling/50          245.1        62.7      163.2     225.9      -7.8%     13.86x        7.80x      11.56x
+comprehension_scaling/100         263.2        66.5      188.6     255.1      -3.1%     22.24x       13.25x      18.98x
+comprehension_scaling/500         305.3        58.6      221.7     280.3      -8.2%     49.71x       36.24x      46.40x
+string_operations                  60.1        11.3       54.5      65.8       9.4%     46.84x        3.93x      15.37x
+real_world_policy                 668.9       144.8      520.6     665.4      -0.5%     46.48x        1.42x       5.92x
+map_body/x                        305.8        45.7      279.8     325.5       6.4%     56.34x       38.39x      52.66x
+map_body/x*2                      357.1        62.1      292.9     355.0      -0.6%     46.13x       35.30x      43.79x
+map_body/x*2+1                    373.6        63.0      288.3     351.2      -6.0%     58.00x       44.91x      55.29x
+map_body/x*2+1-3                  311.2        45.9      255.8     301.7      -3.1%     83.43x       62.63x      79.53x
+record_map_scaling/1              172.3        44.0      121.9     165.9      -3.7%      3.22x        0.92x       1.97x
+record_map_scaling/10             231.9        45.5      121.7     167.2     -27.9%      5.88x        2.26x       4.48x
+record_map_scaling/100            180.0        44.8      141.4     186.2       3.4%     38.62x       21.55x      32.26x
+record_map_scaling/1000           304.7        47.7      273.8     321.5       5.5%    137.60x       89.81x     127.03x
+record_map_scaling/10000          476.9        63.0      579.2     642.3      34.7%    164.76x      152.98x     163.10x
+record_filter                     368.3        66.6      306.0     372.6       1.2%    127.22x       93.37x     119.39x
+record_exists_int/1               189.0        69.9      111.2     181.1      -4.2%     12.93x        1.67x       3.69x
+record_exists_int/10              188.9        62.0       91.7     153.7     -18.6%     23.31x        7.95x      14.27x
+record_exists_int/100             182.4        66.5      107.9     174.5      -4.4%     90.57x       50.44x      70.20x
+record_exists_int/1000            186.6        69.9      116.0     185.9      -0.4%    320.86x      235.05x     282.28x
+record_exists_int/10000           167.9        53.6       98.8     152.4      -9.3%    699.76x      663.42x     687.75x
+record_exists_str/1               193.5        45.5      145.1     190.6      -1.5%     15.35x        1.60x       5.09x
+record_exists_str/10              288.7        45.7      169.0     214.8     -25.6%     23.34x        6.21x      16.24x
+record_exists_str/100             293.5        44.5      236.8     281.3      -4.2%     93.88x       34.59x      74.51x
+record_exists_str/1000            961.1        43.7      871.0     914.7      -4.8%    376.61x      116.70x     341.99x
+record_exists_str/10000          7797.4        45.8     7694.5    7740.3      -0.7%    569.75x      152.83x     560.77x
+scalar_exists/1                   135.8        42.0       87.4     129.4      -4.7%      8.30x        1.15x       2.84x
+scalar_exists/10                  139.1        46.9       95.5     142.4       2.4%      8.69x        3.33x       5.63x
+scalar_exists/100                 134.4        40.3       83.3     123.6      -8.0%     37.47x       21.35x      30.55x
+scalar_exists/1000                137.3        43.2       85.5     128.6      -6.3%    144.54x      111.70x     132.31x
+scalar_exists/10000               127.3        39.8       83.7     123.5      -3.0%    239.39x      229.11x     236.08x
+
+`resolve ns` is every declared slot path looked up in the batch's columns — one
+map lookup per path, and nothing else. `encode ns` is what the rest of `bind`
+does: build the buffers the caller did not supply (a `size(...)` length column, a
+list's `offset(...)` prefix sums, a concatenation's characters) and rank the
+batch's strings into ids. The library performs them in that order and `bind` is
+the two composed, so a caller can hold a resolution and encode against it — which
+is how `encode ns` is timed without re-resolving inside the timer.
+
+`split err` is `(res+enc - bind) / bind`. It is the whole test that this is a
+SPLIT and not a second measurement of the same thing: near zero, the two halves
+account for `bind` and the row can be read; large, they do not and it cannot. The
+answers are gated separately — the two-step bind must produce what the one-step
+bind produces, checked per case before anything here is timed.
+
+The three ratios are all `exec` over one of OUR costs, spelled as the division
+performed, so ABOVE 1.00x we beat `Program::execute` and BELOW it that door beat
+us. They answer three different questions and are not interchangeable:
+* `exec/auto` charges our side for the EVALUATION only. A caller who binds once
+and evaluates many times approaches it; a single-shot caller never does.
+* `exec/a+bind` charges our side in full — evaluation plus the whole activation
+encoding. This is what a caller who evaluates ONCE actually gets, and it is the
+honest single-shot verdict.
+* `exec/a+res` charges our side only for the work the other door also does: the
+by-name lookup per variable that `cel_eval_loop` performs on every call. It is
+NOT what a single-shot caller pays. It isolates how much of the single-shot
+verdict is columnar SETUP rather than a difference between evaluators, which is
+the one thing `exec/a+bind` cannot say on its own.
+
+⚠ Read `exec/a+bind` and `exec/a+res` as a PAIR. Where they agree, the verdict
+does not depend on how the encoding is charged. Where they straddle 1.00x, it
+does, and the case is decided by setup rather than by evaluation — which is a
+finding about the batch API's shape, not about either evaluator.
+
+`clean ns` is the same lowered bytecode on the plain Rust VM, with no tracing
+machinery at all. Where `majit` is far above it the cost is the tracer, not the
+machine, and the compiled tier is not what answered the call.
+
+`auto ns` is the DEFAULT door, `collect()`, which names no tier: the bound batch
+picks between `clean` and `majit` by `save ns` — how much the compiled tier is
+ESTIMATED to save on this run: rows times a per-row rate plus elements times a
+per-element one, each rate set by that loop's word count less a fixed per-unit
+cost a word count cannot see. Below `JIT_ENTRY_PS` the run does not save what
+reaching compiled code costs, so it stays on `clean` — the batch machine's
+untraced interpreter, not `cel::vm`. `words` is the same
+run's size on either tier, printed beside it because the two were once one
+decision. `route` says which side of that each case
+landed, and `auto ns` should track whichever of the two columns to its left the
+route named. `majit ns` beside it is still the compiled tier ASKED FOR outright,
+which is what every tier-explicit test and every column of this table below
+measures — the route changes the default, not the `_on` doors.
+
+⚠ `stock/auto` measures our route against the TREE WALKER, `stock/majit` a
+caller who names `Tier::Jit`, and `exec/auto` our route against
+`Program::execute`. All three are spelled as the division actually performed, so
+each cell checks against the two ns columns it comes from: ABOVE 1.00x we beat
+the evaluator the numerator names, BELOW it that evaluator beat us.
+
+The walker is NOT what a default caller gets, and `exec ns` is the column that
+says so in numbers. `vm` is a default feature, so in this build `Program::execute`
+reaches cel::vm::cel_eval_loop, the bytecode VM,
+while the head of this file says why the walker is nonetheless the right baseline
+for comparing against HIS published figures. So read the two families apart:
+every `stock/..` ratio is against the walker and against nothing else, and
+`exec/auto` is the one that answers whether we beat the evaluator a default
+consumer actually runs.
+
+⚠ `exec ns` is one whole `Program::execute` and the batch columns beside it are
+not the same setup. `execute` builds its VM state — operand stack, locals, logic
+slots — on every call and looks every variable up in the `Context` BY NAME; the
+batch columns hoist both out, the activation having been resolved to slots and
+encoded into columns at `bind` (timed on its own as `bind ns`) and the run state
+belonging to the `BoundBatch` and reused call after call. `exec/auto` is
+therefore a DOOR-to-door ratio — what a caller gains by moving to the batch API,
+setup and all — and not two evaluators compared on equal footing.
+
+Where the two disagree the route is
+doing something: at one row a straight-line expression has a body of tens of
+words, and no amount of compiling it pays back the entry.
+
+`majit ns` holds the activation fixed exactly as his `execute(&ctx)` does, but a
+majit activation was resolved to slots and encoded into columns at `bind`, while his
+compiled code looks every variable up in the context BY NAME on every call. `bind ns`
+is that encoding timed on its own — it is MORE than name resolution, so adding it back
+is a pessimistic bound on the difference, not an estimate of it.
+
+`enter/call` is calls that ENTERED compiled code, counted at the point the
+compiled body is about to run — not artifacts minted. It now GATES the `majit ns`
+cell beside it rather than merely standing next to it: a case that did not enter on
+every call of the settled window prints `not entered` there and no `stock/majit`
+ratio, because the number would be the tracing interpreter's under the compiled
+tier's heading. A `0.00` with `compiles` at 1 is a loop that was compiled and never
+run. Two ways in can produce a positive number: the row BODY contains a loop that
+gets hot on its own, or the function-entry door — which counts CALLS, not rows —
+warmed on the repeated one-row calls this file makes. The door declines for a
+program whose own loop is already compiled, so which of the two applies is a
+per-case fact.
+
+⚠ The window this is measured over is the 1 000-call settled window, not the timed
+loop: the timed loop cannot afford a counter read per call. A case that entered on
+all 1 000 settled calls and then stopped would still publish a number. For the
+per-call-evidenced form of the same measurement see `majit_percall_steady`.
+
+`jit/row ns` is the compiled tier's MARGINAL cost of one more activation,
+measured by replicating this case's single activation bit-for-bit into two batch
+sizes and differencing them. Three counter gates stand in front of it and it
+prints `-` if any fails: every call in a fixed 200-call probe entered compiled
+code, every TIMED call entered it, and no compile or trace-abort happened inside
+the timed windows. A number that merely looks fast does not get printed.
+
+⚠ `jit/row ns` is NOT the unit cometkim's `compiled` column is in. His is one
+whole `execute(&ctx)` including every per-call cost; this differences those away
+on purpose. `jit fix ns` is published so they can be added back — but their SUM
+models a call this engine cannot currently make at one activation, and quoting
+`jit/row` against his number without it flatters this side.
+⚠ A NEGATIVE `jit fix ns` means the two-point model is refuted for that row: cost
+is superlinear in the replication count there, so extrapolating to zero rows
+undershoots. Its `jit/row` is still a measured difference quotient between the
+two sizes, but it is not a constant marginal cost, and neither cell should be
+read as a per-activation figure.
+⚠ Every replicated row is identical, so the compiled loop gets perfect branch
+prediction and a hot cache. His regime has the same property — he re-evaluates
+one fixed activation — so the comparison is symmetric, but neither side's number
+is what varying data would cost.
+
+The `record_*` cases are the only ones whose comprehension body carries a
+CONTAINER. Every other body on this board is integer arithmetic over a scalar,
+which is the one shape whose loop never puts a container on the operand stack —
+and structured attributes are what CEL is actually used over.
+
+⚠ `record_map_scaling/N` is a SIGN TEST against `map_list_scaling/N`, not a
+paired control. Same element counts and the same `map`, but the two differ three
+ways at once and the three do not share a sign.
+
+In the BODY: `x * 2` is 3 instructions, 2 drops, 0 atomics; `i.price` is 2
+instructions, 1 drop, 2 atomics — `LoadLocal i` clones the element's `Map` and
+`GetField` pops it, reads through a reference and drops it again.
+
+⚠ But a ladder-vs-ladder difference is NOT body-scoped, and the SCAFFOLDING
+carries two more atomics that a body table cannot see. `IterAt` is
+`value_index(sequence, index)`, which returns an OWNED `Value`, so it clones the
+element every iteration; and `StoreLocal iter_var` drops what the slot held
+before, which is the PREVIOUS element. Both are `Value::Int` on
+`map_list_scaling` and `Value::Map` here. So the per-element difference between
+the two ladders is: −1 instruction, −1 drop, and **+4 atomic RMWs**, not +2.
+The clone and drop COUNTS are equal across the two; what differs is which arm of
+`drop_glue::<Value>` each takes — the `Map` arm against the do-nothing one.
+
+A difference of terms with mixed signs bounds nothing in either direction, so
+what the pair answers is whether that container traffic outweighs the
+instruction and the drop it saves, and nothing more quantitative. It cannot be
+repaired by a better rung: a field read IS an instruction, so no record body
+matches a scalar body's instruction count. The matched pair is
+`record_exists_int/N` against `record_exists_str/N` below.
+
+⚠ The column that answers it is `exec`, and ONLY `exec`. The three components
+are instructions, drops and `Arc` traffic in `cel/src/vm/interp.rs`, and none of
+them exist on `clean`/`majit`/`auto`, which read `items[].price` as a flattened
+`i64` column with no `Value` and no refcount anywhere in it. Those columns
+answer a different and also interesting question — whether the COLUMNAR tier
+cares about record shape — and must be reported under that heading.
+
+`record_exists_int/N` and `record_exists_str/N` ARE a matched pair, and the only
+one here that earns the word: same `exists`, same instruction sequence, same
+drop count, the same CONTAINER atomics, identical declared columns, and neither
+predicate matchable so neither short-circuits. They differ in the field's type
+and in nothing else.
+
+Both are LADDERS over `map_list_scaling`'s element counts, and that is a second
+question rather than a refinement of the first. `exists` answers a BOOL, so no
+rung of either allocates a result list at any `n`, where `map_list_scaling/N`
+and `record_map_scaling/N` each write `n` `Value`s and converge on each other
+per element at n = 10 000.
+
+⚠ But the pair that tells the two readings of that convergence apart is
+`scalar_exists/N` against `record_exists_int/N`, NOT the int-vs-str pair. The
+convergence is between a flat `Vec<i64>` and `n` separately-allocated
+`Arc<HashMap>`s — an INPUT SHAPE contrast — and int-field against string-field
+varies the field type at a roughly constant input shape. An instrument has to
+vary the same thing the question does. `scalar_exists` binds the same
+`Col::IntList` and the same `Value::list` of `Value::Int` that
+`map_list_scaling` does, so `scalar_exists` vs `record_exists_int` is exactly
+`map_list_scaling` vs `record_map_scaling` with the result list removed:
+
+converges at n = 10 000 anyway  ⇒ the input alone reaches the ceiling
+keeps separating                ⇒ the output list is what converged
+
+⚠ What `exists` removes is FOUR things, not one. `run()`'s value is a temporary
+dropped inside the timed span, so a `map` rung allocates a `Vec<Value>`, writes
+`n` elements, makes `n` `drop_glue::<Value>` calls and frees it, EVERY timed
+call. `exists` answers a bool and does none of the four. That is a much heavier
+treatment than "no output list", which is why a null result here is informative
+rather than merely disappointing.
+
+⚠ And three of those four are the SAME work on both map ladders -- each produces
+a `Vec<Value>` of `n` `Value::Int`, identical in type, size, allocation and free.
+So no common-addend reading of the output survives: a shared cost added at the
+top rung would raise both ladders by the same amount and leave their difference
+intact, and the measured increments were 9.91 ns against 2.99. What survives is
+INTERACTION -- the output evicting resident input, where the ladder with more to
+lose loses more.
+
+⚠ At n = 10 000 that allocation is ~240 KB, large enough that the allocator may
+change regime (large bin or `mmap`) and take page faults a 24 KB one does not.
+It is a PER-CALL cost, so segment slopes shed most of it -- but not all, since
+the fault count scales with the size.
+
+⚠ `clean`/`majit`/`auto` time `collect_into_on` into a buffer REUSED call after
+call, so they amortize that allocation to zero, while `stock` and `exec`
+allocate and free a fresh one every call. That is the deliberate fair door and
+not a defect, but it means the VM columns carry one malloc+free per call the
+batch columns do not, and at n = 10 000 it is a 240 KB one. It does NOT touch
+the discriminator, which compares `exec` against `exec` and pays it identically
+on both arms; it does affect `exec/auto` and `stock/auto` at large `n`.
+
+⚠ The two arms build their activations differently, and this is harmless ONLY
+because of WHERE the build sits. `run_case` calls `(case.stock)(&mut activation)`
+ONCE per case, before any timer, and both VM columns then take it by reference
+through `black_box(&activation)`. The scalar arm's build converts a `Vec<i64>`
+into `n` `Value::Int` -- a 24N allocation, ZERO atomics. The record arm's clones
+a `Vec<Value>` of `Value::Map` -- N ATOMIC INCREMENTS. Both scale with `n`;
+only one touches a refcount, so the difference is in KIND and could not cancel
+in a difference of the two arms. Anyone who later moves that build inside a
+timed region has BROKEN this instrument, not perturbed it: the record arm would
+then pay `n` `Arc` increments per call that the scalar arm does not, which
+manufactures the "keeps separating" branch -- the exact result the pair exists
+to test for.
+
+⚠ The two outcomes are not equally strong. A SEPARATION is clean. A CONVERGENCE
+is real evidence but leaves a residue: at n = 10 000 the scalar rung already
+carries ~240 KB of input against a 128 KB L1D, so it is over L1 on the input
+alone, and a convergence there is consistent with input saturation without
+proving the ceiling is bandwidth rather than a level crossing. Read the weaker
+branch as the weaker branch.
+
+⚠ What that pair isolates is NOT the container's refcount traffic. That is FOUR
+atomics per element and it is identical on both rungs: `IterAt` clones the
+element out of the list, `StoreLocal` drops the previous one, `LoadLocal i`
+clones it again and the field read drops that clone — whichever field is named.
+
+What differs is FOUR MORE on the string rung, none of them on the container:
+`value_field` returns `v.into_owned()`, so a string field CLONES its
+`Arc<String>` where an int field copies; `LoadConst "zz"` clones the constant's
+`Arc<String>` every iteration; and `Equals` pops both operands by value and
+drops them. Int rung: none of the four. So the pair prices a string-valued
+attribute against an int-valued one — a real question for policy evaluation —
+and it does not price the loop.
+
+⚠ The batch columns on the string rung are not comparable to the walker's.
+`ValType::Str` carries a string as its order-preserving i64 RANK among the
+batch's distinct strings, so the compiled tiers pay neither the container atomic
+nor the answer's. `exec/auto` and `stock/auto` will therefore be wider there than
+on the int rung for a reason that is about representation and not about the loop.
+
+⚠ `record_filter` is NOT `filter_list_scaling`'s control. `i.price > 10` admits
+989 of 1 000 elements where `x % 2 == 0` admits half, so the two run a different
+number of appends per element. It is here because it is the shape a policy has,
+not because it differences against anything.
+
+task #88's decomposition, computed here rather than by hand. `majit fixed`
+is the column the STOP-AT-P5 gate is stated in: its re-entry criterion is a
+compiled artifact's fixed per-call cost under ~1 us. It is reported by TWO
+estimators, in the second block, because one of them cannot disagree with
+its own inputs and so cannot report an error against them.
+
+the per-element cost, and the clean VM it is measured against:
+
+ladder                  points  excl fit through n  majit/elem     ls/elem  clean fixed  clean/elem  break-even
+map_list_scaling             5     0      1..10000        0.692       0.688         82.1       4.398          33
+filter_list_scaling          5     0      1..10000        0.687       0.682         87.8       7.817          15
+comprehension_scaling        4     0     10..500          1.206       1.141         35.6      11.448          16
+record_map_scaling           5     0      1..10000        0.517       0.516         71.7       3.636          26
+record_exists_int            5     0      1..10000        0.337       0.334         26.0       4.271          28
+record_exists_str            5     0      1..10000        0.267       0.264         26.2       5.626          16
+scalar_exists                5     0      1..10000        0.269       0.265         18.1       2.957          32
+
+`majit fixed`, the number the gate is stated in, by both estimators:
+
+ladder                  points  excl   n_lo    t(n_lo)  majit fixed   mid err     ls fixed    ls err  gfails/call  bridges/call
+map_list_scaling             5     0      1      205.1        204.4     20.0%        256.2     25.2%         0.00          0.00
+filter_list_scaling          5     0      1      194.8        194.1     21.7%        249.3     28.4%         0.00          0.00
+comprehension_scaling        4     0     10      211.4        199.3     16.8%        238.6     18.3%         0.00          0.00
+record_map_scaling           5     0      1      152.8        152.3     21.7%        147.1     24.2%         0.00          0.00
+record_exists_int            5     0      1      134.8        134.5     27.4%        167.4     24.4%         0.00          0.00
+record_exists_str            5     0      1      111.6        111.3     35.9%        145.9     31.0%         0.00          0.00
+scalar_exists                5     0      1      103.7        103.4     31.1%        151.5     46.4%         0.00          0.00
+
+Read it with six cautions.
+* The two-point fit passes through its two endpoints BY CONSTRUCTION, so
+it cannot disagree with them: its `majit fixed` is an extrapolation to
+n=0 carrying no residual of its own. `mid err` is the whole test of that
+model — the worst relative error at a ladder point the fit did not
+touch — and a `-` means the ladder had no such point and the row is
+entirely unchecked.
+* `ls fixed` is the same model fitted by LEAST SQUARES over every included
+point. It is the second opinion, not the better number, and it does not
+replace the two-point figure: reproducing #88's METHOD is what makes a
+number here comparable to one taken then. Unlike the first it touches no
+point, so every point is a residual — `ls err` is the worst of them. A
+`-` means fewer than three points, where least squares is just the line
+through the two and its zero residual would say nothing. No interval is
+printed for either: four or five points at one sample each cannot carry
+one, and printing one would claim a precision this harness has not got.
+* `majit fixed` is `t(n_lo)` MINUS the slope's contribution at n_lo, and
+both are printed so that correction can be sized rather than assumed.
+Where it is a few percent of `t(n_lo)` the intercept inherits the
+precision of a DIRECTLY MEASURED point, not the model's: `mid err` and
+`ls err` describe the model BETWEEN the endpoints, so they bound the
+per-element term and any extrapolation past the ladder's reach, and a
+large one does not make the intercept uncertain by the same fraction.
+The reading that does put the intercept in doubt is the opposite one —
+`per_elem * n_lo` a LARGE fraction of `t(n_lo)`, where `majit fixed` is
+mostly the subtraction of a modelled quantity from a measured one.
+* `excl` is ladder members whose loop never compiled, so they are NOT in
+the fit: their `majit` cell is the tracing interpreter, and fitting it
+would decompose a different machine. (0 across all ladders.)
+It is printed PER LADDER because `points` alone cannot say why a rung
+is missing: `points=2, excl=1` is a decline worth investigating, while
+`points=2, excl=0` is a rung this run simply did not run. A chunked-out
+rung never becomes a row at all, so it is invisible to `excl` — the two
+columns are only informative together.
+* `gfails/call` belongs beside `majit fixed`, not in a separate table:
+#88 found 1.00 guard failure per call on every compiled case and named
+it the prime suspect for the fixed cost it measured. A fixed cost read
+without it is half a finding.
+* `bridges/call` counts artifacts COMPILED in the warm window, not
+artifacts entered. A zero says the artifact population stopped
+growing, NOT that the call enters no bridge; a nonzero one says a warm
+call is still compiling, which puts compilation inside `majit fixed`.
+
+BODY-size ladder: the element count is FIXED and only the body of the `map`
+varies.
+case                           elems    ops  loop ops     exec ns    stock ns  exec/elem  stock/elem
+map_body/x                      1000     13         -     36868.6     10473.8      36.87       10.47
+map_body/x*2                    1000     13         -     53725.2     20762.7      53.73       20.76
+map_body/x*2+1                  1000     15         -     74306.6     41303.7      74.31       41.30
+map_body/x*2+1-3                1000     17         -     78209.9     51726.9      78.21       51.73
+
+The three size ladders above hold the expression fixed and grow `n`, so they
+price an ELEMENT and cannot say what inside an element the cost is. These hold
+`n` fixed and grow the body, so the loop scaffolding every rung runs is
+identical and the only thing that moves between two rungs is how many
+instructions the body itself contributes.
+
+`ops` is every instruction in the compiled stream. `loop ops` is the span that
+runs once per element: the instructions from the single backward `Jump`'s
+target through that `Jump`, inclusive. Both come from the COMPILER, not from
+counting operators in the source — see `Ops` for why that distinction is the
+point of the column and for the one caveat, that the counts are read off a
+recompilation. `loop ops` prints `-` unless the stream holds exactly one
+backward jump, which is a refusal to name a span rather than a guess at one.
+
+`exec/elem` and `stock/elem` are that rung's whole call divided by `elems`. The
+per-call fixed cost is NOT differenced away — there is no size ladder here to
+take it out with — so each figure carries its own, spread across every element.
+
+`stock/elem` is the CONTROL and not decoration: the same bodies through the
+other evaluator, against the same x-axis. Where it is flat in body size and
+`exec/elem` is not, what grows with the body is the VM's cost per instruction
+and not the expression's own.

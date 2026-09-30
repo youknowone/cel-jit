@@ -1,0 +1,183 @@
+//! cell-majit **uint** columnar batch evaluator vs the stock tree-walker
+//! (issue #357). The unsigned analog of `majit_columnar_batch`.
+//!
+//! This is an explicit **cross-model batch experiment**, not the default fair
+//! CEL JIT benchmark. Its stock/JIT ratio combines columnar specialization,
+//! batch fusion, and compilation; it is not a JIT-only claim.
+//!
+//! Runs the REAL cel path: a CEL `Program` over `uint` columns is lowered
+//! (`cel::majit::lower::lower_typed`, under a schema declaring the uint slots)
+//! and evaluated over a batch of rows via `eval_batch_sum_f`. uint values share
+//! the int register file (their raw 64-bit pattern), so the compiled trace reads
+//! each column as `i64` bits via a `raw_load`; ordering comparisons emit the
+//! unsigned `OP_ULT`/`OP_ULE` (`>`/`>=` via an operand swap), and the tree-walker
+//! orders `Value::UInt` unsigned, so the two agree on the full u64 range.
+//!
+//! FAIR comparison = hot vs hot. Both sides receive their data already laid out
+//! (u64 columns for the JIT, a live `Context` for the walker) and are measured
+//! steady-state, with no per-row setup on either side. The baseline is the
+//! tree-walker at its best: ONE reused `Context` whose variables are overwritten
+//! per row, then `Value::resolve_value` — the walker itself, called directly.
+//! NOT `Program::execute`: that is the bytecode VM whenever the `vm` feature is
+//! on, and `vm` is a DEFAULT feature, so through the public door `stock` would
+//! be a second VM and `stock / clean VM` would compare two bytecode
+//! interpreters. `required-features = ["jit"]` does not imply
+//! `--no-default-features`, so the door would be the VM in every ordinary run.
+//!
+//! The columns are full-range u64 (about half the rows have the high bit set),
+//! so a signed compare would give a different count — the win is not bought by
+//! restricting the data to the non-negative i64 range.
+//!
+//! The benchmark reports four paths over one prebuilt batch program: stock,
+//! clean bytecode VM, majit with compilation disabled, and compiled majit.
+//! `stock / clean VM` measures the representation/lowering effect — the
+//! tree-walker against the lowered columnar bytecode — while
+//! `clean VM / JIT-on` measures the compilation effect. RELEASE ONLY (4-way
+//! equality gate).
+
+use std::hint::black_box;
+use std::time::Instant;
+
+use cel::majit::batch::{Batch, BatchProgram, ColumnRef, Tier};
+use cel::majit::bytecode::float_bank::{jit_stats, reset_jit_stats};
+use cel::majit::lower::{Schema, ValType};
+use cel::{Context, Program, Value};
+
+const LCG_A: u64 = 6364136223846793005;
+const LCG_C: u64 = 1442695040888963407;
+
+/// Deterministic full-range u64 column, returned as the i64 bit pattern the int
+/// register file carries. `as u64` in the oracle recovers the unsigned value.
+fn make_col_u(n: usize, seed: u64) -> Vec<u64> {
+    let mut x = seed;
+    let mut v = Vec::with_capacity(n);
+    for _ in 0..n {
+        x = x.wrapping_mul(LCG_A).wrapping_add(LCG_C);
+        v.push(x);
+    }
+    v
+}
+
+fn median(mut v: Vec<f64>) -> f64 {
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    v[v.len() / 2]
+}
+
+fn time_ns_per_row<F: FnMut() -> i64>(n: usize, mut f: F) -> f64 {
+    let t = Instant::now();
+    black_box(f());
+    t.elapsed().as_nanos() as f64 / n as f64
+}
+
+/// The batch API answers in CEL's types; this benchmark counts matching rows.
+fn count(v: Value) -> i64 {
+    match v {
+        Value::Int(i) => i,
+        other => panic!("unexpected batch result {other:?}"),
+    }
+}
+
+fn main() {
+    // Flagship uint policy: an unsigned column clears a per-row unsigned minimum
+    // AND stays under an unsigned ceiling above the signed range (10^19 >
+    // i64::MAX), so unsigned ordering is load-bearing.
+    let expr = "account >= minimum && account < 10000000000000000000u";
+    let program = Program::compile(expr).expect("compile");
+    let schema: Schema = [
+        ("account".to_string(), ValType::UInt),
+        ("minimum".to_string(), ValType::UInt),
+    ]
+    .into_iter()
+    .collect();
+    let lowered = BatchProgram::compile(expr, &schema).expect("lower uint policy");
+
+    let n: usize = 2_000_000;
+    let account = make_col_u(n, 0x2545_F491_4F6C_DD1D);
+    let minimum = make_col_u(n, 0x9E37_79B9_7F4A_7C15);
+    let batch = Batch::new(n)
+        .column("account", ColumnRef::UInt(&account))
+        .column("minimum", ColumnRef::UInt(&minimum));
+    let bound = lowered.bind(&batch).expect("bind columns");
+
+    // FAIR baseline: the stock tree-walker at its best — reuse one Context,
+    // overwrite the two uint variables per row (hot; no per-row Context alloc).
+    let naive = || -> i64 {
+        let mut acc = 0i64;
+        let mut ctx = Context::default();
+        for i in 0..n {
+            ctx.add_variable_from_value("account", account[i]);
+            ctx.add_variable_from_value("minimum", minimum[i]);
+            acc += match Value::resolve_value(program.expression(), &ctx).expect("execute") {
+                Value::Bool(b) => b as i64,
+                Value::Int(v) => v,
+                other => panic!("unexpected {other:?}"),
+            };
+        }
+        acc
+    };
+
+    // Correctness gate: stock == clean VM == JIT-off == JIT-on.
+    reset_jit_stats();
+    let base = naive();
+    let clean = count(bound.sum_on(Tier::Clean).expect("clean tier"));
+    let off = count(bound.sum_on(Tier::Interpreter).expect("interp tier"));
+    let off_c = jit_stats().loops_compiled;
+    reset_jit_stats();
+    let on = count(bound.sum_on(Tier::Jit).expect("jit tier"));
+    let on_c = jit_stats().loops_compiled;
+    assert_eq!(base, clean, "stock vs clean VM divergence");
+    assert_eq!(base, off, "naive vs JIT-off divergence");
+    assert_eq!(base, on, "naive vs JIT-on divergence -> miscompile");
+    assert_eq!(off_c, 0, "JIT-off must never compile");
+    assert!(on_c >= 1, "JIT-on must compile the batch loop");
+    println!("policy: {expr}");
+    println!(
+        "n = {n}, matching rows = {on} ({:.1}%)  (all paths agree)  compiles: off={off_c} on={on_c}",
+        100.0 * on as f64 / n as f64
+    );
+
+    let rounds = 5;
+    let (mut on_t, mut off_t, mut clean_t, mut naive_t) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for _ in 0..rounds {
+        naive_t.push(time_ns_per_row(n, naive));
+        clean_t.push(time_ns_per_row(n, || {
+            count(bound.sum_on(Tier::Clean).expect("clean tier"))
+        }));
+        off_t.push(time_ns_per_row(n, || {
+            count(bound.sum_on(Tier::Interpreter).expect("interp tier"))
+        }));
+        on_t.push(time_ns_per_row(n, || {
+            count(bound.sum_on(Tier::Jit).expect("jit tier"))
+        }));
+    }
+    let (jit, jit_off, vm, nv) = (
+        median(on_t),
+        median(off_t),
+        median(clean_t),
+        median(naive_t),
+    );
+    println!();
+    println!("  stock   (cel tree-walk, reused ctx) : {nv:>9.2} ns/row");
+    println!("  clean VM(lowered bytecode, no JIT)  : {vm:>9.2} ns/row");
+    println!("  majit   (tracing interp, JIT off)    : {jit_off:>9.2} ns/row");
+    println!("  majit   (compiled trace, JIT on)     : {jit:>9.2} ns/row");
+    println!();
+    println!(
+        "  VM/data-model effect  stock / clean VM : {:>8.2}x",
+        nv / vm
+    );
+    println!(
+        "  JIT effect          clean VM / JIT-on  : {:>8.2}x",
+        vm / jit
+    );
+    println!(
+        "  majit tier delta     JIT-off / JIT-on  : {:>8.2}x",
+        jit_off / jit
+    );
+    println!(
+        "  cross-model batch    stock / JIT-on    : {:>8.2}x",
+        nv / jit
+    );
+    black_box((&account, &minimum));
+}

@@ -1,0 +1,10 @@
+== provenance ==
+cel HEAD: 71f493e25cd97e3ce28060f1897ea931c806a25e
+majit HEAD: 302ee9a5bb94a310f169b09af099055c4f4f348f
+ck HEAD: 4d57618f4896f482272c983be19861a00621e270
+650d7d84e6c8363202e5d1eaaec3e78f9d4f7e36cbb7b047bc481e7ca38d396b  /Users/youknowone/Projects/pyre-wasmi/cel-jit/target/release/examples/majit_vs_cometkim_percall
+0f4e5130360ac1d13f9d58c132ce3ee4ad5b2597f502674899c5dab81ec02620  /Users/youknowone/Projects/pyre-wasmi/cel-jit/target/release/examples/jit_regime
+90e6adea99500de1a5ff2f7d7f448bacc2a601ae6f1d2659eda7749313ca159b  /Users/youknowone/Projects/cel-cometkim-233/target/release/examples/percall_ck
+fc75d54bc089bb4087310b988f9201d4e12179e4db971e992d590778b6034a1e  /Users/youknowone/Projects/pyre-wasmi/cel-jit/Cargo.lock
+90910ee536688fe3fc3b147c8fde4c392a6e576700e93ac3583df3e20a3c73fe  /Users/youknowone/Projects/cel-cometkim-233/Cargo.lock
+rustc 1.98.1 (48a229cea 2026-09-01)

@@ -1,0 +1,517 @@
+//! Allocation census for the two collect doors, on the list-producing shape.
+//!
+//! Timing on this host is not trustworthy — it is shared, and a run at load
+//! average 29 moved the untouched `collect_raw` control arm by 20-36%. An
+//! allocation COUNT is immune to that: it is a property of the code, not of the
+//! machine, so it is the same number on a quiet box and a loaded one.
+//!
+//! Both doors execute the identical compiled loop
+//! (`BoundBatch::collect_raw_with` runs it either way); the only difference is
+//! what happens to the output. `collect_on` calls `RawOutput::to_values`, which
+//! turns each row into a `Value`; `collect_raw_on` hands the flat buffers
+//! straight to the caller. The DELTA between the two arms is therefore exactly
+//! what the boxed representation costs, with the run subtracted out.
+//!
+//! Two list lengths are swept so the per-row term and the per-element term
+//! separate.
+//!
+//! RELEASE ONLY. Run: `./bench.sh allocs`.
+
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use cel::majit::batch::{Batch, BatchProgram, ColumnRef, Tier};
+use cel::majit::lower::{Schema, ValType};
+use cel::{Context, Program, Value};
+
+/// Counts every allocation the process makes. `dealloc` is deliberately not
+/// counted: the question is how much work the boxing DOES, and a freed
+/// allocation was still made.
+struct Counting;
+
+static ALLOCS: AtomicUsize = AtomicUsize::new(0);
+static BYTES: AtomicUsize = AtomicUsize::new(0);
+
+unsafe impl GlobalAlloc for Counting {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        ALLOCS.fetch_add(1, Ordering::Relaxed);
+        BYTES.fetch_add(layout.size(), Ordering::Relaxed);
+        unsafe { System.alloc(layout) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        unsafe { System.dealloc(ptr, layout) }
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        ALLOCS.fetch_add(1, Ordering::Relaxed);
+        BYTES.fetch_add(new_size, Ordering::Relaxed);
+        unsafe { System.realloc(ptr, layout, new_size) }
+    }
+}
+
+#[global_allocator]
+static ALLOC: Counting = Counting;
+
+const ROWS: usize = 50_000;
+
+/// What `Program::execute` resolves to in THIS build, for the panel headers.
+///
+/// `vm` is a default feature, so it is the bytecode VM unless the example was
+/// built with `--no-default-features`. Naming one of the two in a literal would
+/// leave the header disagreeing with what ran.
+const PUBLIC_DOOR: &str = if cfg!(feature = "vm") {
+    "bytecode VM"
+} else {
+    "tree-walker"
+};
+
+fn reset() {
+    ALLOCS.store(0, Ordering::Relaxed);
+    BYTES.store(0, Ordering::Relaxed);
+}
+
+fn read() -> (usize, usize) {
+    (
+        ALLOCS.load(Ordering::Relaxed),
+        BYTES.load(Ordering::Relaxed),
+    )
+}
+
+/// Touch every element, and every field of every element -- the traversal a
+/// consumer of `collect_on` does. A strategy that boxes on ACCESS has only
+/// MOVED the cost unless this arm is cheap too, so it is measured rather than
+/// assumed.
+fn walk(rows: &[Value]) -> i64 {
+    let mut sum = 0i64;
+    for row in rows {
+        let Value::List(items) = row else { continue };
+        for element in items.iter() {
+            match element {
+                Value::Int(i) => sum += i,
+                Value::Map(m) => {
+                    for (_, v) in m.iter() {
+                        if let Value::Int(i) = *v {
+                            sum += i;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    sum
+}
+
+fn main() {
+    // The representation width decides what an element costs, so it is part
+    // of the census rather than something to assume.
+    println!(
+        "size_of::<Value>() = {}, size_of::<Map>() = {}, size_of::<ListRef>() = {}",
+        std::mem::size_of::<cel::Value>(),
+        std::mem::size_of::<cel::objects::Map>(),
+        std::mem::size_of::<cel::objects::ListRef>(),
+    );
+    println!("allocation census: collect_on vs collect_raw_on, {ROWS} rows");
+    println!("both arms execute the SAME compiled loop; the delta is the boxing\n");
+    println!(
+        "{:<28} {:>10} {:>10} {:>12} {:>12}",
+        "arm", "allocs/row", "bytes/row", "allocs total", "bytes total"
+    );
+
+    for list_len in [10i64, 40i64] {
+        let lens: Vec<i64> = vec![list_len; ROWS];
+        let elems: Vec<i64> = (0..ROWS as i64 * list_len)
+            .map(|k| (k * 7) % 1000)
+            .collect();
+
+        let schema: Schema = [("list[]".to_string(), ValType::Int)].into_iter().collect();
+        let program = BatchProgram::compile("list.map(x, x * 2)", &schema)
+            .unwrap_or_else(|e| panic!("lower: {e:?}"));
+        let batch = Batch::new(ROWS).column(
+            "list",
+            ColumnRef::List {
+                lens: &lens,
+                fields: vec![(None, ColumnRef::Int(&elems))],
+            },
+        );
+        let bound = program.bind_per_row(&batch).expect("bind");
+
+        // Warm the tier first: tracing and compiling allocate, and they are a
+        // one-off that would otherwise land in whichever arm ran first.
+        let _ = bound.collect_on(Tier::Jit).expect("warmup");
+        let _ = bound
+            .collect_raw_on(Tier::Jit, |out| out.rows())
+            .expect("warmup raw");
+
+        println!("\n-- {list_len} elements per row --");
+
+        reset();
+        let boxed = bound.collect_on(Tier::Jit).expect("collect");
+        let (a_boxed, b_boxed) = read();
+        // Read the counters BEFORE dropping, so the frees are outside the window
+        // and cannot be mistaken for work the arm avoided.
+        assert_eq!(boxed.len(), ROWS);
+
+        reset();
+        let checksum = walk(&boxed);
+        let (a_walk, b_walk) = read();
+        assert_ne!(checksum, 0);
+        drop(boxed);
+
+        reset();
+        let rows = bound
+            .collect_raw_on(Tier::Jit, |out| out.rows())
+            .expect("collect_raw");
+        let (a_raw, b_raw) = read();
+        assert_eq!(rows, ROWS);
+
+        for (label, a, b) in [
+            ("collect_on (boxed)", a_boxed, b_boxed),
+            ("+ walk every element", a_walk, b_walk),
+            ("collect_raw_on", a_raw, b_raw),
+            (
+                "delta = the boxing",
+                (a_boxed + a_walk).saturating_sub(a_raw),
+                (b_boxed + b_walk).saturating_sub(b_raw),
+            ),
+        ] {
+            println!(
+                "{:<28} {:>10.3} {:>10.1} {:>12} {:>12}",
+                label,
+                a as f64 / ROWS as f64,
+                b as f64 / ROWS as f64,
+                a,
+                b
+            );
+        }
+    }
+
+    println!(
+        "\nA row that owned its elements cost two allocations -- the `Arc` control \
+         block\nand the element buffer -- plus a 24-byte `Value` per element. A \
+         `ListRef` is a\nWINDOW onto one `ListStorage` the whole batch shares, so \
+         a row costs no\nallocation at all and the bytes above are the output \
+         `Vec<Value>`'s 24 per row\nplus the shared column's 8 per element for \
+         the int and float banks."
+    );
+
+    record_list();
+    string_column();
+    public_door();
+}
+
+/// The door most callers actually use, `cel::Program::execute`.
+///
+/// WHICH evaluator that door runs depends on the feature set: `vm` is a DEFAULT
+/// feature and `required-features = ["jit"]` does not turn it off, so an
+/// ordinary run of this example measures the bytecode VM, and only
+/// `--no-default-features` reaches the recursive AST tree-walker. The panel
+/// headers print whichever one this build resolved to rather than naming one of
+/// them, because the arm is about the door and not about a fixed evaluator.
+///
+/// `cel/src/majit/CONVERGENCE.md` prices the tree-walker at 1498.89 ns/row
+/// against the compiled tier's 22.70. The batch tiers are now at 1.000
+/// allocs/row, so this arm says what the gap costs in allocations rather than
+/// in a timing that this host cannot measure.
+fn public_door() {
+    // A scalar expression first, so the per-NODE cost is separated from the
+    // per-element cost the comprehension adds.
+    walk_scalar();
+    // Swept wide, because the per-element term is only meaningful if the cost
+    // is linear in the element count.
+    for list_len in [5i64, 10, 20, 40, 80] {
+        walk_list(list_len, "list.map(x, x * 2)");
+    }
+    // At one width, vary the STEP instead: the difference between these is what
+    // the element expression costs, so what remains is the loop's own per-element
+    // cost -- binding the iteration variable and pushing the result.
+    for source in [
+        "list.map(x, x)",
+        "list.map(x, x * 2)",
+        "list.map(x, x * 2 + 1)",
+        "list.filter(x, x >= 0)",
+        "list.filter(x, x < 0)",
+    ] {
+        walk_list(40, source);
+    }
+}
+
+/// `a * 2 + b`: three nodes, two variables, no comprehension.
+///
+/// Reported twice, because `Context::default()` registers the whole standard
+/// function library and a caller that builds one per evaluation pays for that
+/// and not for the expression. The batch door binds once, so the hoisted row
+/// is the one to compare against it.
+fn walk_scalar() {
+    let program = Program::compile("a * 2 + b").expect("compile");
+
+    reset();
+    let mut total = 0i64;
+    for k in 0..ROWS as i64 {
+        let mut ctx = Context::default();
+        ctx.add_variable_from_value("a", Value::Int(k));
+        ctx.add_variable_from_value("b", Value::Int(k % 7));
+        match program.execute(&ctx).expect("execute") {
+            Value::Int(i) => total += i,
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    let (a_fresh, b_fresh) = read();
+    assert_ne!(total, 0);
+
+    let mut ctx = Context::default();
+    reset();
+    let mut total = 0i64;
+    for k in 0..ROWS as i64 {
+        ctx.add_variable_from_value("a", Value::Int(k));
+        ctx.add_variable_from_value("b", Value::Int(k % 7));
+        match program.execute(&ctx).expect("execute") {
+            Value::Int(i) => total += i,
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    let (a_hoisted, b_hoisted) = read();
+    assert_ne!(total, 0);
+
+    println!("\n-- {PUBLIC_DOOR} (Program::execute), scalar `a * 2 + b` --");
+    for (label, a, b) in [
+        ("Context::default() per row", a_fresh, b_fresh),
+        ("hoisted Context", a_hoisted, b_hoisted),
+    ] {
+        println!(
+            "{:<28} {:>10.3} {:>10.1} {:>12} {:>12}",
+            label,
+            a as f64 / ROWS as f64,
+            b as f64 / ROWS as f64,
+            a,
+            b
+        );
+    }
+}
+
+fn walk_list(list_len: i64, source: &str) {
+    let elems: Vec<i64> = (0..list_len).map(|k| (k * 7) % 1000).collect();
+
+    let program = Program::compile(source).expect("compile");
+
+    // Building the input is the caller's cost either way, so it is measured
+    // apart from the evaluation it feeds.
+    reset();
+    let mut inputs = Vec::with_capacity(ROWS);
+    for _ in 0..ROWS {
+        inputs.push(Value::list(
+            elems.iter().map(|&v| Value::Int(v)).collect::<Vec<_>>(),
+        ));
+    }
+    let (a_in, b_in) = read();
+
+    // Binding alone, so any conversion the bind forces is separated from the
+    // evaluation. The context stores `Value` directly, so a `Value::List` is
+    // bound by cloning its handle and keeps whichever strategy it arrived with.
+    let mut ctx = Context::default();
+    reset();
+    for input in &inputs {
+        ctx.add_variable_from_value("list", input.clone());
+    }
+    let (a_bind, b_bind) = read();
+
+    reset();
+    let mut total = 0usize;
+    for input in &inputs {
+        ctx.add_variable_from_value("list", input.clone());
+        match program.execute(&ctx).expect("execute") {
+            Value::List(items) => total += items.len(),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    let (a_exec, b_exec) = read();
+    // `filter(x, x < 0)` keeps nothing; every other source keeps everything.
+    assert_eq!(total % list_len as usize, 0);
+
+    println!("\n-- {PUBLIC_DOOR} (Program::execute), {list_len} elements per row, `{source}` --");
+    for (label, a, b) in [
+        ("build the input Value", a_in, b_in),
+        ("bind it to a Context", a_bind, b_bind),
+        ("bind + Program::execute", a_exec, b_exec),
+    ] {
+        println!(
+            "{:<28} {:>10.3} {:>10.1} {:>12} {:>12}",
+            label,
+            a as f64 / ROWS as f64,
+            b as f64 / ROWS as f64,
+            a,
+            b
+        );
+    }
+}
+
+/// A STRING result, scalar and inside a list. `decode` turns a rank into
+/// `Value::String(Arc::new(distinct[rank].clone()))`, which is a `String` and
+/// an `Arc` per value even though the batch holds only a handful of distinct
+/// strings -- the whole point of the rank encoding.
+fn string_column() {
+    const LIST_LEN: i64 = 10;
+    // Few distinct strings, many rows: the shape the rank encoding is for.
+    let names: Vec<String> = (0..ROWS).map(|k| format!("name-{}", k % 8)).collect();
+    let schema: Schema = [("name".to_string(), ValType::Str)].into_iter().collect();
+    let program = BatchProgram::compile("name", &schema).unwrap_or_else(|e| panic!("lower: {e:?}"));
+    let batch = Batch::new(ROWS).column("name", ColumnRef::Str(&names));
+    let bound = program.bind_per_row(&batch).expect("bind");
+    let _ = bound.collect_on(Tier::Jit).expect("warmup");
+
+    println!(
+        "\n-- scalar string result, {} distinct over {ROWS} rows --",
+        8
+    );
+
+    reset();
+    let boxed = bound.collect_on(Tier::Jit).expect("collect");
+    let (a_boxed, b_boxed) = read();
+    assert_eq!(boxed.len(), ROWS);
+    drop(boxed);
+    println!(
+        "{:<28} {:>10.3} {:>10.1} {:>12} {:>12}",
+        "collect_on (boxed)",
+        a_boxed as f64 / ROWS as f64,
+        b_boxed as f64 / ROWS as f64,
+        a_boxed,
+        b_boxed
+    );
+
+    // The same bank inside a list, which takes the scalar arm of `to_values`
+    // and so has no unboxed strategy today.
+    let lens: Vec<i64> = vec![LIST_LEN; ROWS];
+    let elems: Vec<String> = (0..ROWS as i64 * LIST_LEN)
+        .map(|k| format!("name-{}", k % 8))
+        .collect();
+    let schema: Schema = [("tags[]".to_string(), ValType::Str)].into_iter().collect();
+    let program = match BatchProgram::compile("tags.filter(t, t != \"name-0\")", &schema) {
+        Ok(p) => p,
+        Err(e) => {
+            println!("\n-- string list -- NOT LOWERABLE: {e:?}");
+            return;
+        }
+    };
+    let batch = Batch::new(ROWS).column(
+        "tags",
+        ColumnRef::List {
+            lens: &lens,
+            fields: vec![(None, ColumnRef::Str(&elems))],
+        },
+    );
+    let bound = program.bind_per_row(&batch).expect("bind");
+    let _ = bound.collect_on(Tier::Jit).expect("warmup");
+
+    println!("\n-- string list, {LIST_LEN} elements per row --");
+
+    reset();
+    let boxed = bound.collect_on(Tier::Jit).expect("collect");
+    let (a_boxed, b_boxed) = read();
+    assert_eq!(boxed.len(), ROWS);
+
+    reset();
+    let checksum = boxed.len();
+    let (a_walk, b_walk) = read();
+    assert_ne!(checksum, 0);
+    drop(boxed);
+
+    for (label, a, b) in [
+        ("collect_on (boxed)", a_boxed, b_boxed),
+        ("+ walk every element", a_walk, b_walk),
+    ] {
+        println!(
+            "{:<28} {:>10.3} {:>10.1} {:>12} {:>12}",
+            label,
+            a as f64 / ROWS as f64,
+            b as f64 / ROWS as f64,
+            a,
+            b
+        );
+    }
+}
+
+/// The other shape `to_values` decodes: a list of RECORDS, which
+/// `collect_list_comprehension` produces whenever the chain hands the element
+/// back rather than computing one — `filter` on a record list, whose fields are
+/// then `source_fields(schema, path)` (`lower.rs:3304-3308`).
+///
+/// This arm rebuilds a `Value::Map` per element, so unlike the scalar arm it
+/// allocates per element, and the count says how much of that is the map itself
+/// and how much is the field NAMES.
+fn record_list() {
+    const LIST_LEN: i64 = 10;
+    let lens: Vec<i64> = vec![LIST_LEN; ROWS];
+    let n = ROWS as i64 * LIST_LEN;
+    let price: Vec<i64> = (0..n).map(|k| (k * 7) % 100).collect();
+    let qty: Vec<i64> = (0..n).map(|k| (k * 3) % 50).collect();
+
+    let schema: Schema = [
+        ("items[].price".to_string(), ValType::Int),
+        ("items[].qty".to_string(), ValType::Int),
+    ]
+    .into_iter()
+    .collect();
+    let program = match BatchProgram::compile("items.filter(i, i.price > 10)", &schema) {
+        Ok(p) => p,
+        Err(e) => {
+            println!("\n-- record list -- NOT LOWERABLE: {e:?}");
+            return;
+        }
+    };
+    let batch = Batch::new(ROWS).column(
+        "items",
+        ColumnRef::List {
+            lens: &lens,
+            fields: vec![
+                (Some("price"), ColumnRef::Int(&price)),
+                (Some("qty"), ColumnRef::Int(&qty)),
+            ],
+        },
+    );
+    let bound = program.bind_per_row(&batch).expect("bind");
+    let _ = bound.collect_on(Tier::Jit).expect("warmup");
+    let _ = bound
+        .collect_raw_on(Tier::Jit, |out| out.rows())
+        .expect("warmup raw");
+
+    println!("\n-- record list, {LIST_LEN} elements per row, 2 named fields --");
+
+    reset();
+    let boxed = bound.collect_on(Tier::Jit).expect("collect");
+    let (a_boxed, b_boxed) = read();
+    assert_eq!(boxed.len(), ROWS);
+
+    reset();
+    let checksum = walk(&boxed);
+    let (a_walk, b_walk) = read();
+    assert_ne!(checksum, 0);
+    drop(boxed);
+
+    reset();
+    let rows = bound
+        .collect_raw_on(Tier::Jit, |out| out.rows())
+        .expect("collect_raw");
+    let (a_raw, b_raw) = read();
+    assert_eq!(rows, ROWS);
+
+    for (label, a, b) in [
+        ("collect_on (boxed)", a_boxed, b_boxed),
+        ("+ walk every element", a_walk, b_walk),
+        ("collect_raw_on", a_raw, b_raw),
+        (
+            "delta = the boxing",
+            (a_boxed + a_walk).saturating_sub(a_raw),
+            (b_boxed + b_walk).saturating_sub(b_raw),
+        ),
+    ] {
+        println!(
+            "{:<28} {:>10.3} {:>10.1} {:>12} {:>12}",
+            label,
+            a as f64 / ROWS as f64,
+            b as f64 / ROWS as f64,
+            a,
+            b
+        );
+    }
+}

@@ -1,0 +1,28 @@
+[package]
+name = "cel-census"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Front-end B census of majit-translate over cel's Charon LLBC"
+
+# Both probes read `../build/llbc/cel.ullbc` and lower it; neither links against
+# `cel` itself, so there is no dependency on the sibling crate.
+#
+# This package exists so `majit-translate` stays out of `cel`'s dependency
+# graph. As a dev-dependency of `cel` it would be built by every `cargo test`
+# and `cargo build --all-features` row in CI, none of which take the census.
+# `[workspace] default-members` in the root manifest keeps it out of a bare
+# `cargo build`/`cargo test`; reach it with `-p cel-census`.
+[dependencies]
+# Same revision as the four `majit` crates `cel/Cargo.toml` pins, and for the
+# same reason: a path dependency into a sibling checkout resolves while the
+# manifest is parsed, so it breaks a clean clone that has no pyre next to it.
+# The cohabitation `[patch]` in `.cargo/config.toml` redirects both of these
+# to the enclosing worktree when there is one.
+majit-translate = { git = "https://github.com/youknowone/pyre.git", rev = "3ccbd1f5f4d88d1b43b32f79fc7e93391f36f2a6" }
+# Direct rather than through `majit-translate`, which depends on it but
+# re-exports nothing from it: `Llbc` is what the census opens the artefact with.
+majit-charon-reader = { git = "https://github.com/youknowone/pyre.git", rev = "3ccbd1f5f4d88d1b43b32f79fc7e93391f36f2a6" }
+
+[lib]
+path = "src/lib.rs"

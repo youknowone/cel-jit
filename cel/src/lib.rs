@@ -19,6 +19,9 @@ use thiserror::Error;
 
 mod macros;
 
+#[cfg(feature = "jit")]
+pub mod majit;
+
 pub mod common;
 pub mod context;
 mod env;
@@ -35,6 +38,10 @@ pub mod functions;
 mod magic;
 pub mod objects;
 mod resolvers;
+/// Internal class-based value universe. The public [`Value`] enum is the cel
+/// drop-in; cross the boundary through [`runtime::convert`].
+pub mod runtime;
+pub mod vm;
 
 #[cfg(feature = "chrono")]
 mod duration;
@@ -176,18 +183,66 @@ impl ExecutionError {
 #[derive(Debug)]
 pub struct Program {
     expression: Expression,
+    /// The code object this program runs, built once here rather than per
+    /// evaluation.
+    ///
+    /// A `Result` field rather than a widened `Program::compile` error, and
+    /// eager rather than a lazy cell, for three reasons:
+    ///
+    /// * the program **owns** its code outright, which is the arrangement a
+    ///   greens-keyed JIT cell needs -- neither a lazily filled cell nor a
+    ///   side table keyed on the expression;
+    /// * `Program::compile`'s signature stays `Result<_, ParseErrors>` in both
+    ///   feature builds. Widening it would make the public API depend on
+    ///   whether `vm` is on, which is not a choice a caller makes;
+    /// * a compile failure on an expression that *parsed* is unreachable in
+    ///   practice -- the compiler's coverage over parseable CEL is total, and
+    ///   the remaining `CompileError` variants are program-size limits -- so
+    ///   the error path is a formality that should not shape the API.
+    #[cfg(feature = "vm")]
+    code: Result<vm::CelCode, vm::CompileError>,
 }
 
 impl Program {
     pub fn compile(source: &str) -> Result<Program, ParseErrors> {
         let parser = Parser::default();
-        parser
-            .parse(source)
-            .map(|expression| Program { expression })
+        parser.parse(source).map(Program::from_expression)
     }
 
+    #[cfg(not(feature = "vm"))]
+    fn from_expression(expression: Expression) -> Program {
+        Program { expression }
+    }
+
+    #[cfg(feature = "vm")]
+    fn from_expression(expression: Expression) -> Program {
+        let code = vm::compile(&expression);
+        Program { expression, code }
+    }
+
+    /// Evaluate the program.
+    ///
+    /// With the `vm` feature — which is a DEFAULT feature — this is a thin
+    /// wrapper over the bytecode VM's dispatch loop, and with it off it is the
+    /// tree walker. The two are held to the same answers by the differential
+    /// corpus in `tests/oracle.rs`.
+    #[cfg(not(feature = "vm"))]
     pub fn execute(&self, context: &Context) -> ResolveResult {
         Value::resolve(&self.expression, context)
+    }
+
+    /// Evaluate the program. See the non-`vm` build of this method.
+    ///
+    /// Nothing is compiled here: the code object was built by
+    /// [`Program::compile`]. A compilation that failed is reported now because
+    /// that is where the caller is looking, and because the alternative would
+    /// change `Program::compile`'s error type under a cargo feature.
+    #[cfg(feature = "vm")]
+    pub fn execute(&self, context: &Context) -> ResolveResult {
+        match &self.code {
+            Ok(code) => vm::cel_eval_loop(code, context),
+            Err(e) => Err(ExecutionError::InternalError(format!("compiling: {e}"))),
+        }
     }
 
     /// Returns the variables and functions referenced by the CEL program
