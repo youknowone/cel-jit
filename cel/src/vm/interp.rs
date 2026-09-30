@@ -1009,12 +1009,6 @@ impl<'a> Vm<'a> {
         self.ctx.lookup_is_pure()
     }
 
-    /// [`intern_context_var`] skipping resolvers. Only when
-    /// [`Self::context_lookup_pure`] is true.
-    pub(crate) fn intern_context_var_pure(&self, name: &str) -> Option<CelRef> {
-        self.ctx.lookup_interned_pure(name)
-    }
-
     pub(crate) fn interned_unary_bits(&self, name: &str, w: CelRef) -> i64 {
         match interned_unary_host(name, w) {
             Ok(Some(out)) if out != ERROR_SENTINEL => out as i64,

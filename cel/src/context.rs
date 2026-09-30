@@ -13,7 +13,7 @@ use std::sync::Arc;
 /// again is still a different generation. `jit_interp` has no
 /// quasi-immutable field (`QuasiImmutDescr` / `record_quasi_immutable_field`
 /// are not reachable from `jit_inline`), so the portal promotes this id.
-pub(crate) struct VersionTag {
+pub struct VersionTag {
     id: u64,
 }
 

@@ -11,6 +11,19 @@
 //! `getarrayitem_vable_*` shape — and call `cel_add` / `cel_equals`
 //! with no `Result`. Everything else is residual [`Vm::dispatch_one`].
 
+// Traced interpreter source whose control-flow shape is read by the JIT generator.
+#![allow(
+    unused_mut,
+    clippy::cmp_null,
+    clippy::collapsible_if,
+    clippy::if_same_then_else,
+    clippy::manual_unwrap_or,
+    clippy::manual_unwrap_or_default,
+    clippy::too_many_arguments,
+    clippy::unnecessary_cast,
+    clippy::useless_transmute
+)]
+
 use majit_metainterp::intrinsics::majit_uint_lt;
 use majit_metainterp::JitDriver;
 
@@ -1463,7 +1476,7 @@ fn thread_owner_token(heap: *const crate::runtime::heap::CelHeap) -> usize {
 
 #[inline(always)]
 fn portal_heap(vm_bits: i64) -> *const crate::runtime::heap::CelHeap {
-    unsafe { vm_of(vm_bits).heap }
+    vm_of(vm_bits).heap
 }
 
 pub(crate) fn driver_table_len() -> usize {

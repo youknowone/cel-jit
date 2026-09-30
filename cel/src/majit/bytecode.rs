@@ -1819,6 +1819,8 @@ pub mod float_bank {
             host_call2_f => residual_int_cannot_raise,
         },
     )]
+    // Generated entry runner shares this signature and does not use `mut`; the portal body does.
+    #[allow(unused_mut)]
     fn run_mainloop_f(
         mut driver: &mut majit_metainterp::JitDriver<VmStateF>,
         program: &Code,

@@ -2159,14 +2159,7 @@ fn mapdict_node(bits: i64) -> Option<&'static MapdictLayout> {
 }
 
 fn mapdict_walk_limit(start: &MapdictLayout) -> i64 {
-    let mut limit = start.length.saturating_add(1);
-    if limit < 1 {
-        limit = 1;
-    }
-    if limit > MAPDICT_WALK_CAP {
-        limit = MAPDICT_WALK_CAP;
-    }
-    limit
+    start.length.saturating_add(1).clamp(1, MAPDICT_WALK_CAP)
 }
 
 /// `mapdict.py` `find_map_attr`: walk `back` until `name` matches an
@@ -2225,9 +2218,7 @@ pub(crate) fn mapdict_name_at(layout_bits: i64, index: i64) -> Option<&'static [
     if index < 0 {
         return None;
     }
-    let Some(start) = mapdict_node(layout_bits) else {
-        return None;
-    };
+    let start = mapdict_node(layout_bits)?;
     let limit = mapdict_walk_limit(start);
     let mut node = start;
     let mut steps = 0i64;
@@ -2239,10 +2230,7 @@ pub(crate) fn mapdict_name_at(layout_bits: i64, index: i64) -> Option<&'static [
         if steps >= limit || node.back == 0 {
             return None;
         }
-        let Some(prev) = mapdict_node(node.back as i64) else {
-            return None;
-        };
-        node = prev;
+        node = mapdict_node(node.back as i64)?;
     }
 }
 

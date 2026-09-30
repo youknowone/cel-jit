@@ -1183,6 +1183,13 @@ pub struct CelGc {
 }
 
 #[cfg(feature = "jit")]
+impl Default for CelGc {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(feature = "jit")]
 impl CelGc {
     /// Register the root, every class and every block, then freeze.
     ///

@@ -21,7 +21,7 @@ use super::object_array::{
 use crate::objects::{Key, ListRef, Map, MapStorage};
 use crate::Value;
 use core::alloc::Layout;
-use core::mem::{align_of, size_of};
+use core::mem::{align_of, size_of, size_of_val};
 use std::sync::Arc;
 
 /// Arena of interned constant leaves. Shared by clones of a [`crate::vm::CelCode`].
@@ -253,7 +253,7 @@ impl ConstPool {
         let data = if n == 0 {
             core::ptr::null_mut()
         } else {
-            let bytes = CEL_INT_WORDS_ITEMS_OFFSET + n * size_of::<i64>();
+            let bytes = CEL_INT_WORDS_ITEMS_OFFSET + size_of_val(ints);
             let block = self.alloc_raw_typed(CelIntWords::TYPE_ID, bytes, align_of::<CelIntWords>())
                 as *mut CelIntWords;
             unsafe {

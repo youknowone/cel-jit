@@ -26,7 +26,11 @@ fn traced_host_call_keeps_its_result() {
     ctx.add_variable_from_value("x", 41i64);
     ctx.add_function("f", |a: i64| -> i64 { a });
     for i in 0..2000 {
-        assert_eq!(program.execute(&ctx).expect("runs"), Value::Int(42), "iteration {i}");
+        assert_eq!(
+            program.execute(&ctx).expect("runs"),
+            Value::Int(42),
+            "iteration {i}"
+        );
     }
 }
 
@@ -57,6 +61,10 @@ fn traced_reentrant_host_call_does_not_force_a_null_descr() {
         }
     });
     for i in 0..400 {
-        assert_eq!(program.execute(&ctx).expect("outer"), Value::Int(1), "iteration {i}");
+        assert_eq!(
+            program.execute(&ctx).expect("outer"),
+            Value::Int(1),
+            "iteration {i}"
+        );
     }
 }
