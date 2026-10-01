@@ -7,17 +7,19 @@ use crate::parser::gen::{
     BoolFalseContext, BoolTrueContext, BytesContext, CELListener, CELParserContextType,
     CalcContext, CalcContextAttrs, ConditionalAndContext, ConditionalOrContext,
     ConstantLiteralContext, ConstantLiteralContextAttrs, CreateListContext, CreateMessageContext,
-    CreateStructContext, DoubleContext, ExprContext, Field_initializer_listContext,
-    GlobalCallContext, IdentContext, IndexContext, IndexContextAttrs, IntContext,
-    ListInitContextAll, LogicalNotContext, LogicalNotContextAttrs, MapInitializerListContextAll,
-    MemberCallContext, MemberCallContextAttrs, MemberExprContext, MemberExprContextAttrs,
-    NegateContext, NegateContextAttrs, NestedContext, NullContext, OptFieldContextAttrs,
-    PrimaryExprContext, PrimaryExprContextAttrs, RelationContext, RelationContextAttrs,
-    SelectContext, SelectContextAttrs, StartContext, StartContextAttrs, StringContext, UintContext,
+    CreateStructContext, DoubleContext, EscapeIdentContextAll, ExprContext,
+    Field_initializer_listContext, GlobalCallContext, IdentContext, IndexContext,
+    IndexContextAttrs, IntContext, ListInitContextAll, LogicalNotContext, LogicalNotContextAttrs,
+    MapInitializerListContextAll, MemberCallContext, MemberCallContextAttrs, MemberExprContext,
+    MemberExprContextAttrs, NegateContext, NegateContextAttrs, NestedContext, NullContext,
+    OptFieldContextAttrs, PrimaryExprContext, PrimaryExprContextAttrs, RelationContext,
+    RelationContextAttrs, SelectContext, SelectContextAttrs, StartContext, StartContextAttrs,
+    StringContext, UintContext,
 };
 use crate::parser::{gen, macros, parse};
 use antlr4rust::common_token_stream::CommonTokenStream;
 use antlr4rust::error_listener::ErrorListener;
+use antlr4rust::error_strategy::{DefaultErrorStrategy, ErrorStrategy};
 use antlr4rust::errors::ANTLRError;
 use antlr4rust::parser::ParserNodeType;
 use antlr4rust::parser_rule_context::ParserRuleContext;
@@ -25,7 +27,7 @@ use antlr4rust::recognizer::Recognizer;
 use antlr4rust::token::{CommonToken, Token};
 use antlr4rust::token_factory::TokenFactory;
 use antlr4rust::tree::{ParseTree, ParseTreeListener, ParseTreeVisitorCompat, VisitChildren};
-use antlr4rust::{InputStream, Parser as AntlrParser};
+use antlr4rust::{tid, InputStream, Parser as AntlrParser};
 use std::cell::RefCell;
 use std::error::Error;
 use std::fmt::Display;
@@ -35,8 +37,8 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 pub struct MacroExprHelper<'a> {
-    helper: &'a mut ParserHelper,
-    id: u64,
+    pub(crate) helper: &'a mut ParserHelper,
+    pub(crate) id: u64,
 }
 
 impl MacroExprHelper<'_> {
@@ -102,7 +104,9 @@ pub struct Parser {
     helper: ParserHelper,
     errors: Vec<ParseError>,
     max_recursion_depth: u16,
+    error_recovery_limit: u32,
     enable_optional_syntax: bool,
+    enable_ident_escape_syntax: bool,
 }
 
 impl Parser {
@@ -114,7 +118,9 @@ impl Parser {
             helper: ParserHelper::default(),
             errors: Vec::default(),
             max_recursion_depth: 96,
+            error_recovery_limit: 30,
             enable_optional_syntax: false,
+            enable_ident_escape_syntax: false,
         }
     }
 
@@ -123,9 +129,48 @@ impl Parser {
         self
     }
 
+    /// Sets the maximum number of error recovery attempts the parser will make
+    /// before aborting the parse. Once the limit is reached, the parser reports
+    /// `error recovery attempt limit exceeded` and returns.
+    pub fn error_recovery_limit(mut self, limit: u32) -> Self {
+        self.error_recovery_limit = limit;
+        self
+    }
+
     pub fn enable_optional_syntax(mut self, enable: bool) -> Self {
         self.enable_optional_syntax = enable;
         self
+    }
+
+    /// Enables backtick-escaped field identifiers (``` `foo.bar` ```).
+    ///
+    /// With the flag off (the default) the parser rejects any `` `…` ``
+    /// -quoted identifier with an `"unsupported syntax: '`'"` parse error.
+    /// With the flag on the surrounding backticks are stripped and the
+    /// contents are used verbatim as the field name — matching cel-go's
+    /// `EnableIdentEscapeSyntax` (`parser/parser.go:161`).
+    pub fn enable_ident_escape_syntax(mut self, enable: bool) -> Self {
+        self.enable_ident_escape_syntax = enable;
+        self
+    }
+
+    /// Returns the field name for an `escapeIdent` context, mirroring
+    /// cel-go's `normalizeIdent` (`parser/parser.go:161`). Returns an error
+    /// message string if the escape syntax is used without opting in.
+    fn normalize_ident(&self, ctx: &EscapeIdentContextAll<'_>) -> Result<String, &'static str> {
+        match ctx {
+            EscapeIdentContextAll::SimpleIdentifierContext(ident) => Ok(ident.get_text()),
+            EscapeIdentContextAll::EscapedIdentifierContext(ident) => {
+                if !self.enable_ident_escape_syntax {
+                    return Err("unsupported syntax: '`'");
+                }
+                let raw = ident.get_text();
+                // Grammar guarantees a leading and trailing backtick plus at
+                // least one interior char, so this slice is always safe.
+                Ok(raw[1..raw.len() - 1].to_string())
+            }
+            EscapeIdentContextAll::Error(_) => Err("unsupported ident kind"),
+        }
     }
 
     fn new_logic_manager(&self, func: &str, term: IdedExpr) -> LogicManager {
@@ -214,6 +259,9 @@ impl Parser {
             max: self.max_recursion_depth,
             depth: 0,
         }));
+        prsr.set_error_strategy(Box::new(RecoveryLimitErrorStrategy::<
+            gen::CELParserContextType,
+        >::new(self.error_recovery_limit)));
         let r = match prsr.start() {
             Ok(t) => Ok(self.visit(t.deref())),
             Err(e) => Err(ParseError {
@@ -268,7 +316,13 @@ impl Parser {
                     continue;
                 }
                 Some(ident) => {
-                    let field_name = ident.get_text().to_string();
+                    let field_name = match self.normalize_ident(ident.as_ref()) {
+                        Ok(name) => name,
+                        Err(msg) => {
+                            self.report_error::<ParseError, _>(field.start().deref(), None, msg);
+                            continue;
+                        }
+                    };
                     let value = self.visit(ctx.values[i].as_ref());
                     let is_optional = match (&field.opt, self.enable_optional_syntax) {
                         (Some(opt), false) => {
@@ -398,11 +452,11 @@ struct RecursionListener {
 
 impl<'a> CELListener<'a> for RecursionListener {
     fn enter_expr(&mut self, _ctx: &ExprContext<'a>) {
-        self.depth += 1;
+        self.depth = self.depth.saturating_add(1);
     }
 
     fn exit_expr(&mut self, _ctx: &ExprContext<'a>) {
-        self.depth -= 1;
+        self.depth = self.depth.saturating_sub(1);
     }
 }
 
@@ -432,6 +486,93 @@ impl<'a> ParseTreeListener<'a, CELParserContextType> for RecursionListener {
     }
 }
 
+#[derive(Debug)]
+struct RecoveryLimitExceeded {
+    limit: u32,
+}
+
+impl Display for RecoveryLimitExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "error recovery attempt limit exceeded: {}", self.limit)
+    }
+}
+
+impl Error for RecoveryLimitExceeded {}
+
+/// Error strategy that wraps [`DefaultErrorStrategy`] and aborts parsing when
+/// the number of recovery attempts exceeds a configurable limit. Modelled on
+/// cel-go's `recoveryLimitErrorStrategy`.
+struct RecoveryLimitErrorStrategy<'input, Ctx: ParserNodeType<'input>> {
+    inner: DefaultErrorStrategy<'input, Ctx>,
+    limit: u32,
+    attempts: u32,
+}
+
+tid! { impl<'i, Ctx> TidAble<'i> for RecoveryLimitErrorStrategy<'i, Ctx> where Ctx: ParserNodeType<'i> }
+
+impl<'input, Ctx: ParserNodeType<'input>> RecoveryLimitErrorStrategy<'input, Ctx> {
+    fn new(limit: u32) -> Self {
+        Self {
+            inner: DefaultErrorStrategy::new(),
+            limit,
+            attempts: 0,
+        }
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn check_attempts<T>(&mut self, recognizer: &mut T) -> Result<(), ANTLRError>
+    where
+        T: AntlrParser<'input, Node = Ctx, TF = Ctx::TF>,
+    {
+        if self.attempts >= self.limit {
+            let msg = format!("error recovery attempt limit exceeded: {}", self.limit);
+            recognizer.notify_error_listeners(msg, None, None);
+            return Err(ANTLRError::FallThrough(Arc::new(RecoveryLimitExceeded {
+                limit: self.limit,
+            })));
+        }
+        self.attempts += 1;
+        Ok(())
+    }
+}
+
+impl<'input, T: AntlrParser<'input>> ErrorStrategy<'input, T>
+    for RecoveryLimitErrorStrategy<'input, T::Node>
+{
+    fn reset(&mut self, recognizer: &mut T) {
+        self.inner.reset(recognizer)
+    }
+
+    fn recover_inline(
+        &mut self,
+        recognizer: &mut T,
+    ) -> Result<<T::TF as TokenFactory<'input>>::Tok, ANTLRError> {
+        self.check_attempts(recognizer)?;
+        self.inner.recover_inline(recognizer)
+    }
+
+    fn recover(&mut self, recognizer: &mut T, e: &ANTLRError) -> Result<(), ANTLRError> {
+        self.check_attempts(recognizer)?;
+        self.inner.recover(recognizer, e)
+    }
+
+    fn sync(&mut self, recognizer: &mut T) -> Result<(), ANTLRError> {
+        self.inner.sync(recognizer)
+    }
+
+    fn in_error_recovery_mode(&mut self, recognizer: &mut T) -> bool {
+        self.inner.in_error_recovery_mode(recognizer)
+    }
+
+    fn report_error(&mut self, recognizer: &mut T, e: &ANTLRError) {
+        self.inner.report_error(recognizer, e)
+    }
+
+    fn report_match(&mut self, recognizer: &mut T) {
+        self.inner.report_match(recognizer)
+    }
+}
+
 struct ParserErrorListener {
     parse_errors: Rc<RefCell<Vec<ParseError>>>,
 }
@@ -454,6 +595,32 @@ impl<'a, T: Recognizer<'a>> ErrorListener<'a, T> for ParserErrorListener {
             source_info: None,
         })
     }
+}
+
+/// Returns true when `name` is a reserved word that may not be used as a plain
+/// identifier or function name.  Mirrors the `reservedIds` check in cel-go.
+/// Note: `in`, `true`, `false`, `null` are grammar-level keywords that the
+/// lexer never produces as IDENTIFIER tokens, so they are not listed here.
+fn is_reserved_id(name: &str) -> bool {
+    matches!(
+        name,
+        "as" | "break"
+            | "const"
+            | "continue"
+            | "else"
+            | "for"
+            | "function"
+            | "if"
+            | "import"
+            | "let"
+            | "loop"
+            | "package"
+            | "namespace"
+            | "return"
+            | "var"
+            | "void"
+            | "while"
+    )
 }
 
 impl Default for Parser {
@@ -690,7 +857,11 @@ impl gen::CELVisitorCompat<'_> for Parser {
             }
             Some(member) => {
                 if ctx.ops.len() % 2 == 0 {
-                    self.visit(member.as_ref());
+                    // Even number of `!` operators cancel — pass through without
+                    // wrapping in a LogicalNot call.  Visiting once here and
+                    // returning avoids the double-visit that would otherwise
+                    // cause exponential work on deeply nested expressions.
+                    return self.visit(member.as_ref());
                 }
                 let op_id = self.helper.next_id(&ctx.ops[0]);
                 let target = self.visit(member.as_ref());
@@ -706,7 +877,9 @@ impl gen::CELVisitorCompat<'_> for Parser {
             }
             Some(member) => {
                 if ctx.ops.len() % 2 == 0 {
-                    self.visit(member.as_ref());
+                    // Even number of `-` operators cancel — pass through without
+                    // wrapping in a Negate call.
+                    return self.visit(member.as_ref());
                 }
                 let op_id = self.helper.next_id(&ctx.ops[0]);
                 let target = self.visit(member.as_ref());
@@ -739,7 +912,12 @@ impl gen::CELVisitorCompat<'_> for Parser {
     fn visit_Select(&mut self, ctx: &SelectContext<'_>) -> Self::Return {
         if let (Some(member), Some(id), Some(op)) = (&ctx.member(), &ctx.id, &ctx.op) {
             let operand = self.visit(member.as_ref());
-            let field = id.get_text();
+            let field = match self.normalize_ident(id.as_ref()) {
+                Ok(f) => f,
+                Err(msg) => {
+                    return self.report_error::<ParseError, _>(op.as_ref(), None, msg);
+                }
+            };
             if let Some(_opt) = &ctx.opt {
                 return if self.enable_optional_syntax {
                     let field_literal = self.helper.next_expr(
@@ -820,9 +998,18 @@ impl gen::CELVisitorCompat<'_> for Parser {
                 IdedExpr::default()
             }
             Some(id) => {
-                let ident = id.clone().text;
-                self.helper
-                    .next_expr(id.deref(), Expr::Ident(ident.to_string()))
+                let mut ident = id.clone().text.to_string();
+                if ctx.leadingDot.is_some() {
+                    ident = format!(".{ident}");
+                }
+                if is_reserved_id(ident.trim_start_matches('.')) {
+                    return self.report_error::<ParseError, _>(
+                        id.deref(),
+                        None,
+                        format!("reserved identifier: {ident}"),
+                    );
+                }
+                self.helper.next_expr(id.deref(), Expr::Ident(ident))
             }
         }
     }
@@ -831,7 +1018,15 @@ impl gen::CELVisitorCompat<'_> for Parser {
         match &ctx.id {
             None => IdedExpr::default(),
             Some(id) => {
-                let mut id = id.get_text().to_string();
+                let raw = id.get_text().to_string();
+                if is_reserved_id(&raw) {
+                    return self.report_error::<ParseError, _>(
+                        id.deref(),
+                        None,
+                        format!("reserved identifier: {raw}"),
+                    );
+                }
+                let mut id = raw;
                 if ctx.leadingDot.is_some() {
                     id = format!(".{id}");
                 }
@@ -925,18 +1120,25 @@ impl gen::CELVisitorCompat<'_> for Parser {
     }
 
     fn visit_Int(&mut self, ctx: &IntContext<'_>) -> Self::Return {
-        let string = ctx.get_text();
         if let Some(token) = ctx.tok.as_ref() {
-            let val = match if let Some(string) = string.strip_prefix("0x") {
-                i64::from_str_radix(string, 16)
+            // Strip `0x` from the numeric token first, then re-attach the
+            // sign — otherwise `-0x…` would be handed to a base-10 parser.
+            let raw = token.get_text();
+            let (radix, digits) = match raw.strip_prefix("0x") {
+                Some(rest) => (16, rest),
+                None => (10, raw),
+            };
+            let signed = if ctx.sign.is_some() {
+                format!("-{digits}")
             } else {
-                string.parse::<i64>()
-            } {
+                digits.to_string()
+            };
+            let val = match i64::from_str_radix(&signed, radix) {
                 Ok(v) => v,
                 Err(e) => return self.report_error(token, Some(e), "invalid int literal"),
             };
             self.helper
-                .next_expr(token, Expr::Literal(LiteralValue::Int(val.into())))
+                .next_expr(token, Expr::Literal(LiteralValue::Int(val)))
         } else {
             self.report_error::<ParseError, _>(&ctx.start(), None, "Incomplete Int!")
         }
@@ -955,7 +1157,7 @@ impl gen::CELVisitorCompat<'_> for Parser {
                 Err(e) => return self.report_error(token, Some(e), "invalid uint literal"),
             };
             self.helper
-                .next_expr(token, Expr::Literal(LiteralValue::UInt(val.into())))
+                .next_expr(token, Expr::Literal(LiteralValue::UInt(val)))
         } else {
             self.report_error::<ParseError, _>(&ctx.start(), None, "Incomplete Uint!")
         }
@@ -967,7 +1169,7 @@ impl gen::CELVisitorCompat<'_> for Parser {
             match string.parse::<f64>() {
                 Ok(d) if d.is_finite() => self
                     .helper
-                    .next_expr(token, Expr::Literal(LiteralValue::Double(d.into()))),
+                    .next_expr(token, Expr::Literal(LiteralValue::Double(d))),
                 Err(e) => self.report_error(token, Some(e), "invalid double literal"),
                 _ => self.report_error(token, None::<ParseError>, "invalid double literal"),
             }
@@ -1004,7 +1206,7 @@ impl gen::CELVisitorCompat<'_> for Parser {
     fn visit_Bytes(&mut self, ctx: &BytesContext<'_>) -> Self::Return {
         if let Some(token) = ctx.tok.as_deref() {
             let string = ctx.get_text();
-            match parse::parse_bytes(&string[2..string.len() - 1]) {
+            match parse::parse_bytes(&string) {
                 Ok(bytes) => self
                     .helper
                     .next_expr(token, Expr::Literal(LiteralValue::Bytes(bytes.into()))),
@@ -1030,7 +1232,7 @@ impl gen::CELVisitorCompat<'_> for Parser {
         match ctx.tok.as_deref() {
             Some(tok) => self
                 .helper
-                .next_expr(tok, Expr::Literal(LiteralValue::Boolean(true.into()))),
+                .next_expr(tok, Expr::Literal(LiteralValue::Boolean(true))),
             None => self.report_error::<ParseError, _>(&ctx.start(), None, "Incomplete bool!"),
         }
     }
@@ -1039,7 +1241,7 @@ impl gen::CELVisitorCompat<'_> for Parser {
         match ctx.tok.as_deref() {
             Some(token) => self
                 .helper
-                .next_expr(token, Expr::Literal(LiteralValue::Boolean(false.into()))),
+                .next_expr(token, Expr::Literal(LiteralValue::Boolean(false))),
             None => self.report_error::<ParseError, _>(&ctx.start(), None, "Incomplete bool!"),
         }
     }
@@ -1055,8 +1257,8 @@ impl gen::CELVisitorCompat<'_> for Parser {
 }
 
 pub struct ParserHelper {
-    source_info: SourceInfo,
-    next_id: u64,
+    pub(crate) source_info: SourceInfo,
+    pub(crate) next_id: u64,
 }
 
 impl Default for ParserHelper {
@@ -1251,6 +1453,208 @@ mod tests {
         assert!(Parser::new()
             .max_recursion_depth(0)
             .parse("(1 + 1)")
+            .is_err());
+    }
+
+    #[test]
+    fn recovery_limit_bails_out() {
+        let expression = "a ? b ((?))";
+        let err = Parser::new()
+            .error_recovery_limit(4)
+            .parse(expression)
+            .expect_err("expression should fail to parse");
+
+        let rendered = format!("{err}");
+        assert!(
+            rendered.contains("error recovery attempt limit exceeded: 4"),
+            "expected recovery limit error, got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn recovery_limit_hit_by_pathological_nested_negation() {
+        let expression = "!!(!!!!!!(!!!!(((((!!(!!(!!!!((!!(!!!!!!(!!!!(((((!!(!!(!!!!((1";
+        let err = Parser::new()
+            .error_recovery_limit(30)
+            .parse(expression)
+            .expect_err("expression should fail to parse");
+
+        let rendered = format!("{err}");
+        assert!(
+            rendered.contains("error recovery attempt limit exceeded: 30"),
+            "expected recovery limit error, got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn recovery_limit_permits_healthy_parses() {
+        // Well-formed expressions never invoke recovery, so a tiny limit is fine.
+        assert!(Parser::new()
+            .error_recovery_limit(0)
+            .parse("1 + 2 * 3")
+            .is_ok());
+    }
+
+    #[test]
+    fn leading_dot_ident() {
+        let expr = Parser::new()
+            .parse(".x")
+            .expect(".x should parse as a leading-dot ident");
+        assert!(
+            matches!(&expr.expr, crate::common::ast::Expr::Ident(s) if s == ".x"),
+            "expected Ident(\".x\"), got {:?}",
+            expr.expr
+        );
+    }
+
+    #[test]
+    fn reserved_identifiers_are_rejected() {
+        // These are valid IDENTIFIER tokens in the lexer but must be rejected
+        // post-parse by the visitor (mirrors cel-go's reservedIds check).
+        // `in`, `true`, `false`, `null` are grammar-level keywords rejected
+        // earlier — they never reach the visitor.
+        for kw in &[
+            "as",
+            "break",
+            "const",
+            "continue",
+            "else",
+            "for",
+            "function",
+            "if",
+            "import",
+            "let",
+            "loop",
+            "package",
+            "namespace",
+            "return",
+            "var",
+            "void",
+            "while",
+        ] {
+            let err = Parser::new().parse(kw).expect_err(&format!(
+                "`{kw}` should be rejected as a reserved identifier"
+            ));
+            assert!(
+                format!("{err}").contains("reserved identifier"),
+                "expected reserved identifier error for `{kw}`, got: {err}"
+            );
+        }
+        // Also rejected when used as a function name
+        let err = Parser::new()
+            .parse("namespace(1)")
+            .expect_err("`namespace(1)` should fail");
+        assert!(
+            format!("{err}").contains("reserved identifier"),
+            "expected reserved identifier error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn backtick_field_selector_strips_backticks_when_enabled() {
+        // With the flag on the parser should accept the source and lower it
+        // to a plain `Select` whose field is the unescaped identifier.
+        let expr = Parser::new()
+            .enable_ident_escape_syntax(true)
+            .parse("{'a/b': 1}.`a/b`")
+            .expect("should parse with ident-escape enabled");
+        // The outermost node is the Select — walk in and find its field.
+        fn field_of(expr: &crate::common::ast::Expr) -> Option<&str> {
+            match expr {
+                crate::common::ast::Expr::Select(sel) => Some(&sel.field),
+                _ => None,
+            }
+        }
+        assert_eq!(field_of(&expr.expr), Some("a/b"));
+    }
+
+    #[test]
+    fn backtick_field_selector_is_rejected_by_default() {
+        // Per cel-spec (matching cel-go `parser/parser.go:161` with
+        // `EnableIdentEscapeSyntax(false)`), the parser must reject
+        // backtick-quoted field selectors unless the feature is opted in.
+        let err = Parser::new()
+            .parse("{'a/b': 1}.`a/b`")
+            .expect_err("backtick selector must be rejected");
+        assert!(
+            format!("{err}").contains("unsupported syntax: '`'"),
+            "expected `unsupported syntax` error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn reserved_identifiers_are_valid_as_field_selectors() {
+        // Per cel-spec, reserved words CAN be used as field-selector names in
+        // Select expressions (`.as`, `.while`, etc.) — the reserved-id check
+        // only applies to bare identifiers and function names.
+        for kw in &[
+            "as",
+            "break",
+            "const",
+            "continue",
+            "else",
+            "for",
+            "function",
+            "if",
+            "import",
+            "let",
+            "loop",
+            "package",
+            "namespace",
+            "return",
+            "var",
+            "void",
+            "while",
+        ] {
+            let expr = format!("{{ '{kw}': 1 }}.{kw}");
+            Parser::new()
+                .parse(&expr)
+                .unwrap_or_else(|e| panic!("`{expr}` should parse but got: {e}"));
+        }
+    }
+
+    // Regression test: even counts of `!` or `-` cancel out.  The visitor
+    // must visit the child exactly once; visiting twice caused exponential
+    // work on deeply nested expressions (the bug was a discard-and-re-visit
+    // pattern that doubled work at every nesting level).
+    #[test]
+    fn even_unary_operators_visit_child_once() {
+        // Even `!` → identity (no logical-not wrapper)
+        let expr = Parser::new().parse("!!a").expect("!!a should parse");
+        // !!a cancels to `a`; should be an Ident, not a Call
+        assert!(
+            matches!(expr.expr, crate::common::ast::Expr::Ident(_)),
+            "!!a should reduce to an identity ident, got {:?}",
+            expr.expr
+        );
+
+        // Even `-` → identity
+        let expr = Parser::new().parse("--1").expect("--1 should parse");
+        assert!(
+            matches!(expr.expr, crate::common::ast::Expr::Literal(_)),
+            "--1 should reduce to a literal, got {:?}",
+            expr.expr
+        );
+
+        // Deeply nested even `--` must not cause exponential slowdown.
+        // Build `--(--(--(... x ...)))` with 30 levels: 2^30 visits in the
+        // broken implementation, O(n) in the fixed one.
+        let mut nested = "x".to_string();
+        for _ in 0..30 {
+            nested = format!("--({})", nested);
+        }
+        let result = Parser::new().parse(&nested);
+        // May parse or error depending on depth limits, but must not hang.
+        let _ = result;
+    }
+
+    #[test]
+    fn malformed_nested_expression_does_not_panic() {
+        let expression = "ma[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[\x0c\0\0\0\0\0\0\0[[[[[[[putTo?[[[[[[[[[[ep";
+
+        assert!(Parser::new()
+            .max_recursion_depth(48)
+            .parse(expression)
             .is_err());
     }
 
@@ -1957,8 +2361,8 @@ ERROR: <input>:1:10: unsupported syntax '[?'
                 enable_optional_syntax: false,
             },
             TestInfo {
-            i: "a.?b[?0] && a[?c]",
-            p: r#"_&&_(
+                i: "a.?b[?0] && a[?c]",
+                p: r#"_&&_(
     _[?_](
         _?._(
             a^#1:*expr.Expr_IdentExpr#,
@@ -1971,37 +2375,37 @@ ERROR: <input>:1:10: unsupported syntax '[?'
         c^#8:*expr.Expr_IdentExpr#
     )^#7:*expr.Expr_CallExpr#
 )^#9:*expr.Expr_CallExpr#"#,
-            e: "",
-            enable_optional_syntax: true,
-        },
-        TestInfo {
-            i: "{?'key': value}",
-            p: r#"{
+                e: "",
+                enable_optional_syntax: true,
+            },
+            TestInfo {
+                i: "{?'key': value}",
+                p: r#"{
     ?"key"^#3:*expr.Constant_StringValue#:value^#4:*expr.Expr_IdentExpr#^#2:*expr.Expr_CreateStruct_Entry#
 }^#1:*expr.Expr_StructExpr#"#,
-            e: "",
-            enable_optional_syntax: true,
-        },
-        TestInfo {
-            i: "[?a, ?b]",
-            p: r#"[
+                e: "",
+                enable_optional_syntax: true,
+            },
+            TestInfo {
+                i: "[?a, ?b]",
+                p: r#"[
     a^#2:*expr.Expr_IdentExpr#,
     b^#3:*expr.Expr_IdentExpr#
 ]^#1:*expr.Expr_ListExpr#"#,
-            e: "",
-            enable_optional_syntax: true,
-        },
-        TestInfo {
-            i: "[?a[?b]]",
-            p: r#"[
+                e: "",
+                enable_optional_syntax: true,
+            },
+            TestInfo {
+                i: "[?a[?b]]",
+                p: r#"[
     _[?_](
         a^#2:*expr.Expr_IdentExpr#,
         b^#4:*expr.Expr_IdentExpr#
     )^#3:*expr.Expr_CallExpr#
 ]^#1:*expr.Expr_ListExpr#"#,
-            e: "",
-            enable_optional_syntax: true,
-        },
+                e: "",
+                enable_optional_syntax: true,
+            },
             TestInfo {
                 i: "[?a, ?b]",
                 p: "",
@@ -2046,6 +2450,14 @@ ERROR: <input>:1:24: unsupported syntax '?'
                 e: "ERROR: <input>:1:7: argument must be a simple name
 | 1.all(2, 3)
 | ......^",
+                ..Default::default()
+            },
+            TestInfo {
+                i: "foo(a,b,)",
+                p: "",
+                e: "ERROR: <input>:1:9: Syntax error: mismatched input ')' expecting {'[', '{', '(', '.', '-', '!', 'true', 'false', 'null', NUM_FLOAT, NUM_INT, NUM_UINT, STRING, BYTES, IDENTIFIER}
+| foo(a,b,)
+| ........^",
                 ..Default::default()
             },
         ];
@@ -2149,31 +2561,22 @@ ERROR: <input>:1:24: unsupported syntax '?'
                 Expr::Literal(val) => match val {
                     LiteralValue::String(s) => &format!(
                         "\"{}\"^#{}:{}#",
-                        s.inner(),
+                        s.as_str(),
                         expr.id,
                         "*expr.Constant_StringValue"
                     ),
                     LiteralValue::Boolean(b) => {
-                        &format!("{}^#{}:{}#", b.inner(), expr.id, "*expr.Constant_BoolValue")
+                        &format!("{}^#{}:{}#", b, expr.id, "*expr.Constant_BoolValue")
                     }
-                    LiteralValue::Int(i) => &format!(
-                        "{}^#{}:{}#",
-                        i.inner(),
-                        expr.id,
-                        "*expr.Constant_Int64Value"
-                    ),
-                    LiteralValue::UInt(u) => &format!(
-                        "{}u^#{}:{}#",
-                        u.inner(),
-                        expr.id,
-                        "*expr.Constant_Uint64Value"
-                    ),
-                    LiteralValue::Double(f) => &format!(
-                        "{}^#{}:{}#",
-                        f.inner(),
-                        expr.id,
-                        "*expr.Constant_DoubleValue"
-                    ),
+                    LiteralValue::Int(i) => {
+                        &format!("{}^#{}:{}#", i, expr.id, "*expr.Constant_Int64Value")
+                    }
+                    LiteralValue::UInt(u) => {
+                        &format!("{}u^#{}:{}#", u, expr.id, "*expr.Constant_Uint64Value")
+                    }
+                    LiteralValue::Double(f) => {
+                        &format!("{}^#{}:{}#", f, expr.id, "*expr.Constant_DoubleValue")
+                    }
                     LiteralValue::Bytes(bytes) => &format!(
                         "b\"{}\"^#{}:{}#",
                         String::from_utf8_lossy(bytes),

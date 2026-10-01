@@ -4,10 +4,12 @@ permissions:
   pull-requests: write
   contents: write
 
+# Manual only. Upstream releases the `cel` and `cel-parser` crates.io names from
+# cel-rust/cel-rust; this fork does not own them, so a push-triggered
+# `release-plz release` here would try to publish under someone else's name.
+# Re-enable the push trigger only once this fork publishes crates of its own.
 on:
-  push:
-    branches:
-      - master
+  workflow_dispatch:
 
 jobs:
 

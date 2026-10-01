@@ -7,6 +7,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.5](https://github.com/cel-rust/cel-rust/compare/v0.14.4...v0.14.5) - 2026-09-07
+
+### Added
+
+- *(parser)* flag to support indent escaping syntax
+- *(optional)* Impl. equals contract
+- *(parser)* bytes literal parsing fixes, to cel spec
+- *(stdlib)* `type` overloads added ([#330](https://github.com/cel-rust/cel-rust/pull/330))
+- *(parser)* Pratt parser behind `parser_pratt` feature flag
+
+### Fixed
+
+- *(dyn Val)* don't panic converting a custom `Val` into a `Value`
+- *(types)* reject out-of-range int() and uint() conversions ([#336](https://github.com/cel-rust/cel-rust/pull/336))
+- *(parser)* properly _not_ support backticks in idents
+- *(parser)* support negative hex literals
+- *(optional)* chaining is properly supported now
+
+### Other
+
+- Merge pull request #326 from alexsnaps/pratt-feature
+- Add Pratt Parser - an efficient alternative to ANTLR based parser
+
+## [0.14.4](https://github.com/cel-rust/cel-rust/compare/v0.14.3...v0.14.4) - 2026-08-27
+
+### Fixed
+
+- *(parser)* `.x` correctly produces `Ident(".x")`.
+- *(parser)* reject reserved keywords
+- *(parser)* even unary operator cancel out ([#316](https://github.com/cel-rust/cel-rust/pull/316))
+
+## [0.14.3](https://github.com/cel-rust/cel-rust/compare/v0.14.2...v0.14.3) - 2026-08-15
+
+### Added
+
+- *(parser)* Added strategy to limit recoveries ([#310](https://github.com/cel-rust/cel-rust/pull/310))
+
+## [0.14.2](https://github.com/cel-rust/cel-rust/compare/v0.14.1...v0.14.2) - 2026-08-11
+
+### Fixed
+
+- *(parser)* avoid overflows ([#307](https://github.com/cel-rust/cel-rust/pull/307))
+
+## [0.14.1](https://github.com/cel-rust/cel-rust/compare/v0.14.0...v0.14.1) - 2026-07-25
+
+### Added
+
+- *(stdlib)* Add `dyn()` function for dynamic typing support ([#301](https://github.com/cel-rust/cel-rust/pull/301))
+
+### Other
+
+- upgrade thiserror to 2 ([#299](https://github.com/cel-rust/cel-rust/pull/299))
+
 ## [0.14.0](https://github.com/cel-rust/cel-rust/compare/v0.13.0...v0.14.0) - 2026-06-27
 
 ### Added

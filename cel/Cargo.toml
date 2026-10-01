@@ -2,7 +2,7 @@
 name = "cel"
 description = "A parser and interpreter for the Common Expression Language (CEL)"
 repository = "https://github.com/cel-rust/cel-rust"
-version = "0.14.0"
+version = "0.14.5"
 authors = ["Clark McCauley <me@clarkmccauley.com>", "Alex Snaps <alex@wcgw.dev>"]
 edition = "2021"
 rust-version = "1.86.0"
@@ -32,11 +32,72 @@ dhat = { version = "0.3.3" }
 name = "runtime"
 harness = false
 
+[[bench]]
+name = "parser"
+harness = false
+
+# The P0.a allocation instrument. `harness = false` is load-bearing, not style:
+# it installs a `#[global_allocator]`, and the default libtest runner is
+# multi-threaded, so a process-global counter would race across concurrently
+# running tests. `--test-threads=1` cannot be spelled in a manifest, so owning
+# `main` is the only way a plain `cargo test` is correct by construction. The
+# counter it reports is thread-local as well; see the file header.
+[[test]]
+name = "allocs_per_eval"
+harness = false
+
 [features]
-default = ["regex", "chrono"]
+default = ["regex", "chrono", "vm"]
 structs = []
+parser_pratt = []
 bytes = ["dep:bytes"]
 json = ["dep:serde_json", "dep:base64"]
 regex = ["dep:regex"]
 chrono = ["dep:chrono"]
 dhat-heap = [ ] # if you are doing heap profiling
+
+# A measurement probe, never a shipping feature. It adds run-time selectable
+# lowerings at two places in the dispatch loop -- the sites that discard a
+# popped operand, and the element read `Vm::element_at`, which is what `IterAt`
+# is and what `IterBind` does before it stores -- so that what one lowering
+# costs against another is a difference taken inside ONE binary. Two `cargo build`
+# invocations cannot answer that: they admit compile drift and stale binaries,
+# and neither is visible in the numbers they produce.
+#
+# Off by default. One of the drop policies LEAKS by design; see `DropArm::ForgetUnsound`, which is
+# sound only for an integer body over a list of integers and is guarded by an
+# allocation witness before any timing runs.
+__drop-arm-probe = []
+
+# The third measurement probe, and never a shipping feature either. It lets the
+# dispatch loop FUSE the per-element instruction block of an appending
+# comprehension -- `list.map(x, x * k)` -- into one step, in named groups, so
+# that what the VM's dispatch and operand-stack traffic cost per element is a
+# difference taken inside ONE binary rather than between two builds.
+#
+# Every arm computes the same answer from the same helpers; what an arm removes
+# is dispatches and operand-stack round trips, never work the tree walker also
+# does. The harness asserts each arm's result against the stock arm's before
+# any timing, so an arm that removed work it should not have is a failure and
+# not a faster number. Off by default.
+__elem-attr-probe = []
+
+# Route `Program::execute` through the bytecode VM instead of the tree walker.
+#
+# On by default, so the VM is what a caller gets. The tree walker is not
+# deleted and is still the differential oracle: `cel/tests/oracle.rs` and
+# `cel/tests/vm_walker_sweep.rs` call `Value::resolve` / `Value::resolve_value`
+# directly, so both evaluators run under either setting of this flag and
+# turning the flag on did not turn the VM's gate off. What the flag decides is
+# which evaluator a *caller* gets.
+#
+# Turning it OFF -- `--no-default-features --features regex,chrono` -- is now
+# the non-default configuration, and it is the only way `Program::execute`
+# reaches the walker. `.github/workflows/rust.yml` runs a test leg for it.
+vm = []
+
+# `Value` and list buffers are `!Send + !Sync` (`ListBuf`'s
+# `PhantomData<*const ()>`). Shared buffers are still `Arc`: clone and drop
+# bump that refcount. The `Arc` is the owner, not a cross-thread share.
+[lints.clippy]
+arc_with_non_send_sync = "allow"

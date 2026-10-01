@@ -1,0 +1,1331 @@
+# The differential oracle's corpus — CEL source and the frozen answer.
+#
+# This file is DATA. Nothing in it is Rust and nothing in it is CEL beyond the
+# `expr:` line itself; the `want:` notation is a canonical rendering defined by
+# `render()`/`render_error()` in tests/oracle.rs and by nothing else. That is
+# deliberate: an oracle written as a second evaluator gets rewritten by the same
+# commit that rewrites the subject, and the gate disappears without anyone
+# noticing. A text file does not.
+#
+# ---------------------------------------------------------------------------
+# Record format
+# ---------------------------------------------------------------------------
+#
+#   expr: <CEL source, one line>
+#   feat: <space separated tags from REQUIRED_COVERAGE>
+#   want: <canonical rendering of the expected Value, or error(...)>
+#   cfg:  <optional cargo feature this case needs>
+#
+# Records are separated by a blank line. `#` starts a comment line.
+#
+# ---------------------------------------------------------------------------
+# The bindings every case sees (built by `fixed_context()` in oracle.rs)
+# ---------------------------------------------------------------------------
+#
+#   i        int    42
+#   neg      int    -7
+#   u        uint   7
+#   d        double 1.5
+#   b        bool   true
+#   s        string "hello"
+#   by       bytes  b"hi"
+#   nil      null
+#   xs       list   [1, 2, 3, 4]
+#   strs     list   ["a", "bb", "ccc"]
+#   empty    list   []
+#   m        map    {"a": 1, "b": 2}
+#   nested   map    {"inner": {"k": 5}}
+#   people   list   [{"name": "ann", "age": 30}, {"name": "bob", "age": 20}]
+#   opt_some optional(9)
+#   opt_none optional.none
+#
+#   double_it(int) -> int      host function, doubles its argument
+#   boom(int) -> error         host function that always fails
+#
+# ---------------------------------------------------------------------------
+# Literals
+# ---------------------------------------------------------------------------
+
+expr: 1
+feat: literal_int
+want: int(1)
+
+expr: -3
+feat: literal_int
+want: int(-3)
+
+expr: 7u
+feat: literal_uint
+want: uint(7)
+
+expr: 0u
+feat: literal_uint
+want: uint(0)
+
+expr: 1.5
+feat: literal_double
+want: double(1.5)
+
+expr: -0.25
+feat: literal_double
+want: double(-0.25)
+
+expr: true
+feat: literal_bool
+want: bool(true)
+
+expr: false
+feat: literal_bool
+want: bool(false)
+
+expr: "hi"
+feat: literal_string
+want: string("hi")
+
+expr: ""
+feat: literal_string
+want: string("")
+
+expr: b"hi"
+feat: literal_bytes
+want: bytes(6869)
+
+expr: null
+feat: literal_null
+want: null
+
+expr: null == null
+feat: literal_null equality
+want: bool(true)
+
+expr: [1, 2, 3]
+feat: literal_list
+want: list[int(1), int(2), int(3)]
+
+expr: []
+feat: literal_list
+want: list[]
+
+expr: {"a": 1, "b": 2}
+feat: literal_map
+want: map{string("a"): int(1), string("b"): int(2)}
+
+expr: {}
+feat: literal_map
+want: map{}
+
+# ---------------------------------------------------------------------------
+# Arithmetic
+# ---------------------------------------------------------------------------
+
+expr: 1 + 2
+feat: arith
+want: int(3)
+
+expr: 7 - 9
+feat: arith
+want: int(-2)
+
+expr: 6 * 7
+feat: arith
+want: int(42)
+
+expr: 7 / 2
+feat: arith
+want: int(3)
+
+expr: 7 % 3
+feat: arith
+want: int(1)
+
+expr: -i
+feat: arith variable
+want: int(-42)
+
+expr: 1u + 2u
+feat: arith literal_uint
+want: uint(3)
+
+expr: 1.5 + 2.5
+feat: arith literal_double
+want: double(4.0)
+
+expr: "a" + "b"
+feat: arith literal_string
+want: string("ab")
+
+expr: [1] + [2]
+feat: arith literal_list
+want: list[int(1), int(2)]
+
+# Both of these changed when the `dyn Val` walker was deleted, and both moved
+# toward the CEL spec. `+` on a list required both sides to be lists, but the
+# old list adder iterated whatever it was handed, so a map contributed its keys.
+
+expr: [1] + {"a": 1}
+feat: arith literal_list literal_map error
+want: error(NoSuchOverload)
+
+expr: duration("1s") + timestamp("2020-01-01T00:00:00Z")
+feat: arith duration timestamp
+cfg: chrono
+want: timestamp(2020-01-01T00:00:01+00:00)
+
+expr: 9223372036854775807 + 1
+feat: arith_overflow error
+want: error(Overflow: add)
+
+expr: -9223372036854775807 - 2
+feat: arith_overflow error
+want: error(Overflow: sub)
+
+expr: 1 / 0
+feat: arith_div_zero error
+want: error(DivisionByZero)
+
+expr: 1 % 0
+feat: arith_div_zero error
+want: error(RemainderByZero)
+
+# ---------------------------------------------------------------------------
+# Comparison and equality
+# ---------------------------------------------------------------------------
+
+expr: 1 < 2
+feat: compare
+want: bool(true)
+
+expr: 2 <= 2
+feat: compare
+want: bool(true)
+
+expr: 3 > 4
+feat: compare
+want: bool(false)
+
+expr: 3 >= 3
+feat: compare
+want: bool(true)
+
+expr: "a" < "b"
+feat: compare literal_string
+want: bool(true)
+
+expr: 1.0 > 0.0
+feat: compare literal_double
+want: bool(true)
+
+expr: 1 < uint(2)
+feat: compare_hetero conversion
+want: bool(true)
+
+expr: 1 < 1.1
+feat: compare_hetero
+want: bool(true)
+
+expr: uint(0) > -10
+feat: compare_hetero conversion
+want: bool(true)
+
+expr: 1 == 1
+feat: equality
+want: bool(true)
+
+expr: 1 != 2
+feat: equality
+want: bool(true)
+
+expr: {} == []
+feat: equality literal_map literal_list
+want: bool(false)
+
+expr: [1, 2] == [1, 2]
+feat: equality literal_list
+want: bool(true)
+
+expr: double('NaN') == double('NaN')
+feat: equality literal_double conversion
+want: bool(false)
+
+# ---------------------------------------------------------------------------
+# Logic and the ternary
+# ---------------------------------------------------------------------------
+
+expr: true && false
+feat: logic_and
+want: bool(false)
+
+expr: true && true
+feat: logic_and
+want: bool(true)
+
+expr: false && undefined_name
+feat: logic_and error
+want: bool(false)
+
+expr: true || false
+feat: logic_or
+want: bool(true)
+
+expr: false || false
+feat: logic_or
+want: bool(false)
+
+expr: true || undefined_name
+feat: logic_or error
+want: bool(true)
+
+# `&&` and `||` are commutative over errors: an error on either side is
+# absorbed when the *other* side decides the result. The six cases above only
+# ever put the error on the right, where plain short-circuiting already skips
+# it, so none of them can tell absorption apart from short-circuiting. These
+# put it on the left, where the operator has to evaluate both sides and then
+# discard a real error.
+
+expr: undefined_name && false
+feat: logic_and error
+want: bool(false)
+
+expr: undefined_name && true
+feat: logic_and error
+want: error(UndeclaredReference: undefined_name)
+
+expr: undefined_name || true
+feat: logic_or error
+want: bool(true)
+
+expr: undefined_name || false
+feat: logic_or error
+want: error(UndeclaredReference: undefined_name)
+
+expr: undefined_name && undefined_name
+feat: logic_and error
+want: error(UndeclaredReference: undefined_name)
+
+# The absorbed error is raised deep inside the left operand rather than by
+# resolving a name, so recognising it cannot be a property of the operand's
+# shape.
+
+expr: (1 / 0 == 1) && false
+feat: logic_and arith error
+want: bool(false)
+
+# The error lands while a list literal is half-built, so absorbing it has to
+# discard the partial aggregate as well as the error.
+
+expr: ([1, 2, undefined_name][0] == 1) && false
+feat: logic_and literal_list index_list error
+want: bool(false)
+
+# A non-bool operand is an overload failure, and on the *left* that failure is
+# absorbed exactly like any other error -- `1 && false` is `false`. So "is this
+# a bool" is not a precondition the operator can check before deciding; it is
+# one more outcome the merge weighs against the other side.
+
+expr: true && 1
+feat: logic_and error
+want: error(NoSuchOverload)
+
+expr: 1 && false
+feat: logic_and error
+want: bool(false)
+
+expr: 1 && true
+feat: logic_and error
+want: error(NoSuchOverload)
+
+expr: 1 && 2
+feat: logic_and error
+want: error(NoSuchOverload)
+
+expr: 1 || true
+feat: logic_or error
+want: bool(true)
+
+expr: 1 || false
+feat: logic_or error
+want: error(NoSuchOverload)
+
+# The right operand is *not* under the absorption: an error raised there
+# propagates even when the left one already failed, and it is the error the
+# caller sees. Absorption is a property of one side, not of the operator.
+
+expr: 1 && undefined_name
+feat: logic_and error
+want: error(UndeclaredReference: undefined_name)
+
+expr: undefined_name && (1 / 0 == 1)
+feat: logic_and arith error
+want: error(DivisionByZero)
+
+# Nested, so that whichever operator absorbs an error has to be the innermost
+# one still able to discard it.
+
+expr: (undefined_name && false) && true
+feat: logic_and error
+want: bool(false)
+
+expr: true && (undefined_name && false)
+feat: logic_and error
+want: bool(false)
+
+expr: (undefined_name && true) || true
+feat: logic_and logic_or error
+want: bool(true)
+
+expr: !true
+feat: logic_not
+want: bool(false)
+
+expr: !(1 == 2)
+feat: logic_not equality
+want: bool(true)
+
+expr: true ? 1 : 2
+feat: ternary
+want: int(1)
+
+expr: false ? 1 : 2
+feat: ternary
+want: int(2)
+
+expr: i > 0 ? "pos" : "neg"
+feat: ternary compare variable
+want: string("pos")
+
+# ---------------------------------------------------------------------------
+# Indexing and field selection
+# ---------------------------------------------------------------------------
+
+expr: xs[0]
+feat: index_list variable
+want: int(1)
+
+expr: xs[3]
+feat: index_list variable
+want: int(4)
+
+expr: [10, 20][1]
+feat: index_list literal_list
+want: int(20)
+
+expr: m["a"]
+feat: index_map variable
+want: int(1)
+
+expr: {"k": 9}["k"]
+feat: index_map literal_map
+want: int(9)
+
+expr: {1: "one"}[1]
+feat: index_map literal_map
+want: string("one")
+
+expr: m.a
+feat: field_select variable
+want: int(1)
+
+expr: nested.inner.k
+feat: field_select variable
+want: int(5)
+
+expr: {"x": {"y": 3}}.x.y
+feat: field_select literal_map
+want: int(3)
+
+# ---------------------------------------------------------------------------
+# `in`
+# ---------------------------------------------------------------------------
+
+expr: 1 in xs
+feat: in_operator variable
+want: bool(true)
+
+expr: 9 in xs
+feat: in_operator variable
+want: bool(false)
+
+expr: "a" in m
+feat: in_operator variable
+want: bool(true)
+
+expr: "z" in m
+feat: in_operator variable
+want: bool(false)
+
+# ---------------------------------------------------------------------------
+# size()
+# ---------------------------------------------------------------------------
+
+expr: size(xs)
+feat: size variable
+want: int(4)
+
+expr: size(s)
+feat: size variable
+want: int(5)
+
+expr: size(m)
+feat: size variable
+want: int(2)
+
+expr: size(empty)
+feat: size variable
+want: int(0)
+
+# ---------------------------------------------------------------------------
+# Macros
+# ---------------------------------------------------------------------------
+
+expr: has(m.a)
+feat: macro_has variable
+want: bool(true)
+
+expr: has(m.z)
+feat: macro_has variable
+want: bool(false)
+
+expr: has(nested.inner)
+feat: macro_has variable
+want: bool(true)
+
+expr: xs.all(x, x > 0)
+feat: macro_all variable
+want: bool(true)
+
+expr: xs.all(x, x > 2)
+feat: macro_all variable
+want: bool(false)
+
+expr: xs.exists(x, x == 3)
+feat: macro_exists variable
+want: bool(true)
+
+expr: xs.exists(x, x == 9)
+feat: macro_exists variable
+want: bool(false)
+
+expr: xs.exists_one(x, x == 3)
+feat: macro_exists_one variable
+want: bool(true)
+
+expr: xs.exists_one(x, x > 2)
+feat: macro_exists_one variable
+want: bool(false)
+
+expr: xs.map(x, x * 2)
+feat: macro_map variable
+want: list[int(2), int(4), int(6), int(8)]
+
+expr: strs.map(x, size(x))
+feat: macro_map size variable
+want: list[int(1), int(2), int(3)]
+
+expr: people.map(p, p.name)
+feat: macro_map field_select variable
+want: list[string("ann"), string("bob")]
+
+expr: xs.filter(x, x % 2 == 0)
+feat: macro_filter variable
+want: list[int(2), int(4)]
+
+expr: people.filter(p, p.age > 25)
+feat: macro_filter field_select variable
+want: list[map{string("age"): int(30), string("name"): string("ann")}]
+
+expr: xs.filter(x, x > 1).map(x, x * 10)
+feat: comprehension_nested macro_map macro_filter variable
+want: list[int(20), int(30), int(40)]
+
+
+# The body NAMES the iteration source, so the loop is reading a list a live
+# binding also holds. The bytecode VM iterates that list where it stands rather
+# than over a private copy of it (`OpCode::IterElems`), which makes these the
+# cases that would diverge if anything could rewrite a list buffer underneath a
+# comprehension. Both element types are here because a string element is a
+# reference count where an int is a bare word.
+
+expr: xs.map(x, xs)
+feat: macro_map variable
+want: list[list[int(1), int(2), int(3), int(4)], list[int(1), int(2), int(3), int(4)], list[int(1), int(2), int(3), int(4)], list[int(1), int(2), int(3), int(4)]]
+
+expr: xs.all(x, x in xs)
+feat: macro_all in_operator variable
+want: bool(true)
+
+expr: xs.filter(x, xs.exists(y, y == x))
+feat: comprehension_nested macro_filter macro_exists variable
+want: list[int(1), int(2), int(3), int(4)]
+
+expr: strs.map(x, strs.size())
+feat: macro_map size variable
+want: list[int(3), int(3), int(3)]
+
+
+# An error raised in a comprehension body propagates out of the loop, and one
+# the body absorbs does not -- the absorbing case runs the handler once per
+# element, so it is also the only case where catching repeatedly could
+# accumulate state.
+
+expr: xs.map(x, 1 / 0)
+feat: macro_map arith_div_zero error variable
+want: error(DivisionByZero)
+
+expr: xs.filter(x, undefined_name)
+feat: macro_filter error variable
+want: error(UndeclaredReference: undefined_name)
+
+expr: xs.all(x, undefined_name && false)
+feat: macro_all logic_and error variable
+want: bool(false)
+
+expr: xs.exists(x, undefined_name || true)
+feat: macro_exists logic_or error variable
+want: bool(true)
+
+expr: empty.all(x, 1 / 0 == 1)
+feat: macro_all arith_div_zero error variable
+want: bool(true)
+
+# Zero iterations through the APPENDING lowering, which is a different loop
+# from the one `empty.all` above exercises. It is the boundary where the guard
+# decides before the counter has ever been advanced and before any element has
+# been read, so a loop that advanced or indexed one time too many would answer
+# here rather than anywhere else in this section.
+
+expr: empty.map(x, x * 2)
+feat: macro_map variable
+want: list[]
+
+expr: empty.filter(x, x > 0)
+feat: macro_filter variable
+want: list[]
+
+# A comprehension whose range is a map iterates its KEYS. The order is the
+# map's iteration order, which is unspecified — `m.map(k, k)` is deliberately
+# NOT pinned here, because the two evaluators build their maps separately and
+# answer `[b, a]` and `[a, b]` for it. Only order-independent results belong.
+
+expr: m.all(k, k == "a" || k == "b")
+feat: macro_all map_range variable
+want: bool(true)
+
+expr: m.map(k, k).size()
+feat: macro_map map_range size variable
+want: int(2)
+
+expr: m.exists(k, k == "a")
+feat: macro_exists map_range variable
+want: bool(true)
+
+# ---------------------------------------------------------------------------
+# type() and dyn()
+# ---------------------------------------------------------------------------
+#
+# `type(x)` names the value's own CEL type, and the name is the spec's — which
+# is NOT always the spelling `Value`'s Display uses: the null family is
+# `null_type`, not `null`, and the two temporal families carry their protobuf
+# names. The `type(...)` rendering is the denoted type's name; the type value's
+# own runtime type is `type`, whatever it denotes, which is what closes the
+# recursion below.
+
+expr: type(1)
+feat: type_fn literal_int
+want: type(int)
+
+expr: type(1u)
+feat: type_fn literal_uint
+want: type(uint)
+
+expr: type(1.5)
+feat: type_fn literal_double
+want: type(double)
+
+expr: type(true)
+feat: type_fn literal_bool
+want: type(bool)
+
+expr: type("a")
+feat: type_fn literal_string
+want: type(string)
+
+expr: type(b"hi")
+feat: type_fn literal_bytes
+want: type(bytes)
+
+expr: type(null)
+feat: type_fn literal_null
+want: type(null_type)
+
+expr: type(xs)
+feat: type_fn variable literal_list
+want: type(list)
+
+expr: type(m)
+feat: type_fn variable literal_map
+want: type(map)
+
+expr: type(opt_some)
+feat: type_fn optional variable
+want: type(optional_type)
+
+# The two names most often got wrong, so both evaluators are held to them here
+# rather than by a walker-only unit test: the temporal families are named for
+# their protobuf messages, NOT `duration` and `timestamp`.
+
+expr: type(duration("1s"))
+feat: type_fn duration
+cfg: chrono
+want: type(google.protobuf.Duration)
+
+expr: type(timestamp("2020-01-01T00:00:00Z"))
+feat: type_fn timestamp
+cfg: chrono
+want: type(google.protobuf.Timestamp)
+
+# "those values (`int`, `string`, etc.) also have a type: the type `type`, which
+# is an expression by itself which in turn also has type `type`" — langdef.md.
+# A type value is therefore a fixed point, not a tower.
+
+expr: type(type(1))
+feat: type_fn
+want: type(type)
+
+expr: type(type(type("a")))
+feat: type_fn
+want: type(type)
+
+# Type values compare by the type they denote, so two ints agree and an int and
+# a uint do not.
+#
+# The third row is NOT the spec's example, and does not have its answer. Its
+# example is `type(type(1)) == type(string)` -> true; the row below is
+# `type(type(1)) == type("a")` -> false, which compares `type` against `string`.
+# The spec's spelling needs the bare identifier `string`, which did not resolve
+# when this block was written -- the comment is a scar from that. It is in the
+# type-identifier block further down.
+
+expr: type(1) == type(2)
+feat: type_fn equality
+want: bool(true)
+
+expr: type(1) == type(1u)
+feat: type_fn equality
+want: bool(false)
+
+expr: type(type(1)) == type("a")
+feat: type_fn equality
+want: bool(false)
+
+expr: type(xs) == type([9, 9])
+feat: type_fn equality variable
+want: bool(true)
+
+# A type is not the string that spells it.
+
+expr: type(1) == "int"
+feat: type_fn equality
+want: bool(false)
+
+# Arity is what the declaration says: `type(A) -> type`, one argument.
+
+expr: type(1, 2)
+feat: type_fn error
+want: error(UndeclaredReference: type)
+
+# ---------------------------------------------------------------------------
+# The type identifiers
+# ---------------------------------------------------------------------------
+#
+# A type is a value, so the names have to resolve as identifiers and not only as
+# conversion functions. `int(1.9)` in the conversion block below is a call on the
+# overload; bare `int` here is an identifier. The two spellings share one name
+# and neither disturbs the other, because a callee is resolved through
+# `get_function` and an identifier through `get_variable`. The identifier is the
+# last thing `get_variable` tries, so a bound variable named `int` shadows the
+# type; the arity row above stays an `UndeclaredReference` for the same reason,
+# since the call path never consults the identifier at all.
+
+expr: type(1) == int
+feat: type_ident type_fn equality
+want: bool(true)
+
+expr: type("a") == string
+feat: type_ident type_fn equality literal_string
+want: bool(true)
+
+expr: type(1) == string
+feat: type_ident type_fn equality
+want: bool(false)
+
+# langdef.md's own worked example for `type()`, unwritable until the identifiers
+# resolved. `type(1)` is `int` and `int`'s type is `type`; `string` is a type
+# value and its type is `type` as well.
+
+expr: type(type(1)) == type(string)
+feat: type_ident type_fn equality
+want: bool(true)
+
+expr: type(xs) == list
+feat: type_ident type_fn equality variable
+want: bool(true)
+
+# Not `null`: langdef.md names the family `null_type`.
+
+expr: type(null) == null_type
+feat: type_ident type_fn equality literal_null
+want: bool(true)
+
+expr: type(type(1)) == type
+feat: type_ident type_fn equality
+want: bool(true)
+
+# An identifier on its own, with no `type()` call anywhere: the identifier half
+# is what is under test, so at least one row must not lean on the function.
+
+expr: int == int
+feat: type_ident equality
+want: bool(true)
+
+expr: int == uint
+feat: type_ident equality
+want: bool(false)
+
+# A type value's own type is `type`, whichever type it denotes.
+
+expr: type(int)
+feat: type_ident type_fn
+want: type(type)
+
+expr: dyn(1)
+feat: dyn_fn
+want: int(1)
+
+expr: dyn(xs)[0]
+feat: dyn_fn index_list variable
+want: int(1)
+
+# ---------------------------------------------------------------------------
+# Conversions
+# ---------------------------------------------------------------------------
+
+expr: int(1.9)
+feat: conversion
+want: int(1)
+
+expr: uint(3)
+feat: conversion
+want: uint(3)
+
+expr: double(3)
+feat: conversion
+want: double(3.0)
+
+expr: string(1)
+feat: conversion
+want: string("1")
+
+expr: bytes("hi")
+feat: conversion literal_bytes
+want: bytes(6869)
+
+# ---------------------------------------------------------------------------
+# String functions
+# ---------------------------------------------------------------------------
+
+expr: s.startsWith("he")
+feat: string_fn variable
+want: bool(true)
+
+expr: s.endsWith("lo")
+feat: string_fn variable
+want: bool(true)
+
+expr: s.contains("ell")
+feat: string_fn variable
+want: bool(true)
+
+expr: s.contains("zzz")
+feat: string_fn variable
+want: bool(false)
+
+expr: s.matches("h.*o")
+feat: regex string_fn variable
+cfg: regex
+want: bool(true)
+
+# A member call on an identifier receiver is compiled as a namespaced probe
+# followed by the receiver path, and the probe pops the arguments to ask about
+# them. On a miss they are handed straight to the receiver path rather than
+# pushed back, so what is popped once is never popped twice.
+#
+# These two pin the hand-off against the case where it never arrives: the
+# receiver load itself raises, a short-circuit absorbs it, and the arguments
+# must not still be waiting when the OTHER operand makes its own member call.
+# `"..."` receivers are literals, which is the arm that pops its own arguments,
+# so a surviving hand-off is exactly what they would read instead. Both answers
+# below are the ones the walker gives, which never moves an argument twice.
+expr: undefined_name.startsWith("zzz") || "hello world".contains("o w")
+feat: string_fn logic_or error
+want: bool(true)
+
+expr: undefined_name.startsWith("o w") && "hello world".contains("zzz")
+feat: string_fn logic_and error
+want: bool(false)
+
+# ---------------------------------------------------------------------------
+# Optional
+# ---------------------------------------------------------------------------
+
+expr: opt_some
+feat: optional variable
+want: optional(int(9))
+
+expr: opt_none
+feat: optional variable
+want: optional.none
+
+expr: optional.of(3)
+feat: optional
+want: optional(int(3))
+
+expr: optional.none()
+feat: optional
+want: optional.none
+
+expr: opt_some.value()
+feat: optional variable
+want: int(9)
+
+expr: opt_some.hasValue()
+feat: optional variable
+want: bool(true)
+
+expr: opt_none.hasValue()
+feat: optional variable
+want: bool(false)
+
+expr: opt_some.orValue(0)
+feat: optional variable
+want: int(9)
+
+# An optional container decides a plain index on its own, so a `none` receiver
+# answers before the key is looked at. That order is only visible when
+# evaluating the key would itself fail.
+
+expr: opt_none[0]
+feat: optional index_list variable
+want: optional.none
+
+expr: opt_some[1 / 0]
+feat: optional arith_div_zero error variable
+want: error(DivisionByZero)
+
+expr: opt_none[1 / 0]
+feat: optional arith_div_zero error variable
+want: optional.none
+
+# `OPTIONAL_TYPE` is `Kind::Opaque` parameterised on `DYN_TYPE`, so
+# `Type::is_assignable` accepts EVERY value and these member overloads are
+# selected on name and arity alone — a non-optional receiver reaches the body.
+# Until the host boundary took `Value`, the bodies of `value`, `or` and
+# `orValue` answered that with `.expect()`, so each of the three cases below
+# PANICKED: a library panic reachable from ordinary CEL source. They now report
+# the same mismatch `hasValue` always did.
+
+expr: (1).value()
+feat: optional
+want: error(UnexpectedType: got=int want=optional_type)
+
+expr: (1).or(optional.of(2))
+feat: optional
+want: error(UnexpectedType: got=int want=optional_type)
+
+expr: (1).orValue(2)
+feat: optional
+want: error(UnexpectedType: got=int want=optional_type)
+
+expr: (1).hasValue()
+feat: optional
+want: error(UnexpectedType: got=int want=optional_type)
+
+# `Parser::default()` has optional syntax OFF, so `Program::compile` — the door
+# a caller holds — cannot parse `_[?_]` at all. `parse: optional` selects the
+# configured parser; without it these two would only ever pin `parse_error`.
+
+expr: m[?"a"]
+feat: opt_syntax index_map optional variable
+parse: optional
+want: optional(int(1))
+
+expr: m[?"z"]
+feat: opt_syntax index_map optional variable
+parse: optional
+want: optional.none
+
+expr: m[?"a"]
+feat: opt_syntax variable
+want: parse_error
+
+# `_?._` — optional field selection. The non-optional-operand arm propagates a
+# missing-field error rather than answering `optional.none`; the
+# optional-operand arm substitutes `optional.none` for the miss and keeps the
+# outer `Some`, so a miss nests one optional inside another.
+
+expr: m.?a
+feat: opt_syntax opt_select optional variable
+parse: optional
+want: optional(int(1))
+
+expr: m.?z
+feat: opt_syntax opt_select optional variable
+parse: optional
+want: error(NoSuchKey: z)
+
+expr: opt_some.?x
+feat: opt_syntax opt_select optional variable
+parse: optional
+want: optional(optional.none)
+
+# ---------------------------------------------------------------------------
+# Duration and timestamp
+# ---------------------------------------------------------------------------
+
+expr: duration("1h")
+feat: duration
+cfg: chrono
+want: duration(3600000000000ns)
+
+expr: duration("90s")
+feat: duration
+cfg: chrono
+want: duration(90000000000ns)
+
+expr: duration("1h") > duration("30m")
+feat: duration compare
+cfg: chrono
+want: bool(true)
+
+expr: timestamp("2023-01-01T00:00:00Z")
+feat: timestamp
+cfg: chrono
+want: timestamp(2023-01-01T00:00:00+00:00)
+
+expr: timestamp("2023-01-01T00:00:00Z") < timestamp("2024-01-01T00:00:00Z")
+feat: timestamp compare
+cfg: chrono
+want: bool(true)
+
+expr: timestamp("2023-01-01T00:00:00Z") + duration("1h")
+feat: timestamp duration
+cfg: chrono
+want: timestamp(2023-01-01T01:00:00+00:00)
+
+# Negating a duration is CEL, negating a timestamp is not. Only the first has
+# an answer to agree on, and until it was pinned the batch lowering declined it
+# while the tree-walker answered.
+
+expr: -duration("1h")
+feat: duration arith
+cfg: chrono
+want: duration(-3600000000000ns)
+
+expr: -duration("1h") + duration("90m")
+feat: duration arith
+cfg: chrono
+want: duration(1800000000000ns)
+
+# ---------------------------------------------------------------------------
+# Opaque
+# ---------------------------------------------------------------------------
+
+# `impl Val for Optional` (common/types/optional.rs) overrides `equals` to
+# compare presence and then the wrapped values. Before that override these two
+# cases answered `bool(false)` — the default `Val::equals` (common/value.rs)
+# returns `false` unconditionally, so an optional never equalled anything,
+# including itself.
+
+expr: opt_some == opt_some
+feat: opaque optional equality variable
+want: bool(true)
+
+expr: optional.of(3) == optional.of(3)
+feat: opaque optional equality
+want: bool(true)
+
+expr: opt_some == opt_none
+feat: opaque optional equality variable
+want: bool(false)
+
+# ---------------------------------------------------------------------------
+# Host functions
+# ---------------------------------------------------------------------------
+
+expr: double_it(21)
+feat: host_function
+want: int(42)
+
+expr: double_it(i)
+feat: host_function variable
+want: int(84)
+
+expr: boom(1)
+feat: host_function error
+want: error(FunctionError: boom)
+
+# ---------------------------------------------------------------------------
+# Errors
+# ---------------------------------------------------------------------------
+
+expr: xs[10]
+feat: error index_list variable
+want: error(IndexOutOfBounds)
+
+expr: m["z"]
+feat: error index_map variable
+want: error(NoSuchKey: z)
+
+expr: undefined_name
+feat: error variable
+want: error(UndeclaredReference: undefined_name)
+
+expr: 1 + "a"
+feat: error arith
+want: error(NoSuchOverload)
+
+expr: nosuchfn(1)
+feat: error
+want: error(UndeclaredReference: nosuchfn)
+
+# The operator reaches the error as its method name (`sub`), not as its CEL
+# overload id (`_-_`).
+expr: "a" - "b"
+feat: error arith
+want: error(UnsupportedBinaryOperator: sub)
+
+# Selecting a field on a list is routed through list indexing, so the failure
+# names the index types rather than a missing field.
+expr: xs.z
+feat: error field_select variable
+want: error(UnexpectedType: got=string want=int|uint)
+
+expr: has(xs.z)
+feat: error macro_has field_select variable
+want: error(UnexpectedType: got=string want=int|uint)
+
+expr: has(i.z)
+feat: error macro_has field_select variable
+want: error(NoSuchOverload)
+
+expr: !nil
+feat: error logic_not variable
+want: error(NoSuchOverload)
+
+expr: has(nil.x)
+feat: error macro_has variable
+want: error(NoSuchOverload)
+
+expr: double_it()
+feat: error host_function
+want: error(InvalidArgumentCount: expected=1 actual=0)
+
+expr: u - 9u
+feat: error arith_overflow
+want: error(Overflow: sub)
+
+# ---------------------------------------------------------------------------
+# Values that are containers, and the non-scalar results the walker builds
+# ---------------------------------------------------------------------------
+
+expr: people[0]
+feat: index_list field_select variable
+want: map{string("age"): int(30), string("name"): string("ann")}
+
+expr: nested.inner
+feat: field_select variable
+want: map{string("k"): int(5)}
+
+expr: [1,2] + xs
+feat: arith literal_list variable
+want: list[int(1), int(2), int(1), int(2), int(3), int(4)]
+
+expr: b"ab" + b"cd"
+feat: arith literal_bytes
+want: bytes(61626364)
+
+expr: size(by)
+feat: size variable literal_bytes
+want: int(2)
+
+# The three-argument comprehension macro: filter and transform in one pass.
+expr: xs.map(x, x > 2, x * 100)
+feat: macro_map macro_filter variable
+want: list[int(300), int(400)]
+
+expr: strs.exists_one(x, size(x) == 2)
+feat: macro_exists_one size variable
+want: bool(true)
+
+expr: m.size()
+feat: size variable
+want: int(2)
+
+expr: xs[1u]
+feat: index_list literal_uint variable
+want: int(2)
+
+expr: i in m
+feat: in_operator variable
+want: bool(false)
+
+expr: nil == 0
+feat: equality literal_null variable
+want: bool(false)
+
+expr: int("12")
+feat: conversion
+want: int(12)
+
+# Double division does not error; it produces the IEEE result.
+expr: 1.0 / 0.0
+feat: arith literal_double
+want: double(inf)
+
+expr: 0.0 / 0.0
+feat: arith literal_double
+want: double(nan)
+
+expr: s.matches("^z")
+feat: regex string_fn variable
+cfg: regex
+want: bool(false)
+
+expr: duration("1h30m")
+feat: duration
+cfg: chrono
+want: duration(5400000000000ns)
+
+expr: timestamp("2023-05-04T06:07:08Z").getFullYear()
+feat: timestamp
+cfg: chrono
+want: int(2023)
+
+# ---------------------------------------------------------------------------
+# Syntax
+# ---------------------------------------------------------------------------
+
+expr: 1 +
+feat: syntax_error
+want: parse_error
+
+# Cross-type numeric equality. Value's `PartialEq` compares int/uint/double by
+# numeric value, and these cases replace the per-wrapper `test_equals` unit
+# tests that went with the trait universe.
+
+expr: 1 == 1u
+feat: equality literal_int literal_uint
+want: bool(true)
+
+expr: 1 == 1.0
+feat: equality literal_int literal_double
+want: bool(true)
+
+expr: -1 == 1u
+feat: equality literal_int literal_uint
+want: bool(false)
+
+expr: 1u == 1.0
+feat: equality literal_uint literal_double
+want: bool(true)
+
+expr: 42 == 42.2
+feat: equality literal_int literal_double
+want: bool(false)
+
+expr: i == 42.0
+feat: equality variable literal_double
+want: bool(true)
+
+expr: u == 7
+feat: equality variable literal_int
+want: bool(true)
+
+expr: 42 == '42'
+feat: equality literal_int literal_string
+want: bool(false)
+
+# NaN compares unequal to every number including itself, the assertions the
+# deleted per-wrapper `test_equals` carried.
+
+expr: 42 == double('nan')
+feat: equality literal_int conversion
+want: bool(false)
+
+expr: double('nan') == double('nan')
+feat: equality conversion
+want: bool(false)
+
+# ---------------------------------------------------------------------------
+# Struct literals — WHEN the type is refused, not what it builds
+# ---------------------------------------------------------------------------
+#
+# `fixed_context()` registers no struct definition, so every one of these is a
+# refusal. That is the point: the refusal has to come from OPENING the literal,
+# before any field expression runs. The VM used to defer it to the close, so
+# `cel.MyStruct { x: 1 / 0 }` answered the field's error instead of the type's.
+#
+# Each expression appears twice, once per `structs` setting, because the two
+# builds refuse with different errors and a one-sided corpus cannot say so.
+
+expr: cel.MyStruct {}
+feat: struct_literal error
+want: error(UnexpectedType: got=cel.MyStruct want=known struct)
+cfg: structs
+
+expr: cel.MyStruct {}
+feat: struct_literal error
+want: error(InternalError)
+cfg: !structs
+
+expr: cel.MyStruct { x: 1 }
+feat: struct_literal error
+want: error(UnexpectedType: got=cel.MyStruct want=known struct)
+cfg: structs
+
+expr: cel.MyStruct { x: 1 }
+feat: struct_literal error
+want: error(InternalError)
+cfg: !structs
+
+expr: cel.MyStruct { x: 1 / 0 }
+feat: struct_literal error
+want: error(UnexpectedType: got=cel.MyStruct want=known struct)
+cfg: structs
+
+expr: cel.MyStruct { x: 1 / 0 }
+feat: struct_literal error
+want: error(InternalError)
+cfg: !structs
+
+# ---------------------------------------------------------------------------
+# A comprehension variable shadows the package namespace
+# ---------------------------------------------------------------------------
+#
+# Decided by cel-spec, doc/langdef.md (name resolution), not by the incumbent:
+# "in a comprehension like `[1].exists(x, x == 1)`, `x` is a local variable
+# which shadows any identifier named `x` in ancestor scopes or the package
+# namespace". So a receiver a macro bound is a VALUE, never a namespace, and
+# `optional.of(...)` inside `xs.all(optional, ...)` is a member call `of` on the
+# element -- which no overload accepts.
+#
+# The tree walker used to probe the namespace unconditionally and answer
+# `bool(true)` here; the bytecode VM never did. The walker was changed to the
+# spec's answer, so this row records a behaviour change, not a preserved one.
+
+expr: xs.all(optional, optional.of(1) == optional.of(1))
+feat: macro_all optional error
+want: error(UndeclaredReference: of)
+
+expr: xs.map(size, size)
+feat: macro_map variable
+want: list[int(1), int(2), int(3), int(4)]

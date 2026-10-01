@@ -1,7 +1,9 @@
 use crate::macros::{impl_conversions, impl_handler};
-use crate::objects::Opaque;
+use crate::objects::{ListRef, Opaque};
 use crate::resolvers::{AllArguments, Argument};
 use crate::{ExecutionError, FunctionContext, ResolveResult, Value};
+use std::any::Any;
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -12,7 +14,7 @@ impl_conversions!(
     Arc<String> => Value::String,
     Arc<Vec<u8>> => Value::Bytes,
     bool => Value::Bool,
-    Arc<Vec<Value>> => Value::List,
+    ListRef => Value::List,
     Arc<dyn Opaque> => Value::Opaque
 );
 
@@ -149,7 +151,7 @@ where
         Self: Sized,
     {
         if let Some(ref this) = ctx.this {
-            Ok(This(T::from_value(&this.as_ref().try_into()?)?))
+            Ok(This(T::from_value(this)?))
         } else {
             let arg = arg_value_from_context(ctx)
                 .map_err(|_| ExecutionError::missing_argument_or_target())?;
@@ -217,15 +219,15 @@ impl From<Identifier> for String {
 /// use cel::extractors::Arguments;
 /// pub fn sum(Arguments(args): Arguments) -> Value {
 ///     args.iter().fold(0.0, |acc, val| match val {
-///         Value::Int(x) => *x as f64 + acc,
-///         Value::UInt(x) => *x as f64 + acc,
-///         Value::Float(x) => *x + acc,
+///         Value::Int(x) => x as f64 + acc,
+///         Value::UInt(x) => x as f64 + acc,
+///         Value::Float(x) => x + acc,
 ///         _ => acc,
 ///     }).into()
 /// }
 /// ```
 #[derive(Clone)]
-pub struct Arguments(pub Arc<Vec<Value>>);
+pub struct Arguments(pub ListRef);
 
 impl<'a> FromContext<'a, '_, '_> for Arguments {
     fn from_context(ctx: &'a mut FunctionContext) -> Result<Self, ExecutionError>
@@ -277,28 +279,219 @@ impl_handler!(C1, C2, C3, C4, C5, C6, C7, C8, C9);
 // Heavily inspired by https://users.rust-lang.org/t/common-data-type-for-functions-with-different-parameters-e-g-axum-route-handlers/90207/6
 // and https://play.rust-lang.org/?version=stable&mode=debug&edition=2021&gist=c6744c27c2358ec1d1196033a0ec11e4
 
-#[derive(Default)]
 pub struct FunctionRegistry {
     functions: BTreeMap<String, Function>,
+    /// Bumped by every [`FunctionRegistry::add`]. Distinct from the binding
+    /// [`crate::context::VersionTag`], which `add_function` does not touch.
+    /// `0` is reserved: a [`Function`] cache of generation `0` is unchecked.
+    generation: u64,
+}
+
+impl Default for FunctionRegistry {
+    fn default() -> Self {
+        FunctionRegistry {
+            functions: BTreeMap::new(),
+            generation: 1,
+        }
+    }
 }
 
 impl FunctionRegistry {
     pub(crate) fn add<F, T>(&mut self, name: &str, function: F)
     where
-        F: IntoFunction<T> + 'static + Send + Sync,
+        F: IntoFunction<T> + 'static,
         T: 'static,
     {
+        self.generation = self.generation.wrapping_add(1);
+        if self.generation == 0 {
+            self.generation = 1;
+        }
         self.functions
             .insert(name.to_string(), function.into_function());
+    }
+
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
     }
 
     #[allow(dead_code)]
     pub(crate) fn get(&self, name: &str) -> Option<&Function> {
         self.functions.get(name)
     }
+
+    /// [`FunctionRegistry::get`] for a namespaced name, without joining the two
+    /// parts into a `String` the lookup would immediately discard.
+    pub(crate) fn get_qualified(&self, prefix: &str, name: &str) -> Option<&Function> {
+        crate::common::get_qualified(&self.functions, prefix, name)
+    }
 }
 
-pub type Function = Box<dyn Fn(&mut FunctionContext) -> ResolveResult + Send + Sync>;
+/// A registered function in the form every evaluator calls it: arguments and
+/// receiver arrive through the [`FunctionContext`], the answer is a [`Value`].
+pub type ErasedFunction = Box<dyn Fn(&mut FunctionContext) -> ResolveResult>;
+
+/// A registered function.
+///
+/// Every function has its erased form, and a [`Function`] derefs to it so a
+/// caller invokes one as `(func)(&mut ftx)`. A closure whose signature is one
+/// of [`ScalarFn`]'s also keeps that signature: the batch machine calls it on
+/// its register banks directly, with no [`Value`] built for either side.
+pub struct Function {
+    erased: ErasedFunction,
+    scalar: Option<Arc<ScalarFn>>,
+    /// Registry generation at which [`Self::int2_entry`] was decided.
+    /// `0` means the decision has not been made. A later `add` replaces this
+    /// function and bumps the registry, so a surviving entry recomputes.
+    int2_generation: Cell<u64>,
+    /// `ScalarFn::Int2` entry word when the stdlib has no two-int overload
+    /// under this name, otherwise `0` (take the erased path). Meaningful
+    /// only while [`Self::int2_generation`] matches the registry.
+    int2_entry: Cell<i64>,
+}
+
+impl Function {
+    /// A function with only its erased form.
+    pub fn erased(erased: ErasedFunction) -> Self {
+        Function {
+            erased,
+            scalar: None,
+            int2_generation: Cell::new(0),
+            int2_entry: Cell::new(0),
+        }
+    }
+
+    /// A function whose typed closure is also offered, boxed as `Any`: it is
+    /// kept if it has one of [`ScalarFn`]'s signatures and dropped otherwise.
+    pub(crate) fn with_typed(erased: ErasedFunction, typed: Box<dyn Any>) -> Self {
+        Function {
+            erased,
+            scalar: ScalarFn::from_any(typed).map(Arc::new),
+            int2_generation: Cell::new(0),
+            int2_entry: Cell::new(0),
+        }
+    }
+
+    /// Cached two-int resolution for `generation`, if this entry was filled
+    /// then. `Some(0)` is a filled miss (erased path). `None` is unchecked.
+    pub(crate) fn int2_cache(&self, generation: u64) -> Option<i64> {
+        if self.int2_generation.get() == generation {
+            Some(self.int2_entry.get())
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn set_int2_cache(&self, generation: u64, entry: i64) {
+        self.int2_entry.set(entry);
+        self.int2_generation.set(generation);
+    }
+
+    /// The scalar form, when the closure had one of [`ScalarFn`]'s signatures.
+    pub fn scalar(&self) -> Option<&Arc<ScalarFn>> {
+        self.scalar.as_ref()
+    }
+}
+
+impl std::ops::Deref for Function {
+    type Target = dyn Fn(&mut FunctionContext) -> ResolveResult;
+
+    fn deref(&self) -> &Self::Target {
+        &*self.erased
+    }
+}
+
+impl From<ErasedFunction> for Function {
+    fn from(erased: ErasedFunction) -> Self {
+        Function::erased(erased)
+    }
+}
+
+/// A user closure over machine scalars, kept in its own signature.
+///
+/// The set is closed on purpose: each arm is one calling convention the batch
+/// machine's interpreters know how to invoke from a register bank. A closure
+/// outside it is still a perfectly good [`Function`]; it just has no scalar
+/// form, and an expression that calls it is evaluated by the tree-walker.
+pub enum ScalarFn {
+    /// `fn(i64) -> i64`.
+    Int1(Box<dyn Fn(i64) -> i64>),
+    /// `fn(i64, i64) -> i64`.
+    Int2(Box<dyn Fn(i64, i64) -> i64>),
+    /// `fn(f64) -> f64`.
+    Float1(Box<dyn Fn(f64) -> f64>),
+    /// `fn(f64, f64) -> f64`.
+    Float2(Box<dyn Fn(f64, f64) -> f64>),
+}
+
+impl ScalarFn {
+    /// Recover the signature of a typed closure boxed as `Any`.
+    ///
+    /// A `Box<dyn Fn(A, B) -> R + Send + Sync>` is one concrete `'static` type
+    /// per `(A, B, R)`, so downcasting it is an exact test of the signature:
+    /// no specialization, no `unsafe`, and a closure with any other signature
+    /// fails every arm and is reported as having no scalar form.
+    fn from_any(typed: Box<dyn Any>) -> Option<Self> {
+        let typed = match typed.downcast::<Box<dyn Fn(i64, i64) -> i64>>() {
+            Ok(f) => return Some(ScalarFn::Int2(*f)),
+            Err(t) => t,
+        };
+        let typed = match typed.downcast::<Box<dyn Fn(i64) -> i64>>() {
+            Ok(f) => return Some(ScalarFn::Int1(*f)),
+            Err(t) => t,
+        };
+        let typed = match typed.downcast::<Box<dyn Fn(f64, f64) -> f64>>() {
+            Ok(f) => return Some(ScalarFn::Float2(*f)),
+            Err(t) => t,
+        };
+        match typed.downcast::<Box<dyn Fn(f64) -> f64>>() {
+            Ok(f) => Some(ScalarFn::Float1(*f)),
+            Err(_) => None,
+        }
+    }
+}
+
+impl ScalarFn {
+    /// Call an [`ScalarFn::Int2`] whose [`ScalarFn::entry_word`] is `entry`.
+    ///
+    /// # Safety
+    ///
+    /// `entry` is the entry word of an `Int2` arm, and that `ScalarFn` is
+    /// still alive (the registry entry that produced the word has not been
+    /// replaced).
+    pub(crate) unsafe fn call_int2(entry: i64, a: i64, b: i64) -> i64 {
+        let f = unsafe { &*(entry as usize as *const Box<dyn Fn(i64, i64) -> i64>) };
+        f(a, b)
+    }
+
+    /// The address of this closure's `Box`, as one machine word.
+    ///
+    /// The batch machine's `host_call_*` helpers (`majit/bytecode.rs`) read
+    /// the word back as `*const Box<dyn Fn(..)>` of the arm's exact signature
+    /// and call through it; the two are a pair. The address is the `Box` field
+    /// inside this `ScalarFn`, so it is valid for as long as the `Arc<ScalarFn>`
+    /// that was lowered is held — [`LoweredF::host_fns`] holds it.
+    ///
+    /// [`LoweredF::host_fns`]: crate::majit::lower::LoweredF::host_fns
+    pub fn entry_word(&self) -> i64 {
+        (match self {
+            ScalarFn::Int1(b) => b as *const _ as usize,
+            ScalarFn::Int2(b) => b as *const _ as usize,
+            ScalarFn::Float1(b) => b as *const _ as usize,
+            ScalarFn::Float2(b) => b as *const _ as usize,
+        }) as i64
+    }
+}
+
+impl std::fmt::Debug for ScalarFn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            ScalarFn::Int1(_) => "ScalarFn::Int1",
+            ScalarFn::Int2(_) => "ScalarFn::Int2",
+            ScalarFn::Float1(_) => "ScalarFn::Float1",
+            ScalarFn::Float2(_) => "ScalarFn::Float2",
+        })
+    }
+}
 
 pub trait IntoFunction<T> {
     fn into_function(self) -> Function;
@@ -307,5 +500,58 @@ pub trait IntoFunction<T> {
 impl IntoFunction<Function> for Function {
     fn into_function(self) -> Function {
         self
+    }
+}
+
+impl IntoFunction<ErasedFunction> for ErasedFunction {
+    fn into_function(self) -> Function {
+        Function::erased(self)
+    }
+}
+
+#[cfg(test)]
+mod scalar_fn_tests {
+    use super::*;
+
+    fn scalar<T, F: IntoFunction<T>>(f: F) -> Option<String> {
+        f.into_function().scalar().map(|s| format!("{s:?}"))
+    }
+
+    #[test]
+    fn a_closure_over_machine_scalars_keeps_its_signature() {
+        assert_eq!(
+            scalar(|a: i64, b: i64| a + b).as_deref(),
+            Some("ScalarFn::Int2")
+        );
+        assert_eq!(scalar(|a: i64| -a).as_deref(), Some("ScalarFn::Int1"));
+        assert_eq!(
+            scalar(|a: f64, b: f64| a * b).as_deref(),
+            Some("ScalarFn::Float2")
+        );
+        assert_eq!(
+            scalar(|a: f64| a.sqrt()).as_deref(),
+            Some("ScalarFn::Float1")
+        );
+    }
+
+    #[test]
+    fn any_other_signature_has_no_scalar_form() {
+        assert_eq!(
+            scalar(|a: i64| -> Result<i64, ExecutionError> { Ok(a) }),
+            None
+        );
+        assert_eq!(scalar(|_: &FunctionContext, a: i64| a), None);
+        assert_eq!(scalar(|a: i64, b: f64| a as f64 + b), None);
+        assert_eq!(scalar(|s: Arc<String>| s.len() as i64), None);
+        assert_eq!(scalar(|| 1i64), None);
+        assert_eq!(scalar(|a: i64| a > 0), None);
+    }
+
+    #[test]
+    fn the_erased_form_still_answers_through_the_context() {
+        let mut ctx = crate::Context::default();
+        ctx.add_function("add", |a: i64, b: i64| a + b);
+        let program = crate::Program::compile("add(2, 3)").unwrap();
+        assert_eq!(program.execute(&ctx).unwrap(), Value::Int(5));
     }
 }
