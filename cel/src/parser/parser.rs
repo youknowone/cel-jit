@@ -1138,7 +1138,7 @@ impl gen::CELVisitorCompat<'_> for Parser {
                 Err(e) => return self.report_error(token, Some(e), "invalid int literal"),
             };
             self.helper
-                .next_expr(token, Expr::Literal(LiteralValue::Int(val.into())))
+                .next_expr(token, Expr::Literal(LiteralValue::Int(val)))
         } else {
             self.report_error::<ParseError, _>(&ctx.start(), None, "Incomplete Int!")
         }
@@ -1157,7 +1157,7 @@ impl gen::CELVisitorCompat<'_> for Parser {
                 Err(e) => return self.report_error(token, Some(e), "invalid uint literal"),
             };
             self.helper
-                .next_expr(token, Expr::Literal(LiteralValue::UInt(val.into())))
+                .next_expr(token, Expr::Literal(LiteralValue::UInt(val)))
         } else {
             self.report_error::<ParseError, _>(&ctx.start(), None, "Incomplete Uint!")
         }
@@ -1169,7 +1169,7 @@ impl gen::CELVisitorCompat<'_> for Parser {
             match string.parse::<f64>() {
                 Ok(d) if d.is_finite() => self
                     .helper
-                    .next_expr(token, Expr::Literal(LiteralValue::Double(d.into()))),
+                    .next_expr(token, Expr::Literal(LiteralValue::Double(d))),
                 Err(e) => self.report_error(token, Some(e), "invalid double literal"),
                 _ => self.report_error(token, None::<ParseError>, "invalid double literal"),
             }
@@ -1232,7 +1232,7 @@ impl gen::CELVisitorCompat<'_> for Parser {
         match ctx.tok.as_deref() {
             Some(tok) => self
                 .helper
-                .next_expr(tok, Expr::Literal(LiteralValue::Boolean(true.into()))),
+                .next_expr(tok, Expr::Literal(LiteralValue::Boolean(true))),
             None => self.report_error::<ParseError, _>(&ctx.start(), None, "Incomplete bool!"),
         }
     }
@@ -1241,7 +1241,7 @@ impl gen::CELVisitorCompat<'_> for Parser {
         match ctx.tok.as_deref() {
             Some(token) => self
                 .helper
-                .next_expr(token, Expr::Literal(LiteralValue::Boolean(false.into()))),
+                .next_expr(token, Expr::Literal(LiteralValue::Boolean(false))),
             None => self.report_error::<ParseError, _>(&ctx.start(), None, "Incomplete bool!"),
         }
     }
@@ -2561,31 +2561,22 @@ ERROR: <input>:1:24: unsupported syntax '?'
                 Expr::Literal(val) => match val {
                     LiteralValue::String(s) => &format!(
                         "\"{}\"^#{}:{}#",
-                        s.inner(),
+                        s.as_str(),
                         expr.id,
                         "*expr.Constant_StringValue"
                     ),
                     LiteralValue::Boolean(b) => {
-                        &format!("{}^#{}:{}#", b.inner(), expr.id, "*expr.Constant_BoolValue")
+                        &format!("{}^#{}:{}#", b, expr.id, "*expr.Constant_BoolValue")
                     }
-                    LiteralValue::Int(i) => &format!(
-                        "{}^#{}:{}#",
-                        i.inner(),
-                        expr.id,
-                        "*expr.Constant_Int64Value"
-                    ),
-                    LiteralValue::UInt(u) => &format!(
-                        "{}u^#{}:{}#",
-                        u.inner(),
-                        expr.id,
-                        "*expr.Constant_Uint64Value"
-                    ),
-                    LiteralValue::Double(f) => &format!(
-                        "{}^#{}:{}#",
-                        f.inner(),
-                        expr.id,
-                        "*expr.Constant_DoubleValue"
-                    ),
+                    LiteralValue::Int(i) => {
+                        &format!("{}^#{}:{}#", i, expr.id, "*expr.Constant_Int64Value")
+                    }
+                    LiteralValue::UInt(u) => {
+                        &format!("{}u^#{}:{}#", u, expr.id, "*expr.Constant_Uint64Value")
+                    }
+                    LiteralValue::Double(f) => {
+                        &format!("{}^#{}:{}#", f, expr.id, "*expr.Constant_DoubleValue")
+                    }
                     LiteralValue::Bytes(bytes) => &format!(
                         "b\"{}\"^#{}:{}#",
                         String::from_utf8_lossy(bytes),

@@ -1,0 +1,3293 @@
+//! The header-first value class family.
+//!
+//! A port of `rclass.py`'s `OBJECT = GcStruct('object', ('typeptr', CLASSTYPE),
+//! hints={'immutable': True, 'shouldntbenull': True, 'typeptr': True})`,
+//! spelled as `pyre-object`'s `PyObject`. Every value is a `#[repr(C)]` struct
+//! whose **first** field is a [`CelObject`] header, so one raw-pointer type,
+//! [`CelRef`], addresses all of them and the class word is always at offset 0.
+//!
+//! # Three ways to get this wrong, all of them silent
+//!
+//! The point of this family is that `fuse_boxing_alloc` turns an allocation
+//! into a `NewWithVtable`, which the trace optimizer can then delete outright.
+//! The fuse declines with a bare `continue` — no error, no warning, just a
+//! worse graph — so each of its conditions is pinned by a test below rather
+//! than left to be discovered as a disappointing census months later:
+//!
+//! 1. **The allocation call.** Its path must end `lltype::malloc_typed` and it
+//!    must take exactly one argument, the finished value, by value. See
+//!    [`super::lltype`].
+//! 2. **The class word.** `resolve_vtable_addr` keeps a single vtable address
+//!    to stand in for every header store the fuse drops, so it has to be sure
+//!    no dropped store carried a *different* class. Where the header declares
+//!    a `w_class` field it reads that store back through
+//!    `get_instantiate_arg_addr` and compares; where the header declares no
+//!    such field there is nothing that could disagree, which is the arm
+//!    `header_declares_no_class_word` admits and the one every leaf here
+//!    takes. Declaring the field and omitting the store still declines, in
+//!    silence.
+//! 3. **The header offset.** `fuse_boxing_alloc` matches the aggregate's
+//!    `ob_header` store by name and the backend reads the class word at a
+//!    fixed offset (`set_vtable_offset(Some(0))` emits
+//!    `cmp [obj + 0], classptr`). Every leaf therefore const-asserts
+//!    `offset_of!(T, ob_header) == 0`.
+//!
+//! # The header is one word, and the word was recovered upstream
+//!
+//! An earlier revision of this file carried two — `ob_type` and a `w_class`
+//! that was always equal to it — and said so as a correction. It was one at
+//! first, reasoning that pyre needs `w_class` for user-defined Python classes
+//! while CEL's universe is closed; the reasoning was sound and did not survive
+//! contact with `resolve_vtable_addr`, which back then resolved an absent
+//! `w_class` store to `None`, compared it unequal to the `ob_type` address,
+//! and declined the whole cluster. Every allocation stayed residual, silently
+//! — the failure mode this list exists to pin.
+//!
+//! The word came back on the majit side rather than here, by widening that
+//! check rather than by re-spelling anything in cel:
+//! `header_declares_no_class_word` reads a header that *declares* no class
+//! word as a base-type instance, requiring both that no `w_class` store exists
+//! and that the header struct's registered layout has no such field. What that
+//! arm gives up is subclassing, which a CEL value universe does not have: the
+//! type object of an instance of `T` is `T` itself. What it buys is a word on
+//! every value.
+//!
+//! Gone with the field is the `get_instantiate` call the old check read its
+//! argument out of, and with that call the module that carried pyre's name so
+//! the three-segment path suffix would match.
+
+use core::mem::{align_of, offset_of};
+
+use super::lltype;
+use super::object_array::{self, CelBytesBlock, CelItemsBlock};
+
+/// The coarse family a value belongs to.
+///
+/// A fieldless `#[repr(u8)]` enum, so a read of it is an integer load the
+/// annotator can narrow, not a pointer chase. It is a *summary*: dispatch
+/// tests the class pointer itself ([`w_type`]), because pointer identity is
+/// what gives the annotator its `knowntypedata` narrowing. This exists for the
+/// cases that genuinely want the family rather than the type — error messages,
+/// and CEL's own `type()` grouping.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CelKind {
+    Null = 0,
+    Bool = 1,
+    Int = 2,
+    UInt = 3,
+    Double = 4,
+    Timestamp = 5,
+    Duration = 6,
+    Type = 7,
+    Optional = 8,
+    Bytes = 9,
+    Str = 10,
+    List = 11,
+    Map = 12,
+    #[cfg(feature = "structs")]
+    Struct = 13,
+    /// A foreign host object. The leaf is [`W_OpaqueObject`]; the host itself
+    /// lives in the heap's side table (D12).
+    Opaque = 14,
+    /// The activation record. Not a CEL value; `type()` never answers this.
+    Frame = 15,
+    /// `W_TupleObject`. Not a CEL value: only `In` receives it.
+    /// `type()`, equality, printing and conversion never see it.
+    Tuple = 16,
+}
+
+/// One value class.
+///
+/// Held only as a `'static`: the fuse resolves the vtable to a constant
+/// address, which requires the class to be a prebuilt whose address is known
+/// at compile time.
+///
+/// `subclassrange_min` / `subclassrange_max` are the `rclass.OBJECT_VTABLE`
+/// fields. A flat family of leaf classes gets `min = 2 * id`, `max = min + 1`
+/// (`assign_inheritance_ids`: the span's `max` is not another class's `min`).
+#[repr(C)]
+#[derive(Debug)]
+pub struct CelClass {
+    pub subclassrange_min: i64,
+    pub subclassrange_max: i64,
+    pub name: &'static str,
+    pub kind: CelKind,
+}
+
+impl CelClass {
+    const fn new(name: &'static str, kind: CelKind, id: i64) -> Self {
+        let subclassrange_min = id * 2;
+        CelClass {
+            subclassrange_min,
+            subclassrange_max: subclassrange_min + 1,
+            name,
+            kind,
+        }
+    }
+}
+
+/// The object header, first field of every value.
+///
+/// One word, and declaring no class word beyond it is what admits the fuse's
+/// base-type arm — see the module documentation.
+// Written once, at allocation. A read off a constant object folds.
+#[repr(C)]
+pub struct CelObject {
+    pub ob_type: *const CelClass,
+}
+
+/// A pointer to any value.
+///
+/// Every leaf starts with a [`CelObject`], so this addresses all of them and
+/// [`w_type`] is valid on any of them.
+pub type CelRef = *mut CelObject;
+
+/// The class of `w`.
+///
+/// The shape matters as much as the result: a deref of a raw pointer under a
+/// field access is what the frontend recognises, inserting a
+/// `__pyre_cast_instance` narrow so the read lowers to a *typed* `FieldRead`
+/// rather than a classdef-less one that stalls the annotator downstream.
+///
+/// # Safety
+///
+/// `w` must point at a live value allocated through [`super::lltype`].
+#[inline]
+pub unsafe fn w_type(w: CelRef) -> *const CelClass {
+    unsafe { (*w).ob_type }
+}
+
+/// The family of `w`.
+///
+/// # Safety
+///
+/// As [`w_type`].
+#[inline]
+pub unsafe fn w_kind(w: CelRef) -> CelKind {
+    unsafe { (*w_type(w)).kind }
+}
+
+/// Read a payload field that follows the header.
+///
+/// The leaves are `#[repr(C)]` with the header first, so a `CelRef` known to
+/// be of class `T` casts to `*mut T` without adjustment.
+///
+/// Expands to a bare dereference, so every use site must already be an unsafe
+/// context — an `unsafe` block of its own would be redundant inside the
+/// `unsafe fn`s that read a payload and would warn.
+macro_rules! payload {
+    ($w:expr, $leaf:ty, $field:ident) => {
+        (*($w as *mut $leaf)).$field
+    };
+}
+
+pub(crate) use payload;
+
+/// Declare a fixed-size leaf with one payload field.
+///
+/// One macro rather than eight hand-written copies, because the constructor
+/// body is the shape the boxing fuse matches: written out per leaf it would be
+/// eight chances for a spelling to drift out of recognition, and a drifted one
+/// reports nothing.
+macro_rules! scalar_leaf {
+    (
+        $(#[$leaf_doc:meta])*
+        $leaf:ident { $payload:ident : $pty:ty }
+        $(#[$class_doc:meta])*
+        $class:ident = ($name:literal, $kind:expr, $id:literal)
+        $(#[$ctor_doc:meta])*
+        $ctor:ident
+    ) => {
+        $(#[$leaf_doc])*
+        // The payload is written once, at allocation, and never again, so its
+        // reads may fold to a pure getfield. The attribute leaves the
+        // `_immutable_fields_<Struct>` marker Charon extracts; spelling it by
+        // hand here is what the marker's own consumer stopped needing.
+        #[repr(C)]
+        #[allow(non_camel_case_types)]
+        pub struct $leaf {
+            pub ob_header: CelObject,
+            pub $payload: $pty,
+        }
+
+        $(#[$class_doc])*
+        pub static $class: CelClass = CelClass::new($name, $kind, $id);
+
+        // Condition 3: the class word must be at offset 0.
+        const _: () = {
+            assert!(offset_of!($leaf, ob_header) == 0);
+        };
+
+        $(#[$ctor_doc])*
+        #[inline]
+        pub fn $ctor(value: $pty) -> *mut $leaf {
+            lltype::malloc_typed($leaf {
+                ob_header: CelObject { ob_type: &$class },
+                $payload: value,
+            })
+        }
+    };
+}
+
+scalar_leaf! {
+    /// A CEL `int`: a signed 64-bit integer.
+    W_IntObject { intval: i64 }
+    CEL_INT_CLASS = ("int", CelKind::Int, 0)
+    /// Allocate a fresh `int`. The interned range goes through [`new_int`].
+    new_int_raw
+}
+
+scalar_leaf! {
+    /// A CEL `uint`: an unsigned 64-bit integer, a distinct type from `int`.
+    W_UIntObject { uintval: u64 }
+    CEL_UINT_CLASS = ("uint", CelKind::UInt, 1)
+    /// Box `value` as a CEL `uint`.
+    new_uint
+}
+
+scalar_leaf! {
+    /// A CEL `double`.
+    W_DoubleObject { floatval: f64 }
+    CEL_DOUBLE_CLASS = ("double", CelKind::Double, 2)
+    /// Box `value` as a CEL `double`.
+    new_double
+}
+
+scalar_leaf! {
+    /// A CEL `bool`.
+    ///
+    /// The payload is `i64` rather than `bool` so the field is a full machine
+    /// word: the backend's fields are typed `Signed`, and a narrower slot would
+    /// need a widening read on every access for no space saved once the header
+    /// is present.
+    W_BoolObject { boolval: i64 }
+    CEL_BOOL_CLASS = ("bool", CelKind::Bool, 3)
+    /// Box `value` as a CEL `bool`.
+    new_bool_raw
+}
+
+scalar_leaf! {
+    /// A CEL `duration`, as a whole number of nanoseconds.
+    ///
+    /// Nanoseconds rather than a split seconds/subsecond pair because every
+    /// arithmetic operation on a duration would otherwise have to normalise,
+    /// and the range at 64 bits is ±292 years.
+    W_DurationObject { nanos: i64 }
+    CEL_DURATION_CLASS = ("duration", CelKind::Duration, 4)
+    /// Box `nanos` as a CEL `duration`.
+    new_duration
+}
+
+scalar_leaf! {
+    /// A CEL `optional`, holding the value it wraps or nothing.
+    ///
+    /// A NULL `w_value` is the none case. That spelling, rather than a
+    /// discriminant beside the payload, keeps the leaf one header plus one
+    /// word and keeps the none test a null check on a field that is read
+    /// anyway.
+    ///
+    /// The payload is the family's first MANAGED edge — every other leaf holds
+    /// a scalar. Nothing traces it yet, because nothing traces any of them:
+    /// [`CelClass`] carries no collector type id, and the offset list that
+    /// would name this field arrives with the registration mechanism that fills
+    /// it.
+    W_OptionalObject { w_value: CelRef }
+    CEL_OPTIONAL_CLASS = ("optional_type", CelKind::Optional, 5)
+    /// Wrap `value` as a present CEL `optional`.
+    ///
+    /// The none case is [`new_optional_none`], not this function called with a
+    /// null: there the null is a literal inside the allocation body rather than
+    /// a value arriving as an argument.
+    new_optional
+}
+
+/// Allocate the absent CEL `optional`.
+///
+/// Written out rather than delegating to [`new_optional`] so the null it stores
+/// is spelled at the allocation site. A fresh allocation per call: the none
+/// payload is a `CelRef`, so the immortal path — pointer-free leaves only —
+/// cannot hold it.
+pub fn new_optional_none() -> *mut W_OptionalObject {
+    lltype::malloc_typed(W_OptionalObject {
+        ob_header: CelObject {
+            ob_type: &CEL_OPTIONAL_CLASS,
+        },
+        w_value: core::ptr::null_mut(),
+    })
+}
+
+/// A CEL `null`.
+///
+/// The one leaf with no payload, so it is written out rather than passed
+/// through [`scalar_leaf`]: the macro's shape is a header plus exactly one
+/// field, and widening it to cover a payloadless case would make the
+/// fuse-critical constructor body conditional.
+#[repr(C)]
+#[allow(non_camel_case_types)]
+pub struct W_NullObject {
+    pub ob_header: CelObject,
+}
+
+/// The class of [`W_NullObject`].
+pub static CEL_NULL_CLASS: CelClass = CelClass::new("null_type", CelKind::Null, 6);
+
+const _: () = {
+    assert!(offset_of!(W_NullObject, ob_header) == 0);
+};
+
+/// Allocate a CEL `null`.
+///
+/// The one process-wide null. A plain Rust `static` would put the class
+/// word in read-only memory, where a header-relative `guard_is_object`
+/// load does not point; the immortal allocator puts a header word in
+/// front of the payload.
+pub fn new_null() -> *mut W_NullObject {
+    *NULL.get_or_init(|| {
+        lltype::malloc_typed_immortal(W_NullObject {
+            ob_header: CelObject {
+                ob_type: &CEL_NULL_CLASS,
+            },
+        }) as usize
+    }) as *mut W_NullObject
+}
+
+/// A CEL `timestamp`.
+///
+/// Two payload fields — nanoseconds since the epoch and the offset in seconds
+/// the value was written with — so it does not go through [`scalar_leaf`]
+/// either. CEL compares timestamps by instant and formats them by offset, so
+/// dropping the offset would be lossy at the boundary.
+#[repr(C)]
+#[allow(non_camel_case_types)]
+pub struct W_TimestampObject {
+    pub ob_header: CelObject,
+    pub nanos: i64,
+    pub off_s: i64,
+}
+
+/// The class of [`W_TimestampObject`].
+pub static CEL_TIMESTAMP_CLASS: CelClass = CelClass::new("timestamp", CelKind::Timestamp, 7);
+
+const _: () = {
+    assert!(offset_of!(W_TimestampObject, ob_header) == 0);
+};
+
+/// Box an instant as a CEL `timestamp`.
+pub fn new_timestamp(nanos: i64, off_s: i64) -> *mut W_TimestampObject {
+    lltype::malloc_typed(W_TimestampObject {
+        ob_header: CelObject {
+            ob_type: &CEL_TIMESTAMP_CLASS,
+        },
+        nanos,
+        off_s,
+    })
+}
+
+// -- the variable-length leaves ------------------------------------------
+//
+// Each is a FIXED-size leaf holding a pointer to a payload block allocated by
+// [`super::object_array`], which is where the encoding is argued. The short
+// version: a varsize tail cannot be passed by value, so it cannot reach the
+// fuse, and upstream forbids a GC array inlined in a struct anyway.
+//
+// This makes them ordinary members of the family as far as the fuse is
+// concerned — a header plus scalar and pointer fields, exactly the shape
+// `W_OptionalObject` is measured fusing. What they add is a residual call per
+// value for the block, which the fuse never sees and the optimizer cannot
+// delete.
+
+/// A CEL `bytes`.
+#[repr(C)]
+#[allow(non_camel_case_types)]
+pub struct W_BytesObject {
+    pub ob_header: CelObject,
+    /// The payload, or null for a value whose block has not been built. Its
+    /// offset-0 word is the allocated capacity, not this length.
+    pub data: *mut CelBytesBlock,
+    /// Live length in bytes. Upstream's `("length", Signed)` on the wrapper:
+    /// the block's word is a capacity and a shrink must not move it.
+    pub length: i64,
+    /// Non-owning pointer at the public `Arc<Vec<u8>>` this leaf was wrapped
+    /// from, or null if the bytes were allocated by the VM.
+    pub public: *const (),
+}
+
+pub static CEL_BYTES_CLASS: CelClass = CelClass::new("bytes", CelKind::Bytes, 8);
+
+const _: () = {
+    assert!(offset_of!(W_BytesObject, ob_header) == 0);
+};
+
+/// Box `bytes` as a CEL `bytes`.
+///
+/// The block is built BEFORE the allocation call, not inside it: the fuse
+/// matches a call taking exactly one argument, the finished value, so anything
+/// the value needs has to already exist when that call is made.
+pub fn new_bytes(bytes: &[u8]) -> *mut W_BytesObject {
+    let data = object_array::new_bytes_block(bytes);
+    let length = bytes.len() as i64;
+    lltype::malloc_typed(W_BytesObject {
+        ob_header: CelObject {
+            ob_type: &CEL_BYTES_CLASS,
+        },
+        data,
+        length,
+        public: core::ptr::null(),
+    })
+}
+
+/// Box the concatenation of two byte slices as a CEL `bytes`.
+pub fn new_bytes_concat(left: &[u8], right: &[u8]) -> *mut W_BytesObject {
+    let data = object_array::new_bytes_block_concat(left, right);
+    let length = (left.len() + right.len()) as i64;
+    lltype::malloc_typed(W_BytesObject {
+        ob_header: CelObject {
+            ob_type: &CEL_BYTES_CLASS,
+        },
+        data,
+        length,
+        public: core::ptr::null(),
+    })
+}
+
+/// A CEL `string`.
+///
+/// Its own leaf rather than a `bytes` with a different class word, because the
+/// two are different CEL types with different operations, and a shared leaf
+/// would make the class word the only thing separating them at every use site.
+///
+/// The payload is UTF-8, so `byte_len` is what indexes the block and is not the
+/// character count.
+#[repr(C)]
+#[allow(non_camel_case_types)]
+pub struct W_StringObject {
+    pub ob_header: CelObject,
+    pub chars: *mut CelBytesBlock,
+    pub byte_len: i64,
+    /// Non-owning pointer at the public `Arc<String>` this leaf was wrapped
+    /// from, or null if the string was allocated by the VM.
+    pub public: *const (),
+}
+
+pub static CEL_STRING_CLASS: CelClass = CelClass::new("string", CelKind::Str, 9);
+
+const _: () = {
+    assert!(offset_of!(W_StringObject, ob_header) == 0);
+};
+
+/// One allocation holding two headered objects: the leaf, then its
+/// [`CelBytesBlock`].
+///
+/// `chars` points at the block that follows the leaf. The block is not a
+/// second bump. Constructors that wrap a block allocated elsewhere stay on
+/// [`object_array::new_bytes_block`].
+fn alloc_fresh_string(nbytes: usize) -> (*mut W_StringObject, *mut u8) {
+    alloc_fresh_string_in(unsafe { &*super::heap::heap_ptr() }, nbytes)
+}
+
+/// [`alloc_fresh_string`] on a heap the caller already resolved.
+///
+/// ```text
+/// [hdr = W_StringObject::TYPE_ID][leaf][pad to 8]
+///     [hdr = CelBytesBlock::TYPE_ID][block: capacity, bytes]
+/// ```
+fn alloc_fresh_string_in(
+    heap: &super::heap::CelHeap,
+    nbytes: usize,
+) -> (*mut W_StringObject, *mut u8) {
+    let header = super::heap::GC_HEADER_SIZE;
+    let leaf_size = core::mem::size_of::<W_StringObject>();
+    let block_align = align_of::<CelBytesBlock>();
+    let block_hdr = (header + leaf_size + block_align - 1) & !(block_align - 1);
+    let chars_off = block_hdr + header;
+    let block_bytes = object_array::CEL_BYTES_BLOCK_ITEMS_OFFSET + nbytes;
+    let total = chars_off + block_bytes;
+    let align = align_of::<W_StringObject>().max(block_align).max(header);
+    let raw = heap.alloc_raw(total, align);
+    unsafe {
+        (raw as *mut u64).write(u64::from(<W_StringObject as lltype::CelGcType>::TYPE_ID));
+        (raw.add(block_hdr) as *mut u64)
+            .write(u64::from(<CelBytesBlock as lltype::CelGcType>::TYPE_ID));
+        let chars = raw.add(chars_off) as *mut CelBytesBlock;
+        (*chars).capacity = nbytes;
+        let leaf = raw.add(header) as *mut W_StringObject;
+        leaf.write(W_StringObject {
+            ob_header: CelObject {
+                ob_type: &CEL_STRING_CLASS,
+            },
+            chars,
+            byte_len: nbytes as i64,
+            public: core::ptr::null(),
+        });
+        (leaf, object_array::bytes_base(chars))
+    }
+}
+
+/// Box `s` as a CEL `string`.
+pub fn new_string(s: &str) -> *mut W_StringObject {
+    let (leaf, base) = alloc_fresh_string(s.len());
+    unsafe {
+        core::ptr::copy_nonoverlapping(s.as_ptr(), base, s.len());
+    }
+    leaf
+}
+
+/// `ll_str.py` `ll_int2dec`: count the digits, `mallocstr` of that exact
+/// length, then write the digits from the end into the block. One
+/// allocation holding two headered objects. The bytes are ASCII
+/// digits (and an optional leading `-`) by construction, so nothing
+/// validates them as UTF-8.
+///
+/// `i64::MIN` negates in `u64` (`ll_unsigned(-val)`): its magnitude is `2^63`,
+/// nineteen digits, and the sign is the twentieth byte.
+pub fn string_from_int(n: i64) -> *mut W_StringObject {
+    string_from_int_in(unsafe { &*super::heap::heap_ptr() }, n)
+}
+
+/// [`string_from_int`] on a heap the caller already resolved.
+pub fn string_from_int_in(heap: &super::heap::CelHeap, n: i64) -> *mut W_StringObject {
+    let neg = n < 0;
+    let mut val = if neg {
+        (n as u64).wrapping_neg()
+    } else {
+        n as u64
+    };
+    // `ll_int2dec`: `len` is the magnitude's digits; zero contributes
+    // its single `'0'` through `int(val == 0)`, not through this loop.
+    let mut len = 0usize;
+    let mut probe = val;
+    while probe != 0 {
+        len += 1;
+        probe /= 10;
+    }
+    let total = len + usize::from(neg) + usize::from(val == 0);
+    let (leaf, p) = alloc_fresh_string_in(heap, total);
+    unsafe {
+        if neg {
+            *p = b'-';
+        } else if val == 0 {
+            *p = b'0';
+        }
+        let mut j = 0usize;
+        while j < len {
+            *p.add(total - j - 1) = b'0' + (val % 10) as u8;
+            val /= 10;
+            j += 1;
+        }
+    }
+    leaf
+}
+
+/// Box the concatenation of two UTF-8 slices as a CEL `string`.
+pub fn new_string_concat(left: &[u8], right: &[u8]) -> *mut W_StringObject {
+    let n = left.len() + right.len();
+    let (leaf, base) = alloc_fresh_string(n);
+    unsafe {
+        core::ptr::copy_nonoverlapping(left.as_ptr(), base, left.len());
+        core::ptr::copy_nonoverlapping(right.as_ptr(), base.add(left.len()), right.len());
+    }
+    leaf
+}
+
+/// How a [`W_ListObject`] holds its elements.
+///
+/// An inline tag, not a strategy object: a discriminant read plus a
+/// narrowing chain, the same guard-then-fold as a typeptr and one fewer
+/// object. D4.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListStrategy {
+    /// Boxed [`CelRef`]s in [`W_ListObject::items`].
+    Object = 0,
+    /// Unboxed `i64`s in a [`W_IntColumn`] at [`W_ListObject::storage`].
+    Ints = 1,
+    /// A column or record window parked in the heap host table. The
+    /// schema/buffer stays shared; `start`/`length` are the window.
+    Window = 2,
+    /// Unboxed `f64`s in a [`W_FloatColumn`] at [`W_ListObject::storage`].
+    /// `FloatListStrategy`: `append` stores `unwrap` (`float_w`), not the box.
+    Floats = 3,
+    /// String leaves in [`W_ListObject::items`]. `BytesListStrategy` /
+    /// `AsciiListStrategy`: the list holds the string, and `wrap` is the leaf
+    /// already produced by `ll_str`.
+    Strs = 4,
+    /// `SizeListStrategy`: no storage and no items block. `start` holds
+    /// the capacity hint (`W_ListObject.newlist_hint`); the first append
+    /// switches strategy (`EmptyListStrategy.switch_to_correct_strategy`).
+    /// Window is the only other reader of `start`.
+    Size = 5,
+}
+
+/// An unboxed integer column. Not pointer-traced; the payload is raw `i64`s.
+///
+/// `data` and `length` (the allocated count, `ll_newlist_hint`) are written
+/// once, when the column is allocated. [`list_resize_ge`] allocates a new
+/// column and stores it in [`W_ListObject::storage`] (`_ll_list_resize_really`
+/// replaces `l.items`; the array's length is not rewritten in place), so both
+/// fields are `_immutable_fields_`.
+#[repr(C)]
+#[allow(non_camel_case_types)]
+pub struct W_IntColumn {
+    pub ob_header: CelObject,
+    /// [`CelIntWords`]: capacity at offset 0, then the `i64`s.
+    /// `data` and [`Self::length`] are write-once.
+    pub data: *mut crate::runtime::object_array::CelIntWords,
+    pub length: i64,
+}
+
+pub static CEL_INT_COLUMN_CLASS: CelClass = CelClass::new("int_column", CelKind::List, 10);
+
+/// An unboxed float column. `FloatListStrategy` storage: raw `f64`s, not
+/// `W_DoubleObject`s. `data` and `length` are write-once, same as
+/// [`W_IntColumn`].
+#[repr(C)]
+#[allow(non_camel_case_types)]
+pub struct W_FloatColumn {
+    pub ob_header: CelObject,
+    /// [`CelFloatWords`]: capacity at offset 0, then the `f64`s.
+    /// Reads and writes are `getarrayitem_gc_f` / `setarrayitem_gc_f`.
+    pub data: *mut crate::runtime::object_array::CelFloatWords,
+    pub length: i64,
+}
+
+pub static CEL_FLOAT_COLUMN_CLASS: CelClass = CelClass::new("float_column", CelKind::List, 17);
+
+const _: () = {
+    assert!(offset_of!(W_FloatColumn, ob_header) == 0);
+};
+
+/// A float column whose `length` is the allocated count (`ll_newlist_hint`).
+pub(crate) fn new_float_column_capacity(cap: i64) -> *mut W_FloatColumn {
+    let cap = cap.max(1);
+    super::heap::with_heap(|h| {
+        let data = crate::runtime::object_array::new_float_words_in(h, cap as usize);
+        h.alloc(W_FloatColumn {
+            ob_header: CelObject {
+                ob_type: &CEL_FLOAT_COLUMN_CLASS,
+            },
+            data,
+            length: cap,
+        })
+    })
+}
+
+const _: () = {
+    assert!(offset_of!(W_IntColumn, ob_header) == 0);
+};
+
+/// Box `values` as an unboxed int column.
+pub fn new_int_column(values: &[i64]) -> *mut W_IntColumn {
+    let length = values.len() as i64;
+    let data = if values.is_empty() {
+        core::ptr::null_mut()
+    } else {
+        super::heap::with_heap(|h| {
+            let block = crate::runtime::object_array::new_int_words_in(h, values.len());
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    values.as_ptr(),
+                    crate::runtime::object_array::int_words_base(block),
+                    values.len(),
+                );
+            }
+            block
+        })
+    };
+    lltype::malloc_typed(W_IntColumn {
+        ob_header: CelObject {
+            ob_type: &CEL_INT_COLUMN_CLASS,
+        },
+        data,
+        length,
+    })
+}
+
+/// A CEL `list`.
+///
+/// Strategy tag + storage + window, the `listobject.py` shape. Object
+/// lists keep their items block on the leaf (the block is not a
+/// class-family value); int columns and host windows live at `storage`.
+///
+/// `strategy`, `storage`, `items` and `start` are written after allocation
+/// (`W_ListObject.__init__`, `EmptyListStrategy.switch_to_correct_strategy`).
+/// They are not `_immutable_fields_`.
+#[repr(C)]
+#[allow(non_camel_case_types)]
+pub struct W_ListObject {
+    pub ob_header: CelObject,
+    pub strategy: ListStrategy,
+    /// [`W_IntColumn`] or a [`W_OpaqueObject`] holding a window host.
+    pub storage: CelRef,
+    pub items: *mut CelItemsBlock,
+    /// Window offset, or the `SizeListStrategy` capacity hint. Other
+    /// strategies leave it at 0. `start` is not an items-block length.
+    ///
+    /// Invariant for Ints, Floats, Object and Strs (`ll_getitem_fast`):
+    /// `0 <= start` and `start + length <= capacity` of the column or
+    /// items block. A traced item read compares the index with `length`
+    /// once and loads `start + index` with no further check.
+    pub start: i64,
+    pub length: i64,
+}
+
+pub static CEL_LIST_CLASS: CelClass = CelClass::new("list", CelKind::List, 11);
+
+/// A list wrapped from a host value.
+///
+/// The link back to that value's buffer is three fields after
+/// [`W_ListObject`]. A list the VM allocates is a [`W_ListObject`] and has
+/// no link. `kind` stays [`CelKind::List`], so a family test accepts both.
+#[repr(C)]
+#[allow(non_camel_case_types)]
+pub struct W_HostListObject {
+    pub base: W_ListObject,
+    /// Non-owning pointer at the public list buffer this leaf was wrapped
+    /// from. The Context that performed the wrap keeps the owning handle alive.
+    pub public: *const (),
+    pub public_start: u32,
+    pub public_len: u32,
+}
+
+pub static CEL_HOST_LIST_CLASS: CelClass = CelClass::new("list", CelKind::List, 19);
+
+const _: () = {
+    assert!(offset_of!(W_ListObject, ob_header) == 0);
+    assert!(offset_of!(W_HostListObject, base) == 0);
+    assert!(size_of::<W_ListObject>() == 48);
+};
+
+/// Drop the host buffer link. A VM list has none.
+///
+/// # Safety
+///
+/// `w` is a live list.
+pub(crate) unsafe fn list_clear_public_link(w: CelRef) {
+    if (*w).ob_type != &CEL_HOST_LIST_CLASS {
+        return;
+    }
+    let leaf = &mut *w.cast::<W_HostListObject>();
+    leaf.public = core::ptr::null();
+    leaf.public_start = 0;
+    leaf.public_len = 0;
+}
+
+/// `W_TupleObject` (`tupleobject.py`).
+///
+/// Header first. `length` and `items` are written once, at allocation.
+/// `_immutable_fields_ = ['length', 'items[*]']`: the pointer does not
+/// change, and `rewrite_op_getarrayitem` reads the `CelRef`s with
+/// `getarrayitem_gc_pure`. The block is a `GcArray` (`CelItemsBlock`):
+/// length word, then the items. Only `In` consumes one; it is not a CEL value.
+#[repr(C)]
+#[allow(non_camel_case_types)]
+pub struct W_TupleObject {
+    pub ob_header: CelObject,
+    pub length: i64,
+    /// `wrappeditems`. Items begin at [`CelItemsBlock::items`].
+    pub items: *mut crate::runtime::object_array::CelItemsBlock,
+}
+
+/// `W_TupleObject.typedef`, named `tuple`.
+pub static CEL_TUPLE_CLASS: CelClass = CelClass::new("tuple", CelKind::Tuple, 18);
+
+const _: () = {
+    assert!(offset_of!(W_TupleObject, ob_header) == 0);
+};
+
+/// Live length of a tuple leaf.
+///
+/// # Safety
+///
+/// `w` is a live [`W_TupleObject`].
+pub unsafe fn tuple_len(w: CelRef) -> i64 {
+    (*w.cast::<W_TupleObject>()).length
+}
+
+/// Item `index` of a tuple leaf, or `None` if out of range.
+///
+/// # Safety
+///
+/// `w` is a live [`W_TupleObject`].
+pub unsafe fn tuple_item(w: CelRef, index: i64) -> Option<CelRef> {
+    if index < 0 {
+        return None;
+    }
+    let leaf = &*w.cast::<W_TupleObject>();
+    if index >= leaf.length || leaf.items.is_null() {
+        return None;
+    }
+    let base = crate::runtime::object_array::items_block_items_base(leaf.items);
+    if base.is_null() {
+        return None;
+    }
+    Some(*base.add(index as usize))
+}
+
+/// ⚠ Immutable in the sense the JIT means: written once at allocation, so a
+/// read may fold. CEL lists are immutable values, so this is not the bet it
+/// Box `values` as a CEL `list`.
+///
+/// The elements are the family's first MULTIPLE managed edges from one value,
+/// and they live in the block rather than in the leaf. Nothing traces them yet,
+/// for the same reason nothing traces [`W_OptionalObject`]'s single edge.
+/// Live length of a list leaf.
+///
+/// # Safety
+///
+/// `w` is a live [`W_ListObject`].
+pub unsafe fn list_len(w: CelRef) -> i64 {
+    (*w.cast::<W_ListObject>()).length
+}
+
+/// Live entry count of a map leaf.
+///
+/// # Safety
+///
+/// `w` is a live [`W_MapObject`].
+pub unsafe fn map_len(w: CelRef) -> i64 {
+    (*w.cast::<W_MapObject>()).length
+}
+
+/// UTF-8 byte length of a string leaf. Matches `Arc<String>::len`.
+///
+/// # Safety
+///
+/// `w` is a live [`W_StringObject`].
+pub unsafe fn string_byte_len(w: CelRef) -> i64 {
+    (*w.cast::<W_StringObject>()).byte_len
+}
+
+/// Borrow the UTF-8 payload of a string leaf.
+///
+/// # Safety
+///
+/// `w` is a live [`W_StringObject`] that outlives the returned slice.
+pub unsafe fn string_as_str<'a>(w: CelRef) -> Option<&'a str> {
+    if w_kind(w) != CelKind::Str {
+        return None;
+    }
+    let leaf = &*w.cast::<W_StringObject>();
+    let n = leaf.byte_len as usize;
+    let base = crate::runtime::object_array::bytes_base(leaf.chars);
+    if base.is_null() {
+        return Some("");
+    }
+    std::str::from_utf8(std::slice::from_raw_parts(base, n)).ok()
+}
+
+/// Live length of a bytes leaf.
+///
+/// # Safety
+///
+/// `w` is a live [`W_BytesObject`].
+pub unsafe fn bytes_len(w: CelRef) -> i64 {
+    (*w.cast::<W_BytesObject>()).length
+}
+
+/// `0 <= start` and `start + length <= capacity` (`ll_getitem_fast`).
+///
+/// # Safety
+///
+/// `leaf` is a live [`W_ListObject`].
+unsafe fn debug_assert_list_window(leaf: &W_ListObject) {
+    debug_assert!(leaf.start >= 0, "list start is negative");
+    let end = leaf.start.saturating_add(leaf.length);
+    match leaf.strategy {
+        ListStrategy::Ints => {
+            if leaf.storage.is_null() {
+                debug_assert!(leaf.length == 0, "int list has no column");
+            } else {
+                let cap = (*leaf.storage.cast::<W_IntColumn>()).length;
+                debug_assert!(end <= cap, "int list window exceeds the column");
+            }
+        }
+        ListStrategy::Floats => {
+            if leaf.storage.is_null() {
+                debug_assert!(leaf.length == 0, "float list has no column");
+            } else {
+                let cap = (*leaf.storage.cast::<W_FloatColumn>()).length;
+                debug_assert!(end <= cap, "float list window exceeds the column");
+            }
+        }
+        ListStrategy::Object | ListStrategy::Strs => {
+            let cap = crate::runtime::object_array::items_capacity(leaf.items) as i64;
+            debug_assert!(end <= cap, "list window exceeds the items block");
+        }
+        ListStrategy::Window | ListStrategy::Size => {}
+    }
+}
+
+/// Item `index` of a list leaf, or null if out of range.
+///
+/// # Safety
+///
+/// `w` is a live [`W_ListObject`].
+pub unsafe fn list_get(w: CelRef, index: i64) -> Option<CelRef> {
+    if index < 0 {
+        return None;
+    }
+    let leaf = &*w.cast::<W_ListObject>();
+    debug_assert_list_window(leaf);
+    if index >= leaf.length {
+        return None;
+    }
+    let at = leaf.start + index;
+    match leaf.strategy {
+        ListStrategy::Object => {
+            let base = crate::runtime::object_array::items_block_items_base(leaf.items);
+            if base.is_null() {
+                return None;
+            }
+            Some(*base.add(at as usize))
+        }
+        ListStrategy::Ints => {
+            if leaf.storage.is_null() {
+                return None;
+            }
+            let col = &*leaf.storage.cast::<W_IntColumn>();
+            if col.data.is_null() || at < 0 || at >= col.length {
+                return None;
+            }
+            Some(
+                new_int(*crate::runtime::object_array::int_words_base(col.data).add(at as usize))
+                    as CelRef,
+            )
+        }
+        ListStrategy::Floats => list_float_at(w, index).map(|f| new_double(f) as CelRef),
+        ListStrategy::Strs => {
+            let base = crate::runtime::object_array::items_block_items_base(leaf.items);
+            if base.is_null() {
+                return None;
+            }
+            Some(*base.add(at as usize))
+        }
+        ListStrategy::Window | ListStrategy::Size => None,
+    }
+}
+
+/// The unboxed integer at `index` of an Ints-strategy list, with no allocation.
+///
+/// `None` if `w` is not an Ints list or `index` is out of range.
+///
+/// # Safety
+///
+/// `w` is a live [`W_ListObject`].
+pub unsafe fn list_int_at(w: CelRef, index: i64) -> Option<i64> {
+    if index < 0 {
+        return None;
+    }
+    let leaf = &*w.cast::<W_ListObject>();
+    debug_assert_list_window(leaf);
+    if leaf.strategy != ListStrategy::Ints || index >= leaf.length {
+        return None;
+    }
+    if leaf.storage.is_null() {
+        return None;
+    }
+    let col = &*leaf.storage.cast::<W_IntColumn>();
+    let at = leaf.start + index;
+    if col.data.is_null() || at < 0 || at >= col.length {
+        return None;
+    }
+    Some(*crate::runtime::object_array::int_words_base(col.data).add(at as usize))
+}
+
+/// The unboxed float at `index` of a Floats-strategy list.
+///
+/// `FloatListStrategy.getitem` wraps on the way out; this is the storage read.
+///
+/// # Safety
+///
+/// `w` is a live [`W_ListObject`].
+pub unsafe fn list_float_at(w: CelRef, index: i64) -> Option<f64> {
+    if index < 0 {
+        return None;
+    }
+    let leaf = &*w.cast::<W_ListObject>();
+    debug_assert_list_window(leaf);
+    if leaf.strategy != ListStrategy::Floats || index >= leaf.length {
+        return None;
+    }
+    if leaf.storage.is_null() {
+        return None;
+    }
+    let col = &*leaf.storage.cast::<W_FloatColumn>();
+    let at = leaf.start + index;
+    if col.data.is_null() || at < 0 || at >= col.length {
+        return None;
+    }
+    Some(*crate::runtime::object_array::float_words_base(col.data).add(at as usize))
+}
+
+/// The int column of an Ints-strategy list, or `None` if `w` is not one.
+///
+/// # Safety
+///
+/// `w` is a live value.
+pub unsafe fn list_ints_slice<'a>(w: CelRef) -> Option<&'a [i64]> {
+    if w_kind(w) != CelKind::List {
+        return None;
+    }
+    let leaf = &*w.cast::<W_ListObject>();
+    if leaf.strategy != ListStrategy::Ints || leaf.storage.is_null() {
+        return None;
+    }
+    let col = &*leaf.storage.cast::<W_IntColumn>();
+    let start = leaf.start as usize;
+    let n = leaf.length as usize;
+    if col.data.is_null() || start.saturating_add(n) > col.length as usize {
+        return None;
+    }
+    Some(std::slice::from_raw_parts(
+        crate::runtime::object_array::int_words_base(col.data).add(start),
+        n,
+    ))
+}
+
+/// Equality of two interned lists when at least one is an Ints column.
+///
+/// `None` if neither side is Ints; the caller then uses the generic path.
+///
+/// # Safety
+///
+/// Both operands are live values.
+pub unsafe fn interned_list_eq(a: CelRef, b: CelRef) -> Option<bool> {
+    match (list_ints_slice(a), list_ints_slice(b)) {
+        (Some(la), Some(lb)) => Some(la == lb),
+        (Some(ints), None) if w_kind(b) == CelKind::List => Some(object_list_eq_ints(b, ints)),
+        (None, Some(ints)) if w_kind(a) == CelKind::List => Some(object_list_eq_ints(a, ints)),
+        _ => None,
+    }
+}
+
+unsafe fn object_list_eq_ints(w: CelRef, ints: &[i64]) -> bool {
+    if list_len(w) as usize != ints.len() {
+        return false;
+    }
+    let mut i = 0i64;
+    while i < ints.len() as i64 {
+        let Some(item) = list_get(w, i) else {
+            return false;
+        };
+        if w_kind(item) != CelKind::Int {
+            return false;
+        }
+        if (*item.cast::<W_IntObject>()).intval != ints[i as usize] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// An empty list whose items block has room for `cap` appends.
+///
+/// `start` is 0 and `length` stays `<=` the items capacity
+/// (`ll_getitem_fast`).
+pub fn new_list_with_capacity(cap: i64) -> *mut W_ListObject {
+    super::heap::with_heap(|h| new_list_with_capacity_in(h, cap))
+}
+
+/// [`new_list_with_capacity`] on `heap`. Slots past `length` are written
+/// by append before anything reads them, so they are not zeroed.
+#[inline(never)]
+pub fn new_list_with_capacity_in(heap: &super::heap::CelHeap, cap: i64) -> *mut W_ListObject {
+    let n = cap.max(0) as usize;
+    let items = object_array::new_items_block_with_zeroed_prefix_in(heap, n, 0);
+    heap.alloc(W_ListObject {
+        ob_header: CelObject {
+            ob_type: &CEL_LIST_CLASS,
+        },
+        strategy: ListStrategy::Object,
+        storage: core::ptr::null_mut(),
+        items,
+        start: 0,
+        length: 0,
+    })
+}
+
+/// An int column whose `length` is the allocated count (`ll_newlist_hint`).
+///
+/// The only allocation on `EmptyListStrategy.switch_to_correct_strategy`
+/// for a plain int. The strategy tag itself is a field write.
+pub(crate) fn new_int_column_capacity(cap: i64) -> *mut W_IntColumn {
+    let cap = cap.max(1);
+    super::heap::with_heap(|h| {
+        let data = crate::runtime::object_array::new_int_words_in(h, cap as usize);
+        h.alloc(W_IntColumn {
+            ob_header: CelObject {
+                ob_type: &CEL_INT_COLUMN_CLASS,
+            },
+            data,
+            length: cap,
+        })
+    })
+}
+
+/// Grow an int-column list so its storage holds at least `newsize` words.
+///
+/// `lltypesystem/rlist.py` `_ll_list_resize_ge`: the only residual call on
+/// the append fast path. Logical [`W_ListObject::length`] stays put; the
+/// caller writes the new word and then the length (`ll_append`).
+///
+/// # Safety
+///
+/// `w` is a live [`W_ListObject`].
+pub unsafe fn list_resize_ge(w: CelRef, newsize: i64) -> bool {
+    if newsize < 0 || w_kind(w) != CelKind::List {
+        return false;
+    }
+    let leaf = &mut *w.cast::<W_ListObject>();
+    if leaf.strategy != ListStrategy::Ints || leaf.storage.is_null() {
+        return false;
+    }
+    let col = &mut *leaf.storage.cast::<W_IntColumn>();
+    if newsize <= col.length {
+        return true;
+    }
+    let mut newcap = col.length.saturating_mul(2);
+    if newcap < newsize {
+        newcap = newsize;
+    }
+    if newcap < 4 {
+        newcap = 4;
+    }
+    let live = leaf.length.max(0) as usize;
+    let src = col.data;
+    // `_ll_list_resize_really` allocates a new items array and stores it
+    // into the mutable list field. The column's `data` / `length` stay
+    // write-once (`_immutable_fields_`).
+    let new_col = super::heap::with_heap(|h| {
+        let ptr = crate::runtime::object_array::new_int_words_in(h, newcap as usize);
+        if live > 0 && !src.is_null() {
+            core::ptr::copy_nonoverlapping(
+                crate::runtime::object_array::int_words_base(src),
+                crate::runtime::object_array::int_words_base(ptr),
+                live,
+            );
+        }
+        h.alloc(W_IntColumn {
+            ob_header: CelObject {
+                ob_type: &CEL_INT_COLUMN_CLASS,
+            },
+            data: ptr,
+            length: newcap,
+        })
+    });
+    (*w.cast::<W_ListObject>()).storage = new_col as CelRef;
+    true
+}
+
+/// Store `word` at the end of an int-column list, growing when the column
+/// is full. `AbstractUnwrappedStrategy.append` / `ll_append`.
+///
+/// # Safety
+///
+/// `w` is a live [`W_ListObject`] whose strategy is [`ListStrategy::Ints`].
+pub unsafe fn list_store_int(w: CelRef, word: i64) -> bool {
+    if w_kind(w) != CelKind::List {
+        return false;
+    }
+    let length = (*w.cast::<W_ListObject>()).length;
+    let storage = (*w.cast::<W_ListObject>()).storage;
+    if storage.is_null() {
+        return false;
+    }
+    let cap = (*storage.cast::<W_IntColumn>()).length;
+    if length < 0 || (length >= cap && !list_resize_ge(w, length + 1)) {
+        return false;
+    }
+    let leaf = &mut *w.cast::<W_ListObject>();
+    let storage = leaf.storage;
+    if storage.is_null() {
+        return false;
+    }
+    let col = &*storage.cast::<W_IntColumn>();
+    let at = leaf.length;
+    if col.data.is_null() || at < 0 || at >= col.length {
+        return false;
+    }
+    let data = crate::runtime::object_array::int_words_base(col.data);
+    *data.add(at as usize) = word;
+    leaf.length = at + 1;
+    list_clear_public_link(w);
+    true
+}
+
+/// `EmptyListStrategy.switch_to_correct_strategy` for a plain int: the
+/// empty object list becomes an int column sized to the hint, then the
+/// word is stored.
+///
+/// # Safety
+///
+/// `w` is a live [`W_ListObject`].
+pub unsafe fn list_promote_empty_to_ints(w: CelRef, word: i64) -> bool {
+    if w_kind(w) != CelKind::List {
+        return false;
+    }
+    let leaf = &*w.cast::<W_ListObject>();
+    let size_hint = leaf.strategy == ListStrategy::Size;
+    if !(size_hint || (leaf.strategy == ListStrategy::Object && leaf.length == 0)) {
+        return false;
+    }
+    let cap = if size_hint {
+        leaf.start.max(1)
+    } else if leaf.items.is_null() {
+        1
+    } else {
+        (crate::runtime::object_array::items_capacity(leaf.items) as i64).max(1)
+    };
+    let col = new_int_column_capacity(cap);
+    let leaf = &mut *w.cast::<W_ListObject>();
+    leaf.strategy = ListStrategy::Ints;
+    leaf.storage = col as CelRef;
+    leaf.items = core::ptr::null_mut();
+    leaf.start = 0;
+    list_store_int(w, word)
+}
+
+/// Grow a float-column list so its storage holds at least `newsize` words.
+///
+/// Same shape as [`list_resize_ge`] (`_ll_list_resize_ge`).
+///
+/// # Safety
+///
+/// `w` is a live [`W_ListObject`].
+pub unsafe fn list_resize_ge_float(w: CelRef, newsize: i64) -> bool {
+    if newsize < 0 || w_kind(w) != CelKind::List {
+        return false;
+    }
+    let leaf = &mut *w.cast::<W_ListObject>();
+    if leaf.strategy != ListStrategy::Floats || leaf.storage.is_null() {
+        return false;
+    }
+    let col = &mut *leaf.storage.cast::<W_FloatColumn>();
+    if newsize <= col.length {
+        return true;
+    }
+    let mut newcap = col.length.saturating_mul(2);
+    if newcap < newsize {
+        newcap = newsize;
+    }
+    if newcap < 4 {
+        newcap = 4;
+    }
+    let live = leaf.length.max(0) as usize;
+    let src = col.data;
+    let new_col = super::heap::with_heap(|h| {
+        let data = crate::runtime::object_array::new_float_words_in(h, newcap as usize);
+        if live > 0 && !src.is_null() {
+            core::ptr::copy_nonoverlapping(
+                crate::runtime::object_array::float_words_base(src),
+                crate::runtime::object_array::float_words_base(data),
+                live,
+            );
+        }
+        h.alloc(W_FloatColumn {
+            ob_header: CelObject {
+                ob_type: &CEL_FLOAT_COLUMN_CLASS,
+            },
+            data,
+            length: newcap,
+        })
+    });
+    (*w.cast::<W_ListObject>()).storage = new_col as CelRef;
+    true
+}
+
+/// `FloatListStrategy.append`: store the unboxed float.
+///
+/// # Safety
+///
+/// `w` is a live [`W_ListObject`] whose strategy is [`ListStrategy::Floats`].
+pub unsafe fn list_store_float(w: CelRef, word: f64) -> bool {
+    if w_kind(w) != CelKind::List {
+        return false;
+    }
+    let length = (*w.cast::<W_ListObject>()).length;
+    let storage = (*w.cast::<W_ListObject>()).storage;
+    if storage.is_null() {
+        return false;
+    }
+    let cap = (*storage.cast::<W_FloatColumn>()).length;
+    if length < 0 || (length >= cap && !list_resize_ge_float(w, length + 1)) {
+        return false;
+    }
+    let leaf = &mut *w.cast::<W_ListObject>();
+    let storage = leaf.storage;
+    if storage.is_null() {
+        return false;
+    }
+    let col = &*storage.cast::<W_FloatColumn>();
+    let at = leaf.length;
+    if col.data.is_null() || at < 0 || at >= col.length {
+        return false;
+    }
+    let data = crate::runtime::object_array::float_words_base(col.data);
+    *data.add(at as usize) = word;
+    leaf.length = at + 1;
+    list_clear_public_link(w);
+    true
+}
+
+/// Grow a string-strategy list so its items block holds at least `newsize`
+/// leaves. Same shape as [`list_resize_ge`] (`_ll_list_resize_ge`): a new
+/// block, the live leaves copied, the pointer stored on the list.
+///
+/// # Safety
+///
+/// `w` is a live [`W_ListObject`].
+pub unsafe fn list_resize_ge_strs(w: CelRef, newsize: i64) -> bool {
+    if newsize < 0 || w_kind(w) != CelKind::List {
+        return false;
+    }
+    let leaf = &*w.cast::<W_ListObject>();
+    if leaf.strategy != ListStrategy::Strs || leaf.items.is_null() {
+        return false;
+    }
+    let cap = crate::runtime::object_array::items_capacity(leaf.items) as i64;
+    if newsize <= cap {
+        return true;
+    }
+    let mut newcap = cap.saturating_mul(2);
+    if newcap < newsize {
+        newcap = newsize;
+    }
+    if newcap < 4 {
+        newcap = 4;
+    }
+    let live = leaf.length.max(0) as usize;
+    let src = leaf.items;
+    let new_items = super::heap::with_heap(|h| {
+        crate::runtime::object_array::new_items_block_with_zeroed_prefix_in(h, newcap as usize, 0)
+    });
+    if live > 0 {
+        let src_base = crate::runtime::object_array::items_block_items_base(src);
+        let dst_base = crate::runtime::object_array::items_block_items_base(new_items);
+        if !src_base.is_null() && !dst_base.is_null() {
+            core::ptr::copy_nonoverlapping(src_base, dst_base, live);
+        }
+    }
+    (*w.cast::<W_ListObject>()).items = new_items;
+    true
+}
+
+/// `AsciiListStrategy.append`: store the string leaf, growing the items
+/// block when it is full.
+///
+/// # Safety
+///
+/// `w` is a live [`W_ListObject`] whose strategy is [`ListStrategy::Strs`].
+/// `item` is a live string leaf.
+pub unsafe fn list_store_str(w: CelRef, item: CelRef) -> bool {
+    if w_kind(w) != CelKind::List {
+        return false;
+    }
+    let length = (*w.cast::<W_ListObject>()).length;
+    let items = (*w.cast::<W_ListObject>()).items;
+    if items.is_null() {
+        return false;
+    }
+    let cap = crate::runtime::object_array::items_capacity(items) as i64;
+    if length < 0 || (length >= cap && !list_resize_ge_strs(w, length + 1)) {
+        return false;
+    }
+    list_append_item_ref(w, item)
+}
+
+/// Empty or `Size` list becomes a string items block, then `item` is stored.
+///
+/// # Safety
+///
+/// `w` is a live [`W_ListObject`]. `item` is a live string leaf.
+pub unsafe fn list_promote_empty_to_strs(w: CelRef, item: CelRef) -> bool {
+    if w_kind(w) != CelKind::List {
+        return false;
+    }
+    let leaf = &*w.cast::<W_ListObject>();
+    let size_hint = leaf.strategy == ListStrategy::Size;
+    if !(size_hint || (leaf.strategy == ListStrategy::Object && leaf.length == 0)) {
+        return false;
+    }
+    let cap = if size_hint {
+        leaf.start.max(1)
+    } else if leaf.items.is_null() {
+        1
+    } else {
+        (crate::runtime::object_array::items_capacity(leaf.items) as i64).max(1)
+    };
+    let items = super::heap::with_heap(|h| {
+        crate::runtime::object_array::new_items_block_zeroed_in(h, cap as usize)
+    });
+    let leaf = &mut *w.cast::<W_ListObject>();
+    leaf.strategy = ListStrategy::Strs;
+    leaf.items = items;
+    leaf.start = 0;
+    list_append_item_ref(w, item)
+}
+
+/// Empty object list becomes a float column, then the word is stored.
+///
+/// `EmptyListStrategy.switch_to_correct_strategy` for a float.
+///
+/// # Safety
+///
+/// `w` is a live [`W_ListObject`].
+pub unsafe fn list_promote_empty_to_floats(w: CelRef, word: f64) -> bool {
+    if w_kind(w) != CelKind::List {
+        return false;
+    }
+    let leaf = &*w.cast::<W_ListObject>();
+    let size_hint = leaf.strategy == ListStrategy::Size;
+    if !(size_hint || (leaf.strategy == ListStrategy::Object && leaf.length == 0)) {
+        return false;
+    }
+    let cap = if size_hint {
+        leaf.start.max(1)
+    } else if leaf.items.is_null() {
+        1
+    } else {
+        (crate::runtime::object_array::items_capacity(leaf.items) as i64).max(1)
+    };
+    let col = new_float_column_capacity(cap);
+    let leaf = &mut *w.cast::<W_ListObject>();
+    leaf.strategy = ListStrategy::Floats;
+    leaf.storage = col as CelRef;
+    leaf.items = core::ptr::null_mut();
+    leaf.start = 0;
+    list_store_float(w, word)
+}
+
+/// `switch_to_object_strategy`: box the int column and append `item`.
+///
+/// # Safety
+///
+/// `w` is a live [`W_ListObject`]. `item` is a live value.
+unsafe fn list_switch_to_object_append(w: CelRef, item: CelRef) -> bool {
+    if w_kind(w) != CelKind::List {
+        return false;
+    }
+    let leaf = &*w.cast::<W_ListObject>();
+    if leaf.strategy != ListStrategy::Ints {
+        return false;
+    }
+    let n = leaf.length.max(0) as usize;
+    let col = leaf.storage;
+    let (words, cap_words) = if col.is_null() {
+        (core::ptr::null_mut(), 0i64)
+    } else {
+        let col = &*col.cast::<W_IntColumn>();
+        (
+            crate::runtime::object_array::int_words_base(col.data),
+            col.length,
+        )
+    };
+    if n > 0 && words.is_null() {
+        return false;
+    }
+    let cap = (cap_words.max(0) as usize).max(n + 1);
+    let items = super::heap::with_heap(|h| {
+        crate::runtime::object_array::new_items_block_with_zeroed_prefix_in(h, cap, 0)
+    });
+    let base = crate::runtime::object_array::items_block_items_base(items);
+    if base.is_null() {
+        return false;
+    }
+    let mut i = 0;
+    while i < n {
+        *base.add(i) = new_int(*words.add(i)) as CelRef;
+        i += 1;
+    }
+    *base.add(n) = item;
+    let leaf = &mut *w.cast::<W_ListObject>();
+    leaf.strategy = ListStrategy::Object;
+    leaf.storage = core::ptr::null_mut();
+    leaf.items = items;
+    leaf.start = 0;
+    leaf.length = (n + 1) as i64;
+    list_clear_public_link(w);
+    true
+}
+
+/// `switch_to_object_strategy` from a float column: box each float, then append.
+///
+/// # Safety
+///
+/// `w` is a live [`W_ListObject`]. `item` is a live value.
+unsafe fn list_switch_floats_to_object(w: CelRef, item: CelRef) -> bool {
+    if w_kind(w) != CelKind::List {
+        return false;
+    }
+    let leaf = &*w.cast::<W_ListObject>();
+    if leaf.strategy != ListStrategy::Floats {
+        return false;
+    }
+    let n = leaf.length.max(0) as usize;
+    let col = leaf.storage;
+    let (words, cap_words) = if col.is_null() {
+        (core::ptr::null_mut::<f64>(), 0i64)
+    } else {
+        let col = &*col.cast::<W_FloatColumn>();
+        (
+            crate::runtime::object_array::float_words_base(col.data),
+            col.length,
+        )
+    };
+    if n > 0 && words.is_null() {
+        return false;
+    }
+    let cap = (cap_words.max(0) as usize).max(n + 1);
+    let items = super::heap::with_heap(|h| {
+        crate::runtime::object_array::new_items_block_with_zeroed_prefix_in(h, cap, 0)
+    });
+    let base = crate::runtime::object_array::items_block_items_base(items);
+    if base.is_null() {
+        return false;
+    }
+    let mut i = 0;
+    while i < n {
+        *base.add(i) = new_double(*words.add(i)) as CelRef;
+        i += 1;
+    }
+    *base.add(n) = item;
+    let leaf = &mut *w.cast::<W_ListObject>();
+    leaf.strategy = ListStrategy::Object;
+    leaf.storage = core::ptr::null_mut();
+    leaf.items = items;
+    leaf.start = 0;
+    leaf.length = (n + 1) as i64;
+    list_clear_public_link(w);
+    true
+}
+
+/// A string-strategy list is already an items block. A non-string switches
+/// the tag to [`ListStrategy::Object`] (`switch_to_object_strategy`).
+///
+/// # Safety
+///
+/// `w` is a live [`W_ListObject`].
+unsafe fn list_switch_strs_to_object(w: CelRef, item: CelRef) -> bool {
+    if w_kind(w) != CelKind::List {
+        return false;
+    }
+    let leaf = &mut *w.cast::<W_ListObject>();
+    if leaf.strategy != ListStrategy::Strs {
+        return false;
+    }
+    leaf.strategy = ListStrategy::Object;
+    list_append_item_ref(w, item)
+}
+
+/// Store `item` into an object or string items block.
+///
+/// # Safety
+///
+/// `w` is a live list whose items block has a free slot.
+unsafe fn list_append_item_ref(w: CelRef, item: CelRef) -> bool {
+    let leaf = &mut *w.cast::<W_ListObject>();
+    let cap = crate::runtime::object_array::items_capacity(leaf.items);
+    if leaf.length < 0 || (leaf.length as usize) >= cap {
+        return false;
+    }
+    let base = crate::runtime::object_array::items_block_items_base(leaf.items);
+    if base.is_null() {
+        return false;
+    }
+    *base.add(leaf.length as usize) = item;
+    leaf.length += 1;
+    list_clear_public_link(w);
+    true
+}
+
+/// Append `item` to a list opened by [`new_list_with_capacity`].
+///
+/// An int, float, or string joined to an empty list or to a matching column
+/// is stored unboxed (`IntegerListStrategy.append`, `FloatListStrategy.append`,
+/// `AsciiListStrategy.append`). A mismatch switches to the object strategy.
+///
+/// # Safety
+///
+/// `w` is a live [`W_ListObject`].
+pub unsafe fn list_try_append(w: CelRef, item: CelRef) -> bool {
+    if w_kind(w) != CelKind::List {
+        return false;
+    }
+    let strategy = (*w.cast::<W_ListObject>()).strategy;
+    let kind = w_kind(item);
+    if strategy == ListStrategy::Ints {
+        if kind == CelKind::Int {
+            return list_store_int(w, (*item.cast::<W_IntObject>()).intval);
+        }
+        return list_switch_to_object_append(w, item);
+    }
+    if strategy == ListStrategy::Floats {
+        if kind == CelKind::Double {
+            return list_store_float(w, (*item.cast::<W_DoubleObject>()).floatval);
+        }
+        return list_switch_floats_to_object(w, item);
+    }
+    if strategy == ListStrategy::Strs {
+        if kind == CelKind::Str {
+            return list_store_str(w, item);
+        }
+        return list_switch_strs_to_object(w, item);
+    }
+    let size_hint = strategy == ListStrategy::Size;
+    let empty_object = strategy == ListStrategy::Object && (*w.cast::<W_ListObject>()).length == 0;
+    if size_hint || empty_object {
+        if kind == CelKind::Int {
+            return list_promote_empty_to_ints(w, (*item.cast::<W_IntObject>()).intval);
+        }
+        if kind == CelKind::Double {
+            return list_promote_empty_to_floats(w, (*item.cast::<W_DoubleObject>()).floatval);
+        }
+        if size_hint {
+            let hint = (*w.cast::<W_ListObject>()).start.max(1) as usize;
+            let items = super::heap::with_heap(|h| {
+                crate::runtime::object_array::new_items_block_zeroed_in(h, hint.max(1))
+            });
+            let leaf = &mut *w.cast::<W_ListObject>();
+            leaf.items = items;
+            leaf.start = 0;
+            leaf.strategy = if kind == CelKind::Str {
+                ListStrategy::Strs
+            } else {
+                ListStrategy::Object
+            };
+            return list_append_item_ref(w, item);
+        }
+        if kind == CelKind::Str {
+            (*w.cast::<W_ListObject>()).strategy = ListStrategy::Strs;
+            return list_append_item_ref(w, item);
+        }
+    } else if strategy != ListStrategy::Object {
+        return false;
+    }
+    list_append_item_ref(w, item)
+}
+
+/// `start == 0` and `length <=` the items-block capacity (`ll_getitem_fast`).
+pub fn new_list(values: &[CelRef]) -> *mut W_ListObject {
+    let items = object_array::new_items_block(values);
+    let length = values.len() as i64;
+    lltype::malloc_typed(W_ListObject {
+        ob_header: CelObject {
+            ob_type: &CEL_LIST_CLASS,
+        },
+        strategy: ListStrategy::Object,
+        storage: core::ptr::null_mut(),
+        items,
+        start: 0,
+        length,
+    })
+}
+
+/// Box unboxed integers as a CEL list.
+///
+/// `start == 0` and `length <=` the column's allocated count
+/// (`ll_getitem_fast`).
+pub fn new_list_ints(values: &[i64]) -> *mut W_ListObject {
+    let storage = new_int_column(values) as CelRef;
+    let length = values.len() as i64;
+    lltype::malloc_typed(W_ListObject {
+        ob_header: CelObject {
+            ob_type: &CEL_LIST_CLASS,
+        },
+        strategy: ListStrategy::Ints,
+        storage,
+        items: core::ptr::null_mut(),
+        start: 0,
+        length,
+    })
+}
+
+/// Box a host-table window as a CEL list.
+pub fn new_list_window(storage: CelRef, start: i64, length: i64) -> *mut W_ListObject {
+    lltype::malloc_typed(W_ListObject {
+        ob_header: CelObject {
+            ob_type: &CEL_LIST_CLASS,
+        },
+        strategy: ListStrategy::Window,
+        storage,
+        items: core::ptr::null_mut(),
+        start,
+        length,
+    })
+}
+
+fn host_list_leaf(
+    strategy: ListStrategy,
+    storage: CelRef,
+    items: *mut CelItemsBlock,
+    start: i64,
+    length: i64,
+) -> W_HostListObject {
+    W_HostListObject {
+        base: W_ListObject {
+            ob_header: CelObject {
+                ob_type: &CEL_HOST_LIST_CLASS,
+            },
+            strategy,
+            storage,
+            items,
+            start,
+            length,
+        },
+        public: core::ptr::null(),
+        public_start: 0,
+        public_len: 0,
+    }
+}
+
+/// [`new_list`] for a list wrapped from a host value.
+pub(crate) fn new_host_list(values: &[CelRef]) -> *mut W_HostListObject {
+    let items = object_array::new_items_block(values);
+    let length = values.len() as i64;
+    lltype::malloc_typed(host_list_leaf(
+        ListStrategy::Object,
+        core::ptr::null_mut(),
+        items,
+        0,
+        length,
+    ))
+}
+
+/// [`new_list_ints`] for a list wrapped from a host value.
+pub(crate) fn new_host_list_ints(values: &[i64]) -> *mut W_HostListObject {
+    let storage = new_int_column(values) as CelRef;
+    let length = values.len() as i64;
+    lltype::malloc_typed(host_list_leaf(
+        ListStrategy::Ints,
+        storage,
+        core::ptr::null_mut(),
+        0,
+        length,
+    ))
+}
+
+/// [`new_list_window`] for a list wrapped from a host value.
+pub(crate) fn new_host_list_window(
+    storage: CelRef,
+    start: i64,
+    length: i64,
+) -> *mut W_HostListObject {
+    lltype::malloc_typed(host_list_leaf(
+        ListStrategy::Window,
+        storage,
+        core::ptr::null_mut(),
+        start,
+        length,
+    ))
+}
+
+/// Flatten `[k, v]` pairs into one items block. Shared by map and struct so
+/// the two leaves cannot drift on how they pack an entry.
+fn interleaved_pair_block(pairs: &[(CelRef, CelRef)]) -> *mut CelItemsBlock {
+    let n = pairs.len();
+    let mut items = Vec::with_capacity(n * 2);
+    let mut i = 0;
+    while i < n {
+        items.push(pairs[i].0);
+        items.push(pairs[i].1);
+        i += 1;
+    }
+    object_array::new_items_block(&items)
+}
+
+/// String-key maps at or below this entry count share a layout.
+/// Larger maps stay on [`MapStrategy::Object`].
+pub const MAPDICT_MAX_ENTRIES: usize = 16;
+
+/// How a [`W_MapObject`] holds its entries. D4, same as [`ListStrategy`].
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MapStrategy {
+    /// Interleaved `[k0, v0, …]` references in [`W_MapObject::items`].
+    Object = 0,
+    /// One record row. The schema lives in the heap host table at `storage`.
+    Record = 1,
+    /// Values only, in layout-index order. String keys, at most
+    /// [`MAPDICT_MAX_ENTRIES`]. The chain lives at [`W_MapObject::layout`].
+    Mapdict = 2,
+}
+
+/// A CEL `map`.
+///
+/// An object map stores interleaved `[k0, v0, …]` references. A record row
+/// parks its schema in the host table. A mapdict map stores values only,
+/// one per layout index.
+///
+/// [`Self::layout`] is the address bits of a leaked layout node
+/// (`mapdict.py` `AbstractAttribute`), or 0 when the strategy is not
+/// [`MapStrategy::Mapdict`]. The node is not a GC object, so the word is
+/// absent from `gc_ptr_offsets`. [`Self::storage`] stays the record
+/// strategy's host opaque and is traced.
+///
+/// `strategy`, `storage`, `items`, and `layout` are written only by the
+/// allocating constructors. `length` and the `public*` words change on insert.
+#[repr(C)]
+#[allow(non_camel_case_types)]
+pub struct W_MapObject {
+    pub ob_header: CelObject,
+    pub strategy: MapStrategy,
+    pub storage: CelRef,
+    pub items: *mut CelItemsBlock,
+    /// Live entry count, not the number of references in [`Self::items`].
+    pub length: i64,
+    /// Non-owning pointer at the public map table this leaf was wrapped
+    /// from, or null if the map was allocated by the VM.
+    pub public: *const (),
+    /// Discriminator for [`Self::public`]: 0 is a `HashMap` object table,
+    /// 1 is the data pointer of an `Arc<[(Key, Value)]>` whose length is
+    /// [`Self::public_len`].
+    pub public_kind: u32,
+    /// Slice length for [`Self::public`] when [`Self::public_kind`] is 1.
+    /// Independent of [`Self::length`], which interned inserts may change.
+    pub public_len: u32,
+    /// Mapdict layout address bits. Not a managed edge. See the struct doc.
+    pub layout: i64,
+}
+
+pub static CEL_MAP_CLASS: CelClass = CelClass::new("map", CelKind::Map, 12);
+
+const _: () = {
+    assert!(offset_of!(W_MapObject, ob_header) == 0);
+};
+
+/// Look up a string key on a map leaf.
+///
+/// # Safety
+///
+/// `w` is a live [`W_MapObject`].
+pub unsafe fn map_lookup_string(w: CelRef, field: &str) -> Option<CelRef> {
+    let leaf = &*w.cast::<W_MapObject>();
+    if leaf.strategy == MapStrategy::Mapdict {
+        return mapdict_get(leaf, field.as_bytes());
+    }
+    lookup_string_pairs(leaf.items, leaf.length, field)
+}
+
+unsafe fn lookup_string_pairs(
+    items: *mut crate::runtime::object_array::CelItemsBlock,
+    length: i64,
+    field: &str,
+) -> Option<CelRef> {
+    let n = length as usize;
+    let base = crate::runtime::object_array::items_block_items_base(items);
+    if base.is_null() {
+        return None;
+    }
+    let mut i = 0;
+    while i < n {
+        let key = *base.add(2 * i);
+        if string_eq_str(key, field) {
+            return Some(*base.add(2 * i + 1));
+        }
+        i += 1;
+    }
+    None
+}
+
+pub(crate) unsafe fn string_eq_str(w: CelRef, field: &str) -> bool {
+    if w.is_null() || w_kind(w) != CelKind::Str {
+        return false;
+    }
+    let leaf = &*w.cast::<W_StringObject>();
+    let n = leaf.byte_len as usize;
+    let base = crate::runtime::object_array::bytes_base(leaf.chars);
+    if base.is_null() {
+        return field.is_empty();
+    }
+    std::slice::from_raw_parts(base, n) == field.as_bytes()
+}
+
+/// An empty map whose items block has room for `cap` entries.
+pub fn new_map_with_capacity(cap: i64) -> *mut W_MapObject {
+    super::heap::with_heap(|h| new_map_with_capacity_in(h, cap))
+}
+
+/// An empty map on `heap` with room for `cap` entries.
+#[inline]
+pub fn new_map_with_capacity_in(heap: &super::heap::CelHeap, cap: i64) -> *mut W_MapObject {
+    let n = cap.max(0) as usize;
+    let items = crate::runtime::object_array::new_items_block_zeroed_in(heap, n.saturating_mul(2));
+    heap.alloc(W_MapObject {
+        ob_header: CelObject {
+            ob_type: &CEL_MAP_CLASS,
+        },
+        strategy: MapStrategy::Object,
+        storage: core::ptr::null_mut(),
+        items,
+        length: 0,
+        public: core::ptr::null(),
+        public_kind: 0,
+        public_len: 0,
+        layout: 0,
+    })
+}
+
+/// Insert `(key, value)` into an object-strategy map: overwrite the value of
+/// an existing pair whose key is the same [`crate::objects::Key`] (same
+/// kind, same payload), otherwise append if the block still has room.
+///
+/// A mapdict map overwrites the value of a string key already on its layout
+/// and returns `false` for any other key. The strategy stays. A record map
+/// returns `false`.
+///
+/// A key that is not Int/UInt/Bool/Str is refused so the residual path
+/// raises through [`crate::objects::value_key`].
+///
+/// # Safety
+///
+/// `w` is a live [`W_MapObject`].
+#[inline]
+pub unsafe fn map_try_insert(w: CelRef, key: CelRef, value: CelRef) -> bool {
+    if w_kind(w) != CelKind::Map {
+        return false;
+    }
+    match w_kind(key) {
+        CelKind::Int | CelKind::UInt | CelKind::Bool | CelKind::Str => {}
+        _ => return false,
+    }
+    let leaf = &mut *w.cast::<W_MapObject>();
+    if leaf.strategy == MapStrategy::Mapdict {
+        if w_kind(key) == CelKind::Str {
+            let idx = mapdict_find_cell(leaf.layout, key);
+            if idx >= 0 && idx < leaf.length {
+                let base = crate::runtime::object_array::items_block_items_base(leaf.items);
+                let cap = crate::runtime::object_array::items_capacity(leaf.items);
+                if !base.is_null() && (idx as usize) < cap {
+                    *base.add(idx as usize) = value;
+                    clear_map_public(leaf);
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+    if leaf.strategy != MapStrategy::Object {
+        return false;
+    }
+    if leaf.length < 0 {
+        return false;
+    }
+    let n = leaf.length as usize;
+    let mut base = core::ptr::null_mut();
+    if n != 0 {
+        base = crate::runtime::object_array::items_block_items_base(leaf.items);
+        if base.is_null() {
+            return false;
+        }
+        let mut i = 0;
+        while i < n {
+            if interned_same_map_key(*base.add(2 * i), key) {
+                *base.add(2 * i + 1) = value;
+                clear_map_public(leaf);
+                return true;
+            }
+            i += 1;
+        }
+    }
+    let cap = crate::runtime::object_array::items_capacity(leaf.items);
+    let used = n.saturating_mul(2);
+    if used.saturating_add(2) > cap {
+        return false;
+    }
+    if base.is_null() {
+        base = crate::runtime::object_array::items_block_items_base(leaf.items);
+        if base.is_null() {
+            return false;
+        }
+    }
+    *base.add(used) = key;
+    *base.add(used + 1) = value;
+    leaf.length += 1;
+    clear_map_public(leaf);
+    true
+}
+
+fn clear_map_public(leaf: &mut W_MapObject) {
+    leaf.public = core::ptr::null();
+    leaf.public_kind = 0;
+    leaf.public_len = 0;
+}
+
+/// Exact [`crate::objects::Key`] equality on two interned leaves: kind and
+/// payload, not [`super::binop::values_equal`].
+#[inline]
+unsafe fn interned_same_map_key(a: CelRef, b: CelRef) -> bool {
+    if a == b {
+        return true;
+    }
+    let ka = w_kind(a);
+    if ka != w_kind(b) {
+        return false;
+    }
+    match ka {
+        CelKind::Int => (*a.cast::<W_IntObject>()).intval == (*b.cast::<W_IntObject>()).intval,
+        CelKind::UInt => (*a.cast::<W_UIntObject>()).uintval == (*b.cast::<W_UIntObject>()).uintval,
+        CelKind::Bool => (*a.cast::<W_BoolObject>()).boolval == (*b.cast::<W_BoolObject>()).boolval,
+        CelKind::Str => interned_string_bytes_eq(a, b),
+        _ => false,
+    }
+}
+
+#[inline]
+unsafe fn interned_string_bytes_eq(a: CelRef, b: CelRef) -> bool {
+    let la = &*a.cast::<W_StringObject>();
+    let lb = &*b.cast::<W_StringObject>();
+    if la.byte_len != lb.byte_len {
+        return false;
+    }
+    let n = la.byte_len as usize;
+    let ba = crate::runtime::object_array::bytes_base(la.chars);
+    let bb = crate::runtime::object_array::bytes_base(lb.chars);
+    if ba.is_null() || bb.is_null() {
+        return n == 0;
+    }
+    if n >= 8 {
+        // Each payload is `byte_len` live bytes; n >= 8 so an unaligned word fits.
+        let wa = core::ptr::read_unaligned(ba as *const u64);
+        let wb = core::ptr::read_unaligned(bb as *const u64);
+        if wa != wb {
+            return false;
+        }
+        if n == 8 {
+            return true;
+        }
+    }
+    std::slice::from_raw_parts(ba, n) == std::slice::from_raw_parts(bb, n)
+}
+
+/// Box `pairs` as a CEL `map`.
+pub fn new_map(pairs: &[(CelRef, CelRef)]) -> *mut W_MapObject {
+    let items = interleaved_pair_block(pairs);
+    let length = pairs.len() as i64;
+    lltype::malloc_typed(W_MapObject {
+        ob_header: CelObject {
+            ob_type: &CEL_MAP_CLASS,
+        },
+        strategy: MapStrategy::Object,
+        storage: core::ptr::null_mut(),
+        items,
+        length,
+        public: core::ptr::null(),
+        public_kind: 0,
+        public_len: 0,
+        layout: 0,
+    })
+}
+
+/// Box a host-table record row as a CEL map.
+pub fn new_map_record(storage: CelRef, length: i64) -> *mut W_MapObject {
+    lltype::malloc_typed(W_MapObject {
+        ob_header: CelObject {
+            ob_type: &CEL_MAP_CLASS,
+        },
+        strategy: MapStrategy::Record,
+        storage,
+        items: core::ptr::null_mut(),
+        length,
+        public: core::ptr::null(),
+        public_kind: 0,
+        public_len: 0,
+        layout: 0,
+    })
+}
+
+/// One node of a mapdict layout chain (`mapdict.py` `AbstractAttribute`).
+///
+/// Immortal: leaked to `'static`, never freed, never a GC object. `back` is
+/// the previous node's address, or 0 for the terminator (`Terminator`).
+/// `index` is the storage slot (`storageindex`); the terminator uses -1 so
+/// an empty name does not match it. `length` is the attribute count from
+/// the root through this node.
+///
+/// `transitions` caches [`mapdict_add_attr`] (`mapdict.py` `_get_new_attr`)
+/// on the node itself. The mutex is per node, so two threads can extend
+/// different chains without a VM-wide lock. A reader of `name` / `index` /
+/// `back` does not take it: those words are written before the node's
+/// address is published.
+struct MapdictLayout {
+    back: usize,
+    name: &'static [u8],
+    index: i64,
+    length: i64,
+    transitions: std::sync::Mutex<Vec<(&'static [u8], usize)>>,
+}
+
+static MAPDICT_TERMINATOR: MapdictLayout = MapdictLayout {
+    back: 0,
+    name: b"",
+    index: -1,
+    length: 0,
+    transitions: std::sync::Mutex::new(Vec::new()),
+};
+
+const MAPDICT_WALK_CAP: i64 = 4096;
+
+/// Address bits of the root terminator.
+pub(crate) fn mapdict_terminator_bits() -> i64 {
+    &MAPDICT_TERMINATOR as *const MapdictLayout as usize as i64
+}
+
+fn mapdict_node(bits: i64) -> Option<&'static MapdictLayout> {
+    if bits == 0 {
+        return None;
+    }
+    let addr = bits as usize;
+    if addr == 0 {
+        return None;
+    }
+    Some(unsafe { &*(addr as *const MapdictLayout) })
+}
+
+fn mapdict_walk_limit(start: &MapdictLayout) -> i64 {
+    start.length.saturating_add(1).clamp(1, MAPDICT_WALK_CAP)
+}
+
+/// `mapdict.py` `find_map_attr`: walk `back` until `name` matches an
+/// attribute. `-1` is a miss. The terminator's empty name does not match.
+pub(crate) fn mapdict_find_bytes(layout_bits: i64, name: &[u8]) -> i64 {
+    let Some(start) = mapdict_node(layout_bits) else {
+        return -1;
+    };
+    let limit = mapdict_walk_limit(start);
+    let mut node = start;
+    let mut steps = 0i64;
+    loop {
+        if node.index >= 0 && node.name == name {
+            return node.index;
+        }
+        steps += 1;
+        if steps >= limit || node.back == 0 {
+            return -1;
+        }
+        let Some(prev) = mapdict_node(node.back as i64) else {
+            return -1;
+        };
+        node = prev;
+    }
+}
+
+/// [`mapdict_find_bytes`] against a string cell's raw bytes.
+///
+/// A null, non-string, or corrupt cell is a miss. The compare does not
+/// decode UTF-8.
+///
+/// # Safety
+///
+/// `name` is null or a live value.
+pub(crate) unsafe fn mapdict_find_cell(layout_bits: i64, name: CelRef) -> i64 {
+    if name.is_null() || w_kind(name) != CelKind::Str {
+        return -1;
+    }
+    let leaf = &*name.cast::<W_StringObject>();
+    if leaf.byte_len < 0 {
+        return -1;
+    }
+    let n = leaf.byte_len as usize;
+    let base = object_array::bytes_base(leaf.chars);
+    if base.is_null() {
+        if n == 0 {
+            return mapdict_find_bytes(layout_bits, b"");
+        }
+        return -1;
+    }
+    mapdict_find_bytes(layout_bits, std::slice::from_raw_parts(base, n))
+}
+
+/// Name bytes stored at `index`, walking from `layout_bits`.
+pub(crate) fn mapdict_name_at(layout_bits: i64, index: i64) -> Option<&'static [u8]> {
+    if index < 0 {
+        return None;
+    }
+    let start = mapdict_node(layout_bits)?;
+    let limit = mapdict_walk_limit(start);
+    let mut node = start;
+    let mut steps = 0i64;
+    loop {
+        if node.index == index {
+            return Some(node.name);
+        }
+        steps += 1;
+        if steps >= limit || node.back == 0 {
+            return None;
+        }
+        node = mapdict_node(node.back as i64)?;
+    }
+}
+
+/// Value at a layout index.
+///
+/// # Safety
+///
+/// `leaf` is a live mapdict map.
+pub(crate) unsafe fn mapdict_get(leaf: &W_MapObject, name: &[u8]) -> Option<CelRef> {
+    let idx = mapdict_find_bytes(leaf.layout, name);
+    if idx < 0 || idx >= leaf.length {
+        return None;
+    }
+    let base = object_array::items_block_items_base(leaf.items);
+    if base.is_null() {
+        return None;
+    }
+    let idx = idx as usize;
+    if idx >= object_array::items_capacity(leaf.items) {
+        return None;
+    }
+    Some(*base.add(idx))
+}
+
+/// Transition `parent` + `name` (`mapdict.py` `add_attr` / `_get_new_attr`).
+///
+/// The new node's address is cached on the parent's `transitions` under
+/// that parent's lock. The same name on the same parent returns the same
+/// node. Only this lock is held.
+pub(crate) fn mapdict_add_attr(parent_bits: i64, name: &[u8]) -> i64 {
+    let parent_bits = if parent_bits == 0 {
+        mapdict_terminator_bits()
+    } else {
+        parent_bits
+    };
+    let Some(parent) = mapdict_node(parent_bits) else {
+        return mapdict_terminator_bits();
+    };
+    let mut guard = parent
+        .transitions
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    let mut i = 0;
+    while i < guard.len() {
+        if guard[i].0 == name {
+            return guard[i].1 as i64;
+        }
+        i += 1;
+    }
+    let name_static: &'static [u8] = Box::leak(name.to_vec().into_boxed_slice());
+    let child = Box::leak(Box::new(MapdictLayout {
+        back: parent as *const MapdictLayout as usize,
+        name: name_static,
+        index: parent.length,
+        length: parent.length.saturating_add(1),
+        transitions: std::sync::Mutex::new(Vec::new()),
+    }));
+    let bits = child as *const MapdictLayout as usize;
+    guard.push((name_static, bits));
+    bits as i64
+}
+
+/// Layout reached by adding `names` in order, starting at the terminator.
+pub(crate) fn mapdict_layout_for_names(names: &[&[u8]]) -> i64 {
+    let mut layout = mapdict_terminator_bits();
+    let mut i = 0;
+    while i < names.len() {
+        layout = mapdict_add_attr(layout, names[i]);
+        i += 1;
+    }
+    layout
+}
+
+/// Sort `rows` into key-byte order.
+///
+/// `false` when there are more than [`MAPDICT_MAX_ENTRIES`] rows or two
+/// keys have the same bytes. A public `HashMap` iterates in a per-instance
+/// random order; callers sort so one key set shares one layout
+/// (`mapdict.py` `_get_new_attr`).
+pub(crate) fn prepare_mapdict_rows<T>(rows: &mut [(&str, T)]) -> bool {
+    if rows.len() > MAPDICT_MAX_ENTRIES {
+        return false;
+    }
+    rows.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+    let mut i = 1;
+    while i < rows.len() {
+        if rows[i].0.as_bytes() == rows[i - 1].0.as_bytes() {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// A mapdict map. `values[i]` is the value of layout index `i`.
+pub fn new_map_mapdict(layout: i64, values: &[CelRef]) -> *mut W_MapObject {
+    let items = object_array::new_items_block(values);
+    lltype::malloc_typed(W_MapObject {
+        ob_header: CelObject {
+            ob_type: &CEL_MAP_CLASS,
+        },
+        strategy: MapStrategy::Mapdict,
+        storage: core::ptr::null_mut(),
+        items,
+        length: values.len() as i64,
+        public: core::ptr::null(),
+        public_kind: 0,
+        public_len: 0,
+        layout,
+    })
+}
+
+/// Interleaved `[key, value, …]` rebuilt from the layout names.
+///
+/// An unreadable name or a non-UTF-8 name yields an empty vec so equality
+/// fails closed.
+///
+/// # Safety
+///
+/// `leaf` is a live mapdict map.
+pub(crate) unsafe fn mapdict_pair_refs(leaf: &W_MapObject) -> Vec<CelRef> {
+    if leaf.length < 0 {
+        return Vec::new();
+    }
+    let n = leaf.length as usize;
+    let base = object_array::items_block_items_base(leaf.items);
+    if n != 0 && (base.is_null() || object_array::items_capacity(leaf.items) < n) {
+        return Vec::new();
+    }
+    let mut pairs = Vec::with_capacity(n.saturating_mul(2));
+    let mut i = 0;
+    while i < n {
+        let value = *base.add(i);
+        let Some(name) = mapdict_name_at(leaf.layout, i as i64) else {
+            return Vec::new();
+        };
+        let Ok(text) = std::str::from_utf8(name) else {
+            return Vec::new();
+        };
+        pairs.push(new_string(text) as CelRef);
+        pairs.push(value);
+        i += 1;
+    }
+    pairs
+}
+
+/// A CEL `struct`.
+///
+/// §3 of the design gives this leaf a `w_type: CelRef` pointing at a type
+/// value. That type value is not a leaf yet: [`W_TypeObject`] only holds a
+/// `*const CelClass` and cannot carry a per-instance struct name.
+/// [`CEL_STRUCT_CLASS`] is the class word; the instance name is an ordinary
+/// payload so convert can rebuild `CelStruct::new(name)`.
+///
+/// Fields live as interleaved `[name0, value0, …]` references, names as
+/// [`W_StringObject`]. [`W_StructObject::length`] is the field count.
+///
+/// ⚠ The strategy tag is absent for the same reason [`W_ListObject`] omits
+/// it: a discriminant is only meaningful once there is a second strategy.
+#[cfg(feature = "structs")]
+#[repr(C)]
+#[allow(non_camel_case_types)]
+pub struct W_StructObject {
+    pub ob_header: CelObject,
+    pub name: *mut W_StringObject,
+    pub fields: *mut CelItemsBlock,
+    /// Live field count, not the number of references in [`Self::fields`].
+    pub length: i64,
+}
+
+#[cfg(feature = "structs")]
+pub static CEL_STRUCT_CLASS: CelClass = CelClass::new("struct", CelKind::Struct, 13);
+
+#[cfg(feature = "structs")]
+const _: () = {
+    assert!(offset_of!(W_StructObject, ob_header) == 0);
+};
+
+/// Look up a field on a struct leaf.
+///
+/// # Safety
+///
+/// `w` is a live [`W_StructObject`].
+#[cfg(feature = "structs")]
+pub unsafe fn struct_lookup_field(w: CelRef, field: &str) -> Option<CelRef> {
+    lookup_string_pairs(
+        (*w.cast::<W_StructObject>()).fields,
+        (*w.cast::<W_StructObject>()).length,
+        field,
+    )
+}
+
+/// Box a named struct with `fields` as name/value pairs.
+#[cfg(feature = "structs")]
+pub fn new_struct(name: *mut W_StringObject, fields: &[(CelRef, CelRef)]) -> *mut W_StructObject {
+    let items = interleaved_pair_block(fields);
+    let length = fields.len() as i64;
+    lltype::malloc_typed(W_StructObject {
+        ob_header: CelObject {
+            ob_type: &CEL_STRUCT_CLASS,
+        },
+        name,
+        fields: items,
+        length,
+    })
+}
+
+/// A CEL type value — what `type(x)` evaluates to.
+///
+/// `cls` is the class of the type this value *denotes*, while the header's own
+/// `ob_type` is [`CEL_TYPE_CLASS`]. The two being different is what makes
+/// `type(type(1)) == type(string)` hold, and it is why the two spellings must
+/// not be collapsed: `(*type_value).cls` is a class, `(*any_value).ob_type` is
+/// a class, and only the type value itself is an allocated object.
+#[repr(C)]
+#[allow(non_camel_case_types)]
+pub struct W_TypeObject {
+    pub ob_header: CelObject,
+    pub cls: *const CelClass,
+}
+
+/// The class of [`W_TypeObject`] — the type of a type.
+pub static CEL_TYPE_CLASS: CelClass = CelClass::new("type", CelKind::Type, 14);
+
+const _: () = {
+    assert!(offset_of!(W_TypeObject, ob_header) == 0);
+};
+
+/// The activation record, `pyframe.py` `PyFrame` virtualizable subset.
+///
+/// `_virtualizable_ = ['last_instr', 'valuestackdepth', 'locals_stack_w[*]']`
+/// (`interp_jit.py`). The JIT driver names this object `virtualizables =
+/// ['frame']`. Slots are a fixed [`CelItemsBlock`] — `make_sure_not_resized`.
+#[repr(C)]
+#[allow(non_camel_case_types)]
+pub struct W_CelFrame {
+    pub ob_header: CelObject,
+    /// `virtualizable.py` token. 0 = not virtualized.
+    pub vable_token: usize,
+    pub last_instr: i64,
+    pub valuestackdepth: i64,
+    /// Indexed as `frame.locals_stack_w[i]`, the shape `jtransform`
+    /// `getarrayitem_vable_*` matches.
+    pub locals_stack_w: VableStack,
+    pub n_slots: i64,
+    /// `0` while the evaluator has no scratch. A portal merge reads this
+    /// instead of `Option<Box<_>>`. Not part of the input list; it changes
+    /// when a residual hydrates.
+    pub scratch_bits: i64,
+}
+
+/// The `locals_cells_stack_w[*]` array: a pointer that indexes as a slice.
+///
+/// `#[repr(transparent)]` so the field is still one pointer in the frame.
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+pub struct VableStack {
+    pub(crate) block: *mut crate::runtime::object_array::CelItemsBlock,
+}
+
+impl VableStack {
+    fn from_block(block: *mut crate::runtime::object_array::CelItemsBlock) -> Self {
+        VableStack { block }
+    }
+
+    pub fn capacity(self) -> usize {
+        unsafe { crate::runtime::object_array::items_capacity(self.block) }
+    }
+}
+
+impl VableStack {
+    /// `ll_getitem_nonneg`: the block was sized from `n_slots + max_stack`.
+    /// Release builds do not check; a wrong compiler size fails here in debug.
+    #[inline(always)]
+    fn debug_slot(&self, i: i64) {
+        debug_assert!(
+            i >= 0 && (i as usize) < self.capacity(),
+            "frame slot {i} outside 0..{}",
+            self.capacity()
+        );
+    }
+}
+
+impl core::ops::Index<i64> for VableStack {
+    type Output = CelRef;
+    fn index(&self, i: i64) -> &CelRef {
+        self.debug_slot(i);
+        unsafe {
+            &*crate::runtime::object_array::items_block_items_base(self.block).add(i as usize)
+        }
+    }
+}
+
+impl core::ops::IndexMut<i64> for VableStack {
+    fn index_mut(&mut self, i: i64) -> &mut CelRef {
+        self.debug_slot(i);
+        unsafe {
+            &mut *crate::runtime::object_array::items_block_items_base(self.block).add(i as usize)
+        }
+    }
+}
+
+pub static CEL_FRAME_CLASS: CelClass = CelClass::new("frame", CelKind::Frame, 15);
+
+const _: () = {
+    assert!(offset_of!(W_CelFrame, ob_header) == 0);
+};
+
+pub const CELFRAME_VABLE_TOKEN_OFFSET: usize = offset_of!(W_CelFrame, vable_token);
+pub const CELFRAME_LAST_INSTR_OFFSET: usize = offset_of!(W_CelFrame, last_instr);
+pub const CELFRAME_VALUESTACKDEPTH_OFFSET: usize = offset_of!(W_CelFrame, valuestackdepth);
+pub const CELFRAME_LOCALS_STACK_OFFSET: usize = offset_of!(W_CelFrame, locals_stack_w);
+pub const CELFRAME_SCRATCH_BITS_OFFSET: usize = offset_of!(W_CelFrame, scratch_bits);
+
+/// Allocate a frame whose array is `n_slots + max_stack` and never resized.
+pub fn new_cel_frame(n_slots: i64, max_stack: i64) -> *mut W_CelFrame {
+    crate::runtime::heap::with_heap(|h| new_cel_frame_in(h, n_slots, max_stack))
+}
+
+/// Allocate a frame on `heap`.
+///
+/// The block is `n_slots + max_stack` cells, every one null. A
+/// virtualizable snapshot reads the whole array (`read_all_boxes`); an
+/// uninitialised slot would be a garbage reference.
+#[inline(always)]
+pub fn new_cel_frame_in(
+    heap: &crate::runtime::heap::CelHeap,
+    n_slots: i64,
+    max_stack: i64,
+) -> *mut W_CelFrame {
+    let n_slots_us = n_slots.max(0) as usize;
+    let cap = n_slots_us.saturating_add(max_stack.max(0) as usize);
+    let items = object_array::new_items_block_zeroed_in(heap, cap);
+    heap.alloc(W_CelFrame {
+        ob_header: CelObject {
+            ob_type: &CEL_FRAME_CLASS,
+        },
+        vable_token: 0,
+        last_instr: -1,
+        valuestackdepth: n_slots,
+        locals_stack_w: VableStack::from_block(items),
+        n_slots,
+        scratch_bits: 0,
+    })
+}
+
+/// Reset a reused frame so the next execute sees the same initial state as
+/// a freshly allocated one. Every cell is nulled: a virtualizable snapshot
+/// reads the whole array, including slots the interpreter has not written.
+///
+/// # Safety
+///
+/// `frame` is a live [`W_CelFrame`] whose item block holds at least
+/// `n_slots` cells.
+#[inline]
+pub unsafe fn reset_cel_frame(frame: *mut W_CelFrame, n_slots: i64) {
+    (*frame).vable_token = 0;
+    (*frame).last_instr = -1;
+    (*frame).valuestackdepth = n_slots;
+    (*frame).n_slots = n_slots;
+    (*frame).scratch_bits = 0;
+    let cap = crate::runtime::object_array::items_capacity((*frame).locals_stack_w.block);
+    if cap > 0 {
+        let base =
+            crate::runtime::object_array::items_block_items_base((*frame).locals_stack_w.block);
+        core::ptr::write_bytes(base, 0, cap);
+    }
+}
+
+/// Slot `i` of a live frame.
+///
+/// # Safety
+///
+/// `frame` is a live [`W_CelFrame`] and `i` is in range.
+pub unsafe fn cel_frame_slot(frame: *mut W_CelFrame, i: i64) -> *mut CelRef {
+    (*frame).locals_stack_w.debug_slot(i);
+    crate::runtime::object_array::items_block_items_base((*frame).locals_stack_w.block)
+        .add(i as usize)
+}
+
+/// `virtualizable.py` `force_virtualizable_if_necessary`.
+///
+/// The token is 0 until a compiled loop owns the frame, so this is a
+/// no-op in the interpreter. `jtransform` rewrites a residual force
+/// into a call when the token is live.
+///
+/// # Safety
+///
+/// `frame` is a live [`W_CelFrame`].
+pub unsafe fn force_virtualizable_if_necessary(_frame: *mut W_CelFrame) {}
+
+/// The type value denoting `cls`.
+pub fn new_type(cls: &'static CelClass) -> *mut W_TypeObject {
+    lltype::malloc_typed(W_TypeObject {
+        ob_header: CelObject {
+            ob_type: &CEL_TYPE_CLASS,
+        },
+        cls,
+    })
+}
+
+/// A foreign host object.
+///
+/// `w_type` is a type value ([`W_TypeObject`]); `host_index` is a slot in
+/// this thread's heap table. D12: the host lives as long as the heap — no
+/// finalizer, no `Drop` on the leaf.
+#[repr(C)]
+#[allow(non_camel_case_types)]
+pub struct W_OpaqueObject {
+    pub ob_header: CelObject,
+    pub w_type: CelRef,
+    pub host_index: i64,
+}
+
+/// The class of [`W_OpaqueObject`].
+pub static CEL_OPAQUE_CLASS: CelClass = CelClass::new("opaque", CelKind::Opaque, 16);
+
+const _: () = {
+    assert!(offset_of!(W_OpaqueObject, ob_header) == 0);
+};
+
+/// Box a host-table slot as a CEL opaque.
+pub fn new_opaque(w_type: CelRef, host_index: i64) -> *mut W_OpaqueObject {
+    lltype::malloc_typed(W_OpaqueObject {
+        ob_header: CelObject {
+            ob_type: &CEL_OPAQUE_CLASS,
+        },
+        w_type,
+        host_index,
+    })
+}
+
+/// The host-table index of an opaque leaf.
+///
+/// # Safety
+///
+/// `w` is a live [`W_OpaqueObject`].
+pub unsafe fn opaque_host_index(w: CelRef) -> i64 {
+    (*w.cast::<W_OpaqueObject>()).host_index
+}
+
+/// Box `value` as a CEL `bool`.
+///
+/// Returns one of the two immortal singletons. [`new_bool_raw`] is the
+/// fuse-shaped allocation; the interned path does not go through it.
+pub fn new_bool(value: bool) -> *mut W_BoolObject {
+    let slot = if value { &TRUE } else { &FALSE };
+    *slot.get_or_init(|| {
+        lltype::malloc_typed_immortal(W_BoolObject {
+            ob_header: CelObject {
+                ob_type: &CEL_BOOL_CLASS,
+            },
+            boolval: i64::from(value),
+        }) as usize
+    }) as *mut W_BoolObject
+}
+
+/// Inclusive lower bound of the interned `int` table.
+///
+/// `intobject.py` `PREBUILTINTFROM`. Values outside the table still go
+/// through [`new_int_raw`] so the boxing fuse can see a `malloc_typed`.
+pub const PREBUILT_INT_FROM: i64 = -5;
+
+/// Exclusive upper bound of the interned `int` table (`PREBUILTINTTO`).
+pub const PREBUILT_INT_TO: i64 = 257;
+
+static TRUE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+static FALSE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+static NULL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+static SMALL_INTS: std::sync::OnceLock<Vec<usize>> = std::sync::OnceLock::new();
+
+fn small_ints() -> &'static [usize] {
+    SMALL_INTS.get_or_init(|| {
+        (PREBUILT_INT_FROM..PREBUILT_INT_TO)
+            .map(|v| {
+                lltype::malloc_typed_immortal(W_IntObject {
+                    ob_header: CelObject {
+                        ob_type: &CEL_INT_CLASS,
+                    },
+                    intval: v,
+                }) as usize
+            })
+            .collect()
+    })
+}
+
+/// The immortal singleton for `value`, if it is in the prebuilt int table.
+///
+/// Process-lifetime; no thread-heap allocation. [`new_int`] and [`new_int_in`]
+/// use this lookup; a const-pool list holds the same pointer for a small-int
+/// element.
+#[inline]
+pub fn prebuilt_int(value: i64) -> Option<*mut W_IntObject> {
+    if (PREBUILT_INT_FROM..PREBUILT_INT_TO).contains(&value) {
+        let idx = (value - PREBUILT_INT_FROM) as usize;
+        Some(small_ints()[idx] as *mut W_IntObject)
+    } else {
+        None
+    }
+}
+
+/// Box `value` as a CEL `int`.
+///
+/// Values in [`PREBUILT_INT_FROM`]..[`PREBUILT_INT_TO`] are immortal
+/// singletons. Everything else is a fresh [`new_int_raw`].
+#[inline]
+pub fn new_int(value: i64) -> *mut W_IntObject {
+    prebuilt_int(value).unwrap_or_else(|| new_int_raw(value))
+}
+
+/// Box `value` as a CEL `int` on `heap`.
+///
+/// The interned range is the same singletons [`new_int`] returns. A miss
+/// writes a young leaf through `heap` and does not re-resolve thread-local
+/// storage.
+#[inline]
+pub fn new_int_in(heap: &super::heap::CelHeap, value: i64) -> *mut W_IntObject {
+    if let Some(w) = prebuilt_int(value) {
+        return w;
+    }
+    heap.alloc(W_IntObject {
+        ob_header: CelObject {
+            ob_type: &CEL_INT_CLASS,
+        },
+        intval: value,
+    })
+}
+
+/// Box `value` as a CEL `uint` on `heap`.
+#[inline]
+pub fn new_uint_in(heap: &super::heap::CelHeap, value: u64) -> *mut W_UIntObject {
+    heap.alloc(W_UIntObject {
+        ob_header: CelObject {
+            ob_type: &CEL_UINT_CLASS,
+        },
+        uintval: value,
+    })
+}
+
+/// Box `value` as a CEL `double` on `heap`.
+#[inline]
+pub fn new_double_in(heap: &super::heap::CelHeap, value: f64) -> *mut W_DoubleObject {
+    heap.alloc(W_DoubleObject {
+        ob_header: CelObject {
+            ob_type: &CEL_DOUBLE_CLASS,
+        },
+        floatval: value,
+    })
+}
+
+// Registration order in `CEL_CLASS_LAYOUTS`: root, then the table, then blocks.
+// These literals are the ids that order hands out. A 64-bit leaf whose size
+// moved would also fail the asserts below.
+impl lltype::CelGcType for CelObject {
+    const TYPE_ID: u32 = 0;
+}
+impl lltype::CelGcType for W_NullObject {
+    const TYPE_ID: u32 = 1;
+}
+impl lltype::CelGcType for W_BoolObject {
+    const TYPE_ID: u32 = 2;
+}
+impl lltype::CelGcType for W_IntObject {
+    const TYPE_ID: u32 = 3;
+}
+impl lltype::CelGcType for W_UIntObject {
+    const TYPE_ID: u32 = 4;
+}
+impl lltype::CelGcType for W_DoubleObject {
+    const TYPE_ID: u32 = 5;
+}
+impl lltype::CelGcType for W_DurationObject {
+    const TYPE_ID: u32 = 6;
+}
+impl lltype::CelGcType for W_TimestampObject {
+    const TYPE_ID: u32 = 7;
+}
+impl lltype::CelGcType for W_TypeObject {
+    const TYPE_ID: u32 = 8;
+}
+impl lltype::CelGcType for W_OptionalObject {
+    const TYPE_ID: u32 = 9;
+}
+impl lltype::CelGcType for W_BytesObject {
+    const TYPE_ID: u32 = 10;
+}
+impl lltype::CelGcType for W_StringObject {
+    const TYPE_ID: u32 = 11;
+}
+impl lltype::CelGcType for W_ListObject {
+    const TYPE_ID: u32 = 12;
+}
+impl lltype::CelGcType for W_IntColumn {
+    const TYPE_ID: u32 = 13;
+}
+impl lltype::CelGcType for W_FloatColumn {
+    const TYPE_ID: u32 = 14;
+}
+impl lltype::CelGcType for W_HostListObject {
+    const TYPE_ID: u32 = 15;
+}
+impl lltype::CelGcType for W_TupleObject {
+    const TYPE_ID: u32 = 16;
+}
+impl lltype::CelGcType for W_MapObject {
+    const TYPE_ID: u32 = 17;
+}
+impl lltype::CelGcType for W_CelFrame {
+    const TYPE_ID: u32 = 18;
+}
+impl lltype::CelGcType for W_OpaqueObject {
+    const TYPE_ID: u32 = 19;
+}
+#[cfg(feature = "structs")]
+impl lltype::CelGcType for W_StructObject {
+    const TYPE_ID: u32 = 20;
+}
+
+const _: () = {
+    assert!(size_of::<W_IntColumn>() == 24);
+    assert!(offset_of!(W_IntColumn, data) == 8);
+    assert!(offset_of!(W_IntColumn, length) == 16);
+    assert!(size_of::<W_FloatColumn>() == 24);
+    assert!(offset_of!(W_FloatColumn, data) == 8);
+    assert!(offset_of!(W_FloatColumn, length) == 16);
+    assert!(size_of::<W_HostListObject>() == 64);
+    assert!(offset_of!(W_HostListObject, public) == 48);
+    assert!(offset_of!(W_HostListObject, public_start) == 56);
+    assert!(offset_of!(W_HostListObject, public_len) == 60);
+    assert!(size_of::<W_TupleObject>() == 24);
+    assert!(offset_of!(W_TupleObject, length) == 8);
+    assert!(offset_of!(W_TupleObject, items) == 16);
+    assert!(size_of::<W_MapObject>() == 64);
+    assert!(offset_of!(W_MapObject, strategy) == 8);
+    assert!(offset_of!(W_MapObject, storage) == 16);
+    assert!(offset_of!(W_MapObject, items) == 24);
+    assert!(offset_of!(W_MapObject, length) == 32);
+    assert!(offset_of!(W_MapObject, public) == 40);
+    assert!(offset_of!(W_MapObject, public_kind) == 48);
+    assert!(offset_of!(W_MapObject, public_len) == 52);
+    assert!(offset_of!(W_MapObject, layout) == 56);
+    assert!(size_of::<W_CelFrame>() == 56);
+    assert!(offset_of!(W_CelFrame, vable_token) == 8);
+    assert!(offset_of!(W_CelFrame, last_instr) == 16);
+    assert!(offset_of!(W_CelFrame, valuestackdepth) == 24);
+    assert!(offset_of!(W_CelFrame, locals_stack_w) == 32);
+    assert!(offset_of!(W_CelFrame, n_slots) == 40);
+    assert!(offset_of!(W_CelFrame, scratch_bits) == 48);
+    assert!(size_of::<W_OpaqueObject>() == 24);
+    assert!(offset_of!(W_OpaqueObject, w_type) == 8);
+    assert!(offset_of!(W_OpaqueObject, host_index) == 16);
+};
+#[cfg(feature = "structs")]
+const _: () = {
+    assert!(size_of::<W_StructObject>() == 32);
+    assert!(offset_of!(W_StructObject, name) == 8);
+    assert!(offset_of!(W_StructObject, fields) == 16);
+    assert!(offset_of!(W_StructObject, length) == 24);
+};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Condition 3, checked at run time as well as in the const asserts: a
+    /// leaf pointer and its header pointer are the same address, which is what
+    /// lets one [`CelRef`] address every leaf.
+    #[test]
+    fn every_leaf_starts_with_its_header() {
+        let w = new_int(7);
+        assert_eq!(w as usize, w as CelRef as usize);
+        let t = new_timestamp(1, 2);
+        assert_eq!(t as usize, t as CelRef as usize);
+        let n = new_null();
+        assert_eq!(n as usize, n as CelRef as usize);
+        let m = new_map(&[]);
+        assert_eq!(m as usize, m as CelRef as usize);
+        #[cfg(feature = "structs")]
+        {
+            let s = new_struct(new_string("T"), &[]);
+            assert_eq!(s as usize, s as CelRef as usize);
+        }
+    }
+
+    /// Condition 2's cel-side half: the one header store a constructor makes
+    /// names its own class. The fuse keeps a single vtable address for the
+    /// whole cluster, so a constructor stamping some other class would make
+    /// that address wrong for the values it mints. This does not prove the
+    /// fuse fires — that needs the lowering — but a constructor that broke
+    /// the invariant would fail here rather than showing up as an unexplained
+    /// zero in a census.
+    ///
+    /// The header declares nothing else to check. That is the point of the
+    /// one-word shape, and `header_declares_no_class_word` is the majit-side
+    /// half that reads the absence as a base-type instance.
+    #[test]
+    fn every_constructor_stamps_its_own_class() {
+        fn check(w: CelRef, expected: *const CelClass) {
+            unsafe {
+                assert_eq!((*w).ob_type, expected);
+            }
+        }
+        check(new_int(1) as CelRef, &CEL_INT_CLASS);
+        check(new_uint(1) as CelRef, &CEL_UINT_CLASS);
+        check(new_double(1.0) as CelRef, &CEL_DOUBLE_CLASS);
+        check(new_bool(true) as CelRef, &CEL_BOOL_CLASS);
+        check(new_null() as CelRef, &CEL_NULL_CLASS);
+        check(new_duration(1) as CelRef, &CEL_DURATION_CLASS);
+        check(new_timestamp(1, 0) as CelRef, &CEL_TIMESTAMP_CLASS);
+        check(new_type(&CEL_INT_CLASS) as CelRef, &CEL_TYPE_CLASS);
+        check(
+            new_optional(new_int(1) as CelRef) as CelRef,
+            &CEL_OPTIONAL_CLASS,
+        );
+        check(new_optional_none() as CelRef, &CEL_OPTIONAL_CLASS);
+        check(new_bytes(b"x") as CelRef, &CEL_BYTES_CLASS);
+        check(new_string("x") as CelRef, &CEL_STRING_CLASS);
+        check(new_list(&[]) as CelRef, &CEL_LIST_CLASS);
+        check(new_cel_frame(0, 0) as CelRef, &CEL_FRAME_CLASS);
+        check(new_map(&[]) as CelRef, &CEL_MAP_CLASS);
+        check(
+            new_opaque(new_type(&CEL_OPAQUE_CLASS) as CelRef, 0) as CelRef,
+            &CEL_OPAQUE_CLASS,
+        );
+        #[cfg(feature = "structs")]
+        check(
+            new_struct(new_string("T"), &[]) as CelRef,
+            &CEL_STRUCT_CLASS,
+        );
+    }
+
+    #[test]
+    fn string_from_int_writes_decimal_digits() {
+        fn check(n: i64) {
+            let w = string_from_int(n);
+            let text = n.to_string();
+            unsafe {
+                assert_eq!((*w).byte_len, text.len() as i64);
+                assert_eq!(
+                    crate::runtime::object_array::bytes_capacity((*w).chars),
+                    text.len()
+                );
+                let base = crate::runtime::object_array::bytes_base((*w).chars);
+                let got = core::slice::from_raw_parts(base, text.len());
+                assert_eq!(got, text.as_bytes());
+            }
+        }
+        check(0);
+        check(9);
+        check(10);
+        check(99);
+        check(100);
+        check(-1);
+        check(-10);
+        check(i64::MAX);
+        check(i64::MIN);
+        let mut p: i64 = 1;
+        for _ in 0..18 {
+            check(p);
+            check(-p);
+            p *= 10;
+        }
+    }
+
+    /// A fresh string is one allocation holding two headered objects.
+    /// `new_bytes` still allocates the block and the leaf separately.
+    #[test]
+    fn a_fresh_string_is_one_heap_object() {
+        let objects = || crate::runtime::heap::with_heap(|h| h.allocated_objects());
+        let before = objects();
+        let w = string_from_int(42);
+        assert_eq!(objects(), before + 1);
+        let s = new_string("hi");
+        let cat = new_string_concat(b"ab", b"c");
+        let empty = new_string("");
+        assert_eq!(objects(), before + 4);
+        unsafe {
+            use crate::runtime::heap::GC_HEADER_SIZE;
+            use crate::runtime::lltype::CelGcType;
+            use crate::runtime::object_array::{bytes_base, bytes_capacity, CelBytesBlock};
+            let gap = (*w).chars as usize - w as usize;
+            let leaf = core::mem::size_of::<W_StringObject>();
+            let block_align = core::mem::align_of::<CelBytesBlock>();
+            assert!(gap >= leaf + GC_HEADER_SIZE);
+            assert!(gap < leaf + GC_HEADER_SIZE + block_align);
+            assert_eq!((*s).chars as usize - s as usize, gap);
+            assert_eq!(
+                *((w as *const u8).sub(GC_HEADER_SIZE) as *const u64),
+                u64::from(W_StringObject::TYPE_ID)
+            );
+            assert_eq!(
+                *(((*w).chars as *const u8).sub(GC_HEADER_SIZE) as *const u64),
+                u64::from(CelBytesBlock::TYPE_ID)
+            );
+            assert_eq!((*(*w).chars).capacity, 2);
+            assert_eq!((*s).byte_len, 2);
+            assert_eq!((*cat).byte_len, 3);
+            assert_eq!(bytes_capacity((*cat).chars), 3);
+            let base = bytes_base((*cat).chars);
+            assert_eq!(core::slice::from_raw_parts(base, 3), b"abc");
+            assert_eq!((*empty).byte_len, 0);
+            assert_eq!(bytes_capacity((*empty).chars), 0);
+            crate::runtime::heap::with_heap(|h| {
+                assert!(h.contains(w as *const u8));
+                assert!(h.contains((*w).chars as *const u8));
+                assert_eq!(
+                    h.is_young(w as *const u8),
+                    h.is_young((*w).chars as *const u8)
+                );
+            });
+        }
+        let b0 = objects();
+        let _b = new_bytes(b"zz");
+        assert_eq!(objects(), b0 + 2);
+    }
+
+    /// The variable-length leaves keep their live length on the leaf and their
+    /// payload in the block, and the two must agree at construction. A block's
+    /// own word is a CAPACITY, so the pair is the only place the distinction is
+    /// observable while every block is still exact-sized.
+    #[test]
+    fn a_variable_length_leaf_and_its_block_agree_on_length() {
+        use crate::runtime::object_array::{
+            bytes_base, bytes_capacity, items_block_items_base, items_capacity,
+        };
+        unsafe {
+            let b = new_bytes(b"hello");
+            assert_eq!((*b).length, 5);
+            assert_eq!(bytes_capacity((*b).data), 5);
+            assert_eq!(
+                core::slice::from_raw_parts(bytes_base((*b).data), 5),
+                b"hello"
+            );
+
+            let s = new_string("hi");
+            assert_eq!((*s).byte_len, 2);
+            assert_eq!(bytes_capacity((*s).chars), 2);
+
+            let elems: Vec<CelRef> = (0..3).map(|i| new_int(i) as CelRef).collect();
+            let l = new_list(&elems);
+            assert_eq!((*l).length, 3);
+            assert_eq!(items_capacity((*l).items), 3);
+            for (i, e) in elems.iter().enumerate() {
+                assert_eq!(*items_block_items_base((*l).items).add(i), *e);
+            }
+
+            let pairs = [
+                (new_int(1) as CelRef, new_string("a") as CelRef),
+                (new_string("b") as CelRef, new_bool(true) as CelRef),
+            ];
+            let m = new_map(&pairs);
+            assert_eq!((*m).length, 2);
+            assert_eq!(items_capacity((*m).items), 4);
+            let map_base = items_block_items_base((*m).items);
+            for (i, (k, v)) in pairs.iter().enumerate() {
+                assert_eq!(*map_base.add(2 * i), *k);
+                assert_eq!(*map_base.add(2 * i + 1), *v);
+            }
+
+            let empty = new_map(&[]);
+            assert_eq!((*empty).length, 0);
+            assert_eq!(items_capacity((*empty).items), 0);
+
+            #[cfg(feature = "structs")]
+            {
+                let fields = [(new_string("x") as CelRef, new_int(1) as CelRef)];
+                let s = new_struct(new_string("T"), &fields);
+                assert_eq!((*s).length, 1);
+                assert_eq!(items_capacity((*s).fields), 2);
+                let field_base = items_block_items_base((*s).fields);
+                assert_eq!(*field_base.add(0), fields[0].0);
+                assert_eq!(*field_base.add(1), fields[0].1);
+            }
+        }
+    }
+
+    /// The virtualizable subset matches `interp_jit.py` `_virtualizable_`:
+    /// `last_instr`, `valuestackdepth`, `locals_stack_w[*]`, and a token.
+    #[test]
+    fn a_cel_frame_is_the_virtualizable_activation_record() {
+        unsafe {
+            let f = new_cel_frame(2, 3);
+            assert_eq!((*f).ob_header.ob_type, &CEL_FRAME_CLASS as *const CelClass);
+            assert_eq!(w_kind(f as CelRef), CelKind::Frame);
+            assert_eq!((*f).vable_token, 0);
+            assert_eq!((*f).last_instr, -1);
+            assert_eq!((*f).valuestackdepth, 2);
+            assert_eq!((*f).n_slots, 2);
+            assert_eq!((*f).locals_stack_w.capacity(), 5);
+            let a = new_int(1) as CelRef;
+            *cel_frame_slot(f, 0) = a;
+            assert_eq!(*cel_frame_slot(f, 0), a);
+            force_virtualizable_if_necessary(f);
+            assert_eq!((*f).vable_token, 0);
+            assert_eq!(
+                CELFRAME_VABLE_TOKEN_OFFSET,
+                offset_of!(W_CelFrame, vable_token)
+            );
+            assert_eq!(
+                CELFRAME_LAST_INSTR_OFFSET,
+                offset_of!(W_CelFrame, last_instr)
+            );
+            assert_eq!(
+                CELFRAME_VALUESTACKDEPTH_OFFSET,
+                offset_of!(W_CelFrame, valuestackdepth)
+            );
+            assert_eq!(
+                CELFRAME_LOCALS_STACK_OFFSET,
+                offset_of!(W_CelFrame, locals_stack_w)
+            );
+        }
+    }
+
+    /// A `string` is not a `bytes` with a different header: the two are
+    /// distinct CEL types, and nothing may rely on the class word alone to tell
+    /// them apart at a use site that has already narrowed.
+    #[test]
+    fn string_and_bytes_are_separate_classes() {
+        unsafe {
+            let s = new_string("x") as CelRef;
+            let b = new_bytes(b"x") as CelRef;
+            assert_ne!((*s).ob_type, (*b).ob_type);
+            assert_eq!(w_kind(s), CelKind::Str);
+            assert_eq!(w_kind(b), CelKind::Bytes);
+        }
+    }
+
+    #[test]
+    fn payloads_survive_the_round_trip() {
+        unsafe {
+            assert_eq!((*new_int(-9)).intval, -9);
+            assert_eq!((*new_uint(9)).uintval, 9);
+            assert_eq!((*new_double(0.5)).floatval, 0.5);
+            assert_eq!((*new_bool(true)).boolval, 1);
+            assert_eq!((*new_bool(false)).boolval, 0);
+            assert_eq!((*new_duration(-3)).nanos, -3);
+            let t = &*new_timestamp(11, -5);
+            assert_eq!((t.nanos, t.off_s), (11, -5));
+        }
+    }
+
+    /// The class pointer is the dispatch key, so distinct types must not share
+    /// one. Equally, `type(1)` and `type(2)` must share theirs, or a narrowing
+    /// chain would never fold.
+    #[test]
+    fn class_pointers_are_per_type_identities() {
+        let classes: [*const CelClass; 8] = [
+            &CEL_INT_CLASS,
+            &CEL_UINT_CLASS,
+            &CEL_DOUBLE_CLASS,
+            &CEL_BOOL_CLASS,
+            &CEL_NULL_CLASS,
+            &CEL_DURATION_CLASS,
+            &CEL_TIMESTAMP_CLASS,
+            &CEL_TYPE_CLASS,
+        ];
+        for (i, a) in classes.iter().enumerate() {
+            for b in &classes[i + 1..] {
+                assert_ne!(a, b, "two classes share one address");
+            }
+        }
+        unsafe {
+            assert_eq!(w_type(new_int(1) as CelRef), w_type(new_int(2) as CelRef));
+        }
+    }
+
+    /// A type value's own class is `type`, while the class it denotes is its
+    /// payload — the distinction `type(type(1)) == type(string)` rests on.
+    #[test]
+    fn a_type_values_own_class_is_type() {
+        unsafe {
+            let int_type = new_type(&CEL_INT_CLASS);
+            assert_eq!((*int_type).cls, &CEL_INT_CLASS as *const CelClass);
+            assert_eq!(
+                w_type(int_type as CelRef),
+                &CEL_TYPE_CLASS as *const CelClass
+            );
+
+            let string_stand_in = new_type(&CEL_BOOL_CLASS);
+            assert_eq!(
+                w_type(int_type as CelRef),
+                w_type(string_stand_in as CelRef),
+                "every type value shares one class",
+            );
+        }
+    }
+
+    #[test]
+    fn kinds_come_off_the_class_word() {
+        unsafe {
+            assert_eq!(w_kind(new_int(1) as CelRef), CelKind::Int);
+            assert_eq!(w_kind(new_uint(1) as CelRef), CelKind::UInt);
+            assert_eq!(w_kind(new_null() as CelRef), CelKind::Null);
+            assert_eq!(w_kind(new_type(&CEL_INT_CLASS) as CelRef), CelKind::Type);
+        }
+    }
+
+    /// TRUE, FALSE, NULL and the small-int table are one address each, and
+    /// that address came from the immortal allocator — not a Rust `static`
+    /// whose preceding word is rodata.
+    #[test]
+    fn prebuilts_are_immortal_singletons() {
+        assert_eq!(new_bool(true), new_bool(true));
+        assert_eq!(new_bool(false), new_bool(false));
+        assert_ne!(new_bool(true), new_bool(false));
+        assert_eq!(new_null(), new_null());
+        assert_eq!(new_int(0), new_int(0));
+        assert_eq!(new_int(-5), new_int(-5));
+        assert_eq!(new_int(256), new_int(256));
+        assert_ne!(new_int(0), new_int(1));
+
+        let outsides = [new_int(-6), new_int(257), new_int(1000)];
+        for w in outsides {
+            let value = unsafe { (*w).intval };
+            assert_ne!(w, new_int(value), "outside the table is not interned");
+            assert!(
+                !lltype::is_immortal(w as *const u8),
+                "a fresh int must not be registered as immortal"
+            );
+        }
+
+        let prebuilts: [*const u8; 6] = [
+            new_bool(true) as *const u8,
+            new_bool(false) as *const u8,
+            new_null() as *const u8,
+            new_int(-5) as *const u8,
+            new_int(0) as *const u8,
+            new_int(256) as *const u8,
+        ];
+        for p in prebuilts {
+            assert!(
+                lltype::is_immortal(p),
+                "prebuilt {p:?} must come from malloc_typed_immortal"
+            );
+            unsafe {
+                assert_ne!(
+                    crate::runtime::heap::immortal_header(p),
+                    0,
+                    "header-relative load at obj-8 must be a real word"
+                );
+            }
+        }
+    }
+
+    /// Interned ints do not increment this thread's heap counter.
+    #[test]
+    fn prebuilts_do_not_count_against_the_thread_heap() {
+        let before = crate::runtime::heap::with_heap(|h| h.allocated_objects());
+        let _ = new_bool(true);
+        let _ = new_bool(false);
+        let _ = new_null();
+        let _ = new_int(1);
+        let _ = new_int(2);
+        let after = crate::runtime::heap::with_heap(|h| h.allocated_objects());
+        assert_eq!(before, after);
+        let _ = new_int(1000);
+        let later = crate::runtime::heap::with_heap(|h| h.allocated_objects());
+        assert_eq!(later, after + 1);
+    }
+
+    /// `new_int_in` writes a miss on the heap it was handed, not a second one.
+    #[test]
+    fn new_int_in_counts_against_the_given_heap() {
+        let heap = crate::runtime::heap::CelHeap::new();
+        let before = heap.allocated_objects();
+        let w = new_int_in(&heap, 1000);
+        assert_eq!(heap.allocated_objects(), before + 1);
+        unsafe {
+            assert_eq!((*w).intval, 1000);
+        }
+        let interned = new_int_in(&heap, 1);
+        assert_eq!(heap.allocated_objects(), before + 1);
+        assert_eq!(interned, new_int(1));
+    }
+}

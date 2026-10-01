@@ -72,7 +72,7 @@ fn exists_macro_expander(
     let mut arguments = vec![args.remove(1)];
     let v = extract_ident(args.remove(0), helper)?;
 
-    let init = helper.next_expr(Expr::Literal(LiteralValue::Boolean(false.into())));
+    let init = helper.next_expr(Expr::Literal(LiteralValue::Boolean(false)));
     let result_binding = "@result".to_string();
     let accu_ident = helper.next_expr(Expr::Ident(result_binding.clone()));
     let arg = helper.next_expr(Expr::Call(CallExpr {
@@ -123,7 +123,7 @@ fn all_macro_expander(
     let mut arguments = vec![args.remove(1)];
     let v = extract_ident(args.remove(0), helper)?;
 
-    let init = helper.next_expr(Expr::Literal(LiteralValue::Boolean(true.into())));
+    let init = helper.next_expr(Expr::Literal(LiteralValue::Boolean(true)));
     let result_binding = "@result".to_string();
     let accu_ident = helper.next_expr(Expr::Ident(result_binding.clone()));
     let condition = helper.next_expr(Expr::Call(CallExpr {
@@ -172,7 +172,7 @@ fn exists_one_macro_expander(
 
     let init = helper.next_expr(Expr::Literal(LiteralValue::Int(0.into())));
     let result_binding = "@result".to_string();
-    let condition = helper.next_expr(Expr::Literal(LiteralValue::Boolean(true.into())));
+    let condition = helper.next_expr(Expr::Literal(LiteralValue::Boolean(true)));
 
     let args = vec![
         helper.next_expr(Expr::Ident(result_binding.clone())),
@@ -230,7 +230,7 @@ fn map_macro_expander(
 
     let init = helper.next_expr(Expr::List(ListExpr::new(Vec::default())));
     let result_binding = "@result".to_string();
-    let condition = helper.next_expr(Expr::Literal(LiteralValue::Boolean(true.into())));
+    let condition = helper.next_expr(Expr::Literal(LiteralValue::Boolean(true)));
 
     let filter = args.pop();
 
@@ -290,7 +290,7 @@ fn filter_macro_expander(
 
     let init = helper.next_expr(Expr::List(ListExpr::new(Vec::default())));
     let result_binding = "@result".to_string();
-    let condition = helper.next_expr(Expr::Literal(LiteralValue::Boolean(true.into())));
+    let condition = helper.next_expr(Expr::Literal(LiteralValue::Boolean(true)));
 
     let args = vec![
         helper.next_expr(Expr::Ident(result_binding.clone())),
