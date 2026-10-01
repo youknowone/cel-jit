@@ -67,7 +67,7 @@ static MIN_TIMESTAMP: LazyLock<chrono::DateTime<chrono::FixedOffset>> = LazyLock
 
 /// Tables this small are scanned as [`MapStorage::Entries`]; larger tables
 /// are [`MapStorage::Object`].
-const ORDERED_SCAN_LIMIT: usize = 8;
+pub(crate) const ORDERED_SCAN_LIMIT: usize = 8;
 
 /// Insertion-ordered pairs in one `Arc` allocation. Used when the table is
 /// small enough to scan.
@@ -340,10 +340,20 @@ impl StrBank {
 /// per row while the int column cost 1.
 ///
 /// Cloning one is a reference count per bank, not a copy of the buffer.
+///
+/// [`ValueColumn::Range`] names `len` rows at `words[origin..]` so every
+/// field of one record list can share a single word allocation.
 #[derive(Clone)]
 pub enum ValueColumn {
-    /// Raw words, read through `bank`.
+    /// Raw words, read through `bank`. The buffer is exactly this column.
     Scalar { bank: ScalarBank, words: Arc<[i64]> },
+    /// `len` words at `words[origin..]`, sharing `words` with other columns.
+    Range {
+        bank: ScalarBank,
+        words: Arc<[i64]>,
+        origin: usize,
+        len: usize,
+    },
     /// Ranks into an interned string table.
     Str(Arc<StrBank>),
 }
@@ -369,23 +379,51 @@ pub enum ScalarBank {
 }
 
 impl ValueColumn {
+    /// `len` rows of `bank` beginning at `origin` in a shared word buffer.
+    pub(crate) fn range(
+        bank: ScalarBank,
+        words: Arc<[i64]>,
+        origin: usize,
+        len: usize,
+    ) -> ValueColumn {
+        debug_assert!(origin
+            .checked_add(len)
+            .is_some_and(|end| end <= words.len()));
+        ValueColumn::Range {
+            bank,
+            words,
+            origin,
+            len,
+        }
+    }
+
+    fn scalar_value(bank: ScalarBank, word: i64) -> Value {
+        match bank {
+            ScalarBank::Int => Value::Int(word),
+            ScalarBank::UInt => Value::UInt(word as u64),
+            ScalarBank::Bool => Value::Bool(word != 0),
+            ScalarBank::Float => Value::Float(f64::from_bits(word as u64)),
+            #[cfg(feature = "chrono")]
+            ScalarBank::Timestamp => {
+                Value::Timestamp(chrono::DateTime::from_timestamp_nanos(word).fixed_offset())
+            }
+            #[cfg(feature = "chrono")]
+            ScalarBank::Duration => Value::Duration(chrono::Duration::nanoseconds(word)),
+            ScalarBank::Type => crate::common::types::type_const_value(word),
+        }
+    }
+
     pub fn value_at(&self, index: usize) -> Value {
         match self {
-            ValueColumn::Scalar { bank, words } => {
-                let word = words[index];
-                match bank {
-                    ScalarBank::Int => Value::Int(word),
-                    ScalarBank::UInt => Value::UInt(word as u64),
-                    ScalarBank::Bool => Value::Bool(word != 0),
-                    ScalarBank::Float => Value::Float(f64::from_bits(word as u64)),
-                    #[cfg(feature = "chrono")]
-                    ScalarBank::Timestamp => Value::Timestamp(
-                        chrono::DateTime::from_timestamp_nanos(word).fixed_offset(),
-                    ),
-                    #[cfg(feature = "chrono")]
-                    ScalarBank::Duration => Value::Duration(chrono::Duration::nanoseconds(word)),
-                    ScalarBank::Type => crate::common::types::type_const_value(word),
-                }
+            ValueColumn::Scalar { bank, words } => Self::scalar_value(*bank, words[index]),
+            ValueColumn::Range {
+                bank,
+                words,
+                origin,
+                len,
+            } => {
+                assert!(index < *len, "column index {index} past {len}");
+                Self::scalar_value(*bank, words[*origin + index])
             }
             ValueColumn::Str(bank) => bank.value_at(index),
         }
@@ -394,6 +432,7 @@ impl ValueColumn {
     pub fn len(&self) -> usize {
         match self {
             ValueColumn::Scalar { words, .. } => words.len(),
+            ValueColumn::Range { len, .. } => *len,
             ValueColumn::Str(bank) => bank.len(),
         }
     }

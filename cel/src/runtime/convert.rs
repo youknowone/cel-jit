@@ -10,6 +10,7 @@
 //! stays shared.
 
 use std::collections::HashMap;
+use std::mem::MaybeUninit;
 use std::sync::Arc;
 
 use super::object::{
@@ -17,21 +18,23 @@ use super::object::{
     new_host_list, new_host_list_ints, new_host_list_window, new_int, new_map, new_map_mapdict,
     new_map_record, new_null, new_opaque, new_optional, new_optional_none, new_string, new_type,
     new_uint, opaque_host_index, prepare_mapdict_rows, w_kind, w_type, CelClass, CelKind, CelRef,
-    ListStrategy, MapStrategy, W_BoolObject, W_BytesObject, W_DoubleObject, W_HostListObject,
-    W_IntColumn, W_IntObject, W_ListObject, W_MapObject, W_OptionalObject, W_StringObject,
-    W_TypeObject, W_UIntObject, CEL_BOOL_CLASS, CEL_BYTES_CLASS, CEL_DOUBLE_CLASS,
+    ListStrategy, MapStrategy, W_BoolObject, W_BytesObject, W_DoubleObject, W_FloatColumn,
+    W_HostListObject, W_IntColumn, W_IntObject, W_ListObject, W_MapObject, W_OptionalObject,
+    W_StringObject, W_TypeObject, W_UIntObject, CEL_BOOL_CLASS, CEL_BYTES_CLASS, CEL_DOUBLE_CLASS,
     CEL_HOST_LIST_CLASS, CEL_INT_CLASS, CEL_LIST_CLASS, CEL_MAP_CLASS, CEL_NULL_CLASS,
     CEL_OPAQUE_CLASS, CEL_OPTIONAL_CLASS, CEL_STRING_CLASS, CEL_TYPE_CLASS, CEL_UINT_CLASS,
     MAPDICT_MAX_ENTRIES,
 };
-use super::object_array::{bytes_base, items_block_items_base, items_capacity};
+use super::object_array::{
+    bytes_base, float_words_base, int_words_base, items_block_items_base, items_capacity,
+};
 use crate::common::types::{
     Kind, Type, TypeValue, BOOL_TYPE, BYTES_TYPE, DOUBLE_TYPE, INT_TYPE, LIST_TYPE, MAP_TYPE,
     NULL_TYPE, OPTIONAL_TYPE, STRING_TYPE, TYPE_TYPE, UINT_TYPE,
 };
 use crate::objects::{
     map_get_by_key, map_has_exact_key, try_build_map, Key, KeyRef, ListRef, ListStorage, Map,
-    MapStorage, Opaque, OptionalValue, ScalarBank, ValueColumn,
+    MapStorage, Opaque, OptionalValue, RecordSchema, ScalarBank, ValueColumn, ORDERED_SCAN_LIMIT,
 };
 use crate::Value;
 
@@ -559,6 +562,512 @@ unsafe fn values_from_items(leaf: &W_ListObject) -> Result<ListRef, ConvertError
     })
 }
 
+/// Fixed allocations of one [`ListStorage::Record`] list: the key vector,
+/// the column vector, the schema `Arc`, and the storage `Arc`. Every scalar
+/// column shares one more word-buffer `Arc`.
+const RECORD_FIXED_ALLOCS: usize = 4;
+/// The shared word buffer behind a record list's columns.
+const RECORD_WORD_ALLOCS: usize = 1;
+/// Fixed allocations of one shared [`ListStorage::Column`] plus the outer
+/// list of [`ListRef::window`]s: the word buffer, the storage `Arc`, and
+/// the outer list buffer.
+const COLUMN_FIXED_ALLOCS: usize = 3;
+
+/// One row of a list-of-lists, when every element is the same scalar bank.
+enum RowSpan {
+    Empty,
+    Words { bank: ScalarBank, len: usize },
+}
+
+/// A list of same-shaped scalar maps finishes as one [`ListStorage::Record`].
+/// A list of scalar lists finishes as one [`ListStorage::Column`] and a
+/// [`ListRef::window`] per row. Either form is built only when it allocates
+/// less than one container per element ([`try_build_map`] /
+/// [`ListRef::try_fill_ints`]). Fewer than three rows never wins: a single
+/// nested list is two allocations, and the shared form is three.
+///
+/// # Safety
+///
+/// `leaf` is a live object-strategy [`W_ListObject`].
+unsafe fn try_coalesce_object_list(leaf: &W_ListObject) -> Option<ListRef> {
+    if leaf.length < 3 || leaf.start < 0 {
+        return None;
+    }
+    let n = leaf.length as usize;
+    let start = leaf.start as usize;
+    let base = unsafe { items_block_items_base(leaf.items) };
+    if base.is_null() {
+        return None;
+    }
+    let cap = unsafe { items_capacity(leaf.items) };
+    if start.checked_add(n).is_none_or(|end| end > cap) {
+        return None;
+    }
+    let first = unsafe { *base.add(start) };
+    if first.is_null() {
+        return None;
+    }
+    match unsafe { w_kind(first) } {
+        CelKind::Map => unsafe { try_coalesce_record_list(base, start, n) },
+        CelKind::List => unsafe { try_coalesce_column_list(base, start, n) },
+        _ => None,
+    }
+}
+
+/// Object-strategy map entries, or `None` when the leaf is not one fresh
+/// object map. A non-null `public` is already a shared table; rebuilding it
+/// as a record would allocate the schema the link does not.
+///
+/// # Safety
+///
+/// `w` is a live reference or null.
+unsafe fn object_map_entries(w: CelRef) -> Option<(*mut CelRef, usize)> {
+    if w.is_null() || unsafe { w_kind(w) } != CelKind::Map || unsafe { w_type(w) } != &CEL_MAP_CLASS
+    {
+        return None;
+    }
+    let leaf = unsafe { &*w.cast::<W_MapObject>() };
+    if leaf.strategy != MapStrategy::Object || !leaf.public.is_null() || leaf.length < 0 {
+        return None;
+    }
+    let n = leaf.length as usize;
+    if n == 0 {
+        return Some((core::ptr::null_mut(), 0));
+    }
+    let base = unsafe { items_block_items_base(leaf.items) };
+    if base.is_null() || n.saturating_mul(2) > unsafe { items_capacity(leaf.items) } {
+        return None;
+    }
+    Some((base, n))
+}
+
+unsafe fn map_field(base: *mut CelRef, field: usize, value: bool) -> Option<CelRef> {
+    let mut index = field.checked_mul(2)?;
+    if value {
+        index = index.checked_add(1)?;
+    }
+    Some(unsafe { *base.add(index) })
+}
+
+unsafe fn same_interned_key(a: CelRef, b: CelRef) -> bool {
+    if a == b {
+        return true;
+    }
+    if a.is_null() || b.is_null() {
+        return false;
+    }
+    let kind = unsafe { w_kind(a) };
+    if kind != unsafe { w_kind(b) } {
+        return false;
+    }
+    unsafe {
+        match kind {
+            CelKind::Int => (*a.cast::<W_IntObject>()).intval == (*b.cast::<W_IntObject>()).intval,
+            CelKind::UInt => {
+                (*a.cast::<W_UIntObject>()).uintval == (*b.cast::<W_UIntObject>()).uintval
+            }
+            CelKind::Bool => {
+                (*a.cast::<W_BoolObject>()).boolval == (*b.cast::<W_BoolObject>()).boolval
+            }
+            CelKind::Str => interned_string_eq(a, b),
+            _ => false,
+        }
+    }
+}
+
+unsafe fn interned_string_eq(a: CelRef, b: CelRef) -> bool {
+    let left = unsafe { &*a.cast::<W_StringObject>() };
+    let right = unsafe { &*b.cast::<W_StringObject>() };
+    if left.byte_len != right.byte_len || left.byte_len < 0 {
+        return false;
+    }
+    let n = left.byte_len as usize;
+    if n == 0 {
+        return true;
+    }
+    let left_bytes = unsafe { bytes_base(left.chars) };
+    let right_bytes = unsafe { bytes_base(right.chars) };
+    if left_bytes.is_null() || right_bytes.is_null() {
+        return false;
+    }
+    unsafe {
+        std::slice::from_raw_parts(left_bytes, n) == std::slice::from_raw_parts(right_bytes, n)
+    }
+}
+
+/// Allocations [`string_from_leaf`] makes for this key. `None` is a key that
+/// leaf cannot turn into a [`Key`]. A linked `public` arc is a refcount.
+/// An unlinked string is the byte buffer plus the `Arc`, except an empty
+/// string, whose buffer allocates nothing.
+unsafe fn fresh_key_allocs(w: CelRef) -> Option<usize> {
+    if w.is_null() {
+        return None;
+    }
+    unsafe {
+        match w_kind(w) {
+            CelKind::Int | CelKind::UInt | CelKind::Bool => Some(0),
+            CelKind::Str => {
+                let leaf = &*w.cast::<W_StringObject>();
+                if !leaf.public.is_null() {
+                    return Some(0);
+                }
+                if leaf.byte_len < 0 {
+                    return None;
+                }
+                let n = leaf.byte_len as usize;
+                if n == 0 {
+                    return Some(1);
+                }
+                let base = bytes_base(leaf.chars);
+                if base.is_null() {
+                    return None;
+                }
+                let bytes = std::slice::from_raw_parts(base, n);
+                if std::str::from_utf8(bytes).is_err() {
+                    return None;
+                }
+                Some(2)
+            }
+            _ => None,
+        }
+    }
+}
+
+unsafe fn scalar_word(w: CelRef) -> Option<(ScalarBank, i64)> {
+    if w.is_null() {
+        return None;
+    }
+    let class = unsafe { w_type(w) };
+    unsafe {
+        match w_kind(w) {
+            CelKind::Int if class == &CEL_INT_CLASS => {
+                Some((ScalarBank::Int, (*w.cast::<W_IntObject>()).intval))
+            }
+            CelKind::UInt if class == &CEL_UINT_CLASS => {
+                Some((ScalarBank::UInt, (*w.cast::<W_UIntObject>()).uintval as i64))
+            }
+            CelKind::Bool if class == &CEL_BOOL_CLASS => {
+                Some((ScalarBank::Bool, (*w.cast::<W_BoolObject>()).boolval))
+            }
+            CelKind::Double if class == &CEL_DOUBLE_CLASS => Some((
+                ScalarBank::Float,
+                (*w.cast::<W_DoubleObject>()).floatval.to_bits() as i64,
+            )),
+            _ => None,
+        }
+    }
+}
+
+/// # Safety
+///
+/// `base` is the items pointer of a live object list. `start..start + n`
+/// is in range and every slot there is non-null.
+unsafe fn try_coalesce_record_list(base: *mut CelRef, start: usize, n: usize) -> Option<ListRef> {
+    let (base0, fields) = unsafe { object_map_entries(*base.add(start)) }?;
+    // No column means [`RecordSchema::rows`] is 0, so the row count is lost.
+    if fields == 0 {
+        return None;
+    }
+    let mut key_allocs = 0usize;
+    for field in 0..fields {
+        let key = unsafe { map_field(base0, field, false) }?;
+        for prev in 0..field {
+            let earlier = unsafe { map_field(base0, prev, false) }?;
+            if unsafe { same_interned_key(key, earlier) } {
+                return None;
+            }
+        }
+        key_allocs = key_allocs.saturating_add(unsafe { fresh_key_allocs(key) }?);
+        let (bank0, _) = unsafe { scalar_word(map_field(base0, field, true)?) }?;
+        for row in 1..n {
+            let (row_base, row_fields) = unsafe { object_map_entries(*base.add(start + row)) }?;
+            if row_fields != fields {
+                return None;
+            }
+            let row_key = unsafe { map_field(row_base, field, false) }?;
+            if unsafe { !same_interned_key(key, row_key) } {
+                return None;
+            }
+            let (bank, _) = unsafe { scalar_word(map_field(row_base, field, true)?) }?;
+            if bank != bank0 {
+                return None;
+            }
+        }
+    }
+    // [`try_build_map`] is one `Arc` at or below [`ORDERED_SCAN_LIMIT`] and a
+    // table plus an `Arc` above it. The outer list is one more buffer.
+    let per_row: usize = if fields <= ORDERED_SCAN_LIMIT { 1 } else { 2 };
+    let current = per_row.saturating_mul(n).saturating_add(1);
+    let record_cost = RECORD_FIXED_ALLOCS
+        .saturating_add(RECORD_WORD_ALLOCS)
+        .saturating_add(key_allocs);
+    if record_cost >= current {
+        return None;
+    }
+    unsafe { build_record_list(base, start, n, base0, fields) }
+}
+
+unsafe fn build_record_list(
+    base: *mut CelRef,
+    start: usize,
+    n: usize,
+    base0: *mut CelRef,
+    fields: usize,
+) -> Option<ListRef> {
+    let mut keys = Vec::with_capacity(fields);
+    for field in 0..fields {
+        let key = unsafe { map_field(base0, field, false) }?;
+        keys.push(ref_to_key(key).ok()?);
+    }
+    let total = n.checked_mul(fields)?;
+    let mut uninit: Arc<[MaybeUninit<i64>]> = Arc::new_uninit_slice(total);
+    {
+        let slot = Arc::get_mut(&mut uninit).expect("unique");
+        for field in 0..fields {
+            let (bank, _) = unsafe { scalar_word(map_field(base0, field, true)?) }?;
+            let origin = field * n;
+            for row in 0..n {
+                let (row_base, row_fields) = unsafe { object_map_entries(*base.add(start + row)) }?;
+                if row_fields != fields {
+                    return None;
+                }
+                let (row_bank, word) = unsafe { scalar_word(map_field(row_base, field, true)?) }?;
+                if row_bank != bank {
+                    return None;
+                }
+                slot[origin + row].write(word);
+            }
+        }
+    }
+    let words = unsafe { uninit.assume_init() };
+    let mut columns = Vec::with_capacity(fields);
+    for field in 0..fields {
+        let (bank, _) = unsafe { scalar_word(map_field(base0, field, true)?) }?;
+        columns.push(ValueColumn::range(bank, Arc::clone(&words), field * n, n));
+    }
+    let schema = Arc::new(RecordSchema::new(keys, columns));
+    Some(ListRef::whole(Arc::new(ListStorage::Record(schema))))
+}
+
+/// # Safety
+///
+/// `base` is the items pointer of a live object list. `start..start + n`
+/// is in range.
+unsafe fn try_coalesce_column_list(base: *mut CelRef, start: usize, n: usize) -> Option<ListRef> {
+    let mut bank = None;
+    let mut total = 0usize;
+    // The outer list is one buffer. Each non-empty inner list is one more
+    // ([`ListRef::try_fill_ints`] / [`ListRef::try_fill_values`]). An empty
+    // inner list is the static empty header and allocates nothing.
+    let mut current = 1usize;
+    for row in 0..n {
+        match unsafe { row_span(*base.add(start + row)) }? {
+            RowSpan::Empty => {}
+            RowSpan::Words {
+                bank: row_bank,
+                len,
+            } => {
+                match bank {
+                    None => bank = Some(row_bank),
+                    Some(prev) if prev == row_bank => {}
+                    Some(_) => return None,
+                }
+                total = total.checked_add(len)?;
+                current = current.saturating_add(1);
+            }
+        }
+    }
+    let bank = bank?;
+    if total == 0 || COLUMN_FIXED_ALLOCS >= current {
+        return None;
+    }
+    unsafe { build_column_list(base, start, n, bank, total) }
+}
+
+unsafe fn build_column_list(
+    base: *mut CelRef,
+    start: usize,
+    n: usize,
+    bank: ScalarBank,
+    total: usize,
+) -> Option<ListRef> {
+    let mut uninit: Arc<[MaybeUninit<i64>]> = Arc::new_uninit_slice(total);
+    {
+        let slot = Arc::get_mut(&mut uninit).expect("unique");
+        let mut at = 0usize;
+        for row in 0..n {
+            let written =
+                unsafe { write_row_words(*base.add(start + row), bank, &mut slot[at..]) }?;
+            at += written;
+        }
+        if at != total {
+            return None;
+        }
+    }
+    let words = unsafe { uninit.assume_init() };
+    let storage = Arc::new(ListStorage::Column(ValueColumn::Scalar { bank, words }));
+    let mut at = 0usize;
+    match ListRef::try_fill_values::<std::convert::Infallible>(n, |row| {
+        let len = unsafe { row_len(*base.add(start + row)) };
+        let window = ListRef::window(Arc::clone(&storage), at, len);
+        at += len;
+        Ok(Some(Value::List(window)))
+    }) {
+        Ok(list) => Some(list),
+        Err(err) => match err {},
+    }
+}
+
+unsafe fn row_len(w: CelRef) -> usize {
+    match unsafe { row_span(w) } {
+        Some(RowSpan::Empty) => 0,
+        Some(RowSpan::Words { len, .. }) => len,
+        None => 0,
+    }
+}
+
+/// # Safety
+///
+/// `w` is a live reference or null.
+unsafe fn row_span(w: CelRef) -> Option<RowSpan> {
+    if w.is_null()
+        || unsafe { w_kind(w) } != CelKind::List
+        || unsafe { w_type(w) } != &CEL_LIST_CLASS
+    {
+        return None;
+    }
+    let leaf = unsafe { &*w.cast::<W_ListObject>() };
+    if leaf.length < 0 || leaf.start < 0 {
+        return None;
+    }
+    let n = leaf.length as usize;
+    let start = leaf.start as usize;
+    match leaf.strategy {
+        ListStrategy::Size => (n == 0).then_some(RowSpan::Empty),
+        ListStrategy::Ints => unsafe { word_column_span(leaf, start, n, true) },
+        ListStrategy::Floats => unsafe { word_column_span(leaf, start, n, false) },
+        ListStrategy::Object => unsafe { object_scalar_span(leaf, start, n) },
+        ListStrategy::Strs | ListStrategy::Window => None,
+    }
+}
+
+unsafe fn word_column_span(
+    leaf: &W_ListObject,
+    start: usize,
+    n: usize,
+    ints: bool,
+) -> Option<RowSpan> {
+    if n == 0 {
+        return Some(RowSpan::Empty);
+    }
+    if leaf.storage.is_null() {
+        return None;
+    }
+    let (data_null, col_len, bank) = if ints {
+        let col = unsafe { &*leaf.storage.cast::<W_IntColumn>() };
+        (col.data.is_null(), col.length, ScalarBank::Int)
+    } else {
+        let col = unsafe { &*leaf.storage.cast::<W_FloatColumn>() };
+        (col.data.is_null(), col.length, ScalarBank::Float)
+    };
+    if data_null || col_len < 0 {
+        return None;
+    }
+    let end = start.checked_add(n)?;
+    if end > col_len as usize {
+        return None;
+    }
+    Some(RowSpan::Words { bank, len: n })
+}
+
+unsafe fn object_scalar_span(leaf: &W_ListObject, start: usize, n: usize) -> Option<RowSpan> {
+    if n == 0 {
+        return Some(RowSpan::Empty);
+    }
+    let base = unsafe { items_block_items_base(leaf.items) };
+    if base.is_null() {
+        return None;
+    }
+    let cap = unsafe { items_capacity(leaf.items) };
+    if start.checked_add(n).is_none_or(|end| end > cap) {
+        return None;
+    }
+    let (bank, _) = unsafe { scalar_word(*base.add(start)) }?;
+    for i in 1..n {
+        let (row_bank, _) = unsafe { scalar_word(*base.add(start + i)) }?;
+        if row_bank != bank {
+            return None;
+        }
+    }
+    Some(RowSpan::Words { bank, len: n })
+}
+
+unsafe fn write_row_words(
+    w: CelRef,
+    bank: ScalarBank,
+    dest: &mut [MaybeUninit<i64>],
+) -> Option<usize> {
+    match unsafe { row_span(w) }? {
+        RowSpan::Empty => Some(0),
+        RowSpan::Words {
+            bank: row_bank,
+            len,
+        } => {
+            if row_bank != bank || len > dest.len() {
+                return None;
+            }
+            unsafe { copy_row_words(w, &mut dest[..len]) }?;
+            Some(len)
+        }
+    }
+}
+
+unsafe fn copy_row_words(w: CelRef, dest: &mut [MaybeUninit<i64>]) -> Option<()> {
+    let leaf = unsafe { &*w.cast::<W_ListObject>() };
+    let n = dest.len();
+    if n == 0 {
+        return Some(());
+    }
+    let start = leaf.start as usize;
+    match leaf.strategy {
+        ListStrategy::Ints => {
+            let col = unsafe { &*leaf.storage.cast::<W_IntColumn>() };
+            let src = unsafe { int_words_base(col.data) };
+            if src.is_null() {
+                return None;
+            }
+            unsafe {
+                std::ptr::copy_nonoverlapping(src.add(start), dest.as_mut_ptr().cast::<i64>(), n);
+            }
+            Some(())
+        }
+        ListStrategy::Floats => {
+            let col = unsafe { &*leaf.storage.cast::<W_FloatColumn>() };
+            let src = unsafe { float_words_base(col.data) };
+            if src.is_null() {
+                return None;
+            }
+            for (slot, word) in dest.iter_mut().zip(0..n) {
+                let bits = unsafe { (*src.add(start + word)).to_bits() } as i64;
+                slot.write(bits);
+            }
+            Some(())
+        }
+        ListStrategy::Object => {
+            let base = unsafe { items_block_items_base(leaf.items) };
+            if base.is_null() {
+                return None;
+            }
+            for (slot, index) in dest.iter_mut().zip(0..n) {
+                let (_, word) = unsafe { scalar_word(*base.add(start + index)) }?;
+                slot.write(word);
+            }
+            Some(())
+        }
+        ListStrategy::Strs | ListStrategy::Window | ListStrategy::Size => None,
+    }
+}
+
 unsafe fn list_from_ref(w: CelRef) -> Result<ListRef, ConvertError> {
     if unsafe { w_type(w) } == &CEL_HOST_LIST_CLASS {
         let host = &*w.cast::<W_HostListObject>();
@@ -575,6 +1084,9 @@ unsafe fn list_from_ref(w: CelRef) -> Result<ListRef, ConvertError> {
         ListStrategy::Object => {
             if let Some(ints) = interned_object_list_ints(leaf) {
                 return Ok(ints);
+            }
+            if let Some(coalesced) = unsafe { try_coalesce_object_list(leaf) } {
+                return Ok(coalesced);
             }
             values_from_items(leaf)
         }
@@ -1016,7 +1528,7 @@ fn ref_to_key(w: CelRef) -> Result<Key, ConvertError> {
 mod tests {
     use super::*;
     use crate::objects::MapEntries;
-    use crate::runtime::object::{map_try_insert, new_list, new_map_with_capacity};
+    use crate::runtime::object::{map_try_insert, new_list, new_list_ints, new_map_with_capacity};
 
     fn roundtrip(v: Value) -> Value {
         let w = value_to_ref(&v).expect("to_ref");
@@ -1064,6 +1576,308 @@ mod tests {
                 ListStorage::Ints(vec![15])
             )))])
         );
+        let Value::List(outer) = v else {
+            panic!("list");
+        };
+        let Value::List(inner) = outer.get(0).expect("row") else {
+            panic!("inner list");
+        };
+        assert!(
+            inner.is_ints(),
+            "one nested list stays an int buffer, not a shared column"
+        );
+    }
+
+    /// [`link_public_handle`] stores `Arc::as_ptr` and does not keep the
+    /// allocation alive. The returned arc has to outlive `interned_to_public`.
+    fn linked_string(text: &str) -> (CelRef, Arc<String>) {
+        let arc = Arc::new(text.to_string());
+        let leaf = new_string(text) as CelRef;
+        link_public_handle(leaf, &Value::String(Arc::clone(&arc)));
+        (leaf, arc)
+    }
+
+    fn int_rows(key: CelRef, n: i64) -> CelRef {
+        let rows: Vec<CelRef> = (1..=n)
+            .map(|i| new_map(&[(key, new_int(i) as CelRef)]) as CelRef)
+            .collect();
+        new_list(&rows) as CelRef
+    }
+
+    fn assert_record_rows(value: &Value, n: usize) {
+        let Value::List(list) = value else {
+            panic!("list");
+        };
+        assert!(
+            matches!(list.storage(), Some(ListStorage::Record(_))),
+            "rows share one record schema"
+        );
+        assert_eq!(list.len(), n);
+    }
+
+    fn assert_entry_rows(value: &Value) {
+        let Value::List(list) = value else {
+            panic!("list");
+        };
+        let Value::Map(map) = list.get(0).expect("row") else {
+            panic!("map");
+        };
+        assert!(
+            matches!(map.storage(), MapStorage::Entries(_)),
+            "short or mixed map list stays one table per row: {map:?}"
+        );
+    }
+
+    #[test]
+    fn homogeneous_scalar_maps_finish_as_one_record() {
+        let (key, key_arc) = linked_string("k");
+        let value = interned_to_public(int_rows(key, 5));
+        assert_record_rows(&value, 5);
+        let expected: Vec<Value> = (1..=5)
+            .map(|i| {
+                Value::Map(
+                    try_build_map::<(), false>(1, |_| {
+                        Ok(Some((Key::String(Arc::clone(&key_arc)), Value::Int(i))))
+                    })
+                    .expect("map"),
+                )
+            })
+            .collect();
+        assert_eq!(value, Value::list(expected));
+        let Value::List(list) = &value else {
+            panic!("list");
+        };
+        let Value::Map(first) = list.get(0).expect("row") else {
+            panic!("map");
+        };
+        assert_eq!(
+            first.get(&Key::String(Arc::clone(&key_arc))).as_deref(),
+            Some(&Value::Int(1))
+        );
+    }
+
+    #[test]
+    fn four_scalar_maps_stay_entries_when_a_record_is_not_cheaper() {
+        let (key, key_arc) = linked_string("k");
+        let value = interned_to_public(int_rows(key, 4));
+        assert_entry_rows(&value);
+        let Value::List(list) = &value else {
+            panic!("list");
+        };
+        assert_eq!(list.len(), 4);
+        let Value::Map(first) = list.get(0).expect("row") else {
+            panic!("map");
+        };
+        assert_eq!(
+            first.get(&Key::String(key_arc)).as_deref(),
+            Some(&Value::Int(1))
+        );
+    }
+
+    #[test]
+    fn record_rows_keep_insertion_order() {
+        let (key_c, arc_c) = linked_string("c");
+        let (key_a, arc_a) = linked_string("a");
+        let (key_b, arc_b) = linked_string("b");
+        let rows: Vec<CelRef> = (0..7)
+            .map(|i| {
+                new_map(&[
+                    (key_c, new_int(i) as CelRef),
+                    (key_a, new_int(i + 10) as CelRef),
+                    (key_b, new_int(i + 20) as CelRef),
+                ]) as CelRef
+            })
+            .collect();
+        let value = interned_to_public(new_list(&rows) as CelRef);
+        assert_record_rows(&value, 7);
+        let Value::List(list) = &value else {
+            panic!("list");
+        };
+        let Value::Map(map) = list.get(3).expect("row") else {
+            panic!("map");
+        };
+        assert!(matches!(map.storage(), MapStorage::Record { .. }));
+        assert_eq!(map.len(), 3);
+        let keys: Vec<&str> = map
+            .iter()
+            .map(|(key, _)| match key {
+                Key::String(text) => text.as_str(),
+                other => panic!("string key, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(keys, [arc_c.as_str(), arc_a.as_str(), arc_b.as_str()]);
+        assert_eq!(
+            map.get(&Key::String(arc_a)).as_deref(),
+            Some(&Value::Int(13))
+        );
+    }
+
+    #[test]
+    fn mismatched_map_rows_stay_separate_tables() {
+        let (key_k, arc_k) = linked_string("k");
+        let (key_z, arc_z) = linked_string("z");
+        let mut rows: Vec<CelRef> = (1..=6)
+            .map(|i| new_map(&[(key_k, new_int(i) as CelRef)]) as CelRef)
+            .collect();
+        rows.push(new_map(&[(key_z, new_int(7) as CelRef)]) as CelRef);
+        let value = interned_to_public(new_list(&rows) as CelRef);
+        assert_entry_rows(&value);
+        let Value::List(list) = &value else {
+            panic!("list");
+        };
+        let Value::Map(first) = list.get(0).expect("row") else {
+            panic!("map");
+        };
+        let Value::Map(last) = list.get(6).expect("row") else {
+            panic!("map");
+        };
+        assert_eq!(
+            first.get(&Key::String(arc_k)).as_deref(),
+            Some(&Value::Int(1))
+        );
+        assert_eq!(
+            last.get(&Key::String(arc_z)).as_deref(),
+            Some(&Value::Int(7))
+        );
+    }
+
+    #[test]
+    fn duplicate_keys_and_non_scalar_values_stay_separate_tables() {
+        let (key, key_arc) = linked_string("k");
+        let dupes: Vec<CelRef> = (0..7)
+            .map(|i| {
+                new_map(&[(key, new_int(i) as CelRef), (key, new_int(i + 1) as CelRef)]) as CelRef
+            })
+            .collect();
+        let duped = interned_to_public(new_list(&dupes) as CelRef);
+        assert_entry_rows(&duped);
+        let Value::List(list) = &duped else {
+            panic!("list");
+        };
+        let Value::Map(map) = list.get(0).expect("row") else {
+            panic!("map");
+        };
+        assert!(map.get(&Key::String(Arc::clone(&key_arc))).is_some());
+
+        let nested: Vec<CelRef> = (0..7)
+            .map(|_| new_map(&[(key, new_list(&[new_int(1) as CelRef]) as CelRef)]) as CelRef)
+            .collect();
+        assert_entry_rows(&interned_to_public(new_list(&nested) as CelRef));
+    }
+
+    fn assert_shared_windows(value: &Value, lens: &[usize], word: impl Fn(usize, usize) -> Value) {
+        let Value::List(outer) = value else {
+            panic!("list");
+        };
+        assert_eq!(outer.len(), lens.len());
+        let mut rows = Vec::new();
+        for index in 0..lens.len() {
+            let Value::List(row) = outer.get(index).expect("row") else {
+                panic!("inner list");
+            };
+            assert_eq!(row.len(), lens[index]);
+            for at in 0..lens[index] {
+                assert_eq!(row.get(at), Some(word(index, at)));
+            }
+            rows.push(row);
+        }
+        let first = &rows[0];
+        for row in &rows[1..] {
+            assert!(
+                first.shares_storage_with(row),
+                "inner lists are windows of one column"
+            );
+        }
+    }
+
+    #[test]
+    fn three_int_lists_share_one_column() {
+        let rows: Vec<CelRef> = (0..3)
+            .map(|i| new_list(&[new_int(i) as CelRef, new_int(i + 10) as CelRef]) as CelRef)
+            .collect();
+        let value = interned_to_public(new_list(&rows) as CelRef);
+        assert_shared_windows(&value, &[2, 2, 2], |row, at| {
+            Value::Int(row as i64 + if at == 0 { 0 } else { 10 })
+        });
+    }
+
+    #[test]
+    fn two_int_lists_stay_separate_buffers() {
+        let rows = [
+            new_list_ints(&[1, 2]) as CelRef,
+            new_list_ints(&[3, 4]) as CelRef,
+        ];
+        let value = interned_to_public(new_list(&rows) as CelRef);
+        let Value::List(outer) = value else {
+            panic!("list");
+        };
+        let Value::List(left) = outer.get(0).expect("row") else {
+            panic!("inner");
+        };
+        let Value::List(right) = outer.get(1).expect("row") else {
+            panic!("inner");
+        };
+        assert!(left.is_ints());
+        assert!(right.is_ints());
+        assert!(!left.shares_storage_with(&right));
+        assert_eq!(left.get(1), Some(Value::Int(2)));
+        assert_eq!(right.get(0), Some(Value::Int(3)));
+    }
+
+    #[test]
+    fn int_columns_of_different_lengths_share_one_buffer() {
+        let rows = [
+            new_list_ints(&[1, 2]) as CelRef,
+            new_list(&[]) as CelRef,
+            new_list_ints(&[3, 4]) as CelRef,
+            new_list_ints(&[5]) as CelRef,
+        ];
+        let value = interned_to_public(new_list(&rows) as CelRef);
+        assert_shared_windows(&value, &[2, 0, 2, 1], |row, at| {
+            let words = [1i64, 2, 3, 4, 5];
+            let start = [0usize, 2, 2, 4][row];
+            Value::Int(words[start + at])
+        });
+    }
+
+    #[test]
+    fn uint_and_float_rows_share_a_column_and_mixed_banks_do_not() {
+        let uints: Vec<CelRef> = (0..3)
+            .map(|i| new_list(&[new_uint(i as u64) as CelRef]) as CelRef)
+            .collect();
+        let value = interned_to_public(new_list(&uints) as CelRef);
+        assert_shared_windows(&value, &[1, 1, 1], |row, _| Value::UInt(row as u64));
+
+        let floats: Vec<CelRef> = [1.5f64, 2.5, 3.5]
+            .into_iter()
+            .map(|n| new_list(&[new_double(n) as CelRef]) as CelRef)
+            .collect();
+        let value = interned_to_public(new_list(&floats) as CelRef);
+        assert_shared_windows(&value, &[1, 1, 1], |row, _| {
+            Value::Float([1.5, 2.5, 3.5][row])
+        });
+
+        let mixed = [
+            new_list_ints(&[1, 2]) as CelRef,
+            new_list(&[new_bool(true) as CelRef, new_bool(false) as CelRef]) as CelRef,
+            new_list_ints(&[3, 4]) as CelRef,
+            new_list_ints(&[5, 6]) as CelRef,
+        ];
+        let value = interned_to_public(new_list(&mixed) as CelRef);
+        let Value::List(outer) = value else {
+            panic!("list");
+        };
+        let Value::List(first) = outer.get(0).expect("row") else {
+            panic!("inner");
+        };
+        let Value::List(third) = outer.get(2).expect("row") else {
+            panic!("inner");
+        };
+        assert!(!first.shares_storage_with(&third));
+        let Value::List(bools) = outer.get(1).expect("row") else {
+            panic!("inner");
+        };
+        assert_eq!(bools.get(0), Some(Value::Bool(true)));
     }
 
     #[test]
