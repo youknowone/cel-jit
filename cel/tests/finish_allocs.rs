@@ -1,4 +1,4 @@
-//! Allocation count at `Program::execute` for the three finish-heavy rows.
+//! Allocation count at `Program::execute` for the finish-heavy rows.
 //! Prints mallocs per evaluation so a finish change has a number, not a guess.
 
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -16,9 +16,10 @@ static GLOBAL: AtomicU64 = AtomicU64::new(0);
 struct Counting;
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let ptr = unsafe { System.alloc(layout) };
         GLOBAL.fetch_add(1, Ordering::Relaxed);
         let _ = LOCAL.try_with(|c| c.set(c.get() + 1));
-        unsafe { System.alloc(layout) }
+        ptr
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         unsafe { System.dealloc(ptr, layout) }
@@ -38,8 +39,11 @@ fn count(src: &str, setup: impl FnOnce(&mut Context)) -> u64 {
     let program = Program::compile(src).expect(src);
     let mut ctx = Context::default();
     setup(&mut ctx);
+    // The first evaluations compile a 10-element loop (the back-edge door is
+    // 101). Straight-line programs stay under the function door and never
+    // compile. The window below is the steady cost after that.
     program.execute(&ctx).expect(src);
-    for _ in 0..8 {
+    for _ in 0..24 {
         let _ = program.execute(&ctx);
     }
     let t0 = LOCAL.with(Cell::get);
@@ -96,9 +100,28 @@ fn mallocs_per_eval_on_finish_rows() {
     println!("walker {{a: x}} mallocs/eval={walker_one}");
     assert_eq!(nested, 2, "[[x]] finish mallocs");
     assert_eq!(chain, 2, "string-chain finish mallocs");
-    assert_eq!(maps, 11, "1-entry map-in-map finish mallocs");
-    assert_eq!(maps3, 11, "3-entry map-in-map finish mallocs");
-    assert_eq!(inner_lists, 11, "list-of-lists finish mallocs");
+    // A compiled eval also builds the resume buffers in
+    // `consume_compiled_entry_result` on top of the interpreter finish
+    // cost below. Cranelift measures 11 and dynasm 12 for each row.
+    #[cfg(not(feature = "jit"))]
+    {
+        assert_eq!(maps, 5, "1-entry map list finish mallocs");
+        assert_eq!(maps3, 5, "3-entry map list finish mallocs");
+        assert_eq!(inner_lists, 3, "list-of-lists finish mallocs");
+    }
+    #[cfg(feature = "jit")]
+    {
+        for (got, name) in [
+            (maps, "1-entry map list"),
+            (maps3, "3-entry map list"),
+            (inner_lists, "list-of-lists"),
+        ] {
+            assert!(
+                got == 11 || got == 12,
+                "{name} finish mallocs: cranelift 11, dynasm 12, got {got}"
+            );
+        }
+    }
     assert_eq!(pair, 1, "[x, x] finish mallocs");
     assert_eq!(ints, 0, "int-list finish mallocs");
     assert_eq!(walker_list, 1, "walker list literal mallocs");

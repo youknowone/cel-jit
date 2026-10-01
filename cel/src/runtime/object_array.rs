@@ -74,6 +74,7 @@ pub struct ArrayToken {
 /// second header between the length word and item 0.
 // `capacity` is fixed for the block's lifetime (a grow allocates a fresh
 // block). `listobject.py` array length words are `_immutable_fields_`.
+#[cfg_attr(feature = "jit", majit_macros::jit_immutable_fields(capacity))]
 #[repr(C)]
 #[allow(non_camel_case_types)]
 pub struct CelItemsBlock {
@@ -143,6 +144,7 @@ impl CelGcType for CelBytesBlock {
 ///
 /// Same body as [`CelItemsBlock`]. `new_array` can build it; a raw
 /// `*mut i64` cannot, because the array descr needs the length word.
+#[cfg_attr(feature = "jit", majit_macros::jit_immutable_fields(capacity))]
 #[repr(C)]
 #[allow(non_camel_case_types)]
 pub struct CelIntWords {
@@ -174,6 +176,7 @@ impl CelGcType for CelIntWords {
 ///
 /// Same body as [`CelIntWords`]. The array descr reads the length at
 /// offset 0, so the payload cannot be a raw `*mut f64`.
+#[cfg_attr(feature = "jit", majit_macros::jit_immutable_fields(capacity))]
 #[repr(C)]
 #[allow(non_camel_case_types)]
 pub struct CelFloatWords {

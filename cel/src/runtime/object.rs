@@ -132,6 +132,7 @@ impl CelClass {
 /// One word, and declaring no class word beyond it is what admits the fuse's
 /// base-type arm — see the module documentation.
 // Written once, at allocation. A read off a constant object folds.
+#[cfg_attr(feature = "jit", majit_macros::jit_immutable_fields(ob_type))]
 #[repr(C)]
 pub struct CelObject {
     pub ob_type: *const CelClass,
@@ -204,6 +205,7 @@ macro_rules! scalar_leaf {
         // reads may fold to a pure getfield. The attribute leaves the
         // `_immutable_fields_<Struct>` marker Charon extracts; spelling it by
         // hand here is what the marker's own consumer stopped needing.
+        #[cfg_attr(feature = "jit", majit_macros::jit_immutable_fields($payload))]
         #[repr(C)]
         #[allow(non_camel_case_types)]
         pub struct $leaf {
@@ -358,6 +360,7 @@ pub fn new_null() -> *mut W_NullObject {
 /// the value was written with — so it does not go through [`scalar_leaf`]
 /// either. CEL compares timestamps by instant and formats them by offset, so
 /// dropping the offset would be lossy at the boundary.
+#[cfg_attr(feature = "jit", majit_macros::jit_immutable_fields(nanos, off_s))]
 #[repr(C)]
 #[allow(non_camel_case_types)]
 pub struct W_TimestampObject {
@@ -398,6 +401,7 @@ pub fn new_timestamp(nanos: i64, off_s: i64) -> *mut W_TimestampObject {
 // delete.
 
 /// A CEL `bytes`.
+#[cfg_attr(feature = "jit", majit_macros::jit_immutable_fields(data, length))]
 #[repr(C)]
 #[allow(non_camel_case_types)]
 pub struct W_BytesObject {
@@ -459,6 +463,7 @@ pub fn new_bytes_concat(left: &[u8], right: &[u8]) -> *mut W_BytesObject {
 ///
 /// The payload is UTF-8, so `byte_len` is what indexes the block and is not the
 /// character count.
+#[cfg_attr(feature = "jit", majit_macros::jit_immutable_fields(chars, byte_len))]
 #[repr(C)]
 #[allow(non_camel_case_types)]
 pub struct W_StringObject {
@@ -626,6 +631,7 @@ pub enum ListStrategy {
 /// column and stores it in [`W_ListObject::storage`] (`_ll_list_resize_really`
 /// replaces `l.items`; the array's length is not rewritten in place), so both
 /// fields are `_immutable_fields_`.
+#[cfg_attr(feature = "jit", majit_macros::jit_immutable_fields(data, length))]
 #[repr(C)]
 #[allow(non_camel_case_types)]
 pub struct W_IntColumn {
@@ -641,6 +647,7 @@ pub static CEL_INT_COLUMN_CLASS: CelClass = CelClass::new("int_column", CelKind:
 /// An unboxed float column. `FloatListStrategy` storage: raw `f64`s, not
 /// `W_DoubleObject`s. `data` and `length` are write-once, same as
 /// [`W_IntColumn`].
+#[cfg_attr(feature = "jit", majit_macros::jit_immutable_fields(data, length))]
 #[repr(C)]
 #[allow(non_camel_case_types)]
 pub struct W_FloatColumn {
@@ -779,6 +786,10 @@ pub(crate) unsafe fn list_clear_public_link(w: CelRef) {
 /// change, and `rewrite_op_getarrayitem` reads the `CelRef`s with
 /// `getarrayitem_gc_pure`. The block is a `GcArray` (`CelItemsBlock`):
 /// length word, then the items. Only `In` consumes one; it is not a CEL value.
+#[cfg_attr(
+    feature = "jit",
+    majit_macros::jit_immutable_fields(length, "items[*]")
+)]
 #[repr(C)]
 #[allow(non_camel_case_types)]
 pub struct W_TupleObject {
@@ -1826,6 +1837,10 @@ pub enum MapStrategy {
 ///
 /// `strategy`, `storage`, `items`, and `layout` are written only by the
 /// allocating constructors. `length` and the `public*` words change on insert.
+#[cfg_attr(
+    feature = "jit",
+    majit_macros::jit_immutable_fields(strategy, storage, items, layout)
+)]
 #[repr(C)]
 #[allow(non_camel_case_types)]
 pub struct W_MapObject {
@@ -2376,6 +2391,10 @@ pub(crate) unsafe fn mapdict_pair_refs(leaf: &W_MapObject) -> Vec<CelRef> {
 /// ⚠ The strategy tag is absent for the same reason [`W_ListObject`] omits
 /// it: a discriminant is only meaningful once there is a second strategy.
 #[cfg(feature = "structs")]
+#[cfg_attr(
+    feature = "jit",
+    majit_macros::jit_immutable_fields(name, fields, length)
+)]
 #[repr(C)]
 #[allow(non_camel_case_types)]
 pub struct W_StructObject {
@@ -2430,6 +2449,7 @@ pub fn new_struct(name: *mut W_StringObject, fields: &[(CelRef, CelRef)]) -> *mu
 /// `type(type(1)) == type(string)` hold, and it is why the two spellings must
 /// not be collapsed: `(*type_value).cls` is a class, `(*any_value).ob_type` is
 /// a class, and only the type value itself is an allocated object.
+#[cfg_attr(feature = "jit", majit_macros::jit_immutable_fields(cls))]
 #[repr(C)]
 #[allow(non_camel_case_types)]
 pub struct W_TypeObject {
@@ -2605,7 +2625,29 @@ pub unsafe fn cel_frame_slot(frame: *mut W_CelFrame, i: i64) -> *mut CelRef {
 /// # Safety
 ///
 /// `frame` is a live [`W_CelFrame`].
-pub unsafe fn force_virtualizable_if_necessary(_frame: *mut W_CelFrame) {}
+#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+pub unsafe fn force_virtualizable_if_necessary(frame: *mut W_CelFrame) {
+    // `virtualizable.py` `force_now`: a residual helper that writes the
+    // frame must clear `TOKEN_TRACING_RESCALL` so `vable_after_residual_call`
+    // reloads the boxes. Leaving the token set tells the tracer the
+    // helper did not touch the frame.
+    let token = (*frame).vable_token;
+    if token == 0 {
+        return;
+    }
+    #[cfg(feature = "jit")]
+    {
+        let tracing = majit_metainterp::virtualizable::token_tracing_rescall() as usize;
+        if token == tracing {
+            (*frame).vable_token = 0;
+        } else {
+            // `compile.py ResumeGuardForcedDescr.force_now`: write the
+            // compiled virtual fields back and mark the guard forced.
+            crate::vm::portal::force_portal_driver_token(token as u64);
+            assert_eq!((*frame).vable_token, 0, "force_now must leave TOKEN_NONE");
+        }
+    }
+}
 
 /// The type value denoting `cls`.
 pub fn new_type(cls: &'static CelClass) -> *mut W_TypeObject {
@@ -2622,6 +2664,10 @@ pub fn new_type(cls: &'static CelClass) -> *mut W_TypeObject {
 /// `w_type` is a type value ([`W_TypeObject`]); `host_index` is a slot in
 /// this thread's heap table. D12: the host lives as long as the heap — no
 /// finalizer, no `Drop` on the leaf.
+#[cfg_attr(
+    feature = "jit",
+    majit_macros::jit_immutable_fields(w_type, host_index)
+)]
 #[repr(C)]
 #[allow(non_camel_case_types)]
 pub struct W_OpaqueObject {

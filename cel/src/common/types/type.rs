@@ -166,7 +166,6 @@ pub(crate) const TYPE_CONST_NAMES: [&str; 11] = [
 
 /// The index [`TYPE_CONST_NAMES`] gives `name`, or `None` for a type it does
 /// not carry.
-#[allow(dead_code)]
 pub(crate) fn type_const_id(name: &str) -> Option<i64> {
     TYPE_CONST_NAMES
         .iter()
