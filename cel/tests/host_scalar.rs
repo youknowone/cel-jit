@@ -120,3 +120,46 @@ fn reregister_takes_effect_on_the_next_call() {
     });
     agree(&ctx, "add(x, y)");
 }
+
+/// Straight-line code compiles at the function entry once the driver's
+/// threshold is crossed. The replacement has to be visible in that code.
+#[cfg(feature = "jit")]
+#[test]
+fn reregister_after_the_portal_compiles() {
+    // SAFETY: read when this program's driver is created, which is its
+    // first execute below. Same knob `portal_reentry` uses.
+    unsafe { std::env::set_var("CEL_PORTAL_THRESHOLD", "100") };
+
+    let mut ctx = Context::default();
+    bind_xy(&mut ctx);
+    ctx.add_function("add", |a: i64, b: i64| a + b);
+    ctx.add_function("multiply", |a: i64, b: i64| a * b);
+    let program = Program::compile("add(x, y) + multiply(a, b)").unwrap();
+    for i in 0..200 {
+        let vm = program.execute(&ctx);
+        assert_eq!(vm.unwrap(), Value::Int(45), "warm {i}");
+    }
+
+    ctx.add_function("add", |a: i64, b: i64| a.wrapping_mul(b));
+    let walker = Value::resolve_value(program.expression(), &ctx).unwrap();
+    assert_eq!(walker, Value::Int(10 * 20 + 5 * 3));
+    for i in 0..5 {
+        assert_eq!(
+            program.execute(&ctx).unwrap(),
+            walker,
+            "after re-register {i}"
+        );
+    }
+
+    ctx.add_function(
+        "multiply",
+        |a: i64, b: i64| -> Result<i64, ExecutionError> {
+            let _ = (a, b);
+            Err(ExecutionError::function_error("multiply", "replaced"))
+        },
+    );
+    let walker = Value::resolve_value(program.expression(), &ctx);
+    let vm = program.execute(&ctx);
+    assert_eq!(show(&walker), show(&vm));
+    assert!(vm.is_err(), "erased replacement must run");
+}

@@ -11,9 +11,9 @@ use crate::runtime::convert::{
 };
 use crate::runtime::error::{take_error, CelErrCode, ERROR_SENTINEL};
 use crate::runtime::object::{
-    bytes_len, list_int_at, list_len, map_len, string_byte_len, tuple_item, tuple_len, w_kind,
-    w_type, CelKind, CelRef, ListStrategy, W_BoolObject, W_DoubleObject, W_IntColumn, W_IntObject,
-    W_ListObject, W_OptionalObject, W_UIntObject,
+    bytes_len, list_int_at, list_len, map_len, new_optional, new_optional_none, string_byte_len,
+    tuple_item, tuple_len, w_kind, w_type, CelKind, CelRef, ListStrategy, W_BoolObject,
+    W_DoubleObject, W_IntColumn, W_IntObject, W_ListObject, W_OptionalObject, W_UIntObject,
 };
 use crate::runtime::object_array::{items_block_items_base, items_capacity};
 use crate::ExecutionError::NoSuchOverload;
@@ -3865,6 +3865,34 @@ pub(crate) fn interned_contains(container: CelRef, needle: CelRef) -> Result<boo
             Ok(unsafe { map_contains_key(container, needle) })
         }
         _ => Err(ExecutionError::NoSuchOverload),
+    }
+}
+
+/// `a?.b` on an interned receiver.
+///
+/// A miss on a plain map/struct is `NoSuchKey`. A miss on an optional
+/// receiver folds to `optional.of(optional.none)`. Anything else is
+/// `NoSuchOverload` so the caller can decline.
+pub(crate) fn interned_opt_select(w: CelRef, field: &str) -> Result<CelRef, ExecutionError> {
+    let (inner, optional) = if unsafe { w_kind(w) } == CelKind::Optional {
+        let inner = unsafe { (*w.cast::<W_OptionalObject>()).w_value };
+        if inner.is_null() {
+            return Ok(new_optional_none() as CelRef);
+        }
+        (inner, true)
+    } else {
+        (w, false)
+    };
+    let found = match unsafe { w_kind(inner) } {
+        CelKind::Map => unsafe { interned_map_lookup_string(inner, field) },
+        #[cfg(feature = "structs")]
+        CelKind::Struct => unsafe { crate::runtime::object::struct_lookup_field(inner, field) },
+        _ => return Err(ExecutionError::NoSuchOverload),
+    };
+    match found {
+        Some(item) => Ok(new_optional(item) as CelRef),
+        None if optional => Ok(new_optional(new_optional_none() as CelRef) as CelRef),
+        None => Err(ExecutionError::NoSuchKey(Arc::new(field.to_string()))),
     }
 }
 

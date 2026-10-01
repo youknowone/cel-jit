@@ -72,6 +72,11 @@ const SEGMENT_BYTES: usize = 64 * 1024;
 /// without `majit_gc` stores the same `u64`.
 pub const GC_HEADER_SIZE: usize = 8;
 
+#[cfg(feature = "jit")]
+const _: () = {
+    assert!(GC_HEADER_SIZE == majit_gc::header::GcHeader::SIZE);
+};
+
 /// `GC_HEADER_SIZE + size`, rounded up to a multiple of 8 so a nursery
 /// bump leaves `nursery_free` 8-aligned. The compiled inline bump does
 /// not realign.
@@ -538,6 +543,13 @@ pub struct CelHeap {
     next_region_id: Cell<u32>,
     /// Detached, rewound regions waiting for the next Context on this thread.
     spare_regions: RefCell<Vec<NonNull<BindRegion>>>,
+    /// VM word [`crate::vm::portal`] publishes for a re-entering step.
+    /// The heap is already resolved for the call; this is not a second
+    /// thread-local.
+    pub(crate) portal_vm: Cell<i64>,
+    /// Driver [`crate::vm::portal`] is inside, so a `may_force` residual
+    /// can reach it without another thread-local.
+    pub(crate) active_driver: Cell<usize>,
 }
 
 impl CelHeap {
@@ -562,6 +574,8 @@ impl CelHeap {
             regions: RefCell::new(Vec::new()),
             next_region_id: Cell::new(0),
             spare_regions: RefCell::new(Vec::new()),
+            portal_vm: Cell::new(0),
+            active_driver: Cell::new(0),
         }
     }
 
@@ -1149,6 +1163,374 @@ pub(crate) fn heap_ptr() -> *const CelHeap {
 #[inline]
 pub fn with_heap<R>(f: impl FnOnce(&CelHeap) -> R) -> R {
     HEAP.with(f)
+}
+
+/// Framework GC descr (`gc.py GcLLDescr_framework`) over this thread's
+/// [`CelHeap`].
+///
+/// Every object carries a type-id word at `payload - GcHeader::SIZE`.
+/// `supports_guard_gc_type` is true, so a portal loop may unroll.
+/// `gc.py get_nursery_free_addr` / `get_nursery_top_addr` name the two
+/// cells on the heap. Allocation bumps the nursery and never collects.
+/// `JITFRAME` is registered after the cel types (`jitframe.py`
+/// `jitframe_allocate`): a type table cannot be installed without that id.
+/// The frame itself is a nursery object, reclaimed with the rest of the
+/// evaluation's young objects.
+#[cfg(feature = "jit")]
+pub struct CelGc {
+    types: majit_gc::trace::TypeRegistry,
+    jitframe_type_id: Option<u32>,
+}
+
+#[cfg(feature = "jit")]
+impl Default for CelGc {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(feature = "jit")]
+impl CelGc {
+    /// Register the root, every class and every block, then freeze.
+    ///
+    /// Ids are the [`super::lltype::CelGcType`] literals.
+    /// [`super::registration::register_cel_classes_unfrozen`] checks that.
+    pub fn new() -> CelGc {
+        let mut gc = CelGc {
+            types: majit_gc::trace::TypeRegistry::new(),
+            jitframe_type_id: None,
+        };
+        let _ids = super::registration::register_cel_classes_unfrozen(&mut gc);
+        // After the cel types, so [`super::lltype::CelGcType::TYPE_ID`]
+        // stays the literal. `check_jitframe_descr` refuses the install
+        // when this id is missing.
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            majit_metainterp::register_active_backend_jitframe_gc_type(&mut gc);
+        }
+        majit_gc::GcAllocator::freeze_types(&mut gc);
+        gc
+    }
+
+    /// Payload of `payload` bytes. `header` is the word at `payload - 8`.
+    ///
+    /// `0` is a zero header: the compiled nursery slow path stores the
+    /// type id itself. A nonzero word is `u64::from(type_id)`, which is
+    /// what `GcHeader::new` stores.
+    fn bump_payload(&mut self, header: u64, payload: usize) -> majit_ir::GcRef {
+        let Some(total) = try_headered_total(payload) else {
+            return majit_ir::GcRef(0);
+        };
+        let raw = unsafe { (*heap_ptr()).bump_nursery(total, GC_HEADER_SIZE) };
+        unsafe { (raw as *mut u64).write(header) };
+        majit_ir::GcRef(unsafe { raw.add(GC_HEADER_SIZE) } as usize)
+    }
+
+    fn bump_typed(&mut self, type_id: u32, payload: usize) -> majit_ir::GcRef {
+        // Frames are nursery objects (`jitframe.py jitframe_allocate`),
+        // reclaimed with the rest of the evaluation's young objects.
+        self.bump_payload(u64::from(type_id), payload)
+    }
+}
+
+#[cfg(feature = "jit")]
+impl majit_gc::GcAllocator for CelGc {
+    fn alloc_nursery(&mut self, size: usize) -> majit_ir::GcRef {
+        self.bump_payload(0, size)
+    }
+
+    fn alloc_nursery_no_collect(&mut self, size: usize) -> majit_ir::GcRef {
+        self.bump_payload(0, size)
+    }
+
+    fn alloc_nursery_typed(&mut self, type_id: u32, size: usize) -> majit_ir::GcRef {
+        self.bump_typed(type_id, size)
+    }
+
+    fn alloc_nursery_no_collect_typed(&mut self, type_id: u32, size: usize) -> majit_ir::GcRef {
+        self.bump_typed(type_id, size)
+    }
+
+    fn try_alloc_nursery_no_collect_typed(&mut self, type_id: u32, size: usize) -> majit_ir::GcRef {
+        self.bump_typed(type_id, size)
+    }
+
+    unsafe fn try_alloc_nursery_no_collect_typed_with_placement(
+        &mut self,
+        type_id: u32,
+        size: usize,
+        needs_write_barrier: *mut bool,
+    ) -> majit_ir::GcRef {
+        // Every result is nursery. A young pointer stored into it needs
+        // no creation barrier, and this descr never collects.
+        unsafe { *needs_write_barrier = false };
+        self.try_alloc_nursery_no_collect_typed(type_id, size)
+    }
+
+    unsafe fn alloc_nursery_collecting_typed_rooted(
+        &mut self,
+        type_id: u32,
+        size: usize,
+        _root: *mut majit_ir::GcRef,
+        needs_write_barrier: *mut bool,
+    ) -> majit_ir::GcRef {
+        unsafe { *needs_write_barrier = false };
+        self.alloc_nursery_typed(type_id, size)
+    }
+
+    unsafe fn alloc_fast_nursery_collecting_typed_roots(
+        &mut self,
+        type_id: u32,
+        size: usize,
+        _roots: *mut majit_ir::GcRef,
+        _root_count: usize,
+        needs_write_barrier: *mut bool,
+    ) -> majit_ir::GcRef {
+        unsafe { *needs_write_barrier = false };
+        self.alloc_nursery_typed(type_id, size)
+    }
+
+    fn alloc_varsize(
+        &mut self,
+        base_size: usize,
+        item_size: usize,
+        length: usize,
+    ) -> majit_ir::GcRef {
+        let Some(bytes) = item_size
+            .checked_mul(length)
+            .and_then(|n| base_size.checked_add(n))
+        else {
+            return majit_ir::GcRef(0);
+        };
+        // Untyped: header word stays 0, and the length word is not written.
+        self.bump_payload(0, bytes)
+    }
+
+    fn alloc_varsize_no_collect(
+        &mut self,
+        base_size: usize,
+        item_size: usize,
+        length: usize,
+    ) -> majit_ir::GcRef {
+        self.alloc_varsize(base_size, item_size, length)
+    }
+
+    fn alloc_varsize_typed(
+        &mut self,
+        type_id: u32,
+        base_size: usize,
+        item_size: usize,
+        length: usize,
+    ) -> majit_ir::GcRef {
+        let Some(payload) = item_size
+            .checked_mul(length)
+            .and_then(|n| base_size.checked_add(n))
+        else {
+            return majit_ir::GcRef(0);
+        };
+        if (type_id as usize) >= self.types.len() {
+            return majit_ir::GcRef(0);
+        }
+        let info = self.types.get(type_id);
+        let registered_varsize = info.item_size != 0;
+        let length_offset = info.length_offset;
+        let obj = self.bump_typed(type_id, payload);
+        // `malloc_varsize` writes the length when the registered shape is
+        // varsize. A fixed type leaves its first word to the caller.
+        if !obj.is_null() && registered_varsize {
+            unsafe { *((obj.0 + length_offset) as *mut usize) = length };
+        }
+        obj
+    }
+
+    fn alloc_oldgen_typed(&mut self, type_id: u32, size: usize) -> majit_ir::GcRef {
+        self.bump_typed(type_id, size)
+    }
+
+    fn alloc_young_nonmoving_typed(&mut self, type_id: u32, size: usize) -> majit_ir::GcRef {
+        self.bump_typed(type_id, size)
+    }
+
+    fn write_barrier(&mut self, _obj: majit_ir::GcRef) {}
+
+    fn jit_remember_young_pointer(&mut self, _obj: majit_ir::GcRef) {}
+
+    fn jit_remember_young_pointer_from_array(&mut self, _obj: majit_ir::GcRef) {}
+
+    fn remember_young_pointer_from_array2(
+        &mut self,
+        _obj: majit_ir::GcRef,
+        _index: usize,
+        _card_page_shift: u32,
+    ) {
+    }
+
+    fn collect_nursery(&mut self) {}
+
+    fn collect_full(&mut self) {}
+
+    /// Nothing moves, and [`Self::collect_nursery`] / [`Self::collect_full`]
+    /// are no-ops, so no walker has to find live jitframes.
+    /// `assembler.py` `_call_header_shadowstack` stays off when
+    /// `gcrootmap` is missing.
+    fn has_gcrootmap(&self) -> bool {
+        false
+    }
+
+    fn nursery_free(&self) -> *mut u8 {
+        unsafe { (*heap_ptr()).nursery_free.get() }
+    }
+
+    fn nursery_free_addr(&self) -> usize {
+        unsafe { core::ptr::addr_of!((*heap_ptr()).nursery_free) as usize }
+    }
+
+    fn nursery_top(&self) -> *const u8 {
+        unsafe { (*heap_ptr()).nursery_top.get() }
+    }
+
+    fn nursery_top_addr(&self) -> usize {
+        unsafe { core::ptr::addr_of!((*heap_ptr()).nursery_top) as usize }
+    }
+
+    fn max_nursery_object_size(&self) -> usize {
+        SEGMENT_BYTES
+    }
+
+    /// `gc.py GcLLDescr_framework.supports_guard_gc_type`.
+    fn supports_guard_gc_type(&self) -> bool {
+        true
+    }
+
+    fn register_type(&mut self, info: majit_gc::TypeInfo) -> u32 {
+        self.types.register(info)
+    }
+
+    fn freeze_types(&mut self) {
+        self.types.freeze_types();
+    }
+
+    fn assign_inheritance_ids_now(&mut self) {
+        self.types.assign_inheritance_ids_now();
+    }
+
+    fn types_frozen(&self) -> bool {
+        self.types.is_frozen()
+    }
+
+    fn has_type_registry(&self) -> bool {
+        true
+    }
+
+    fn set_jitframe_type_id(&mut self, id: u32) {
+        assert!(
+            (id as usize) < self.types.len(),
+            "JITFRAME type id {id} is not registered on this collector"
+        );
+        self.jitframe_type_id = Some(id);
+    }
+
+    fn jitframe_type_id(&self) -> Option<u32> {
+        self.jitframe_type_id
+    }
+
+    fn type_count(&self) -> usize {
+        self.types.len()
+    }
+
+    fn type_size(&self, type_id: u32) -> Option<usize> {
+        if (type_id as usize) < self.types.len() {
+            Some(self.types.get(type_id).size)
+        } else {
+            None
+        }
+    }
+
+    fn varsize_layout(&self, obj: majit_ir::GcRef) -> Option<majit_gc::GcVarSizeLayout> {
+        let type_id = self.get_actual_typeid(obj)?;
+        if type_id as usize >= self.types.len() {
+            return None;
+        }
+        let info = self.types.get(type_id);
+        (info.item_size != 0).then_some(majit_gc::GcVarSizeLayout {
+            base_size: info.size,
+            item_size: info.item_size,
+            items_have_gc_ptrs: info.items_have_gc_ptrs,
+        })
+    }
+
+    fn get_typeid_from_classptr_if_gcremovetypeptr(&self, classptr: usize) -> Option<u32> {
+        super::registration::type_id_for_classptr(classptr)
+    }
+
+    fn get_translated_info_for_typeinfo(&self) -> (usize, u8, usize) {
+        let table = self.types.type_info_table();
+        (
+            table.as_ptr() as usize,
+            majit_gc::trace::TypeEntry::SHIFT_BY,
+            majit_gc::trace::TypeInfoLayout::SIZE_OF_TI,
+        )
+    }
+
+    /// `gc.py _setup_guard_is_object` then
+    /// `get_translated_info_for_guard_is_object`: the infobits byte that
+    /// holds `T_IS_RPYTHON_INSTANCE`.
+    fn get_translated_info_for_guard_is_object(&self) -> (usize, u8) {
+        let infobits_offset = majit_gc::trace::TypeInfoLayout::INFOBITS_OFFSET;
+        let mask = majit_gc::trace::TypeInfoLayout::T_IS_RPYTHON_INSTANCE.to_le_bytes();
+        let mut plus = 0usize;
+        while plus < mask.len() && mask[plus] == 0 {
+            plus += 1;
+        }
+        (infobits_offset + plus, mask[plus])
+    }
+
+    fn check_is_object(&self, gcref: majit_ir::GcRef) -> bool {
+        if gcref.is_null() {
+            return false;
+        }
+        let Some(typeid) = self.get_actual_typeid(gcref) else {
+            return false;
+        };
+        let (base_type_info, shift_by, _sizeof_ti) = self.get_translated_info_for_typeinfo();
+        let (infobits_offset, is_object_flag) = self.get_translated_info_for_guard_is_object();
+        let typeid = typeid as usize;
+        if typeid >= self.types.len() {
+            return false;
+        }
+        let p = base_type_info + (typeid << shift_by) + infobits_offset;
+        let byte = unsafe { *(p as *const u8) };
+        (byte & is_object_flag) != 0
+    }
+
+    fn get_actual_typeid(&self, gcref: majit_ir::GcRef) -> Option<u32> {
+        if gcref.is_null() {
+            return None;
+        }
+        let header_addr = gcref.0.wrapping_sub(majit_gc::header::GcHeader::SIZE);
+        let header = unsafe { *(header_addr as *const majit_gc::header::GcHeader) };
+        Some(header.type_id())
+    }
+
+    fn typeid_is_object(&self, typeid: u32) -> Option<bool> {
+        if (typeid as usize) >= self.types.len() {
+            return None;
+        }
+        Some(self.types.get(typeid).is_object)
+    }
+
+    fn subclassrange_min_offset(&self) -> usize {
+        core::mem::offset_of!(super::object::CelClass, subclassrange_min)
+    }
+
+    fn subclass_range(&self, classptr: usize) -> Option<(i64, i64)> {
+        let cls = super::registration::class_at_ptr(classptr)?;
+        Some((cls.subclassrange_min, cls.subclassrange_max))
+    }
+
+    fn typeid_subclass_range(&self, typeid: u32) -> Option<(i64, i64)> {
+        super::registration::class_subclass_range(typeid)
+    }
 }
 
 /// Nursery bump captured at outermost entry. Leave compares [`Self::used`]
@@ -1770,5 +2152,16 @@ mod tests {
         drop(slot);
         assert!(!heap.contains(p as *const u8));
         assert_eq!(heap.allocated_objects(), 0);
+    }
+
+    /// `GcHeader::new` stores the type id in the low bits and nothing else.
+    #[cfg(feature = "jit")]
+    #[test]
+    fn gc_header_word_is_the_type_id() {
+        let id = crate::runtime::object::W_IntObject::TYPE_ID;
+        let header = majit_gc::header::GcHeader::new(id);
+        assert_eq!(header.tid_and_flags, u64::from(id));
+        assert_eq!(header.type_id(), id);
+        assert_eq!(GC_HEADER_SIZE, majit_gc::header::GcHeader::SIZE);
     }
 }

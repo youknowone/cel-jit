@@ -3,15 +3,25 @@ use crate::objects::{Opaque, TryIntoValue, Value};
 use crate::parser::Expression;
 use crate::{Env, ExecutionError};
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// Identity of one binding generation.
 ///
-/// Replaced on every binding change. Two generations are distinct objects.
-pub struct VersionTag;
+/// `ModuleDictStrategy.mutated` installs a fresh `VersionTag`. The id
+/// never repeats, so a freed tag whose address the allocator hands out
+/// again is still a different generation. `jit_interp` has no
+/// quasi-immutable field (`QuasiImmutDescr` / `record_quasi_immutable_field`
+/// are not reachable from `jit_inline`), so the portal promotes this id.
+pub struct VersionTag {
+    id: u64,
+}
 
 fn fresh_version() -> Box<VersionTag> {
-    Box::new(VersionTag)
+    static NEXT_VERSION: AtomicU64 = AtomicU64::new(1);
+    Box::new(VersionTag {
+        id: NEXT_VERSION.fetch_add(1, Ordering::Relaxed),
+    })
 }
 
 /// Context is a collection of variables and functions that can be used
@@ -68,7 +78,9 @@ pub enum Context<'a> {
         /// dropped with the Context. A child created for a comprehension
         /// never wraps, so it stays empty.
         region: crate::runtime::heap::BindRegionSlot,
-        /// Replaced on every binding change.
+        /// Replaced on every binding change. Quasi-immutable `version?`
+        /// on `ModuleDictStrategy`, spelled as a fresh box because
+        /// `jit_inline` cannot record `RecordQuasiImmutField`.
         version: Box<VersionTag>,
     },
     Child {
@@ -125,7 +137,6 @@ fn retain_public(ctx: &mut Context, value: Value) {
     }
 }
 
-#[cfg(test)]
 fn leaf_of(v: &Value) -> Option<crate::runtime::object::CelRef> {
     match v {
         Value::Interned(w) => Some(*w),
@@ -200,6 +211,38 @@ impl<'a> Context<'a> {
             Context::Root { version, .. } | Context::Child { version, .. } => version,
         };
         *slot = fresh_version();
+    }
+
+    /// `(id, pointer)` read once per portal entry.
+    ///
+    /// The id is the guard. The pointer is the version object
+    /// `getdictvalue_no_unwrapping` would promote; a rebind replaces it.
+    pub(crate) fn portal_version(&self) -> (i64, i64) {
+        let version = match self {
+            Context::Root { version, .. } | Context::Child { version, .. } => version.as_ref(),
+        };
+        (
+            version.id as i64,
+            version as *const VersionTag as usize as i64,
+        )
+    }
+
+    /// `version_ptr` still carries `version_id`.
+    ///
+    /// Both arguments are pure-call keys. A mismatch returns false so a
+    /// reused box address cannot publish the previous generation's leaf.
+    pub(crate) fn version_matches(&self, version_id: i64, version_ptr: i64) -> bool {
+        let version = version_ptr as usize as *const VersionTag;
+        !version.is_null()
+            && std::ptr::eq(
+                version,
+                match self {
+                    Context::Root { version, .. } | Context::Child { version, .. } => {
+                        version.as_ref() as *const VersionTag
+                    }
+                },
+            )
+            && unsafe { (*version).id as i64 } == version_id
     }
 
     fn retained_mut(&mut self) -> &mut Vec<Value> {
@@ -292,7 +335,6 @@ impl<'a> Context<'a> {
 
     /// The interned leaf stored under `name`, without cloning the public
     /// [`Value`]. A miss, or a binding with no leaf, is `None`.
-    #[cfg(test)]
     pub(crate) fn lookup_interned(&self, name: &str) -> Option<crate::runtime::object::CelRef> {
         let from_resolver =
             |resolver: &Option<&'a dyn VariableResolver>| resolver.and_then(|r| r.resolve(name));
@@ -319,6 +361,45 @@ impl<'a> Context<'a> {
                 if let Some(v) = from_resolver(resolver) {
                     return leaf_of(&v);
                 }
+                variables.get(name).and_then(leaf_of).or_else(|| {
+                    crate::common::types::r#type::type_ident(name)
+                        .as_ref()
+                        .and_then(leaf_of)
+                })
+            }
+        }
+    }
+
+    /// `true` when no [`VariableResolver`] sits on this context or an ancestor.
+    ///
+    /// The context is borrowed immutably for one evaluation, so the answer
+    /// does not change between iterations. Callers treat it as
+    /// `effectinfo.py` `EF_ELIDABLE_CANNOT_RAISE` (`pure.py` `OptPure`).
+    pub(crate) fn lookup_is_pure(&self) -> bool {
+        match self {
+            Context::Child {
+                resolver, parent, ..
+            } => resolver.is_none() && parent.lookup_is_pure(),
+            Context::Root { resolver, .. } => resolver.is_none(),
+        }
+    }
+
+    /// [`lookup_interned`] without consulting any resolver on the chain.
+    ///
+    /// Sound only when [`lookup_is_pure`] is true: a resolver can return a
+    /// different value on every call.
+    pub(crate) fn lookup_interned_pure(
+        &self,
+        name: &str,
+    ) -> Option<crate::runtime::object::CelRef> {
+        match self {
+            Context::Child {
+                variables, parent, ..
+            } => variables
+                .get(name)
+                .and_then(leaf_of)
+                .or_else(|| parent.lookup_interned_pure(name)),
+            Context::Root { variables, .. } => {
                 variables.get(name).and_then(leaf_of).or_else(|| {
                     crate::common::types::r#type::type_ident(name)
                         .as_ref()

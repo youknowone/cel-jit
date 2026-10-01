@@ -42,6 +42,8 @@ pub mod compile;
 pub mod error;
 pub mod interp;
 pub mod opcode;
+#[cfg(feature = "jit")]
+pub mod portal;
 
 pub use code::{CelCode, Handler, Insn};
 pub use compile::{compile, CompileError, CompileErrorKind};
@@ -52,6 +54,14 @@ pub use interp::{cel_eval_loop_with_fuse, map_loop_is_fusable, FuseArm};
 #[cfg(feature = "__drop-arm-probe")]
 pub use interp::{cel_eval_loop_with_probe, DropArm, IterAtArm, ProbePolicy};
 pub use opcode::{OpCode, OPCODE_COUNT};
+
+/// Length of this thread's portal driver table. Tests observe that dead
+/// code is swept and the table stays bounded.
+#[cfg(feature = "jit")]
+#[doc(hidden)]
+pub fn portal_driver_len() -> usize {
+    portal::driver_table_len()
+}
 
 use crate::common::ast::IdedExpr;
 use crate::{Context, ExecutionError, Value};

@@ -92,6 +92,9 @@ pub fn cel_eval_loop(code: &CelCode, ctx: &Context) -> Result<Value, ExecutionEr
             vm.shape.top
         };
     }
+    #[cfg(feature = "jit")]
+    let result = crate::vm::portal::eval_through_portal(&mut vm, code);
+    #[cfg(not(feature = "jit"))]
     let result = match vm.run() {
         Ok(value) => Ok(value),
         Err(err) => Err(vm.public_error(err)),
@@ -897,6 +900,9 @@ impl<'a> Vm<'a> {
             code.n_slots as i64,
             code.max_stack as i64,
         );
+        #[cfg(feature = "jit")]
+        let (frame, scratch) = (Vec::new(), None::<Box<Scratch>>);
+        #[cfg(not(feature = "jit"))]
         let (frame, scratch) = {
             let mut scratch = take_scratch_box();
             let mut frame = std::mem::take(&mut scratch.frame);
@@ -981,6 +987,66 @@ impl<'a> Vm<'a> {
     /// Exhaustive over [`CelErr`], so a variant added without a public
     /// counterpart is a compile error here rather than a silent
     /// `InternalError` at run time.
+    pub(crate) fn sync_pop_push_interned(&mut self, n_pop: usize, w: CelRef) {
+        let mut i = 0;
+        while i < n_pop {
+            let _ = self.pop_operand();
+            i += 1;
+        }
+        self.push_operand(Operand::Interned(w));
+    }
+
+    pub(crate) fn sync_push_interned(&mut self, w: CelRef) {
+        self.push_operand(Operand::Interned(w));
+    }
+
+    pub(crate) fn intern_context_var(&self, name: &str) -> Option<CelRef> {
+        self.ctx.lookup_interned(name)
+    }
+
+    /// No resolver on the context chain. Stable for this evaluation.
+    pub(crate) fn context_lookup_pure(&self) -> bool {
+        self.ctx.lookup_is_pure()
+    }
+
+    pub(crate) fn interned_unary_bits(&self, name: &str, w: CelRef) -> i64 {
+        match interned_unary_host(name, w) {
+            Ok(Some(out)) if out != ERROR_SENTINEL => out as i64,
+            _ => 0,
+        }
+    }
+
+    pub(crate) fn interned_temporal_int(&self, name: &str, w: CelRef) -> Option<i64> {
+        interned_temporal_accessor(name, w)
+    }
+
+    pub(crate) fn interned_map_key_list(&self, w: CelRef) -> CelRef {
+        unsafe { interned_map_keys(w) }
+    }
+
+    pub(crate) fn interned_list_index_list(&self, w: CelRef) -> CelRef {
+        unsafe { interned_list_indices(w) }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn sync_store_interned(&mut self, slot: u32, w: CelRef) {
+        let _ = self.pop_operand();
+        let _ = self.store_operand(slot, Operand::Interned(w));
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn sync_write_local(&mut self, slot: u32, w: CelRef) {
+        let _ = self.store_operand(slot, Operand::Interned(w));
+    }
+
+    pub(crate) fn sync_pop(&mut self) {
+        let _ = self.pop_operand();
+    }
+
+    pub(crate) fn park_return(&mut self, w: CelRef) {
+        *self.portal_ret = Some(Ok(crate::Value::from_interned(w)));
+    }
+
     pub(crate) fn public_error(&self, err: CelErr) -> ExecutionError {
         let name = |id: NameId| self.code.name(id).unwrap_or("?").to_string();
         // The operator name the public error carries is a property of the
@@ -1060,6 +1126,17 @@ impl<'a> Vm<'a> {
         unsafe { &*self.heap }
     }
 
+    #[inline]
+    pub(crate) fn logic_copy(&self, slot: u32) -> Option<CelResult<bool>> {
+        match self.scratch.as_ref() {
+            Some(s) => s.logic.get(slot as usize).copied(),
+            None if (slot as usize) < self.code.n_logic as usize => {
+                Some(Err(CelErr::InternalError))
+            }
+            None => None,
+        }
+    }
+
     /// Scratch cell back to never-wrote, without allocating the pool.
     ///
     /// Residual `And`/`Or` persist an outcome only for the merge that will
@@ -1109,6 +1186,47 @@ impl<'a> Vm<'a> {
     #[inline]
     fn box_int(&self, n: i64) -> CelRef {
         new_int_in(self.heap(), n) as CelRef
+    }
+
+    /// Copy interned cells back into the operand array.
+    ///
+    /// Portal interned arms write `locals_stack_w` and `valuestackdepth`
+    /// only. A residual instruction still reads `frame`, so this rebuilds
+    /// interned slots from the cells. A builder operand has no leaf and
+    /// keeps its existing variant: its cell is null and is not overwritten.
+    pub(crate) fn hydrate_from_cells(&mut self) {
+        self.ensure_scratch();
+        unsafe {
+            let vdepth = (*self.cel_frame).valuestackdepth as usize;
+            let cap = (*self.cel_frame).locals_stack_w.capacity();
+            let want = vdepth.max(self.stack_base);
+            if self.frame.len() > want {
+                self.frame.truncate(want);
+            }
+            while self.frame.len() < want {
+                self.frame.push(Operand::NULL);
+            }
+            let n = want.min(cap);
+            let mut i = 0;
+            while i < n {
+                let w = *cel_frame_slot(self.cel_frame, i as i64);
+                if !w.is_null() {
+                    match self.frame.get(i) {
+                        Some(
+                            Operand::EmptyList(_)
+                            | Operand::Ints(_)
+                            | Operand::List(_)
+                            | Operand::Refs(_)
+                            | Operand::Map(_)
+                            | Operand::MapRefs(_)
+                            | Operand::Struct(_, _),
+                        ) => {}
+                        _ => self.frame[i] = Operand::Interned(w),
+                    }
+                }
+                i += 1;
+            }
+        }
     }
 
     fn vable_cell(operand: &Operand) -> CelRef {
@@ -2882,6 +3000,7 @@ impl<'a> Vm<'a> {
     /// The name is what needs the [`Arc`]: `opt_select` indexes with a
     /// [`Value`] because a map key is one, and the operand it is given is
     /// spelled the same way the walker spells it.
+    #[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
     fn opt_select_arm(&mut self, a: u32) -> CelResult<()> {
         let operand = self.pop()?;
         let field = Value::String(Arc::new(self.name(a)?.to_string()));
@@ -2891,6 +3010,7 @@ impl<'a> Vm<'a> {
     }
 
     /// [`OpCode::NewMap`]: open a young map with room for `n` entries.
+    #[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
     fn new_map_arm(&mut self, n: u32) {
         let w = new_map_with_capacity_in(self.heap(), n as i64);
         self.push_operand(Operand::Interned(w as CelRef));
