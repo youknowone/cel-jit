@@ -33,8 +33,9 @@ use crate::common::types::{
     NULL_TYPE, OPTIONAL_TYPE, STRING_TYPE, TYPE_TYPE, UINT_TYPE,
 };
 use crate::objects::{
-    map_get_by_key, map_has_exact_key, try_build_map, Key, KeyRef, ListRef, ListStorage, Map,
-    MapStorage, Opaque, OptionalValue, RecordSchema, ScalarBank, ValueColumn, ORDERED_SCAN_LIMIT,
+    map_get_by_key, map_has_exact_key, try_build_map, InlineKeys, Key, KeyRef, ListRef,
+    ListStorage, Map, MapStorage, Opaque, OptionalValue, RecordSchema, ScalarBank, ValueColumn,
+    ORDERED_SCAN_LIMIT,
 };
 use crate::Value;
 
@@ -562,12 +563,16 @@ unsafe fn values_from_items(leaf: &W_ListObject) -> Result<ListRef, ConvertError
     })
 }
 
-/// Fixed allocations of one [`ListStorage::Record`] list: the key vector,
-/// the column vector, the schema `Arc`, and the storage `Arc`. Every scalar
-/// column shares one more word-buffer `Arc`.
+/// Fixed allocations of one owned [`ListStorage::Record`] list: the key
+/// vector, the column vector, the schema `Arc`, and the storage `Arc`. Every
+/// scalar column shares one more word-buffer `Arc`. Used when the row has
+/// more than [`ORDERED_SCAN_LIMIT`] fields.
 const RECORD_FIXED_ALLOCS: usize = 4;
-/// The shared word buffer behind a record list's columns.
+/// The shared word buffer behind an owned record list's columns.
 const RECORD_WORD_ALLOCS: usize = 1;
+/// A packed record list: the word `Vec`, the schema `Arc`, and the storage
+/// `Arc`. Field names and column descriptors live in the schema object.
+const PACKED_RECORD_ALLOCS: usize = 3;
 /// Fixed allocations of one shared [`ListStorage::Column`] plus the outer
 /// list of [`ListRef::window`]s: the word buffer, the storage `Arc`, and
 /// the outer list buffer.
@@ -798,9 +803,12 @@ unsafe fn try_coalesce_record_list(base: *mut CelRef, start: usize, n: usize) ->
     // table plus an `Arc` above it. The outer list is one more buffer.
     let per_row: usize = if fields <= ORDERED_SCAN_LIMIT { 1 } else { 2 };
     let current = per_row.saturating_mul(n).saturating_add(1);
-    let record_cost = RECORD_FIXED_ALLOCS
-        .saturating_add(RECORD_WORD_ALLOCS)
-        .saturating_add(key_allocs);
+    let structural = if fields <= ORDERED_SCAN_LIMIT {
+        PACKED_RECORD_ALLOCS
+    } else {
+        RECORD_FIXED_ALLOCS.saturating_add(RECORD_WORD_ALLOCS)
+    };
+    let record_cost = structural.saturating_add(key_allocs);
     if record_cost >= current {
         return None;
     }
@@ -814,12 +822,64 @@ unsafe fn build_record_list(
     base0: *mut CelRef,
     fields: usize,
 ) -> Option<ListRef> {
+    let total = n.checked_mul(fields)?;
+    if fields > ORDERED_SCAN_LIMIT || u32::try_from(n).is_err() {
+        return unsafe { build_owned_record_list(base, start, n, base0, fields, total) };
+    }
+    unsafe { build_packed_record_list(base, start, n, base0, fields, total) }
+}
+
+unsafe fn build_packed_record_list(
+    base: *mut CelRef,
+    start: usize,
+    n: usize,
+    base0: *mut CelRef,
+    fields: usize,
+    total: usize,
+) -> Option<ListRef> {
+    let mut words = vec![0; total];
+    let mut banks = [ScalarBank::Int; ORDERED_SCAN_LIMIT];
+    let mut keys = InlineKeys::empty();
+    for (field, bank_slot) in banks.iter_mut().take(fields).enumerate() {
+        let key = unsafe { map_field(base0, field, false) }?;
+        keys.push(ref_to_key(key).ok()?);
+        let (bank, _) = unsafe { scalar_word(map_field(base0, field, true)?) }?;
+        *bank_slot = bank;
+        let origin = field * n;
+        for row in 0..n {
+            let (row_base, row_fields) = unsafe { object_map_entries(*base.add(start + row)) }?;
+            if row_fields != fields {
+                return None;
+            }
+            let (row_bank, word) = unsafe { scalar_word(map_field(row_base, field, true)?) }?;
+            if row_bank != bank {
+                return None;
+            }
+            words[origin + row] = word;
+        }
+    }
+    let schema = Arc::new(RecordSchema::packed_scalars(
+        keys,
+        &banks[..fields],
+        words,
+        n,
+    ));
+    Some(ListRef::whole(Arc::new(ListStorage::Record(schema))))
+}
+
+unsafe fn build_owned_record_list(
+    base: *mut CelRef,
+    start: usize,
+    n: usize,
+    base0: *mut CelRef,
+    fields: usize,
+    total: usize,
+) -> Option<ListRef> {
     let mut keys = Vec::with_capacity(fields);
     for field in 0..fields {
         let key = unsafe { map_field(base0, field, false) }?;
         keys.push(ref_to_key(key).ok()?);
     }
-    let total = n.checked_mul(fields)?;
     let mut uninit: Arc<[MaybeUninit<i64>]> = Arc::new_uninit_slice(total);
     {
         let slot = Arc::get_mut(&mut uninit).expect("unique");
@@ -1657,10 +1717,10 @@ mod tests {
     }
 
     #[test]
-    fn four_scalar_maps_stay_entries_when_a_record_is_not_cheaper() {
+    fn four_scalar_maps_finish_as_one_record() {
         let (key, key_arc) = linked_string("k");
         let value = interned_to_public(int_rows(key, 4));
-        assert_entry_rows(&value);
+        assert_record_rows(&value, 4);
         let Value::List(list) = &value else {
             panic!("list");
         };

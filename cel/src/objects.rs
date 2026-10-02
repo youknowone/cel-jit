@@ -302,8 +302,68 @@ pub enum MapStorage {
 /// of these is built per output, so a row costs an index into it rather than a
 /// table of its own.
 pub struct RecordSchema {
-    keys: Vec<Key>,
-    columns: Vec<ValueColumn>,
+    body: SchemaBody,
+}
+
+/// One scalar column inside a packed schema: `len` words at `words[origin]`.
+#[derive(Clone, Copy)]
+struct ColumnMeta {
+    bank: ScalarBank,
+    origin: u32,
+    len: u32,
+}
+
+/// Up to [`ORDERED_SCAN_LIMIT`] field names stored in the schema object.
+pub(crate) struct InlineKeys {
+    n: u8,
+    keys: [MaybeUninit<Key>; ORDERED_SCAN_LIMIT],
+}
+
+impl InlineKeys {
+    pub(crate) fn empty() -> InlineKeys {
+        InlineKeys {
+            n: 0,
+            keys: std::array::from_fn(|_| MaybeUninit::uninit()),
+        }
+    }
+
+    pub(crate) fn push(&mut self, key: Key) {
+        let index = self.n as usize;
+        self.keys[index].write(key);
+        self.n = index as u8 + 1;
+    }
+
+    fn as_slice(&self) -> &[Key] {
+        unsafe { std::slice::from_raw_parts(self.keys.as_ptr().cast::<Key>(), self.n as usize) }
+    }
+}
+
+impl Drop for InlineKeys {
+    fn drop(&mut self) {
+        for slot in &mut self.keys[..self.n as usize] {
+            unsafe { slot.assume_init_drop() }
+        }
+    }
+}
+
+// Packed keeps its field names in this object. A box around them would be
+// a separate allocation on the finish path.
+#[allow(clippy::large_enum_variant)]
+enum SchemaBody {
+    /// Each column owns its bank. String columns and scalar columns that do
+    /// not share one word buffer use this.
+    Owned {
+        keys: Vec<Key>,
+        columns: Vec<ValueColumn>,
+    },
+    /// At most [`ORDERED_SCAN_LIMIT`] scalar columns. Names and descriptors
+    /// sit in this object; `words` is the one shared buffer.
+    Packed {
+        nrows: u32,
+        keys: InlineKeys,
+        metas: [ColumnMeta; ORDERED_SCAN_LIMIT],
+        words: Vec<i64>,
+    },
 }
 
 /// A string column: order-preserving ranks into the batch's distinct strings,
@@ -455,27 +515,86 @@ impl RecordSchema {
             columns.windows(2).all(|w| w[0].len() == w[1].len()),
             "a record schema's columns must agree on the row count"
         );
-        RecordSchema { keys, columns }
+        RecordSchema {
+            body: SchemaBody::Owned { keys, columns },
+        }
+    }
+
+    /// Scalar columns that share `words`, with at most [`ORDERED_SCAN_LIMIT`]
+    /// fields. `words` is `rows * keys` long, column-major: field `f` occupies
+    /// `words[f * rows .. (f + 1) * rows]`.
+    pub(crate) fn packed_scalars(
+        keys: InlineKeys,
+        banks: &[ScalarBank],
+        words: Vec<i64>,
+        rows: usize,
+    ) -> RecordSchema {
+        let nfields = keys.as_slice().len();
+        assert!(nfields > 0 && nfields <= ORDERED_SCAN_LIMIT);
+        assert_eq!(banks.len(), nfields);
+        assert_eq!(words.len(), rows * nfields);
+        let nrows = u32::try_from(rows).expect("a packed record fits in u32");
+        let mut metas = [ColumnMeta {
+            bank: ScalarBank::Int,
+            origin: 0,
+            len: 0,
+        }; ORDERED_SCAN_LIMIT];
+        for (field, bank) in banks.iter().copied().enumerate() {
+            metas[field] = ColumnMeta {
+                bank,
+                origin: u32::try_from(field * rows).expect("column origin fits in u32"),
+                len: nrows,
+            };
+        }
+        RecordSchema {
+            body: SchemaBody::Packed {
+                nrows,
+                keys,
+                metas,
+                words,
+            },
+        }
     }
 
     pub fn field_count(&self) -> usize {
-        self.keys.len()
+        self.keys().len()
     }
 
     /// How many records the columns hold.
     pub fn rows(&self) -> usize {
-        self.columns.first().map_or(0, ValueColumn::len)
+        match &self.body {
+            SchemaBody::Owned { columns, .. } => columns.first().map_or(0, ValueColumn::len),
+            SchemaBody::Packed { nrows, .. } => *nrows as usize,
+        }
     }
 
     pub fn keys(&self) -> &[Key] {
-        &self.keys
+        match &self.body {
+            SchemaBody::Owned { keys, .. } => keys,
+            SchemaBody::Packed { keys, .. } => keys.as_slice(),
+        }
+    }
+
+    fn value_at(&self, field: usize, row: usize) -> Value {
+        match &self.body {
+            SchemaBody::Owned { columns, .. } => columns[field].value_at(row),
+            SchemaBody::Packed { metas, words, .. } => {
+                let meta = metas[field];
+                assert!(
+                    row < meta.len as usize,
+                    "column index {row} past {}",
+                    meta.len
+                );
+                ValueColumn::scalar_value(meta.bank, words[meta.origin as usize + row])
+            }
+        }
     }
 
     /// A record carries a handful of fields, so a scan over the shared names
     /// beats hashing and needs no table of its own.
     fn position(&self, key: &(dyn AsKeyRef + '_)) -> Option<usize> {
         let key = key.as_keyref();
-        self.keys.iter().position(|k| k.as_keyref() == key)
+        self.keys().iter().position(|k| k.as_keyref() == key)
     }
 }
 
@@ -625,7 +744,7 @@ impl Map {
             MapStorage::Entries(e) => pairs_get(&e.entries, key).map(Cow::Borrowed),
             MapStorage::Record { schema, index } => {
                 let field = schema.position(key)?;
-                Some(Cow::Owned(schema.columns[field].value_at(*index)))
+                Some(Cow::Owned(schema.value_at(field, *index)))
             }
         }
     }
@@ -681,9 +800,9 @@ impl<'a> Iterator for MapIter<'a> {
                 field,
             } => {
                 let at = *field;
-                let key = schema.keys.get(at)?;
+                let key = schema.keys().get(at)?;
                 *field += 1;
-                Some((key, Cow::Owned(schema.columns[at].value_at(*index))))
+                Some((key, Cow::Owned(schema.value_at(at, *index))))
             }
         }
     }
@@ -3835,7 +3954,7 @@ fn map_keys(map: &Map) -> Vec<Value> {
             .iter()
             .map(|(k, _)| key_value(k))
             .collect(),
-        MapStorage::Record { schema, .. } => schema.keys.iter().map(key_value).collect(),
+        MapStorage::Record { schema, .. } => schema.keys().iter().map(key_value).collect(),
     }
 }
 
