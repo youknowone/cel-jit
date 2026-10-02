@@ -101,9 +101,9 @@ fn mallocs_per_eval_on_finish_rows() {
     assert_eq!(nested, 2, "[[x]] finish mallocs");
     assert_eq!(chain, 2, "string-chain finish mallocs");
     // A compiled eval also allocates resume buffers on top of the
-    // interpreter finish cost below. On the pinned majit, cranelift
-    // measures 7 and dynasm 8 for a packed record list, and 9 and 10
-    // for a scalar-row list.
+    // interpreter finish cost below. On the pinned majit, dynasm
+    // measures 3 and cranelift 4 for a packed record list and a
+    // scalar-row list.
     #[cfg(not(feature = "jit"))]
     {
         assert_eq!(maps, 1, "1-entry map list finish mallocs");
@@ -112,16 +112,16 @@ fn mallocs_per_eval_on_finish_rows() {
     }
     #[cfg(feature = "jit")]
     {
-        for (got, name) in [(maps, "1-entry map list"), (maps3, "3-entry map list")] {
+        for (got, name) in [
+            (maps, "1-entry map list"),
+            (maps3, "3-entry map list"),
+            (inner_lists, "list-of-lists"),
+        ] {
             assert!(
-                got == 7 || got == 8,
-                "{name} finish mallocs: cranelift 7, dynasm 8, got {got}"
+                got == 3 || got == 4,
+                "{name} finish mallocs: dynasm 3, cranelift 4, got {got}"
             );
         }
-        assert!(
-            inner_lists == 9 || inner_lists == 10,
-            "list-of-lists finish mallocs: cranelift 9, dynasm 10, got {inner_lists}"
-        );
     }
     assert_eq!(pair, 1, "[x, x] finish mallocs");
     assert_eq!(ints, 0, "int-list finish mallocs");
