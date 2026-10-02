@@ -93,14 +93,22 @@ fn mallocs_per_eval_on_finish_rows() {
     println!("list.map(e, {{k:e}}) mallocs/eval={maps}");
     println!("list.map(e, {{k,v,w}}) mallocs/eval={maps3}");
     let walker_one = count_walker(r#"{"a": x}"#, |ctx| ctx.add_variable_from_value("x", 15i64));
+    // Three method calls on a bound string. The joined name is not a
+    // function, so each probe leaves its argument on the stack.
+    let str_var = count(
+        r#"s.startsWith("hello") && s.endsWith("world") && s.contains("o w")"#,
+        |ctx| ctx.add_variable_from_value("s", "hello world"),
+    );
     println!("list.map(e, [e,e]) mallocs/eval={inner_lists}");
     println!("[x, x] mallocs/eval={pair}");
     println!("[1, 2, 3] mallocs/eval={ints}");
     println!("walker [x, x] mallocs/eval={walker_list}");
     println!("walker {{a: x}} mallocs/eval={walker_one}");
+    println!("string-var mallocs/eval={str_var}");
     assert_eq!(nested, 2, "[[x]] finish mallocs");
     // Constant concatenation is one pool string. Executing it clones that arc.
     assert_eq!(chain, 0, "string-chain finish mallocs");
+    assert_eq!(str_var, 0, "identifier string methods");
     // A compiled eval also allocates resume buffers on top of the
     // interpreter finish cost below. On the pinned majit, dynasm
     // measures 3 and cranelift 4 for a packed record list and a

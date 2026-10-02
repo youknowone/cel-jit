@@ -574,8 +574,8 @@ fn null_builder_portal_agrees_between_vm_and_walker() {
         "'a' in {'a': 1}",
         "-[1][0]",
         "![true][0]",
-        // Identifier receiver: CallQualified parks the argument, so the
-        // portal CallMethod slot is not a live leaf.
+        // Identifier receiver. The argument stays under the receiver, so
+        // CallMethod sees both cells.
         "s.startsWith(\"he\")",
         "s.startsWith(\"h\")",
         "s.startsWith(\"hello\") && s.endsWith(\"world\") && s.contains(\"o w\")",

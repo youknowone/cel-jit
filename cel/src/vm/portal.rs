@@ -73,9 +73,10 @@ fn slot_leaf(w: i64) -> Option<CelRef> {
 
 /// Operand `from_top` down the value stack (1 = top).
 ///
-/// Locals occupy `0..n_slots`. A `CallQualified` miss parks its arguments and
-/// drops `valuestackdepth` to the locals, so a later `CallMethod` must not
-/// treat a local — or the items-block header at index `-1` — as an operand.
+/// Locals occupy `0..n_slots`. A `CallQualified` miss that parked its
+/// arguments drops `valuestackdepth` onto the locals, so a later `CallMethod`
+/// must not treat a local, or the items-block header at index `-1`, as an
+/// operand. A miss that left the arguments keeps them below the receiver.
 fn operand_cell(frame: &W_CelFrame, from_top: i64) -> Option<CelRef> {
     let i = frame.valuestackdepth - from_top;
     if i < frame.n_slots {
@@ -3884,9 +3885,9 @@ fn step_hot(program: &CelCode, pc: usize) -> i64 {
                     _ => residual_dispatch(vm, here),
                 }
             } else if opcode == OP_CALL_METHOD && arity == 1 {
-                // After a CallQualified miss the arguments are parked and
-                // only the receiver sits on the stack. `operand_cell(2)`
-                // is then a local or the items-block header; decline.
+                // `operand_cell(2)` is absent when a miss parked the arguments
+                // and only the receiver remains. Both cells present means the
+                // arguments stayed.
                 match (operand_cell(frame, 1), operand_cell(frame, 2)) {
                     (Some(recv), Some(arg)) if !recv.is_null() && !arg.is_null() => {
                         let out = interned_method1(program, name, recv as i64, arg as i64);
@@ -6256,6 +6257,9 @@ fn run_cel_portal(
                 let here = pc as i64;
                 let kind = interned_qualified_kind(program, insn_a(program, pc));
                 let arity = insn_b(program, pc);
+                // `kind == 0` is every name besides the three optional
+                // constructors. Arity 0 has no arguments to pop. A positive
+                // arity still residualizes: `math.max` is kind 0 and has to run.
                 let next = if kind == 0 {
                     if arity == 0 {
                         here + 1

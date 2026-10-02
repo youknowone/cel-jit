@@ -754,20 +754,16 @@ pub(crate) struct Vm<'a> {
     pub(crate) heap: *const crate::runtime::heap::CelHeap,
     /// Result parked by the JIT portal when `dispatch_one` returns.
     pub(crate) portal_ret: core::mem::ManuallyDrop<Option<CelResult<Value>>>,
-    /// Arguments a missed [`OpCode::CallQualified`] popped, held for the
+    /// Arguments popped by a [`OpCode::CallQualified`] miss, held for the
     /// [`OpCode::CallMethod`] the compiler emitted right after it.
     ///
-    /// The pair is one call. The probe has to pop its arguments to ask
-    /// `find_overload` about them, and the receiver path then wants the same
-    /// values in the same order; re-pushing them for `pop_n` to rebuild is a
-    /// second `Vec` per member call on an identifier receiver, which is an
-    /// allocation the walker never pays -- it resolves its arguments once and
-    /// lends the probe a slice.
+    /// Built only when the joined name is a declared overload or a host
+    /// function. An undeclared joined name leaves the arguments on the stack,
+    /// and `CallMethod` pops them there.
     ///
-    /// Live only across the `LoadVar` that loads the receiver, and cleared on
-    /// both ways out: taken by [`OpCode::CallMethod`], and dropped by
-    /// [`Vm::unwind`], which is where that load's error goes when a `&&`/`||`
-    /// absorbs it and the method call never runs.
+    /// Live only across the `LoadVar` that loads the receiver. Taken by
+    /// [`OpCode::CallMethod`], and dropped by [`Vm::unwind`] when that load's
+    /// error is absorbed by `&&` / `||` and the method call never runs.
     pending_args: core::mem::ManuallyDrop<Option<Vec<Value>>>,
     /// Which lowering the probe's sites take. Probe only; see [`ProbePolicy`].
     #[cfg(feature = "__drop-arm-probe")]
@@ -1723,14 +1719,15 @@ impl<'a> Vm<'a> {
     /// there, and a pure loss on the path below.
     ///
     /// Both opcodes that can reach `call_member` pop through here.
-    /// `CallMethod` is the obvious one; `CallQualified` is the other, because
-    /// a miss hands its vector on rather than re-pushing it, and the compiler
-    /// only ever emits the probe ahead of a `CallMethod` of the same arity
+    /// `CallMethod` does when nothing is parked. `CallQualified` does when
+    /// the joined name is a declared overload or a host function, and a miss
+    /// then hands that vector on. The compiler only ever emits the probe
+    /// ahead of a `CallMethod` of the same arity
     /// (`compile::tests::a_probe_and_its_member_call_agree_on_arity`). The
-    /// probe pops BEFORE it knows hit from miss, and a HIT never fills the
-    /// spare slot -- so above arity 0, where the vector is allocated either
-    /// way, widening it costs nothing, but at arity 0 it turns a call that
-    /// allocated no argument vector at all into one that does. Nullary
+    /// probe still pops before it knows whether the overload matches, and a
+    /// hit never fills the spare slot. Above arity 0 the vector is allocated
+    /// either way, so widening it costs nothing. At arity 0 reserving a slot
+    /// would turn a call that allocated nothing into one that does. Nullary
     /// namespaced overloads are ordinary: `optional.none` is one, and so is
     /// any `ctx.add_function("ns.f", || ..)`.
     ///
@@ -2739,10 +2736,16 @@ impl<'a> Vm<'a> {
                 if let Some(step) = self.try_interned_qualified(NameId(a), b as usize, c, op)? {
                     return Ok(step);
                 }
+                // An unknown joined name is a member call. The arguments stay
+                // where the fall-through depth already counts them, and
+                // `CallMethod` reads them off the stack.
+                let joined = self.name(a)?;
+                if self.ctx.get_function(joined).is_none()
+                    && !self.ctx.env().declares_function(joined)
+                {
+                    return Ok(Step::Next);
+                }
                 let args = self.pop_n_for_member(b as usize)?;
-                // A miss parks the arguments instead of re-pushing them, so
-                // the stack the receiver path falls through to holds the
-                // receiver alone and `CallMethod` reads the park.
                 if let Some(value) = self.call_qualified(NameId(a), args)? {
                     self.push(value);
                     return Ok(Step::Jump(c));
@@ -3596,10 +3599,10 @@ impl<'a> Vm<'a> {
 
     /// The namespaced probe: `math.max(1, 2)`.
     ///
-    /// `None` is a miss, and a miss must leave no *evaluated* trace -- the
-    /// receiver has not run yet, because `optional.of(1)` names no variable
-    /// `optional`. It does leave `args` in [`Vm::pending_args`], which is
-    /// where the `CallMethod` after it takes them from.
+    /// Reached when the joined name is a declared overload or a host function.
+    /// `None` means the overload does not match these values. The receiver has
+    /// not run yet (`optional.of(1)` names no variable `optional`). The
+    /// arguments stay in [`Vm::pending_args`] for the following `CallMethod`.
     fn call_qualified(&mut self, joined: NameId, args: Vec<Value>) -> CelResult<Option<Value>> {
         let name = self.name(joined.0)?;
         let args = unpack_host_args(args);

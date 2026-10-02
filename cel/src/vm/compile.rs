@@ -1893,12 +1893,12 @@ mod tests {
 
     /// Every `CallQualified` is followed by a `CallMethod` of the SAME arity.
     ///
-    /// That pairing is what lets `Vm::call_qualified`'s miss hand its popped
-    /// arguments straight to `Vm::call_member`, and it is why the probe pops
-    /// with the receiver's slot already reserved: on a miss that vector is the
-    /// one the receiver gets prepended to, and on a hit the spare slot is not
-    /// an allocation. A probe emitted without its member call would make both
-    /// claims false, so the pairing is asserted rather than assumed.
+    /// On a miss that popped, `Vm::call_qualified` hands that vector to
+    /// `Vm::call_member`, and the probe reserves the receiver's slot because
+    /// that vector is the one the receiver is prepended to. A hit never fills
+    /// the spare slot, and arity 0 reserves nothing. A probe emitted without
+    /// its member call would make both claims false, so the pairing is
+    /// asserted rather than assumed.
     #[test]
     fn a_probe_and_its_member_call_agree_on_arity() {
         for source in [
