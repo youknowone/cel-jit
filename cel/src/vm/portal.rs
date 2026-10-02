@@ -670,6 +670,18 @@ fn interned_method1(program: &CelCode, name_idx: i64, recv: i64, arg: i64) -> i6
     }
 }
 
+/// [`interned_method1`] as a reference. Null declines, including
+/// `ERROR_SENTINEL`, so the portal stores a real object.
+#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+fn method1_cell(program: &CelCode, name_idx: i64, recv: CelRef, arg: CelRef) -> CelRef {
+    let out = interned_method1(program, name_idx, recv as i64, arg as i64);
+    if out == 0 || out == ERROR_SENTINEL as i64 {
+        core::ptr::null_mut()
+    } else {
+        out as usize as CelRef
+    }
+}
+
 /// `0` unknown, `1` optional.none, `2` optional.of, `3` optional.ofNonZeroValue.
 #[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
 fn interned_qualified_kind(program: &CelCode, name_idx: i64) -> i64 {
@@ -4255,6 +4267,27 @@ fn host_int2_entry(ctx_bits: i64, program: *const CelCode, name: i64) -> i64 {
     ctx.int2_entry(name).unwrap_or(0)
 }
 
+/// `1` when the joined name has to run as a function, else `0`.
+///
+/// A null context or a missing name returns `1`, so the erased path runs.
+/// Reads the registry on every call, so `add_function` is visible to the
+/// next call.
+#[cfg_attr(feature = "jit", majit_macros::dont_look_inside_cannot_raise)]
+fn qualified_name_is_callable(ctx_bits: i64, program: &CelCode, name: i64) -> i64 {
+    if ctx_bits == 0 {
+        return 1;
+    }
+    let ctx = unsafe { &*(ctx_bits as usize as *const crate::context::Context) };
+    let Some(name) = program.name(NameId(name as u32)) else {
+        return 1;
+    };
+    if ctx.get_function(name).is_some() || ctx.env().declares_function(name) {
+        1
+    } else {
+        0
+    }
+}
+
 /// `ScalarFn::Int2` at `entry`. The word is [`crate::magic::ScalarFn::entry_word`].
 #[cfg_attr(feature = "jit", majit_macros::dont_look_inside_cannot_raise)]
 fn host_call2_i(entry: i64, a: i64, b: i64) -> i64 {
@@ -4408,6 +4441,8 @@ fn host_call2_i(entry: i64, a: i64, b: i64) -> i64 {
         interned_temporal => residual_int,
         interned_optional_unary => residual_int,
         interned_method1 => residual_int,
+        method1_cell => residual_ref,
+        qualified_name_is_callable => residual_int_cannot_raise,
         interned_optional_state => residual_int,
         interned_optional_inner => residual_int,
         interned_as_bool => residual_int,
@@ -6187,6 +6222,33 @@ fn run_cel_portal(
                     } else {
                         slow_pc(vm, here)
                     }
+                } else if arity == 1 {
+                    // The receiver was pushed last. A parked miss leaves only
+                    // that receiver, and the argument index then names a local.
+                    let arg_i = depth - 2;
+                    if arg_i >= code_n_slots(program) {
+                        let recv = state.frame.locals_stack_w[i];
+                        let arg = state.frame.locals_stack_w[arg_i];
+                        if !recv.is_null() {
+                            if !arg.is_null() {
+                                let r = method1_cell(program, name, recv, arg);
+                                if r.is_null() {
+                                    slow_pc(vm, here)
+                                } else {
+                                    state.frame.locals_stack_w[arg_i] = r;
+                                    state.frame.locals_stack_w[i] = core::ptr::null_mut();
+                                    state.frame.valuestackdepth = depth - 1;
+                                    here + 1
+                                }
+                            } else {
+                                slow_pc(vm, here)
+                            }
+                        } else {
+                            slow_pc(vm, here)
+                        }
+                    } else {
+                        slow_pc(vm, here)
+                    }
                 } else {
                     slow_pc(vm, here)
                 };
@@ -6255,16 +6317,23 @@ fn run_cel_portal(
                 state.frame.last_instr = pc as i64;
                 let vm = state.vm;
                 let here = pc as i64;
-                let kind = interned_qualified_kind(program, insn_a(program, pc));
+                let name = insn_a(program, pc);
+                let kind = interned_qualified_kind(program, name);
                 let arity = insn_b(program, pc);
                 // `kind == 0` is every name besides the three optional
                 // constructors. Arity 0 has no arguments to pop. A positive
-                // arity still residualizes: `math.max` is kind 0 and has to run.
+                // arity falls through when the joined name is not a function;
+                // `math.max` still runs.
                 let next = if kind == 0 {
                     if arity == 0 {
                         here + 1
                     } else {
-                        slow_pc(vm, here)
+                        let callable = qualified_name_is_callable(state.ctx, program, name);
+                        if callable == 0 {
+                            here + 1
+                        } else {
+                            slow_pc(vm, here)
+                        }
                     }
                 } else {
                     slow_pc(vm, here)

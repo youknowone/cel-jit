@@ -188,6 +188,8 @@ fn compiled_optional_opcodes_match_the_walker() {
     agree_optional("list.map(e, {?\"k\": optional.of(e)})", 150);
     agree_optional("list.map(e, {?\"k\": optional.none()})", 150);
     agree_optional("list.map(e, {?\"k\": e})", 150);
+    agree_optional("list.map(e, optional.of(e).orValue(0))", 40);
+    agree_optional("list.map(e, optional.none().orValue(e))", 40);
 }
 
 fn agree_compiled_list(src: &str, list: Vec<i64>, times: usize) {
@@ -499,4 +501,48 @@ fn record_name_equality_answers_after_the_portal_compiles() {
             "filter != n1 {i}"
         );
     }
+}
+
+/// One-argument string methods stay on the compiled loop, including a field
+/// receiver and a free-variable receiver. `math.max` is a real function and
+/// still runs.
+#[test]
+fn string_methods_answer_after_the_portal_compiles() {
+    unsafe { std::env::set_var("CEL_PORTAL_THRESHOLD", "100") };
+    let tags: Vec<Value> = (0..256i64)
+        .map(|i| {
+            if i == 255 {
+                Value::from("alpha")
+            } else if i % 2 == 0 {
+                Value::from("beta-row")
+            } else {
+                Value::from("other-row")
+            }
+        })
+        .collect();
+    let items: Vec<Value> = (0..256i64)
+        .map(|i| {
+            let mut map = std::collections::HashMap::new();
+            let tag = if i == 255 { "alpha" } else { "other-row" };
+            map.insert("tag", Value::from(tag));
+            Value::from(map)
+        })
+        .collect();
+    let mut ctx = Context::default();
+    ctx.add_variable_from_value("tags", Value::list(tags));
+    ctx.add_variable_from_value("items", Value::list(items));
+    ctx.add_variable_from_value("s", "alpha");
+    ctx.add_variable_from_value("list", (1..=256i64).collect::<Vec<_>>());
+    agree_compiled_in(r#"tags.exists(t, t.startsWith("alp"))"#, &ctx, 20);
+    agree_compiled_in(r#"tags.map(t, t.startsWith("a"))"#, &ctx, 20);
+    agree_compiled_in(r#"tags.map(t, t.endsWith("row"))"#, &ctx, 20);
+    agree_compiled_in(r#"tags.map(t, t.contains("bet"))"#, &ctx, 20);
+    agree_compiled_in(r#"items.exists(i, i.tag.startsWith("alp"))"#, &ctx, 20);
+    agree_compiled_in(r#"tags.exists(t, s.startsWith(t))"#, &ctx, 20);
+    agree_compiled_in("list.map(e, math.max(e, 2))", &ctx, 20);
+    agree_compiled_in(r#"list.map(e, "alpha".startsWith("a"))"#, &ctx, 20);
+    if cfg!(feature = "regex") {
+        agree_compiled_in(r#"tags.exists(t, t.matches("alpha"))"#, &ctx, 20);
+    }
+    agree_compiled_in(r#"list.map(e, e.startsWith("a"))"#, &ctx, 5);
 }
