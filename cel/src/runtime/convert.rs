@@ -33,9 +33,9 @@ use crate::common::types::{
     NULL_TYPE, OPTIONAL_TYPE, STRING_TYPE, TYPE_TYPE, UINT_TYPE,
 };
 use crate::objects::{
-    map_get_by_key, map_has_exact_key, try_build_map, InlineKeys, Key, KeyRef, ListRef,
-    ListStorage, Map, MapStorage, Opaque, OptionalValue, RecordSchema, ScalarBank, ValueColumn,
-    ORDERED_SCAN_LIMIT,
+    map_get_by_key, map_has_exact_key, try_build_map, Key, KeyRef, ListRef, ListStorage, Map,
+    MapStorage, Opaque, OptionalValue, PackedRecordBuf, RecordSchema, ScalarBank, ScalarRowsBuf,
+    ValueColumn, ORDERED_SCAN_LIMIT,
 };
 use crate::Value;
 
@@ -570,13 +570,10 @@ unsafe fn values_from_items(leaf: &W_ListObject) -> Result<ListRef, ConvertError
 const RECORD_FIXED_ALLOCS: usize = 4;
 /// The shared word buffer behind an owned record list's columns.
 const RECORD_WORD_ALLOCS: usize = 1;
-/// A packed record list: the word `Vec`, the schema `Arc`, and the storage
-/// `Arc`. Field names and column descriptors live in the schema object.
-const PACKED_RECORD_ALLOCS: usize = 3;
-/// Fixed allocations of one shared [`ListStorage::Column`] plus the outer
-/// list of [`ListRef::window`]s: the word buffer, the storage `Arc`, and
-/// the outer list buffer.
-const COLUMN_FIXED_ALLOCS: usize = 3;
+/// A packed record list is one block: header, field names, and words.
+const PACKED_RECORD_ALLOCS: usize = 1;
+/// A shared scalar-row list is one block: header, per-row offsets, and words.
+const COLUMN_FIXED_ALLOCS: usize = 1;
 
 /// One row of a list-of-lists, when every element is the same scalar bank.
 enum RowSpan {
@@ -584,12 +581,12 @@ enum RowSpan {
     Words { bank: ScalarBank, len: usize },
 }
 
-/// A list of same-shaped scalar maps finishes as one [`ListStorage::Record`].
-/// A list of scalar lists finishes as one [`ListStorage::Column`] and a
-/// [`ListRef::window`] per row. Either form is built only when it allocates
-/// less than one container per element ([`try_build_map`] /
-/// [`ListRef::try_fill_ints`]). Fewer than three rows never wins: a single
-/// nested list is two allocations, and the shared form is three.
+/// A list of same-shaped scalar maps finishes as one packed record block.
+/// A list of scalar lists finishes as one scalar-row block. Either form is
+/// built only when it allocates less than one container per element
+/// ([`try_build_map`] / [`ListRef::try_fill_ints`]). Fewer than three rows
+/// stay separate: one nested list is two allocations, and the length guard
+/// keeps a two-row list on that path.
 ///
 /// # Safety
 ///
@@ -837,14 +834,15 @@ unsafe fn build_packed_record_list(
     fields: usize,
     total: usize,
 ) -> Option<ListRef> {
-    let mut words = vec![0; total];
-    let mut banks = [ScalarBank::Int; ORDERED_SCAN_LIMIT];
-    let mut keys = InlineKeys::empty();
-    for (field, bank_slot) in banks.iter_mut().take(fields).enumerate() {
+    if n.checked_mul(fields) != Some(total) {
+        return None;
+    }
+    let mut block = PackedRecordBuf::alloc(n, fields)?;
+    for field in 0..fields {
         let key = unsafe { map_field(base0, field, false) }?;
-        keys.push(ref_to_key(key).ok()?);
+        block.push_key(ref_to_key(key).ok()?);
         let (bank, _) = unsafe { scalar_word(map_field(base0, field, true)?) }?;
-        *bank_slot = bank;
+        block.set_column(field, bank);
         let origin = field * n;
         for row in 0..n {
             let (row_base, row_fields) = unsafe { object_map_entries(*base.add(start + row)) }?;
@@ -855,16 +853,10 @@ unsafe fn build_packed_record_list(
             if row_bank != bank {
                 return None;
             }
-            words[origin + row] = word;
+            block.write_word(origin + row, word);
         }
     }
-    let schema = Arc::new(RecordSchema::packed_scalars(
-        keys,
-        &banks[..fields],
-        words,
-        n,
-    ));
-    Some(ListRef::whole(Arc::new(ListStorage::Record(schema))))
+    Some(block.finish())
 }
 
 unsafe fn build_owned_record_list(
@@ -951,31 +943,30 @@ unsafe fn build_column_list(
     bank: ScalarBank,
     total: usize,
 ) -> Option<ListRef> {
-    let mut uninit: Arc<[MaybeUninit<i64>]> = Arc::new_uninit_slice(total);
-    {
-        let slot = Arc::get_mut(&mut uninit).expect("unique");
-        let mut at = 0usize;
-        for row in 0..n {
-            let written =
-                unsafe { write_row_words(*base.add(start + row), bank, &mut slot[at..]) }?;
-            at += written;
-        }
-        if at != total {
+    if u32::try_from(n).is_err() || u32::try_from(total).is_err() {
+        return None;
+    }
+    let mut block = ScalarRowsBuf::alloc(n, total, bank)?;
+    let mut at = 0usize;
+    for row in 0..n {
+        let len = unsafe { row_len(*base.add(start + row)) };
+        let end = at.checked_add(len)?;
+        if end > total {
             return None;
         }
+        let written =
+            unsafe { write_row_words(*base.add(start + row), bank, block.word_slot(at, len)) };
+        let written = written?;
+        if written != len {
+            return None;
+        }
+        block.set_row(row, at as u32, len as u32);
+        at = end;
     }
-    let words = unsafe { uninit.assume_init() };
-    let storage = Arc::new(ListStorage::Column(ValueColumn::Scalar { bank, words }));
-    let mut at = 0usize;
-    match ListRef::try_fill_values::<std::convert::Infallible>(n, |row| {
-        let len = unsafe { row_len(*base.add(start + row)) };
-        let window = ListRef::window(Arc::clone(&storage), at, len);
-        at += len;
-        Ok(Some(Value::List(window)))
-    }) {
-        Ok(list) => Some(list),
-        Err(err) => match err {},
+    if at != total {
+        return None;
     }
+    Some(block.finish())
 }
 
 unsafe fn row_len(w: CelRef) -> usize {
@@ -1668,10 +1659,7 @@ mod tests {
         let Value::List(list) = value else {
             panic!("list");
         };
-        assert!(
-            matches!(list.storage(), Some(ListStorage::Record(_))),
-            "rows share one record schema"
-        );
+        assert!(list.is_record(), "rows share one record schema");
         assert_eq!(list.len(), n);
     }
 

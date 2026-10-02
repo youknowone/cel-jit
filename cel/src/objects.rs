@@ -292,20 +292,19 @@ pub enum MapStorage {
     /// One row of a record batch. The field names and the column banks live in
     /// `schema` and are shared with every other row, so this row is an index
     /// into them and a field is boxed only when it is read.
-    Record {
-        schema: Arc<RecordSchema>,
-        index: usize,
-    },
+    Record { schema: RecordRows, index: usize },
 }
 
 /// The field names and column banks shared by every row of a record batch. One
 /// of these is built per output, so a row costs an index into it rather than a
 /// table of its own.
 pub struct RecordSchema {
-    body: SchemaBody,
+    keys: Vec<Key>,
+    columns: Vec<ValueColumn>,
 }
 
-/// One scalar column inside a packed schema: `len` words at `words[origin]`.
+/// One scalar column inside a packed record block: `len` words at
+/// `words[origin]`.
 #[derive(Clone, Copy)]
 struct ColumnMeta {
     bank: ScalarBank,
@@ -313,7 +312,7 @@ struct ColumnMeta {
     len: u32,
 }
 
-/// Up to [`ORDERED_SCAN_LIMIT`] field names stored in the schema object.
+/// Up to [`ORDERED_SCAN_LIMIT`] field names stored in the record block.
 pub(crate) struct InlineKeys {
     n: u8,
     keys: [MaybeUninit<Key>; ORDERED_SCAN_LIMIT],
@@ -344,26 +343,6 @@ impl Drop for InlineKeys {
             unsafe { slot.assume_init_drop() }
         }
     }
-}
-
-// Packed keeps its field names in this object. A box around them would be
-// a separate allocation on the finish path.
-#[allow(clippy::large_enum_variant)]
-enum SchemaBody {
-    /// Each column owns its bank. String columns and scalar columns that do
-    /// not share one word buffer use this.
-    Owned {
-        keys: Vec<Key>,
-        columns: Vec<ValueColumn>,
-    },
-    /// At most [`ORDERED_SCAN_LIMIT`] scalar columns. Names and descriptors
-    /// sit in this object; `words` is the one shared buffer.
-    Packed {
-        nrows: u32,
-        keys: InlineKeys,
-        metas: [ColumnMeta; ORDERED_SCAN_LIMIT],
-        words: Vec<i64>,
-    },
 }
 
 /// A string column: order-preserving ranks into the batch's distinct strings,
@@ -515,86 +494,122 @@ impl RecordSchema {
             columns.windows(2).all(|w| w[0].len() == w[1].len()),
             "a record schema's columns must agree on the row count"
         );
-        RecordSchema {
-            body: SchemaBody::Owned { keys, columns },
-        }
-    }
-
-    /// Scalar columns that share `words`, with at most [`ORDERED_SCAN_LIMIT`]
-    /// fields. `words` is `rows * keys` long, column-major: field `f` occupies
-    /// `words[f * rows .. (f + 1) * rows]`.
-    pub(crate) fn packed_scalars(
-        keys: InlineKeys,
-        banks: &[ScalarBank],
-        words: Vec<i64>,
-        rows: usize,
-    ) -> RecordSchema {
-        let nfields = keys.as_slice().len();
-        assert!(nfields > 0 && nfields <= ORDERED_SCAN_LIMIT);
-        assert_eq!(banks.len(), nfields);
-        assert_eq!(words.len(), rows * nfields);
-        let nrows = u32::try_from(rows).expect("a packed record fits in u32");
-        let mut metas = [ColumnMeta {
-            bank: ScalarBank::Int,
-            origin: 0,
-            len: 0,
-        }; ORDERED_SCAN_LIMIT];
-        for (field, bank) in banks.iter().copied().enumerate() {
-            metas[field] = ColumnMeta {
-                bank,
-                origin: u32::try_from(field * rows).expect("column origin fits in u32"),
-                len: nrows,
-            };
-        }
-        RecordSchema {
-            body: SchemaBody::Packed {
-                nrows,
-                keys,
-                metas,
-                words,
-            },
-        }
+        RecordSchema { keys, columns }
     }
 
     pub fn field_count(&self) -> usize {
-        self.keys().len()
+        self.keys.len()
     }
 
     /// How many records the columns hold.
     pub fn rows(&self) -> usize {
-        match &self.body {
-            SchemaBody::Owned { columns, .. } => columns.first().map_or(0, ValueColumn::len),
-            SchemaBody::Packed { nrows, .. } => *nrows as usize,
-        }
+        self.columns.first().map_or(0, ValueColumn::len)
     }
 
     pub fn keys(&self) -> &[Key] {
-        match &self.body {
-            SchemaBody::Owned { keys, .. } => keys,
-            SchemaBody::Packed { keys, .. } => keys.as_slice(),
-        }
+        &self.keys
     }
 
     fn value_at(&self, field: usize, row: usize) -> Value {
-        match &self.body {
-            SchemaBody::Owned { columns, .. } => columns[field].value_at(row),
-            SchemaBody::Packed { metas, words, .. } => {
-                let meta = metas[field];
-                assert!(
-                    row < meta.len as usize,
-                    "column index {row} past {}",
-                    meta.len
-                );
-                ValueColumn::scalar_value(meta.bank, words[meta.origin as usize + row])
-            }
+        self.columns[field].value_at(row)
+    }
+}
+
+/// Shared rows of one record list. An owned [`RecordSchema`], or the single
+/// block a packed scalar record list is stored in. A row holds this handle
+/// and an index; cloning bumps a reference count.
+pub struct RecordRows {
+    ptr: NonNull<u8>,
+}
+
+const RECORD_BLOCK_BIT: usize = 1;
+
+impl RecordRows {
+    fn from_schema(schema: Arc<RecordSchema>) -> Self {
+        let raw = Arc::into_raw(schema) as *mut u8;
+        debug_assert_eq!(raw.addr() & RECORD_BLOCK_BIT, 0);
+        RecordRows {
+            ptr: unsafe { NonNull::new_unchecked(raw) },
         }
     }
 
-    /// A record carries a handful of fields, so a scan over the shared names
-    /// beats hashing and needs no table of its own.
+    fn from_block(buf: ListBuf) -> Self {
+        debug_assert!(!buf.is_shared() && !buf.is_word_view());
+        debug_assert_eq!(buf.tag(), LIST_TAG_RECORD);
+        let raw = buf.ptr.as_ptr();
+        debug_assert_eq!(raw.addr() & RECORD_BLOCK_BIT, 0);
+        std::mem::forget(buf);
+        RecordRows {
+            ptr: unsafe { NonNull::new_unchecked(raw.map_addr(|a| a | RECORD_BLOCK_BIT)) },
+        }
+    }
+
+    fn is_block(&self) -> bool {
+        self.ptr.as_ptr().addr() & RECORD_BLOCK_BIT != 0
+    }
+
+    fn block_header(&self) -> NonNull<RcSliceHeader> {
+        debug_assert!(self.is_block());
+        let p = self.ptr.as_ptr().map_addr(|a| a & !RECORD_BLOCK_BIT);
+        unsafe { NonNull::new_unchecked(p.cast()) }
+    }
+
+    fn as_schema(&self) -> Option<&RecordSchema> {
+        if self.is_block() {
+            None
+        } else {
+            Some(unsafe { &*self.ptr.as_ptr().cast::<RecordSchema>() })
+        }
+    }
+
+    fn same_allocation(&self, other: &Self) -> bool {
+        self.is_block() == other.is_block()
+            && self.ptr.as_ptr().map_addr(|a| a & !RECORD_BLOCK_BIT)
+                == other.ptr.as_ptr().map_addr(|a| a & !RECORD_BLOCK_BIT)
+    }
+
+    fn field_count(&self) -> usize {
+        self.keys().len()
+    }
+
+    fn keys(&self) -> &[Key] {
+        if let Some(schema) = self.as_schema() {
+            return schema.keys();
+        }
+        record_prefix(self.block_header()).keys.as_slice()
+    }
+
+    fn value_at(&self, field: usize, row: usize) -> Value {
+        if let Some(schema) = self.as_schema() {
+            return schema.value_at(field, row);
+        }
+        record_value_at(self.block_header(), field, row)
+    }
+
     fn position(&self, key: &(dyn AsKeyRef + '_)) -> Option<usize> {
         let key = key.as_keyref();
         self.keys().iter().position(|k| k.as_keyref() == key)
+    }
+}
+
+impl Clone for RecordRows {
+    fn clone(&self) -> Self {
+        if self.is_block() {
+            rc_header_inc(unsafe { self.block_header().as_ref() });
+        } else {
+            unsafe { Arc::increment_strong_count(self.ptr.as_ptr().cast::<RecordSchema>()) };
+        }
+        RecordRows { ptr: self.ptr }
+    }
+}
+
+impl Drop for RecordRows {
+    fn drop(&mut self) {
+        if self.is_block() {
+            rc_header_dec(self.block_header());
+            return;
+        }
+        unsafe { Arc::decrement_strong_count(self.ptr.as_ptr().cast::<RecordSchema>()) };
     }
 }
 
@@ -662,7 +677,20 @@ impl Map {
     pub fn record(schema: Arc<RecordSchema>, index: usize) -> Map {
         debug_assert!(index < schema.rows(), "record index is past the columns");
         Map {
-            storage: MapStorage::Record { schema, index },
+            storage: MapStorage::Record {
+                schema: RecordRows::from_schema(schema),
+                index,
+            },
+        }
+    }
+
+    fn from_record_block(buf: ListBuf, index: usize) -> Map {
+        debug_assert!(index < buf.len());
+        Map {
+            storage: MapStorage::Record {
+                schema: RecordRows::from_block(buf),
+                index,
+            },
         }
     }
 
@@ -687,7 +715,7 @@ impl Map {
                     schema: sb,
                     index: ib,
                 },
-            ) => Arc::ptr_eq(sa, sb) && ia == ib,
+            ) => sa.same_allocation(sb) && ia == ib,
             _ => false,
         }
     }
@@ -781,7 +809,7 @@ pub enum MapIter<'a> {
     Object(std::collections::hash_map::Iter<'a, Key, Value>),
     Entries(std::slice::Iter<'a, (Key, Value)>),
     Record {
-        schema: &'a RecordSchema,
+        schema: &'a RecordRows,
         index: usize,
         field: usize,
     },
@@ -1244,10 +1272,12 @@ impl TryIntoValue for Value {
 /// `len` elements. `Arc<[T]>` is a fat pointer (16 bytes); putting one in
 /// [`ListRef`] would make [`Value`] 32.
 ///
-/// Every list buffer — object, ints, and shared column/record — starts with
-/// this header so [`ListBuf::clone`] / [`ListBuf::drop`] bump the count at
-/// the untagged address with no kind test. The static empty header starts
-/// at 1 and is never released: [`RcSlice::empty`] takes an extra count.
+/// Every list buffer starts with this header so [`ListBuf::clone`] /
+/// [`ListBuf::drop`] bump the count at the untagged address with no kind
+/// test. Object lists, int lists, packed record lists, and scalar-row lists
+/// are that header plus their payload. A shared column or an owned record
+/// list is a tagged `Arc` instead. The static empty header starts at 1 and
+/// is never released: [`RcSlice::empty`] takes an extra count.
 ///
 /// # Safety
 ///
@@ -1269,12 +1299,22 @@ struct RcSliceHeader {
 const LIST_TAG_OBJECT: usize = 0;
 const LIST_TAG_INTS: usize = 1;
 const LIST_TAG_SHARED: usize = 2;
+/// Packed scalar record: header, inline keys, then column-major `i64` words.
+const LIST_TAG_RECORD: usize = 3;
+/// Scalar rows: header, per-row start and length, then `i64` words.
+/// A handle with [`LIST_WORD_BIT`] set reads those words as one row.
+const LIST_TAG_ROWS: usize = 4;
 /// Low bit on a [`ListBuf`] pointer: set for a tagged `Arc<ListStorage>`.
 const LIST_SHARED_BIT: usize = 1;
+/// Second low bit on a [`ListBuf`] pointer. Set on a scalar window of a
+/// [`LIST_TAG_ROWS`] block and clear on the row list, so
+/// [`ListRef::shares_storage_with`] matches scalar windows of one block.
+const LIST_WORD_BIT: usize = 2;
 
 const _: () = {
-    assert!(core::mem::align_of::<ListStorage>() >= 2);
-    assert!(core::mem::align_of::<RcSliceHeader>() >= 2);
+    assert!(core::mem::align_of::<ListStorage>() >= 4);
+    assert!(core::mem::align_of::<RcSliceHeader>() >= 4);
+    assert!(core::mem::align_of::<RecordSchema>() >= 2);
 };
 
 static EMPTY_OBJECT: RcSliceHeader = RcSliceHeader {
@@ -1300,6 +1340,16 @@ fn rc_header_inc(header: &RcSliceHeader) {
     if old > (isize::MAX as usize) {
         std::process::abort();
     }
+}
+
+fn rc_header_dec(header: NonNull<RcSliceHeader>) {
+    // SAFETY: `header` is a live [`RcSliceHeader`]. The slow path runs only
+    // for the last owner of a heap buffer.
+    if unsafe { header.as_ref().strong.fetch_sub(1, AtomicOrdering::Release) } != 1 {
+        return;
+    }
+    std::sync::atomic::fence(AtomicOrdering::Acquire);
+    unsafe { list_buf_drop_slow(header) };
 }
 
 fn is_empty_header(ptr: *const RcSliceHeader) -> bool {
@@ -1592,7 +1642,7 @@ impl ListBuf {
         let raw = Arc::into_raw(arc) as *mut u8;
         debug_assert_eq!(raw.addr() & LIST_SHARED_BIT, 0);
         ListBuf {
-            // SAFETY: `Arc::into_raw` is aligned to `ListStorage` (>= 2), so
+            // SAFETY: `Arc::into_raw` is aligned to `ListStorage` (>= 4), so
             // setting the low bit does not collide with a live address.
             // `map_addr` keeps the allocation's provenance.
             ptr: unsafe { NonNull::new_unchecked(raw.map_addr(|a| a | LIST_SHARED_BIT)) },
@@ -1608,12 +1658,38 @@ impl ListBuf {
         self.ptr.as_ptr().map_addr(|a| a & !LIST_SHARED_BIT) as *const ListStorage
     }
 
+    fn is_word_view(&self) -> bool {
+        !self.is_shared() && self.ptr.as_ptr().addr() & LIST_WORD_BIT != 0
+    }
+
+    /// Header address. Clears [`LIST_WORD_BIT`]; the shared-arc bit is not
+    /// set on this handle.
+    fn header(&self) -> NonNull<RcSliceHeader> {
+        debug_assert!(!self.is_shared());
+        let p = self.ptr.as_ptr().map_addr(|a| a & !LIST_WORD_BIT);
+        unsafe { NonNull::new_unchecked(p.cast()) }
+    }
+
+    fn set_word_bit(&mut self) {
+        debug_assert!(!self.is_shared());
+        debug_assert_eq!(self.ptr.as_ptr().addr() & LIST_WORD_BIT, 0);
+        self.ptr =
+            unsafe { NonNull::new_unchecked(self.ptr.as_ptr().map_addr(|a| a | LIST_WORD_BIT)) };
+    }
+
+    fn row_window(&self, row: usize) -> ListRef {
+        let (start, len) = row_bounds(self.header(), row);
+        let mut buf = self.clone();
+        buf.set_word_bit();
+        ListRef { buf, start, len }
+    }
+
     fn tag(&self) -> usize {
         if self.is_shared() {
             return LIST_TAG_SHARED;
         }
-        // SAFETY: untagged pointer is a live [`RcSliceHeader`].
-        unsafe { (*self.ptr.as_ptr().cast::<RcSliceHeader>()).kind as usize }
+        // SAFETY: header address is a live [`RcSliceHeader`].
+        unsafe { self.header().as_ref().kind as usize }
     }
 
     fn raw(&self) -> NonNull<u8> {
@@ -1649,6 +1725,7 @@ impl ListBuf {
             LIST_TAG_OBJECT => self.object_slice().map_or(0, <[Value]>::len),
             LIST_TAG_INTS => self.ints_slice().map_or(0, <[i64]>::len),
             LIST_TAG_SHARED => self.shared().map_or(0, ListStorage::len),
+            LIST_TAG_RECORD | LIST_TAG_ROWS => unsafe { self.header().as_ref().len as usize },
             _ => 0,
         }
     }
@@ -1656,7 +1733,7 @@ impl ListBuf {
     fn object_slice(&self) -> Option<&[Value]> {
         match self.tag() {
             // SAFETY: tag names an object [`RcSlice<Value>`] header.
-            LIST_TAG_OBJECT => Some(unsafe { rc_slice_as_slice(self.ptr.cast()) }),
+            LIST_TAG_OBJECT => Some(unsafe { rc_slice_as_slice(self.header()) }),
             LIST_TAG_SHARED => match self.shared()? {
                 ListStorage::Object(v) => Some(v.as_slice()),
                 _ => None,
@@ -1668,7 +1745,7 @@ impl ListBuf {
     fn ints_slice(&self) -> Option<&[i64]> {
         match self.tag() {
             // SAFETY: tag names an int [`RcSlice<i64>`] header.
-            LIST_TAG_INTS => Some(unsafe { rc_slice_as_slice(self.ptr.cast()) }),
+            LIST_TAG_INTS => Some(unsafe { rc_slice_as_slice(self.header()) }),
             LIST_TAG_SHARED => match self.shared()? {
                 ListStorage::Ints(v) => Some(v.as_slice()),
                 _ => None,
@@ -1691,15 +1768,22 @@ impl ListBuf {
     }
 
     fn element_at(&self, index: usize) -> Value {
+        if self.is_word_view() {
+            return row_word(self.header(), index);
+        }
         if let Some(v) = self.object_slice() {
             return v[index].clone();
         }
         if let Some(v) = self.ints_slice() {
             return Value::Int(v[index]);
         }
-        match self.shared() {
-            Some(s) => s.element_at(index),
-            None => panic!("list buffer has no element at {index}"),
+        if let Some(s) = self.shared() {
+            return s.element_at(index);
+        }
+        match self.tag() {
+            LIST_TAG_RECORD => Value::Map(Map::from_record_block(self.clone(), index)),
+            LIST_TAG_ROWS => Value::List(self.row_window(index)),
+            _ => panic!("list buffer has no element at {index}"),
         }
     }
 }
@@ -1711,8 +1795,9 @@ impl Clone for ListBuf {
             // is live.
             unsafe { Arc::increment_strong_count(self.shared_ptr()) };
         } else {
-            // SAFETY: untagged pointer is a live [`RcSliceHeader`].
-            rc_header_inc(unsafe { self.ptr.cast::<RcSliceHeader>().as_ref() });
+            // SAFETY: header address is a live [`RcSliceHeader`]. The word
+            // bit, when set, stays on the cloned handle.
+            rc_header_inc(unsafe { self.header().as_ref() });
         }
         ListBuf {
             ptr: self.ptr,
@@ -1729,15 +1814,168 @@ impl Drop for ListBuf {
             unsafe { Arc::decrement_strong_count(self.shared_ptr()) };
             return;
         }
-        let header = self.ptr.cast::<RcSliceHeader>();
-        // SAFETY: untagged pointer is a live [`RcSliceHeader`].
-        if unsafe { header.as_ref().strong.fetch_sub(1, AtomicOrdering::Release) } != 1 {
-            return;
-        }
-        std::sync::atomic::fence(AtomicOrdering::Acquire);
-        // SAFETY: last owner of this owned buffer.
-        unsafe { list_buf_drop_slow(header) };
+        // SAFETY: header address is a live [`RcSliceHeader`].
+        rc_header_dec(self.header());
     }
+}
+
+fn bank_tag(bank: ScalarBank) -> u8 {
+    match bank {
+        ScalarBank::Int => 0,
+        ScalarBank::UInt => 1,
+        ScalarBank::Bool => 2,
+        ScalarBank::Float => 3,
+        #[cfg(feature = "chrono")]
+        ScalarBank::Timestamp => 4,
+        #[cfg(feature = "chrono")]
+        ScalarBank::Duration => 5,
+        ScalarBank::Type => 6,
+    }
+}
+
+fn bank_from_tag(tag: u8) -> ScalarBank {
+    match tag {
+        0 => ScalarBank::Int,
+        1 => ScalarBank::UInt,
+        2 => ScalarBank::Bool,
+        3 => ScalarBank::Float,
+        #[cfg(feature = "chrono")]
+        4 => ScalarBank::Timestamp,
+        #[cfg(feature = "chrono")]
+        5 => ScalarBank::Duration,
+        6 => ScalarBank::Type,
+        _ => unreachable!("scalar bank tag"),
+    }
+}
+
+/// Header of a [`LIST_TAG_RECORD`] block, followed by column-major `i64` words.
+#[repr(C)]
+struct RecordPrefix {
+    header: RcSliceHeader,
+    nfields: u8,
+    keys: InlineKeys,
+    metas: [ColumnMeta; ORDERED_SCAN_LIMIT],
+}
+
+/// Header of a [`LIST_TAG_ROWS`] block. `starts`, `lens`, and `i64` words follow.
+#[repr(C)]
+struct RowPrefix {
+    header: RcSliceHeader,
+    bank: u8,
+    nwords: u32,
+}
+
+fn record_layout(nrows: usize, nfields: usize) -> Option<(Layout, usize)> {
+    let total = nrows.checked_mul(nfields)?;
+    let words = Layout::array::<i64>(total).ok()?;
+    let (layout, offset) = Layout::new::<RecordPrefix>().extend(words).ok()?;
+    Some((layout.pad_to_align(), offset))
+}
+
+fn rows_layout(nrows: usize, nwords: usize) -> Option<(Layout, usize, usize, usize)> {
+    let starts = Layout::array::<u32>(nrows).ok()?;
+    let lens = Layout::array::<u32>(nrows).ok()?;
+    let words = Layout::array::<i64>(nwords).ok()?;
+    let (with_starts, starts_off) = Layout::new::<RowPrefix>().extend(starts).ok()?;
+    let (with_lens, lens_off) = with_starts.extend(lens).ok()?;
+    let (layout, words_off) = with_lens.extend(words).ok()?;
+    Some((layout.pad_to_align(), starts_off, lens_off, words_off))
+}
+
+fn record_prefix<'a>(header: NonNull<RcSliceHeader>) -> &'a RecordPrefix {
+    // SAFETY: `header` is the first field of a live [`RecordPrefix`].
+    unsafe { &*header.as_ptr().cast::<RecordPrefix>() }
+}
+
+fn record_value_at(header: NonNull<RcSliceHeader>, field: usize, row: usize) -> Value {
+    let (bank, origin, len, nrows, nfields) = {
+        let prefix = record_prefix(header);
+        let meta = prefix.metas[field];
+        (
+            meta.bank,
+            meta.origin as usize,
+            meta.len as usize,
+            prefix.header.len as usize,
+            prefix.nfields as usize,
+        )
+    };
+    assert!(row < len, "column index {row} past {len}");
+    let (_, words_off) = record_layout(nrows, nfields).expect("record layout");
+    // SAFETY: `origin + row` addresses an initialized word in the tail.
+    let word = unsafe {
+        *header
+            .as_ptr()
+            .cast::<u8>()
+            .add(words_off)
+            .cast::<i64>()
+            .add(origin + row)
+    };
+    ValueColumn::scalar_value(bank, word)
+}
+
+fn row_prefix<'a>(header: NonNull<RcSliceHeader>) -> &'a RowPrefix {
+    // SAFETY: `header` is the first field of a live [`RowPrefix`].
+    unsafe { &*header.as_ptr().cast::<RowPrefix>() }
+}
+
+fn row_bounds(header: NonNull<RcSliceHeader>, row: usize) -> (u32, u32) {
+    let (nrows, nwords) = {
+        let prefix = row_prefix(header);
+        (prefix.header.len as usize, prefix.nwords as usize)
+    };
+    let (_, starts_off, lens_off, _) = rows_layout(nrows, nwords).expect("row layout");
+    // SAFETY: `row` is below `nrows`. Both arrays were written for every row.
+    unsafe {
+        let base = header.as_ptr().cast::<u8>();
+        let start = *base.add(starts_off).cast::<u32>().add(row);
+        let len = *base.add(lens_off).cast::<u32>().add(row);
+        (start, len)
+    }
+}
+
+fn row_word(header: NonNull<RcSliceHeader>, index: usize) -> Value {
+    let (nrows, nwords, bank) = {
+        let prefix = row_prefix(header);
+        (
+            prefix.header.len as usize,
+            prefix.nwords as usize,
+            bank_from_tag(prefix.bank),
+        )
+    };
+    debug_assert!(index < nwords);
+    let (_, _, _, words_off) = rows_layout(nrows, nwords).expect("row layout");
+    // SAFETY: `index` addresses an initialized word in the tail.
+    let word = unsafe {
+        *header
+            .as_ptr()
+            .cast::<u8>()
+            .add(words_off)
+            .cast::<i64>()
+            .add(index)
+    };
+    ValueColumn::scalar_value(bank, word)
+}
+
+fn drop_record_block(ptr: NonNull<RcSliceHeader>) {
+    let prefix = ptr.as_ptr().cast::<RecordPrefix>();
+    // SAFETY: unique [`LIST_TAG_RECORD`] block. `nfields` is read before the
+    // keys are dropped. The word tail is plain `i64`.
+    let (nrows, nfields) = unsafe { ((*ptr.as_ptr()).len as usize, (*prefix).nfields as usize) };
+    let (layout, _) = record_layout(nrows, nfields).expect("record layout");
+    unsafe {
+        std::ptr::drop_in_place(prefix);
+        dealloc(ptr.as_ptr().cast(), layout);
+    }
+}
+
+fn drop_rows_block(ptr: NonNull<RcSliceHeader>) {
+    // SAFETY: unique [`LIST_TAG_ROWS`] block. The tail is `u32` and `i64`.
+    let (nrows, nwords) = unsafe {
+        let prefix = &*ptr.as_ptr().cast::<RowPrefix>();
+        (prefix.header.len as usize, prefix.nwords as usize)
+    };
+    let (layout, _, _, _) = rows_layout(nrows, nwords).expect("row layout");
+    unsafe { dealloc(ptr.as_ptr().cast(), layout) };
 }
 
 /// Last-owner drop: dispatch on [`RcSliceHeader::kind`], drop elements /
@@ -1763,6 +2001,8 @@ unsafe fn list_buf_drop_slow(ptr: NonNull<RcSliceHeader>) {
             // SAFETY: int buffer; unique owner; `len` elements follow.
             unsafe { rc_slice_drop_in_place::<i64>(ptr) };
         }
+        LIST_TAG_RECORD => drop_record_block(ptr),
+        LIST_TAG_ROWS => drop_rows_block(ptr),
         _ => unreachable!("list buffer kind"),
     }
 }
@@ -1874,9 +2114,10 @@ impl FromIterator<Value> for ListStorage {
 /// allocation at all, where a list that owned its own storage cost one per row.
 ///
 /// An owned object or int list is one allocation: a reference-counted header
-/// followed by the inline element array. Column and record lists keep a
-/// shared [`ListStorage`] so a batch of windows still shares one buffer:
-/// [`ListRef::window`] tags that `Arc` and does not allocate.
+/// followed by the inline element array. A packed scalar record list and a
+/// shared scalar-row list are that same shape. Batch columns, and record
+/// lists with more than [`ORDERED_SCAN_LIMIT`] fields, keep a shared
+/// [`ListStorage`]: [`ListRef::window`] tags that `Arc` and does not allocate.
 ///
 /// Neither `Send` nor `Sync`. A list owns [`Value`]s, which are neither.
 ///
@@ -1924,8 +2165,22 @@ impl ListRef {
         self.buf.ints_slice().is_some()
     }
 
+    /// True when this list is a record batch: a packed block, or a window
+    /// onto [`ListStorage::Record`].
+    #[cfg(test)]
+    pub(crate) fn is_record(&self) -> bool {
+        if self.buf.is_word_view() {
+            return false;
+        }
+        match self.buf.tag() {
+            LIST_TAG_RECORD => true,
+            LIST_TAG_SHARED => matches!(self.buf.shared(), Some(ListStorage::Record(_))),
+            _ => false,
+        }
+    }
+
     pub(crate) fn is_whole(&self) -> bool {
-        self.start == 0 && self.len() == self.buf.len()
+        !self.buf.is_word_view() && self.start == 0 && self.len() == self.buf.len()
     }
 
     /// Reconstruct a window from a bind-time public link. The offsets were
@@ -2098,6 +2353,215 @@ impl ListRef {
     fn whole_object(&self) -> Option<&[Value]> {
         let v = self.buf.object_slice()?;
         (self.start == 0 && self.len() == v.len()).then_some(v)
+    }
+}
+
+/// One in-progress [`LIST_TAG_RECORD`] block. Drop releases initialized keys
+/// and the allocation. [`PackedRecordBuf::finish`] publishes it as a [`ListRef`].
+pub(crate) struct PackedRecordBuf {
+    ptr: NonNull<RecordPrefix>,
+    nrows: usize,
+    nfields: usize,
+    words_off: usize,
+}
+
+impl PackedRecordBuf {
+    pub(crate) fn alloc(nrows: usize, nfields: usize) -> Option<Self> {
+        if nrows == 0 || nfields == 0 || nfields > ORDERED_SCAN_LIMIT {
+            return None;
+        }
+        let nrows_u = u32::try_from(nrows).ok()?;
+        let (layout, words_off) = record_layout(nrows, nfields)?;
+        // SAFETY: `layout` is non-zero (`nrows` and `nfields` are non-zero)
+        // and aligned for [`RecordPrefix`] plus the word tail.
+        let raw = unsafe { alloc(layout) };
+        if raw.is_null() {
+            handle_alloc_error(layout);
+        }
+        // The word tail is initialized so a partial fill still drops cleanly.
+        unsafe { std::ptr::write_bytes(raw, 0, layout.size()) };
+        let prefix = raw.cast::<RecordPrefix>();
+        // SAFETY: `raw` is a unique allocation of `layout`.
+        unsafe {
+            prefix.write(RecordPrefix {
+                header: RcSliceHeader {
+                    strong: AtomicUsize::new(1),
+                    len: nrows_u,
+                    kind: LIST_TAG_RECORD as u8,
+                },
+                nfields: nfields as u8,
+                keys: InlineKeys::empty(),
+                metas: [ColumnMeta {
+                    bank: ScalarBank::Int,
+                    origin: 0,
+                    len: 0,
+                }; ORDERED_SCAN_LIMIT],
+            });
+        }
+        Some(PackedRecordBuf {
+            ptr: unsafe { NonNull::new_unchecked(prefix) },
+            nrows,
+            nfields,
+            words_off,
+        })
+    }
+
+    pub(crate) fn push_key(&mut self, key: Key) {
+        // SAFETY: unique block; `keys.n` stays within `nfields`.
+        unsafe { (*self.ptr.as_ptr()).keys.push(key) };
+    }
+
+    pub(crate) fn set_column(&mut self, field: usize, bank: ScalarBank) {
+        let origin = u32::try_from(field * self.nrows).expect("column origin fits in u32");
+        // SAFETY: unique block; `field` is below `nfields` <= [`ORDERED_SCAN_LIMIT`].
+        unsafe {
+            (*self.ptr.as_ptr()).metas[field] = ColumnMeta {
+                bank,
+                origin,
+                len: self.nrows as u32,
+            };
+        }
+    }
+
+    pub(crate) fn write_word(&mut self, index: usize, word: i64) {
+        debug_assert!(index < self.nrows * self.nfields);
+        // SAFETY: unique block; `index` addresses the word tail.
+        unsafe {
+            let words = self
+                .ptr
+                .as_ptr()
+                .cast::<u8>()
+                .add(self.words_off)
+                .cast::<i64>();
+            *words.add(index) = word;
+        }
+    }
+
+    pub(crate) fn finish(self) -> ListRef {
+        debug_assert_eq!(
+            unsafe { self.ptr.as_ref().keys.as_slice().len() },
+            self.nfields
+        );
+        let ptr = self.ptr;
+        let nrows = u32::try_from(self.nrows).expect("packed record nrows fit in u32");
+        std::mem::forget(self);
+        ListRef {
+            buf: ListBuf::from_header(ptr.cast()),
+            start: 0,
+            len: nrows,
+        }
+    }
+}
+
+impl Drop for PackedRecordBuf {
+    fn drop(&mut self) {
+        let (layout, _) = record_layout(self.nrows, self.nfields).expect("record layout");
+        // SAFETY: unique block. Keys written through [`PackedRecordBuf::push_key`]
+        // are dropped with the prefix; the word tail is plain `i64`.
+        unsafe {
+            std::ptr::drop_in_place(self.ptr.as_ptr());
+            dealloc(self.ptr.as_ptr().cast(), layout);
+        }
+    }
+}
+
+/// One in-progress [`LIST_TAG_ROWS`] block. The tail is `u32` starts, `u32`
+/// lengths, and `i64` words, all in this allocation.
+pub(crate) struct ScalarRowsBuf {
+    ptr: NonNull<RowPrefix>,
+    nrows: usize,
+    nwords: usize,
+    starts_off: usize,
+    lens_off: usize,
+    words_off: usize,
+}
+
+impl ScalarRowsBuf {
+    pub(crate) fn alloc(nrows: usize, nwords: usize, bank: ScalarBank) -> Option<Self> {
+        if nrows == 0 || nwords == 0 {
+            return None;
+        }
+        let nrows_u = u32::try_from(nrows).ok()?;
+        let nwords_u = u32::try_from(nwords).ok()?;
+        let (layout, starts_off, lens_off, words_off) = rows_layout(nrows, nwords)?;
+        // SAFETY: `layout` is non-zero and aligned for [`RowPrefix`] plus the tail.
+        let raw = unsafe { alloc(layout) };
+        if raw.is_null() {
+            handle_alloc_error(layout);
+        }
+        // Starts, lengths, and words are initialized before any row is written.
+        unsafe { std::ptr::write_bytes(raw, 0, layout.size()) };
+        let prefix = raw.cast::<RowPrefix>();
+        // SAFETY: `raw` is a unique allocation of `layout`.
+        unsafe {
+            prefix.write(RowPrefix {
+                header: RcSliceHeader {
+                    strong: AtomicUsize::new(1),
+                    len: nrows_u,
+                    kind: LIST_TAG_ROWS as u8,
+                },
+                bank: bank_tag(bank),
+                nwords: nwords_u,
+            });
+        }
+        Some(ScalarRowsBuf {
+            ptr: unsafe { NonNull::new_unchecked(prefix) },
+            nrows,
+            nwords,
+            starts_off,
+            lens_off,
+            words_off,
+        })
+    }
+
+    pub(crate) fn set_row(&mut self, row: usize, start: u32, len: u32) {
+        debug_assert!(row < self.nrows);
+        debug_assert!(start as usize + len as usize <= self.nwords);
+        // SAFETY: unique block; `row` is below `nrows`.
+        unsafe {
+            let base = self.ptr.as_ptr().cast::<u8>();
+            *base.add(self.starts_off).cast::<u32>().add(row) = start;
+            *base.add(self.lens_off).cast::<u32>().add(row) = len;
+        }
+    }
+
+    pub(crate) fn word_slot(&mut self, at: usize, len: usize) -> &mut [MaybeUninit<i64>] {
+        if len == 0 {
+            return &mut [];
+        }
+        assert!(
+            at.checked_add(len).is_some_and(|end| end <= self.nwords),
+            "row word range runs past the buffer"
+        );
+        // SAFETY: unique block; the range sits in the word tail.
+        unsafe {
+            let base = self
+                .ptr
+                .as_ptr()
+                .cast::<u8>()
+                .add(self.words_off)
+                .cast::<MaybeUninit<i64>>();
+            std::slice::from_raw_parts_mut(base.add(at), len)
+        }
+    }
+
+    pub(crate) fn finish(self) -> ListRef {
+        let ptr = self.ptr;
+        let nrows = u32::try_from(self.nrows).expect("scalar rows fit in u32");
+        std::mem::forget(self);
+        ListRef {
+            buf: ListBuf::from_header(ptr.cast()),
+            start: 0,
+            len: nrows,
+        }
+    }
+}
+
+impl Drop for ScalarRowsBuf {
+    fn drop(&mut self) {
+        let (layout, _, _, _) = rows_layout(self.nrows, self.nwords).expect("row layout");
+        // SAFETY: unique block. The tail has no drop glue.
+        unsafe { dealloc(self.ptr.as_ptr().cast(), layout) };
     }
 }
 
@@ -4805,6 +5269,73 @@ mod tests {
         drop(shared);
         assert_eq!(hits.load(std::sync::atomic::Ordering::Relaxed), 1);
         assert_eq!(hits2.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn packed_record_block_is_one_allocation_and_drops_its_key() {
+        let key = Arc::new("k".to_string());
+        let mut block = super::PackedRecordBuf::alloc(3, 1).expect("block");
+        block.push_key(Key::String(Arc::clone(&key)));
+        assert_eq!(Arc::strong_count(&key), 2);
+        drop(block);
+        assert_eq!(Arc::strong_count(&key), 1);
+
+        let mut block = super::PackedRecordBuf::alloc(3, 1).expect("block");
+        block.push_key(Key::String(Arc::clone(&key)));
+        block.set_column(0, super::ScalarBank::Int);
+        block.write_word(0, 1);
+        block.write_word(1, 2);
+        block.write_word(2, 3);
+        let list = block.finish();
+        assert!(list.is_record());
+        assert!(list.storage().is_none());
+        let Value::Map(row) = list.get(1).expect("row") else {
+            panic!("map");
+        };
+        let Value::Map(again) = list.get(1).expect("row") else {
+            panic!("map");
+        };
+        assert!(row.ptr_eq(&again));
+        assert_eq!(
+            row.get(&Key::String(Arc::clone(&key))).as_deref(),
+            Some(&Value::Int(2))
+        );
+        assert_eq!(Arc::strong_count(&key), 2);
+        drop(row);
+        drop(again);
+        drop(list);
+        assert_eq!(Arc::strong_count(&key), 1);
+    }
+
+    #[test]
+    fn scalar_row_block_windows_share_one_allocation() {
+        let mut block = super::ScalarRowsBuf::alloc(3, 4, super::ScalarBank::Int).expect("rows");
+        for (index, word) in [1i64, 2, 3, 4].into_iter().enumerate() {
+            block.word_slot(index, 1)[0].write(word);
+        }
+        block.set_row(0, 0, 2);
+        block.set_row(1, 2, 0);
+        block.set_row(2, 2, 2);
+        let list = block.finish();
+        assert!(!list.is_record());
+        let Value::List(a) = list.get(0).expect("row") else {
+            panic!("list");
+        };
+        let Value::List(b) = list.get(1).expect("row") else {
+            panic!("list");
+        };
+        let Value::List(c) = list.get(2).expect("row") else {
+            panic!("list");
+        };
+        assert!(a.shares_storage_with(&c));
+        assert!(a.shares_storage_with(&b));
+        assert!(!list.shares_storage_with(&a));
+        assert!(!a.is_ints());
+        assert_eq!(a.to_vec(), vec![Value::Int(1), Value::Int(2)]);
+        assert!(b.is_empty());
+        assert_eq!(c.to_vec(), vec![Value::Int(3), Value::Int(4)]);
+        drop(list);
+        assert_eq!(c.get(1), Some(Value::Int(4)));
     }
 
     /// `math.max(x)` and `s.startsWith(x)` parse the same, so the walker asks
