@@ -99,7 +99,8 @@ fn mallocs_per_eval_on_finish_rows() {
     println!("walker [x, x] mallocs/eval={walker_list}");
     println!("walker {{a: x}} mallocs/eval={walker_one}");
     assert_eq!(nested, 2, "[[x]] finish mallocs");
-    assert_eq!(chain, 2, "string-chain finish mallocs");
+    // Constant concatenation is one pool string. Executing it clones that arc.
+    assert_eq!(chain, 0, "string-chain finish mallocs");
     // A compiled eval also allocates resume buffers on top of the
     // interpreter finish cost below. On the pinned majit, dynasm
     // measures 3 and cranelift 4 for a packed record list and a

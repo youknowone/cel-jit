@@ -351,11 +351,11 @@ impl Drop for InlineKeys {
 /// the `String` per value gave that back.
 pub struct StrBank {
     codes: Arc<[i64]>,
-    interned: Arc<[Arc<String>]>,
+    interned: Arc<[Arc<str>]>,
 }
 
 impl StrBank {
-    pub fn new(codes: Arc<[i64]>, interned: Arc<[Arc<String>]>) -> StrBank {
+    pub fn new(codes: Arc<[i64]>, interned: Arc<[Arc<str>]>) -> StrBank {
         StrBank { codes, interned }
     }
 
@@ -874,7 +874,7 @@ pub enum Key {
     Int(i64),
     Uint(u64),
     Bool(bool),
-    String(Arc<String>),
+    String(Arc<str>),
 }
 
 /// A borrowed version of [`Key`] that avoids allocating for lookups.
@@ -897,7 +897,7 @@ impl AsKeyRef for Key {
             Key::Int(i) => KeyRef::Int(*i),
             Key::Uint(u) => KeyRef::Uint(*u),
             Key::Bool(b) => KeyRef::Bool(*b),
-            Key::String(s) => KeyRef::String(s.as_str()),
+            Key::String(s) => KeyRef::String(s.as_ref()),
         }
     }
 }
@@ -977,13 +977,19 @@ impl From<String> for Key {
 
 impl From<Arc<String>> for Key {
     fn from(v: Arc<String>) -> Self {
+        Key::String(Arc::from(v.as_str()))
+    }
+}
+
+impl From<Arc<str>> for Key {
+    fn from(v: Arc<str>) -> Self {
         Key::String(v)
     }
 }
 
 impl<'a> From<&'a str> for Key {
     fn from(v: &'a str) -> Self {
-        Key::String(Arc::new(v.into()))
+        Key::String(Arc::from(v))
     }
 }
 
@@ -1066,7 +1072,7 @@ impl<'a> TryFrom<&'a Value> for KeyRef<'a> {
         match value {
             Value::Int(v) => Ok(KeyRef::Int(*v)),
             Value::UInt(v) => Ok(KeyRef::Uint(*v)),
-            Value::String(v) => Ok(KeyRef::String(v.as_str())),
+            Value::String(v) => Ok(KeyRef::String(v.as_ref())),
             Value::Bool(v) => Ok(KeyRef::Bool(*v)),
             _ => Err(value.clone()),
         }
@@ -2663,7 +2669,7 @@ pub enum Value {
     Int(i64),
     UInt(u64),
     Float(f64),
-    String(Arc<String>),
+    String(Arc<str>),
     Bytes(Arc<Vec<u8>>),
     Bool(bool),
     #[cfg(feature = "chrono")]
@@ -3013,13 +3019,13 @@ impl From<&::bytes::Bytes> for Value {
 // Convert String to Value
 impl From<String> for Value {
     fn from(v: String) -> Self {
-        Value::String(v.into())
+        Value::String(Arc::from(v))
     }
 }
 
 impl From<&str> for Value {
     fn from(v: &str) -> Self {
-        Value::String(v.to_string().into())
+        Value::String(Arc::from(v))
     }
 }
 
@@ -4176,7 +4182,7 @@ fn interned_or_public_map_key(key: &Value) -> Option<KeyRef<'_>> {
         Value::Int(i) => Some(KeyRef::Int(*i)),
         Value::UInt(u) => Some(KeyRef::Uint(*u)),
         Value::Bool(b) => Some(KeyRef::Bool(*b)),
-        Value::String(s) => Some(KeyRef::String(s.as_str())),
+        Value::String(s) => Some(KeyRef::String(s.as_ref())),
         Value::Interned(w) => unsafe { interned_as_keyref(*w) },
         _ => None,
     }
@@ -4342,7 +4348,7 @@ pub(crate) fn value_field(container: &Value, field: &str) -> Result<Value, Execu
                 want: format!("{}|{}", ValueType::Int, ValueType::UInt),
             }),
             #[cfg(feature = "structs")]
-            CelKind::Struct => value_index(container, &Value::String(Arc::new(field.to_string()))),
+            CelKind::Struct => value_index(container, &Value::String(Arc::from(field))),
             _ => Err(ExecutionError::NoSuchOverload),
         };
     }
@@ -4356,7 +4362,7 @@ pub(crate) fn value_field(container: &Value, field: &str) -> Result<Value, Execu
             want: format!("{}|{}", ValueType::Int, ValueType::UInt),
         }),
         #[cfg(feature = "structs")]
-        Value::Struct(_) => value_index(container, &Value::String(Arc::new(field.to_string()))),
+        Value::Struct(_) => value_index(container, &Value::String(Arc::from(field))),
         _ => Err(ExecutionError::NoSuchOverload),
     }
 }
@@ -4398,7 +4404,7 @@ pub(crate) fn value_index(container: &Value, key: &Value) -> Result<Value, Execu
             Value::String(field) => s
                 .field_value(field)
                 .cloned()
-                .ok_or_else(|| ExecutionError::NoSuchKey(Arc::new(field.as_str().to_owned()))),
+                .ok_or_else(|| ExecutionError::NoSuchKey(Arc::new(field.to_string()))),
             other => Err(ExecutionError::UnsupportedIndex(
                 other.clone(),
                 container.clone(),
@@ -4436,7 +4442,7 @@ fn key_display(key: &Key) -> String {
         Key::Int(i) => i.to_string(),
         Key::Uint(u) => u.to_string(),
         Key::Bool(b) => b.to_string(),
-        Key::String(s) => s.as_str().to_string(),
+        Key::String(s) => s.to_string(),
     }
 }
 
@@ -4725,6 +4731,39 @@ fn interned_list_item(w: CelRef, index: i64) -> Option<Value> {
     }
 }
 
+/// Data address of an `Arc<str>`, the thin pointer a string leaf stores.
+/// Rebuild with [`crate::runtime::convert`] using the leaf's `byte_len`.
+pub(crate) fn arc_str_thin(s: &Arc<str>) -> *const () {
+    Arc::as_ptr(s) as *const u8 as *const ()
+}
+
+/// `*const str` naming `len` UTF-8 bytes at `data`.
+///
+/// `data` addresses an allocation that stays live across this call. The
+/// returned pointer is that allocation's data address with `len` as metadata.
+pub(crate) unsafe fn str_ptr_from_thin(data: *const u8, len: usize) -> *const str {
+    let bytes = unsafe { std::slice::from_raw_parts(data, len) };
+    let s = unsafe { std::str::from_utf8_unchecked(bytes) };
+    s as *const str
+}
+
+/// One allocation holding `left` then `right`.
+pub(crate) fn concat_arc_str(left: &str, right: &str) -> Arc<str> {
+    let n = left.len() + right.len();
+    let mut buf = Arc::<[u8]>::new_uninit_slice(n);
+    {
+        let slot = Arc::get_mut(&mut buf).expect("fresh string");
+        unsafe {
+            let dest = slot.as_mut_ptr().cast::<u8>();
+            std::ptr::copy_nonoverlapping(left.as_ptr(), dest, left.len());
+            std::ptr::copy_nonoverlapping(right.as_ptr(), dest.add(left.len()), right.len());
+        }
+    }
+    let bytes: Arc<[u8]> = unsafe { buf.assume_init() };
+    let raw = Arc::into_raw(bytes);
+    unsafe { Arc::from_raw(str_ptr_from_thin(raw as *const u8, n)) }
+}
+
 impl ops::Add<Value> for Value {
     type Output = ResolveResult;
 
@@ -4758,17 +4797,7 @@ impl ops::Add<Value> for Value {
             (Value::Float(l), Value::Float(r)) => Value::Float(l + r).into(),
 
             (Value::List(l), Value::List(r)) => Ok(Value::List(l.concat(&r))),
-            (Value::String(mut l), Value::String(r)) => {
-                if let Some(s) = Arc::get_mut(&mut l) {
-                    s.push_str(&r);
-                    Ok(Value::String(l))
-                } else {
-                    let mut out = String::with_capacity(l.len() + r.len());
-                    out.push_str(&l);
-                    out.push_str(&r);
-                    Ok(Value::String(Arc::new(out)))
-                }
-            }
+            (Value::String(l), Value::String(r)) => Ok(Value::String(concat_arc_str(&l, &r))),
             (Value::Bytes(mut l), Value::Bytes(r)) => {
                 if let Some(s) = Arc::get_mut(&mut l) {
                     s.extend_from_slice(&r);
@@ -4989,9 +5018,9 @@ mod tests {
         let again = crate::runtime::object::new_string("zz") as crate::runtime::object::CelRef;
         let other = crate::runtime::object::new_string("n3") as crate::runtime::object::CelRef;
         let empty = crate::runtime::object::new_string("") as crate::runtime::object::CelRef;
-        let public_zz = Value::String(Arc::new("zz".to_string()));
-        let public_n3 = Value::String(Arc::new("n3".to_string()));
-        let public_empty = Value::String(Arc::new(String::new()));
+        let public_zz = Value::String(Arc::from("zz"));
+        let public_n3 = Value::String(Arc::from("n3"));
+        let public_empty = Value::String(Arc::from(""));
         assert_eq!(Value::from_interned(zz), public_zz.clone());
         assert_eq!(public_zz, Value::from_interned(again));
         assert_eq!(Value::from_interned(zz), Value::from_interned(zz));
@@ -5002,7 +5031,7 @@ mod tests {
         let number = Value::from_interned(
             crate::runtime::object::new_int(1) as crate::runtime::object::CelRef
         );
-        assert_ne!(number, Value::String(Arc::new("1".to_string())));
+        assert_ne!(number, Value::String(Arc::from("1")));
     }
 
     #[test]
@@ -5120,7 +5149,7 @@ mod tests {
 
     #[test]
     fn list_fill_drops_prefix_on_error() {
-        let s = Arc::new("keep".to_string());
+        let s: Arc<str> = Arc::from("keep");
         let err = ListRef::try_fill_values::<&'static str>(2, |i| {
             if i == 0 {
                 Ok(Some(Value::String(s.clone())))
@@ -5273,7 +5302,7 @@ mod tests {
 
     #[test]
     fn packed_record_block_is_one_allocation_and_drops_its_key() {
-        let key = Arc::new("k".to_string());
+        let key = Arc::from("k");
         let mut block = super::PackedRecordBuf::alloc(3, 1).expect("block");
         block.push_key(Key::String(Arc::clone(&key)));
         assert_eq!(Arc::strong_count(&key), 2);
@@ -5531,13 +5560,13 @@ mod tests {
     fn reference_to_value() {
         let test = "example".to_string();
         let direct: Value = test.as_str().into();
-        assert_eq!(direct, Value::String(Arc::new(String::from("example"))));
+        assert_eq!(direct, Value::String(Arc::from("example")));
 
         let vec = vec![test.as_str()];
         let indirect: Value = vec.into();
         assert_eq!(
             indirect,
-            Value::list(vec![Value::String(Arc::new(String::from("example")))])
+            Value::list(vec![Value::String(Arc::from("example"))])
         );
     }
 
@@ -5712,10 +5741,7 @@ mod tests {
             ctx.add_variable_from_value("mine", Value::Opaque(value.clone()));
             ctx.add_function("myFn", my_fn);
             let prog = Program::compile("mine.myFn()").unwrap();
-            assert_eq!(
-                Ok(Value::String(Arc::new("value".into()))),
-                prog.execute(&ctx)
-            );
+            assert_eq!(Ok(Value::String(Arc::from("value"))), prog.execute(&ctx));
         }
 
         #[test]
@@ -5902,7 +5928,7 @@ mod tests {
             assert_eq!(
                 Value::resolve(&expr, &ctx),
                 Ok(Value::Opaque(Arc::new(OptionalValue::of(Value::String(
-                    Arc::new("value".to_string())
+                    Arc::from("value")
                 )))))
             );
 
@@ -5913,7 +5939,7 @@ mod tests {
             assert_eq!(
                 Value::resolve(&expr, &ctx),
                 Ok(Value::Opaque(Arc::new(OptionalValue::of(Value::String(
-                    Arc::new("value".to_string())
+                    Arc::from("value")
                 )))))
             );
 
@@ -5932,7 +5958,7 @@ mod tests {
                 .expect("Must parse");
             assert_eq!(
                 Value::resolve(&expr, &ctx),
-                Ok(Value::String(Arc::new("value".to_string())))
+                Ok(Value::String(Arc::from("value")))
             );
 
             let expr = Parser::default()
@@ -5941,7 +5967,7 @@ mod tests {
                 .expect("Must parse");
             assert_eq!(
                 Value::resolve(&expr, &ctx),
-                Ok(Value::String(Arc::new("default".to_string())))
+                Ok(Value::String(Arc::from("default")))
             );
 
             let mut map_ctx = Context::default();
@@ -6174,8 +6200,8 @@ mod tests {
                     .parse(source)
                     .expect("Must parse")
             };
-            let some_field = Value::Opaque(Arc::new(OptionalValue::of(Value::String(Arc::new(
-                "value".to_string(),
+            let some_field = Value::Opaque(Arc::new(OptionalValue::of(Value::String(Arc::from(
+                "value",
             )))));
             assert_eq!(
                 Value::resolve(&parse("optional.of(msg).field"), &ctx),
@@ -6211,7 +6237,7 @@ mod tests {
                 Program::compile("optional.of(msg).missing.orValue('default')")
                     .unwrap()
                     .execute(&ctx),
-                Ok(Value::String(Arc::new("default".to_string())))
+                Ok(Value::String(Arc::from("default")))
             );
             assert!(Program::compile("optional.of(1).field")
                 .unwrap()
@@ -6281,7 +6307,7 @@ mod tests {
             );
             let program = Program::compile("cel.MyStruct { some: 'value' }.some").unwrap();
             let value = program.execute(&Context::with_env(env.into())).unwrap();
-            assert_eq!(value, Value::String(Arc::new("value".to_owned())));
+            assert_eq!(value, Value::String(Arc::from("value")));
         }
 
         #[test]
@@ -6307,14 +6333,11 @@ mod tests {
             env.add_struct(
                 StructDef::new(String::from("cel.MyStruct"))
                     .add_field("some".into(), types::STRING_TYPE)
-                    .add_field_with_default(
-                        "here".into(),
-                        Value::String(Arc::new("yes".to_owned())),
-                    ),
+                    .add_field_with_default("here".into(), Value::String(Arc::from("yes"))),
             );
             let program = Program::compile("cel.MyStruct { some: 'value' }.here").unwrap();
             let result = program.execute(&Context::with_env(env.into()));
-            assert_eq!(result, Ok(Value::String(Arc::new(String::from("yes")))));
+            assert_eq!(result, Ok(Value::String(Arc::from("yes"))));
         }
 
         #[test]
@@ -6323,15 +6346,12 @@ mod tests {
             env.add_struct(
                 StructDef::new(String::from("cel.MyStruct"))
                     .add_field("some".into(), types::STRING_TYPE)
-                    .add_field_with_default(
-                        "here".into(),
-                        Value::String(Arc::new("yes".to_owned())),
-                    ),
+                    .add_field_with_default("here".into(), Value::String(Arc::from("yes"))),
             );
             let program =
                 Program::compile("cel.MyStruct { some: 'value', here: 'totally' }.here").unwrap();
             let result = program.execute(&Context::with_env(env.into()));
-            assert_eq!(result, Ok(Value::String(Arc::new(String::from("totally")))));
+            assert_eq!(result, Ok(Value::String(Arc::from("totally"))));
         }
 
         #[test]
@@ -6344,10 +6364,7 @@ mod tests {
             );
 
             let mut my_struct = CelStruct::new("cel.MyStruct".to_owned());
-            my_struct.add_field_value(
-                "name".to_owned(),
-                Value::String(Arc::new("test".to_owned())),
-            );
+            my_struct.add_field_value("name".to_owned(), Value::String(Arc::from("test")));
             my_struct.add_field_value("value".to_owned(), Value::Int(42));
 
             let mut context = Context::with_env(Arc::new(env));
@@ -6411,10 +6428,7 @@ mod tests {
             );
 
             let mut my_struct = CelStruct::new("cel.MyStruct".to_owned());
-            my_struct.add_field_value(
-                "name".to_owned(),
-                Value::String(Arc::new("test".to_owned())),
-            );
+            my_struct.add_field_value("name".to_owned(), Value::String(Arc::from("test")));
             my_struct.add_field_value("value".to_owned(), Value::Int(42));
 
             let mut context = Context::with_env(Arc::new(env));
@@ -6424,7 +6438,7 @@ mod tests {
 
             let program = Program::compile("my_var.name + ' ' + string(my_var.value)").unwrap();
             let result = program.execute(&context).unwrap();
-            assert_eq!(result, Value::String(Arc::new("test 42".to_owned())));
+            assert_eq!(result, Value::String(Arc::from("test 42")));
         }
     }
 }

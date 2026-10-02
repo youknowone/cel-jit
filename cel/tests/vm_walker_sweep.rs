@@ -62,7 +62,7 @@ fn ctx() -> Context<'static> {
     ctx.add_variable_from_value("d", Value::Float(1.5));
     ctx.add_variable_from_value("b", Value::Bool(true));
     ctx.add_variable_from_value("f", Value::Bool(false));
-    ctx.add_variable_from_value("s", Value::String(Arc::new("hello".to_string())));
+    ctx.add_variable_from_value("s", Value::String(Arc::from("hello")));
     ctx.add_variable_from_value("by", Value::Bytes(Arc::new(b"hi".to_vec())));
     ctx.add_variable_from_value("nil", Value::Null);
     ctx.add_variable_from_value(
@@ -71,8 +71,8 @@ fn ctx() -> Context<'static> {
     );
     ctx.add_variable_from_value("empty", Value::list(Vec::<Value>::new()));
     let mut m = std::collections::HashMap::new();
-    m.insert(Key::String(Arc::new("a".to_string())), Value::Int(1));
-    m.insert(Key::String(Arc::new("b".to_string())), Value::Int(2));
+    m.insert(Key::String(Arc::from("a")), Value::Int(1));
+    m.insert(Key::String(Arc::from("b")), Value::Int(2));
     ctx.add_variable_from_value("m", Value::Map(cel::objects::Map::object(Arc::new(m))));
     ctx.add_variable_from_value(
         "opt_some",
@@ -507,7 +507,7 @@ fn interned_index_agrees_between_vm_and_walker() {
         ]),
     );
     let mut m = std::collections::HashMap::new();
-    m.insert(Key::String(Arc::new("k".to_string())), Value::Int(7));
+    m.insert(Key::String(Arc::from("k")), Value::Int(7));
     ctx.add_variable_from_value("m", Value::Map(cel::objects::Map::object(Arc::new(m))));
 
     let plain: &[&str] = &[
@@ -556,7 +556,7 @@ fn interned_index_agrees_between_vm_and_walker() {
 #[test]
 fn null_builder_portal_agrees_between_vm_and_walker() {
     let mut ctx = Context::default();
-    ctx.add_variable_from_value("s", Value::String(Arc::new("hello".to_string())));
+    ctx.add_variable_from_value("s", Value::String(Arc::from("hello")));
     ctx.add_variable_from_value("opt_none", Value::Opaque(Arc::new(OptionalValue::none())));
     ctx.add_variable_from_value(
         "opt_some",

@@ -470,8 +470,8 @@ pub struct W_StringObject {
     pub ob_header: CelObject,
     pub chars: *mut CelBytesBlock,
     pub byte_len: i64,
-    /// Non-owning pointer at the public `Arc<String>` this leaf was wrapped
-    /// from, or null if the string was allocated by the VM.
+    /// Non-owning thin pointer at the data of the public `Arc<str>` this leaf
+    /// was wrapped from, or null if the string was allocated by the VM.
     pub public: *const (),
 }
 
@@ -860,7 +860,7 @@ pub unsafe fn map_len(w: CelRef) -> i64 {
     (*w.cast::<W_MapObject>()).length
 }
 
-/// UTF-8 byte length of a string leaf. Matches `Arc<String>::len`.
+/// UTF-8 byte length of a string leaf. Matches `Arc<str>::len`.
 ///
 /// # Safety
 ///

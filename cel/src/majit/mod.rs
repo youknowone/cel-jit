@@ -796,7 +796,7 @@ mod tests {
             ColData::Bool(c) => Value::Bool(c[k]),
             ColData::UInt(c) => Value::UInt(c[k] as u64),
             ColData::Float(c) => Value::Float(c[k]),
-            ColData::Str(c) => Value::String(std::sync::Arc::new(c[k].clone())),
+            ColData::Str(c) => Value::String(std::sync::Arc::from(c[k].as_str())),
             ColData::Timestamp(c) => {
                 Value::Timestamp(chrono::DateTime::from_timestamp_nanos(c[k]).fixed_offset())
             }
@@ -1280,7 +1280,7 @@ mod tests {
                             .iter()
                             .map(|(f, d)| {
                                 let f = f.expect("a record list names every field");
-                                (Key::String(Arc::new(f.to_string())), cell_value(d, k))
+                                (Key::String(Arc::from(f)), cell_value(d, k))
                             })
                             .collect();
                         Value::Map(Map::object(Arc::new(map)))

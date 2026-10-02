@@ -25,21 +25,18 @@ fn make_ctx() -> Context<'static> {
     ctx.add_variable_from_value(
         "xs",
         Value::list(vec![
-            Value::String(Arc::new("a".to_string())),
+            Value::String(Arc::from("a")),
             Value::list(vec![Value::Int(1)]),
         ]),
     );
     ctx.add_variable_from_value("empty", Value::list(Vec::<Value>::new()));
-    ctx.add_variable_from_value("s", Value::String(Arc::new("hello".to_string())));
+    ctx.add_variable_from_value("s", Value::String(Arc::from("hello")));
     let mut m = HashMap::new();
     m.insert(
-        Key::String(Arc::new("a".to_string())),
+        Key::String(Arc::from("a")),
         Value::list(vec![Value::Int(1)]),
     );
-    m.insert(
-        Key::String(Arc::new("b".to_string())),
-        Value::String(Arc::new("x".to_string())),
-    );
+    m.insert(Key::String(Arc::from("b")), Value::String(Arc::from("x")));
     ctx.add_variable_from_value("m", Value::Map(cel::objects::Map::object(Arc::new(m))));
     ctx.add_function("id", |v: Value| -> Result<Value, ExecutionError> { Ok(v) });
     ctx

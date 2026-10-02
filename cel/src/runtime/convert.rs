@@ -1,7 +1,8 @@
 //! Boundary between the public [`crate::Value`] enum and this class family.
 //!
-//! [`crate::Value`] is the cel drop-in and does not change: callers still
-//! construct `Value::Int`, match variants, and bind `This<Arc<String>>`.
+//! [`crate::Value`] is the cel drop-in. `Value::String` is an `Arc<str>`
+//! (one allocation). Callers still construct `Value::Int`, match variants,
+//! and bind `This<Arc<str>>` or `This<Arc<String>>`.
 //! Evaluators that want a header-first object cross here, and only here.
 //!
 //! Leftover host opaques cross as [`super::object::W_OpaqueObject`], with the
@@ -112,7 +113,7 @@ pub(crate) fn interned_linked(w: CelRef) -> Option<Value> {
             }
             CelKind::Str => {
                 let leaf = &*w.cast::<W_StringObject>();
-                clone_arc(leaf.public as *const String).map(Value::String)
+                clone_linked_str(leaf.public, leaf.byte_len).map(Value::String)
             }
             CelKind::Bytes => {
                 let leaf = &*w.cast::<W_BytesObject>();
@@ -298,11 +299,11 @@ unsafe fn ref_to_value_cold(
             if base.is_null() && n != 0 {
                 return Err(ConvertError::Corrupt("struct"));
             }
-            let mut s = CelStruct::new((*name).clone());
+            let mut s = CelStruct::new(name.as_ref().to_owned());
             for i in 0..n {
                 let fname = unsafe { string_from_ref(*base.add(2 * i))? };
                 let fval = unsafe { ref_to_value(*base.add(2 * i + 1))? };
-                s.add_field_value((*fname).clone(), fval);
+                s.add_field_value(fname.as_ref().to_owned(), fval);
             }
             Ok(Value::Struct(Arc::new(s)))
         }
@@ -492,7 +493,9 @@ pub(crate) fn link_public_handle(w: CelRef, value: &Value) {
                 if w_kind(w) != CelKind::Str {
                     return;
                 }
-                (*w.cast::<W_StringObject>()).public = Arc::as_ptr(s) as *const ();
+                let leaf = &mut *w.cast::<W_StringObject>();
+                debug_assert_eq!(leaf.byte_len, s.len() as i64);
+                leaf.public = crate::objects::arc_str_thin(s);
             }
             Value::Bytes(b) => {
                 if w_kind(w) != CelKind::Bytes {
@@ -699,8 +702,7 @@ unsafe fn interned_string_eq(a: CelRef, b: CelRef) -> bool {
 
 /// Allocations [`string_from_leaf`] makes for this key. `None` is a key that
 /// leaf cannot turn into a [`Key`]. A linked `public` arc is a refcount.
-/// An unlinked string is the byte buffer plus the `Arc`, except an empty
-/// string, whose buffer allocates nothing.
+/// An unlinked string is one `Arc<str>`.
 unsafe fn fresh_key_allocs(w: CelRef) -> Option<usize> {
     if w.is_null() {
         return None;
@@ -728,7 +730,7 @@ unsafe fn fresh_key_allocs(w: CelRef) -> Option<usize> {
                 if std::str::from_utf8(bytes).is_err() {
                     return None;
                 }
-                Some(2)
+                Some(1)
             }
             _ => None,
         }
@@ -1352,7 +1354,7 @@ fn intern_string_key_mapdict(map: &Map) -> Result<Option<CelRef>, ConvertError> 
         let std::borrow::Cow::Borrowed(value) = v else {
             return Ok(None);
         };
-        rows.push((s.as_str(), value));
+        rows.push((s.as_ref(), value));
     }
     // Attribute order is the byte order of the key, so the same key set
     // shares one layout (`mapdict.py` `_get_new_attr`).
@@ -1438,7 +1440,7 @@ unsafe fn map_from_ref(w: CelRef) -> Result<Map, ConvertError> {
                 let name =
                     mapdict_name_at(leaf.layout, i as i64).ok_or(ConvertError::Corrupt("map"))?;
                 let text = std::str::from_utf8(name).map_err(|_| ConvertError::Corrupt("map"))?;
-                let key = Key::String(Arc::new(text.to_owned()));
+                let key = Key::String(Arc::from(text));
                 let value = unsafe { ref_to_value(*base.add(i))? };
                 Ok(Some((key, value)))
             })
@@ -1522,8 +1524,8 @@ fn map_pairs(map: &Map) -> Result<Vec<(CelRef, CelRef)>, ConvertError> {
     }
 }
 
-fn string_from_leaf(leaf: &W_StringObject) -> Result<Arc<String>, ConvertError> {
-    if let Some(s) = unsafe { clone_arc(leaf.public as *const String) } {
+fn string_from_leaf(leaf: &W_StringObject) -> Result<Arc<str>, ConvertError> {
+    if let Some(s) = clone_linked_str(leaf.public, leaf.byte_len) {
         return Ok(s);
     }
     let n = leaf.byte_len as usize;
@@ -1533,7 +1535,20 @@ fn string_from_leaf(leaf: &W_StringObject) -> Result<Arc<String>, ConvertError> 
     }
     let bytes = unsafe { std::slice::from_raw_parts(base, n) };
     let s = std::str::from_utf8(bytes).map_err(|_| ConvertError::Corrupt("string"))?;
-    Ok(Arc::new(s.to_string()))
+    Ok(Arc::from(s))
+}
+
+/// Rebuild the `Arc<str>` a leaf's `public` word names. `len` is the leaf's
+/// `byte_len`, which is the fat pointer's metadata.
+fn clone_linked_str(data: *const (), len: i64) -> Option<Arc<str>> {
+    if data.is_null() || len < 0 {
+        return None;
+    }
+    let fat = unsafe { crate::objects::str_ptr_from_thin(data.cast::<u8>(), len as usize) };
+    unsafe {
+        Arc::increment_strong_count(fat);
+        Some(Arc::from_raw(fat))
+    }
 }
 
 fn bytes_from_leaf(leaf: &W_BytesObject) -> Result<Arc<Vec<u8>>, ConvertError> {
@@ -1550,7 +1565,7 @@ fn bytes_from_leaf(leaf: &W_BytesObject) -> Result<Arc<Vec<u8>>, ConvertError> {
 }
 
 #[cfg(feature = "structs")]
-fn string_from_ref(w: CelRef) -> Result<Arc<String>, ConvertError> {
+fn string_from_ref(w: CelRef) -> Result<Arc<str>, ConvertError> {
     if w.is_null() || unsafe { w_type(w) } != &CEL_STRING_CLASS {
         return Err(ConvertError::Corrupt("string"));
     }
@@ -1595,7 +1610,7 @@ mod tests {
             Value::Bool(true),
             Value::Bool(false),
             Value::Null,
-            Value::String(Arc::new("hi".into())),
+            Value::String(Arc::from("hi")),
             Value::Bytes(Arc::new(b"xy".to_vec())),
         ] {
             assert_eq!(roundtrip(v.clone()), v, "{v:?}");
@@ -1641,8 +1656,8 @@ mod tests {
 
     /// [`link_public_handle`] stores `Arc::as_ptr` and does not keep the
     /// allocation alive. The returned arc has to outlive `interned_to_public`.
-    fn linked_string(text: &str) -> (CelRef, Arc<String>) {
-        let arc = Arc::new(text.to_string());
+    fn linked_string(text: &str) -> (CelRef, Arc<str>) {
+        let arc = Arc::from(text);
         let leaf = new_string(text) as CelRef;
         link_public_handle(leaf, &Value::String(Arc::clone(&arc)));
         (leaf, arc)
@@ -1749,11 +1764,11 @@ mod tests {
         let keys: Vec<&str> = map
             .iter()
             .map(|(key, _)| match key {
-                Key::String(text) => text.as_str(),
+                Key::String(text) => text.as_ref(),
                 other => panic!("string key, got {other:?}"),
             })
             .collect();
-        assert_eq!(keys, [arc_c.as_str(), arc_a.as_str(), arc_b.as_str()]);
+        assert_eq!(keys, [arc_c.as_ref(), arc_a.as_ref(), arc_b.as_ref()]);
         assert_eq!(
             map.get(&Key::String(arc_a)).as_deref(),
             Some(&Value::Int(13))
@@ -1819,12 +1834,12 @@ mod tests {
         };
         assert_eq!(outer.len(), lens.len());
         let mut rows = Vec::new();
-        for index in 0..lens.len() {
+        for (index, len) in lens.iter().copied().enumerate() {
             let Value::List(row) = outer.get(index).expect("row") else {
                 panic!("inner list");
             };
-            assert_eq!(row.len(), lens[index]);
-            for at in 0..lens[index] {
+            assert_eq!(row.len(), len);
+            for at in 0..len {
                 assert_eq!(row.get(at), Some(word(index, at)));
             }
             rows.push(row);
@@ -1936,19 +1951,19 @@ mod tests {
         );
         assert_eq!(intern_leaf(&Value::Null), Some(new_null() as CelRef));
         assert_eq!(intern_leaf(&Value::Int(3)), Some(new_int(3) as CelRef));
-        assert!(intern_leaf(&Value::String(Arc::new("x".into()))).is_some());
+        assert!(intern_leaf(&Value::String(Arc::from("x"))).is_some());
         let list = Value::List(ListRef::from(vec![Value::Int(1)]));
         assert!(intern_leaf(&list).is_some());
         assert!(intern_leaf(&Value::UInt(3)).is_some());
         assert!(intern_leaf(&Value::Float(1.5)).is_some());
         let object = Value::Map(Map::object(Arc::new(
-            [(Key::String(Arc::new("a".into())), Value::Int(1))]
+            [(Key::String(Arc::from("a")), Value::Int(1))]
                 .into_iter()
                 .collect(),
         )));
         assert!(intern_leaf(&object).is_some());
         let schema = Arc::new(crate::objects::RecordSchema::new(
-            vec![Key::String(Arc::new("a".into()))],
+            vec![Key::String(Arc::from("a"))],
             vec![crate::objects::ValueColumn::Scalar {
                 bank: crate::objects::ScalarBank::Int,
                 words: Arc::from([1i64]),
@@ -1995,12 +2010,12 @@ mod tests {
 
     #[test]
     fn interned_string_and_list_add_roundtrip() {
-        let hello = intern_leaf(&Value::String(Arc::new("he".into()))).unwrap();
-        let lo = intern_leaf(&Value::String(Arc::new("llo".into()))).unwrap();
+        let hello = intern_leaf(&Value::String(Arc::from("he"))).unwrap();
+        let lo = intern_leaf(&Value::String(Arc::from("llo"))).unwrap();
         let joined = unsafe { crate::runtime::binop::cel_add(hello, lo) };
         assert_eq!(
             unsafe { ref_to_value(joined) }.unwrap(),
-            Value::String(Arc::new("hello".into()))
+            Value::String(Arc::from("hello"))
         );
         let a = intern_leaf(&Value::List(ListRef::from(vec![Value::Int(1)]))).unwrap();
         let b = intern_leaf(&Value::List(ListRef::from(vec![Value::Int(2)]))).unwrap();
@@ -2055,7 +2070,7 @@ mod tests {
 
     fn object_map() -> Value {
         Value::Map(Map::object(Arc::new(
-            [(Key::String(Arc::new("k".into())), Value::Int(1))]
+            [(Key::String(Arc::from("k")), Value::Int(1))]
                 .into_iter()
                 .collect(),
         )))
@@ -2079,10 +2094,10 @@ mod tests {
         assert_eq!(roundtrip(empty.clone()), empty);
 
         let mut entries = HashMap::new();
-        entries.insert(Key::Int(1), Value::String(Arc::new("one".into())));
+        entries.insert(Key::Int(1), Value::String(Arc::from("one")));
         entries.insert(Key::Uint(2), Value::Int(2));
         entries.insert(Key::Bool(true), Value::Bool(false));
-        entries.insert(Key::String(Arc::new("k".into())), Value::UInt(3));
+        entries.insert(Key::String(Arc::from("k")), Value::UInt(3));
         let object = Value::Map(Map::object(Arc::new(entries)));
         assert_eq!(roundtrip(object.clone()), object);
 
@@ -2140,7 +2155,7 @@ mod tests {
     #[test]
     fn from_arc_string_still_builds_the_public_value() {
         let v: Value = Arc::new("drop-in".to_string()).into();
-        assert_eq!(v, Value::String(Arc::new("drop-in".into())));
+        assert_eq!(v, Value::String(Arc::from("drop-in")));
         assert_eq!(roundtrip(v.clone()), v);
     }
 
@@ -2165,7 +2180,7 @@ mod tests {
     #[test]
     fn a_linked_public_map_unpacks_the_same_table() {
         let mut entries = HashMap::new();
-        entries.insert(Key::String(Arc::new("a".into())), Value::Int(1));
+        entries.insert(Key::String(Arc::from("a")), Value::Int(1));
         let original = Map::object(Arc::new(entries));
         let value = Value::Map(original.clone());
         let w = intern_leaf(&value).expect("intern");
@@ -2177,7 +2192,7 @@ mod tests {
     #[test]
     fn a_linked_public_entries_map_unpacks_the_same_table() {
         let original = Map::entries(MapEntries::new(
-            vec![(Key::String(Arc::new("a".into())), Value::Int(1))].into_boxed_slice(),
+            vec![(Key::String(Arc::from("a")), Value::Int(1))].into_boxed_slice(),
         ));
         let value = Value::Map(original.clone());
         let w = intern_leaf(&value).expect("intern");
@@ -2193,8 +2208,8 @@ mod tests {
         // returning the stale linked table.
         let original = Map::ordered(
             vec![
-                (Key::String(Arc::new("a".into())), Value::Int(1)),
-                (Key::String(Arc::new("b".into())), Value::Int(2)),
+                (Key::String(Arc::from("a")), Value::Int(1)),
+                (Key::String(Arc::from("b")), Value::Int(2)),
             ]
             .into_boxed_slice(),
         );
@@ -2220,7 +2235,7 @@ mod tests {
         );
         assert_eq!(back.len(), 3);
         assert_eq!(
-            back.get(&Key::String(Arc::new("c".into()))).as_deref(),
+            back.get(&Key::String(Arc::from("c"))).as_deref(),
             Some(&Value::Int(3))
         );
     }
@@ -2248,7 +2263,7 @@ mod tests {
 
     #[test]
     fn a_linked_public_string_unpacks_the_same_arc() {
-        let original = Arc::new("hello".to_string());
+        let original: Arc<str> = Arc::from("hello");
         let value = Value::String(original.clone());
         let w = intern_leaf(&value).expect("intern");
         link_public_handle(w, &value);

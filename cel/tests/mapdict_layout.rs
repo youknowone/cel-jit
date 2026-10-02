@@ -163,7 +163,7 @@ fn wide_or_non_string_maps_stay_object() {
 
     let mut mixed = HashMap::new();
     mixed.insert(Key::Int(1), Value::Int(2));
-    mixed.insert(Key::String(Arc::new("a".into())), Value::Int(3));
+    mixed.insert(Key::String(Arc::from("a")), Value::Int(3));
     let mixed_w = intern_map(&Value::Map(Map::object(Arc::new(mixed))));
     assert_eq!(map_leaf(mixed_w).strategy, MapStrategy::Object);
     assert_eq!(map_leaf(mixed_w).layout, 0);

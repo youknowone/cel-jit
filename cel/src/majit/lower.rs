@@ -91,7 +91,7 @@ fn absorbs(e: &IdedExpr, absorbing: bool) -> bool {
 
 fn as_string_literal(e: &IdedExpr) -> Option<&str> {
     match &e.expr {
-        Expr::Literal(LiteralValue::String(s)) => Some(s.as_str()),
+        Expr::Literal(LiteralValue::String(s)) => Some(s.as_ref()),
         _ => None,
     }
 }
@@ -2386,7 +2386,7 @@ fn compile_literal_t(ctx: &mut LowerCtxF, lit: &LiteralValue) -> Result<TReg, Lo
             // against the column strings.
             let r = ctx.fresh(ValType::Str);
             ctx.scalar_seeds.push(ScalarSeed {
-                kind: SeedKind::StrId(s.as_str().to_owned()),
+                kind: SeedKind::StrId(s.as_ref().to_owned()),
                 reg: r.idx,
             });
             Ok(r)

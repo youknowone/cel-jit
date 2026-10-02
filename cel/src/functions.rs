@@ -127,7 +127,7 @@ pub fn contains(This(this): This<Value>, arg: Value) -> Result<Value> {
             crate::runtime::object::CelKind::Str => {
                 let hay = unsafe { crate::runtime::object::string_as_str(*w) }.unwrap_or("");
                 let found = match &arg {
-                    Value::String(s) => hay.contains(s.as_str()),
+                    Value::String(s) => hay.contains(s.as_ref()),
                     Value::Interned(n)
                         if unsafe { crate::runtime::object::w_kind(*n) }
                             == crate::runtime::object::CelKind::Str =>
@@ -150,7 +150,7 @@ pub fn contains(This(this): This<Value>, arg: Value) -> Result<Value> {
         }
         Value::String(s) => {
             if let Value::String(arg) = arg {
-                s.contains(arg.as_str())
+                s.contains(arg.as_ref())
             } else {
                 false
             }
@@ -179,12 +179,12 @@ pub fn string(ftx: &FunctionContext, This(this): This<Value>) -> Result<Value> {
         Value::Int(v) => Value::String(v.to_string().into()),
         Value::UInt(v) => Value::String(v.to_string().into()),
         Value::Float(v) => Value::String(v.to_string().into()),
-        Value::Bytes(v) => Value::String(Arc::new(String::from_utf8_lossy(v.as_slice()).into())),
+        Value::Bytes(v) => Value::String(Arc::from(&*String::from_utf8_lossy(v.as_slice()))),
         v => return Err(ftx.error(format!("cannot convert {v:?} to string"))),
     })
 }
 
-pub fn bytes(value: Arc<String>) -> Result<Value> {
+pub fn bytes(value: Arc<str>) -> Result<Value> {
     Ok(Value::Bytes(value.as_bytes().to_vec().into()))
 }
 
@@ -310,11 +310,7 @@ pub fn optional_or_value(This(this): This<Value>, other: Value) -> Result<Value>
 /// "abc".matches("^[a-z]*$") == true
 /// ```
 #[cfg(feature = "regex")]
-pub fn matches(
-    ftx: &FunctionContext,
-    This(this): This<Arc<String>>,
-    regex: Arc<String>,
-) -> Result<bool> {
+pub fn matches(ftx: &FunctionContext, This(this): This<Arc<str>>, regex: Arc<str>) -> Result<bool> {
     match crate::runtime::regex_intern::intern_regex(&regex) {
         Ok(re) => Ok(re.is_match(&this)),
         Err(message) => Err(ftx.error(message)),
@@ -347,9 +343,9 @@ pub mod time {
     /// - `1.5ms` parses as 1 millisecond and 500 microseconds
     /// - `1ns` parses as 1 nanosecond
     /// - `1.5ns` parses as 1 nanosecond (sub-nanosecond durations not supported)
-    pub fn duration(value: Arc<String>) -> crate::functions::Result<Value> {
+    pub fn duration(value: Arc<str>) -> crate::functions::Result<Value> {
         Ok(Value::Duration({
-            let i = value.as_str();
+            let i = value.as_ref();
             let (_, duration) = crate::duration::parse_duration(i)
                 .map_err(|e| ExecutionError::function_error("duration", e.to_string()))?;
             Ok(duration)

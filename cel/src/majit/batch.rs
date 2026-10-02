@@ -1485,7 +1485,7 @@ impl<'b> Node<'b> {
         Value::Map(crate::objects::Map::object(std::sync::Arc::new(
             self.kids
                 .into_iter()
-                .map(|(k, n)| (Key::String(std::sync::Arc::new(k.to_string())), n.value()))
+                .map(|(k, n)| (Key::String(std::sync::Arc::from(k)), n.value()))
                 .collect(),
         )))
     }
@@ -1548,10 +1548,7 @@ impl<'a, 'b> RowReader<'a, 'b> {
                         .iter()
                         .filter_map(|(f, c)| {
                             let f = (*f)?;
-                            Some((
-                                Key::String(std::sync::Arc::new(f.to_string())),
-                                cell(c, start + j),
-                            ))
+                            Some((Key::String(std::sync::Arc::from(f)), cell(c, start + j)))
                         })
                         .collect(),
                 ))),
@@ -1569,7 +1566,7 @@ fn cell(col: &ColumnRef, k: usize) -> Value {
         ColumnRef::Bool(c) => Value::Bool(c[k]),
         ColumnRef::UInt(c) => Value::UInt(c[k]),
         ColumnRef::Float(c) => Value::Float(c[k]),
-        ColumnRef::Str(c) => Value::String(std::sync::Arc::new(c[k].clone())),
+        ColumnRef::Str(c) => Value::String(std::sync::Arc::from(c[k].as_str())),
         ColumnRef::Timestamp(c) => {
             Value::Timestamp(chrono::DateTime::from_timestamp_nanos(c[k]).fixed_offset())
         }
@@ -1871,9 +1868,7 @@ impl RawOutput<'_> {
                     fields => {
                         let keys: Vec<Key> = fields
                             .iter()
-                            .map(|(name, _, _)| {
-                                Key::String(Arc::new(name.unwrap_or_default().to_string()))
-                            })
+                            .map(|(name, _, _)| Key::String(Arc::from(name.unwrap_or_default())))
                             .collect();
                         let columns = fields
                             .iter()
@@ -1902,7 +1897,7 @@ impl RawOutput<'_> {
 /// `interned` is `None` when no field of the output is a `Str`, which is the
 /// only arm that reads it — its caller decides that once for the whole output
 /// rather than building a table every arm but one ignores.
-fn column_of(bank: ValType, words: &[i64], interned: Option<&Arc<[Arc<String>]>>) -> ValueColumn {
+fn column_of(bank: ValType, words: &[i64], interned: Option<&Arc<[Arc<str>]>>) -> ValueColumn {
     let bank = match bank {
         ValType::Int => ScalarBank::Int,
         ValType::UInt => ScalarBank::UInt,
@@ -1939,8 +1934,8 @@ fn column_of(bank: ValType, words: &[i64], interned: Option<&Arc<[Arc<String>]>>
 /// nothing reads — measured at ~12 ns of a ~46 ns fixed per-call cost. A
 /// comment here previously asserted the opposite, that an empty `Arc<[_]>`
 /// does not allocate; a counting `#[global_allocator]` says it does.
-fn intern(distinct: &[String]) -> Arc<[Arc<String>]> {
-    distinct.iter().map(|s| Arc::new(s.clone())).collect()
+fn intern(distinct: &[String]) -> Arc<[Arc<str>]> {
+    distinct.iter().map(|s| Arc::from(s.as_str())).collect()
 }
 
 #[cfg(test)]
@@ -3399,7 +3394,7 @@ mod tests {
             Value::Map(crate::objects::Map::object(Arc::new(
                 fields
                     .iter()
-                    .map(|(k, v)| (Key::String(Arc::new(k.to_string())), Value::Int(*v)))
+                    .map(|(k, v)| (Key::String(Arc::<str>::from(*k)), Value::Int(*v)))
                     .collect(),
             )))
         }
@@ -3471,8 +3466,8 @@ mod tests {
             assert_eq!(
                 entries,
                 vec![
-                    (Key::String(Arc::new("price".to_string())), Value::Int(10)),
-                    (Key::String(Arc::new("qty".to_string())), Value::Int(1)),
+                    (Key::String(Arc::from("price")), Value::Int(10)),
+                    (Key::String(Arc::from("qty")), Value::Int(1)),
                 ],
                 "{tier:?}"
             );
@@ -3547,7 +3542,7 @@ mod tests {
         let s = schema(&[("tags[]", ValType::Str)]);
         let lens = vec![3i64, 1];
         let tags: Vec<String> = ["a", "b", "a", "c"].iter().map(|t| t.to_string()).collect();
-        let text = |t: &str| Value::String(Arc::new(t.to_string()));
+        let text = |t: &str| Value::String(Arc::from(t));
         let expect = vec![
             Value::list(vec![text("a"), text("a")]),
             Value::list(vec![text("c")]),
@@ -3602,7 +3597,7 @@ mod tests {
             .collect();
         let expect: Vec<Value> = ["ada!", "grace!", "ada!"]
             .iter()
-            .map(|t| Value::String(Arc::new(t.to_string())))
+            .map(|t| Value::String(Arc::<str>::from(*t)))
             .collect();
 
         let program = BatchProgram::compile("name + \"!\"", &s).unwrap();
@@ -3668,7 +3663,7 @@ mod tests {
                 else {
                     panic!("{tier:?}: the name field is not a string")
                 };
-                assert_eq!(*got, "x", "{tier:?}");
+                assert_eq!(&*got, "x", "{tier:?}");
                 names.push(got);
             }
             assert!(

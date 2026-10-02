@@ -11,7 +11,7 @@ impl_conversions!(
     i64 => Value::Int,
     u64 => Value::UInt,
     f64 => Value::Float,
-    Arc<String> => Value::String,
+    Arc<str> => Value::String,
     Arc<Vec<u8>> => Value::Bytes,
     bool => Value::Bool,
     ListRef => Value::List,
@@ -69,7 +69,37 @@ pub trait IntoResolveResult {
 
 impl IntoResolveResult for String {
     fn into_resolve_result(self) -> ResolveResult {
-        Ok(Value::String(Arc::new(self)))
+        Ok(Value::String(Arc::from(self)))
+    }
+}
+
+impl FromValue for Arc<String> {
+    fn from_value(expr: &Value) -> Result<Self, ExecutionError> {
+        match expr.unpack() {
+            Value::String(v) => Ok(Arc::new(v.to_string())),
+            _ => Err(ExecutionError::UnexpectedType {
+                got: format!("{expr:?}"),
+                want: "Arc<String>".to_string(),
+            }),
+        }
+    }
+}
+
+impl From<Arc<String>> for Value {
+    fn from(value: Arc<String>) -> Self {
+        Value::String(Arc::from(value.as_str()))
+    }
+}
+
+impl IntoResolveResult for Arc<String> {
+    fn into_resolve_result(self) -> ResolveResult {
+        Ok(Value::from(self))
+    }
+}
+
+impl<'a, 'context, 'call> FromContext<'a, 'context, 'call> for Arc<String> {
+    fn from_context(ctx: &'a mut FunctionContext<'context, 'call>) -> Result<Self, ExecutionError> {
+        arg_value_from_context(ctx).and_then(|v| FromValue::from_value(&v))
     }
 }
 

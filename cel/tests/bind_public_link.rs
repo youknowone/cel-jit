@@ -69,7 +69,7 @@ fn bound_list_door_returns_the_same_buffer() {
 #[test]
 fn bound_map_door_returns_the_same_table() {
     let mut entries = HashMap::new();
-    entries.insert(Key::String(Arc::new("k".into())), Value::Int(1));
+    entries.insert(Key::String(Arc::from("k")), Value::Int(1));
     let original = Map::object(Arc::new(entries));
     let mut ctx = Context::default();
     ctx.add_variable_from_value("m", Value::Map(original.clone()));
@@ -90,7 +90,7 @@ fn bound_map_door_returns_the_same_table() {
 
 #[test]
 fn bound_string_door_returns_the_same_arc() {
-    let original = Arc::new("x".repeat(1024));
+    let original: Arc<str> = Arc::from("x".repeat(1024));
     let mut ctx = Context::default();
     ctx.add_variable_from_value("s", Value::String(original.clone()));
 

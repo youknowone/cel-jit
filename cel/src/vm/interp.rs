@@ -1534,7 +1534,7 @@ impl<'a> Vm<'a> {
             #[cfg(feature = "structs")]
             CelKind::Struct => {
                 let field = match key {
-                    Operand::Value(Value::String(s)) => Some(s.as_str()),
+                    Operand::Value(Value::String(s)) => Some(s.as_ref()),
                     Operand::Interned(k) => unsafe { crate::runtime::object::string_as_str(*k) },
                     _ => None,
                 };
@@ -3003,7 +3003,7 @@ impl<'a> Vm<'a> {
     #[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
     fn opt_select_arm(&mut self, a: u32) -> CelResult<()> {
         let operand = self.pop()?;
-        let field = Value::String(Arc::new(self.name(a)?.to_string()));
+        let field = Value::String(Arc::from(self.name(a)?));
         let value = self.opt_select(operand, field)?;
         self.push(value);
         Ok(())
@@ -4271,7 +4271,7 @@ mod tests {
             OpCode::GreaterEqualsConst,
         ];
 
-        let hi = || Value::String(std::sync::Arc::new("hi".to_string()));
+        let hi = || Value::String(std::sync::Arc::from("hi"));
         let mut ctx = Context::default();
         ctx.add_variable_from_value("xs", vec![i64::MAX]);
         ctx.add_variable_from_value("ss", Value::list(vec![hi()]));
@@ -4485,7 +4485,7 @@ mod tests {
     /// agreeing is not what this is about.
     #[test]
     fn every_appending_producer_answers_what_its_pair_answered() {
-        let hi = || Value::String(Arc::new("hi".to_string()));
+        let hi = || Value::String(Arc::from("hi"));
         let record = Value::Map(crate::objects::Map::from(
             [("price", Value::Int(7))]
                 .into_iter()
@@ -4894,7 +4894,7 @@ mod tests {
         );
         let as_string =
             cel_eval_loop(&compile(&parse("string(7)")).expect("compile"), &ctx).expect("eval");
-        assert_eq!(as_string, Value::String(Arc::new("7".into())));
+        assert_eq!(as_string, Value::String(Arc::from("7")));
         assert!(crate::runtime::convert::intern_leaf(&as_string).is_some());
         let as_bytes =
             cel_eval_loop(&compile(&parse("bytes('ab')")).expect("compile"), &ctx).expect("eval");
@@ -5005,7 +5005,7 @@ mod tests {
         let code = compile(&expr).expect("compile");
         let ctx = Context::default();
         let value = cel_eval_loop(&code, &ctx).expect("eval");
-        assert_eq!(value, Value::String(std::sync::Arc::new("hello".into())));
+        assert_eq!(value, Value::String(std::sync::Arc::from("hello")));
     }
 
     /// A comprehension counter stored as an interned int stays on the table.
@@ -5271,15 +5271,12 @@ mod tests {
         assert!(opened_maps > 0, "the builder must stay a young map leaf");
         assert_eq!(answer, {
             let inner = Value::Map(crate::objects::Map::object(Arc::new(
-                [(
-                    crate::objects::Key::String(Arc::new("y".into())),
-                    Value::Int(3),
-                )]
-                .into_iter()
-                .collect(),
+                [(crate::objects::Key::String(Arc::from("y")), Value::Int(3))]
+                    .into_iter()
+                    .collect(),
             )));
             Value::Map(crate::objects::Map::object(Arc::new(
-                [(crate::objects::Key::String(Arc::new("x".into())), inner)]
+                [(crate::objects::Key::String(Arc::from("x")), inner)]
                     .into_iter()
                     .collect(),
             )))

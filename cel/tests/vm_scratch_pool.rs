@@ -307,9 +307,7 @@ fn a_host_function_may_re_enter_the_evaluator() {
 /// cannot see a value that is merely not dropped.
 #[test]
 fn a_failed_run_drops_what_was_on_the_stack() {
-    let s = Arc::new(String::from(
-        "a string big enough to be worth not retaining",
-    ));
+    let s: Arc<str> = Arc::from("a string big enough to be worth not retaining");
     let mut ctx = Context::default();
     ctx.add_variable_from_value("s", Value::String(Arc::clone(&s)));
     ctx.add_variable_from_value("zero", 0i64);

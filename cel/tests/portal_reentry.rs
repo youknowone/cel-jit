@@ -150,7 +150,7 @@ fn compiled_string_map_covers_sign_zero_and_mixed_kinds() {
         "list",
         cel::objects::ListRef::from(vec![
             Value::Float(1.5),
-            Value::String(std::sync::Arc::new("ab".to_string())),
+            Value::String(std::sync::Arc::from("ab")),
             Value::Int(-3),
         ]),
     );

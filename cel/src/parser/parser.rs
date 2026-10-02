@@ -2561,7 +2561,7 @@ ERROR: <input>:1:24: unsupported syntax '?'
                 Expr::Literal(val) => match val {
                     LiteralValue::String(s) => &format!(
                         "\"{}\"^#{}:{}#",
-                        s.as_str(),
+                        s.as_ref(),
                         expr.id,
                         "*expr.Constant_StringValue"
                     ),
