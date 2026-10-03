@@ -33,7 +33,8 @@ use super::interp::{interned_optional_is_none, Step, Vm};
 use super::opcode::OpCode;
 use crate::runtime::binop::{
     cel_add, cel_div, cel_equals, cel_greater, cel_greater_equals, cel_less, cel_less_equals,
-    cel_mul, cel_negate, cel_not_equals, cel_rem, cel_sub, values_equal, w_string_eq,
+    cel_mul, cel_negate, cel_not_equals, cel_rem, cel_sub, values_equal, w_string_cmp, w_string_eq,
+    CMP_EQUAL, CMP_GREATER, CMP_LESS,
 };
 use crate::runtime::convert::{
     intern_leaf, interned_as_keyref, interned_list_get, interned_map_get,
@@ -2637,6 +2638,53 @@ fn str_cells_eq(left: *mut CelObject, right: *mut CelObject) -> i64 {
     }
 }
 
+/// `1` or `0` when both cells are strings ordered by `op`.
+///
+/// `op` is `OP_LT`, `OP_LE`, `OP_GT`, or `OP_GE`. `-1` declines: a null, a
+/// non-string, or any other `op`. Payloads are immutable.
+#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+fn str_ord_bit(left: *mut CelObject, right: *mut CelObject, op: i64) -> i64 {
+    if left.is_null()
+        || right.is_null()
+        || unsafe { w_kind(left) } != CelKind::Str
+        || unsafe { w_kind(right) } != CelKind::Str
+    {
+        return -1;
+    }
+    let cmp = if left == right {
+        CMP_EQUAL
+    } else {
+        unsafe { w_string_cmp(left, right) }
+    };
+    if op == OP_LT {
+        if cmp == CMP_LESS {
+            1
+        } else {
+            0
+        }
+    } else if op == OP_LE {
+        if cmp == CMP_GREATER {
+            0
+        } else {
+            1
+        }
+    } else if op == OP_GT {
+        if cmp == CMP_GREATER {
+            1
+        } else {
+            0
+        }
+    } else if op == OP_GE {
+        if cmp == CMP_LESS {
+            0
+        } else {
+            1
+        }
+    } else {
+        -1
+    }
+}
+
 /// Index of `name` on a mapdict layout, or `-1`.
 ///
 /// Elidable (`mapdict.py` `find_map_attr`). A promoted layout and a folded
@@ -4423,6 +4471,7 @@ fn host_call2_i(entry: i64, a: i64, b: i64) -> i64 {
         interned_field => residual_int,
         field_name_cell => elidable_ref_cannot_raise_wrapped,
         str_cells_eq => elidable_int_cannot_raise,
+        str_ord_bit => elidable_int_cannot_raise,
         mapdict_find => elidable_int_cannot_raise,
         map_object_field => inline_ref,
         map_object_known => inline_int,
@@ -4922,6 +4971,21 @@ fn run_cel_portal(
                                 state.frame.locals_stack_w[depth] = r;
                                 state.frame.valuestackdepth = depth + 1;
                                 here + 1
+                            } else {
+                                slow_pc(vm, here)
+                            }
+                        } else if cell_kind(a) == CelKind::Str as i64 {
+                            if cell_kind(k) == CelKind::Str as i64 {
+                                let bit = str_ord_bit(a, k, OP_GT);
+                                if bit < 0 {
+                                    slow_pc(vm, here)
+                                } else {
+                                    let r = box_bool(bit);
+                                    let depth = state.frame.valuestackdepth;
+                                    state.frame.locals_stack_w[depth] = r;
+                                    state.frame.valuestackdepth = depth + 1;
+                                    here + 1
+                                }
                             } else {
                                 slow_pc(vm, here)
                             }
@@ -5710,7 +5774,17 @@ fn run_cel_portal(
                                         state.frame.valuestackdepth = depth - 1;
                                         here + 1
                                     } else {
-                                        slow_pc(vm, here)
+                                        let bit = str_ord_bit(a, b, opcode);
+                                        if bit < 0 {
+                                            slow_pc(vm, here)
+                                        } else {
+                                            let r = box_bool(bit);
+                                            state.frame.locals_stack_w[ai] = r;
+                                            state.frame.locals_stack_w[depth - 1] =
+                                                core::ptr::null_mut();
+                                            state.frame.valuestackdepth = depth - 1;
+                                            here + 1
+                                        }
                                     }
                                 } else {
                                     slow_pc(vm, here)
@@ -5802,7 +5876,14 @@ fn run_cel_portal(
                                         state.frame.locals_stack_w[i] = r;
                                         here + 1
                                     } else {
-                                        slow_pc(vm, here)
+                                        let bit = str_ord_bit(a, k, cmp_op);
+                                        if bit < 0 {
+                                            slow_pc(vm, here)
+                                        } else {
+                                            let r = box_bool(bit);
+                                            state.frame.locals_stack_w[i] = r;
+                                            here + 1
+                                        }
                                     }
                                 } else {
                                     slow_pc(vm, here)
@@ -5876,24 +5957,54 @@ fn run_cel_portal(
                             } else {
                                 slow_pc(vm, here)
                             }
-                        } else if opcode == OP_NE_LOCAL_K {
-                            if cell_kind(a) == CelKind::Str as i64 {
-                                if cell_kind(k) == CelKind::Str as i64 {
-                                    let eq = str_cells_eq(a, k);
-                                    let bit = if eq == 0 { 1 } else { 0 };
-                                    let r = box_bool(bit);
-                                    let depth = state.frame.valuestackdepth;
-                                    state.frame.locals_stack_w[depth] = r;
-                                    state.frame.valuestackdepth = depth + 1;
-                                    here + 1
+                        } else {
+                            let bit = if opcode == OP_NE_LOCAL_K {
+                                if cell_kind(a) == CelKind::Str as i64 {
+                                    if cell_kind(k) == CelKind::Str as i64 {
+                                        let eq = str_cells_eq(a, k);
+                                        if eq == 0 {
+                                            1
+                                        } else {
+                                            0
+                                        }
+                                    } else {
+                                        -1
+                                    }
                                 } else {
-                                    slow_pc(vm, here)
+                                    -1
+                                }
+                            } else if opcode == OP_LT_LOCAL_K {
+                                if cell_kind(a) == CelKind::Str as i64 {
+                                    if cell_kind(k) == CelKind::Str as i64 {
+                                        str_ord_bit(a, k, OP_LT)
+                                    } else {
+                                        -1
+                                    }
+                                } else {
+                                    -1
+                                }
+                            } else if opcode == OP_GE_LOCAL_K {
+                                if cell_kind(a) == CelKind::Str as i64 {
+                                    if cell_kind(k) == CelKind::Str as i64 {
+                                        str_ord_bit(a, k, OP_GE)
+                                    } else {
+                                        -1
+                                    }
+                                } else {
+                                    -1
                                 }
                             } else {
+                                -1
+                            };
+                            if bit < 0 {
                                 slow_pc(vm, here)
+                            } else {
+                                let r = box_bool(bit);
+                                let depth = state.frame.valuestackdepth;
+                                state.frame.locals_stack_w[depth] = r;
+                                state.frame.valuestackdepth = depth + 1;
+                                here + 1
                             }
-                        } else {
-                            slow_pc(vm, here)
                         }
                     } else {
                         slow_pc(vm, here)
@@ -5979,6 +6090,36 @@ fn run_cel_portal(
                                                 } else {
                                                     0
                                                 }
+                                            } else {
+                                                -1
+                                            }
+                                        } else {
+                                            -1
+                                        }
+                                    } else if opcode == OP_LT_LOCAL_K_APPEND {
+                                        if cell_kind(a) == CelKind::Str as i64 {
+                                            if cell_kind(k) == CelKind::Str as i64 {
+                                                str_ord_bit(a, k, OP_LT)
+                                            } else {
+                                                -1
+                                            }
+                                        } else {
+                                            -1
+                                        }
+                                    } else if opcode == OP_GT_LOCAL_K_APPEND {
+                                        if cell_kind(a) == CelKind::Str as i64 {
+                                            if cell_kind(k) == CelKind::Str as i64 {
+                                                str_ord_bit(a, k, OP_GT)
+                                            } else {
+                                                -1
+                                            }
+                                        } else {
+                                            -1
+                                        }
+                                    } else if opcode == OP_GE_LOCAL_K_APPEND {
+                                        if cell_kind(a) == CelKind::Str as i64 {
+                                            if cell_kind(k) == CelKind::Str as i64 {
+                                                str_ord_bit(a, k, OP_GE)
                                             } else {
                                                 -1
                                             }
