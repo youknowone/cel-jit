@@ -615,6 +615,19 @@ fn interned_is_size(program: &CelCode, idx: i64) -> i64 {
     i64::from(program.name(NameId(idx as u32)) == Some("size"))
 }
 
+/// `1` startsWith, `2` endsWith, `3` contains. `0` is any other name.
+///
+/// The name table does not change, so the portal folds this per instruction.
+#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+fn interned_str_method_kind(program: &CelCode, idx: i64) -> i64 {
+    match program.name(NameId(idx as u32)) {
+        Some("startsWith") => 1,
+        Some("endsWith") => 2,
+        Some("contains") => 3,
+        _ => 0,
+    }
+}
+
 /// Unary optional method. 0 residual, else the result (may be `ERROR_SENTINEL`).
 #[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
 fn interned_optional_unary(program: &CelCode, name_idx: i64, w: i64) -> i64 {
@@ -2685,6 +2698,54 @@ fn str_ord_bit(left: *mut CelObject, right: *mut CelObject, op: i64) -> i64 {
     }
 }
 
+/// `1` or `0` for startsWith (`1`), endsWith (`2`), or contains (`3`).
+///
+/// `-1` declines: a null, a non-string, or any other `op`. Payloads are
+/// immutable. A string contains, starts with, and ends with itself.
+#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+fn str_affix_bit(left: *mut CelObject, right: *mut CelObject, op: i64) -> i64 {
+    if left.is_null()
+        || right.is_null()
+        || unsafe { w_kind(left) } != CelKind::Str
+        || unsafe { w_kind(right) } != CelKind::Str
+    {
+        return -1;
+    }
+    if op == 1 {
+        if left == right {
+            return 1;
+        }
+        match (unsafe { string_as_str(left) }, unsafe {
+            string_as_str(right)
+        }) {
+            (Some(hay), Some(needle)) => i64::from(hay.starts_with(needle)),
+            _ => -1,
+        }
+    } else if op == 2 {
+        if left == right {
+            return 1;
+        }
+        match (unsafe { string_as_str(left) }, unsafe {
+            string_as_str(right)
+        }) {
+            (Some(hay), Some(needle)) => i64::from(hay.ends_with(needle)),
+            _ => -1,
+        }
+    } else if op == 3 {
+        if left == right {
+            return 1;
+        }
+        match (unsafe { string_as_str(left) }, unsafe {
+            string_as_str(right)
+        }) {
+            (Some(hay), Some(needle)) => i64::from(hay.contains(needle)),
+            _ => -1,
+        }
+    } else {
+        -1
+    }
+}
+
 /// Index of `name` on a mapdict layout, or `-1`.
 ///
 /// Elidable (`mapdict.py` `find_map_attr`). A promoted layout and a folded
@@ -4472,6 +4533,8 @@ fn host_call2_i(entry: i64, a: i64, b: i64) -> i64 {
         field_name_cell => elidable_ref_cannot_raise_wrapped,
         str_cells_eq => elidable_int_cannot_raise,
         str_ord_bit => elidable_int_cannot_raise,
+        str_affix_bit => elidable_int_cannot_raise,
+        interned_str_method_kind => elidable_int_cannot_raise,
         mapdict_find => elidable_int_cannot_raise,
         map_object_field => inline_ref,
         map_object_known => inline_int,
@@ -4813,14 +4876,38 @@ fn run_cel_portal(
                 let here = pc as i64;
                 let a = state.frame.locals_stack_w[insn_a(program, pc)];
                 let k = intern_const(program, insn_b(program, pc));
-                let r = add_local_const_cell(vm, a, k);
-                let next = if r.is_null() {
-                    slow_pc(vm, here)
+                let next = if !a.is_null() {
+                    if !k.is_null() {
+                        if cell_kind(a) == CelKind::Str as i64 {
+                            if cell_kind(k) == CelKind::Str as i64 {
+                                let r = string_add_cell(a, k);
+                                if r.is_null() {
+                                    slow_pc(vm, here)
+                                } else {
+                                    let depth = state.frame.valuestackdepth;
+                                    state.frame.locals_stack_w[depth] = r;
+                                    state.frame.valuestackdepth = depth + 1;
+                                    here + 1
+                                }
+                            } else {
+                                slow_pc(vm, here)
+                            }
+                        } else {
+                            let r = add_local_const_cell(vm, a, k);
+                            if r.is_null() {
+                                slow_pc(vm, here)
+                            } else {
+                                let depth = state.frame.valuestackdepth;
+                                state.frame.locals_stack_w[depth] = r;
+                                state.frame.valuestackdepth = depth + 1;
+                                here + 1
+                            }
+                        }
+                    } else {
+                        slow_pc(vm, here)
+                    }
                 } else {
-                    let depth = state.frame.valuestackdepth;
-                    state.frame.locals_stack_w[depth] = r;
-                    state.frame.valuestackdepth = depth + 1;
-                    here + 1
+                    slow_pc(vm, here)
                 };
                 if next >= 0 {
                     let tgt = next as usize;
@@ -5078,7 +5165,28 @@ fn run_cel_portal(
                     if !a.is_null() {
                         if !k.is_null() {
                             if !list.is_null() {
-                                if cell_kind(a) == CelKind::Int as i64 {
+                                if cell_kind(a) == CelKind::Str as i64 {
+                                    if cell_kind(k) == CelKind::Str as i64 {
+                                        let r = string_add_cell(a, k);
+                                        if r.is_null() {
+                                            slow_pc(vm, here)
+                                        } else {
+                                            let stored = append_str_word(list, r);
+                                            let stored = if stored != 0 {
+                                                stored
+                                            } else {
+                                                append_cell(list, r)
+                                            };
+                                            if stored != 0 {
+                                                here + 1
+                                            } else {
+                                                slow_pc(vm, here)
+                                            }
+                                        }
+                                    } else {
+                                        slow_pc(vm, here)
+                                    }
+                                } else if cell_kind(a) == CelKind::Int as i64 {
                                     if cell_kind(k) == CelKind::Int as i64 {
                                         let l = cell_int(a);
                                         let rv = cell_int(k);
@@ -5756,7 +5864,18 @@ fn run_cel_portal(
                                 }
                             } else if cell_kind(a) == CelKind::Str as i64 {
                                 if cell_kind(b) == CelKind::Str as i64 {
-                                    if opcode == OP_EQ || opcode == OP_NE {
+                                    if opcode == OP_ADD {
+                                        let r = string_add_cell(a, b);
+                                        if r.is_null() {
+                                            slow_pc(vm, here)
+                                        } else {
+                                            state.frame.locals_stack_w[ai] = r;
+                                            state.frame.locals_stack_w[depth - 1] =
+                                                core::ptr::null_mut();
+                                            state.frame.valuestackdepth = depth - 1;
+                                            here + 1
+                                        }
+                                    } else if opcode == OP_EQ || opcode == OP_NE {
                                         let eq = str_cells_eq(a, b);
                                         let bit = if opcode == OP_NE {
                                             if eq == 0 {
@@ -6441,14 +6560,68 @@ fn run_cel_portal(
                         let arg = state.frame.locals_stack_w[arg_i];
                         if !recv.is_null() {
                             if !arg.is_null() {
-                                let r = method1_cell(program, name, recv, arg);
-                                if r.is_null() {
-                                    slow_pc(vm, here)
+                                // `1` startsWith, `2` endsWith, `3` contains.
+                                // A folded name keeps a list `contains` off
+                                // the string residual, and a string `contains`
+                                // off the list residual. `matches`, `or`, and
+                                // `orValue` stay on `method1_cell`.
+                                let kind = interned_str_method_kind(program, name);
+                                if kind == 0 {
+                                    let r = method1_cell(program, name, recv, arg);
+                                    if r.is_null() {
+                                        slow_pc(vm, here)
+                                    } else {
+                                        state.frame.locals_stack_w[arg_i] = r;
+                                        state.frame.locals_stack_w[i] = core::ptr::null_mut();
+                                        state.frame.valuestackdepth = depth - 1;
+                                        here + 1
+                                    }
+                                } else if kind == 3 {
+                                    if cell_kind(recv) == CelKind::Str as i64 {
+                                        // A non-string needle in a string is
+                                        // false. Both strings take the bit.
+                                        let bit = if cell_kind(arg) == CelKind::Str as i64 {
+                                            str_affix_bit(recv, arg, kind)
+                                        } else {
+                                            0
+                                        };
+                                        if bit < 0 {
+                                            slow_pc(vm, here)
+                                        } else {
+                                            let r = box_bool(bit);
+                                            state.frame.locals_stack_w[arg_i] = r;
+                                            state.frame.locals_stack_w[i] = core::ptr::null_mut();
+                                            state.frame.valuestackdepth = depth - 1;
+                                            here + 1
+                                        }
+                                    } else {
+                                        let r = method1_cell(program, name, recv, arg);
+                                        if r.is_null() {
+                                            slow_pc(vm, here)
+                                        } else {
+                                            state.frame.locals_stack_w[arg_i] = r;
+                                            state.frame.locals_stack_w[i] = core::ptr::null_mut();
+                                            state.frame.valuestackdepth = depth - 1;
+                                            here + 1
+                                        }
+                                    }
+                                } else if cell_kind(recv) == CelKind::Str as i64 {
+                                    if cell_kind(arg) == CelKind::Str as i64 {
+                                        let bit = str_affix_bit(recv, arg, kind);
+                                        if bit < 0 {
+                                            slow_pc(vm, here)
+                                        } else {
+                                            let r = box_bool(bit);
+                                            state.frame.locals_stack_w[arg_i] = r;
+                                            state.frame.locals_stack_w[i] = core::ptr::null_mut();
+                                            state.frame.valuestackdepth = depth - 1;
+                                            here + 1
+                                        }
+                                    } else {
+                                        slow_pc(vm, here)
+                                    }
                                 } else {
-                                    state.frame.locals_stack_w[arg_i] = r;
-                                    state.frame.locals_stack_w[i] = core::ptr::null_mut();
-                                    state.frame.valuestackdepth = depth - 1;
-                                    here + 1
+                                    slow_pc(vm, here)
                                 }
                             } else {
                                 slow_pc(vm, here)

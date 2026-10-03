@@ -503,8 +503,9 @@ fn record_name_equality_answers_after_the_portal_compiles() {
     }
 }
 
-/// String methods, equality, and ordering against a constant string stay on
-/// the compiled loop. `math.max` is a real function and still runs.
+/// String methods, equality, ordering, and concatenation against a constant
+/// string stay on the compiled loop. `math.max` is a real function and still
+/// runs.
 #[test]
 fn string_methods_answer_after_the_portal_compiles() {
     unsafe { std::env::set_var("CEL_PORTAL_THRESHOLD", "100") };
@@ -546,9 +547,18 @@ fn string_methods_answer_after_the_portal_compiles() {
     agree_compiled_in(r#"list.map(e, e < "a")"#, &ctx, 5);
     agree_compiled_in(r#"list.map(e, e == "a")"#, &ctx, 5);
     agree_compiled_in(r#"tags.exists(t, t.startsWith("alp"))"#, &ctx, 20);
+    agree_compiled_in(r#"tags.exists(t, t.startsWith(""))"#, &ctx, 20);
+    agree_compiled_in(r#"tags.exists(t, t.endsWith("zzz"))"#, &ctx, 20);
+    agree_compiled_in(r#"tags.exists(t, t.contains("zzz"))"#, &ctx, 20);
+    agree_compiled_in(r#"tags.exists(t, t.contains("beta"))"#, &ctx, 20);
     agree_compiled_in(r#"tags.map(t, t.startsWith("a"))"#, &ctx, 20);
     agree_compiled_in(r#"tags.map(t, t.endsWith("row"))"#, &ctx, 20);
     agree_compiled_in(r#"tags.map(t, t.contains("bet"))"#, &ctx, 20);
+    agree_compiled_in(r#"tags.map(t, t + "x")"#, &ctx, 20);
+    agree_compiled_in(r#"tags.exists(t, t + "x" == "beta-rowx")"#, &ctx, 20);
+    agree_compiled_in(r#"list.map(e, e + 1)"#, &ctx, 20);
+    agree_compiled_in(r#"list.map(e, e.contains("a"))"#, &ctx, 5);
+    agree_compiled_in(r#"list.map(e, e + "a")"#, &ctx, 5);
     agree_compiled_in(r#"items.exists(i, i.tag.startsWith("alp"))"#, &ctx, 20);
     agree_compiled_in(r#"tags.exists(t, s.startsWith(t))"#, &ctx, 20);
     agree_compiled_in("list.map(e, math.max(e, 2))", &ctx, 20);
