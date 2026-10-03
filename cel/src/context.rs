@@ -1,4 +1,4 @@
-use crate::magic::{Function, FunctionRegistry, IntoFunction, ScalarFn};
+use crate::magic::{Function, FunctionRegistry, IntoFunction};
 use crate::objects::{Opaque, TryIntoValue, Value};
 use crate::parser::Expression;
 use crate::{Env, ExecutionError};
@@ -526,42 +526,26 @@ impl<'a> Context<'a> {
         }
     }
 
-    fn registry_and_env(&self) -> (&FunctionRegistry, &Env) {
+    fn root_registry(&self) -> &FunctionRegistry {
         match self {
-            Context::Root { functions, env, .. } => (functions, env.as_ref()),
-            Context::Child { parent, .. } => parent.registry_and_env(),
+            Context::Root { functions, .. } => functions,
+            Context::Child { parent, .. } => parent.root_registry(),
         }
     }
 
-    /// Entry word of a two-int scalar under `name`, when the stdlib has no
-    /// matching overload.
+    /// Address of the root [`FunctionRegistry`], as a trace word.
     ///
-    /// The decision is stored on the registry entry and reused while
-    /// [`FunctionRegistry::generation`] is unchanged. `add_function` bumps
-    /// that generation, so the next call resolves again. A miss, a non-int
-    /// signature, or a stdlib hit returns `None` and the erased path runs.
+    /// A child walks to the root. The word is that registry, not this context.
+    #[cfg(feature = "jit")]
+    pub(crate) fn registry_word(&self) -> i64 {
+        self.root_registry() as *const FunctionRegistry as usize as i64
+    }
+
+    /// Entry word of a two-int scalar under `name` on the root registry.
+    ///
+    /// A child walks to the root. See [`FunctionRegistry::int2_entry`].
     pub(crate) fn int2_entry(&self, name: &str) -> Option<i64> {
-        let (registry, env) = self.registry_and_env();
-        let func = registry.get(name)?;
-        let generation = registry.generation();
-        if let Some(entry) = func.int2_cache(generation) {
-            return (entry != 0).then_some(entry);
-        }
-        let entry = if env
-            .find_overload(name, &[Value::Int(0), Value::Int(0)])
-            .is_some()
-        {
-            0
-        } else if let Some(scalar) = func.scalar() {
-            match &**scalar {
-                ScalarFn::Int2(_) => scalar.entry_word(),
-                _ => 0,
-            }
-        } else {
-            0
-        };
-        func.set_int2_cache(generation, entry);
-        (entry != 0).then_some(entry)
+        self.root_registry().int2_entry(name)
     }
 
     /// [`Context::get_function`] for a namespaced name, without joining the two
@@ -613,10 +597,11 @@ impl<'a> Context<'a> {
     /// context.add_function("add", |a: i64, b: i64| a + b);
     /// ```
     pub fn empty() -> Self {
+        let env = Arc::new(Env::default());
         Context::Root {
-            env: Arc::new(Env::default()),
+            env: Arc::clone(&env),
             variables: Default::default(),
-            functions: Default::default(),
+            functions: FunctionRegistry::with_env(env),
             resolver: None,
             retained: Vec::new(),
             region: crate::runtime::heap::BindRegionSlot::empty(),
@@ -626,9 +611,9 @@ impl<'a> Context<'a> {
 
     pub fn with_env(env: Arc<Env>) -> Self {
         Context::Root {
+            functions: FunctionRegistry::with_env(Arc::clone(&env)),
             env,
             variables: Default::default(),
-            functions: Default::default(),
             resolver: None,
             retained: Vec::new(),
             region: crate::runtime::heap::BindRegionSlot::empty(),
@@ -639,10 +624,11 @@ impl<'a> Context<'a> {
 
 impl Default for Context<'_> {
     fn default() -> Self {
+        let env = Env::shared_stdlib();
         Context::Root {
-            env: Env::shared_stdlib(),
+            env: Arc::clone(&env),
             variables: Default::default(),
-            functions: Default::default(),
+            functions: FunctionRegistry::with_env(env),
             resolver: None,
             retained: Vec::new(),
             region: crate::runtime::heap::BindRegionSlot::empty(),

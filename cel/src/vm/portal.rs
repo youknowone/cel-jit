@@ -1658,6 +1658,25 @@ fn run_table_driver(code: &CelCode, state: &mut PortalState) -> *mut CelObject {
     call_portal(unsafe { &mut *ptr }, code, state)
 }
 
+/// Compile counters of the driver this thread owns for `code`.
+///
+/// `(loops_compiled, bridges_compiled, retraces_compiled, guard_failures)`.
+/// Zeros when this thread has not evaluated `code`. The caller is the
+/// owner thread and is not inside [`eval_through_portal`].
+pub fn portal_compile_counts(code: &CelCode) -> (usize, usize, usize, usize) {
+    let ptr = unsafe { *code.identity.live.jit.driver.get() };
+    if ptr == 0 {
+        return (0, 0, 0, 0);
+    }
+    let stats = unsafe { (*(ptr as *const JitDriver<PortalState>)).get_stats() };
+    (
+        stats.loops_compiled,
+        stats.bridges_compiled,
+        stats.retraces_compiled,
+        stats.guard_failures,
+    )
+}
+
 /// Evaluate `code` through the portal loop.
 #[inline(always)]
 pub(crate) fn eval_through_portal(
@@ -4388,10 +4407,20 @@ fn slow_pc(vm: i64, here: i64) -> i64 {
 /// Null means this call is not that convention: the erased path in
 /// `slow_pc` still runs, including its argument errors. A hit does not
 /// build an argument `Vec` and does not hydrate the frame.
+///
+/// `ctx` stays red. The root registry address and its generation are
+/// loaded through that pointer and promoted (`version_tag`).
+/// [`host_int2_entry_pure`] is `_pure_lookup_where_with_method_cache`.
+/// A child shares the root registry, so those guards pass across scopes.
+/// `add_function` replaces the generation and that guard fails. The
+/// interpreter resolves through the same elidable, which reads the
+/// registry rather than `ctx`.
 #[majit_macros::jit_inline(
     ref_params = { program: ref(CelCode) },
     calls = {
-        host_int2_entry => residual_int_cannot_raise,
+        host_root_registry => residual_int_cannot_raise,
+        host_registry_generation_at => residual_int_cannot_raise,
+        host_int2_entry_pure => elidable_int_cannot_raise,
         host_call2_i => residual_int_cannot_raise,
         cell_int => inline_int,
         box_int => inline_ref,
@@ -4405,7 +4434,11 @@ fn host_int2_cell(
     left: *mut CelObject,
     right: *mut CelObject,
 ) -> *mut CelObject {
-    let entry = host_int2_entry(ctx_bits, program, name);
+    let registry = host_root_registry(ctx_bits);
+    let registry = majit_ir::jit::promote(registry);
+    let version = host_registry_generation_at(registry);
+    let version = majit_ir::jit::promote(version);
+    let entry = host_int2_entry_pure(registry, version, program, name);
     if entry == 0 {
         core::ptr::null_mut()
     } else {
@@ -4414,20 +4447,52 @@ fn host_int2_cell(
     }
 }
 
-/// Entry word of the two-int scalar for `name`, or `0` when the erased
-/// path must run. Reads the registry on every call, so a generation bump
-/// from `add_function` is visible to the next call.
+/// Address of the root [`crate::magic::FunctionRegistry`], or `0`.
+///
+/// Residual. A [`crate::context::Context::Child`] walks to the root.
+/// The promote in [`host_int2_cell`] guards this word, not `ctx`.
 #[cfg_attr(feature = "jit", majit_macros::dont_look_inside_cannot_raise)]
-fn host_int2_entry(ctx_bits: i64, program: *const CelCode, name: i64) -> i64 {
-    if ctx_bits == 0 || program.is_null() {
+fn host_root_registry(ctx_bits: i64) -> i64 {
+    if ctx_bits == 0 {
         return 0;
     }
     let ctx = unsafe { &*(ctx_bits as usize as *const crate::context::Context) };
+    ctx.registry_word()
+}
+
+/// Generation of the registry at `registry`, or `0` when the pointer is null.
+///
+/// Residual. [`crate::magic::FunctionRegistry::add`] replaces the id, and
+/// the promote in [`host_int2_cell`] guards this word.
+#[cfg_attr(feature = "jit", majit_macros::dont_look_inside_cannot_raise)]
+fn host_registry_generation_at(registry: i64) -> i64 {
+    if registry == 0 {
+        return 0;
+    }
+    let registry = unsafe { &*(registry as usize as *const crate::magic::FunctionRegistry) };
+    registry.generation() as i64
+}
+
+/// Entry word for `name` at `(registry, version)`, or `0`.
+///
+/// `_pure_lookup_where_with_method_cache(self, name, version_tag)`.
+/// A generation that is not the registry's current one yields `0`, so
+/// the pure-call cache cannot replay another registry's entry. The
+/// lookup reads the registry, not a context.
+#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+fn host_int2_entry_pure(registry: i64, version: i64, program: *const CelCode, name: i64) -> i64 {
+    if registry == 0 || version == 0 || program.is_null() {
+        return 0;
+    }
+    let registry = unsafe { &*(registry as usize as *const crate::magic::FunctionRegistry) };
+    if registry.generation() as i64 != version {
+        return 0;
+    }
     let program = unsafe { &*program };
     let Some(name) = program.name(NameId(name as u32)) else {
         return 0;
     };
-    ctx.int2_entry(name).unwrap_or(0)
+    registry.int2_entry(name).unwrap_or(0)
 }
 
 /// `1` when the joined name has to run as a function, else `0`.
@@ -4604,7 +4669,9 @@ fn host_call2_i(entry: i64, a: i64, b: i64) -> i64 {
         interned_unary => residual_int,
         interned_unary_cell => residual_ref,
         host_int2_cell => inline_ref,
-        host_int2_entry => residual_int_cannot_raise,
+        host_root_registry => residual_int_cannot_raise,
+        host_registry_generation_at => residual_int_cannot_raise,
+        host_int2_entry_pure => elidable_int_cannot_raise,
         host_call2_i => residual_int_cannot_raise,
         interned_temporal => residual_int,
         interned_optional_unary => residual_int,

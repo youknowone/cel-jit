@@ -1,10 +1,11 @@
 use crate::macros::{impl_conversions, impl_handler};
 use crate::objects::{ListRef, Opaque};
 use crate::resolvers::{AllArguments, Argument};
-use crate::{ExecutionError, FunctionContext, ResolveResult, Value};
+use crate::{Env, ExecutionError, FunctionContext, ResolveResult, Value};
 use std::any::Any;
 use std::cell::Cell;
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 impl_conversions!(
@@ -311,31 +312,53 @@ impl_handler!(C1, C2, C3, C4, C5, C6, C7, C8, C9);
 
 pub struct FunctionRegistry {
     functions: BTreeMap<String, Function>,
-    /// Bumped by every [`FunctionRegistry::add`]. Distinct from the binding
+    /// Identity of the registered functions.
+    ///
+    /// [`FunctionRegistry::add`] replaces it. Distinct from the binding
     /// [`crate::context::VersionTag`], which `add_function` does not touch.
     /// `0` is reserved: a [`Function`] cache of generation `0` is unchecked.
+    /// Drawn from one process-wide counter, so two registries do not share
+    /// an id and a dropped registry's id is not handed out again.
     generation: u64,
+    /// Overloads for names in this registry.
+    ///
+    /// The same [`Arc`] the root context holds. A two-int lookup reads it
+    /// from here, so the lookup does not need the context pointer.
+    env: Arc<Env>,
+}
+
+/// Next registry generation. `0` stays unused.
+fn fresh_registry_generation() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    let id = NEXT.fetch_add(1, Ordering::Relaxed);
+    if id == 0 {
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    } else {
+        id
+    }
 }
 
 impl Default for FunctionRegistry {
     fn default() -> Self {
-        FunctionRegistry {
-            functions: BTreeMap::new(),
-            generation: 1,
-        }
+        FunctionRegistry::with_env(Env::shared_stdlib())
     }
 }
 
 impl FunctionRegistry {
+    pub(crate) fn with_env(env: Arc<Env>) -> Self {
+        FunctionRegistry {
+            functions: BTreeMap::new(),
+            generation: fresh_registry_generation(),
+            env,
+        }
+    }
+
     pub(crate) fn add<F, T>(&mut self, name: &str, function: F)
     where
         F: IntoFunction<T> + 'static,
         T: 'static,
     {
-        self.generation = self.generation.wrapping_add(1);
-        if self.generation == 0 {
-            self.generation = 1;
-        }
+        self.generation = fresh_registry_generation();
         self.functions
             .insert(name.to_string(), function.into_function());
     }
@@ -353,6 +376,37 @@ impl FunctionRegistry {
     /// parts into a `String` the lookup would immediately discard.
     pub(crate) fn get_qualified(&self, prefix: &str, name: &str) -> Option<&Function> {
         crate::common::get_qualified(&self.functions, prefix, name)
+    }
+
+    /// Entry word of a two-int scalar under `name`, when [`Self::env`] has no
+    /// matching overload.
+    ///
+    /// The decision is stored on the registry entry and reused while
+    /// [`Self::generation`] is unchanged. [`Self::add`] replaces that
+    /// generation, so the next call resolves again. A miss, a non-int
+    /// signature, or a stdlib hit returns `None` and the erased path runs.
+    pub(crate) fn int2_entry(&self, name: &str) -> Option<i64> {
+        let func = self.get(name)?;
+        let generation = self.generation();
+        if let Some(entry) = func.int2_cache(generation) {
+            return (entry != 0).then_some(entry);
+        }
+        let entry = if self
+            .env
+            .find_overload(name, &[Value::Int(0), Value::Int(0)])
+            .is_some()
+        {
+            0
+        } else if let Some(scalar) = func.scalar() {
+            match &**scalar {
+                ScalarFn::Int2(_) => scalar.entry_word(),
+                _ => 0,
+            }
+        } else {
+            0
+        };
+        func.set_int2_cache(generation, entry);
+        (entry != 0).then_some(entry)
     }
 }
 

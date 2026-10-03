@@ -121,6 +121,95 @@ fn reregister_takes_effect_on_the_next_call() {
     agree(&ctx, "add(x, y)");
 }
 
+/// Past the function-entry door the host entry word is a constant.
+/// `add_function` replaces the registry generation, so later calls run
+/// the new body. A second context does not reuse the first word.
+#[test]
+fn compiled_host_call_observes_reregister() {
+    let mut ctx = Context::default();
+    bind_xy(&mut ctx);
+    ctx.add_function("add", |a: i64, b: i64| a + b);
+    ctx.add_function("multiply", |a: i64, b: i64| a * b);
+    let program = Program::compile("add(x, y) + multiply(a, b)").unwrap();
+    for i in 0..400 {
+        assert_eq!(program.execute(&ctx).unwrap(), Value::Int(45), "warm {i}");
+    }
+
+    ctx.add_function("add", |a: i64, b: i64| a.wrapping_mul(b));
+    let replaced = Value::Int(10 * 20 + 5 * 3);
+    for i in 0..8 {
+        assert_eq!(
+            program.execute(&ctx).unwrap(),
+            replaced,
+            "after re-register {i}"
+        );
+    }
+
+    let mut other = Context::default();
+    bind_xy(&mut other);
+    other.add_function("add", |a: i64, b: i64| a.wrapping_sub(b));
+    other.add_function("multiply", |a: i64, b: i64| a * b);
+    assert_eq!(
+        program.execute(&other).unwrap(),
+        Value::Int(10 - 20 + 5 * 3)
+    );
+    assert_eq!(program.execute(&ctx).unwrap(), replaced);
+}
+
+/// One root registry serves every fresh child. A fresh root is a new registry.
+///
+/// Each evaluation binds a different `x`. The child case shares the root
+/// registry, so compiled loops and bridges stay bounded when the portal
+/// is on.
+#[cfg(feature = "vm")]
+#[test]
+fn compiled_host_call_across_fresh_scopes() {
+    let expr = Parser::default()
+        .parse("add(x, y) + multiply(a, b)")
+        .unwrap();
+    let code = cel::vm::compile(&expr).unwrap();
+    let mut root = Context::default();
+    root.add_function("add", |a: i64, b: i64| a + b);
+    root.add_function("multiply", |a: i64, b: i64| a * b);
+
+    const N: i64 = 5000;
+    for i in 0..N {
+        let x = 10 + (i % 17);
+        let mut child = root.new_inner_scope();
+        child.add_variable_from_value("x", x);
+        child.add_variable_from_value("y", 20i64);
+        child.add_variable_from_value("a", 5i64);
+        child.add_variable_from_value("b", 3i64);
+        let got = cel::vm::cel_eval_loop(&code, &child).unwrap();
+        assert_eq!(got, Value::Int(x + 20 + 5 * 3), "child {i}");
+    }
+
+    #[cfg(feature = "jit")]
+    let child_counts = cel::vm::portal::portal_compile_counts(&code);
+
+    for i in 0..N {
+        let x = 10 + (i % 17);
+        let mut ctx = Context::default();
+        ctx.add_function("add", |a: i64, b: i64| a + b);
+        ctx.add_function("multiply", |a: i64, b: i64| a * b);
+        ctx.add_variable_from_value("x", x);
+        ctx.add_variable_from_value("y", 20i64);
+        ctx.add_variable_from_value("a", 5i64);
+        ctx.add_variable_from_value("b", 3i64);
+        let got = cel::vm::cel_eval_loop(&code, &ctx).unwrap();
+        assert_eq!(got, Value::Int(x + 20 + 5 * 3), "root {i}");
+    }
+
+    #[cfg(feature = "jit")]
+    {
+        let (loops, bridges, retraces, guards) = child_counts;
+        assert!(
+            loops >= 1 && loops + bridges <= 8,
+            "child compiled loops+bridges grew with N={N}: loops={loops} bridges={bridges} retraces={retraces} guards={guards}"
+        );
+    }
+}
+
 /// Straight-line code compiles at the function entry once the driver's
 /// threshold is crossed. The replacement has to be visible in that code.
 #[cfg(feature = "jit")]
