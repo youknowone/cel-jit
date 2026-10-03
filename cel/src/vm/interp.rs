@@ -783,12 +783,13 @@ pub(crate) struct Vm<'a> {
     anchor: u32,
 }
 
-/// Frame for this execute: a region-owned frame on the outermost call,
-/// else a nursery allocation that the scope rewind reclaims.
+/// Frame for this execute.
 ///
-/// Nested execute (a host re-entering while this frame is live) must not
-/// reuse the cached pointer. A larger code object abandons the previous
-/// frame inside the region; rewind and drop reclaim it with the region.
+/// Outermost + bind region: the region's frame, reset when it is large
+/// enough. Outermost + no region: the heap's young frame, reset when that
+/// pointer is still live nursery and large enough. Nested execute allocates
+/// a fresh frame and does not touch either cache — the outer frame is live
+/// across the host call.
 #[inline]
 fn frame_for_execute(
     ctx: &Context,
@@ -801,7 +802,7 @@ fn frame_for_execute(
         return new_cel_frame_in(heap, n_slots, max_stack);
     }
     let Some(region) = ctx.eval_region() else {
-        return new_cel_frame_in(heap, n_slots, max_stack);
+        return unbound_young_frame(heap, n_slots, max_stack);
     };
     let need = (n_slots.max(0) as usize).saturating_add(max_stack.max(0) as usize);
     let cached = region.take_eval_frame(need);
@@ -815,6 +816,36 @@ fn frame_for_execute(
         new_cel_frame_in(heap, n_slots, max_stack)
     });
     region.store_eval_frame(frame as *mut u8, need);
+    frame
+}
+
+/// Nursery frame reused across unbound outermost executes.
+///
+/// Stored only when the header is young. `Vm::new` outside an evaluation
+/// allocates in old space; caching that pointer would pin it for every
+/// later execute. A hit resets the cells. The items block was bumped
+/// before the header, so a live header means the block is live too.
+#[inline]
+fn unbound_young_frame(
+    heap: &crate::runtime::heap::CelHeap,
+    n_slots: i64,
+    max_stack: i64,
+) -> *mut W_CelFrame {
+    let need = (n_slots.max(0) as usize).saturating_add(max_stack.max(0) as usize);
+    let cached = heap.cached_young_frame(need);
+    if !cached.is_null() {
+        let frame = cached as *mut W_CelFrame;
+        unsafe {
+            debug_assert!(heap.young_payload_live((*frame).locals_stack_w.block as *const u8));
+            reset_cel_frame(frame, n_slots);
+        }
+        return frame;
+    }
+    let frame = new_cel_frame_in(heap, n_slots, max_stack);
+    if heap.young_payload_live(frame as *const u8) {
+        let cap = unsafe { (*frame).locals_stack_w.capacity() };
+        heap.store_young_frame(frame as *mut u8, cap);
+    }
     frame
 }
 
@@ -874,13 +905,12 @@ impl Vm<'_> {
 }
 
 impl<'a> Vm<'a> {
-    /// Borrow this thread's buffers and size them for `code`.
+    /// Build an evaluator for `code`.
     ///
-    /// Every buffer arrives empty — [`Scratch::release`] is what put it back —
-    /// so this establishes the lengths the loop indexes into: the locals and
-    /// the operand stack the compiler proved it needs, as one array. On a
-    /// thread that has evaluated anything before, the capacity is already
-    /// there and none of this allocates.
+    /// The operand vector stays empty until [`Self::ensure_scratch`]. An
+    /// interned-only run never takes the thread-local pool; the cel frame's
+    /// cells are the stack. A residual that needs a [`Value`] or a builder
+    /// copies those cells into the pool on the way in.
     #[inline]
     fn new(
         code: &'a CelCode,
@@ -896,23 +926,8 @@ impl<'a> Vm<'a> {
             code.n_slots as i64,
             code.max_stack as i64,
         );
-        #[cfg(feature = "jit")]
-        let (frame, scratch) = (Vec::new(), None::<Box<Scratch>>);
-        #[cfg(not(feature = "jit"))]
-        let (frame, scratch) = {
-            let mut scratch = take_scratch_box();
-            let mut frame = std::mem::take(&mut scratch.frame);
-            if stack_base > 0 {
-                frame.resize_with(stack_base, || Operand::NULL);
-            }
-            frame.reserve(code.max_stack as usize);
-            if code.n_logic > 0 {
-                scratch
-                    .logic
-                    .resize(code.n_logic as usize, Err(CelErr::InternalError));
-            }
-            (frame, Some(scratch))
-        };
+        let frame = Vec::new();
+        let scratch: Option<Box<Scratch>> = None;
         let scratch_bits = scratch
             .as_ref()
             .map(|s| &**s as *const Scratch as usize)
@@ -1162,8 +1177,25 @@ impl<'a> Vm<'a> {
         }
         let mut scratch = take_scratch_box();
         let mut frame = std::mem::take(&mut scratch.frame);
-        if self.stack_base > 0 && frame.len() < self.stack_base {
-            frame.resize_with(self.stack_base, || Operand::NULL);
+        // Cells are the stack until this runs. Copy them before any push,
+        // or the next operand lands past a hole and the live ones vanish.
+        let (vdepth, cap) = unsafe {
+            (
+                (*self.cel_frame).valuestackdepth as usize,
+                (*self.cel_frame).locals_stack_w.capacity(),
+            )
+        };
+        let want = vdepth.max(self.stack_base);
+        frame.clear();
+        frame.resize_with(want, || Operand::NULL);
+        let n = want.min(cap);
+        let mut i = 0;
+        while i < n {
+            let w = unsafe { *cel_frame_slot(self.cel_frame, i as i64) };
+            if !w.is_null() {
+                frame[i] = Operand::Interned(w);
+            }
+            i += 1;
         }
         frame.reserve(self.code.max_stack as usize);
         if self.code.n_logic > 0 {
@@ -1171,11 +1203,13 @@ impl<'a> Vm<'a> {
                 .logic
                 .resize(self.code.n_logic as usize, Err(CelErr::InternalError));
         }
+        let len = frame.len();
         *self.frame = frame;
         self.scratch_bits = &*scratch as *const Scratch as usize;
         *self.scratch = Some(scratch);
         unsafe {
             (*self.cel_frame).scratch_bits = self.scratch_bits as i64;
+            (*self.cel_frame).valuestackdepth = len as i64;
         }
     }
 
@@ -1245,11 +1279,46 @@ impl<'a> Vm<'a> {
 
     #[inline(always)]
     fn push_operand(&mut self, operand: Operand) {
-        self.ensure_scratch();
+        if self.scratch.is_none() {
+            if let Operand::Interned(w) = operand {
+                self.push_cell(w);
+                return;
+            }
+            self.ensure_scratch();
+        }
         let index = self.frame.len();
         let w = Self::vable_cell(&operand);
         self.frame.push(operand);
         self.write_vable_cell(index, w);
+    }
+
+    /// Write an interned leaf at `valuestackdepth` and advance it.
+    ///
+    /// The operand vector stays empty while the index fits in the items
+    /// block. `write_vable_cell` would store the vector's length, which is
+    /// zero on that path. Past the block the leaf is pushed on the vector;
+    /// advancing the depth without storing it would drop the operand.
+    #[inline(always)]
+    fn push_cell(&mut self, w: CelRef) {
+        let index = unsafe { (*self.cel_frame).valuestackdepth as usize };
+        let cap = unsafe { (*self.cel_frame).locals_stack_w.capacity() };
+        if index < cap {
+            unsafe {
+                *cel_frame_slot(self.cel_frame, index as i64) = w;
+                (*self.cel_frame).valuestackdepth = (index + 1) as i64;
+            }
+        } else {
+            self.push_cell_past_cap(w);
+        }
+    }
+
+    /// No cell remains at `valuestackdepth`. Copy the live cells into the
+    /// operand vector, then push this leaf there.
+    #[cold]
+    #[inline(never)]
+    fn push_cell_past_cap(&mut self, w: CelRef) {
+        self.ensure_scratch();
+        self.push_operand(Operand::Interned(w));
     }
 
     /// Take the topmost operand, or `None` where there is none.
@@ -1259,6 +1328,9 @@ impl<'a> Vm<'a> {
     /// a value pays for closing it.
     #[inline(always)]
     fn pop_operand(&mut self) -> Option<Operand> {
+        if self.scratch.is_none() {
+            return self.pop_cell();
+        }
         if self.frame.len() <= self.stack_base {
             return None;
         }
@@ -1275,9 +1347,95 @@ impl<'a> Vm<'a> {
         popped
     }
 
+    /// Pop one interned cell. A null cell is the frame's unset slot, which
+    /// the vector spells [`Operand::NULL`].
+    #[inline(always)]
+    fn pop_cell(&mut self) -> Option<Operand> {
+        unsafe {
+            let depth = (*self.cel_frame).valuestackdepth as usize;
+            if depth <= self.stack_base {
+                return None;
+            }
+            let index = depth - 1;
+            let cap = (*self.cel_frame).locals_stack_w.capacity();
+            let w = if index < cap {
+                let slot = cel_frame_slot(self.cel_frame, index as i64);
+                let w = *slot;
+                *slot = core::ptr::null_mut();
+                w
+            } else {
+                core::ptr::null_mut()
+            };
+            (*self.cel_frame).valuestackdepth = index as i64;
+            if w.is_null() {
+                Some(Operand::NULL)
+            } else {
+                Some(Operand::Interned(w))
+            }
+        }
+    }
+
+    /// Absolute index of the next free entry: vector length, or
+    /// `valuestackdepth` while the vector has not been built.
+    #[inline(always)]
+    fn abs_len(&self) -> usize {
+        if self.scratch.is_some() {
+            self.frame.len()
+        } else {
+            unsafe { (*self.cel_frame).valuestackdepth as usize }
+        }
+    }
+
+    #[inline(always)]
+    fn cell_at(&self, index: usize) -> CelRef {
+        unsafe {
+            let cap = (*self.cel_frame).locals_stack_w.capacity();
+            if index < cap {
+                *cel_frame_slot(self.cel_frame, index as i64)
+            } else {
+                core::ptr::null_mut()
+            }
+        }
+    }
+
+    /// Write one cell. Does not touch `valuestackdepth`: a local store must
+    /// not look like a push.
+    #[inline(always)]
+    fn set_cell(&mut self, index: usize, w: CelRef) {
+        unsafe {
+            let cap = (*self.cel_frame).locals_stack_w.capacity();
+            if index < cap {
+                *cel_frame_slot(self.cel_frame, index as i64) = w;
+            }
+        }
+    }
+
     /// The topmost operand, left where it is.
+    ///
+    /// `None` while the operand vector has not been built. Callers that only
+    /// need an interned leaf use [`Self::top_leaf`].
     fn top(&self) -> Option<&Operand> {
+        if self.scratch.is_none() {
+            return None;
+        }
         (self.frame.len() > self.stack_base).then(|| &self.frame[self.frame.len() - 1])
+    }
+
+    /// Interned leaf on top of the stack, in either representation.
+    fn top_leaf(&self) -> Option<CelRef> {
+        if self.scratch.is_some() {
+            return self.top().and_then(Self::leaf_of);
+        }
+        let abs = self.abs_len();
+        if abs <= self.stack_base {
+            return None;
+        }
+        let w = self.cell_at(abs - 1);
+        if w.is_null() {
+            None
+        } else {
+            Some(w)
+        }
     }
 
     /// The topmost operand, left where it is, open for mutation.
@@ -1285,7 +1443,14 @@ impl<'a> Vm<'a> {
     /// An aggregate still being built is reached through here and mutated in
     /// place. Every such caller runs AFTER the value it is about to store has
     /// been popped, so what this answers is the operand under that one.
+    /// Building the vector is the only way to hand back `&mut Operand`.
     fn top_mut(&mut self) -> Option<&mut Operand> {
+        if self.scratch.is_none() {
+            if self.abs_len() <= self.stack_base {
+                return None;
+            }
+            self.ensure_scratch();
+        }
         if self.frame.len() > self.stack_base {
             self.frame.last_mut()
         } else {
@@ -1295,7 +1460,7 @@ impl<'a> Vm<'a> {
 
     /// How many operands are held.
     fn depth(&self) -> usize {
-        self.frame.len().saturating_sub(self.stack_base)
+        self.abs_len().saturating_sub(self.stack_base)
     }
 
     /// Drop every operand above `depth`.
@@ -1310,6 +1475,20 @@ impl<'a> Vm<'a> {
             "unwinding to depth {depth} from {}",
             self.depth()
         );
+        if self.scratch.is_none() {
+            let old = self.abs_len();
+            let new = self.stack_base + depth;
+            unsafe {
+                let cap = (*self.cel_frame).locals_stack_w.capacity();
+                let mut i = new;
+                while i < old && i < cap {
+                    *cel_frame_slot(self.cel_frame, i as i64) = core::ptr::null_mut();
+                    i += 1;
+                }
+                (*self.cel_frame).valuestackdepth = new as i64;
+            }
+            return;
+        }
         let old = self.frame.len();
         self.frame.truncate(self.stack_base + depth);
         unsafe {
@@ -1330,22 +1509,59 @@ impl<'a> Vm<'a> {
     #[inline(always)]
     #[allow(dead_code)]
     fn local(&self, slot: u32) -> Option<&Value> {
-        match self.frame[..self.stack_base].get(slot as usize) {
+        if self.scratch.is_none() {
+            return None;
+        }
+        let end = self.stack_base.min(self.frame.len());
+        match self.frame[..end].get(slot as usize) {
             Some(Operand::Value(value)) => Some(value),
             _ => None,
         }
     }
 
+    /// The cell in local `slot`, or `None` past the locals.
+    ///
+    /// A null cell is in range: it is the unset slot, not a missing one.
+    fn local_cell(&self, slot: u32) -> Option<CelRef> {
+        let i = slot as usize;
+        if i >= self.stack_base {
+            return None;
+        }
+        let cap = unsafe { (*self.cel_frame).locals_stack_w.capacity() };
+        if i >= cap {
+            return None;
+        }
+        Some(self.cell_at(i))
+    }
+
     fn local_operand(&self, slot: u32) -> Option<&Operand> {
-        self.frame[..self.stack_base].get(slot as usize)
+        if self.scratch.is_none() {
+            return None;
+        }
+        let end = self.stack_base.min(self.frame.len());
+        self.frame[..end].get(slot as usize)
     }
 
     fn local_operand_mut(&mut self, slot: u32) -> Option<&mut Operand> {
-        self.frame[..self.stack_base].get_mut(slot as usize)
+        if (slot as usize) >= self.stack_base {
+            return None;
+        }
+        if self.scratch.is_none() {
+            self.ensure_scratch();
+        }
+        let end = self.stack_base.min(self.frame.len());
+        self.frame[..end].get_mut(slot as usize)
     }
 
     /// The slot as a public [`Value`], converting an interned leaf.
     fn local_as_value(&self, slot: u32) -> Option<Value> {
+        if self.scratch.is_none() {
+            let w = self.local_cell(slot)?;
+            if w.is_null() {
+                return Some(Value::Null);
+            }
+            return unsafe { ref_to_value(w) }.ok();
+        }
         match self.local_operand(slot)? {
             Operand::Value(value) => Some(value.clone()),
             Operand::Interned(w) => unsafe { ref_to_value(*w) }.ok(),
@@ -1354,10 +1570,20 @@ impl<'a> Vm<'a> {
     }
 
     fn local_leaf(&self, slot: u32) -> Option<CelRef> {
+        if self.scratch.is_none() {
+            let w = self.local_cell(slot)?;
+            if w.is_null() {
+                return intern_leaf(&Value::Null);
+            }
+            return Some(w);
+        }
         Self::leaf_of(self.local_operand(slot)?)
     }
 
     fn local_int(&self, slot: u32) -> Option<i64> {
+        if self.scratch.is_none() {
+            return cell_int(self.local_cell(slot)?);
+        }
         match self.local_operand(slot)? {
             Operand::Value(Value::Int(n)) => Some(*n),
             Operand::Interned(w) if unsafe { w_kind(*w) } == CelKind::Int => {
@@ -1782,6 +2008,13 @@ impl<'a> Vm<'a> {
 
     fn append_int(&mut self, word: i64) -> CelResult<()> {
         let boxed = self.box_int(word);
+        if self.scratch.is_none() {
+            if let Some(list) = self.top_leaf() {
+                if unsafe { crate::runtime::object::list_try_append(list, boxed) } {
+                    return Ok(());
+                }
+            }
+        }
         let top = self.top_mut().ok_or(CelErr::InternalError)?;
         match top {
             Operand::Ints(words) => words.push(word),
@@ -1800,6 +2033,13 @@ impl<'a> Vm<'a> {
     }
 
     fn append_ref(&mut self, w: CelRef) -> CelResult<()> {
+        if self.scratch.is_none() {
+            if let Some(list) = self.top_leaf() {
+                if unsafe { crate::runtime::object::list_try_append(list, w) } {
+                    return Ok(());
+                }
+            }
+        }
         let heap = self.heap;
         let top = self.top_mut().ok_or(CelErr::InternalError)?;
         match top {
@@ -1946,10 +2186,9 @@ impl<'a> Vm<'a> {
         };
         if let (Some(k), Some(v)) = (Self::leaf_of(&key), Self::leaf_of(&value)) {
             if interned_is_map_key(k) {
-                let map = match self.top() {
-                    Some(Operand::Interned(w)) if unsafe { w_kind(*w) } == CelKind::Map => Some(*w),
-                    _ => None,
-                };
+                let map = self
+                    .top_leaf()
+                    .filter(|w| unsafe { w_kind(*w) } == CelKind::Map);
                 if let Some(map) = map {
                     if unsafe { map_try_insert(map, k, v) } {
                         return Ok(());
@@ -1981,7 +2220,6 @@ impl<'a> Vm<'a> {
     // build routes `Program::execute` through the portal instead.
     #[allow(dead_code)]
     pub(crate) fn run(&mut self) -> CelResult<Value> {
-        self.ensure_scratch();
         unsafe {
             force_virtualizable_if_necessary(self.cel_frame);
         }
@@ -2186,11 +2424,22 @@ impl<'a> Vm<'a> {
                     .ok_or(CelErr::UndeclaredReference(NameId(a)))?;
                 self.push(value);
             }
-            OpCode::LoadLocal => match self.local_operand(a).ok_or(CelErr::InternalError)? {
-                Operand::Interned(w) => self.push_operand(Operand::Interned(*w)),
-                Operand::Value(value) => self.push(value.clone()),
-                _ => return Err(CelErr::InternalError),
-            },
+            OpCode::LoadLocal => {
+                if self.scratch.is_none() {
+                    let w = self.local_cell(a).ok_or(CelErr::InternalError)?;
+                    if w.is_null() {
+                        self.push(Value::Null);
+                    } else {
+                        self.push_operand(Operand::Interned(w));
+                    }
+                } else {
+                    match self.local_operand(a).ok_or(CelErr::InternalError)? {
+                        Operand::Interned(w) => self.push_operand(Operand::Interned(*w)),
+                        Operand::Value(value) => self.push(value.clone()),
+                        _ => return Err(CelErr::InternalError),
+                    }
+                }
+            }
             OpCode::StoreLocal => {
                 let operand = self.pop_operand().ok_or(CelErr::InternalError)?;
                 self.store_operand(a, operand)?;
@@ -2545,8 +2794,17 @@ impl<'a> Vm<'a> {
             // top of the stack without popping it, which is what `ListAppend`
             // does too.
             OpCode::LoadLocalAppend => {
-                let operand = self.local_operand(a).ok_or(CelErr::InternalError)?.clone();
-                self.append_operand(operand)?;
+                if self.scratch.is_none() {
+                    let w = self.local_cell(a).ok_or(CelErr::InternalError)?;
+                    if w.is_null() {
+                        self.append_operand(Operand::Value(Value::Null))?;
+                    } else {
+                        self.append_operand(Operand::Interned(w))?;
+                    }
+                } else {
+                    let operand = self.local_operand(a).ok_or(CelErr::InternalError)?.clone();
+                    self.append_operand(operand)?;
+                }
             }
             OpCode::GetFieldLocalAppend | OpCode::HasFieldLocalAppend => {
                 let field = self.name(b)?;
@@ -2876,12 +3134,16 @@ impl<'a> Vm<'a> {
             // -- control flow ---------------------------------------------------
             OpCode::Jump => return Ok(Step::Jump(a)),
             OpCode::JumpIfOptNone => {
-                let empty = match self.top() {
-                    Some(Operand::Value(value)) => {
-                        matches!(optional_inner(value), OptView::Empty)
+                let empty = if self.scratch.is_none() {
+                    self.top_leaf().is_some_and(interned_optional_is_none)
+                } else {
+                    match self.top() {
+                        Some(Operand::Value(value)) => {
+                            matches!(optional_inner(value), OptView::Empty)
+                        }
+                        Some(Operand::Interned(w)) => interned_optional_is_none(*w),
+                        _ => false,
                     }
-                    Some(Operand::Interned(w)) => interned_optional_is_none(*w),
-                    _ => false,
                 };
                 if empty {
                     return Ok(Step::Jump(a));
@@ -3037,6 +3299,13 @@ impl<'a> Vm<'a> {
     /// atomic refcount pair for a list -- once per element of the loop.
     #[inline(always)]
     fn sequence_len(&self, slot: u32) -> CelResult<i64> {
+        if self.scratch.is_none() {
+            let w = self.local_cell(slot).ok_or(CelErr::InternalError)?;
+            if !w.is_null() && unsafe { w_kind(w) } == CelKind::List {
+                return Ok(unsafe { crate::runtime::object::list_len(w) });
+            }
+            return Err(CelErr::InternalError);
+        }
         match self.local_operand(slot).ok_or(CelErr::InternalError)? {
             Operand::Value(Value::List(list)) => Ok(list.len() as i64),
             Operand::Interned(w) if unsafe { w_kind(*w) } == CelKind::List => {
@@ -3088,6 +3357,13 @@ impl<'a> Vm<'a> {
         let Some(index) = self.local_int(index) else {
             return Err(CelErr::InternalError);
         };
+        if self.scratch.is_none() {
+            let w = self.local_cell(sequence).ok_or(CelErr::InternalError)?;
+            if w.is_null() || unsafe { w_kind(w) } != CelKind::List {
+                return Err(CelErr::InternalError);
+            }
+            return self.interned_list_element(w, index);
+        }
         let interned = match self.local_operand(sequence).ok_or(CelErr::InternalError)? {
             Operand::Value(Value::List(seq)) => {
                 return seq
@@ -3102,10 +3378,14 @@ impl<'a> Vm<'a> {
             Operand::Interned(w) if unsafe { w_kind(*w) } == CelKind::List => *w,
             _ => return Err(CelErr::InternalError),
         };
-        if let Some(n) = unsafe { list_int_at(interned, index) } {
+        self.interned_list_element(interned, index)
+    }
+
+    fn interned_list_element(&self, list: CelRef, index: i64) -> CelResult<Operand> {
+        if let Some(n) = unsafe { list_int_at(list, index) } {
             return Ok(Operand::Interned(self.box_int(n)));
         }
-        let item = unsafe { interned_list_get(interned, index) }.ok_or(CelErr::IndexOutOfBounds)?;
+        let item = unsafe { interned_list_get(list, index) }.ok_or(CelErr::IndexOutOfBounds)?;
         Ok(Operand::Interned(item))
     }
 
@@ -3117,6 +3397,21 @@ impl<'a> Vm<'a> {
     }
 
     fn store_operand(&mut self, slot: u32, operand: Operand) -> CelResult<()> {
+        if self.scratch.is_none() {
+            let w = match &operand {
+                Operand::Interned(w) => Some(*w),
+                Operand::Value(v) => intern_leaf(v),
+                _ => None,
+            };
+            if let Some(w) = w {
+                if (slot as usize) >= self.stack_base {
+                    return Err(CelErr::InternalError);
+                }
+                self.set_cell(slot as usize, w);
+                return Ok(());
+            }
+            self.ensure_scratch();
+        }
         if let Operand::Interned(w) = operand {
             let dest = self.local_operand_mut(slot).ok_or(CelErr::InternalError)?;
             let previous = std::mem::replace(dest, Operand::Interned(w));
@@ -3162,6 +3457,16 @@ impl<'a> Vm<'a> {
     /// list.
     #[inline(always)]
     fn advance_counter(&mut self, slot: u32) -> CelResult<()> {
+        if self.scratch.is_none() {
+            let w = self.local_cell(slot).ok_or(CelErr::InternalError)?;
+            let Some(n) = cell_int(w) else {
+                return Err(CelErr::InternalError);
+            };
+            let next = n.checked_add(1).ok_or(CelErr::Overflow(OpCode::Add))?;
+            let nw = new_int_in(self.heap(), next) as CelRef;
+            self.set_cell(slot as usize, nw);
+            return Ok(());
+        }
         let heap = self.heap;
         let dest = self.local_operand_mut(slot).ok_or(CelErr::InternalError)?;
         match dest {
@@ -3255,6 +3560,17 @@ impl<'a> Vm<'a> {
     fn try_interned_size_on_top(&mut self, name: NameId) -> CelResult<bool> {
         if self.name(name.0)? != "size" {
             return Ok(false);
+        }
+        if self.scratch.is_none() {
+            let Some(w) = self.top_leaf() else {
+                return Ok(false);
+            };
+            let Some(n) = interned_size(w) else {
+                return Ok(false);
+            };
+            let _ = self.pop_operand();
+            self.push_operand(Operand::Interned(self.box_int(n)));
+            return Ok(true);
         }
         let Some(operand) = self.top() else {
             return Ok(false);
@@ -3372,10 +3688,7 @@ impl<'a> Vm<'a> {
 
     /// `getHours` / `getFullYear` / … on an interned duration or timestamp.
     fn try_interned_temporal_accessor(&mut self, name: NameId) -> CelResult<bool> {
-        let Some(operand) = self.top() else {
-            return Ok(false);
-        };
-        let Some(w) = Self::leaf_of(operand) else {
+        let Some(w) = self.top_leaf() else {
             return Ok(false);
         };
         let Some(n) = interned_temporal_accessor(self.name(name.0)?, w) else {
@@ -3395,6 +3708,11 @@ impl<'a> Vm<'a> {
         };
         if n == 0 || self.depth() < n {
             return Ok(false);
+        }
+        // The name matched. The operand vector is what this arm indexes.
+        // Any other host name returned above and did not take the pool.
+        if self.scratch.is_none() {
+            self.ensure_scratch();
         }
         let args: Vec<Operand> = self.frame[self.frame.len() - n..].to_vec();
         let refs: Option<Vec<CelRef>> = args.iter().map(Self::leaf_of).collect();
@@ -3436,10 +3754,7 @@ impl<'a> Vm<'a> {
     /// [`OpCode::CallMethod`] (`(1.5).int()`): the receiver sits on top in
     /// both spellings, so the same pop works.
     fn try_interned_unary_host(&mut self, name: NameId, op: OpCode) -> CelResult<bool> {
-        let Some(operand) = self.top() else {
-            return Ok(false);
-        };
-        let Some(w) = Self::leaf_of(operand) else {
+        let Some(w) = self.top_leaf() else {
             return Ok(false);
         };
         match interned_unary_host(self.name(name.0)?, w) {
@@ -3484,10 +3799,7 @@ impl<'a> Vm<'a> {
         skip: u32,
         op: OpCode,
     ) -> CelResult<Option<Step>> {
-        let Some(operand) = self.top() else {
-            return Ok(None);
-        };
-        let Some(w) = Self::leaf_of(operand) else {
+        let Some(w) = self.top_leaf() else {
             return Ok(None);
         };
         let _ = self.pop_operand();
@@ -3516,10 +3828,7 @@ impl<'a> Vm<'a> {
         call: unsafe fn(CelRef) -> CelRef,
         op: OpCode,
     ) -> CelResult<bool> {
-        let Some(operand) = self.top() else {
-            return Ok(false);
-        };
-        let Some(w) = Self::leaf_of(operand) else {
+        let Some(w) = self.top_leaf() else {
             return Ok(false);
         };
         if unsafe { w_kind(w) } != CelKind::Optional {
@@ -3560,12 +3869,24 @@ impl<'a> Vm<'a> {
         if self.depth() < 2 {
             return Ok(false);
         }
-        let len = self.frame.len();
-        let Some(b) = interned_int(&self.frame[len - 1]) else {
-            return Ok(false);
-        };
-        let Some(a) = interned_int(&self.frame[len - 2]) else {
-            return Ok(false);
+        let (a, b) = if self.scratch.is_some() {
+            let len = self.frame.len();
+            let Some(b) = interned_int(&self.frame[len - 1]) else {
+                return Ok(false);
+            };
+            let Some(a) = interned_int(&self.frame[len - 2]) else {
+                return Ok(false);
+            };
+            (a, b)
+        } else {
+            let abs = self.abs_len();
+            let Some(b) = cell_int(self.cell_at(abs - 1)) else {
+                return Ok(false);
+            };
+            let Some(a) = cell_int(self.cell_at(abs - 2)) else {
+                return Ok(false);
+            };
+            (a, b)
         };
         // A bad name id is the erased path's error. Leaving the operands
         // in place keeps that path's stack effect.
@@ -3939,6 +4260,13 @@ fn interned_to_timestamp(w: CelRef) -> Result<Option<CelRef>, ExecutionError> {
 
 fn unpack_host_args(args: Vec<Value>) -> Vec<Value> {
     args.into_iter().map(|v| v.unpack()).collect()
+}
+
+fn cell_int(w: CelRef) -> Option<i64> {
+    if w.is_null() || unsafe { w_kind(w) } != CelKind::Int {
+        return None;
+    }
+    Some(unsafe { (*w.cast::<W_IntObject>()).intval })
 }
 
 fn interned_int(operand: &Operand) -> Option<i64> {
@@ -4682,6 +5010,33 @@ mod tests {
         }
     }
 
+    /// A call's interned leaves survive when they do not fit in the items block.
+    ///
+    /// The block is `n_slots + max_stack` cells. Pushing past that capacity
+    /// and then popping the argument vector, which is what a call does, has
+    /// to return every leaf. A nested frame is exact, so a reused larger
+    /// block cannot hide the overflow.
+    #[test]
+    fn a_call_keeps_interned_leaves_past_the_items_block() {
+        let ctx = Context::default();
+        let code = CelCode {
+            max_stack: 1,
+            ..CelCode::default()
+        };
+        let mut vm = crate::runtime::heap::with_heap(|h| Vm::new(&code, &ctx, h, false));
+        let cap = unsafe { (*vm.cel_frame).locals_stack_w.capacity() };
+        assert_eq!(cap, 1, "the items block holds one leaf");
+        let n = cap + 7;
+        for i in 0..n {
+            vm.push(Value::Int(i as i64));
+        }
+        let got = Value::list(vm.pop_n(n).expect("argument leaves"));
+        assert_eq!(
+            got,
+            Value::list((0..n as i64).map(Value::Int).collect::<Vec<_>>())
+        );
+    }
+
     /// `1 + 2` stays on the interned `int` table through `cel_add`.
     #[test]
     fn interned_add_of_small_ints_is_the_prebuilt() {
@@ -5250,15 +5605,23 @@ mod tests {
             let &Insn { op, ops } = vm.code.insns.get(pc as usize).expect("`pc` is in range");
             let next = pc + 1;
             let step = vm.step(op, ops, pc, next).expect("the literal evaluates");
-            match vm.top() {
-                Some(Operand::Map(_)) => opened_hash += 1,
-                Some(Operand::Interned(w))
-                    if unsafe { crate::runtime::object::w_kind(*w) }
-                        == crate::runtime::object::CelKind::Map =>
+            let leaf = match vm.top() {
+                Some(Operand::Map(_)) => {
+                    opened_hash += 1;
+                    None
+                }
+                Some(Operand::Interned(w)) => Some(*w),
+                // Cell mode keeps the young map in the frame and leaves the
+                // operand vector unbuilt, so `top` is empty.
+                None => vm.top_leaf(),
+                _ => None,
+            };
+            if let Some(w) = leaf {
+                if unsafe { crate::runtime::object::w_kind(w) }
+                    == crate::runtime::object::CelKind::Map
                 {
                     opened_maps += 1;
                 }
-                _ => {}
             }
             match step {
                 Step::Next => pc = next,

@@ -840,7 +840,7 @@ mod tests {
     /// takes two operand words and pushes its answer onto an operand stack it
     /// never reads. Declared here rather than inferred from an emitted
     /// program, for the reason above -- and this is the one of the three where
-    /// a wrong declaration is silent in release: `Vm::new` only `reserve`s
+    /// a wrong declaration is silent in release: `ensure_scratch` only `reserve`s
     /// `max_stack` and both depth guards are `debug_assert`, so a net effect
     /// declared one low surfaces as `Vm::unwind` truncating below a live
     /// `Operand::List` accumulator rather than as a failure here.

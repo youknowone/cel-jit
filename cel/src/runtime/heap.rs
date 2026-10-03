@@ -550,6 +550,13 @@ pub struct CelHeap {
     /// Driver [`crate::vm::portal`] is inside, so a `may_force` residual
     /// can reach it without another thread-local.
     pub(crate) active_driver: Cell<usize>,
+    /// Outermost frame for a Context with no bind region.
+    ///
+    /// Nursery memory. Reused only while [`Self::young_payload_live`] still
+    /// covers the pointer; rewind nulls it and does not read it. An
+    /// old-space frame is never stored: old space is not rewound.
+    eval_frame: Cell<*mut u8>,
+    eval_frame_cap: Cell<usize>,
 }
 
 impl CelHeap {
@@ -576,6 +583,8 @@ impl CelHeap {
             spare_regions: RefCell::new(Vec::new()),
             portal_vm: Cell::new(0),
             active_driver: Cell::new(0),
+            eval_frame: Cell::new(null_mut()),
+            eval_frame_cap: Cell::new(0),
         }
     }
 
@@ -715,6 +724,9 @@ impl CelHeap {
         self.nursery.bytes.set(self.snap_bytes.get());
         self.nursery.objects.set(self.snap_objects.get());
         self.publish_nursery_bounds();
+        // The cached frame, if any, sat in the rewound range or in a hole
+        // the next bump may reuse. Drop the pointer; do not read it.
+        self.invalidate_young_frame();
     }
 
     /// Bytes handed out of the open nursery segment.
@@ -775,6 +787,7 @@ impl CelHeap {
         self.nursery.bytes.set(self.snap_bytes.get());
         self.nursery.objects.set(self.snap_objects.get());
         self.publish_nursery_bounds();
+        self.invalidate_young_frame();
     }
 
     fn reset_nursery(&self) {
@@ -810,6 +823,7 @@ impl CelHeap {
         drop(segs);
         self.nursery.sync_open();
         self.publish_nursery_bounds();
+        self.invalidate_young_frame();
     }
 
     /// Allocate `value` in this heap and return a pointer to the payload.
@@ -1095,6 +1109,61 @@ impl CelHeap {
     /// code advances without touching the segment vector.
     pub fn is_young(&self, ptr: *const u8) -> bool {
         self.nursery_contains(ptr as usize)
+    }
+
+    /// A cached unbound frame whose item cap is at least `need`, or null.
+    ///
+    /// A pointer the nursery no longer contains is forgotten. The test does
+    /// not dereference it: rewind poisons or frees those bytes, and the
+    /// next bump may hand the same address out again.
+    #[inline]
+    pub(crate) fn cached_young_frame(&self, need: usize) -> *mut u8 {
+        let p = self.eval_frame.get();
+        if p.is_null() {
+            return null_mut();
+        }
+        if !self.young_payload_live(p) {
+            self.invalidate_young_frame();
+            return null_mut();
+        }
+        if self.eval_frame_cap.get() < need {
+            return null_mut();
+        }
+        p
+    }
+
+    /// Remember `ptr` when it is live nursery. Old space is left uncached.
+    #[inline]
+    pub(crate) fn store_young_frame(&self, ptr: *mut u8, cap: usize) {
+        if ptr.is_null() || !self.young_payload_live(ptr) {
+            return;
+        }
+        self.eval_frame.set(ptr);
+        self.eval_frame_cap.set(cap);
+    }
+
+    #[inline]
+    fn invalidate_young_frame(&self) {
+        self.eval_frame.set(null_mut());
+        self.eval_frame_cap.set(0);
+    }
+
+    /// `ptr` is a live nursery payload. Does not dereference `ptr`.
+    ///
+    /// The open segment is `[open_base, nursery_free)`. Older segments are
+    /// still live until [`Self::reset_nursery`] drops them.
+    #[inline]
+    pub(crate) fn young_payload_live(&self, ptr: *const u8) -> bool {
+        let p = ptr as usize;
+        if p == 0 {
+            return false;
+        }
+        let base = self.nursery.open_base.get() as usize;
+        let free = self.nursery_free.get() as usize;
+        if base != 0 && p >= base && p < free {
+            return true;
+        }
+        self.nursery_contains(p)
     }
 
     fn nursery_contains(&self, p: usize) -> bool {
