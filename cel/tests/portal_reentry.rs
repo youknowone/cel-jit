@@ -554,6 +554,9 @@ fn string_methods_answer_after_the_portal_compiles() {
     agree_compiled_in(r#"tags.map(t, t.startsWith("a"))"#, &ctx, 20);
     agree_compiled_in(r#"tags.map(t, t.endsWith("row"))"#, &ctx, 20);
     agree_compiled_in(r#"tags.map(t, t.contains("bet"))"#, &ctx, 20);
+    agree_compiled_in(r#"tags.map(t, t.startsWith("é"))"#, &ctx, 20);
+    agree_compiled_in(r#"tags.map(t, t.endsWith("é"))"#, &ctx, 20);
+    agree_compiled_in(r#"tags.map(t, t.contains("é"))"#, &ctx, 20);
     agree_compiled_in(r#"tags.map(t, t + "x")"#, &ctx, 20);
     agree_compiled_in(r#"tags.exists(t, t + "x" == "beta-rowx")"#, &ctx, 20);
     agree_compiled_in(r#"list.map(e, e + 1)"#, &ctx, 20);

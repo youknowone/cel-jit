@@ -2698,10 +2698,42 @@ fn str_ord_bit(left: *mut CelObject, right: *mut CelObject, op: i64) -> i64 {
     }
 }
 
+/// UTF-8 bytes of a string leaf.
+///
+/// A null block is empty. A negative length declines. The payload is UTF-8,
+/// so these bytes answer `starts_with`, `ends_with`, and `contains`.
+///
+/// # Safety
+///
+/// `w` is a live string leaf.
+unsafe fn str_bytes(w: *mut CelObject) -> Option<&'static [u8]> {
+    let leaf = &*w.cast::<crate::runtime::object::W_StringObject>();
+    if leaf.byte_len < 0 {
+        return None;
+    }
+    let n = leaf.byte_len as usize;
+    let base = crate::runtime::object_array::bytes_base(leaf.chars);
+    if base.is_null() || n == 0 {
+        Some(&[])
+    } else {
+        Some(core::slice::from_raw_parts(base, n))
+    }
+}
+
+/// `needle` occurs in `hay`. An empty needle does.
+fn bytes_contains(hay: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() {
+        true
+    } else {
+        hay.windows(needle.len()).any(|window| window == needle)
+    }
+}
+
 /// `1` or `0` for startsWith (`1`), endsWith (`2`), or contains (`3`).
 ///
-/// `-1` declines: a null, a non-string, or any other `op`. Payloads are
-/// immutable. A string contains, starts with, and ends with itself.
+/// `-1` declines: a null, a non-string, a negative length, or any other
+/// `op`. Payloads are immutable. A string contains, starts with, and ends
+/// with itself.
 #[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
 fn str_affix_bit(left: *mut CelObject, right: *mut CelObject, op: i64) -> i64 {
     if left.is_null()
@@ -2711,39 +2743,35 @@ fn str_affix_bit(left: *mut CelObject, right: *mut CelObject, op: i64) -> i64 {
     {
         return -1;
     }
-    if op == 1 {
-        if left == right {
-            return 1;
-        }
-        match (unsafe { string_as_str(left) }, unsafe {
-            string_as_str(right)
-        }) {
-            (Some(hay), Some(needle)) => i64::from(hay.starts_with(needle)),
-            _ => -1,
-        }
+    let known = if op == 1 {
+        1
     } else if op == 2 {
-        if left == right {
-            return 1;
-        }
-        match (unsafe { string_as_str(left) }, unsafe {
-            string_as_str(right)
-        }) {
-            (Some(hay), Some(needle)) => i64::from(hay.ends_with(needle)),
-            _ => -1,
-        }
+        1
     } else if op == 3 {
-        if left == right {
-            return 1;
-        }
-        match (unsafe { string_as_str(left) }, unsafe {
-            string_as_str(right)
-        }) {
-            (Some(hay), Some(needle)) => i64::from(hay.contains(needle)),
-            _ => -1,
-        }
+        1
     } else {
-        -1
+        0
+    };
+    if known == 0 {
+        return -1;
     }
+    if left == right {
+        return 1;
+    }
+    let Some(hay) = (unsafe { str_bytes(left) }) else {
+        return -1;
+    };
+    let Some(needle) = (unsafe { str_bytes(right) }) else {
+        return -1;
+    };
+    let hit = if op == 1 {
+        hay.starts_with(needle)
+    } else if op == 2 {
+        hay.ends_with(needle)
+    } else {
+        bytes_contains(hay, needle)
+    };
+    i64::from(hit)
 }
 
 /// Index of `name` on a mapdict layout, or `-1`.
