@@ -3258,15 +3258,41 @@ fn int_to_text(vm: i64, n: i64) -> *mut CelObject {
 /// takes the class on the int bank (`record_exact_class/ri`).
 const STRING_CLASS_PTR: *const crate::runtime::object::CelClass = &CEL_STRING_CLASS;
 
-/// `W_StringObject` + `W_StringObject` via `cel_add`. Residual. Null declines.
+/// Two string leaves as one fresh string (`new_string_concat`).
+///
+/// One bump holds the leaf and its byte block. Null declines: a null,
+/// a non-string, or a negative length. Payloads are immutable UTF-8.
 #[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
-fn string_add_cell(a: *mut CelObject, b: *mut CelObject) -> *mut CelObject {
-    let r = unsafe { cel_add(a, b) };
-    if r.is_null() || r == ERROR_SENTINEL {
-        core::ptr::null_mut()
-    } else {
-        r
+fn concat_text(a: *mut CelObject, b: *mut CelObject) -> *mut CelObject {
+    if a.is_null()
+        || b.is_null()
+        || unsafe { w_kind(a) } != CelKind::Str
+        || unsafe { w_kind(b) } != CelKind::Str
+    {
+        return core::ptr::null_mut();
     }
+    let Some(left) = (unsafe { str_bytes(a) }) else {
+        return core::ptr::null_mut();
+    };
+    let Some(right) = (unsafe { str_bytes(b) }) else {
+        return core::ptr::null_mut();
+    };
+    crate::runtime::object::new_string_concat(left, right) as *mut CelObject
+}
+
+/// `W_StringObject` + `W_StringObject`. [`concat_text`] is the fresh leaf.
+/// Null declines.
+#[majit_macros::jit_inline(calls = {
+    // Fresh string only. Empty write sets, so cached fields stay.
+    concat_text => alloc_ref,
+})]
+fn string_add_cell(a: *mut CelObject, b: *mut CelObject) -> *mut CelObject {
+    let text = concat_text(a, b);
+    if !text.is_null() {
+        // Fresh `W_StringObject` (`new_string_concat`).
+        majit_metainterp::jit::record_exact_class(text, STRING_CLASS_PTR as usize);
+    }
+    text
 }
 
 /// Two doubles: `cel_div` / ordered compare. Residual so the leaves are
@@ -4540,7 +4566,9 @@ fn host_call2_i(entry: i64, a: i64, b: i64) -> i64 {
         int_to_text => alloc_ref,
         string_from_cell => inline_ref,
         double_binop_cell => residual_ref,
-        string_add_cell => residual_ref,
+        // `new_string_concat`: writes only the string it just allocated.
+        concat_text => alloc_ref,
+        string_add_cell => inline_ref,
         map_store_pair => inline_int,
         cell_map_len => inline_int,
         trace_len_cell => inline_int,
