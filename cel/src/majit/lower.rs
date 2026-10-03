@@ -1902,20 +1902,29 @@ impl LowerCtxF<'_> {
     /// op is TOTAL wherever the guard says nothing reads its result.
     ///
     /// `safe` is the word that makes this operator total: `0` for the
-    /// overflow-checked `+ - *`, since `x + 0`, `x - 0` and `x * 0` are all in
-    /// range for every `x`; `1` for `/` and `%`, since one divides everything
-    /// and is neither of the two divisors that trap. The guard selects, so the
-    /// answer where the position IS read is the operand unchanged.
+    /// overflow-checked `+ - *` and for `int`/`uint` conversions, since `0`
+    /// is in range for every one of them; `1` for `/` and `%`, since one
+    /// divides everything and is neither of the two divisors that trap. On a
+    /// float bank the word is the IEEE bit pattern, so `0` is `0.0`. The
+    /// guard selects, so the answer where the position IS read is the operand
+    /// unchanged.
     ///
-    /// The identity outside the safe lowering, where `guard` is never set.
+    /// A float operand blends with [`OP_FSELECT`]. [`OP_SELECT`] reads the int
+    /// register file. The identity outside the safe lowering, where `guard`
+    /// is never set.
     fn neutralize(&mut self, operand: TReg, safe: i64) -> TReg {
         let Some(live) = self.guard else {
             return operand;
         };
         let k = self.const_reg(operand.bank, safe);
         let d = self.fresh(operand.bank);
+        let op = if operand.bank == ValType::Float {
+            OP_FSELECT
+        } else {
+            OP_SELECT
+        };
         self.body.extend_from_slice(&[
-            OP_SELECT,
+            op,
             live.idx as i64,
             operand.idx as i64,
             k.idx as i64,
@@ -2721,18 +2730,30 @@ fn emit_days_of_jan1(ctx: &mut LowerCtxF, year: TReg) -> TReg {
     emit_int_bin_k(ctx, OP_SUB, abs, 719_468)
 }
 
-/// Narrow a float-bank value to a fresh int reg via a per-row `f64 as i64` cast
-/// (`OP_F2I` -> `cast_float_to_int`), the inverse of [`emit_i2f`].
+/// Emit a partial numeric conversion. The op traps into [`OVF_FLAG_REG`]
+/// when the value is outside the destination range. Under a guard the source
+/// is replaced by 0 wherever that guard says the result is unread: 0 is in
+/// range for `int`, `uint` and both narrowings of `double`.
+fn emit_checked_conv(ctx: &mut LowerCtxF, op: i64, src: TReg, bank: ValType) -> TReg {
+    if ctx.guard_depth > 0 {
+        ctx.has_guarded_trap = true;
+    }
+    let src = ctx.neutralize(src, 0);
+    let r = ctx.fresh(bank);
+    ctx.body
+        .extend_from_slice(&[op, src.idx as i64, r.idx as i64, OVF_FLAG_REG as i64]);
+    r
+}
+
+/// Narrow a float-bank value to a fresh int reg (`OP_F2I`). Traps outside
+/// the open interval `(-2^63, 2^63)` and truncates toward zero inside it.
 fn emit_f2i(ctx: &mut LowerCtxF, src: TReg) -> TReg {
     debug_assert_eq!(
         src.bank,
         ValType::Float,
         "emit_f2i: source must be float-banked"
     );
-    let r = ctx.fresh(ValType::Int);
-    ctx.body
-        .extend_from_slice(&[OP_F2I, src.idx as i64, r.idx as i64]);
-    r
+    emit_checked_conv(ctx, OP_F2I, src, ValType::Int)
 }
 
 /// CEL's comparison type classes.
@@ -3032,19 +3053,16 @@ fn emit_u2f(ctx: &mut LowerCtxF, src: TReg) -> TReg {
     r
 }
 
-/// Narrow a float-bank value to a fresh uint reg (`OP_F2U`). The unsigned twin
-/// of [`emit_f2i`]; it saturates at different bounds, so `uint(-1.5)` is `0u`
-/// where `int(-1.5)` is `-1`.
+/// Narrow a float-bank value to a fresh uint reg (`OP_F2U`). Traps on
+/// negatives, NaN, the infinities and any magnitude at or above 2^64.
+/// `uint(-1.5)` traps, where `int(-1.5)` is `-1`.
 fn emit_f2u(ctx: &mut LowerCtxF, src: TReg) -> TReg {
     debug_assert_eq!(
         src.bank,
         ValType::Float,
         "emit_f2u: source must be float-banked"
     );
-    let r = ctx.fresh(ValType::UInt);
-    ctx.body
-        .extend_from_slice(&[OP_F2U, src.idx as i64, r.idx as i64]);
-    r
+    emit_checked_conv(ctx, OP_F2U, src, ValType::UInt)
 }
 
 /// Compile the two operands of a comparison, promoting a bare `int` literal to
@@ -3438,17 +3456,14 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
         };
     }
 
-    // Numeric type conversions. `double`/`int`/`uint` are global (non-member)
-    // overloads whose `Kind`-dispatched bodies (`common/types/double.rs:199`,
-    // `int.rs:229`, `uint.rs:250`) are TOTAL for the numeric arguments — a plain
-    // Rust `as` cast, no error — so each lowers to a pure register move, a bank
-    // relabel, or one widening cast. The string arguments parse and the rest are
-    // a `FunctionError`; both bail.
-    //
-    // The signed/unsigned pairs are FREE: `int(uint)` is `u64 as i64` and
-    // `uint(int)` is `i64 as u64`, i.e. raw reinterpretations, and the int
-    // register file already carries a uint as its raw 64-bit pattern. Only the
-    // bank label on the result changes, so no instruction is emitted at all.
+    // Numeric type conversions. `double` of an int or a uint is total (a
+    // widening `as f64`, precision loss included). `int` and `uint` are
+    // partial: a uint above `i64::MAX`, a negative int, and a double outside
+    // the destination range — NaN and the infinities included — trap, and the
+    // batch driver turns that into the walker's overflow error. In range,
+    // `int(uint)` / `uint(int)` keep the bits and the two double narrowings
+    // truncate toward zero. String arguments parse and the rest are a
+    // `FunctionError`; both bail.
     if matches!(name, "double" | "int" | "uint") && call.args.len() == 1 {
         let a = compile_t(ctx, &call.args[0])?;
         return match (name, a.bank) {
@@ -3457,24 +3472,16 @@ fn compile_call_t(ctx: &mut LowerCtxF, call: &CallExpr) -> Result<TReg, LowerErr
             // Widening: `i64 as f64` per row, the same `cast_int_to_float` the
             // mixed int/float comparisons already use.
             ("double", ValType::Int) => Ok(emit_i2f(ctx, a)),
-            // Reinterpretations within the int register file.
-            ("int", ValType::UInt) => Ok(TReg {
-                bank: ValType::Int,
-                idx: a.idx,
-            }),
-            ("uint", ValType::Int) => Ok(TReg {
-                bank: ValType::UInt,
-                idx: a.idx,
-            }),
+            // Same bits, but only while the high bit is clear. Above
+            // `i64::MAX` / below 0 the walker raises.
+            ("int", ValType::UInt) => Ok(emit_checked_conv(ctx, OP_SU_CHK, a, ValType::Int)),
+            ("uint", ValType::Int) => Ok(emit_checked_conv(ctx, OP_SU_CHK, a, ValType::UInt)),
             // `u64 as f64`, which differs from `i64 as f64` above 2^63:
             // `double(18446744073709551615u)` is `1.8446744073709552e19`, not
             // `-1.0`.
             ("double", ValType::UInt) => Ok(emit_u2f(ctx, a)),
-            // Both narrowings truncate toward zero and SATURATE, with NaN
-            // mapping to `0` — total, exactly what the walker's plain `as` cast
-            // does, so neither needs a guard. They saturate at different bounds,
-            // which is why `uint` cannot reuse the signed op: `uint(-1.5)` is
-            // `0u` where `int(-1.5)` is `-1`.
+            // Truncate toward zero inside the range, trap outside it. The
+            // ranges differ: `uint(-1.5)` traps where `int(-1.5)` is `-1`.
             ("int", ValType::Float) => Ok(emit_f2i(ctx, a)),
             ("uint", ValType::Float) => Ok(emit_f2u(ctx, a)),
             _ => Err(LowerError::unsupported(format!(

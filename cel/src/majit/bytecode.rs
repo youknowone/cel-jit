@@ -89,12 +89,16 @@ pub const OP_MUL_OVF: i64 = 42; // [a, b, dst, trap]    regs[dst] = ovfchecked(a
 /// channel out. `regs[addr]` holds the address of a caller-owned i64 word, the
 /// same loop-invariant-pointer-in-a-register shape the column bases use.
 pub const OP_TRAP_STORE: i64 = 43; // [addr, flag]      *(regs[addr]) = regs[flag]
-/// Narrow a float-bank value into the int bank (`cast_float_to_int`): Rust's
-/// `as i64`, truncating toward zero and SATURATING at the i64 bounds, with NaN
-/// mapping to 0. That is total — the walker's `int(double)` is the same plain
-/// `as` cast (`common/types/int.rs:237-239`) and raises nothing — so no guard
-/// is needed. The inverse of [`OP_I2F`].
-pub const OP_F2I: i64 = 44; // [fsrc, dst]             regs[dst] = fregs[fsrc] as i64  (cast_float_to_int)
+/// Narrow a float into an int, or trap when it is outside `(i64::MIN as f64, i64::MAX as f64)`.
+///
+/// The bounds are exclusive: `i64::MIN as f64` is exactly -2^63 and `i64::MAX as f64`
+/// rounds up to 2^63. NaN and the infinities fail an ordered comparison against
+/// either bound, so they trap too. Inside the interval the value is truncated
+/// toward zero. Outside it `regs[trap]` is set and `regs[dst]` is 0; the cast
+/// runs only on the in-range arm, because the narrowing rejects both endpoints.
+/// The batch driver turns a set flag into "no result". The inverse of [`OP_I2F`]
+/// is total; this narrowing is not.
+pub const OP_F2I: i64 = 44; // [fsrc, dst, trap]  regs[dst] = trunc(fregs[fsrc]) or trap
 
 // Domain-guarded division. The tree-walker's `/` and `%` are partial on both
 // numeric banks: a zero divisor raises `DivisionByZero`/`RemainderByZero`, and
@@ -143,12 +147,15 @@ pub const OP_UMUL_OVF: i64 = 51; // [a, b, dst, trap]  regs[dst] = ovfchecked_u(
 /// `true` — and the widening is the same `as f64` the tree-walker performs.
 pub const OP_U2F: i64 = 52; // [src, fdst]   fregs[fdst] = (regs[src] as u64) as f64
 
-/// Narrow a `double` to a `uint`. The unsigned twin of [`OP_F2I`], and total
-/// for the same reason: `as u64` truncates toward zero and SATURATES, with a
-/// negative double clamping to `0` and NaN mapping to `0`. It saturates at
-/// DIFFERENT bounds than `as i64`, which is why it cannot reuse `OP_F2I`:
-/// `uint(-1.5)` is `0u` where `int(-1.5)` is `-1`.
-pub const OP_F2U: i64 = 53; // [fsrc, dst]   regs[dst] = (fregs[fsrc] as u64) as i64
+/// Narrow a double to a uint, or trap outside `[0, u64::MAX as f64)`.
+///
+/// `u64::MAX as f64` rounds up to 2^64, so every finite value in `[0, 2^64)`
+/// is in range, including -0.0. Negatives, NaN and the infinities set the
+/// trap and store 0. Truncation toward zero below 2^63 is the signed cast.
+/// A value in `[2^63, 2^64)` is an integer whose low 11 bits are 0, so the
+/// result is that mantissa shifted up with bit 63 set. `uint(-1.5)` traps,
+/// where `int(-1.5)` is `-1`, which is why this cannot reuse [`OP_F2I`].
+pub const OP_F2U: i64 = 53; // [fsrc, dst, trap]  regs[dst] = trunc_u(fregs[fsrc]) or trap
 
 /// The write side of [`OP_COL_LOAD`], and what a per-row output loop ends each
 /// iteration with instead of accumulating: `*(regs[base] + regs[ea]) = regs[src]`.
@@ -281,6 +288,14 @@ pub const OP_ADD_OVF_K: i64 = 86; // [a, k, dst, trap]  regs[dst] = a + k
 pub const OP_SUB_OVF_K: i64 = 87; // [a, k, dst, trap]  regs[dst] = a - k
 pub const OP_MUL_OVF_K: i64 = 88; // [a, k, dst, trap]  regs[dst] = a * k
 
+/// Copy an int-bank word, trapping when its high bit is set.
+///
+/// `int(uint)` rejects a uint above `i64::MAX` and `uint(int)` rejects a
+/// negative int. Both are this bit test. On success the bits are unchanged
+/// and the destination's bank is only a label; on failure `regs[trap]` is
+/// set and `regs[dst]` is 0.
+pub const OP_SU_CHK: i64 = 89; // [src, dst, trap]  regs[dst] = regs[src] if regs[src] >= 0 else trap
+
 /// The constant-divisor peers of [`OP_DIV_CHK`]/[`OP_MOD_CHK`]/[`OP_UDIV`]/
 /// [`OP_UMOD`]: the divisor is an IMMEDIATE word in the instruction stream
 /// rather than a register.
@@ -387,7 +402,7 @@ use Operand::{Float, FloatOut, Imm, Int, IntOut, IntTrap, Target};
 /// so an opcode added past it without a row here is a compile error on this
 /// array instead of an out-of-bounds index the first time that opcode is
 /// decoded.
-pub const OPERANDS: [&[Operand]; OP_MUL_OVF_K as usize + 1] = [
+pub const OPERANDS: [&[Operand]; OP_SU_CHK as usize + 1] = [
     &[Imm, IntOut],                           // 0  LOAD_CONST
     &[Int, IntOut],                           // 1  MOV
     &[Int, Int, IntOut],                      // 2  ADD
@@ -432,7 +447,7 @@ pub const OPERANDS: [&[Operand]; OP_MUL_OVF_K as usize + 1] = [
     &[Int, Int, IntOut, IntTrap],             // 41 SUB_OVF
     &[Int, Int, IntOut, IntTrap],             // 42 MUL_OVF
     &[Int, Int],                              // 43 TRAP_STORE
-    &[Float, IntOut],                         // 44 F2I
+    &[Float, IntOut, IntTrap],                // 44 F2I
     &[Int, Int, IntOut, IntTrap],             // 45 DIV_CHK
     &[Int, Int, IntOut, IntTrap],             // 46 MOD_CHK
     &[Int, Int, IntOut, IntTrap],             // 47 UDIV
@@ -441,7 +456,7 @@ pub const OPERANDS: [&[Operand]; OP_MUL_OVF_K as usize + 1] = [
     &[Int, Int, IntOut, IntTrap],             // 50 USUB_OVF
     &[Int, Int, IntOut, IntTrap],             // 51 UMUL_OVF
     &[Int, FloatOut],                         // 52 U2F
-    &[Float, IntOut],                         // 53 F2U
+    &[Float, IntOut, IntTrap],                // 53 F2U
     &[Int, Int, Int],                         // 54 COL_STORE
     &[Int, Int, Float],                       // 55 COL_STORE_F
     &[Int, Int, IntOut],                      // 56 COL_LOAD_B
@@ -477,6 +492,7 @@ pub const OPERANDS: [&[Operand]; OP_MUL_OVF_K as usize + 1] = [
     &[Int, Imm, IntOut, IntTrap],             // 86 ADD_OVF_K
     &[Int, Imm, IntOut, IntTrap],             // 87 SUB_OVF_K
     &[Int, Imm, IntOut, IntTrap],             // 88 MUL_OVF_K
+    &[Int, IntOut, IntTrap],                  // 89 SU_CHK
 ];
 
 /// What one [`check_code`] established about one program: the words it read,
@@ -1662,7 +1678,7 @@ pub mod float_bank {
         OP_INDEX_R, OP_INDEX_R_F, OP_JUMP_IF_ABOVE, OP_LE, OP_LE_K, OP_LOAD_CONST, OP_LOAD_CONST_F,
         OP_LT, OP_LT_K, OP_MOD, OP_MODN_K, OP_MOD_CHK, OP_MOD_CHK_K, OP_MOD_K, OP_MOV, OP_MUL,
         OP_MUL_IMM, OP_MUL_OVF, OP_MUL_OVF_K, OP_NE, OP_NEG, OP_NE_K, OP_NOT, OP_OR, OP_RETURN,
-        OP_RETURN_F, OP_SELECT, OP_SUB, OP_SUB_OVF, OP_SUB_OVF_K, OP_TRAP_STORE, OP_U2F,
+        OP_RETURN_F, OP_SELECT, OP_SUB, OP_SUB_OVF, OP_SUB_OVF_K, OP_SU_CHK, OP_TRAP_STORE, OP_U2F,
         OP_UADD_OVF, OP_UDIV, OP_UDIV_K, OP_ULE, OP_ULT, OP_UMOD, OP_UMOD_K, OP_UMUL_OVF,
         OP_USUB_OVF,
     };
@@ -1734,6 +1750,12 @@ pub mod float_bank {
         majit_raw_load_i64, majit_raw_load_u8, majit_raw_store_i64, majit_uint_div, majit_uint_le,
         majit_uint_lt, majit_uint_mod, majit_uint_mul_high,
     };
+
+    /// Biased binary64 exponent field of 2^63. Every finite magnitude below
+    /// 2^63 has a smaller field; ±2^63, NaN and the infinities do not.
+    const EXP_2_POW_63: i64 = 0x43e;
+    /// Biased binary64 exponent field of 2^64.
+    const EXP_2_POW_64: i64 = 0x43f;
 
     struct VmStateF {
         regs: majit_metainterp::virt_array::VirtArray<i64>,
@@ -2698,14 +2720,61 @@ pub mod float_bank {
                     pc += 3;
                 }
                 OP_F2I => {
-                    state.regs[program[pc + 2] as usize] =
-                        state.fregs[program[pc + 1] as usize] as i64;
-                    pc += 3;
+                    let v = state.fregs[program[pc + 1] as usize];
+                    let d = program[pc + 2] as usize;
+                    let t = program[pc + 3] as usize;
+                    // Magnitude below 2^63 is the open interval
+                    // (-2^63, 2^63). The cast stays on that arm.
+                    let exp = (majit_f64_to_bits(v) >> 52) & 0x7ff;
+                    if exp < EXP_2_POW_63 {
+                        state.regs[d] = v as i64;
+                    } else {
+                        state.regs[t] = 1;
+                        state.regs[d] = 0;
+                    }
+                    pc += 4;
                 }
                 OP_F2U => {
-                    state.regs[program[pc + 2] as usize] =
-                        state.fregs[program[pc + 1] as usize] as u64 as i64;
-                    pc += 3;
+                    let v = state.fregs[program[pc + 1] as usize];
+                    let d = program[pc + 2] as usize;
+                    let t = program[pc + 3] as usize;
+                    // [0, 2^64). -0.0 is the one negative pattern in range;
+                    // its bits are `i64::MIN`. At and above 2^63 the value is
+                    // an integer whose low 11 bits are 0, so the uint is the
+                    // mantissa shifted, with bit 63 set — no float subtract
+                    // and no unsigned cast.
+                    let bits = majit_f64_to_bits(v);
+                    let exp = (bits >> 52) & 0x7ff;
+                    if bits < 0 {
+                        if bits == i64::MIN {
+                            state.regs[d] = 0;
+                        } else {
+                            state.regs[t] = 1;
+                            state.regs[d] = 0;
+                        }
+                    } else if exp >= EXP_2_POW_64 {
+                        state.regs[t] = 1;
+                        state.regs[d] = 0;
+                    } else if exp >= EXP_2_POW_63 {
+                        let mant = bits & 0x000f_ffff_ffff_ffff;
+                        state.regs[d] = (mant << 11) | i64::MIN;
+                    } else {
+                        state.regs[d] = v as i64;
+                    }
+                    pc += 4;
+                }
+                OP_SU_CHK => {
+                    let s = state.regs[program[pc + 1] as usize];
+                    let d = program[pc + 2] as usize;
+                    let t = program[pc + 3] as usize;
+                    // High bit set: uint > i64::MAX, or int < 0.
+                    if s < 0 {
+                        state.regs[t] = 1;
+                        state.regs[d] = 0;
+                    } else {
+                        state.regs[d] = s;
+                    }
+                    pc += 4;
                 }
                 OP_FMOV => {
                     state.fregs[program[pc + 2] as usize] = state.fregs[program[pc + 1] as usize];
@@ -3850,12 +3919,53 @@ pub mod float_bank {
                     pc += 3;
                 }
                 OP_F2I => {
-                    regs[program[pc + 2] as usize] = fregs[program[pc + 1] as usize] as i64;
-                    pc += 3;
+                    let v = fregs[program[pc + 1] as usize];
+                    let d = program[pc + 2] as usize;
+                    let t = program[pc + 3] as usize;
+                    let exp = (majit_f64_to_bits(v) >> 52) & 0x7ff;
+                    if exp < EXP_2_POW_63 {
+                        regs[d] = v as i64;
+                    } else {
+                        regs[t] = 1;
+                        regs[d] = 0;
+                    }
+                    pc += 4;
                 }
                 OP_F2U => {
-                    regs[program[pc + 2] as usize] = fregs[program[pc + 1] as usize] as u64 as i64;
-                    pc += 3;
+                    let v = fregs[program[pc + 1] as usize];
+                    let d = program[pc + 2] as usize;
+                    let t = program[pc + 3] as usize;
+                    let bits = majit_f64_to_bits(v);
+                    let exp = (bits >> 52) & 0x7ff;
+                    if bits < 0 {
+                        if bits == i64::MIN {
+                            regs[d] = 0;
+                        } else {
+                            regs[t] = 1;
+                            regs[d] = 0;
+                        }
+                    } else if exp >= EXP_2_POW_64 {
+                        regs[t] = 1;
+                        regs[d] = 0;
+                    } else if exp >= EXP_2_POW_63 {
+                        let mant = bits & 0x000f_ffff_ffff_ffff;
+                        regs[d] = (mant << 11) | i64::MIN;
+                    } else {
+                        regs[d] = v as i64;
+                    }
+                    pc += 4;
+                }
+                OP_SU_CHK => {
+                    let s = regs[program[pc + 1] as usize];
+                    let d = program[pc + 2] as usize;
+                    let t = program[pc + 3] as usize;
+                    if s < 0 {
+                        regs[t] = 1;
+                        regs[d] = 0;
+                    } else {
+                        regs[d] = s;
+                    }
+                    pc += 4;
                 }
                 OP_FMOV => {
                     fregs[program[pc + 2] as usize] = fregs[program[pc + 1] as usize];

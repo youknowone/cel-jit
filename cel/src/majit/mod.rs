@@ -186,7 +186,7 @@ pub mod lower;
 mod tests {
     use super::bytecode::{clean_batch_sum_f, eval_batch_sum_f, Column};
     use super::lower::{lower_typed, size_slot_source, Schema, ValType};
-    use crate::{Context, Program, Value};
+    use crate::{Context, ExecutionError, Program, Value};
     use std::collections::HashMap;
 
     #[derive(Debug, Clone, Copy)]
@@ -2629,18 +2629,46 @@ mod tests {
         }
     }
 
-    /// The numeric conversions that are pure moves on the two-bank machine.
-    /// `double(int)` is one `cast_int_to_float`; `int(uint)` and `uint(int)` are
-    /// raw reinterpretations of the same 64-bit pattern, so they emit nothing at
-    /// all and only relabel the bank; the same-type spellings are the identity.
-    /// The uint columns deliberately include values above 2^63, where the signed
-    /// and unsigned readings differ, so a mislabelled bank cannot pass.
+    fn function_error(function: &str, message: &str) -> ExecutionError {
+        ExecutionError::FunctionError {
+            function: function.to_owned(),
+            message: message.to_owned(),
+        }
+    }
+
+    /// Walker result of `expr` on one row, checked against a concrete value or
+    /// a concrete [`ExecutionError::FunctionError`].
+    fn assert_row(
+        expr: &str,
+        program: &Program,
+        cols: &[(&str, ColData)],
+        row: usize,
+        want: Result<Value, (&str, &str)>,
+    ) {
+        let got = program.execute(&row_context(cols, row));
+        match want {
+            Ok(v) => assert_eq!(got.as_ref().ok(), Some(&v), "`{expr}` row {row}"),
+            Err((function, message)) => assert_eq!(
+                got,
+                Err(function_error(function, message)),
+                "`{expr}` row {row}"
+            ),
+        }
+    }
+
+    /// `double` widens and may lose precision. `int(uint)` and `uint(int)` keep
+    /// the bits only while the high bit is clear — a uint above `i64::MAX` and
+    /// a negative int are range errors, on the walker and on every tier.
+    /// `int(double)` / `uint(double)` truncate toward zero inside their ranges
+    /// and raise outside them. The float column spans both signs so truncation
+    /// is exercised where a floor would differ.
     #[test]
     fn batch_numeric_conversions() {
         let n = 3000;
         let i = gen_i64(n, 0x4a3b_2c1d_0e9f_8a7b, -5_000, 10_000);
         let f = gen_f64(n, 0x9f8e_7d6c_5b4a_3928, -5_000.0, 10_000.0);
-        // Straddles 2^63: read as i64 these are negative, as u64 they are huge.
+        // Straddles 2^63: read as i64 these are negative, as u64 they are past
+        // i64::MAX, which `int` rejects.
         let u: Vec<i64> = gen_i64(n, 0x1357_9bdf_2468_ace0, -5_000, 10_000)
             .into_iter()
             .enumerate()
@@ -2652,6 +2680,11 @@ mod tests {
                 }
             })
             .collect();
+        // High bit clear, so `int(u)` has an answer on every row. Clearing the
+        // bit does not distinguish a wrapping cast from a copy; the straddling
+        // `u` column is what catches a wrap.
+        let u_fit: Vec<i64> = u.iter().map(|v| v & i64::MAX).collect();
+        let i_fit: Vec<i64> = i.iter().map(|v| (*v).max(0)).collect();
 
         check_batch_f("double(i) > 100.0", &[("i", ColData::Int(i.clone()))]);
         for expr in ["double(i) + f > 0.0", "double(i) == f"] {
@@ -2663,17 +2696,103 @@ mod tests {
                 ],
             );
         }
+
+        let u_cols = [("u", ColData::UInt(u.clone()))];
         for expr in ["int(u) < 0", "int(u) > 100", "uint(int(u)) > 100u"] {
-            check_batch_f(expr, &[("u", ColData::UInt(u.clone()))]);
+            let program = Program::compile(expr).unwrap();
+            for row in 0..n {
+                let bits = u[row] as u64;
+                let want = if bits > i64::MAX as u64 {
+                    Err(("int", "integer overflow"))
+                } else {
+                    let v = bits as i64;
+                    Ok(match expr {
+                        "int(u) < 0" => Value::Bool(v < 0),
+                        "int(u) > 100" => Value::Bool(v > 100),
+                        "uint(int(u)) > 100u" => Value::Bool((v as u64) > 100),
+                        _ => unreachable!(),
+                    })
+                };
+                assert_row(expr, &program, &u_cols, row, want);
+            }
+            check_batch_f_refuses(expr, &u_cols);
         }
+        let u_fit_cols = [("u", ColData::UInt(u_fit.clone()))];
+        for expr in [
+            "int(u) < 0",
+            "int(u) > 100",
+            "uint(int(u)) > 100u",
+            "int(u)",
+        ] {
+            let program = Program::compile(expr).unwrap();
+            for row in 0..n {
+                let v = u_fit[row];
+                assert!(v >= 0, "in-range uint column went negative");
+                let want = Ok(match expr {
+                    "int(u) < 0" => Value::Bool(v < 0),
+                    "int(u) > 100" => Value::Bool(v > 100),
+                    "uint(int(u)) > 100u" => Value::Bool((v as u64) > 100),
+                    "int(u)" => Value::Int(v),
+                    _ => unreachable!(),
+                });
+                assert_row(expr, &program, &u_fit_cols, row, want);
+            }
+            check_batch_f(expr, &u_fit_cols);
+        }
+
+        let i_cols = [("i", ColData::Int(i.clone()))];
         for expr in ["uint(i) > 100u", "int(uint(i)) > 100"] {
-            check_batch_f(expr, &[("i", ColData::Int(i.clone()))]);
+            let program = Program::compile(expr).unwrap();
+            for row in 0..n {
+                let v = i[row];
+                let want = if v < 0 {
+                    Err(("uint", "unsigned integer overflow"))
+                } else {
+                    Ok(match expr {
+                        "uint(i) > 100u" => Value::Bool((v as u64) > 100),
+                        "int(uint(i)) > 100" => Value::Bool(v > 100),
+                        _ => unreachable!(),
+                    })
+                };
+                assert_row(expr, &program, &i_cols, row, want);
+            }
+            check_batch_f_refuses(expr, &i_cols);
         }
-        // `int(double)` truncates toward zero and saturates at the i64 bounds.
-        // The float column spans both signs so the toward-zero rounding is
-        // exercised on negatives, where a floor would differ.
+        let i_fit_cols = [("i", ColData::Int(i_fit))];
+        for expr in ["uint(i) > 100u", "int(uint(i)) > 100", "uint(i)"] {
+            let program = Program::compile(expr).unwrap();
+            for row in 0..n {
+                let v = i[row].max(0);
+                let want = Ok(match expr {
+                    "uint(i) > 100u" => Value::Bool((v as u64) > 100),
+                    "int(uint(i)) > 100" => Value::Bool(v > 100),
+                    "uint(i)" => Value::UInt(v as u64),
+                    _ => unreachable!(),
+                });
+                assert_row(expr, &program, &i_fit_cols, row, want);
+            }
+            check_batch_f(expr, &i_fit_cols);
+        }
+
         for expr in ["int(f) > 100", "int(f) < 0", "int(f)"] {
-            check_batch_f(expr, &[("f", ColData::Float(f.clone()))]);
+            let cols = [("f", ColData::Float(f.clone()))];
+            let program = Program::compile(expr).unwrap();
+            for row in 0..n {
+                let v = f[row];
+                assert!(
+                    v > i64::MIN as f64 && v < i64::MAX as f64,
+                    "generated float left the int range"
+                );
+                let iv = v as i64;
+                let want = Ok(match expr {
+                    "int(f) > 100" => Value::Bool(iv > 100),
+                    "int(f) < 0" => Value::Bool(iv < 0),
+                    "int(f)" => Value::Int(iv),
+                    _ => unreachable!(),
+                });
+                assert_row(expr, &program, &cols, row, want);
+            }
+            check_batch_f(expr, &cols);
         }
         check_batch_f(
             "int(f) + i > 0",
@@ -2683,9 +2802,17 @@ mod tests {
             ],
         );
         // Identity spellings.
-        check_batch_f("int(i) > 100", &[("i", ColData::Int(i.clone()))]);
+        check_batch_f("int(i) > 100", &[("i", ColData::Int(i))]);
         check_batch_f("double(f) > 100.0", &[("f", ColData::Float(f))]);
-        check_batch_f("uint(u) > 100u", &[("u", ColData::UInt(u))]);
+        check_batch_f("uint(u) > 100u", &u_cols);
+        // `double` of a uint past 2^63 stays a large positive. A signed
+        // widening would turn `u64::MAX` into `-1.0` and fail this sum.
+        let wide = Program::compile("double(u) > 1.5").unwrap();
+        for row in 0..n {
+            let got = (u[row] as u64) as f64 > 1.5;
+            assert_row("double(u) > 1.5", &wide, &u_cols, row, Ok(Value::Bool(got)));
+        }
+        check_batch_f("double(u) > 1.5", &u_cols);
     }
 
     #[test]
@@ -5065,68 +5192,319 @@ mod tests {
         }
     }
 
-    /// The numeric conversions, at the bounds where the four casts differ.
+    fn tile<T: Clone>(pat: &[T], times: usize) -> Vec<T> {
+        pat.iter()
+            .cloned()
+            .cycle()
+            .take(pat.len() * times)
+            .collect()
+    }
+
+    /// Conversions at the bounds where a wrap or a saturating cast would
+    /// disagree with the range check.
     ///
-    /// The walker converts with a plain Rust `as`, so every one of them is
-    /// TOTAL: the two widenings wrap or lose precision rather than raise, and
-    /// the two narrowings truncate toward zero and saturate. That is why none
-    /// of them needs a trap guard — and why `uint` cannot borrow the signed
-    /// narrowing, which saturates at different bounds.
+    /// `int(uint)` errors past `i64::MAX`. `uint(int)` errors on a negative.
+    /// `int(double)` accepts the open interval `(-2^63, 2^63)` and
+    /// `uint(double)` the half-open interval `[0, 2^64)`; NaN and the
+    /// infinities fall outside both. `double` of an int or a uint is total.
+    /// Each case names a concrete value or a concrete `FunctionError`, for
+    /// the walker and for every tier.
     #[test]
     fn numeric_conversions_at_the_saturation_bounds() {
-        for (src, want) in [
-            // int <-> uint reinterpret the same 64 bits, in both directions.
-            ("int(18446744073709551615u)", Value::Int(-1)),
-            ("int(9223372036854775808u)", Value::Int(i64::MIN)),
-            ("uint(-1)", Value::UInt(u64::MAX)),
+        let int_ovf = ("int", "integer overflow");
+        let uint_ovf = ("uint", "unsigned integer overflow");
+        let scalars: &[(&str, Result<Value, (&str, &str)>)] = &[
+            ("int(18446744073709551615u)", Err(int_ovf)),
+            ("int(9223372036854775808u)", Err(int_ovf)),
+            ("int(9223372036854775807u)", Ok(Value::Int(i64::MAX))),
+            ("int(0u)", Ok(Value::Int(0))),
+            ("uint(-1)", Err(uint_ovf)),
+            ("uint(0)", Ok(Value::UInt(0))),
+            (
+                "uint(9223372036854775807)",
+                Ok(Value::UInt(i64::MAX as u64)),
+            ),
             // uint -> double goes through `u64`, so it does not turn negative
             // above 2^63; precision is lost the way `as f64` loses it.
             (
                 "double(18446744073709551615u)",
-                Value::Float(u64::MAX as f64),
+                Ok(Value::Float(u64::MAX as f64)),
             ),
             (
                 "double(9007199254740993u)",
-                Value::Float(9007199254740992.0),
+                Ok(Value::Float(9007199254740992.0)),
             ),
-            // double -> int and double -> uint saturate at DIFFERENT bounds.
-            ("int(1.0e20)", Value::Int(i64::MAX)),
-            ("int(-1.0e20)", Value::Int(i64::MIN)),
-            ("uint(1.0e20)", Value::UInt(u64::MAX)),
-            ("uint(-1.5)", Value::UInt(0)),
-            ("uint(10.5)", Value::UInt(10)),
-        ] {
+            (
+                "double(-9223372036854775808)",
+                Ok(Value::Float(i64::MIN as f64)),
+            ),
+            // Open interval (-2^63, 2^63). The decimal spells the endpoints
+            // exactly: `i64::MAX as f64` is 2^63, and -2^63 is `i64::MIN`.
+            ("int(1.0e20)", Err(int_ovf)),
+            ("int(-1.0e20)", Err(int_ovf)),
+            ("int(-9223372036854775808.0)", Err(int_ovf)),
+            ("int(9223372036854775807.0)", Err(int_ovf)),
+            ("int(double('NaN'))", Err(int_ovf)),
+            ("int(double('infinity'))", Err(int_ovf)),
+            ("int(double('-infinity'))", Err(int_ovf)),
+            ("int(-1.5)", Ok(Value::Int(-1))),
+            ("int(1.9)", Ok(Value::Int(1))),
+            (
+                "int(9223372036854774784.0)",
+                Ok(Value::Int(9223372036854774784)),
+            ),
+            (
+                "int(-9223372036854774784.0)",
+                Ok(Value::Int(-9223372036854774784)),
+            ),
+            // [0, 2^64). 1e20 is past 2^64. 2^63 and 2^64-2048 are in range
+            // and exercise the half at and above 2^63.
+            ("uint(1.0e20)", Err(uint_ovf)),
+            ("uint(-1.5)", Err(uint_ovf)),
+            ("uint(double('NaN'))", Err(uint_ovf)),
+            ("uint(double('infinity'))", Err(uint_ovf)),
+            ("uint(double('-infinity'))", Err(uint_ovf)),
+            ("uint(18446744073709551616.0)", Err(uint_ovf)),
+            ("uint(0.0)", Ok(Value::UInt(0))),
+            ("uint(-0.0)", Ok(Value::UInt(0))),
+            ("uint(10.5)", Ok(Value::UInt(10))),
+            ("uint(9223372036854775808.0)", Ok(Value::UInt(1u64 << 63))),
+            (
+                "uint(18446744073709549568.0)",
+                Ok(Value::UInt(18446744073709549568)),
+            ),
+        ];
+        for (src, want) in scalars {
             let program = Program::compile(src).unwrap();
-            assert_eq!(
-                program.execute(&Context::default()).map_err(|_| ()),
-                Ok(want),
-                "tree-walker ground truth for `{src}`"
-            );
+            let got = program.execute(&Context::default());
+            match want {
+                Ok(v) => assert_eq!(got.as_ref().ok(), Some(v), "`{src}`"),
+                Err((function, message)) => {
+                    assert_eq!(got, Err(function_error(function, message)), "`{src}`")
+                }
+            }
         }
 
-        // The same conversions on COLUMN operands, through the machine.
-        let cols: Vec<(&'static str, ColData)> = vec![
-            ("i", ColData::Int(vec![-1, 0, 7, i64::MIN])),
-            (
-                "u",
-                ColData::UInt(vec![u64::MAX as i64, 0, 7, (i64::MAX as u64 + 1) as i64]),
-            ),
-            ("f", ColData::Float(vec![-1.5, 0.0, 10.5, 1.0e20])),
+        // Tiled past the compiled tier's threshold so the loop actually traces.
+        let i_pat = [-1_i64, 0, 7, i64::MIN];
+        let u_pat = [u64::MAX as i64, 0, 7, i64::MIN];
+        let i_cols = [("i", ColData::Int(tile(&i_pat, 8)))];
+        let u_cols = [("u", ColData::UInt(tile(&u_pat, 8)))];
+        let int_u_pat = [
+            Err(int_ovf),
+            Ok(Value::Bool(false)),
+            Ok(Value::Bool(false)),
+            Err(int_ovf),
         ];
-        for expr in [
-            "int(u) < 0",
-            "uint(i) > 0u",
-            "double(u) > 1.5",
-            "double(i) > 1.5",
-            "int(f) > 0",
-            "uint(f) > 0u",
-        ] {
-            assert_eq!(
-                sweep_case(expr, &cols),
-                SweepVerdict::Agreed,
-                "`{expr}` must lower and agree with the tree-walker"
+        let uint_i_pat = [
+            Err(uint_ovf),
+            Ok(Value::Bool(false)),
+            Ok(Value::Bool(true)),
+            Err(uint_ovf),
+        ];
+        let program = Program::compile("int(u) < 0").unwrap();
+        for row in 0..u_cols[0].1.len() {
+            assert_row(
+                "int(u) < 0",
+                &program,
+                &u_cols,
+                row,
+                int_u_pat[row % 4].clone(),
             );
         }
+        check_batch_f_refuses("int(u) < 0", &u_cols);
+        let program = Program::compile("uint(i) > 0u").unwrap();
+        for row in 0..i_cols[0].1.len() {
+            assert_row(
+                "uint(i) > 0u",
+                &program,
+                &i_cols,
+                row,
+                uint_i_pat[row % 4].clone(),
+            );
+        }
+        check_batch_f_refuses("uint(i) > 0u", &i_cols);
+
+        let f_pat = [
+            -1.5,
+            0.0,
+            10.5,
+            1.0e20,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            -9223372036854775808.0,
+            9223372036854775808.0,
+        ];
+        let f_cols = [("f", ColData::Float(tile(&f_pat, 4)))];
+        let int_f_pat = [
+            Ok(Value::Bool(false)),
+            Ok(Value::Bool(false)),
+            Ok(Value::Bool(true)),
+            Err(int_ovf),
+            Err(int_ovf),
+            Err(int_ovf),
+            Err(int_ovf),
+            Err(int_ovf),
+            Err(int_ovf),
+        ];
+        let uint_f_pat = [
+            Err(uint_ovf),
+            Ok(Value::Bool(false)),
+            Ok(Value::Bool(true)),
+            Err(uint_ovf),
+            Err(uint_ovf),
+            Err(uint_ovf),
+            Err(uint_ovf),
+            Err(uint_ovf),
+            Ok(Value::Bool(true)),
+        ];
+        let program = Program::compile("int(f) > 0").unwrap();
+        for row in 0..f_cols[0].1.len() {
+            assert_row(
+                "int(f) > 0",
+                &program,
+                &f_cols,
+                row,
+                int_f_pat[row % f_pat.len()].clone(),
+            );
+        }
+        check_batch_f_refuses("int(f) > 0", &f_cols);
+        let program = Program::compile("uint(f) > 0u").unwrap();
+        for row in 0..f_cols[0].1.len() {
+            assert_row(
+                "uint(f) > 0u",
+                &program,
+                &f_cols,
+                row,
+                uint_f_pat[row % f_pat.len()].clone(),
+            );
+        }
+        check_batch_f_refuses("uint(f) > 0u", &f_cols);
+
+        // In-range columns, so the success arm is what the tier compiles.
+        // The uint doubles start at 2^63 so that arm is the traced one.
+        let u_ok = [("u", ColData::UInt(tile(&[0_i64, 7, i64::MAX], 11)))];
+        let u_ok_pat = [
+            Ok(Value::Int(0)),
+            Ok(Value::Int(7)),
+            Ok(Value::Int(i64::MAX)),
+        ];
+        let program = Program::compile("int(u)").unwrap();
+        for row in 0..u_ok[0].1.len() {
+            assert_row("int(u)", &program, &u_ok, row, u_ok_pat[row % 3].clone());
+        }
+        check_batch_f("int(u)", &u_ok);
+
+        let i_ok = [("i", ColData::Int(tile(&[0_i64, 7, i64::MAX], 11)))];
+        let i_ok_pat = [
+            Ok(Value::UInt(0)),
+            Ok(Value::UInt(7)),
+            Ok(Value::UInt(i64::MAX as u64)),
+        ];
+        let program = Program::compile("uint(i)").unwrap();
+        for row in 0..i_ok[0].1.len() {
+            assert_row("uint(i)", &program, &i_ok, row, i_ok_pat[row % 3].clone());
+        }
+        check_batch_f("uint(i)", &i_ok);
+
+        let f_ok_pat = [
+            -1.5,
+            0.0,
+            10.5,
+            9223372036854774784.0,
+            -9223372036854774784.0,
+        ];
+        let f_ok = [("f", ColData::Float(tile(&f_ok_pat, 8)))];
+        let f_ok_want = [
+            Ok(Value::Int(-1)),
+            Ok(Value::Int(0)),
+            Ok(Value::Int(10)),
+            Ok(Value::Int(9223372036854774784)),
+            Ok(Value::Int(-9223372036854774784)),
+        ];
+        let program = Program::compile("int(f)").unwrap();
+        for row in 0..f_ok[0].1.len() {
+            assert_row(
+                "int(f)",
+                &program,
+                &f_ok,
+                row,
+                f_ok_want[row % f_ok_pat.len()].clone(),
+            );
+        }
+        check_batch_f("int(f)", &f_ok);
+
+        let fu_pat = [
+            9223372036854775808.0,
+            18446744073709549568.0,
+            0.0,
+            10.5,
+            -0.0,
+        ];
+        let fu = [("f", ColData::Float(tile(&fu_pat, 8)))];
+        let fu_want = [
+            Ok(Value::UInt(1u64 << 63)),
+            Ok(Value::UInt(18446744073709549568)),
+            Ok(Value::UInt(0)),
+            Ok(Value::UInt(10)),
+            Ok(Value::UInt(0)),
+        ];
+        let program = Program::compile("uint(f)").unwrap();
+        for row in 0..fu[0].1.len() {
+            assert_row(
+                "uint(f)",
+                &program,
+                &fu,
+                row,
+                fu_want[row % fu_pat.len()].clone(),
+            );
+        }
+        check_batch_f("uint(f)", &fu);
+
+        // Total widenings. `double(u)` of `u64::MAX` must stay large and positive.
+        let du_pat = [
+            Ok(Value::Bool(true)),
+            Ok(Value::Bool(false)),
+            Ok(Value::Bool(true)),
+            Ok(Value::Bool(true)),
+        ];
+        let program = Program::compile("double(u) > 1.5").unwrap();
+        for row in 0..u_cols[0].1.len() {
+            assert_row(
+                "double(u) > 1.5",
+                &program,
+                &u_cols,
+                row,
+                du_pat[row % 4].clone(),
+            );
+        }
+        check_batch_f("double(u) > 1.5", &u_cols);
+        let di_pat = [
+            Ok(Value::Bool(false)),
+            Ok(Value::Bool(false)),
+            Ok(Value::Bool(true)),
+            Ok(Value::Bool(false)),
+        ];
+        let program = Program::compile("double(i) > 1.5").unwrap();
+        for row in 0..i_cols[0].1.len() {
+            assert_row(
+                "double(i) > 1.5",
+                &program,
+                &i_cols,
+                row,
+                di_pat[row % 4].clone(),
+            );
+        }
+        check_batch_f("double(i) > 1.5", &i_cols);
+
+        // A raising constant is not folded into a wrapped value.
+        let stub = [("i", ColData::Int(tile(&[0_i64, 1, 2, 3], 8)))];
+        let program = Program::compile("int(1.0e20) > i").unwrap();
+        for row in 0..stub[0].1.len() {
+            assert_row("int(1.0e20) > i", &program, &stub, row, Err(int_ovf));
+        }
+        check_batch_f_refuses("int(1.0e20) > i", &stub);
     }
 
     /// `list[k]` on a bound LIST column reads the row's OWN element, which

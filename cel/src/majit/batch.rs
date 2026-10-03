@@ -4000,6 +4000,124 @@ mod tests {
             assert_eq!(who, Answered::Batch, "`{src}`");
             assert_eq!(got, oracle, "`{src}`");
         }
+
+        // `uint(int)` under a condition the row does not select must not
+        // refuse the batch. The selected negative still raises.
+        for (xs, src) in [
+            (&[-1i64, 0, 7][..], "list.map(x, x >= 0 ? uint(x) : 0u)"),
+            (&[-1, 4][..], "list.filter(x, x >= 0).map(x, uint(x))"),
+        ] {
+            let (guarded, (who, got), oracle) = run(xs, src);
+            assert!(guarded, "`{src}`: the conversion is under a condition");
+            assert_eq!(who, Answered::BatchSafe, "`{src}`");
+            assert_eq!(got, oracle, "`{src}`");
+        }
+        let (guarded, (who, got), _) = run(&[-1], "list.map(x, x < 0 ? uint(x) : 0u)");
+        assert!(guarded, "uint of a selected negative is under a condition");
+        assert_eq!(who, Answered::RowByRow);
+        assert!(
+            got.contains("unsigned integer overflow"),
+            "the walker's range error, not a wrapped uint: {got}"
+        );
+
+        let run_float = |xs: &[f64], src: &str| {
+            let lens = vec![xs.len() as i64];
+            let sc = schema(&[("list[]", ValType::Float)]);
+            let program = Program::compile(src).unwrap();
+            let p = BatchProgram::from_program(&program, &sc)
+                .unwrap_or_else(|e| panic!("`{src}`: {e:?}"));
+            let b = Batch::new(1).column(
+                "list",
+                ColumnRef::List {
+                    lens: &lens,
+                    fields: vec![(None, ColumnRef::Float(xs))],
+                },
+            );
+            let reader = RowReader::new(&b);
+            let oracle = format!("{:?}", program.execute(&reader.scope(&base, 0)));
+            let mut seen = Vec::new();
+            for tier in [Tier::Clean, Tier::Interpreter, Tier::Jit] {
+                let got = match eval_per_row_on(&program, &sc, &b, &base, tier) {
+                    Ok((v, who)) => (who, format!("Ok({:?})", v[0])),
+                    Err(e) => (Answered::RowByRow, format!("Err({e:?})")),
+                };
+                seen.push(got);
+            }
+            assert!(
+                seen.windows(2).all(|w| w[0] == w[1]),
+                "`{src}`: the tiers disagree: {seen:?}"
+            );
+            (p.lowered().has_guarded_trap, seen.remove(0), oracle)
+        };
+        for (xs, src) in [
+            (&[1.5, 1.0e20][..], "list.map(x, x < 10.0 ? int(x) : 0)"),
+            (
+                &[1.5, 1.0e20, -1.5][..],
+                "list.filter(x, x < 100.0).map(x, int(x))",
+            ),
+            (
+                &[-1.5, 10.5, 9223372036854775808.0][..],
+                "list.map(x, x >= 0.0 ? uint(x) : 0u)",
+            ),
+            (&[10.5, f64::NAN][..], "list.map(x, x == x ? uint(x) : 0u)"),
+        ] {
+            let (guarded, (who, got), oracle) = run_float(xs, src);
+            assert!(guarded, "`{src}`: the conversion is under a condition");
+            assert_eq!(who, Answered::BatchSafe, "`{src}`");
+            assert_eq!(got, oracle, "`{src}`");
+        }
+        let (guarded, (who, got), _) = run_float(&[1.0e20], "list.map(x, x > 0.0 ? int(x) : 0)");
+        assert!(
+            guarded,
+            "int of a selected out-of-range double is under a condition"
+        );
+        assert_eq!(who, Answered::RowByRow);
+        assert!(
+            got.contains("integer overflow"),
+            "the walker's range error, not a saturated int: {got}"
+        );
+
+        let run_uint = |xs: &[u64], src: &str| {
+            let lens = vec![xs.len() as i64];
+            let sc = schema(&[("list[]", ValType::UInt)]);
+            let program = Program::compile(src).unwrap();
+            let p = BatchProgram::from_program(&program, &sc)
+                .unwrap_or_else(|e| panic!("`{src}`: {e:?}"));
+            let b = Batch::new(1).column(
+                "list",
+                ColumnRef::List {
+                    lens: &lens,
+                    fields: vec![(None, ColumnRef::UInt(xs))],
+                },
+            );
+            let reader = RowReader::new(&b);
+            let oracle = format!("{:?}", program.execute(&reader.scope(&base, 0)));
+            let mut seen = Vec::new();
+            for tier in [Tier::Clean, Tier::Interpreter, Tier::Jit] {
+                let got = match eval_per_row_on(&program, &sc, &b, &base, tier) {
+                    Ok((v, who)) => (who, format!("Ok({:?})", v[0])),
+                    Err(e) => (Answered::RowByRow, format!("Err({e:?})")),
+                };
+                seen.push(got);
+            }
+            assert!(
+                seen.windows(2).all(|w| w[0] == w[1]),
+                "`{src}`: the tiers disagree: {seen:?}"
+            );
+            (p.lowered().has_guarded_trap, seen.remove(0), oracle)
+        };
+        let (guarded, (who, got), oracle) =
+            run_uint(&[0, 5, u64::MAX], "list.map(x, x < 10u ? int(x) : 0)");
+        assert!(guarded, "int(uint) under a rejected condition");
+        assert_eq!(who, Answered::BatchSafe);
+        assert_eq!(got, oracle);
+        let (guarded, (who, got), _) = run_uint(&[u64::MAX], "list.map(x, x > 0u ? int(x) : 0)");
+        assert!(guarded, "int of a selected uint past i64::MAX");
+        assert_eq!(who, Answered::RowByRow);
+        assert!(
+            got.contains("integer overflow"),
+            "the walker's range error, not a wrapped int: {got}"
+        );
     }
 
     /// The row loop carries two induction variables, a row counter and a byte
