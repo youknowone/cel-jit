@@ -503,9 +503,8 @@ fn record_name_equality_answers_after_the_portal_compiles() {
     }
 }
 
-/// One-argument string methods stay on the compiled loop, including a field
-/// receiver and a free-variable receiver. `math.max` is a real function and
-/// still runs.
+/// String methods and a slot compared with a constant string stay on the
+/// compiled loop. `math.max` is a real function and still runs.
 #[test]
 fn string_methods_answer_after_the_portal_compiles() {
     unsafe { std::env::set_var("CEL_PORTAL_THRESHOLD", "100") };
@@ -533,6 +532,13 @@ fn string_methods_answer_after_the_portal_compiles() {
     ctx.add_variable_from_value("items", Value::list(items));
     ctx.add_variable_from_value("s", "alpha");
     ctx.add_variable_from_value("list", (1..=256i64).collect::<Vec<_>>());
+    agree_compiled_in(r#"tags.exists(t, t == "alpha")"#, &ctx, 20);
+    agree_compiled_in(r#"tags.exists(t, t == "zzz")"#, &ctx, 20);
+    agree_compiled_in(r#"tags.all(t, t != "zzz")"#, &ctx, 20);
+    agree_compiled_in(r#"tags.map(t, t == "beta-row")"#, &ctx, 20);
+    agree_compiled_in(r#"tags.map(t, t != "zzz")"#, &ctx, 20);
+    agree_compiled_in(r#"tags.filter(t, t == "alpha")"#, &ctx, 20);
+    agree_compiled_in(r#"list.map(e, e == "a")"#, &ctx, 5);
     agree_compiled_in(r#"tags.exists(t, t.startsWith("alp"))"#, &ctx, 20);
     agree_compiled_in(r#"tags.map(t, t.startsWith("a"))"#, &ctx, 20);
     agree_compiled_in(r#"tags.map(t, t.endsWith("row"))"#, &ctx, 20);

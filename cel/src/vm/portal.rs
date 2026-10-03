@@ -4860,6 +4860,16 @@ fn run_cel_portal(
                             } else {
                                 slow_pc(vm, here)
                             }
+                        } else if cell_kind(a) == CelKind::Str as i64 {
+                            if cell_kind(k) == CelKind::Str as i64 {
+                                let r = box_bool(str_cells_eq(a, k));
+                                let depth = state.frame.valuestackdepth;
+                                state.frame.locals_stack_w[depth] = r;
+                                state.frame.valuestackdepth = depth + 1;
+                                here + 1
+                            } else {
+                                slow_pc(vm, here)
+                            }
                         } else {
                             slow_pc(vm, here)
                         }
@@ -5866,6 +5876,22 @@ fn run_cel_portal(
                             } else {
                                 slow_pc(vm, here)
                             }
+                        } else if opcode == OP_NE_LOCAL_K {
+                            if cell_kind(a) == CelKind::Str as i64 {
+                                if cell_kind(k) == CelKind::Str as i64 {
+                                    let eq = str_cells_eq(a, k);
+                                    let bit = if eq == 0 { 1 } else { 0 };
+                                    let r = box_bool(bit);
+                                    let depth = state.frame.valuestackdepth;
+                                    state.frame.locals_stack_w[depth] = r;
+                                    state.frame.valuestackdepth = depth + 1;
+                                    here + 1
+                                } else {
+                                    slow_pc(vm, here)
+                                }
+                            } else {
+                                slow_pc(vm, here)
+                            }
                         } else {
                             slow_pc(vm, here)
                         }
@@ -5934,7 +5960,50 @@ fn run_cel_portal(
                                         slow_pc(vm, here)
                                     }
                                 } else {
-                                    slow_pc(vm, here)
+                                    let bit = if opcode == OP_EQ_LOCAL_K_APPEND {
+                                        if cell_kind(a) == CelKind::Str as i64 {
+                                            if cell_kind(k) == CelKind::Str as i64 {
+                                                str_cells_eq(a, k)
+                                            } else {
+                                                -1
+                                            }
+                                        } else {
+                                            -1
+                                        }
+                                    } else if opcode == OP_NE_LOCAL_K_APPEND {
+                                        if cell_kind(a) == CelKind::Str as i64 {
+                                            if cell_kind(k) == CelKind::Str as i64 {
+                                                let eq = str_cells_eq(a, k);
+                                                if eq == 0 {
+                                                    1
+                                                } else {
+                                                    0
+                                                }
+                                            } else {
+                                                -1
+                                            }
+                                        } else {
+                                            -1
+                                        }
+                                    } else {
+                                        -1
+                                    };
+                                    if bit < 0 {
+                                        slow_pc(vm, here)
+                                    } else {
+                                        let r = box_bool(bit);
+                                        let stored = append_ref(list, r);
+                                        let stored = if stored != 0 {
+                                            stored
+                                        } else {
+                                            append_cell(list, r)
+                                        };
+                                        if stored != 0 {
+                                            here + 1
+                                        } else {
+                                            slow_pc(vm, here)
+                                        }
+                                    }
                                 }
                             } else {
                                 slow_pc(vm, here)
