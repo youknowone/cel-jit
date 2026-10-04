@@ -85,8 +85,12 @@ pub enum Context<'a> {
 /// back to that handle; [`retain_public`] keeps the handle alive.
 ///
 /// The interned leaf is allocated from this Context's region, so dropping
-/// the Context releases it. Immortal singletons are not allocated here.
+/// the Context releases it. Immortal singletons (`intern_prebuilt`) are
+/// not allocated here and do not need a bind region.
 fn wrap_entry(ctx: &mut Context, value: Value) -> Value {
+    if let Some(w) = crate::runtime::convert::intern_prebuilt(&value) {
+        return Value::from_interned(w);
+    }
     let region = ctx.ensure_region();
     crate::runtime::heap::with_bind_region(region, || {
         match crate::runtime::convert::intern_leaf(&value) {
@@ -174,8 +178,9 @@ impl<'a> Context<'a> {
         let leaf = leaf_of(&value);
         let index = match self {
             Context::Root { map, storage, .. } | Context::Child { map, storage, .. } => {
-                *map = ScopeMap::bind(*map, storage, name, value);
-                map.find_in_this_scope(name).expect("just bound") as usize
+                let (next, index) = ScopeMap::bind(*map, storage, name, value);
+                *map = next;
+                index
             }
         };
         self.sync_leaf_slot(index, leaf);
@@ -195,19 +200,35 @@ impl<'a> Context<'a> {
 
     /// Write `leaf` at `storageindex` on the items block. A missing leaf
     /// stores null so the portal's `slow_pc` path still runs. The block is
-    /// allocated in this Context's bind region.
+    /// allocated in this Context's bind region, sized from the map
+    /// (`_mapdict_init_empty`) so later binds do not regrow.
     fn sync_leaf_slot(&mut self, index: usize, leaf: Option<crate::runtime::object::CelRef>) {
         if leaf.is_none() && self.leaves().items.is_null() {
             return;
         }
+        let leaf = leaf.unwrap_or(core::ptr::null_mut());
+        if crate::runtime::object_array::items_block_store_existing(
+            self.leaves().items,
+            index,
+            leaf,
+        ) {
+            return;
+        }
+        let cap = self.map().likely_storage_len().max(index.saturating_add(1));
         let region = self.ensure_region();
         crate::runtime::heap::with_bind_region(region, || {
             let storage = self.leaves_mut();
-            storage.items = crate::runtime::object_array::items_block_store(
-                storage.items,
-                index,
-                leaf.unwrap_or(core::ptr::null_mut()),
-            );
+            if storage.items.is_null() {
+                storage.items = crate::runtime::object_array::new_items_block_zeroed(cap);
+                let _ = crate::runtime::object_array::items_block_store_existing(
+                    storage.items,
+                    index,
+                    leaf,
+                );
+            } else {
+                storage.items =
+                    crate::runtime::object_array::items_block_store(storage.items, index, leaf);
+            }
         });
     }
 
@@ -547,17 +568,30 @@ impl<'a> Context<'a> {
     }
 
     pub fn new_inner_scope(&self) -> Context<'_> {
+        let map = self.map().child_terminator();
+        // `_mapdict_init_empty` / `_make_storage_mixin_size_n`: size
+        // storage from the map the unique cached chain will reach.
+        let cap = map.likely_storage_len();
+        let mut region = crate::runtime::heap::BindRegionSlot::empty();
+        let items = if cap == 0 {
+            core::ptr::null_mut()
+        } else {
+            let r = region.get_or_insert();
+            crate::runtime::heap::with_bind_region(r, || {
+                crate::runtime::object_array::new_items_block_zeroed(cap)
+            })
+        };
         Context::Child {
             parent: self,
-            map: self.map().child_terminator(),
-            storage: Vec::new(),
+            map,
+            storage: Vec::with_capacity(cap),
             resolver: None,
             retained: Vec::new(),
-            region: crate::runtime::heap::BindRegionSlot::empty(),
+            region,
             leaves: crate::runtime::object_array::CelLeafStorage {
                 parent: self.leaves() as *const crate::runtime::object_array::CelLeafStorage
                     as *mut crate::runtime::object_array::CelLeafStorage,
-                items: core::ptr::null_mut(),
+                items,
             },
         }
     }
@@ -670,8 +704,16 @@ mod tests {
         let ctx = Context::default();
         let mut inner = ctx.new_inner_scope();
         inner.rebind("x", Value::Int(1));
+        match inner.lookup_raw("x") {
+            Some(Value::Int(1)) => {}
+            other => panic!("rebind of an unboxed int stays unboxed, got {other:?}"),
+        }
         match &inner {
-            Context::Child { region, .. } => assert!(region.is_none()),
+            Context::Child { region, leaves, .. } => {
+                if leaves.items.is_null() {
+                    assert!(region.is_none(), "no wrap and no preallocated block");
+                }
+            }
             Context::Root { .. } => panic!("inner scope is a child"),
         }
     }
@@ -705,10 +747,22 @@ mod tests {
         let heap = ctx.eval_heap().expect("bound");
         with_heap(|h| assert!(core::ptr::eq(heap as *const _, h as *const _)));
         let inner = ctx.new_inner_scope();
-        assert!(
-            inner.eval_heap().is_none(),
-            "a child does not inherit the parent's region"
-        );
+        match inner.eval_heap() {
+            None => {}
+            Some(heap) => {
+                with_heap(|h| assert!(core::ptr::eq(heap as *const _, h as *const _)));
+                let child_region = inner
+                    .eval_region()
+                    .map(|r| r as *const crate::runtime::heap::BindRegion);
+                let parent_region = ctx
+                    .eval_region()
+                    .map(|r| r as *const crate::runtime::heap::BindRegion);
+                assert_ne!(
+                    child_region, parent_region,
+                    "a child does not inherit the parent's region"
+                );
+            }
+        }
     }
 
     #[test]
@@ -835,7 +889,6 @@ mod tests {
             child.leaves().parent,
             root.leaves() as *const _ as *mut _
         ));
-        assert!(child.leaves().items.is_null());
         unsafe {
             let parent_items = (*child.leaves().parent).items;
             let x = root.lookup_interned("x").expect("x");

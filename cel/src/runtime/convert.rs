@@ -18,13 +18,13 @@ use super::object::{
     mapdict_get, mapdict_layout_for_names, mapdict_name_at, new_bool, new_bytes, new_double,
     new_host_list, new_host_list_ints, new_host_list_window, new_int, new_map, new_map_mapdict,
     new_map_record, new_null, new_opaque, new_optional, new_optional_none, new_string, new_type,
-    new_uint, opaque_host_index, prebuilt_type, prepare_mapdict_rows, w_kind, w_type, CelClass,
-    CelKind, CelRef, ListStrategy, MapStrategy, W_BoolObject, W_BytesObject, W_DoubleObject,
-    W_FloatColumn, W_HostListObject, W_IntColumn, W_IntObject, W_ListObject, W_MapObject,
-    W_OptionalObject, W_StringObject, W_TypeObject, W_UIntObject, CEL_BOOL_CLASS, CEL_BYTES_CLASS,
-    CEL_DOUBLE_CLASS, CEL_HOST_LIST_CLASS, CEL_INT_CLASS, CEL_LIST_CLASS, CEL_MAP_CLASS,
-    CEL_NULL_CLASS, CEL_OPAQUE_CLASS, CEL_OPTIONAL_CLASS, CEL_STRING_CLASS, CEL_TYPE_CLASS,
-    CEL_UINT_CLASS, MAPDICT_MAX_ENTRIES,
+    new_uint, opaque_host_index, prebuilt_int, prebuilt_type, prepare_mapdict_rows, w_kind, w_type,
+    CelClass, CelKind, CelRef, ListStrategy, MapStrategy, W_BoolObject, W_BytesObject,
+    W_DoubleObject, W_FloatColumn, W_HostListObject, W_IntColumn, W_IntObject, W_ListObject,
+    W_MapObject, W_OptionalObject, W_StringObject, W_TypeObject, W_UIntObject, CEL_BOOL_CLASS,
+    CEL_BYTES_CLASS, CEL_DOUBLE_CLASS, CEL_HOST_LIST_CLASS, CEL_INT_CLASS, CEL_LIST_CLASS,
+    CEL_MAP_CLASS, CEL_NULL_CLASS, CEL_OPAQUE_CLASS, CEL_OPTIONAL_CLASS, CEL_STRING_CLASS,
+    CEL_TYPE_CLASS, CEL_UINT_CLASS, MAPDICT_MAX_ENTRIES,
 };
 use super::object_array::{
     bytes_base, float_words_base, int_words_base, items_block_items_base, items_capacity,
@@ -136,6 +136,17 @@ pub fn interned_to_public(w: CelRef) -> Value {
             Ok(v) => v,
             Err(_) => Value::Null,
         })
+}
+
+/// The leaf [`intern_leaf`] returns without allocating: small ints
+/// (`intobject.py` `PREBUILTINTFROM` / `PREBUILTINTTO`), bool, and null.
+pub(crate) fn intern_prebuilt(v: &Value) -> Option<CelRef> {
+    match v {
+        Value::Int(i) => prebuilt_int(*i).map(|w| w as CelRef),
+        Value::Bool(b) => Some(new_bool(*b) as CelRef),
+        Value::Null => Some(new_null() as CelRef),
+        _ => None,
+    }
 }
 
 /// Intern `v` onto a class-family leaf.
@@ -1958,6 +1969,12 @@ mod tests {
         );
         assert_eq!(intern_leaf(&Value::Null), Some(new_null() as CelRef));
         assert_eq!(intern_leaf(&Value::Int(3)), Some(new_int(3) as CelRef));
+        assert_eq!(
+            intern_prebuilt(&Value::Int(3)),
+            intern_leaf(&Value::Int(3)),
+            "small ints are prebuilts; intern_leaf does not allocate"
+        );
+        assert_eq!(intern_prebuilt(&Value::Int(1000)), None);
         assert!(intern_leaf(&Value::String(Arc::from("x"))).is_some());
         let list = Value::List(ListRef::from(vec![Value::Int(1)]));
         assert!(intern_leaf(&list).is_some());

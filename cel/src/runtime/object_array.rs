@@ -548,6 +548,22 @@ pub fn new_items_block_zeroed(cap: usize) -> *mut CelItemsBlock {
     super::heap::with_heap(|h| new_items_block_zeroed_in(h, cap))
 }
 
+/// Write `leaf` at `index` when `block` already has that slot.
+///
+/// `false` when the block is missing or too short; the caller then grows
+/// through [`items_block_store`]. An in-place store does not allocate.
+#[inline]
+pub fn items_block_store_existing(block: *mut CelItemsBlock, index: usize, leaf: CelRef) -> bool {
+    let cap = unsafe { items_capacity(block) };
+    if block.is_null() || index >= cap {
+        return false;
+    }
+    unsafe {
+        *items_block_items_base(block).add(index) = leaf;
+    }
+    true
+}
+
 /// Store `leaf` at `index`, growing `block` when the index is past capacity.
 ///
 /// A grow allocates a fresh block and copies the live prefix; the old block
@@ -799,6 +815,13 @@ mod tests {
             assert!(items_capacity(grown) >= 5);
             assert_eq!(*items_block_items_base(grown), first);
             assert_eq!(*items_block_items_base(grown).add(4), fifth);
+            assert!(items_block_store_existing(grown, 0, fifth));
+            assert_eq!(*items_block_items_base(grown), fifth);
+            assert!(!items_block_store_existing(
+                grown,
+                items_capacity(grown),
+                fifth
+            ));
         }
     }
 
