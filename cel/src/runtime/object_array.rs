@@ -272,6 +272,11 @@ pub fn new_int_words_in(heap: &super::heap::CelHeap, cap: usize) -> *mut CelIntW
     }
 }
 
+/// An int-words block of `cap` zero slots on this thread's heap.
+pub fn new_int_words_zeroed(cap: usize) -> *mut CelIntWords {
+    super::heap::with_heap(|h| new_int_words_zeroed_in(h, cap))
+}
+
 /// An int-words block of `cap` zero slots on `heap`.
 pub fn new_int_words_zeroed_in(heap: &super::heap::CelHeap, cap: usize) -> *mut CelIntWords {
     let block = new_int_words_in(heap, cap);
@@ -299,6 +304,19 @@ pub unsafe fn int_words_capacity(block: *mut CelIntWords) -> usize {
         return 0;
     }
     unsafe { (*block).capacity }
+}
+
+/// Store `word` at `index` when `block` already has that slot. `false` if
+/// the block is missing or too small; the caller then grows.
+pub fn int_words_store_existing(block: *mut CelIntWords, index: usize, word: i64) -> bool {
+    let cap = unsafe { int_words_capacity(block) };
+    if block.is_null() || index >= cap {
+        return false;
+    }
+    unsafe {
+        *int_words_base(block).add(index) = word;
+    }
+    true
 }
 
 /// Store `word` at `index`, growing `block` when the index is past capacity.

@@ -4,7 +4,8 @@ use crate::registry_map::RegistryMap;
 use crate::resolvers::{AllArguments, Argument};
 use crate::runtime::object_array::CelInt2Storage;
 use crate::{Env, ExecutionError, FunctionContext, ResolveResult, Value};
-use std::any::Any;
+use std::any::TypeId;
+use std::mem::{needs_drop, size_of, transmute_copy};
 use std::sync::Arc;
 
 impl_conversions!(
@@ -365,6 +366,12 @@ impl FunctionRegistry {
             let next = self.map.add_attr(name);
             debug_assert_eq!(next.storageindex() as usize, self.storage.len());
             let idx = self.storage.len();
+            // `_mapdict_init_empty` / `_make_storage_mixin_size_n`: size
+            // storage from the map the unique cached chain will reach.
+            let cap = self.map.likely_storage_len().max(idx + 1);
+            if self.storage.capacity() < cap {
+                self.storage.reserve(cap - self.storage.len());
+            }
             self.storage.push(value);
             self.map = next;
             self.write_entry(idx, word);
@@ -435,10 +442,26 @@ impl FunctionRegistry {
     }
 
     fn write_entry(&mut self, index: usize, word: i64) {
+        let items = self.entries.items;
+        if !items.is_null()
+            && crate::runtime::object_array::int_words_store_existing(items, index, word)
+        {
+            return;
+        }
+        let cap = self.map.likely_storage_len().max(index.saturating_add(1));
         let region = self.region.get_or_insert();
         crate::runtime::heap::with_bind_region(region, || {
-            self.entries.items =
-                crate::runtime::object_array::int_words_store(self.entries.items, index, word);
+            if self.entries.items.is_null() {
+                self.entries.items = crate::runtime::object_array::new_int_words_zeroed(cap);
+                let _ = crate::runtime::object_array::int_words_store_existing(
+                    self.entries.items,
+                    index,
+                    word,
+                );
+            } else {
+                self.entries.items =
+                    crate::runtime::object_array::int_words_store(self.entries.items, index, word);
+            }
         });
     }
 
@@ -487,18 +510,245 @@ impl Function {
         }
     }
 
-    /// A function whose typed closure is also offered, boxed as `Any`: it is
-    /// kept if it has one of [`ScalarFn`]'s signatures and dropped otherwise.
-    pub(crate) fn with_typed(erased: ErasedFunction, typed: Box<dyn Any>) -> Self {
-        Function {
-            erased,
-            scalar: ScalarFn::from_any(typed).map(Arc::new),
-        }
-    }
-
     /// The scalar form, when the closure had one of [`ScalarFn`]'s signatures.
     pub fn scalar(&self) -> Option<&Arc<ScalarFn>> {
         self.scalar.as_ref()
+    }
+}
+
+fn type_eq<A: 'static, B: 'static>() -> bool {
+    TypeId::of::<A>() == TypeId::of::<B>()
+}
+
+/// `interp2app`: one object holding the closure. The erased and scalar
+/// adapters are views of the closure type (`BuiltinCode`), not extra boxes.
+pub(crate) fn handler0<F, R>(f: F) -> Function
+where
+    F: Fn() -> R + 'static,
+    R: IntoResolveResult + 'static,
+{
+    Function::erased(Box::new(move |_ftx| f().into_resolve_result()))
+}
+
+pub(crate) fn handler1<F, C1, R>(f: F) -> Function
+where
+    F: Fn(C1) -> R + 'static,
+    C1: for<'a, 'context, 'call> FromContext<'a, 'context, 'call> + 'static,
+    R: IntoResolveResult + 'static,
+{
+    if type_eq::<C1, i64>() && type_eq::<R, i64>() {
+        return scalar_int1(f);
+    }
+    if type_eq::<C1, f64>() && type_eq::<R, f64>() {
+        return scalar_float1(f);
+    }
+    Function::erased(Box::new(move |ftx| {
+        let a = C1::from_context(ftx)?;
+        f(a).into_resolve_result()
+    }))
+}
+
+pub(crate) fn handler2<F, C1, C2, R>(f: F) -> Function
+where
+    F: Fn(C1, C2) -> R + 'static,
+    C1: for<'a, 'context, 'call> FromContext<'a, 'context, 'call> + 'static,
+    C2: for<'a, 'context, 'call> FromContext<'a, 'context, 'call> + 'static,
+    R: IntoResolveResult + 'static,
+{
+    if type_eq::<C1, i64>() && type_eq::<C2, i64>() && type_eq::<R, i64>() {
+        return scalar_int2(f);
+    }
+    if type_eq::<C1, f64>() && type_eq::<C2, f64>() && type_eq::<R, f64>() {
+        return scalar_float2(f);
+    }
+    Function::erased(Box::new(move |ftx| {
+        let a = C1::from_context(ftx)?;
+        let b = C2::from_context(ftx)?;
+        f(a, b).into_resolve_result()
+    }))
+}
+
+fn scalar_int1<F, C1, R>(f: F) -> Function
+where
+    F: Fn(C1) -> R + 'static,
+    C1: for<'a, 'context, 'call> FromContext<'a, 'context, 'call> + 'static,
+    R: IntoResolveResult + 'static,
+{
+    let erased_view = zst_view(&f);
+    let boxed: Box<dyn Fn(i64) -> i64> = Box::new(move |a| {
+        // SAFETY: `handler1` only calls this when `TypeId` of `C1` and `R` is `i64`.
+        let a = unsafe { transmute_copy::<i64, C1>(&a) };
+        let r = f(a);
+        unsafe { transmute_copy::<R, i64>(&r) }
+    });
+    let scalar = Arc::new(ScalarFn::Int1(boxed));
+    Function {
+        erased: scalar_erased_1(erased_view, &scalar),
+        scalar: Some(scalar),
+    }
+}
+
+fn scalar_int2<F, C1, C2, R>(f: F) -> Function
+where
+    F: Fn(C1, C2) -> R + 'static,
+    C1: for<'a, 'context, 'call> FromContext<'a, 'context, 'call> + 'static,
+    C2: for<'a, 'context, 'call> FromContext<'a, 'context, 'call> + 'static,
+    R: IntoResolveResult + 'static,
+{
+    let erased_view = zst_view(&f);
+    let boxed: Box<dyn Fn(i64, i64) -> i64> = Box::new(move |a, b| {
+        // SAFETY: `handler2` only calls this when `TypeId` of `C1`, `C2`, and `R` is `i64`.
+        let a = unsafe { transmute_copy::<i64, C1>(&a) };
+        let b = unsafe { transmute_copy::<i64, C2>(&b) };
+        let r = f(a, b);
+        unsafe { transmute_copy::<R, i64>(&r) }
+    });
+    let scalar = Arc::new(ScalarFn::Int2(boxed));
+    Function {
+        erased: scalar_erased_2(erased_view, &scalar),
+        scalar: Some(scalar),
+    }
+}
+
+fn scalar_float1<F, C1, R>(f: F) -> Function
+where
+    F: Fn(C1) -> R + 'static,
+    C1: for<'a, 'context, 'call> FromContext<'a, 'context, 'call> + 'static,
+    R: IntoResolveResult + 'static,
+{
+    let erased_view = zst_view(&f);
+    let boxed: Box<dyn Fn(f64) -> f64> = Box::new(move |a| {
+        // SAFETY: `handler1` only calls this when `TypeId` of `C1` and `R` is `f64`.
+        let a = unsafe { transmute_copy::<f64, C1>(&a) };
+        let r = f(a);
+        unsafe { transmute_copy::<R, f64>(&r) }
+    });
+    let scalar = Arc::new(ScalarFn::Float1(boxed));
+    Function {
+        erased: scalar_erased_float1(erased_view, &scalar),
+        scalar: Some(scalar),
+    }
+}
+
+fn scalar_float2<F, C1, C2, R>(f: F) -> Function
+where
+    F: Fn(C1, C2) -> R + 'static,
+    C1: for<'a, 'context, 'call> FromContext<'a, 'context, 'call> + 'static,
+    C2: for<'a, 'context, 'call> FromContext<'a, 'context, 'call> + 'static,
+    R: IntoResolveResult + 'static,
+{
+    let erased_view = zst_view(&f);
+    let boxed: Box<dyn Fn(f64, f64) -> f64> = Box::new(move |a, b| {
+        // SAFETY: `handler2` only calls this when `TypeId` of `C1`, `C2`, and `R` is `f64`.
+        let a = unsafe { transmute_copy::<f64, C1>(&a) };
+        let b = unsafe { transmute_copy::<f64, C2>(&b) };
+        let r = f(a, b);
+        unsafe { transmute_copy::<R, f64>(&r) }
+    });
+    let scalar = Arc::new(ScalarFn::Float2(boxed));
+    Function {
+        erased: scalar_erased_float2(erased_view, &scalar),
+        scalar: Some(scalar),
+    }
+}
+
+/// A ZST closure with no drop glue has no state: a second adapter is a
+/// view of the type, not a copy of bytes (`interp2app` `BuiltinCode`).
+/// A ZST that still implements `Drop` (it captured a ZST `Drop` value)
+/// is not a view: duplicating it would run `Drop` twice.
+fn zst_view<F>(f: &F) -> Option<F> {
+    if size_of::<F>() == 0 && !needs_drop::<F>() {
+        // SAFETY: `F` is a ZST with no drop glue, so a second value of
+        // the same type is a view of the type, not a second owner.
+        Some(unsafe { transmute_copy(f) })
+    } else {
+        None
+    }
+}
+
+fn scalar_erased_1<F, C1, R>(view: Option<F>, scalar: &Arc<ScalarFn>) -> ErasedFunction
+where
+    F: Fn(C1) -> R + 'static,
+    C1: for<'a, 'context, 'call> FromContext<'a, 'context, 'call> + 'static,
+    R: IntoResolveResult + 'static,
+{
+    if let Some(f) = view {
+        Box::new(move |ftx| {
+            let a = C1::from_context(ftx)?;
+            f(a).into_resolve_result()
+        })
+    } else {
+        let entry = scalar.entry_word();
+        Box::new(move |ftx| {
+            let a = i64::from_context(ftx)?;
+            Ok(Value::Int(unsafe { ScalarFn::call_int1(entry, a) }))
+        })
+    }
+}
+
+fn scalar_erased_2<F, C1, C2, R>(view: Option<F>, scalar: &Arc<ScalarFn>) -> ErasedFunction
+where
+    F: Fn(C1, C2) -> R + 'static,
+    C1: for<'a, 'context, 'call> FromContext<'a, 'context, 'call> + 'static,
+    C2: for<'a, 'context, 'call> FromContext<'a, 'context, 'call> + 'static,
+    R: IntoResolveResult + 'static,
+{
+    if let Some(f) = view {
+        Box::new(move |ftx| {
+            let a = C1::from_context(ftx)?;
+            let b = C2::from_context(ftx)?;
+            f(a, b).into_resolve_result()
+        })
+    } else {
+        let entry = scalar.entry_word();
+        Box::new(move |ftx| {
+            let a = i64::from_context(ftx)?;
+            let b = i64::from_context(ftx)?;
+            Ok(Value::Int(unsafe { ScalarFn::call_int2(entry, a, b) }))
+        })
+    }
+}
+
+fn scalar_erased_float1<F, C1, R>(view: Option<F>, scalar: &Arc<ScalarFn>) -> ErasedFunction
+where
+    F: Fn(C1) -> R + 'static,
+    C1: for<'a, 'context, 'call> FromContext<'a, 'context, 'call> + 'static,
+    R: IntoResolveResult + 'static,
+{
+    if let Some(f) = view {
+        Box::new(move |ftx| {
+            let a = C1::from_context(ftx)?;
+            f(a).into_resolve_result()
+        })
+    } else {
+        let entry = scalar.entry_word();
+        Box::new(move |ftx| {
+            let a = f64::from_context(ftx)?;
+            Ok(Value::Float(unsafe { ScalarFn::call_float1(entry, a) }))
+        })
+    }
+}
+
+fn scalar_erased_float2<F, C1, C2, R>(view: Option<F>, scalar: &Arc<ScalarFn>) -> ErasedFunction
+where
+    F: Fn(C1, C2) -> R + 'static,
+    C1: for<'a, 'context, 'call> FromContext<'a, 'context, 'call> + 'static,
+    C2: for<'a, 'context, 'call> FromContext<'a, 'context, 'call> + 'static,
+    R: IntoResolveResult + 'static,
+{
+    if let Some(f) = view {
+        Box::new(move |ftx| {
+            let a = C1::from_context(ftx)?;
+            let b = C2::from_context(ftx)?;
+            f(a, b).into_resolve_result()
+        })
+    } else {
+        let entry = scalar.entry_word();
+        Box::new(move |ftx| {
+            let a = f64::from_context(ftx)?;
+            let b = f64::from_context(ftx)?;
+            Ok(Value::Float(unsafe { ScalarFn::call_float2(entry, a, b) }))
+        })
     }
 }
 
@@ -534,33 +784,18 @@ pub enum ScalarFn {
 }
 
 impl ScalarFn {
-    /// Recover the signature of a typed closure boxed as `Any`.
+    /// Call an [`ScalarFn::Int1`] whose [`ScalarFn::entry_word`] is `entry`.
     ///
-    /// A `Box<dyn Fn(A, B) -> R + Send + Sync>` is one concrete `'static` type
-    /// per `(A, B, R)`, so downcasting it is an exact test of the signature:
-    /// no specialization, no `unsafe`, and a closure with any other signature
-    /// fails every arm and is reported as having no scalar form.
-    fn from_any(typed: Box<dyn Any>) -> Option<Self> {
-        let typed = match typed.downcast::<Box<dyn Fn(i64, i64) -> i64>>() {
-            Ok(f) => return Some(ScalarFn::Int2(*f)),
-            Err(t) => t,
-        };
-        let typed = match typed.downcast::<Box<dyn Fn(i64) -> i64>>() {
-            Ok(f) => return Some(ScalarFn::Int1(*f)),
-            Err(t) => t,
-        };
-        let typed = match typed.downcast::<Box<dyn Fn(f64, f64) -> f64>>() {
-            Ok(f) => return Some(ScalarFn::Float2(*f)),
-            Err(t) => t,
-        };
-        match typed.downcast::<Box<dyn Fn(f64) -> f64>>() {
-            Ok(f) => Some(ScalarFn::Float1(*f)),
-            Err(_) => None,
-        }
+    /// # Safety
+    ///
+    /// `entry` is the entry word of an `Int1` arm, and that `ScalarFn` is
+    /// still alive (the registry entry that produced the word has not been
+    /// replaced).
+    pub(crate) unsafe fn call_int1(entry: i64, a: i64) -> i64 {
+        let f = unsafe { &*(entry as usize as *const Box<dyn Fn(i64) -> i64>) };
+        f(a)
     }
-}
 
-impl ScalarFn {
     /// Call an [`ScalarFn::Int2`] whose [`ScalarFn::entry_word`] is `entry`.
     ///
     /// # Safety
@@ -570,6 +805,30 @@ impl ScalarFn {
     /// replaced).
     pub(crate) unsafe fn call_int2(entry: i64, a: i64, b: i64) -> i64 {
         let f = unsafe { &*(entry as usize as *const Box<dyn Fn(i64, i64) -> i64>) };
+        f(a, b)
+    }
+
+    /// Call an [`ScalarFn::Float1`] whose [`ScalarFn::entry_word`] is `entry`.
+    ///
+    /// # Safety
+    ///
+    /// `entry` is the entry word of a `Float1` arm, and that `ScalarFn` is
+    /// still alive (the registry entry that produced the word has not been
+    /// replaced).
+    pub(crate) unsafe fn call_float1(entry: i64, a: f64) -> f64 {
+        let f = unsafe { &*(entry as usize as *const Box<dyn Fn(f64) -> f64>) };
+        f(a)
+    }
+
+    /// Call an [`ScalarFn::Float2`] whose [`ScalarFn::entry_word`] is `entry`.
+    ///
+    /// # Safety
+    ///
+    /// `entry` is the entry word of a `Float2` arm, and that `ScalarFn` is
+    /// still alive (the registry entry that produced the word has not been
+    /// replaced).
+    pub(crate) unsafe fn call_float2(entry: i64, a: f64, b: f64) -> f64 {
+        let f = unsafe { &*(entry as usize as *const Box<dyn Fn(f64, f64) -> f64>) };
         f(a, b)
     }
 
@@ -663,6 +922,31 @@ mod scalar_fn_tests {
         ctx.add_function("add", |a: i64, b: i64| a + b);
         let program = crate::Program::compile("add(2, 3)").unwrap();
         assert_eq!(program.execute(&ctx).unwrap(), Value::Int(5));
+    }
+
+    #[test]
+    fn a_zst_drop_closure_is_dropped_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static DROPS: AtomicUsize = AtomicUsize::new(0);
+
+        struct Tick;
+        impl Drop for Tick {
+            fn drop(&mut self) {
+                DROPS.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        {
+            let mut ctx = crate::Context::default();
+            let tick = Tick;
+            ctx.add_function("add", move |a: i64, b: i64| {
+                let _keep = &tick;
+                a + b
+            });
+            assert_eq!(DROPS.load(Ordering::Relaxed), 0);
+        }
+        assert_eq!(DROPS.load(Ordering::Relaxed), 1);
     }
 }
 

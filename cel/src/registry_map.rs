@@ -12,6 +12,7 @@
 //! starts from this terminator, so a root that adds no function has the
 //! same map.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 const WALK_CAP: i64 = 4096;
@@ -27,6 +28,9 @@ pub struct RegistryMap {
     storageindex: i64,
     length: i64,
     cache_attrs: Mutex<Vec<(&'static str, usize)>>,
+    /// Max `length` of this node and any descendant (`_mapdict_init_empty`
+    /// sizes storage from the map). Updated on insert; lock-free load.
+    span: AtomicUsize,
 }
 
 const fn new_node(back: usize, name: &'static str, storageindex: i64, length: i64) -> RegistryMap {
@@ -36,6 +40,7 @@ const fn new_node(back: usize, name: &'static str, storageindex: i64, length: i6
         storageindex,
         length,
         cache_attrs: Mutex::new(Vec::new()),
+        span: AtomicUsize::new(if length > 0 { length as usize } else { 0 }),
     }
 }
 
@@ -74,6 +79,43 @@ impl RegistryMap {
 
     pub(crate) fn storageindex(&'static self) -> i64 {
         self.storageindex
+    }
+
+    /// Longest storage length any cached transition from this node reaches.
+    ///
+    /// `_mapdict_init_empty` / `_make_storage_mixin_size_n` size storage
+    /// from the map. A fresh registry of a known parent preallocates this
+    /// many slots so `add` does not regrow.
+    #[inline]
+    pub(crate) fn likely_storage_len(&'static self) -> usize {
+        self.span.load(Ordering::Acquire)
+    }
+
+    fn bump_span(&'static self, len: usize) {
+        let mut node = self;
+        let mut steps = 0i64;
+        loop {
+            let mut cur = node.span.load(Ordering::Relaxed);
+            while len > cur {
+                match node.span.compare_exchange_weak(
+                    cur,
+                    len,
+                    Ordering::Release,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(seen) => cur = seen,
+                }
+            }
+            steps += 1;
+            if steps >= WALK_CAP {
+                return;
+            }
+            match node.back_node() {
+                Some(back) => node = back,
+                None => return,
+            }
+        }
     }
 
     fn back_node(&'static self) -> Option<&'static RegistryMap> {
@@ -146,6 +188,7 @@ impl RegistryMap {
             self.length.saturating_add(1),
         )));
         guard.push((name_static, child as *const RegistryMap as usize));
+        self.bump_span(child.length.max(0) as usize);
         child
     }
 }
@@ -177,5 +220,16 @@ mod tests {
             RegistryMap::root_terminator(),
             RegistryMap::root_terminator()
         ));
+    }
+
+    #[test]
+    fn likely_storage_len_follows_a_unique_child_chain() {
+        let t = RegistryMap::root_terminator();
+        let before = t.likely_storage_len();
+        let a = t.add_attr("likely_len_probe_a");
+        assert!(a.likely_storage_len() >= 1);
+        let b = a.add_attr("likely_len_probe_b");
+        assert!(b.likely_storage_len() >= 2);
+        assert!(t.likely_storage_len() >= before.max(2));
     }
 }
