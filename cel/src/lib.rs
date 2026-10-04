@@ -26,6 +26,7 @@ pub mod common;
 pub mod context;
 mod env;
 pub mod parser;
+mod registry_map;
 mod scope_map;
 
 pub use common::ast::IdedExpr;

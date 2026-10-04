@@ -4434,19 +4434,22 @@ fn slow_pc(vm: i64, here: i64) -> i64 {
 /// `slow_pc` still runs, including its argument errors. A hit does not
 /// build an argument `Vec` and does not hydrate the frame.
 ///
-/// `ctx` stays red. The root registry address and its generation are
-/// loaded through that pointer. They are not promoted: a fresh root
-/// mints a new registry, and promoting the pointer would fail the
-/// guard on every evaluation. [`host_int2_entry_pure`] is
-/// `_pure_lookup_where_with_method_cache`, keyed on `(registry, version)`.
-/// `add_function` replaces the generation, so the elidable miss sees
-/// the new body. The lookup reads the registry rather than `ctx`.
+/// Promote the registry map (`mapdict.py` `_get_mapdict_map`). Elidable
+/// `find_map_attr` yields the storage index. Residual `_mapdict_read_storage`
+/// reads the entry word from that registry's storage: the closure is
+/// per-registry, so the word is not a constant. Re-registering a name
+/// writes storage and keeps the map; the next residual read is the new
+/// body.
+///
+/// The method-cache lookup (`typeobject.py`
+/// `_pure_lookup_where_with_method_cache`) is this map walk plus the
+/// storage read.
 #[majit_macros::jit_inline(
     ref_params = { program: ref(CelCode) },
     calls = {
-        host_root_registry => residual_int_cannot_raise,
-        host_registry_generation_at => residual_int_cannot_raise,
-        host_int2_entry_pure => elidable_int_cannot_raise,
+        host_registry_map => residual_int_cannot_raise,
+        host_int2_find => elidable_int_cannot_raise,
+        host_int2_entry_at => residual_int_cannot_raise,
         host_call2_i => residual_int_cannot_raise,
         cell_int => inline_int,
         box_int => inline_ref,
@@ -4460,63 +4463,65 @@ fn host_int2_cell(
     left: *mut CelObject,
     right: *mut CelObject,
 ) -> *mut CelObject {
-    let registry = host_root_registry(ctx_bits);
-    let version = host_registry_generation_at(registry);
-    let entry = host_int2_entry_pure(registry, version, program, name);
-    if entry == 0 {
+    let map = host_registry_map(ctx_bits);
+    let map = majit_ir::jit::promote(map);
+    let idx = host_int2_find(map, program, name);
+    if idx < 0 {
         core::ptr::null_mut()
     } else {
-        let n = host_call2_i(entry, cell_int(left), cell_int(right));
-        box_int(vm, n)
+        let entry = host_int2_entry_at(ctx_bits, idx);
+        if entry == 0 {
+            core::ptr::null_mut()
+        } else {
+            let n = host_call2_i(entry, cell_int(left), cell_int(right));
+            box_int(vm, n)
+        }
     }
 }
 
-/// Address of the root [`crate::magic::FunctionRegistry`], or `0`.
+/// Registry map pointer of the root registry, or `0`.
 ///
-/// Residual. A [`crate::context::Context::Child`] walks to the root.
-/// The word is this evaluation's registry, not a promoted constant.
+/// Residual `_get_mapdict_map`. A [`crate::context::Context::Child`] walks
+/// to the root. The word is the shared layout, not this registry's address.
 #[cfg_attr(feature = "jit", majit_macros::dont_look_inside_cannot_raise)]
-fn host_root_registry(ctx_bits: i64) -> i64 {
+fn host_registry_map(ctx_bits: i64) -> i64 {
     if ctx_bits == 0 {
         return 0;
     }
     let ctx = unsafe { &*(ctx_bits as usize as *const crate::context::Context) };
-    ctx.registry_word()
+    ctx.registry_map_bits()
 }
 
-/// Generation of the registry at `registry`, or `0` when the pointer is null.
+/// `(map, program, name) -> storageindex` (`mapdict.py` `find_map_attr`).
 ///
-/// Residual. [`crate::magic::FunctionRegistry::add`] replaces the id, and
-/// [`host_int2_entry_pure`] keys on the current id.
-#[cfg_attr(feature = "jit", majit_macros::dont_look_inside_cannot_raise)]
-fn host_registry_generation_at(registry: i64) -> i64 {
-    if registry == 0 {
-        return 0;
-    }
-    let registry = unsafe { &*(registry as usize as *const crate::magic::FunctionRegistry) };
-    registry.generation() as i64
-}
-
-/// Entry word for `name` at `(registry, version)`, or `0`.
-///
-/// `_pure_lookup_where_with_method_cache(self, name, version_tag)`.
-/// A generation that is not the registry's current one yields `0`, so
-/// the pure-call cache cannot replay another registry's entry. The
-/// lookup reads the registry, not a context.
+/// Elidable: maps are immortal and the name table does not change. `-1`
+/// is a miss.
 #[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
-fn host_int2_entry_pure(registry: i64, version: i64, program: *const CelCode, name: i64) -> i64 {
-    if registry == 0 || version == 0 || program.is_null() {
-        return 0;
-    }
-    let registry = unsafe { &*(registry as usize as *const crate::magic::FunctionRegistry) };
-    if registry.generation() as i64 != version {
-        return 0;
+fn host_int2_find(map_bits: i64, program: *const CelCode, name: i64) -> i64 {
+    if map_bits == 0 || program.is_null() {
+        return -1;
     }
     let program = unsafe { &*program };
     let Some(name) = program.name(NameId(name as u32)) else {
-        return 0;
+        return -1;
     };
-    registry.int2_entry(name).unwrap_or(0)
+    let Some(map) = crate::registry_map::RegistryMap::from_bits(map_bits) else {
+        return -1;
+    };
+    map.find_map_attr(name)
+}
+
+/// Residual `_mapdict_read_storage`: two-int entry word at `storageindex`.
+///
+/// The closure object is per-registry, so the word is not a constant.
+/// Cannot raise. `0` is a miss (erased path).
+#[cfg_attr(feature = "jit", majit_macros::dont_look_inside_cannot_raise)]
+fn host_int2_entry_at(ctx_bits: i64, index: i64) -> i64 {
+    if ctx_bits == 0 || index < 0 {
+        return 0;
+    }
+    let ctx = unsafe { &*(ctx_bits as usize as *const crate::context::Context) };
+    ctx.int2_entry_at(index).unwrap_or(0)
 }
 
 /// `1` when the joined name has to run as a function, else `0`.
@@ -4694,9 +4699,9 @@ fn host_call2_i(entry: i64, a: i64, b: i64) -> i64 {
         interned_unary => residual_int,
         interned_unary_cell => residual_ref,
         host_int2_cell => inline_ref,
-        host_root_registry => residual_int_cannot_raise,
-        host_registry_generation_at => residual_int_cannot_raise,
-        host_int2_entry_pure => elidable_int_cannot_raise,
+        host_registry_map => residual_int_cannot_raise,
+        host_int2_find => elidable_int_cannot_raise,
+        host_int2_entry_at => residual_int_cannot_raise,
         host_call2_i => residual_int_cannot_raise,
         interned_temporal => residual_int,
         interned_optional_unary => residual_int,

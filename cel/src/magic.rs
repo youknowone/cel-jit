@@ -1,11 +1,10 @@
 use crate::macros::{impl_conversions, impl_handler};
 use crate::objects::{ListRef, Opaque};
+use crate::registry_map::RegistryMap;
 use crate::resolvers::{AllArguments, Argument};
 use crate::{Env, ExecutionError, FunctionContext, ResolveResult, Value};
 use std::any::Any;
 use std::cell::Cell;
-use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 impl_conversions!(
@@ -311,31 +310,15 @@ impl_handler!(C1, C2, C3, C4, C5, C6, C7, C8, C9);
 // and https://play.rust-lang.org/?version=stable&mode=debug&edition=2021&gist=c6744c27c2358ec1d1196033a0ec11e4
 
 pub struct FunctionRegistry {
-    functions: BTreeMap<String, Function>,
-    /// Identity of the registered functions.
-    ///
-    /// [`FunctionRegistry::add`] replaces it. Distinct from the binding
-    /// scope map (`mapdict.py` `_get_mapdict_map`), which `add_function` does not touch.
-    /// `0` is reserved: a [`Function`] cache of generation `0` is unchecked.
-    /// Drawn from one process-wide counter, so two registries do not share
-    /// an id and a dropped registry's id is not handed out again.
-    generation: u64,
+    /// Shared immortal name layout (`mapdict.py` `_get_mapdict_map`).
+    map: &'static RegistryMap,
+    /// Per-registry functions, indexed by `PlainAttribute.storageindex`.
+    storage: Vec<Function>,
     /// Overloads for names in this registry.
     ///
     /// The same [`Arc`] the root context holds. A two-int lookup reads it
     /// from here, so the lookup does not need the context pointer.
     env: Arc<Env>,
-}
-
-/// Next registry generation. `0` stays unused.
-fn fresh_registry_generation() -> u64 {
-    static NEXT: AtomicU64 = AtomicU64::new(1);
-    let id = NEXT.fetch_add(1, Ordering::Relaxed);
-    if id == 0 {
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    } else {
-        id
-    }
 }
 
 impl Default for FunctionRegistry {
@@ -347,8 +330,8 @@ impl Default for FunctionRegistry {
 impl FunctionRegistry {
     pub(crate) fn with_env(env: Arc<Env>) -> Self {
         FunctionRegistry {
-            functions: BTreeMap::new(),
-            generation: fresh_registry_generation(),
+            map: RegistryMap::root_terminator(),
+            storage: Vec::new(),
             env,
         }
     }
@@ -358,37 +341,65 @@ impl FunctionRegistry {
         F: IntoFunction<T> + 'static,
         T: 'static,
     {
-        self.generation = fresh_registry_generation();
-        self.functions
-            .insert(name.to_string(), function.into_function());
+        let value = function.into_function();
+        let idx = self.map.find_map_attr(name);
+        if idx >= 0 {
+            let idx = idx as usize;
+            debug_assert!(idx < self.storage.len());
+            if let Some(slot) = self.storage.get_mut(idx) {
+                *slot = value;
+            }
+        } else {
+            let next = self.map.add_attr(name);
+            debug_assert_eq!(next.storageindex() as usize, self.storage.len());
+            self.storage.push(value);
+            self.map = next;
+        }
     }
 
-    pub(crate) fn generation(&self) -> u64 {
-        self.generation
+    pub(crate) fn map_bits(&self) -> i64 {
+        self.map.as_bits()
+    }
+
+    fn function_at(&self, idx: i64) -> Option<&Function> {
+        if idx < 0 {
+            None
+        } else {
+            self.storage.get(idx as usize)
+        }
     }
 
     #[allow(dead_code)]
     pub(crate) fn get(&self, name: &str) -> Option<&Function> {
-        self.functions.get(name)
+        self.function_at(self.map.find_map_attr(name))
     }
 
     /// [`FunctionRegistry::get`] for a namespaced name, without joining the two
     /// parts into a `String` the lookup would immediately discard.
     pub(crate) fn get_qualified(&self, prefix: &str, name: &str) -> Option<&Function> {
-        crate::common::get_qualified(&self.functions, prefix, name)
+        self.function_at(self.map.find_qualified(prefix, name))
     }
 
     /// Entry word of a two-int scalar under `name`, when [`Self::env`] has no
     /// matching overload.
     ///
-    /// The decision is stored on the registry entry and reused while
-    /// [`Self::generation`] is unchanged. [`Self::add`] replaces that
-    /// generation, so the next call resolves again. A miss, a non-int
-    /// signature, or a stdlib hit returns `None` and the erased path runs.
+    /// The decision is stored on the registry entry. [`Self::add`] replaces
+    /// that entry for a re-registered name, so the next call resolves
+    /// again. A miss, a non-int signature, or a stdlib hit returns `None`
+    /// and the erased path runs.
     pub(crate) fn int2_entry(&self, name: &str) -> Option<i64> {
-        let func = self.get(name)?;
-        let generation = self.generation();
-        if let Some(entry) = func.int2_cache(generation) {
+        self.resolve_int2(self.get(name)?, name)
+    }
+
+    /// Entry word at `storageindex` (`_mapdict_read_storage`).
+    pub(crate) fn int2_entry_at(&self, index: i64) -> Option<i64> {
+        let func = self.function_at(index)?;
+        let name = self.map.name_at(index)?;
+        self.resolve_int2(func, name)
+    }
+
+    fn resolve_int2(&self, func: &Function, name: &str) -> Option<i64> {
+        if let Some(entry) = func.int2_cache() {
             return (entry != 0).then_some(entry);
         }
         let entry = if self
@@ -405,7 +416,7 @@ impl FunctionRegistry {
         } else {
             0
         };
-        func.set_int2_cache(generation, entry);
+        func.set_int2_cache(entry);
         (entry != 0).then_some(entry)
     }
 }
@@ -423,13 +434,11 @@ pub type ErasedFunction = Box<dyn Fn(&mut FunctionContext) -> ResolveResult>;
 pub struct Function {
     erased: ErasedFunction,
     scalar: Option<Arc<ScalarFn>>,
-    /// Registry generation at which [`Self::int2_entry`] was decided.
-    /// `0` means the decision has not been made. A later `add` replaces this
-    /// function and bumps the registry, so a surviving entry recomputes.
-    int2_generation: Cell<u64>,
+    /// Whether [`Self::int2_entry`] has been decided.
+    int2_filled: Cell<bool>,
     /// `ScalarFn::Int2` entry word when the stdlib has no two-int overload
     /// under this name, otherwise `0` (take the erased path). Meaningful
-    /// only while [`Self::int2_generation`] matches the registry.
+    /// only after [`Self::int2_filled`].
     int2_entry: Cell<i64>,
 }
 
@@ -439,7 +448,7 @@ impl Function {
         Function {
             erased,
             scalar: None,
-            int2_generation: Cell::new(0),
+            int2_filled: Cell::new(false),
             int2_entry: Cell::new(0),
         }
     }
@@ -450,24 +459,25 @@ impl Function {
         Function {
             erased,
             scalar: ScalarFn::from_any(typed).map(Arc::new),
-            int2_generation: Cell::new(0),
+            int2_filled: Cell::new(false),
             int2_entry: Cell::new(0),
         }
     }
 
-    /// Cached two-int resolution for `generation`, if this entry was filled
-    /// then. `Some(0)` is a filled miss (erased path). `None` is unchecked.
-    pub(crate) fn int2_cache(&self, generation: u64) -> Option<i64> {
-        if self.int2_generation.get() == generation {
+    /// Cached two-int resolution, if this entry was filled. `Some(0)` is a
+    /// filled miss (erased path). `None` is unchecked. Replacing this
+    /// function in storage starts a new cache.
+    pub(crate) fn int2_cache(&self) -> Option<i64> {
+        if self.int2_filled.get() {
             Some(self.int2_entry.get())
         } else {
             None
         }
     }
 
-    pub(crate) fn set_int2_cache(&self, generation: u64, entry: i64) {
+    pub(crate) fn set_int2_cache(&self, entry: i64) {
         self.int2_entry.set(entry);
-        self.int2_generation.set(generation);
+        self.int2_filled.set(true);
     }
 
     /// The scalar form, when the closure had one of [`ScalarFn`]'s signatures.
@@ -637,5 +647,38 @@ mod scalar_fn_tests {
         ctx.add_function("add", |a: i64, b: i64| a + b);
         let program = crate::Program::compile("add(2, 3)").unwrap();
         assert_eq!(program.execute(&ctx).unwrap(), Value::Int(5));
+    }
+}
+
+#[cfg(test)]
+mod registry_map_tests {
+    use super::*;
+
+    #[test]
+    fn two_registries_that_add_the_same_names_share_a_map() {
+        let mut a = FunctionRegistry::default();
+        let mut b = FunctionRegistry::default();
+        assert_eq!(a.map_bits(), b.map_bits());
+        a.add("add", |x: i64, y: i64| x + y);
+        b.add("add", |x: i64, y: i64| x - y);
+        assert_eq!(a.map_bits(), b.map_bits());
+        a.add("multiply", |x: i64, y: i64| x * y);
+        b.add("multiply", |x: i64, y: i64| x * y);
+        assert_eq!(a.map_bits(), b.map_bits());
+        a.add("other", |x: i64, _y: i64| x);
+        assert_ne!(a.map_bits(), b.map_bits());
+    }
+
+    #[test]
+    fn rebind_keeps_the_map_and_replaces_the_entry() {
+        let mut a = FunctionRegistry::default();
+        a.add("add", |x: i64, y: i64| x + y);
+        let map = a.map_bits();
+        let first = a.int2_entry("add").expect("int2");
+        a.add("add", |x: i64, y: i64| x.wrapping_mul(y));
+        assert_eq!(a.map_bits(), map);
+        let second = a.int2_entry("add").expect("int2");
+        assert_ne!(first, second);
+        assert_eq!(unsafe { ScalarFn::call_int2(second, 3, 4) }, 12);
     }
 }

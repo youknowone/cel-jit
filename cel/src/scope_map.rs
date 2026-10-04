@@ -225,7 +225,14 @@ impl ScopeMap {
     }
 
     /// Per-parent-map child scope terminator, cached on this node.
+    ///
+    /// The empty root terminator has no names and no resolver, so a child
+    /// of it starts on the same node. Binding the same names from that
+    /// child and from a fresh root then shares the map.
     pub(crate) fn child_terminator(&'static self) -> &'static ScopeMap {
+        if self.kind == Kind::RootTerminator {
+            return self;
+        }
         let mut slot = self
             .child_scope
             .lock()
@@ -333,6 +340,17 @@ mod tests {
         let after = ScopeMap::bind(map, &mut storage, "x", Value::Int(9));
         assert!(std::ptr::eq(map, after));
         assert_eq!(storage, vec![Value::Int(9)]);
+    }
+
+    #[test]
+    fn a_child_of_an_empty_root_shares_the_root_map() {
+        let parent = ScopeMap::root_terminator();
+        assert!(std::ptr::eq(parent.child_terminator(), parent));
+        let mut a = Vec::new();
+        let mut b = Vec::new();
+        let ma = ScopeMap::bind(parent.child_terminator(), &mut a, "x", Value::Int(1));
+        let mb = ScopeMap::bind(parent, &mut b, "x", Value::Int(2));
+        assert!(std::ptr::eq(ma, mb));
     }
 
     #[test]

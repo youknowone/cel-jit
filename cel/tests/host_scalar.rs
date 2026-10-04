@@ -105,7 +105,8 @@ fn reregister_takes_effect_on_the_next_call() {
         Value::resolve_value(program.expression(), &ctx).unwrap(),
         Value::Int(30)
     );
-    // Filling the cache, then bumping the generation from another name.
+    // Filling the cache, then registering another name. The map grows;
+    // `add`'s storage slot is unchanged.
     assert_eq!(program.execute(&ctx).unwrap(), Value::Int(30));
     ctx.add_function("other", |a: i64, b: i64| a - b);
     assert_eq!(program.execute(&ctx).unwrap(), Value::Int(30));
@@ -121,9 +122,9 @@ fn reregister_takes_effect_on_the_next_call() {
     agree(&ctx, "add(x, y)");
 }
 
-/// Past the function-entry door the host entry word is a constant.
-/// `add_function` replaces the registry generation, so later calls run
-/// the new body. A second context does not reuse the first word.
+/// Past the function-entry door the host lookup folds to a storage index.
+/// `add_function` writes that slot, so later calls run the new body. A
+/// second context shares the map and reads its own storage.
 #[test]
 fn compiled_host_call_observes_reregister() {
     let mut ctx = Context::default();
@@ -207,14 +208,14 @@ fn compiled_host_call_across_fresh_scopes() {
             loops >= 1 && loops + bridges <= 8,
             "child compiled loops+bridges grew with N={N}: loops={loops} bridges={bridges} retraces={retraces} guards={guards}"
         );
-        assert!(
-            guards <= 200,
+        assert_eq!(
+            guards, 0,
             "child guard failures scaled with N={N}: loops={loops} bridges={bridges} retraces={retraces} guards={guards}"
         );
         let (_, _, _, guards_after_root) = cel::vm::portal::portal_compile_counts(&code);
         let root_guards = guards_after_root.saturating_sub(guards);
-        assert!(
-            root_guards <= 200,
+        assert_eq!(
+            root_guards, 0,
             "root guard failures scaled with N={N}: child_guards={guards} after_root={guards_after_root} root_guards={root_guards}"
         );
     }

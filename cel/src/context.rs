@@ -470,12 +470,13 @@ impl<'a> Context<'a> {
         }
     }
 
-    /// Address of the root [`FunctionRegistry`], as a trace word.
+    /// Registry map pointer (`mapdict.py` `_get_mapdict_map`).
     ///
-    /// A child walks to the root. The word is that registry, not this context.
+    /// A child walks to the root. The word is the shared layout, not this
+    /// registry's address.
     #[cfg(feature = "jit")]
-    pub(crate) fn registry_word(&self) -> i64 {
-        self.root_registry() as *const FunctionRegistry as usize as i64
+    pub(crate) fn registry_map_bits(&self) -> i64 {
+        self.root_registry().map_bits()
     }
 
     /// Entry word of a two-int scalar under `name` on the root registry.
@@ -483,6 +484,13 @@ impl<'a> Context<'a> {
     /// A child walks to the root. See [`FunctionRegistry::int2_entry`].
     pub(crate) fn int2_entry(&self, name: &str) -> Option<i64> {
         self.root_registry().int2_entry(name)
+    }
+
+    /// Entry word at `storageindex` on the root registry
+    /// (`_mapdict_read_storage`).
+    #[cfg(feature = "jit")]
+    pub(crate) fn int2_entry_at(&self, index: i64) -> Option<i64> {
+        self.root_registry().int2_entry_at(index)
     }
 
     /// [`Context::get_function`] for a namespaced name, without joining the two
@@ -718,5 +726,24 @@ mod tests {
         c.add_variable_from_value("y", 1i64);
         c.add_variable_from_value("x", 2i64);
         assert_ne!(a.portal_map(), c.portal_map());
+    }
+
+    #[test]
+    fn two_fresh_roots_that_register_the_same_names_share_a_registry_map() {
+        let mut a = Context::default();
+        a.add_function("add", |x: i64, y: i64| x + y);
+        a.add_function("multiply", |x: i64, y: i64| x * y);
+        let mut b = Context::default();
+        b.add_function("add", |x: i64, y: i64| x - y);
+        b.add_function("multiply", |x: i64, y: i64| x * y);
+        assert_eq!(a.root_registry().map_bits(), b.root_registry().map_bits());
+        let empty = Context::default();
+        let also_empty = Context::empty();
+        assert_eq!(
+            empty.root_registry().map_bits(),
+            also_empty.root_registry().map_bits()
+        );
+        a.add_function("add", |x: i64, y: i64| x.wrapping_mul(y));
+        assert_eq!(a.root_registry().map_bits(), b.root_registry().map_bits());
     }
 }
