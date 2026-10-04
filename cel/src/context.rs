@@ -2,27 +2,9 @@ use crate::magic::{Function, FunctionRegistry, IntoFunction};
 use crate::objects::{Opaque, TryIntoValue, Value};
 use crate::parser::Expression;
 use crate::{Env, ExecutionError};
-use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-/// Identity of one binding generation.
-///
-/// `ModuleDictStrategy.mutated` installs a fresh `VersionTag`. The id
-/// never repeats, so a freed tag whose address the allocator hands out
-/// again is still a different generation. `jit_interp` has no
-/// quasi-immutable field (`QuasiImmutDescr` / `record_quasi_immutable_field`
-/// are not reachable from `jit_inline`), so the portal promotes this id.
-pub struct VersionTag {
-    id: u64,
-}
-
-fn fresh_version() -> Box<VersionTag> {
-    static NEXT_VERSION: AtomicU64 = AtomicU64::new(1);
-    Box::new(VersionTag {
-        id: NEXT_VERSION.fetch_add(1, Ordering::Relaxed),
-    })
-}
+pub use crate::scope_map::ScopeMap;
 
 /// Context is a collection of variables and functions that can be used
 /// by the interpreter to resolve expressions.
@@ -66,7 +48,10 @@ fn fresh_version() -> Box<VersionTag> {
 pub enum Context<'a> {
     Root {
         functions: FunctionRegistry,
-        variables: BTreeMap<Box<str>, Value>,
+        /// Shared immortal scope map (`mapdict.py` `_get_mapdict_map`).
+        map: &'static ScopeMap,
+        /// Per-scope values, indexed by `PlainAttribute.storageindex`.
+        storage: Vec<Value>,
         resolver: Option<&'a dyn VariableResolver>,
         env: Arc<Env>,
         /// Owning public handles for values wrapped at bind. Interned
@@ -78,33 +63,15 @@ pub enum Context<'a> {
         /// dropped with the Context. A child created for a comprehension
         /// never wraps, so it stays empty.
         region: crate::runtime::heap::BindRegionSlot,
-        /// Replaced on every binding change. Quasi-immutable `version?`
-        /// on `ModuleDictStrategy`, spelled as a fresh box because
-        /// `jit_inline` cannot record `RecordQuasiImmutField`.
-        version: Box<VersionTag>,
     },
     Child {
         parent: &'a Context<'a>,
-        variables: BTreeMap<Box<str>, Value>,
+        map: &'static ScopeMap,
+        storage: Vec<Value>,
         resolver: Option<&'a dyn VariableResolver>,
         retained: Vec<Value>,
         region: crate::runtime::heap::BindRegionSlot,
-        version: Box<VersionTag>,
     },
-}
-
-/// Stores `value` under `name`, reusing the key the map already owns.
-///
-/// Re-binding is the loop case — a comprehension rebinds its iteration
-/// variable once per element — and `BTreeMap::insert` takes an owned key, so
-/// it allocates a fresh `String` on every pass over a name it already holds.
-fn store(variables: &mut BTreeMap<Box<str>, Value>, name: impl AsRef<str>, value: Value) {
-    match variables.get_mut(name.as_ref()) {
-        Some(slot) => *slot = value,
-        None => {
-            variables.insert(name.as_ref().into(), value);
-        }
-    }
 }
 
 /// Wrap a value as it enters the system: a class-family leaf is stored as
@@ -140,7 +107,7 @@ fn retain_public(ctx: &mut Context, value: Value) {
 fn leaf_of(v: &Value) -> Option<crate::runtime::object::CelRef> {
     match v {
         Value::Interned(w) => Some(*w),
-        other => crate::runtime::convert::intern_leaf(other),
+        _ => None,
     }
 }
 
@@ -198,51 +165,59 @@ impl<'a> Context<'a> {
     where
         S: AsRef<str>,
     {
-        self.bump_version();
-        let variables = match self {
-            Context::Root { variables, .. } => variables,
-            Context::Child { variables, .. } => variables,
-        };
-        store(variables, name, value);
+        match self {
+            Context::Root { map, storage, .. } | Context::Child { map, storage, .. } => {
+                *map = ScopeMap::bind(*map, storage, name.as_ref(), value);
+            }
+        }
     }
 
-    fn bump_version(&mut self) {
-        let slot = match self {
-            Context::Root { version, .. } | Context::Child { version, .. } => version,
-        };
-        *slot = fresh_version();
+    fn map(&self) -> &'static ScopeMap {
+        match self {
+            Context::Root { map, .. } | Context::Child { map, .. } => map,
+        }
     }
 
-    /// `(id, pointer)` read once per portal entry.
+    fn storage(&self) -> &[Value] {
+        match self {
+            Context::Root { storage, .. } | Context::Child { storage, .. } => storage,
+        }
+    }
+
+    fn resolver(&self) -> Option<&dyn VariableResolver> {
+        match self {
+            Context::Root { resolver, .. } | Context::Child { resolver, .. } => *resolver,
+        }
+    }
+
+    /// Scope map pointer read once per portal entry (`_get_mapdict_map`).
+    pub(crate) fn portal_map(&self) -> i64 {
+        self.map().as_bits()
+    }
+
+    /// Leaf at `(depth, storageindex)` (`_mapdict_read_storage`).
     ///
-    /// The id is the guard. The pointer is the version object
-    /// `getdictvalue_no_unwrapping` would promote; a rebind replaces it.
-    pub(crate) fn portal_version(&self) -> (i64, i64) {
-        let version = match self {
-            Context::Root { version, .. } | Context::Child { version, .. } => version.as_ref(),
-        };
-        (
-            version.id as i64,
-            version as *const VersionTag as usize as i64,
-        )
-    }
-
-    /// `version_ptr` still carries `version_id`.
-    ///
-    /// Both arguments are pure-call keys. A mismatch returns false so a
-    /// reused box address cannot publish the previous generation's leaf.
-    pub(crate) fn version_matches(&self, version_id: i64, version_ptr: i64) -> bool {
-        let version = version_ptr as usize as *const VersionTag;
-        !version.is_null()
-            && std::ptr::eq(
-                version,
-                match self {
-                    Context::Root { version, .. } | Context::Child { version, .. } => {
-                        version.as_ref() as *const VersionTag
-                    }
-                },
-            )
-            && unsafe { (*version).id as i64 } == version_id
+    /// `depth` is parent hops from this context. Null when the slot is
+    /// missing or the value is not an interned leaf, so the portal's
+    /// `slow_pc` fallback still runs.
+    #[cfg(feature = "jit")]
+    pub(crate) fn leaf_at(
+        &self,
+        depth: u32,
+        index: usize,
+    ) -> Option<crate::runtime::object::CelRef> {
+        let mut ctx = self;
+        let mut remaining = depth;
+        while remaining > 0 {
+            match ctx {
+                Context::Child { parent, .. } => {
+                    ctx = parent;
+                    remaining -= 1;
+                }
+                Context::Root { .. } => return None,
+            }
+        }
+        ctx.storage().get(index).and_then(leaf_of)
     }
 
     fn retained_mut(&mut self) -> &mut Vec<Value> {
@@ -281,9 +256,9 @@ impl<'a> Context<'a> {
         }
     }
 
-    /// Store `value` as given. A comprehension rebinding is an internal move,
-    /// not an entry: an interned element stays a pointer, an unboxed scalar
-    /// stays unboxed.
+    /// Store `value` as given. A comprehension rebinding is an internal move:
+    /// an interned element stays a pointer. An unboxed scalar stays unboxed
+    /// and [`leaf_of`] declines, so the residual storage read never allocates.
     pub(crate) fn rebind<S>(&mut self, name: S, value: Value)
     where
         S: AsRef<str>,
@@ -292,13 +267,10 @@ impl<'a> Context<'a> {
     }
 
     pub fn set_variable_resolver(&mut self, r: &'a dyn VariableResolver) {
-        self.bump_version();
         match self {
-            Context::Root { resolver, .. } => {
+            Context::Root { resolver, map, .. } | Context::Child { resolver, map, .. } => {
                 *resolver = Some(r);
-            }
-            Context::Child { resolver, .. } => {
-                *resolver = Some(r);
+                *map = map.ensure_resolver();
             }
         }
     }
@@ -336,37 +308,24 @@ impl<'a> Context<'a> {
     /// The interned leaf stored under `name`, without cloning the public
     /// [`Value`]. A miss, or a binding with no leaf, is `None`.
     pub(crate) fn lookup_interned(&self, name: &str) -> Option<crate::runtime::object::CelRef> {
-        let from_resolver =
-            |resolver: &Option<&'a dyn VariableResolver>| resolver.and_then(|r| r.resolve(name));
+        if self.lookup_is_pure() {
+            return self.lookup_interned_pure(name);
+        }
+        if let Some(v) = self.resolver().and_then(|r| r.resolve(name)) {
+            // Resolver answers are public Values, not stored Interned
+            // slots. Intern so the residual intern_var_ptr load is a
+            // leaf and OP_LOAD_VAR does not take slow_pc (a second
+            // resolve). Storage reads stay Interned-only via leaf_of.
+            return crate::runtime::convert::intern_leaf(&v);
+        }
+        if let Some(idx) = self.map().find_in_this_scope(name) {
+            return self.storage().get(idx as usize).and_then(leaf_of);
+        }
         match self {
-            Context::Child {
-                variables,
-                parent,
-                resolver,
-                ..
-            } => {
-                if let Some(v) = from_resolver(resolver) {
-                    return leaf_of(&v);
-                }
-                variables
-                    .get(name)
-                    .and_then(leaf_of)
-                    .or_else(|| parent.lookup_interned(name))
-            }
-            Context::Root {
-                variables,
-                resolver,
-                ..
-            } => {
-                if let Some(v) = from_resolver(resolver) {
-                    return leaf_of(&v);
-                }
-                variables.get(name).and_then(leaf_of).or_else(|| {
-                    crate::common::types::r#type::type_ident(name)
-                        .as_ref()
-                        .and_then(leaf_of)
-                })
-            }
+            Context::Child { parent, .. } => parent.lookup_interned(name),
+            Context::Root { .. } => crate::common::types::r#type::type_ident(name)
+                .as_ref()
+                .and_then(crate::runtime::convert::intern_leaf),
         }
     }
 
@@ -377,10 +336,8 @@ impl<'a> Context<'a> {
     /// `effectinfo.py` `EF_ELIDABLE_CANNOT_RAISE` (`pure.py` `OptPure`).
     pub(crate) fn lookup_is_pure(&self) -> bool {
         match self {
-            Context::Child {
-                resolver, parent, ..
-            } => resolver.is_none() && parent.lookup_is_pure(),
-            Context::Root { resolver, .. } => resolver.is_none(),
+            Context::Child { parent, .. } => self.resolver().is_none() && parent.lookup_is_pure(),
+            Context::Root { .. } => self.resolver().is_none(),
         }
     }
 
@@ -392,20 +349,14 @@ impl<'a> Context<'a> {
         &self,
         name: &str,
     ) -> Option<crate::runtime::object::CelRef> {
+        if let Some(idx) = self.map().find_in_this_scope(name) {
+            return self.storage().get(idx as usize).and_then(leaf_of);
+        }
         match self {
-            Context::Child {
-                variables, parent, ..
-            } => variables
-                .get(name)
-                .and_then(leaf_of)
-                .or_else(|| parent.lookup_interned_pure(name)),
-            Context::Root { variables, .. } => {
-                variables.get(name).and_then(leaf_of).or_else(|| {
-                    crate::common::types::r#type::type_ident(name)
-                        .as_ref()
-                        .and_then(leaf_of)
-                })
-            }
+            Context::Child { parent, .. } => parent.lookup_interned_pure(name),
+            Context::Root { .. } => crate::common::types::r#type::type_ident(name)
+                .as_ref()
+                .and_then(crate::runtime::convert::intern_leaf),
         }
     }
 
@@ -441,55 +392,40 @@ impl<'a> Context<'a> {
                 other => copy_leaf(other),
             }
         }
-        let from_resolver =
-            |resolver: &Option<&'a dyn VariableResolver>| resolver.and_then(|r| r.resolve(name));
+        if let Some(v) = self.resolver().and_then(|r| r.resolve(name)) {
+            return Some(match self {
+                Context::Root { .. } => from_root(&v),
+                Context::Child { .. } => v,
+            });
+        }
+        if let Some(idx) = self.map().find_in_this_scope(name) {
+            let stored = self.storage().get(idx as usize)?;
+            return Some(match self {
+                Context::Root { .. } => from_root(stored),
+                Context::Child { .. } => copy_leaf(stored),
+            });
+        }
         match self {
-            Context::Child {
-                variables,
-                parent,
-                resolver,
-                ..
-            } => from_resolver(resolver)
-                .or_else(|| variables.get(name).map(copy_leaf))
-                .or_else(|| parent.load_ident(name)),
-            Context::Root {
-                variables,
-                resolver,
-                ..
-            } => from_resolver(resolver)
-                .map(|v| from_root(&v))
-                .or_else(|| variables.get(name).map(from_root))
-                .or_else(|| crate::common::types::r#type::type_ident(name)),
+            Context::Child { parent, .. } => parent.load_ident(name),
+            Context::Root { .. } => crate::common::types::r#type::type_ident(name),
         }
     }
 
     /// The value stored under `name`, still interned if wrap-at-bind interned
     /// it. Loads inside an evaluation use this so they stay a pointer copy.
     pub(crate) fn lookup_raw(&self, name: &str) -> Option<Value> {
-        let from_resolver =
-            |resolver: &Option<&'a dyn VariableResolver>| resolver.and_then(|r| r.resolve(name));
+        if let Some(v) = self.resolver().and_then(|r| r.resolve(name)) {
+            return Some(v);
+        }
+        if let Some(idx) = self.map().find_in_this_scope(name) {
+            return self.storage().get(idx as usize).cloned();
+        }
         match self {
-            Context::Child {
-                variables,
-                parent,
-                resolver,
-                ..
-            } => from_resolver(resolver).or_else(|| {
-                variables
-                    .get(name)
-                    .cloned()
-                    .or_else(|| parent.lookup_raw(name))
-            }),
+            Context::Child { parent, .. } => parent.lookup_raw(name),
             // The base case of the recursion, so a `Child` reaches this through
             // `parent.lookup_raw` and the type identifiers stay behind every
             // scope at every depth.
-            Context::Root {
-                variables,
-                resolver,
-                ..
-            } => from_resolver(resolver)
-                .or_else(|| variables.get(name).cloned())
-                .or_else(|| crate::common::types::r#type::type_ident(name)),
+            Context::Root { .. } => crate::common::types::r#type::type_ident(name),
         }
     }
 
@@ -505,9 +441,10 @@ impl<'a> Context<'a> {
     pub(crate) fn is_comprehension_variable(&self, name: &str) -> bool {
         match self {
             Context::Root { .. } => false,
-            Context::Child {
-                variables, parent, ..
-            } => variables.contains_key(name) || parent.is_comprehension_variable(name),
+            Context::Child { parent, .. } => {
+                self.map().find_in_this_scope(name).is_some()
+                    || parent.is_comprehension_variable(name)
+            }
         }
     }
 
@@ -577,11 +514,11 @@ impl<'a> Context<'a> {
     pub fn new_inner_scope(&self) -> Context<'_> {
         Context::Child {
             parent: self,
-            variables: Default::default(),
+            map: self.map().child_terminator(),
+            storage: Vec::new(),
             resolver: None,
             retained: Vec::new(),
             region: crate::runtime::heap::BindRegionSlot::empty(),
-            version: fresh_version(),
         }
     }
 
@@ -600,12 +537,12 @@ impl<'a> Context<'a> {
         let env = Arc::new(Env::default());
         Context::Root {
             env: Arc::clone(&env),
-            variables: Default::default(),
+            map: ScopeMap::root_terminator(),
+            storage: Vec::new(),
             functions: FunctionRegistry::with_env(env),
             resolver: None,
             retained: Vec::new(),
             region: crate::runtime::heap::BindRegionSlot::empty(),
-            version: fresh_version(),
         }
     }
 
@@ -613,11 +550,11 @@ impl<'a> Context<'a> {
         Context::Root {
             functions: FunctionRegistry::with_env(Arc::clone(&env)),
             env,
-            variables: Default::default(),
+            map: ScopeMap::root_terminator(),
+            storage: Vec::new(),
             resolver: None,
             retained: Vec::new(),
             region: crate::runtime::heap::BindRegionSlot::empty(),
-            version: fresh_version(),
         }
     }
 }
@@ -627,12 +564,12 @@ impl Default for Context<'_> {
         let env = Env::shared_stdlib();
         Context::Root {
             env: Arc::clone(&env),
-            variables: Default::default(),
+            map: ScopeMap::root_terminator(),
+            storage: Vec::new(),
             functions: FunctionRegistry::with_env(env),
             resolver: None,
             retained: Vec::new(),
             region: crate::runtime::heap::BindRegionSlot::empty(),
-            version: fresh_version(),
         }
     }
 }
@@ -701,6 +638,7 @@ mod tests {
         let mut ctx = Context::default();
         ctx.add_variable_from_value("n", 1000i64);
         let w = ctx.lookup_interned("n").expect("leaf");
+        assert_eq!(ctx.lookup_interned_pure("n"), Some(w));
         assert!(
             with_heap(|h| h.contains(w as *const u8)),
             "region object is live while the Context lives"
@@ -728,5 +666,57 @@ mod tests {
             inner.eval_heap().is_none(),
             "a child does not inherit the parent's region"
         );
+    }
+
+    #[test]
+    fn wrap_entry_interns_a_float_so_storage_is_a_leaf() {
+        let mut ctx = Context::default();
+        ctx.add_variable_from_value("price", 1.5f64);
+        match ctx.lookup_raw("price") {
+            Some(Value::Interned(w)) => {
+                assert!(!w.is_null());
+                assert_eq!(
+                    unsafe { crate::runtime::object::w_kind(w) },
+                    crate::runtime::object::CelKind::Double
+                );
+            }
+            other => panic!("price storage is {other:?}, expected Interned"),
+        }
+        ctx.add_variable_from_value("n", 7i64);
+        assert!(
+            matches!(ctx.lookup_raw("n"), Some(Value::Interned(_))),
+            "int bind is Interned"
+        );
+    }
+
+    #[test]
+    fn two_fresh_roots_that_bind_the_same_names_share_a_map() {
+        let mut a = Context::default();
+        a.add_variable_from_value("x", 1i64);
+        a.add_variable_from_value("y", 2i64);
+        let mut b = Context::default();
+        b.add_variable_from_value("x", 9i64);
+        b.add_variable_from_value("y", 8i64);
+        assert_eq!(a.portal_map(), b.portal_map());
+        a.add_variable_from_value("x", 3i64);
+        assert_eq!(a.portal_map(), b.portal_map());
+        a.add_variable_from_value("z", 4i64);
+        assert_ne!(a.portal_map(), b.portal_map());
+    }
+
+    #[test]
+    fn two_children_of_one_root_that_bind_the_same_names_share_a_map() {
+        let root = Context::default();
+        let mut a = root.new_inner_scope();
+        a.add_variable_from_value("x", 10i64);
+        a.add_variable_from_value("y", 20i64);
+        let mut b = root.new_inner_scope();
+        b.add_variable_from_value("x", 11i64);
+        b.add_variable_from_value("y", 21i64);
+        assert_eq!(a.portal_map(), b.portal_map());
+        let mut c = root.new_inner_scope();
+        c.add_variable_from_value("y", 1i64);
+        c.add_variable_from_value("x", 2i64);
+        assert_ne!(a.portal_map(), c.portal_map());
     }
 }

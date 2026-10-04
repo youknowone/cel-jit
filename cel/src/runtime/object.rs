@@ -113,6 +113,9 @@ pub struct CelClass {
     pub subclassrange_max: i64,
     pub name: &'static str,
     pub kind: CelKind,
+    /// Immortal [`W_TypeObject`] denoting this class. Filled once by
+    /// [`prebuilt_type`]; null until then.
+    type_leaf: core::sync::atomic::AtomicPtr<()>,
 }
 
 impl CelClass {
@@ -123,6 +126,7 @@ impl CelClass {
             subclassrange_max: subclassrange_min + 1,
             name,
             kind,
+            type_leaf: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
         }
     }
 }
@@ -2650,6 +2654,9 @@ pub unsafe fn force_virtualizable_if_necessary(frame: *mut W_CelFrame) {
 }
 
 /// The type value denoting `cls`.
+///
+/// A fresh nursery leaf. [`prebuilt_type`] is the interned singleton an
+/// elidable load folds to.
 pub fn new_type(cls: &'static CelClass) -> *mut W_TypeObject {
     lltype::malloc_typed(W_TypeObject {
         ob_header: CelObject {
@@ -2657,6 +2664,35 @@ pub fn new_type(cls: &'static CelClass) -> *mut W_TypeObject {
         },
         cls,
     })
+}
+
+/// Immortal type value denoting `cls`.
+///
+/// One leaf per class, owned by that class, process-lifetime. An elidable
+/// identifier load (`intern_type_ident`) folds to this pointer; a nursery
+/// [`new_type`] would not survive the compiled loop. `cls` is a static
+/// vtable, not a GC edge, so the immortal allocator accepts the payload.
+pub fn prebuilt_type(cls: &'static CelClass) -> *mut W_TypeObject {
+    use core::sync::atomic::Ordering;
+    let existing = cls.type_leaf.load(Ordering::Acquire);
+    if !existing.is_null() {
+        return existing.cast();
+    }
+    let w = lltype::malloc_typed_immortal(W_TypeObject {
+        ob_header: CelObject {
+            ob_type: &CEL_TYPE_CLASS,
+        },
+        cls,
+    });
+    match cls.type_leaf.compare_exchange(
+        core::ptr::null_mut(),
+        w.cast(),
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => w,
+        Err(winner) => winner.cast(),
+    }
 }
 
 /// A foreign host object.
@@ -3283,13 +3319,20 @@ mod tests {
             );
         }
 
-        let prebuilts: [*const u8; 6] = [
+        assert_eq!(prebuilt_type(&CEL_INT_CLASS), prebuilt_type(&CEL_INT_CLASS));
+        assert_ne!(
+            prebuilt_type(&CEL_INT_CLASS),
+            prebuilt_type(&CEL_STRING_CLASS)
+        );
+
+        let prebuilts: [*const u8; 7] = [
             new_bool(true) as *const u8,
             new_bool(false) as *const u8,
             new_null() as *const u8,
             new_int(-5) as *const u8,
             new_int(0) as *const u8,
             new_int(256) as *const u8,
+            prebuilt_type(&CEL_INT_CLASS) as *const u8,
         ];
         for p in prebuilts {
             assert!(

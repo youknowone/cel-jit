@@ -18,13 +18,13 @@ use super::object::{
     mapdict_get, mapdict_layout_for_names, mapdict_name_at, new_bool, new_bytes, new_double,
     new_host_list, new_host_list_ints, new_host_list_window, new_int, new_map, new_map_mapdict,
     new_map_record, new_null, new_opaque, new_optional, new_optional_none, new_string, new_type,
-    new_uint, opaque_host_index, prepare_mapdict_rows, w_kind, w_type, CelClass, CelKind, CelRef,
-    ListStrategy, MapStrategy, W_BoolObject, W_BytesObject, W_DoubleObject, W_FloatColumn,
-    W_HostListObject, W_IntColumn, W_IntObject, W_ListObject, W_MapObject, W_OptionalObject,
-    W_StringObject, W_TypeObject, W_UIntObject, CEL_BOOL_CLASS, CEL_BYTES_CLASS, CEL_DOUBLE_CLASS,
-    CEL_HOST_LIST_CLASS, CEL_INT_CLASS, CEL_LIST_CLASS, CEL_MAP_CLASS, CEL_NULL_CLASS,
-    CEL_OPAQUE_CLASS, CEL_OPTIONAL_CLASS, CEL_STRING_CLASS, CEL_TYPE_CLASS, CEL_UINT_CLASS,
-    MAPDICT_MAX_ENTRIES,
+    new_uint, opaque_host_index, prebuilt_type, prepare_mapdict_rows, w_kind, w_type, CelClass,
+    CelKind, CelRef, ListStrategy, MapStrategy, W_BoolObject, W_BytesObject, W_DoubleObject,
+    W_FloatColumn, W_HostListObject, W_IntColumn, W_IntObject, W_ListObject, W_MapObject,
+    W_OptionalObject, W_StringObject, W_TypeObject, W_UIntObject, CEL_BOOL_CLASS, CEL_BYTES_CLASS,
+    CEL_DOUBLE_CLASS, CEL_HOST_LIST_CLASS, CEL_INT_CLASS, CEL_LIST_CLASS, CEL_MAP_CLASS,
+    CEL_NULL_CLASS, CEL_OPAQUE_CLASS, CEL_OPTIONAL_CLASS, CEL_STRING_CLASS, CEL_TYPE_CLASS,
+    CEL_UINT_CLASS, MAPDICT_MAX_ENTRIES,
 };
 use super::object_array::{
     bytes_base, float_words_base, int_words_base, items_block_items_base, items_capacity,
@@ -167,7 +167,7 @@ pub fn intern_leaf(v: &Value) -> Option<CelRef> {
         Value::Opaque(opaque) => opaque
             .downcast_ref::<TypeValue>()
             .and_then(type_class)
-            .map(|cls| new_type(cls) as CelRef)
+            .map(|cls| prebuilt_type(cls) as CelRef)
             .or_else(|| Some(intern_host_opaque(opaque))),
         #[cfg(feature = "chrono")]
         Value::Duration(d) => d.num_nanoseconds().map(|n| new_duration(n) as CelRef),
@@ -1945,6 +1945,13 @@ mod tests {
 
     #[test]
     fn intern_leaf_is_the_prebuilt_for_bool_null_and_small_int() {
+        let int_ty = crate::common::types::r#type::type_ident("int").unwrap();
+        let interned_int_ty = intern_leaf(&int_ty);
+        assert_eq!(
+            interned_int_ty,
+            Some(prebuilt_type(&CEL_INT_CLASS) as CelRef)
+        );
+        assert_eq!(intern_leaf(&int_ty), interned_int_ty);
         assert_eq!(
             intern_leaf(&Value::Bool(true)),
             Some(new_bool(true) as CelRef)

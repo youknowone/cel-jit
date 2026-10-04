@@ -207,6 +207,16 @@ fn compiled_host_call_across_fresh_scopes() {
             loops >= 1 && loops + bridges <= 8,
             "child compiled loops+bridges grew with N={N}: loops={loops} bridges={bridges} retraces={retraces} guards={guards}"
         );
+        assert!(
+            guards <= 200,
+            "child guard failures scaled with N={N}: loops={loops} bridges={bridges} retraces={retraces} guards={guards}"
+        );
+        let (_, _, _, guards_after_root) = cel::vm::portal::portal_compile_counts(&code);
+        let root_guards = guards_after_root.saturating_sub(guards);
+        assert!(
+            root_guards <= 200,
+            "root guard failures scaled with N={N}: child_guards={guards} after_root={guards_after_root} root_guards={root_guards}"
+        );
     }
 }
 

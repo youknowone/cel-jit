@@ -357,13 +357,12 @@ macro_rules! interned_arith_local_k_append {
 struct PortalState {
     frame: usize,
     vm: i64,
-    /// Context address. The leaf is not keyed on this: a rebind keeps the
-    /// address and a new context can reuse it.
+    /// Context address. Used by the residual storage read; the trace does
+    /// not promote it (`_mapdict_read_storage` against a fresh root).
     ctx: i64,
-    /// `VersionTag` id and pointer, read from the context at entry.
-    /// `ModuleDictStrategy._version` (`_immutable_fields_ = ["version?"]`).
-    version_id: i64,
-    version_ptr: i64,
+    /// Scope map pointer read from the context at entry
+    /// (`mapdict.py` `_get_mapdict_map`).
+    map: i64,
     ret: i64,
 }
 
@@ -1186,80 +1185,107 @@ fn intern_var(vm_bits: i64, program: &CelCode, idx: i64) -> CelRef {
         .unwrap_or(core::ptr::null_mut())
 }
 
-/// [`intern_var`] when the context has no resolver.
+/// `(map, program, name_idx) -> location` (`mapdict.py` `find_map_attr`).
 ///
-/// `jit_inline` cannot record a quasi-immutable field: `jit_interp` has
-/// no `RecordQuasiImmutField` (that op lives in `quasiimmut.rs`
-/// `QuasiImmutDescr`, below this macro). The fallback promotes the
-/// version id and the version pointer read at portal entry
-/// (`getdictvalue_no_unwrapping` promotes `version` before
-/// `_getdictvalue_no_unwrapping_pure`). The id is never reused, so a
-/// context or version box allocated at a stale address fails the guard.
-/// The context pointer is promoted only so `OptPure` can fold the lookup;
-/// it is not the key.
-#[majit_macros::jit_inline(
-    ref_params = { program: ref(CelCode) },
-    calls = {
-        context_is_pure => elidable_int_cannot_raise,
-        intern_version_pure => elidable_ref_cannot_raise_wrapped,
-        intern_var_ptr => residual_ref,
-    },
-)]
-fn intern_var_pure(
-    version_id: i64,
-    version_ptr: i64,
-    ctx_bits: i64,
-    vm_bits: i64,
-    program: *const CelCode,
-    idx: i64,
-) -> *mut crate::runtime::object::CelObject {
-    let version_id = majit_ir::jit::promote(version_id);
-    let version_ptr = majit_ir::jit::promote(version_ptr);
-    let ctx_bits = majit_ir::jit::promote(ctx_bits);
-    if context_is_pure(version_id, version_ptr, ctx_bits) != 0 {
-        intern_version_pure(version_id, version_ptr, ctx_bits, program, idx)
+/// The location is `(depth, storageindex)`, type identifier, impure, or
+/// unbound. Elidable: maps are immortal and the name table does not change.
+#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+fn intern_var_location(map_bits: i64, program: *const CelCode, idx: i64) -> i64 {
+    if map_bits == 0 || program.is_null() {
+        return crate::scope_map::LOC_UNBOUND;
+    }
+    let program = unsafe { &*program };
+    let Some(name) = program.name(NameId(idx as u32)) else {
+        return crate::scope_map::LOC_UNBOUND;
+    };
+    let Some(map) = crate::scope_map::ScopeMap::from_bits(map_bits) else {
+        return crate::scope_map::LOC_UNBOUND;
+    };
+    let loc = map.find_location(name);
+    if loc == crate::scope_map::LOC_UNBOUND
+        && crate::common::types::r#type::type_ident(name).is_some()
+    {
+        crate::scope_map::LOC_TYPE
     } else {
-        intern_var_ptr(vm_bits, program, idx)
+        loc
     }
 }
 
+/// Residual `_mapdict_read_storage`: interned leaf at `(ctx, location)`.
+///
+/// Only [`Value::Interned`] slots; an unboxed scalar is null and
+/// [`slow_pc`] still runs. Does not call [`intern_leaf`]. Cannot raise.
+/// `program` is unused; it is a ref argument so the residual matches
+/// [`intern_var_ptr`]'s `ir` call shape.
+#[cfg_attr(feature = "jit", majit_macros::dont_look_inside_cannot_raise)]
+fn intern_var_at(
+    ctx_bits: i64,
+    location: i64,
+    program: *const CelCode,
+) -> *mut crate::runtime::object::CelObject {
+    let _ = program;
+    if ctx_bits == 0 || location < 0 {
+        return core::ptr::null_mut();
+    }
+    let ctx = unsafe { &*(ctx_bits as usize as *const crate::context::Context) };
+    let depth = (location >> 32) as u32;
+    let index = location as u32 as usize;
+    ctx.leaf_at(depth, index).unwrap_or(core::ptr::null_mut())
+}
+
+/// [`intern_var`] as a reference. Residual: a resolver may answer
+/// differently on every call.
 #[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
 fn intern_var_ptr(vm_bits: i64, program: *const CelCode, idx: i64) -> CelRef {
     intern_var(vm_bits, unsafe { &*program }, idx)
 }
 
-/// [`intern_var_pure`] keyed on the version, not the context address.
-///
-/// `_getdictvalue_no_unwrapping_pure(version, w_dict, key)` is
-/// `@jit.elidable_promote`. A version id that does not match the pointer
-/// yields null, so the pure cache cannot replay another generation's leaf.
+/// Type-identifier leaf. Immortal: the call is elidable and the compiled
+/// loop keeps the pointer as a constant.
 #[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
-fn intern_version_pure(
-    version_id: i64,
-    version_ptr: i64,
-    ctx_bits: i64,
-    program: *const CelCode,
-    idx: i64,
-) -> *mut crate::runtime::object::CelObject {
-    let ctx = ctx_bits as usize as *const crate::context::Context;
-    if !unsafe { (*ctx).version_matches(version_id, version_ptr) } {
+fn intern_type_ident(program: *const CelCode, idx: i64) -> *mut crate::runtime::object::CelObject {
+    if program.is_null() {
         return core::ptr::null_mut();
     }
     let program = unsafe { &*program };
     let Some(name) = program.name(NameId(idx as u32)) else {
         return core::ptr::null_mut();
     };
-    unsafe { (*ctx).lookup_interned_pure(name) }.unwrap_or(core::ptr::null_mut())
+    crate::common::types::r#type::type_ident(name)
+        .as_ref()
+        .and_then(crate::runtime::convert::intern_leaf)
+        .unwrap_or(core::ptr::null_mut())
 }
 
-/// `1` when no resolver sits on `ctx` for this version, else `0`.
-#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
-fn context_is_pure(version_id: i64, version_ptr: i64, ctx_bits: i64) -> i64 {
-    let ctx = ctx_bits as usize as *const crate::context::Context;
-    if unsafe { (*ctx).version_matches(version_id, version_ptr) && (*ctx).lookup_is_pure() } {
-        1
+/// Bound name as a cell: promote the map, elidable location, residual
+/// storage read of any interned leaf. Impure and type-ident arms match
+/// [`intern_var_ptr`] / [`intern_type_ident`].
+#[majit_macros::jit_inline(
+    ref_params = { program: ref(CelCode) },
+    calls = {
+        intern_var_location => elidable_int_cannot_raise,
+        intern_var_at => residual_ref_cannot_raise_wrapped,
+        intern_type_ident => elidable_ref_cannot_raise_wrapped,
+        intern_var_ptr => residual_ref,
+    },
+)]
+fn intern_var_pure(
+    ctx_bits: i64,
+    vm: i64,
+    program: *const CelCode,
+    idx: i64,
+    map_bits: i64,
+) -> *mut CelObject {
+    let map_bits = majit_ir::jit::promote(map_bits);
+    let loc = intern_var_location(map_bits, program, idx);
+    if loc == crate::scope_map::LOC_IMPURE {
+        intern_var_ptr(vm, program, idx)
+    } else if loc == crate::scope_map::LOC_TYPE {
+        intern_type_ident(program, idx)
+    } else if loc < 0 {
+        core::ptr::null_mut()
     } else {
-        0
+        intern_var_at(ctx_bits, loc, program)
     }
 }
 
@@ -1683,13 +1709,11 @@ pub(crate) fn eval_through_portal(
     vm: &mut Vm<'_>,
     code: &CelCode,
 ) -> Result<Value, ExecutionError> {
-    let (version_id, version_ptr) = vm.ctx.portal_version();
     let mut state = PortalState {
         frame: vm.cel_frame as usize,
         vm: vm as *mut Vm<'_> as i64,
         ctx: vm.ctx as *const crate::context::Context as usize as i64,
-        version_id,
-        version_ptr,
+        map: vm.ctx.portal_map(),
         ret: 0,
     };
     // A host call can re-enter this function on the same thread. The nested
@@ -1749,8 +1773,9 @@ pub(crate) fn eval_through_portal(
 }
 
 /// [`CelClass`] with `kind` spelled as the byte it is, so the field read
-/// registers that width. The range words and the name word in front are the
-/// same ones [`CelClass`] carries; the asserts pin the two layouts together.
+/// registers that width. The range words, the name word, and the type-leaf
+/// slot are the same ones [`CelClass`] carries; the asserts pin the two
+/// layouts together.
 #[majit_macros::jit_immutable_fields(kind)]
 #[repr(C)]
 struct ClassKindView {
@@ -1758,6 +1783,7 @@ struct ClassKindView {
     _subclassrange_max: i64,
     _name: &'static str,
     kind: u8,
+    _type_leaf: *mut (),
 }
 
 const _: () = {
@@ -4409,12 +4435,12 @@ fn slow_pc(vm: i64, here: i64) -> i64 {
 /// build an argument `Vec` and does not hydrate the frame.
 ///
 /// `ctx` stays red. The root registry address and its generation are
-/// loaded through that pointer and promoted (`version_tag`).
-/// [`host_int2_entry_pure`] is `_pure_lookup_where_with_method_cache`.
-/// A child shares the root registry, so those guards pass across scopes.
-/// `add_function` replaces the generation and that guard fails. The
-/// interpreter resolves through the same elidable, which reads the
-/// registry rather than `ctx`.
+/// loaded through that pointer. They are not promoted: a fresh root
+/// mints a new registry, and promoting the pointer would fail the
+/// guard on every evaluation. [`host_int2_entry_pure`] is
+/// `_pure_lookup_where_with_method_cache`, keyed on `(registry, version)`.
+/// `add_function` replaces the generation, so the elidable miss sees
+/// the new body. The lookup reads the registry rather than `ctx`.
 #[majit_macros::jit_inline(
     ref_params = { program: ref(CelCode) },
     calls = {
@@ -4435,9 +4461,7 @@ fn host_int2_cell(
     right: *mut CelObject,
 ) -> *mut CelObject {
     let registry = host_root_registry(ctx_bits);
-    let registry = majit_ir::jit::promote(registry);
     let version = host_registry_generation_at(registry);
-    let version = majit_ir::jit::promote(version);
     let entry = host_int2_entry_pure(registry, version, program, name);
     if entry == 0 {
         core::ptr::null_mut()
@@ -4450,7 +4474,7 @@ fn host_int2_cell(
 /// Address of the root [`crate::magic::FunctionRegistry`], or `0`.
 ///
 /// Residual. A [`crate::context::Context::Child`] walks to the root.
-/// The promote in [`host_int2_cell`] guards this word, not `ctx`.
+/// The word is this evaluation's registry, not a promoted constant.
 #[cfg_attr(feature = "jit", majit_macros::dont_look_inside_cannot_raise)]
 fn host_root_registry(ctx_bits: i64) -> i64 {
     if ctx_bits == 0 {
@@ -4463,7 +4487,7 @@ fn host_root_registry(ctx_bits: i64) -> i64 {
 /// Generation of the registry at `registry`, or `0` when the pointer is null.
 ///
 /// Residual. [`crate::magic::FunctionRegistry::add`] replaces the id, and
-/// the promote in [`host_int2_cell`] guards this word.
+/// [`host_int2_entry_pure`] keys on the current id.
 #[cfg_attr(feature = "jit", majit_macros::dont_look_inside_cannot_raise)]
 fn host_registry_generation_at(registry: i64) -> i64 {
     if registry == 0 {
@@ -4530,8 +4554,7 @@ fn host_call2_i(entry: i64, a: i64, b: i64) -> i64 {
         frame: ref(W_CelFrame),
         vm: int,
         ctx: int,
-        version_id: int,
-        version_ptr: int,
+        map: int,
         ret: int,
     },
     // `interp_jit.py` `_virtualizable_` on the frame, `virtualizables=['frame']`.
@@ -4593,9 +4616,11 @@ fn host_call2_i(entry: i64, a: i64, b: i64) -> i64 {
         insn_c => elidable_int_cannot_raise,
         intern_const => elidable_ref_cannot_raise_wrapped,
         intern_var => residual_ref,
+        intern_var_location => elidable_int_cannot_raise,
+        intern_var_at => residual_ref_cannot_raise_wrapped,
+        intern_type_ident => elidable_ref_cannot_raise_wrapped,
+        intern_var_ptr => residual_ref,
         intern_var_pure => inline_ref,
-        intern_version_pure => elidable_ref_cannot_raise_wrapped,
-        context_is_pure => elidable_int_cannot_raise,
         context_lookup_pure => elidable_int_cannot_raise,
         cell_kind => inline_int,
         cell_int => inline_int,
@@ -4755,18 +4780,7 @@ fn run_cel_portal(
                 state.frame.last_instr = pc as i64;
                 let vm = state.vm;
                 let here = pc as i64;
-                let name_idx = insn_a(program, pc);
-                // `intern_var_pure` promotes the version and folds the leaf.
-                // The impure resolver arm lives inside that helper, so the
-                // dispatch does not also call `context_lookup_pure`.
-                let w = intern_var_pure(
-                    state.version_id,
-                    state.version_ptr,
-                    state.ctx,
-                    vm,
-                    program,
-                    name_idx,
-                );
+                let w = intern_var_pure(state.ctx, vm, program, insn_a(program, pc), state.map);
                 let next = if w.is_null() {
                     slow_pc(vm, here)
                 } else {

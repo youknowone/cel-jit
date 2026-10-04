@@ -315,7 +315,7 @@ pub struct FunctionRegistry {
     /// Identity of the registered functions.
     ///
     /// [`FunctionRegistry::add`] replaces it. Distinct from the binding
-    /// [`crate::context::VersionTag`], which `add_function` does not touch.
+    /// scope map (`mapdict.py` `_get_mapdict_map`), which `add_function` does not touch.
     /// `0` is reserved: a [`Function`] cache of generation `0` is unchecked.
     /// Drawn from one process-wide counter, so two registries do not share
     /// an id and a dropped registry's id is not handed out again.
