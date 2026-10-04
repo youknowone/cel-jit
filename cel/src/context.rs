@@ -63,6 +63,10 @@ pub enum Context<'a> {
         /// dropped with the Context. A child created for a comprehension
         /// never wraps, so it stays empty.
         region: crate::runtime::heap::BindRegionSlot,
+        /// Interned-leaf slots the portal reads (`_mapdict_read_storage`).
+        /// Inline so a child can hop `parent` without a residual. The
+        /// items block lives in `region`.
+        leaves: crate::runtime::object_array::CelLeafStorage,
     },
     Child {
         parent: &'a Context<'a>,
@@ -71,6 +75,7 @@ pub enum Context<'a> {
         resolver: Option<&'a dyn VariableResolver>,
         retained: Vec<Value>,
         region: crate::runtime::heap::BindRegionSlot,
+        leaves: crate::runtime::object_array::CelLeafStorage,
     },
 }
 
@@ -165,11 +170,45 @@ impl<'a> Context<'a> {
     where
         S: AsRef<str>,
     {
-        match self {
+        let name = name.as_ref();
+        let leaf = leaf_of(&value);
+        let index = match self {
             Context::Root { map, storage, .. } | Context::Child { map, storage, .. } => {
-                *map = ScopeMap::bind(*map, storage, name.as_ref(), value);
+                *map = ScopeMap::bind(*map, storage, name, value);
+                map.find_in_this_scope(name).expect("just bound") as usize
             }
+        };
+        self.sync_leaf_slot(index, leaf);
+    }
+
+    fn leaves(&self) -> &crate::runtime::object_array::CelLeafStorage {
+        match self {
+            Context::Root { leaves, .. } | Context::Child { leaves, .. } => leaves,
         }
+    }
+
+    fn leaves_mut(&mut self) -> &mut crate::runtime::object_array::CelLeafStorage {
+        match self {
+            Context::Root { leaves, .. } | Context::Child { leaves, .. } => leaves,
+        }
+    }
+
+    /// Write `leaf` at `storageindex` on the items block. A missing leaf
+    /// stores null so the portal's `slow_pc` path still runs. The block is
+    /// allocated in this Context's bind region.
+    fn sync_leaf_slot(&mut self, index: usize, leaf: Option<crate::runtime::object::CelRef>) {
+        if leaf.is_none() && self.leaves().items.is_null() {
+            return;
+        }
+        let region = self.ensure_region();
+        crate::runtime::heap::with_bind_region(region, || {
+            let storage = self.leaves_mut();
+            storage.items = crate::runtime::object_array::items_block_store(
+                storage.items,
+                index,
+                leaf.unwrap_or(core::ptr::null_mut()),
+            );
+        });
     }
 
     fn map(&self) -> &'static ScopeMap {
@@ -195,29 +234,15 @@ impl<'a> Context<'a> {
         self.map().as_bits()
     }
 
-    /// Leaf at `(depth, storageindex)` (`_mapdict_read_storage`).
+    /// Interned-leaf storage the portal reads (`_mapdict_read_storage`).
     ///
-    /// `depth` is parent hops from this context. Null when the slot is
-    /// missing or the value is not an interned leaf, so the portal's
-    /// `slow_pc` fallback still runs.
+    /// The pointer is this Context's inline
+    /// [`crate::runtime::object_array::CelLeafStorage`]. It stays valid for
+    /// the borrow of `self` used by one evaluation.
     #[cfg(feature = "jit")]
-    pub(crate) fn leaf_at(
-        &self,
-        depth: u32,
-        index: usize,
-    ) -> Option<crate::runtime::object::CelRef> {
-        let mut ctx = self;
-        let mut remaining = depth;
-        while remaining > 0 {
-            match ctx {
-                Context::Child { parent, .. } => {
-                    ctx = parent;
-                    remaining -= 1;
-                }
-                Context::Root { .. } => return None,
-            }
-        }
-        ctx.storage().get(index).and_then(leaf_of)
+    pub(crate) fn portal_leaf_storage(&self) -> *mut crate::runtime::object_array::CelLeafStorage {
+        self.leaves() as *const crate::runtime::object_array::CelLeafStorage
+            as *mut crate::runtime::object_array::CelLeafStorage
     }
 
     fn retained_mut(&mut self) -> &mut Vec<Value> {
@@ -258,7 +283,7 @@ impl<'a> Context<'a> {
 
     /// Store `value` as given. A comprehension rebinding is an internal move:
     /// an interned element stays a pointer. An unboxed scalar stays unboxed
-    /// and [`leaf_of`] declines, so the residual storage read never allocates.
+    /// and [`leaf_of`] declines, so the block slot is null and `slow_pc` runs.
     pub(crate) fn rebind<S>(&mut self, name: S, value: Value)
     where
         S: AsRef<str>,
@@ -315,7 +340,7 @@ impl<'a> Context<'a> {
             // Resolver answers are public Values, not stored Interned
             // slots. Intern so the residual intern_var_ptr load is a
             // leaf and OP_LOAD_VAR does not take slow_pc (a second
-            // resolve). Storage reads stay Interned-only via leaf_of.
+            // resolve). Block slots stay Interned-only via leaf_of.
             return crate::runtime::convert::intern_leaf(&v);
         }
         if let Some(idx) = self.map().find_in_this_scope(name) {
@@ -527,6 +552,11 @@ impl<'a> Context<'a> {
             resolver: None,
             retained: Vec::new(),
             region: crate::runtime::heap::BindRegionSlot::empty(),
+            leaves: crate::runtime::object_array::CelLeafStorage {
+                parent: self.leaves() as *const crate::runtime::object_array::CelLeafStorage
+                    as *mut crate::runtime::object_array::CelLeafStorage,
+                items: core::ptr::null_mut(),
+            },
         }
     }
 
@@ -551,6 +581,7 @@ impl<'a> Context<'a> {
             resolver: None,
             retained: Vec::new(),
             region: crate::runtime::heap::BindRegionSlot::empty(),
+            leaves: crate::runtime::object_array::CelLeafStorage::empty(),
         }
     }
 
@@ -563,6 +594,7 @@ impl<'a> Context<'a> {
             resolver: None,
             retained: Vec::new(),
             region: crate::runtime::heap::BindRegionSlot::empty(),
+            leaves: crate::runtime::object_array::CelLeafStorage::empty(),
         }
     }
 }
@@ -578,6 +610,7 @@ impl Default for Context<'_> {
             resolver: None,
             retained: Vec::new(),
             region: crate::runtime::heap::BindRegionSlot::empty(),
+            leaves: crate::runtime::object_array::CelLeafStorage::empty(),
         }
     }
 }
@@ -745,5 +778,48 @@ mod tests {
         );
         a.add_function("add", |x: i64, y: i64| x.wrapping_mul(y));
         assert_eq!(a.root_registry().map_bits(), b.root_registry().map_bits());
+    }
+
+    #[test]
+    fn interned_bind_writes_the_leaf_block_at_storageindex() {
+        let mut ctx = Context::default();
+        ctx.add_variable_from_value("x", 10i64);
+        ctx.add_variable_from_value("y", 20i64);
+        let x = ctx.lookup_interned("x").expect("x");
+        let y = ctx.lookup_interned("y").expect("y");
+        let items = ctx.leaves().items;
+        assert!(!items.is_null());
+        unsafe {
+            let base = crate::runtime::object_array::items_block_items_base(items);
+            assert_eq!(*base.add(0), x);
+            assert_eq!(*base.add(1), y);
+        }
+        ctx.add_variable_from_value("x", 30i64);
+        let x2 = ctx.lookup_interned("x").expect("x rebind");
+        unsafe {
+            let base = crate::runtime::object_array::items_block_items_base(ctx.leaves().items);
+            assert_eq!(*base.add(0), x2);
+            assert_eq!(*base.add(1), y);
+        }
+    }
+
+    #[test]
+    fn a_child_leaf_block_parent_is_the_enclosing_storage() {
+        let mut root = Context::default();
+        root.add_variable_from_value("x", 10i64);
+        let child = root.new_inner_scope();
+        assert!(core::ptr::eq(
+            child.leaves().parent,
+            root.leaves() as *const _ as *mut _
+        ));
+        assert!(child.leaves().items.is_null());
+        unsafe {
+            let parent_items = (*child.leaves().parent).items;
+            let x = root.lookup_interned("x").expect("x");
+            assert_eq!(
+                *crate::runtime::object_array::items_block_items_base(parent_items),
+                x
+            );
+        }
     }
 }

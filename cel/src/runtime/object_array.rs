@@ -108,6 +108,27 @@ impl CelGcType for CelItemsBlock {
     const TYPE_ID: u32 = 21;
 }
 
+/// Per-scope interned-leaf storage the portal reads (`_mapdict_read_storage`).
+///
+/// `items` is a [`CelItemsBlock`] indexed by `PlainAttribute.storageindex`.
+/// `parent` is the enclosing scope (`f_back`). The struct sits inline on
+/// [`crate::context::Context`]; the items block is allocated in that
+/// Context's bind region for the Context's lifetime.
+#[repr(C)]
+pub struct CelLeafStorage {
+    pub parent: *mut CelLeafStorage,
+    pub items: *mut CelItemsBlock,
+}
+
+impl CelLeafStorage {
+    pub(crate) const fn empty() -> Self {
+        Self {
+            parent: core::ptr::null_mut(),
+            items: core::ptr::null_mut(),
+        }
+    }
+}
+
 /// A block of bytes: `capacity`, then the bytes.
 ///
 /// Its own type and its own token rather than a generic one over the item type.
@@ -433,6 +454,61 @@ pub fn new_items_block_zeroed(cap: usize) -> *mut CelItemsBlock {
     super::heap::with_heap(|h| new_items_block_zeroed_in(h, cap))
 }
 
+/// Store `leaf` at `index`, growing `block` when the index is past capacity.
+///
+/// A grow allocates a fresh block and copies the live prefix; the old block
+/// stays in the owner until that owner drops. Call from
+/// [`super::heap::with_bind_region`] so the new block has the Context's
+/// bind-region lifetime.
+///
+/// The store is a raw slot write. `CelGc::write_barrier` is a no-op and
+/// nursery alloc sets `needs_write_barrier = false`: this collector does
+/// not run, and bind-region blocks are old. Compiled `setarrayitem_gc_r`
+/// takes the same path.
+pub fn items_block_store(
+    block: *mut CelItemsBlock,
+    index: usize,
+    leaf: CelRef,
+) -> *mut CelItemsBlock {
+    super::heap::with_heap(|h| items_block_store_in(h, block, index, leaf))
+}
+
+/// [`items_block_store`] on `heap`.
+pub fn items_block_store_in(
+    heap: &super::heap::CelHeap,
+    block: *mut CelItemsBlock,
+    index: usize,
+    leaf: CelRef,
+) -> *mut CelItemsBlock {
+    let cap = unsafe { items_capacity(block) };
+    let block = if block.is_null() || index >= cap {
+        let new_cap = if cap == 0 {
+            index.saturating_add(1).max(4)
+        } else {
+            cap.saturating_mul(2).max(index.saturating_add(1))
+        };
+        let grown = new_items_block_zeroed_in(heap, new_cap);
+        if !block.is_null() && cap > 0 {
+            unsafe {
+                let src = items_block_items_base(block);
+                let dst = items_block_items_base(grown);
+                let mut i = 0;
+                while i < cap {
+                    *dst.add(i) = *src.add(i);
+                    i += 1;
+                }
+            }
+        }
+        grown
+    } else {
+        block
+    };
+    unsafe {
+        *items_block_items_base(block).add(index) = leaf;
+    }
+    block
+}
+
 /// A byte block of `len` uninitialised bytes on `heap`.
 ///
 /// The capacity word is written. The bytes are not: `ll_int2dec` stores
@@ -601,6 +677,21 @@ mod tests {
             for (i, v) in values.iter().enumerate() {
                 assert_eq!(*base.add(i), *v);
             }
+        }
+    }
+
+    #[test]
+    fn items_block_store_grows_and_keeps_the_prefix() {
+        unsafe {
+            let first = new_int(1) as CelRef;
+            let block = items_block_store(core::ptr::null_mut(), 0, first);
+            assert_eq!(items_capacity(block), 4);
+            assert_eq!(*items_block_items_base(block), first);
+            let fifth = new_int(5) as CelRef;
+            let grown = items_block_store(block, 4, fifth);
+            assert!(items_capacity(grown) >= 5);
+            assert_eq!(*items_block_items_base(grown), first);
+            assert_eq!(*items_block_items_base(grown).add(4), fifth);
         }
     }
 

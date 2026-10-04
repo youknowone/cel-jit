@@ -363,6 +363,9 @@ struct PortalState {
     /// Scope map pointer read from the context at entry
     /// (`mapdict.py` `_get_mapdict_map`).
     map: i64,
+    /// Interned-leaf storage, read from the context at entry. Red ref:
+    /// `intern_var_pure` hops `parent` and reads `items[storageindex]`.
+    block: usize,
     ret: i64,
 }
 
@@ -1211,28 +1214,6 @@ fn intern_var_location(map_bits: i64, program: *const CelCode, idx: i64) -> i64 
     }
 }
 
-/// Residual `_mapdict_read_storage`: interned leaf at `(ctx, location)`.
-///
-/// Only [`Value::Interned`] slots; an unboxed scalar is null and
-/// [`slow_pc`] still runs. Does not call [`intern_leaf`]. Cannot raise.
-/// `program` is unused; it is a ref argument so the residual matches
-/// [`intern_var_ptr`]'s `ir` call shape.
-#[cfg_attr(feature = "jit", majit_macros::dont_look_inside_cannot_raise)]
-fn intern_var_at(
-    ctx_bits: i64,
-    location: i64,
-    program: *const CelCode,
-) -> *mut crate::runtime::object::CelObject {
-    let _ = program;
-    if ctx_bits == 0 || location < 0 {
-        return core::ptr::null_mut();
-    }
-    let ctx = unsafe { &*(ctx_bits as usize as *const crate::context::Context) };
-    let depth = (location >> 32) as u32;
-    let index = location as u32 as usize;
-    ctx.leaf_at(depth, index).unwrap_or(core::ptr::null_mut())
-}
-
 /// [`intern_var`] as a reference. Residual: a resolver may answer
 /// differently on every call.
 #[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
@@ -1257,20 +1238,32 @@ fn intern_type_ident(program: *const CelCode, idx: i64) -> *mut crate::runtime::
         .unwrap_or(core::ptr::null_mut())
 }
 
-/// Bound name as a cell: promote the map, elidable location, residual
-/// storage read of any interned leaf. Impure and type-ident arms match
-/// [`intern_var_ptr`] / [`intern_type_ident`].
+/// Bound name as a cell: promote the map, elidable location, then
+/// `_mapdict_read_storage` as a `getarrayitem_gc_r` of the leaf block.
+/// Impure and type-ident arms match [`intern_var_ptr`] / [`intern_type_ident`].
 #[majit_macros::jit_inline(
-    ref_params = { program: ref(CelCode) },
+    ref_params = {
+        block: ref(crate::runtime::object_array::CelLeafStorage),
+        program: ref(CelCode),
+    },
+    ref_fields = {
+        crate::runtime::object_array::CelLeafStorage::parent => crate::runtime::object_array::CelLeafStorage,
+        crate::runtime::object_array::CelLeafStorage::items => crate::runtime::object_array::CelItemsBlock,
+    },
+    array_fields = {
+        crate::runtime::object_array::CelLeafStorage::items => crate::runtime::object::CelRef in crate::runtime::object_array::CelItemsBlock,
+    },
+    int_fields = {
+        crate::runtime::object_array::CelItemsBlock::capacity => usize,
+    },
     calls = {
         intern_var_location => elidable_int_cannot_raise,
-        intern_var_at => residual_ref_cannot_raise_wrapped,
         intern_type_ident => elidable_ref_cannot_raise_wrapped,
         intern_var_ptr => residual_ref,
     },
 )]
 fn intern_var_pure(
-    ctx_bits: i64,
+    block: *mut crate::runtime::object_array::CelLeafStorage,
     vm: i64,
     program: *const CelCode,
     idx: i64,
@@ -1284,8 +1277,39 @@ fn intern_var_pure(
         intern_type_ident(program, idx)
     } else if loc < 0 {
         core::ptr::null_mut()
+    } else if (block as *mut u8) == core::ptr::null_mut() {
+        core::ptr::null_mut()
     } else {
-        intern_var_at(ctx_bits, loc, program)
+        let depth = loc >> 32;
+        let index = loc - (depth << 32);
+        let mut cur = block as *mut crate::runtime::object_array::CelLeafStorage;
+        let mut i = 0i64;
+        while i < depth {
+            if (cur as *mut u8) == core::ptr::null_mut() {
+                i = depth;
+            } else {
+                let next = cur.parent as *mut crate::runtime::object_array::CelLeafStorage;
+                cur = next;
+                i += 1;
+            }
+        }
+        if (cur as *mut u8) == core::ptr::null_mut() {
+            core::ptr::null_mut()
+        } else {
+            let items = cur.items as *mut crate::runtime::object_array::CelItemsBlock;
+            if (items as *mut u8) == core::ptr::null_mut() {
+                core::ptr::null_mut()
+            } else {
+                let cap = items.capacity as i64;
+                if index < 0 {
+                    core::ptr::null_mut()
+                } else if index < cap {
+                    cur.items[index]
+                } else {
+                    core::ptr::null_mut()
+                }
+            }
+        }
     }
 }
 
@@ -1714,6 +1738,7 @@ pub(crate) fn eval_through_portal(
         vm: vm as *mut Vm<'_> as i64,
         ctx: vm.ctx as *const crate::context::Context as usize as i64,
         map: vm.ctx.portal_map(),
+        block: vm.ctx.portal_leaf_storage() as usize,
         ret: 0,
     };
     // A host call can re-enter this function on the same thread. The nested
@@ -4560,6 +4585,7 @@ fn host_call2_i(entry: i64, a: i64, b: i64) -> i64 {
         vm: int,
         ctx: int,
         map: int,
+        block: ref(crate::runtime::object_array::CelLeafStorage),
         ret: int,
     },
     // `interp_jit.py` `_virtualizable_` on the frame, `virtualizables=['frame']`.
@@ -4622,7 +4648,6 @@ fn host_call2_i(entry: i64, a: i64, b: i64) -> i64 {
         intern_const => elidable_ref_cannot_raise_wrapped,
         intern_var => residual_ref,
         intern_var_location => elidable_int_cannot_raise,
-        intern_var_at => residual_ref_cannot_raise_wrapped,
         intern_type_ident => elidable_ref_cannot_raise_wrapped,
         intern_var_ptr => residual_ref,
         intern_var_pure => inline_ref,
@@ -4785,7 +4810,13 @@ fn run_cel_portal(
                 state.frame.last_instr = pc as i64;
                 let vm = state.vm;
                 let here = pc as i64;
-                let w = intern_var_pure(state.ctx, vm, program, insn_a(program, pc), state.map);
+                let w = intern_var_pure(
+                    state.block as *mut crate::runtime::object_array::CelLeafStorage,
+                    vm,
+                    program,
+                    insn_a(program, pc),
+                    state.map,
+                );
                 let next = if w.is_null() {
                     slow_pc(vm, here)
                 } else {
