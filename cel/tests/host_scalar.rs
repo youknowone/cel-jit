@@ -85,7 +85,8 @@ fn stdlib_overload_wins_over_a_registered_int2() {
     bind_xy(&mut ctx);
     ctx.add_function("add", |a: i64, b: i64| a + b);
     agree(&ctx, "add(1, 2)");
-    // The miss is cached. A second call still takes the overload.
+    // The miss is stored on the registry entry. A second call still
+    // takes the overload.
     agree(&ctx, "add(x, y)");
 }
 
@@ -105,8 +106,8 @@ fn reregister_takes_effect_on_the_next_call() {
         Value::resolve_value(program.expression(), &ctx).unwrap(),
         Value::Int(30)
     );
-    // Filling the cache, then registering another name. The map grows;
-    // `add`'s storage slot is unchanged.
+    // Registering another name. The map grows; `add`'s storage slot
+    // is unchanged.
     assert_eq!(program.execute(&ctx).unwrap(), Value::Int(30));
     ctx.add_function("other", |a: i64, b: i64| a - b);
     assert_eq!(program.execute(&ctx).unwrap(), Value::Int(30));

@@ -129,6 +129,25 @@ impl CelLeafStorage {
     }
 }
 
+/// Per-registry two-int entry words the portal reads (`_mapdict_read_storage`).
+///
+/// `items` is a [`CelIntWords`] indexed by `PlainAttribute.storageindex`.
+/// The struct sits inline on [`crate::magic::FunctionRegistry`]; the words
+/// block is allocated in that registry's bind region for the registry's
+/// lifetime. A missing two-int fast path stores `0`.
+#[repr(C)]
+pub struct CelInt2Storage {
+    pub items: *mut CelIntWords,
+}
+
+impl CelInt2Storage {
+    pub(crate) const fn empty() -> Self {
+        Self {
+            items: core::ptr::null_mut(),
+        }
+    }
+}
+
 /// A block of bytes: `capacity`, then the bytes.
 ///
 /// Its own type and its own token rather than a generic one over the item type.
@@ -251,6 +270,81 @@ pub fn new_int_words_in(heap: &super::heap::CelHeap, cap: usize) -> *mut CelIntW
             cap,
         ) as *mut CelIntWords
     }
+}
+
+/// An int-words block of `cap` zero slots on `heap`.
+pub fn new_int_words_zeroed_in(heap: &super::heap::CelHeap, cap: usize) -> *mut CelIntWords {
+    let block = new_int_words_in(heap, cap);
+    if cap > 0 {
+        unsafe {
+            let base = int_words_base(block);
+            let mut i = 0;
+            while i < cap {
+                *base.add(i) = 0;
+                i += 1;
+            }
+        }
+    }
+    block
+}
+
+/// The capacity word of an int-words block, or 0 for a null block.
+///
+/// # Safety
+///
+/// `block` is null or points at a live [`CelIntWords`].
+#[inline]
+pub unsafe fn int_words_capacity(block: *mut CelIntWords) -> usize {
+    if block.is_null() {
+        return 0;
+    }
+    unsafe { (*block).capacity }
+}
+
+/// Store `word` at `index`, growing `block` when the index is past capacity.
+///
+/// A grow allocates a fresh block and copies the live prefix; the old block
+/// stays in the owner until that owner drops. Call from
+/// [`super::heap::with_bind_region`] so the new block has the registry's
+/// bind-region lifetime.
+pub fn int_words_store(block: *mut CelIntWords, index: usize, word: i64) -> *mut CelIntWords {
+    super::heap::with_heap(|h| int_words_store_in(h, block, index, word))
+}
+
+/// [`int_words_store`] on `heap`.
+pub fn int_words_store_in(
+    heap: &super::heap::CelHeap,
+    block: *mut CelIntWords,
+    index: usize,
+    word: i64,
+) -> *mut CelIntWords {
+    let cap = unsafe { int_words_capacity(block) };
+    let block = if block.is_null() || index >= cap {
+        let new_cap = if cap == 0 {
+            index.saturating_add(1).max(4)
+        } else {
+            cap.saturating_mul(2).max(index.saturating_add(1))
+        };
+        let grown = new_int_words_zeroed_in(heap, new_cap);
+        if !block.is_null() && cap > 0 {
+            unsafe {
+                let src = int_words_base(block);
+                let dst = int_words_base(grown);
+                let mut i = 0;
+                while i < cap {
+                    *dst.add(i) = *src.add(i);
+                    i += 1;
+                }
+            }
+        }
+        grown
+    } else {
+        block
+    };
+    unsafe {
+        *int_words_base(block).add(index) = word;
+    }
+    block
 }
 
 /// Word 0 of a float-words block, or null.
@@ -681,6 +775,19 @@ mod tests {
     }
 
     #[test]
+    fn int_words_store_grows_and_keeps_the_prefix() {
+        unsafe {
+            let block = int_words_store(core::ptr::null_mut(), 0, 11);
+            assert_eq!(int_words_capacity(block), 4);
+            assert_eq!(*int_words_base(block), 11);
+            let grown = int_words_store(block, 4, 55);
+            assert!(int_words_capacity(grown) >= 5);
+            assert_eq!(*int_words_base(grown), 11);
+            assert_eq!(*int_words_base(grown).add(4), 55);
+        }
+    }
+
+    #[test]
     fn items_block_store_grows_and_keeps_the_prefix() {
         unsafe {
             let first = new_int(1) as CelRef;
@@ -731,6 +838,7 @@ mod tests {
             assert!(float_words_base(core::ptr::null_mut()).is_null());
             assert_eq!(items_capacity(core::ptr::null_mut()), 0);
             assert_eq!(bytes_capacity(core::ptr::null_mut()), 0);
+            assert_eq!(int_words_capacity(core::ptr::null_mut()), 0);
         }
     }
 }

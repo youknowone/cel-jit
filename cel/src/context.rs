@@ -504,18 +504,20 @@ impl<'a> Context<'a> {
         self.root_registry().map_bits()
     }
 
+    /// Two-int entry storage the portal reads (`_mapdict_read_storage`).
+    ///
+    /// A child walks to the root. The pointer is the root registry's
+    /// inline [`crate::runtime::object_array::CelInt2Storage`].
+    #[cfg(feature = "jit")]
+    pub(crate) fn portal_int2_entries(&self) -> *mut crate::runtime::object_array::CelInt2Storage {
+        self.root_registry().entries_ptr()
+    }
+
     /// Entry word of a two-int scalar under `name` on the root registry.
     ///
     /// A child walks to the root. See [`FunctionRegistry::int2_entry`].
     pub(crate) fn int2_entry(&self, name: &str) -> Option<i64> {
         self.root_registry().int2_entry(name)
-    }
-
-    /// Entry word at `storageindex` on the root registry
-    /// (`_mapdict_read_storage`).
-    #[cfg(feature = "jit")]
-    pub(crate) fn int2_entry_at(&self, index: i64) -> Option<i64> {
-        self.root_registry().int2_entry_at(index)
     }
 
     /// [`Context::get_function`] for a namespaced name, without joining the two
@@ -800,6 +802,27 @@ mod tests {
             let base = crate::runtime::object_array::items_block_items_base(ctx.leaves().items);
             assert_eq!(*base.add(0), x2);
             assert_eq!(*base.add(1), y);
+        }
+    }
+
+    #[test]
+    fn a_child_int2_entries_pointer_is_the_root_registry() {
+        let mut root = Context::default();
+        root.add_function("add", |x: i64, y: i64| x + y);
+        let child = root.new_inner_scope();
+        assert!(core::ptr::eq(
+            child.root_registry().entries_ptr(),
+            root.root_registry().entries_ptr()
+        ));
+        assert_eq!(
+            child.root_registry().map_bits(),
+            root.root_registry().map_bits()
+        );
+        let add = root.int2_entry("add").expect("add");
+        unsafe {
+            let items = (*child.root_registry().entries_ptr()).items;
+            assert!(!items.is_null());
+            assert_eq!(*crate::runtime::object_array::int_words_base(items), add);
         }
     }
 

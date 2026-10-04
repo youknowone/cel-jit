@@ -104,28 +104,6 @@ impl RegistryMap {
         }
     }
 
-    /// Name stored at `index`, walking from this node.
-    pub(crate) fn name_at(&'static self, index: i64) -> Option<&'static str> {
-        if index < 0 {
-            return None;
-        }
-        let mut node = self;
-        let mut steps = 0i64;
-        loop {
-            if node.storageindex == index {
-                return Some(node.name);
-            }
-            steps += 1;
-            if steps >= WALK_CAP {
-                return None;
-            }
-            match node.back_node() {
-                Some(back) => node = back,
-                None => return None,
-            }
-        }
-    }
-
     /// `find_map_attr` for the joined name `prefix.name`, without building
     /// that string.
     pub(crate) fn find_qualified(&'static self, prefix: &str, name: &str) -> i64 {

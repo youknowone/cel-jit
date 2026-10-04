@@ -366,6 +366,12 @@ struct PortalState {
     /// Interned-leaf storage, read from the context at entry. Red ref:
     /// `intern_var_pure` hops `parent` and reads `items[storageindex]`.
     block: usize,
+    /// Root registry map pointer, read at entry (`_get_mapdict_map`).
+    /// A child walks to the root once, outside the trace.
+    registry_map: i64,
+    /// Two-int entry storage of the root registry, read at entry.
+    /// `host_int2_cell` reads `items[storageindex]`.
+    entries: usize,
     ret: i64,
 }
 
@@ -1739,6 +1745,8 @@ pub(crate) fn eval_through_portal(
         ctx: vm.ctx as *const crate::context::Context as usize as i64,
         map: vm.ctx.portal_map(),
         block: vm.ctx.portal_leaf_storage() as usize,
+        registry_map: vm.ctx.registry_map_bits(),
+        entries: vm.ctx.portal_int2_entries() as usize,
         ret: 0,
     };
     // A host call can re-enter this function on the same thread. The nested
@@ -4158,9 +4166,16 @@ fn step_hot(program: &CelCode, pc: usize) -> i64 {
                             && cell_kind(left) == CelKind::Int as i64
                             && cell_kind(right) == CelKind::Int as i64 =>
                     {
-                        let ctx_bits =
-                            vm_of(vm).ctx as *const crate::context::Context as usize as i64;
-                        let r = host_int2_cell(ctx_bits, vm, program, name, left, right);
+                        let ctx = vm_of(vm).ctx;
+                        let r = host_int2_cell(
+                            ctx.registry_map_bits(),
+                            ctx.portal_int2_entries(),
+                            vm,
+                            program,
+                            name,
+                            left,
+                            right,
+                        );
                         if r.is_null() {
                             residual_dispatch(vm, here)
                         } else {
@@ -4460,61 +4475,69 @@ fn slow_pc(vm: i64, here: i64) -> i64 {
 /// build an argument `Vec` and does not hydrate the frame.
 ///
 /// Promote the registry map (`mapdict.py` `_get_mapdict_map`). Elidable
-/// `find_map_attr` yields the storage index. Residual `_mapdict_read_storage`
-/// reads the entry word from that registry's storage: the closure is
+/// `find_map_attr` yields the storage index. `_mapdict_read_storage` is a
+/// `getarrayitem_gc_i` of that registry's entry block: the closure is
 /// per-registry, so the word is not a constant. Re-registering a name
-/// writes storage and keeps the map; the next residual read is the new
-/// body.
+/// writes storage and keeps the map; the next read is the new body.
 ///
 /// The method-cache lookup (`typeobject.py`
 /// `_pure_lookup_where_with_method_cache`) is this map walk plus the
 /// storage read.
 #[majit_macros::jit_inline(
-    ref_params = { program: ref(CelCode) },
+    ref_params = {
+        entries: ref(crate::runtime::object_array::CelInt2Storage),
+        program: ref(CelCode),
+    },
+    ref_fields = {
+        crate::runtime::object_array::CelInt2Storage::items => crate::runtime::object_array::CelIntWords,
+    },
+    array_fields = {
+        crate::runtime::object_array::CelInt2Storage::items => i64 in crate::runtime::object_array::CelIntWords,
+    },
+    int_fields = {
+        crate::runtime::object_array::CelIntWords::capacity => usize,
+    },
     calls = {
-        host_registry_map => residual_int_cannot_raise,
         host_int2_find => elidable_int_cannot_raise,
-        host_int2_entry_at => residual_int_cannot_raise,
         host_call2_i => residual_int_cannot_raise,
         cell_int => inline_int,
         box_int => inline_ref,
     },
 )]
 fn host_int2_cell(
-    ctx_bits: i64,
+    map_bits: i64,
+    entries: *mut crate::runtime::object_array::CelInt2Storage,
     vm: i64,
     program: *const CelCode,
     name: i64,
     left: *mut CelObject,
     right: *mut CelObject,
 ) -> *mut CelObject {
-    let map = host_registry_map(ctx_bits);
-    let map = majit_ir::jit::promote(map);
+    let map = majit_ir::jit::promote(map_bits);
     let idx = host_int2_find(map, program, name);
     if idx < 0 {
         core::ptr::null_mut()
+    } else if (entries as *mut u8) == core::ptr::null_mut() {
+        core::ptr::null_mut()
     } else {
-        let entry = host_int2_entry_at(ctx_bits, idx);
-        if entry == 0 {
+        let items = entries.items as *mut crate::runtime::object_array::CelIntWords;
+        if (items as *mut u8) == core::ptr::null_mut() {
             core::ptr::null_mut()
         } else {
-            let n = host_call2_i(entry, cell_int(left), cell_int(right));
-            box_int(vm, n)
+            let cap = items.capacity as i64;
+            if idx < cap {
+                let entry = entries.items[idx];
+                if entry == 0 {
+                    core::ptr::null_mut()
+                } else {
+                    let n = host_call2_i(entry, cell_int(left), cell_int(right));
+                    box_int(vm, n)
+                }
+            } else {
+                core::ptr::null_mut()
+            }
         }
     }
-}
-
-/// Registry map pointer of the root registry, or `0`.
-///
-/// Residual `_get_mapdict_map`. A [`crate::context::Context::Child`] walks
-/// to the root. The word is the shared layout, not this registry's address.
-#[cfg_attr(feature = "jit", majit_macros::dont_look_inside_cannot_raise)]
-fn host_registry_map(ctx_bits: i64) -> i64 {
-    if ctx_bits == 0 {
-        return 0;
-    }
-    let ctx = unsafe { &*(ctx_bits as usize as *const crate::context::Context) };
-    ctx.registry_map_bits()
 }
 
 /// `(map, program, name) -> storageindex` (`mapdict.py` `find_map_attr`).
@@ -4534,19 +4557,6 @@ fn host_int2_find(map_bits: i64, program: *const CelCode, name: i64) -> i64 {
         return -1;
     };
     map.find_map_attr(name)
-}
-
-/// Residual `_mapdict_read_storage`: two-int entry word at `storageindex`.
-///
-/// The closure object is per-registry, so the word is not a constant.
-/// Cannot raise. `0` is a miss (erased path).
-#[cfg_attr(feature = "jit", majit_macros::dont_look_inside_cannot_raise)]
-fn host_int2_entry_at(ctx_bits: i64, index: i64) -> i64 {
-    if ctx_bits == 0 || index < 0 {
-        return 0;
-    }
-    let ctx = unsafe { &*(ctx_bits as usize as *const crate::context::Context) };
-    ctx.int2_entry_at(index).unwrap_or(0)
 }
 
 /// `1` when the joined name has to run as a function, else `0`.
@@ -4586,6 +4596,8 @@ fn host_call2_i(entry: i64, a: i64, b: i64) -> i64 {
         ctx: int,
         map: int,
         block: ref(crate::runtime::object_array::CelLeafStorage),
+        registry_map: int,
+        entries: ref(crate::runtime::object_array::CelInt2Storage),
         ret: int,
     },
     // `interp_jit.py` `_virtualizable_` on the frame, `virtualizables=['frame']`.
@@ -4724,9 +4736,7 @@ fn host_call2_i(entry: i64, a: i64, b: i64) -> i64 {
         interned_unary => residual_int,
         interned_unary_cell => residual_ref,
         host_int2_cell => inline_ref,
-        host_registry_map => residual_int_cannot_raise,
         host_int2_find => elidable_int_cannot_raise,
-        host_int2_entry_at => residual_int_cannot_raise,
         host_call2_i => residual_int_cannot_raise,
         interned_temporal => residual_int,
         interned_optional_unary => residual_int,
@@ -6654,7 +6664,14 @@ fn run_cel_portal(
                                 if cell_kind(left) == CelKind::Int as i64 {
                                     if cell_kind(right) == CelKind::Int as i64 {
                                         let r = host_int2_cell(
-                                            state.ctx, vm, program, name, left, right,
+                                            state.registry_map,
+                                            state.entries
+                                                as *mut crate::runtime::object_array::CelInt2Storage,
+                                            vm,
+                                            program,
+                                            name,
+                                            left,
+                                            right,
                                         );
                                         if r.is_null() {
                                             slow_pc(vm, here)

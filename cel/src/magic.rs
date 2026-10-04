@@ -2,9 +2,9 @@ use crate::macros::{impl_conversions, impl_handler};
 use crate::objects::{ListRef, Opaque};
 use crate::registry_map::RegistryMap;
 use crate::resolvers::{AllArguments, Argument};
+use crate::runtime::object_array::CelInt2Storage;
 use crate::{Env, ExecutionError, FunctionContext, ResolveResult, Value};
 use std::any::Any;
-use std::cell::Cell;
 use std::sync::Arc;
 
 impl_conversions!(
@@ -319,6 +319,14 @@ pub struct FunctionRegistry {
     /// The same [`Arc`] the root context holds. A two-int lookup reads it
     /// from here, so the lookup does not need the context pointer.
     env: Arc<Env>,
+    /// Two-int entry words, indexed by `PlainAttribute.storageindex`.
+    ///
+    /// Written when a slot is registered. `0` is no two-int fast path.
+    /// The wrapper sits here so a trace can `getarrayitem_gc_i` the
+    /// block (`_mapdict_read_storage`) without a residual.
+    entries: CelInt2Storage,
+    /// Bind region that owns [`Self::entries`]'s words block.
+    region: crate::runtime::heap::BindRegionSlot,
 }
 
 impl Default for FunctionRegistry {
@@ -333,6 +341,8 @@ impl FunctionRegistry {
             map: RegistryMap::root_terminator(),
             storage: Vec::new(),
             env,
+            entries: CelInt2Storage::empty(),
+            region: crate::runtime::heap::BindRegionSlot::empty(),
         }
     }
 
@@ -342,6 +352,7 @@ impl FunctionRegistry {
         T: 'static,
     {
         let value = function.into_function();
+        let word = Self::entry_word_for(&self.env, &value, name);
         let idx = self.map.find_map_attr(name);
         if idx >= 0 {
             let idx = idx as usize;
@@ -349,11 +360,14 @@ impl FunctionRegistry {
             if let Some(slot) = self.storage.get_mut(idx) {
                 *slot = value;
             }
+            self.write_entry(idx, word);
         } else {
             let next = self.map.add_attr(name);
             debug_assert_eq!(next.storageindex() as usize, self.storage.len());
+            let idx = self.storage.len();
             self.storage.push(value);
             self.map = next;
+            self.write_entry(idx, word);
         }
     }
 
@@ -383,27 +397,57 @@ impl FunctionRegistry {
     /// Entry word of a two-int scalar under `name`, when [`Self::env`] has no
     /// matching overload.
     ///
-    /// The decision is stored on the registry entry. [`Self::add`] replaces
-    /// that entry for a re-registered name, so the next call resolves
-    /// again. A miss, a non-int signature, or a stdlib hit returns `None`
-    /// and the erased path runs.
+    /// The decision is stored in [`Self::entries`] when the slot is written.
+    /// [`Self::add`] replaces that word for a re-registered name, so the
+    /// next call reads the new body. A miss, a non-int signature, or a
+    /// stdlib hit stores `0` and the erased path runs.
     pub(crate) fn int2_entry(&self, name: &str) -> Option<i64> {
-        self.resolve_int2(self.get(name)?, name)
+        self.entry_at(self.map.find_map_attr(name))
     }
 
-    /// Entry word at `storageindex` (`_mapdict_read_storage`).
-    pub(crate) fn int2_entry_at(&self, index: i64) -> Option<i64> {
-        let func = self.function_at(index)?;
-        let name = self.map.name_at(index)?;
-        self.resolve_int2(func, name)
+    /// Two-int storage the portal reads (`_mapdict_read_storage`).
+    ///
+    /// The pointer is this registry's inline [`CelInt2Storage`]. It stays
+    /// valid for the borrow of `self` used by one evaluation.
+    pub(crate) fn entries_ptr(&self) -> *mut CelInt2Storage {
+        &self.entries as *const CelInt2Storage as *mut CelInt2Storage
     }
 
-    fn resolve_int2(&self, func: &Function, name: &str) -> Option<i64> {
-        if let Some(entry) = func.int2_cache() {
-            return (entry != 0).then_some(entry);
+    fn entry_at(&self, index: i64) -> Option<i64> {
+        if index < 0 {
+            return None;
         }
-        let entry = if self
-            .env
+        let word = self.read_entry(index as usize);
+        (word != 0).then_some(word)
+    }
+
+    fn read_entry(&self, index: usize) -> i64 {
+        let items = self.entries.items;
+        if items.is_null() {
+            return 0;
+        }
+        unsafe {
+            if index >= (*items).capacity {
+                return 0;
+            }
+            *crate::runtime::object_array::int_words_base(items).add(index)
+        }
+    }
+
+    fn write_entry(&mut self, index: usize, word: i64) {
+        let region = self.region.get_or_insert();
+        crate::runtime::heap::with_bind_region(region, || {
+            self.entries.items =
+                crate::runtime::object_array::int_words_store(self.entries.items, index, word);
+        });
+    }
+
+    /// Two-int entry word for `func` under `name`, or `0`.
+    ///
+    /// The same decision [`Self::add`] writes into storage: a stdlib
+    /// two-int overload, a non-int signature, or a miss is `0`.
+    fn entry_word_for(env: &Env, func: &Function, name: &str) -> i64 {
+        if env
             .find_overload(name, &[Value::Int(0), Value::Int(0)])
             .is_some()
         {
@@ -415,9 +459,7 @@ impl FunctionRegistry {
             }
         } else {
             0
-        };
-        func.set_int2_cache(entry);
-        (entry != 0).then_some(entry)
+        }
     }
 }
 
@@ -434,12 +476,6 @@ pub type ErasedFunction = Box<dyn Fn(&mut FunctionContext) -> ResolveResult>;
 pub struct Function {
     erased: ErasedFunction,
     scalar: Option<Arc<ScalarFn>>,
-    /// Whether [`Self::int2_entry`] has been decided.
-    int2_filled: Cell<bool>,
-    /// `ScalarFn::Int2` entry word when the stdlib has no two-int overload
-    /// under this name, otherwise `0` (take the erased path). Meaningful
-    /// only after [`Self::int2_filled`].
-    int2_entry: Cell<i64>,
 }
 
 impl Function {
@@ -448,8 +484,6 @@ impl Function {
         Function {
             erased,
             scalar: None,
-            int2_filled: Cell::new(false),
-            int2_entry: Cell::new(0),
         }
     }
 
@@ -459,25 +493,7 @@ impl Function {
         Function {
             erased,
             scalar: ScalarFn::from_any(typed).map(Arc::new),
-            int2_filled: Cell::new(false),
-            int2_entry: Cell::new(0),
         }
-    }
-
-    /// Cached two-int resolution, if this entry was filled. `Some(0)` is a
-    /// filled miss (erased path). `None` is unchecked. Replacing this
-    /// function in storage starts a new cache.
-    pub(crate) fn int2_cache(&self) -> Option<i64> {
-        if self.int2_filled.get() {
-            Some(self.int2_entry.get())
-        } else {
-            None
-        }
-    }
-
-    pub(crate) fn set_int2_cache(&self, entry: i64) {
-        self.int2_entry.set(entry);
-        self.int2_filled.set(true);
     }
 
     /// The scalar form, when the closure had one of [`ScalarFn`]'s signatures.
@@ -680,5 +696,29 @@ mod registry_map_tests {
         let second = a.int2_entry("add").expect("int2");
         assert_ne!(first, second);
         assert_eq!(unsafe { ScalarFn::call_int2(second, 3, 4) }, 12);
+    }
+
+    #[test]
+    fn add_writes_the_int2_word_at_storageindex() {
+        let mut a = FunctionRegistry::default();
+        a.add("add", |x: i64, y: i64| x + y);
+        a.add("multiply", |x: i64, y: i64| x * y);
+        let first = a.int2_entry("add").expect("add");
+        let second = a.int2_entry("multiply").expect("multiply");
+        unsafe {
+            let items = a.entries.items;
+            assert!(!items.is_null());
+            let base = crate::runtime::object_array::int_words_base(items);
+            assert_eq!(*base.add(0), first);
+            assert_eq!(*base.add(1), second);
+        }
+        a.add("add", |x: i64, y: i64| x.wrapping_mul(y));
+        let replaced = a.int2_entry("add").expect("add rebind");
+        assert_ne!(replaced, first);
+        unsafe {
+            let base = crate::runtime::object_array::int_words_base(a.entries.items);
+            assert_eq!(*base.add(0), replaced);
+            assert_eq!(*base.add(1), second);
+        }
     }
 }
