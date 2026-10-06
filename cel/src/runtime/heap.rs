@@ -907,6 +907,12 @@ impl CelHeap {
     /// cursor back before a rewind, a reset, or a new segment.
     #[inline(always)]
     fn bump_nursery(&self, size: usize, align: usize) -> *mut u8 {
+        // incminimark.py `malloc_varsize` / `malloc_fixedsize` oversized arm:
+        // `external_malloc`. A request the nursery cannot hold is a raw
+        // malloc into old space, not a second nursery segment sized to it.
+        if size >= SEGMENT_BYTES {
+            return self.alloc_old_raw(size, align);
+        }
         let free = self.nursery_free.get() as usize;
         let top = self.nursery_top.get() as usize;
         if free != 0 {
@@ -1288,7 +1294,7 @@ impl CelGc {
     /// what `GcHeader::new` stores.
     fn bump_payload(&mut self, header: u64, payload: usize) -> majit_ir::GcRef {
         let Some(total) = try_headered_total(payload) else {
-            return majit_ir::GcRef(0);
+            return fail_memory_error();
         };
         let raw = unsafe { (*heap_ptr()).bump_nursery(total, GC_HEADER_SIZE) };
         unsafe { (raw as *mut u64).write(header) };
@@ -1300,6 +1306,15 @@ impl CelGc {
         // reclaimed with the rest of the evaluation's young objects.
         self.bump_payload(u64::from(type_id), payload)
     }
+}
+
+/// `incminimark.py` `collect_and_reserve` / `external_malloc`: a failed
+/// size computation is MemoryError. The compiled slow path still sees
+/// NULL; `set_memory_error` is the breaker bit the dispatch loop reads.
+#[cfg(feature = "jit")]
+fn fail_memory_error() -> majit_ir::GcRef {
+    majit_ir::eval_breaker_word::set_memory_error();
+    majit_ir::GcRef(0)
 }
 
 #[cfg(feature = "jit")]
@@ -1369,7 +1384,7 @@ impl majit_gc::GcAllocator for CelGc {
             .checked_mul(length)
             .and_then(|n| base_size.checked_add(n))
         else {
-            return majit_ir::GcRef(0);
+            return fail_memory_error();
         };
         // Untyped: header word stays 0, and the length word is not written.
         self.bump_payload(0, bytes)
@@ -1395,10 +1410,19 @@ impl majit_gc::GcAllocator for CelGc {
             .checked_mul(length)
             .and_then(|n| base_size.checked_add(n))
         else {
-            return majit_ir::GcRef(0);
+            return fail_memory_error();
         };
+        // MiniMark `alloc_varsize_typed`: an unregistered tid is not a
+        // layout. `init_array_descr` stamps `descr.tid` from
+        // `layoutbuilder.get_type_id(ARRAY)`, so the allocator never sees
+        // one. Catch a future miss here rather than stamping a header the
+        // registry cannot name.
+        debug_assert!(
+            (type_id as usize) < self.types.len(),
+            "unregistered varsize tid {type_id}"
+        );
         if (type_id as usize) >= self.types.len() {
-            return majit_ir::GcRef(0);
+            return fail_memory_error();
         }
         let info = self.types.get(type_id);
         let registered_varsize = info.item_size != 0;
@@ -2232,5 +2256,42 @@ mod tests {
         assert_eq!(header.tid_and_flags, u64::from(id));
         assert_eq!(header.type_id(), id);
         assert_eq!(GC_HEADER_SIZE, majit_gc::header::GcHeader::SIZE);
+    }
+
+    /// `incminimark.py` `malloc_varsize` oversized arm: a registered tid
+    /// whose total is past a nursery segment is `external_malloc`.
+    #[cfg(feature = "jit")]
+    #[test]
+    fn a_large_registered_varsize_is_external_malloced() {
+        use majit_gc::GcAllocator;
+        let mut gc = CelGc::new();
+        let n = 8192usize;
+        let known =
+            gc.alloc_varsize_typed(crate::runtime::object_array::CelIntWords::TYPE_ID, 8, 8, n);
+        assert!(!known.is_null());
+        assert!(
+            !is_young(known.0 as *const u8),
+            "incminimark.py external_malloc: oversized, not a nursery bump"
+        );
+    }
+
+    /// An unregistered tid is a defect: debug names it, release is MemoryError.
+    #[cfg(all(feature = "jit", debug_assertions))]
+    #[test]
+    #[should_panic(expected = "unregistered varsize tid")]
+    fn an_unregistered_varsize_tid_panics_in_debug() {
+        use majit_gc::GcAllocator;
+        let mut gc = CelGc::new();
+        let _ = gc.alloc_varsize_typed(u32::MAX, 8, 8, 4);
+    }
+
+    #[cfg(all(feature = "jit", not(debug_assertions)))]
+    #[test]
+    fn an_unregistered_varsize_tid_is_memory_error() {
+        use majit_gc::GcAllocator;
+        let mut gc = CelGc::new();
+        let unknown = gc.alloc_varsize_typed(u32::MAX, 8, 8, 4);
+        assert!(unknown.is_null());
+        assert!(majit_ir::eval_breaker_word::take_memory_error());
     }
 }

@@ -7624,4 +7624,106 @@ mod tests {
         assert_eq!(OP_ITER_KEYS, OpCode::IterKeys as i64);
         assert_eq!(OP_ACCU_LOOP_COND, OpCode::AccuLoopCond as i64);
     }
+
+    /// Inspect the interned leaf before `EvalScope::finish` unpacks it.
+    /// Nursery objects are still live inside `f`.
+    fn with_eval_interned<R>(
+        code: &crate::vm::code::CelCode,
+        ctx: &Context,
+        f: impl FnOnce(crate::runtime::object::CelRef) -> R,
+    ) -> Result<R, crate::ExecutionError> {
+        let scope = crate::runtime::heap::enter_eval_for(ctx);
+        let mut vm = crate::vm::interp::Vm::new(code, ctx, scope.heap(), scope.is_outermost());
+        let result = eval_through_portal(&mut vm, code);
+        match result {
+            Ok(Value::Interned(w)) => {
+                let out = f(w);
+                let _ = scope.finish(Value::from_interned(w));
+                Ok(out)
+            }
+            Ok(other) => {
+                let _ = scope.finish(other);
+                Err(crate::ExecutionError::InternalError(
+                    "portal result was not an interned leaf".into(),
+                ))
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn interned_int_words_header_tid(w: crate::runtime::object::CelRef) -> u32 {
+        use crate::runtime::heap::GC_HEADER_SIZE;
+        use crate::runtime::object::{ListStrategy, W_IntColumn, W_ListObject};
+        unsafe {
+            let list = &*w.cast::<W_ListObject>();
+            assert_eq!(list.strategy, ListStrategy::Ints, "map result is Ints");
+            assert!(!list.storage.is_null());
+            let col = &*list.storage.cast::<W_IntColumn>();
+            assert!(!col.data.is_null());
+            let word = *((col.data as *const u8).sub(GC_HEADER_SIZE) as *const u64);
+            word as u32
+        }
+    }
+
+    /// `init_array_descr` `descr.tid` for the int column is
+    /// [`CelIntWords::TYPE_ID`], not the truncated `path_hash`.
+    #[test]
+    fn alloc_int_column_descr_carries_cel_int_words_type_id() {
+        use crate::runtime::lltype::CelGcType;
+        use crate::runtime::object_array::CelIntWords;
+        use majit_metainterp::jitcode::CanonicalBhDescr;
+
+        let mut asm = majit_metainterp::Assembler::default();
+        let jitcode = super::__majit_inline_jitcode_alloc_int_column_with_asm(&mut asm);
+        let ids: Vec<u32> = jitcode
+            .exec
+            .descrs
+            .iter()
+            .filter_map(|entry| match entry.as_bh_descr() {
+                Some(CanonicalBhDescr::Array { gc_type_id, .. }) => Some(*gc_type_id),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            ids.contains(&CelIntWords::TYPE_ID),
+            "int-column varsize descr gc_type_id, got {ids:?}"
+        );
+    }
+
+    /// Nursery (n=64) and old-space (n=16384) compiled maps stamp the
+    /// registered int-words tid into the payload header.
+    #[test]
+    fn compiled_map_int_words_header_tid_is_registered() {
+        use crate::objects::ListStorage;
+        use crate::runtime::lltype::CelGcType;
+        use crate::runtime::object_array::CelIntWords;
+
+        // SAFETY: stored before this test builds a driver. Both knobs are
+        // read once, when that driver is created.
+        unsafe {
+            std::env::set_var("CEL_PORTAL_THRESHOLD", "10");
+            std::env::set_var("CEL_PORTAL_FUNCTION_THRESHOLD", "10");
+        }
+
+        let expr = Parser::default().parse("xs.map(x, x * 2)").unwrap();
+        let code = compile(&expr).expect("compile");
+        for n in [64usize, 16384] {
+            let mut ctx = Context::default();
+            ctx.add_variable_from_value(
+                "xs",
+                Value::list(ListStorage::Ints((0..n as i64).collect())),
+            );
+            let mut last_tid = None;
+            for i in 0..2000 {
+                let tid = with_eval_interned(&code, &ctx, interned_int_words_header_tid)
+                    .unwrap_or_else(|e| panic!("n={n} execute {i}: {e}"));
+                last_tid = Some(tid);
+            }
+            assert_eq!(
+                last_tid,
+                Some(CelIntWords::TYPE_ID),
+                "compiled map header tid at n={n}"
+            );
+        }
+    }
 }

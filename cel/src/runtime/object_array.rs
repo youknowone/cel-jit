@@ -108,6 +108,11 @@ impl CelGcType for CelItemsBlock {
     const TYPE_ID: u32 = 21;
 }
 
+#[cfg(feature = "jit")]
+impl majit_metainterp::HasGcTypeId for CelItemsBlock {
+    const GC_TYPE_ID: u32 = Self::TYPE_ID;
+}
+
 /// Per-scope interned-leaf storage the portal reads (`_mapdict_read_storage`).
 ///
 /// `items` is a [`CelItemsBlock`] indexed by `PlainAttribute.storageindex`.
@@ -180,6 +185,11 @@ impl CelGcType for CelBytesBlock {
     const TYPE_ID: u32 = 22;
 }
 
+#[cfg(feature = "jit")]
+impl majit_metainterp::HasGcTypeId for CelBytesBlock {
+    const GC_TYPE_ID: u32 = Self::TYPE_ID;
+}
+
 /// Unboxed `i64`s for an int column: capacity word, then the words.
 ///
 /// Same body as [`CelItemsBlock`]. `new_array` can build it; a raw
@@ -212,6 +222,11 @@ impl CelGcType for CelIntWords {
     const TYPE_ID: u32 = 23;
 }
 
+#[cfg(feature = "jit")]
+impl majit_metainterp::HasGcTypeId for CelIntWords {
+    const GC_TYPE_ID: u32 = Self::TYPE_ID;
+}
+
 /// Unboxed `f64`s for a float column: capacity word, then the words.
 ///
 /// Same body as [`CelIntWords`]. The array descr reads the length at
@@ -242,6 +257,11 @@ impl CelGcType for CelFloatWords {
     const TYPE_ID: u32 = 23;
     #[cfg(feature = "structs")]
     const TYPE_ID: u32 = 24;
+}
+
+#[cfg(feature = "jit")]
+impl majit_metainterp::HasGcTypeId for CelFloatWords {
+    const GC_TYPE_ID: u32 = Self::TYPE_ID;
 }
 
 /// Word 0 of an int-words block, or null.

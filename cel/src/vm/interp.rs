@@ -912,7 +912,7 @@ impl<'a> Vm<'a> {
     /// cells are the stack. A residual that needs a [`Value`] or a builder
     /// copies those cells into the pool on the way in.
     #[inline]
-    fn new(
+    pub(crate) fn new(
         code: &'a CelCode,
         ctx: &'a Context<'a>,
         heap: &crate::runtime::heap::CelHeap,
