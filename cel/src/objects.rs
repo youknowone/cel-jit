@@ -3369,17 +3369,22 @@ fn resolve_inner(expr: &Expression, ctx: &Context) -> Result<Value, ExecutionErr
                                 ))
                             }
                         };
-                        return Ok(match optional_view(&operand) {
-                            // `Optional::map` keeps the outer `Some` and
-                            // substitutes `optional.none` for a missing
-                            // field, so a miss nests one optional inside
-                            // another. Mirrored, not corrected, here.
-                            OptView::Empty => optional_none(),
-                            OptView::Present(inner) => optional_of(
-                                value_index(&inner, &field).unwrap_or_else(|_| optional_none()),
-                            ),
-                            OptView::Plain => optional_of(value_index(&operand, &field)?),
-                        });
+                        // A missing key/field maps to `optional.none()`, the
+                        // same as OPT_INDEX. Any other index error
+                        // (`NoSuchOverload`, `UnsupportedIndex`, …)
+                        // propagates. An empty optional short-circuits; a
+                        // present optional is unwrapped before the lookup,
+                        // so a miss is `none` rather than `of(none)`.
+                        let target = match optional_view(&operand) {
+                            OptView::Empty => return Ok(optional_none()),
+                            OptView::Present(inner) => inner,
+                            OptView::Plain => operand,
+                        };
+                        return match value_index(&target, &field) {
+                            Ok(v) => Ok(optional_of(v)),
+                            Err(ExecutionError::NoSuchKey(_)) => Ok(optional_none()),
+                            Err(e) => Err(e),
+                        };
                     }
                     operators::ADD => return binary_op("add", call, ctx),
                     operators::SUBSTRACT => return binary_op("sub", call, ctx),
@@ -4498,18 +4503,19 @@ pub(crate) fn interned_contains(container: CelRef, needle: CelRef) -> Result<boo
 
 /// `a?.b` on an interned receiver.
 ///
-/// A miss on a plain map/struct is `NoSuchKey`. A miss on an optional
-/// receiver folds to `optional.of(optional.none)`. Anything else is
-/// `NoSuchOverload` so the caller can decline.
+/// A miss on a map/struct is `optional.none()`, whether the receiver was a
+/// plain container or an optional wrapping one. An empty optional
+/// short-circuits to `none`. Anything else is `NoSuchOverload` so the
+/// caller can decline.
 pub(crate) fn interned_opt_select(w: CelRef, field: &str) -> Result<CelRef, ExecutionError> {
-    let (inner, optional) = if unsafe { w_kind(w) } == CelKind::Optional {
+    let inner = if unsafe { w_kind(w) } == CelKind::Optional {
         let inner = unsafe { (*w.cast::<W_OptionalObject>()).w_value };
         if inner.is_null() {
             return Ok(new_optional_none() as CelRef);
         }
-        (inner, true)
+        inner
     } else {
-        (w, false)
+        w
     };
     let found = match unsafe { w_kind(inner) } {
         CelKind::Map => unsafe { interned_map_lookup_string(inner, field) },
@@ -4519,8 +4525,7 @@ pub(crate) fn interned_opt_select(w: CelRef, field: &str) -> Result<CelRef, Exec
     };
     match found {
         Some(item) => Ok(new_optional(item) as CelRef),
-        None if optional => Ok(new_optional(new_optional_none() as CelRef) as CelRef),
-        None => Err(ExecutionError::NoSuchKey(Arc::new(field.to_string()))),
+        None => Ok(new_optional_none() as CelRef),
     }
 }
 
@@ -6243,6 +6248,51 @@ mod tests {
                 .unwrap()
                 .execute(&ctx)
                 .is_err());
+        }
+
+        fn parse_optional(source: &str) -> crate::parser::Expression {
+            Parser::default()
+                .enable_optional_syntax(true)
+                .parse(source)
+                .expect("Must parse")
+        }
+
+        fn eval_optional(source: &str) -> crate::ResolveResult {
+            let expr = parse_optional(source);
+            let walker = Value::resolve(&expr, &Context::default());
+            let vm = Program::from_expression(expr).execute(&Context::default());
+            assert_eq!(walker, vm, "`{source}` walker and vm diverged");
+            walker
+        }
+
+        /// `{}.?x` is `optional.none()`, not `NoSuchKey`. OPT_INDEX already
+        /// maps a miss that way; OPT_SELECT on a plain container used to
+        /// propagate the error. A receiver that is not a map/struct stays an
+        /// error: `1.?x` is `NoSuchOverload`.
+        #[test]
+        fn opt_select_on_a_plain_map_miss_is_none() {
+            let none = Value::Opaque(Arc::new(OptionalValue::none()));
+            assert_eq!(eval_optional("{}.?x"), Ok(none));
+            assert_eq!(eval_optional("{}.?x.hasValue()"), Ok(Value::Bool(false)));
+            assert_eq!(eval_optional("has({}.?x.y)"), Ok(Value::Bool(false)));
+            assert_eq!(eval_optional("1.?x"), Err(ExecutionError::NoSuchOverload));
+        }
+
+        /// `optional.of({}).?x` is `optional.none()`, not `of(none)`. The
+        /// nested none made `hasValue()` true. Unwrapping a non-container
+        /// stays an error: `optional.of(1).?x` is `NoSuchOverload`.
+        #[test]
+        fn opt_select_on_an_optional_map_miss_is_none() {
+            let none = Value::Opaque(Arc::new(OptionalValue::none()));
+            assert_eq!(eval_optional("optional.of({}).?x"), Ok(none));
+            assert_eq!(
+                eval_optional("optional.of({}).?x.hasValue()"),
+                Ok(Value::Bool(false))
+            );
+            assert_eq!(
+                eval_optional("optional.of(1).?x"),
+                Err(ExecutionError::NoSuchOverload)
+            );
         }
     }
 

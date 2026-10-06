@@ -967,10 +967,9 @@ expr: m[?"a"]
 feat: opt_syntax variable
 want: parse_error
 
-# `_?._` — optional field selection. The non-optional-operand arm propagates a
-# missing-field error rather than answering `optional.none`; the
-# optional-operand arm substitutes `optional.none` for the miss and keeps the
-# outer `Some`, so a miss nests one optional inside another.
+# `_?._` — optional field selection. A missing key/field is `optional.none()`,
+# whether the receiver is a plain map or an optional wrapping one. A
+# receiver that is not a map/struct is an error (`1.?x` is NoSuchOverload).
 
 expr: m.?a
 feat: opt_syntax opt_select optional variable
@@ -980,12 +979,17 @@ want: optional(int(1))
 expr: m.?z
 feat: opt_syntax opt_select optional variable
 parse: optional
-want: error(NoSuchKey: z)
+want: optional.none
+
+expr: 1.?x
+feat: opt_syntax opt_select error
+parse: optional
+want: error(NoSuchOverload)
 
 expr: opt_some.?x
-feat: opt_syntax opt_select optional variable
+feat: opt_syntax opt_select optional variable error
 parse: optional
-want: optional(optional.none)
+want: error(NoSuchOverload)
 
 # ---------------------------------------------------------------------------
 # Duration and timestamp

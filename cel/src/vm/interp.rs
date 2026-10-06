@@ -3516,17 +3516,22 @@ impl<'a> Vm<'a> {
 
     /// `a?.b`.
     ///
-    /// The nested-optional shape on a miss is the walker's, mirrored rather
-    /// than corrected: `Optional::map` keeps the outer `Some` and substitutes
-    /// `optional.none` for the missing field.
+    /// A missing key/field is `optional.none()`, the same as OPT_INDEX and
+    /// the walker. Any other index error (`NoSuchOverload`,
+    /// `UnsupportedIndex`, …) is parked. An empty optional short-circuits;
+    /// a present optional is unwrapped before the lookup, so a miss is
+    /// `none` rather than `of(none)`.
     fn opt_select(&mut self, operand: Value, field: Value) -> CelResult<Value> {
-        Ok(match optional_inner(&operand) {
-            OptView::Empty => optional_none(),
-            OptView::Present(inner) => {
-                optional_of(value_index(&inner, &field).unwrap_or_else(|_| optional_none()))
-            }
-            OptView::Plain => optional_of(value_index(&operand, &field).map_err(|e| self.park(e))?),
-        })
+        let target = match optional_inner(&operand) {
+            OptView::Empty => return Ok(optional_none()),
+            OptView::Present(inner) => inner,
+            OptView::Plain => operand,
+        };
+        match value_index(&target, &field) {
+            Ok(v) => Ok(optional_of(v)),
+            Err(ExecutionError::NoSuchKey(_)) => Ok(optional_none()),
+            Err(e) => Err(self.park(e)),
+        }
     }
 
     #[cfg(feature = "structs")]
