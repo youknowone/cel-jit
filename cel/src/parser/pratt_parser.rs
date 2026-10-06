@@ -1997,7 +1997,7 @@ impl<'a> PrattParserWorker<'a> {
                 let id = self.next_id(&tok);
                 IdedExpr {
                     id,
-                    expr: Expr::Literal(LiteralValue::Boolean(true.into())),
+                    expr: Expr::Literal(LiteralValue::Boolean(true)),
                 }
             }
             TokenKind::TokFalse => {
@@ -2005,7 +2005,7 @@ impl<'a> PrattParserWorker<'a> {
                 let id = self.next_id(&tok);
                 IdedExpr {
                     id,
-                    expr: Expr::Literal(LiteralValue::Boolean(false.into())),
+                    expr: Expr::Literal(LiteralValue::Boolean(false)),
                 }
             }
             TokenKind::TokInt => self.parse_int_literal(),
@@ -2205,7 +2205,7 @@ impl<'a> PrattParserWorker<'a> {
         match val {
             Ok(v) => IdedExpr {
                 id,
-                expr: Expr::Literal(LiteralValue::Int(v.into())),
+                expr: Expr::Literal(LiteralValue::Int(v)),
             },
             Err(_) => self.report_error(&tok, "invalid int literal".to_string()),
         }
@@ -2222,7 +2222,7 @@ impl<'a> PrattParserWorker<'a> {
         match val {
             Ok(v) => IdedExpr {
                 id: op_id,
-                expr: Expr::Literal(LiteralValue::Int(v.into())),
+                expr: Expr::Literal(LiteralValue::Int(v)),
             },
             Err(_) => self.report_error(&tok, "invalid int literal".to_string()),
         }
@@ -2241,7 +2241,7 @@ impl<'a> PrattParserWorker<'a> {
         match val {
             Ok(v) => IdedExpr {
                 id,
-                expr: Expr::Literal(LiteralValue::UInt(v.into())),
+                expr: Expr::Literal(LiteralValue::UInt(v)),
             },
             Err(_) => self.report_error(&tok, "invalid uint literal".to_string()),
         }
@@ -2254,7 +2254,7 @@ impl<'a> PrattParserWorker<'a> {
         match text.parse::<f64>() {
             Ok(v) if v.is_finite() => IdedExpr {
                 id,
-                expr: Expr::Literal(LiteralValue::Double(v.into())),
+                expr: Expr::Literal(LiteralValue::Double(v)),
             },
             _ => self.report_error(&tok, "invalid double literal".to_string()),
         }
@@ -2266,7 +2266,7 @@ impl<'a> PrattParserWorker<'a> {
         match text.parse::<f64>() {
             Ok(v) if v.is_finite() => IdedExpr {
                 id: op_id,
-                expr: Expr::Literal(LiteralValue::Double((-v).into())),
+                expr: Expr::Literal(LiteralValue::Double(-v)),
             },
             _ => self.report_error(&tok, "invalid double literal".to_string()),
         }
@@ -3441,31 +3441,22 @@ ERROR: <input>:1:24: unsupported syntax '?'
                 Expr::Literal(val) => match val {
                     LiteralValue::String(s) => &format!(
                         "\"{}\"^#{}:{}#",
-                        s.inner(),
+                        s.as_ref(),
                         expr.id,
                         "*expr.Constant_StringValue"
                     ),
                     LiteralValue::Boolean(b) => {
-                        &format!("{}^#{}:{}#", b.inner(), expr.id, "*expr.Constant_BoolValue")
+                        &format!("{}^#{}:{}#", b, expr.id, "*expr.Constant_BoolValue")
                     }
-                    LiteralValue::Int(i) => &format!(
-                        "{}^#{}:{}#",
-                        i.inner(),
-                        expr.id,
-                        "*expr.Constant_Int64Value"
-                    ),
-                    LiteralValue::UInt(u) => &format!(
-                        "{}u^#{}:{}#",
-                        u.inner(),
-                        expr.id,
-                        "*expr.Constant_Uint64Value"
-                    ),
-                    LiteralValue::Double(f) => &format!(
-                        "{}^#{}:{}#",
-                        f.inner(),
-                        expr.id,
-                        "*expr.Constant_DoubleValue"
-                    ),
+                    LiteralValue::Int(i) => {
+                        &format!("{}^#{}:{}#", i, expr.id, "*expr.Constant_Int64Value")
+                    }
+                    LiteralValue::UInt(u) => {
+                        &format!("{}u^#{}:{}#", u, expr.id, "*expr.Constant_Uint64Value")
+                    }
+                    LiteralValue::Double(f) => {
+                        &format!("{}^#{}:{}#", f, expr.id, "*expr.Constant_DoubleValue")
+                    }
                     LiteralValue::Bytes(bytes) => &format!(
                         "b\"{}\"^#{}:{}#",
                         String::from_utf8_lossy(bytes),

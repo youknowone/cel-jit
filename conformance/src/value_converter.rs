@@ -4,6 +4,10 @@
 //! Many proto types (Struct, Enum, Any messages) are not supported by the
 //! current cel crate and will cause test failures.
 
+use cel::common::types::{
+    Type, TypeValue, BOOL_TYPE, BYTES_TYPE, DOUBLE_TYPE, DURATION_TYPE, INT_TYPE, LIST_TYPE,
+    MAP_TYPE, NULL_TYPE, OPTIONAL_TYPE, STRING_TYPE, TIMESTAMP_TYPE, TYPE_TYPE, UINT_TYPE,
+};
 use cel::objects::Value as CelValue;
 use prost::Message;
 use prost_types::Any;
@@ -11,6 +15,28 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::proto::cel::expr::Value as ProtoValue;
+
+/// The value `type()` returns for `name`: a [`TypeValue`] opaque, not the
+/// name as a string.
+fn type_value_from_name(name: &str) -> CelValue {
+    let denoted = match name {
+        "bool" => BOOL_TYPE.to_owned(),
+        "bytes" => BYTES_TYPE.to_owned(),
+        "double" => DOUBLE_TYPE.to_owned(),
+        "google.protobuf.Duration" => DURATION_TYPE.to_owned(),
+        "int" => INT_TYPE.to_owned(),
+        "list" => LIST_TYPE.to_owned(),
+        "map" => MAP_TYPE.to_owned(),
+        "null_type" => NULL_TYPE.to_owned(),
+        "optional_type" => OPTIONAL_TYPE.to_owned(),
+        "string" => STRING_TYPE.to_owned(),
+        "google.protobuf.Timestamp" => TIMESTAMP_TYPE.to_owned(),
+        "type" => TYPE_TYPE.to_owned(),
+        "uint" => UINT_TYPE.to_owned(),
+        other => Type::new_opaque_type(other.to_owned()),
+    };
+    CelValue::Opaque(Arc::new(TypeValue::new(denoted)))
+}
 
 /// Converts a CEL spec protobuf Value to a cel-rust Value
 pub(super) fn proto_value_to_cel_value(
@@ -25,7 +51,7 @@ pub(super) fn proto_value_to_cel_value(
         Some(crate::proto::cel::expr::value::Kind::Uint64Value(v)) => Ok(UInt(*v)),
         Some(crate::proto::cel::expr::value::Kind::DoubleValue(v)) => Ok(Float(*v)),
         Some(crate::proto::cel::expr::value::Kind::StringValue(v)) => {
-            Ok(String(Arc::new(v.clone())))
+            Ok(String(Arc::from(v.as_str())))
         }
         Some(crate::proto::cel::expr::value::Kind::BytesValue(v)) => {
             Ok(Bytes(Arc::new(v.to_vec())))
@@ -35,7 +61,7 @@ pub(super) fn proto_value_to_cel_value(
             for item in &list.values {
                 values.push(proto_value_to_cel_value(item)?);
             }
-            Ok(List(Arc::new(values)))
+            Ok(CelValue::list(values))
         }
         Some(crate::proto::cel::expr::value::Kind::MapValue(map)) => {
             let mut entries = HashMap::new();
@@ -56,9 +82,7 @@ pub(super) fn proto_value_to_cel_value(
                 };
                 entries.insert(key, value);
             }
-            Ok(Map(Map {
-                map: Arc::new(entries),
-            }))
+            Ok(CelValue::Map(Map::from(entries)))
         }
         Some(crate::proto::cel::expr::value::Kind::EnumValue(enum_val)) => {
             // Enum type not supported in current cel crate - return as Int
@@ -72,10 +96,7 @@ pub(super) fn proto_value_to_cel_value(
                 any.type_url
             )))
         }
-        Some(crate::proto::cel::expr::value::Kind::TypeValue(v)) => {
-            // TypeValue is a string representing a type name
-            Ok(String(Arc::new(v.clone())))
-        }
+        Some(crate::proto::cel::expr::value::Kind::TypeValue(v)) => Ok(type_value_from_name(v)),
         None => Err(ConversionError::EmptyValue),
     }
 }

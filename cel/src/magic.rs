@@ -444,7 +444,7 @@ impl FunctionRegistry {
     fn write_entry(&mut self, index: usize, word: i64) {
         let items = self.entries.items;
         if !items.is_null()
-            && crate::runtime::object_array::int_words_store_existing(items, index, word)
+            && unsafe { crate::runtime::object_array::int_words_store_existing(items, index, word) }
         {
             return;
         }
@@ -453,14 +453,17 @@ impl FunctionRegistry {
         crate::runtime::heap::with_bind_region(region, || {
             if self.entries.items.is_null() {
                 self.entries.items = crate::runtime::object_array::new_int_words_zeroed(cap);
-                let _ = crate::runtime::object_array::int_words_store_existing(
-                    self.entries.items,
-                    index,
-                    word,
-                );
+                let _ = unsafe {
+                    crate::runtime::object_array::int_words_store_existing(
+                        self.entries.items,
+                        index,
+                        word,
+                    )
+                };
             } else {
-                self.entries.items =
-                    crate::runtime::object_array::int_words_store(self.entries.items, index, word);
+                self.entries.items = unsafe {
+                    crate::runtime::object_array::int_words_store(self.entries.items, index, word)
+                };
             }
         });
     }

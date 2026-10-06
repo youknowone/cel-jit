@@ -29,7 +29,7 @@ pub struct TypeValue(Type);
 
 impl TypeValue {
     /// Wrap a CEL type so it can sit on the public value boundary.
-    pub(crate) fn new(denoted: Type) -> Self {
+    pub fn new(denoted: Type) -> Self {
         TypeValue(denoted)
     }
 

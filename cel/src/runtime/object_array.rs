@@ -328,7 +328,11 @@ pub unsafe fn int_words_capacity(block: *mut CelIntWords) -> usize {
 
 /// Store `word` at `index` when `block` already has that slot. `false` if
 /// the block is missing or too small; the caller then grows.
-pub fn int_words_store_existing(block: *mut CelIntWords, index: usize, word: i64) -> bool {
+///
+/// # Safety
+///
+/// `block` is null or points at a live [`CelIntWords`].
+pub unsafe fn int_words_store_existing(block: *mut CelIntWords, index: usize, word: i64) -> bool {
     let cap = unsafe { int_words_capacity(block) };
     if block.is_null() || index >= cap {
         return false;
@@ -345,12 +349,24 @@ pub fn int_words_store_existing(block: *mut CelIntWords, index: usize, word: i64
 /// stays in the owner until that owner drops. Call from
 /// [`super::heap::with_bind_region`] so the new block has the registry's
 /// bind-region lifetime.
-pub fn int_words_store(block: *mut CelIntWords, index: usize, word: i64) -> *mut CelIntWords {
-    super::heap::with_heap(|h| int_words_store_in(h, block, index, word))
+///
+/// # Safety
+///
+/// `block` is null or points at a live [`CelIntWords`].
+pub unsafe fn int_words_store(
+    block: *mut CelIntWords,
+    index: usize,
+    word: i64,
+) -> *mut CelIntWords {
+    super::heap::with_heap(|h| unsafe { int_words_store_in(h, block, index, word) })
 }
 
 /// [`int_words_store`] on `heap`.
-pub fn int_words_store_in(
+///
+/// # Safety
+///
+/// As [`int_words_store`].
+pub unsafe fn int_words_store_in(
     heap: &super::heap::CelHeap,
     block: *mut CelIntWords,
     index: usize,
@@ -590,8 +606,16 @@ pub fn new_items_block_zeroed(cap: usize) -> *mut CelItemsBlock {
 ///
 /// `false` when the block is missing or too short; the caller then grows
 /// through [`items_block_store`]. An in-place store does not allocate.
+///
+/// # Safety
+///
+/// `block` is null or points at a live [`CelItemsBlock`].
 #[inline]
-pub fn items_block_store_existing(block: *mut CelItemsBlock, index: usize, leaf: CelRef) -> bool {
+pub unsafe fn items_block_store_existing(
+    block: *mut CelItemsBlock,
+    index: usize,
+    leaf: CelRef,
+) -> bool {
     let cap = unsafe { items_capacity(block) };
     if block.is_null() || index >= cap {
         return false;
@@ -613,16 +637,24 @@ pub fn items_block_store_existing(block: *mut CelItemsBlock, index: usize, leaf:
 /// nursery alloc sets `needs_write_barrier = false`: this collector does
 /// not run, and bind-region blocks are old. Compiled `setarrayitem_gc_r`
 /// takes the same path.
-pub fn items_block_store(
+///
+/// # Safety
+///
+/// `block` is null or points at a live [`CelItemsBlock`].
+pub unsafe fn items_block_store(
     block: *mut CelItemsBlock,
     index: usize,
     leaf: CelRef,
 ) -> *mut CelItemsBlock {
-    super::heap::with_heap(|h| items_block_store_in(h, block, index, leaf))
+    super::heap::with_heap(|h| unsafe { items_block_store_in(h, block, index, leaf) })
 }
 
 /// [`items_block_store`] on `heap`.
-pub fn items_block_store_in(
+///
+/// # Safety
+///
+/// As [`items_block_store`].
+pub unsafe fn items_block_store_in(
     heap: &super::heap::CelHeap,
     block: *mut CelItemsBlock,
     index: usize,

@@ -91,7 +91,6 @@ mod map_fields {
     }
 
     // Test: map_key_mixed_numbers_uint_key
-    #[should_panic]
     #[test]
     fn map_key_mixed_numbers_uint_key() {
         run_test(&dedent!(
@@ -103,7 +102,6 @@ mod map_fields {
     }
 
     // Test: map_key_mixed_numbers_int_key
-    #[should_panic]
     #[test]
     fn map_key_mixed_numbers_int_key() {
         run_test(&dedent!(

@@ -912,7 +912,7 @@ mod tests {
         let mut expected = 0i64;
         for i in 0..n {
             let ctx = row_context(cols, i);
-            expected += match program
+            let row = match program
                 .execute(&ctx)
                 .unwrap_or_else(|e| panic!("execute `{expr_src}`: {e:?}"))
             {
@@ -921,6 +921,7 @@ mod tests {
                 Value::UInt(v) => v as i64,
                 other => panic!("`{expr_src}`: unexpected {other:?}"),
             };
+            expected = expected.wrapping_add(row);
         }
 
         // In SLOT order — see `check`. The caller's column list is written in
@@ -2700,8 +2701,8 @@ mod tests {
         let u_cols = [("u", ColData::UInt(u.clone()))];
         for expr in ["int(u) < 0", "int(u) > 100", "uint(int(u)) > 100u"] {
             let program = Program::compile(expr).unwrap();
-            for row in 0..n {
-                let bits = u[row] as u64;
+            for (row, bits) in u.iter().enumerate() {
+                let bits = *bits as u64;
                 let want = if bits > i64::MAX as u64 {
                     Err(("int", "integer overflow"))
                 } else {
@@ -2725,8 +2726,7 @@ mod tests {
             "int(u)",
         ] {
             let program = Program::compile(expr).unwrap();
-            for row in 0..n {
-                let v = u_fit[row];
+            for (row, &v) in u_fit.iter().enumerate() {
                 assert!(v >= 0, "in-range uint column went negative");
                 let want = Ok(match expr {
                     "int(u) < 0" => Value::Bool(v < 0),
@@ -2743,8 +2743,7 @@ mod tests {
         let i_cols = [("i", ColData::Int(i.clone()))];
         for expr in ["uint(i) > 100u", "int(uint(i)) > 100"] {
             let program = Program::compile(expr).unwrap();
-            for row in 0..n {
-                let v = i[row];
+            for (row, &v) in i.iter().enumerate() {
                 let want = if v < 0 {
                     Err(("uint", "unsigned integer overflow"))
                 } else {
@@ -2761,8 +2760,8 @@ mod tests {
         let i_fit_cols = [("i", ColData::Int(i_fit))];
         for expr in ["uint(i) > 100u", "int(uint(i)) > 100", "uint(i)"] {
             let program = Program::compile(expr).unwrap();
-            for row in 0..n {
-                let v = i[row].max(0);
+            for (row, &v) in i.iter().enumerate() {
+                let v = v.max(0);
                 let want = Ok(match expr {
                     "uint(i) > 100u" => Value::Bool((v as u64) > 100),
                     "int(uint(i)) > 100" => Value::Bool(v > 100),
@@ -2777,8 +2776,7 @@ mod tests {
         for expr in ["int(f) > 100", "int(f) < 0", "int(f)"] {
             let cols = [("f", ColData::Float(f.clone()))];
             let program = Program::compile(expr).unwrap();
-            for row in 0..n {
-                let v = f[row];
+            for (row, &v) in f.iter().enumerate() {
                 assert!(
                     v > i64::MIN as f64 && v < i64::MAX as f64,
                     "generated float left the int range"
@@ -2808,8 +2806,8 @@ mod tests {
         // `double` of a uint past 2^63 stays a large positive. A signed
         // widening would turn `u64::MAX` into `-1.0` and fail this sum.
         let wide = Program::compile("double(u) > 1.5").unwrap();
-        for row in 0..n {
-            let got = (u[row] as u64) as f64 > 1.5;
+        for (row, &bits) in u.iter().enumerate() {
+            let got = (bits as u64) as f64 > 1.5;
             assert_row("double(u) > 1.5", &wide, &u_cols, row, Ok(Value::Bool(got)));
         }
         check_batch_f("double(u) > 1.5", &u_cols);
@@ -5213,7 +5211,8 @@ mod tests {
     fn numeric_conversions_at_the_saturation_bounds() {
         let int_ovf = ("int", "integer overflow");
         let uint_ovf = ("uint", "unsigned integer overflow");
-        let scalars: &[(&str, Result<Value, (&str, &str)>)] = &[
+        type ScalarCase = (&'static str, Result<Value, (&'static str, &'static str)>);
+        let scalars: &[ScalarCase] = &[
             ("int(18446744073709551615u)", Err(int_ovf)),
             ("int(9223372036854775808u)", Err(int_ovf)),
             ("int(9223372036854775807u)", Ok(Value::Int(i64::MAX))),

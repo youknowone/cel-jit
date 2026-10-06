@@ -1872,7 +1872,7 @@ pub mod float_bank {
                     let a = program[pc + 1] as usize;
                     let b = program[pc + 2] as usize;
                     let d = program[pc + 3] as usize;
-                    state.regs[d] = state.regs[a] + state.regs[b];
+                    state.regs[d] = state.regs[a].wrapping_add(state.regs[b]);
                     pc += 4;
                 }
                 OP_SUB => {
@@ -3398,7 +3398,7 @@ pub mod float_bank {
                 }
                 OP_ADD => {
                     regs[program[pc + 3] as usize] =
-                        regs[program[pc + 1] as usize] + regs[program[pc + 2] as usize];
+                        regs[program[pc + 1] as usize].wrapping_add(regs[program[pc + 2] as usize]);
                     pc += 4;
                 }
                 OP_SUB => {

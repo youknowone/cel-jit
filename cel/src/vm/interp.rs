@@ -5462,7 +5462,7 @@ mod tests {
             let accu = comp.accu_var.clone();
             comp.accu_init = IdedExpr {
                 id: 98,
-                expr: Expr::Literal(LiteralValue::Int(7.into())),
+                expr: Expr::Literal(LiteralValue::Int(7)),
             };
             comp.loop_step = IdedExpr {
                 id: 99,

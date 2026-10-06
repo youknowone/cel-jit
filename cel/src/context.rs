@@ -178,7 +178,7 @@ impl<'a> Context<'a> {
         let leaf = leaf_of(&value);
         let index = match self {
             Context::Root { map, storage, .. } | Context::Child { map, storage, .. } => {
-                let (next, index) = ScopeMap::bind(*map, storage, name, value);
+                let (next, index) = ScopeMap::bind(map, storage, name, value);
                 *map = next;
                 index
             }
@@ -207,11 +207,13 @@ impl<'a> Context<'a> {
             return;
         }
         let leaf = leaf.unwrap_or(core::ptr::null_mut());
-        if crate::runtime::object_array::items_block_store_existing(
-            self.leaves().items,
-            index,
-            leaf,
-        ) {
+        if unsafe {
+            crate::runtime::object_array::items_block_store_existing(
+                self.leaves().items,
+                index,
+                leaf,
+            )
+        } {
             return;
         }
         let cap = self.map().likely_storage_len().max(index.saturating_add(1));
@@ -220,14 +222,17 @@ impl<'a> Context<'a> {
             let storage = self.leaves_mut();
             if storage.items.is_null() {
                 storage.items = crate::runtime::object_array::new_items_block_zeroed(cap);
-                let _ = crate::runtime::object_array::items_block_store_existing(
-                    storage.items,
-                    index,
-                    leaf,
-                );
+                let _ = unsafe {
+                    crate::runtime::object_array::items_block_store_existing(
+                        storage.items,
+                        index,
+                        leaf,
+                    )
+                };
             } else {
-                storage.items =
-                    crate::runtime::object_array::items_block_store(storage.items, index, leaf);
+                storage.items = unsafe {
+                    crate::runtime::object_array::items_block_store(storage.items, index, leaf)
+                };
             }
         });
     }
@@ -262,8 +267,7 @@ impl<'a> Context<'a> {
     /// the borrow of `self` used by one evaluation.
     #[cfg(feature = "jit")]
     pub(crate) fn portal_leaf_storage(&self) -> *mut crate::runtime::object_array::CelLeafStorage {
-        self.leaves() as *const crate::runtime::object_array::CelLeafStorage
-            as *mut crate::runtime::object_array::CelLeafStorage
+        core::ptr::from_ref(self.leaves()).cast_mut()
     }
 
     fn retained_mut(&mut self) -> &mut Vec<Value> {
@@ -589,8 +593,7 @@ impl<'a> Context<'a> {
             retained: Vec::new(),
             region,
             leaves: crate::runtime::object_array::CelLeafStorage {
-                parent: self.leaves() as *const crate::runtime::object_array::CelLeafStorage
-                    as *mut crate::runtime::object_array::CelLeafStorage,
+                parent: core::ptr::from_ref(self.leaves()).cast_mut(),
                 items,
             },
         }
@@ -887,7 +890,7 @@ mod tests {
         let child = root.new_inner_scope();
         assert!(core::ptr::eq(
             child.leaves().parent,
-            root.leaves() as *const _ as *mut _
+            core::ptr::from_ref(root.leaves()).cast_mut(),
         ));
         unsafe {
             let parent_items = (*child.leaves().parent).items;
