@@ -95,7 +95,7 @@ fn wrap_entry(ctx: &mut Context, value: Value) -> Value {
     crate::runtime::heap::with_bind_region(region, || {
         match crate::runtime::convert::intern_leaf(&value) {
             Some(w) => {
-                crate::runtime::convert::link_public_handle(w, &value);
+                crate::runtime::convert::link_public_tree(w, &value);
                 retain_public(ctx, value);
                 Value::from_interned(w)
             }

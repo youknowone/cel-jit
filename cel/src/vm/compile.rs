@@ -246,7 +246,7 @@ impl Compiler {
         // heap. Immutable after compile; freed only when the pool drops.
         let leaf = self.const_pool.intern(&value);
         if !leaf.is_null() {
-            crate::runtime::convert::link_public_handle(leaf, &value);
+            crate::runtime::convert::link_public_tree(leaf, &value);
         }
         self.consts.push(value);
         self.const_leaves.push(leaf);
@@ -292,7 +292,7 @@ impl Compiler {
                 if leaf.is_null() {
                     return None;
                 }
-                crate::runtime::convert::link_public_handle(leaf, &value);
+                crate::runtime::convert::link_public_tree(leaf, &value);
                 Some((value, leaf))
             }
             Expr::List(list) => {
@@ -301,7 +301,7 @@ impl Compiler {
                 if leaf.is_null() {
                     return None;
                 }
-                crate::runtime::convert::link_public_handle(leaf, &value);
+                crate::runtime::convert::link_public_tree(leaf, &value);
                 Some((value, leaf))
             }
             Expr::Map(map) => self.intern_const_map(map),
@@ -311,7 +311,7 @@ impl Compiler {
                 if leaf.is_null() {
                     return None;
                 }
-                crate::runtime::convert::link_public_handle(leaf, &value);
+                crate::runtime::convert::link_public_tree(leaf, &value);
                 Some((value, leaf))
             }
             _ => None,
@@ -340,7 +340,7 @@ impl Compiler {
             pairs.push((crate::objects::value_key(key).ok()?, value));
         }
         let value = Value::Map(Map::ordered(pairs.into_boxed_slice()));
-        crate::runtime::convert::link_public_handle(leaf, &value);
+        crate::runtime::convert::link_public_tree(leaf, &value);
         Some((value, leaf))
     }
 

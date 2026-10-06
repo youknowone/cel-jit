@@ -10,6 +10,7 @@
 //! maps and column-window lists intern as strategy windows so the schema
 //! stays shared.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::mem::MaybeUninit;
 use std::sync::Arc;
@@ -34,9 +35,9 @@ use crate::common::types::{
     NULL_TYPE, OPTIONAL_TYPE, STRING_TYPE, TYPE_TYPE, UINT_TYPE,
 };
 use crate::objects::{
-    map_get_by_key, map_has_exact_key, try_build_map, Key, KeyRef, ListRef, ListStorage, Map,
-    MapStorage, Opaque, OptionalValue, PackedRecordBuf, RecordSchema, ScalarBank, ScalarRowsBuf,
-    ValueColumn, ORDERED_SCAN_LIMIT,
+    map_get_by_key, map_has_exact_key, try_build_map, AsKeyRef, Key, KeyRef, ListRef, ListStorage,
+    Map, MapStorage, Opaque, OptionalValue, PackedRecordBuf, RecordSchema, ScalarBank,
+    ScalarRowsBuf, ValueColumn, ORDERED_SCAN_LIMIT,
 };
 use crate::Value;
 
@@ -516,6 +517,62 @@ pub(crate) fn link_public_handle(w: CelRef, value: &Value) {
             }
             _ => {}
         }
+    }
+}
+
+/// [`link_public_handle`] on `w`, then on every interned child that still
+/// names a borrowed public value. Bind retains the parent; a window list
+/// intern's children on get and links them there.
+pub(crate) fn link_public_tree(w: CelRef, value: &Value) {
+    if w.is_null() {
+        return;
+    }
+    link_public_handle(w, value);
+    unsafe { link_public_children(w, value) };
+}
+
+/// # Safety
+///
+/// `w` is the interned form of `value`, allocated on this thread's heap.
+unsafe fn link_public_children(w: CelRef, value: &Value) {
+    match value {
+        Value::List(list) => {
+            if unsafe { w_kind(w) } != CelKind::List {
+                return;
+            }
+            let leaf = unsafe { &*w.cast::<W_ListObject>() };
+            match leaf.strategy {
+                ListStrategy::Object | ListStrategy::Strs => {}
+                ListStrategy::Ints
+                | ListStrategy::Floats
+                | ListStrategy::Window
+                | ListStrategy::Size => return,
+            }
+            let n = list.len() as i64;
+            let mut i = 0i64;
+            while i < n {
+                if let (Some(elt), Some(child)) = (list.get(i as usize), interned_list_get(w, i)) {
+                    link_public_tree(child, &elt);
+                }
+                i += 1;
+            }
+        }
+        Value::Map(map) => {
+            if unsafe { w_kind(w) } != CelKind::Map {
+                return;
+            }
+            for (k, v) in map.iter() {
+                // Record rows yield `Cow::Owned`; those values die at the
+                // end of the iteration, so a link would dangle.
+                let Cow::Borrowed(inner) = v else {
+                    continue;
+                };
+                if let Some(child) = interned_map_get(w, k.as_keyref()) {
+                    link_public_tree(child, inner);
+                }
+            }
+        }
+        _ => {}
     }
 }
 
@@ -1327,7 +1384,10 @@ pub unsafe fn interned_list_get(w: CelRef, index: i64) -> Option<CelRef> {
         return None;
     }
     let list = host_list_ref(opaque_host_index(leaf.storage))?;
-    intern_leaf(&list.get(index as usize)?)
+    let v = list.get(index as usize)?;
+    let child = intern_leaf(&v)?;
+    link_public_handle(child, &v);
+    Some(child)
 }
 
 fn intern_map(map: &Map) -> Result<CelRef, ConvertError> {
@@ -2192,6 +2252,30 @@ mod tests {
         assert_eq!(unsafe { w_type(w) }, &CEL_HOST_LIST_CLASS as *const _);
         let back = unsafe { list_from_ref(w) }.expect("unpack");
         assert!(original.ptr_eq(&back));
+    }
+
+    #[test]
+    fn nested_maps_in_a_linked_list_unpack_the_same_table() {
+        let mut entries = HashMap::new();
+        entries.insert(Key::String(Arc::from("a")), Value::Int(1));
+        let original = Map::object(Arc::new(entries));
+        let value = Value::list(vec![Value::Map(original.clone())]);
+        let w = intern_leaf(&value).expect("intern");
+        link_public_tree(w, &value);
+        let child = unsafe { interned_list_get(w, 0) }.expect("elt");
+        let back = unsafe { map_from_ref(child) }.expect("unpack");
+        assert!(original.ptr_eq(&back));
+    }
+
+    #[test]
+    fn nested_strings_in_a_linked_list_unpack_the_same_arc() {
+        let original: Arc<str> = Arc::from("ab0");
+        let value = Value::list(vec![Value::String(original.clone())]);
+        let w = intern_leaf(&value).expect("intern");
+        link_public_tree(w, &value);
+        let child = unsafe { interned_list_get(w, 0) }.expect("elt");
+        let back = string_from_leaf(unsafe { &*child.cast::<W_StringObject>() }).expect("unpack");
+        assert!(Arc::ptr_eq(&original, &back));
     }
 
     #[test]

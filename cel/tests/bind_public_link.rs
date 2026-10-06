@@ -138,3 +138,91 @@ fn rebind_replaces_the_name_and_the_old_public_handle_stays_valid() {
     assert!(first_buf.ptr_eq(held_list));
     assert_eq!(eval_vm("list", &ctx), second);
 }
+
+fn row_value(i: i64) -> Value {
+    let b: &str = if i % 2 == 0 { "k" } else { "x" };
+    let mut m = HashMap::new();
+    m.insert("a", Value::Int(i));
+    m.insert("b", Value::from(b));
+    m.insert("c", Value::Int(i % 10));
+    Value::from(m)
+}
+
+/// A filter that only selects rows must return the input maps themselves.
+/// Fails while `finish` rebuilds each survivor through `try_build_map`.
+#[test]
+fn filtered_row_is_pointer_identical_to_the_input_row() {
+    let rows: Vec<Value> = (0..8).map(row_value).collect();
+    let originals: Vec<Map> = rows
+        .iter()
+        .map(|v| match v {
+            Value::Map(m) => m.clone(),
+            other => panic!("row: {other:?}"),
+        })
+        .collect();
+    let mut ctx = Context::default();
+    ctx.add_variable_from_value("rows", Value::list(rows));
+
+    for (name, eval) in [
+        ("vm", eval_vm as fn(&str, &Context) -> Value),
+        ("walker", eval_walker),
+    ] {
+        let got = eval(r#"rows.filter(r, r.a > 3 && r.b == "k")"#, &ctx);
+        let Value::List(list) = &got else {
+            panic!("{name}: {got:?}");
+        };
+        assert!(!list.is_empty(), "{name} kept no rows");
+        for i in 0..list.len() {
+            let Value::Map(row) = list.get(i).expect("row") else {
+                panic!("{name} elt {i}");
+            };
+            assert!(
+                originals.iter().any(|orig| orig.ptr_eq(&row)),
+                "{name} kept row {i} is not pointer-identical to an input row"
+            );
+        }
+    }
+}
+
+/// A filter that only selects strings must return the input arcs themselves.
+#[test]
+fn filtered_string_is_pointer_identical_to_the_input_string() {
+    let tags: Vec<Value> = (0..8)
+        .map(|i| {
+            if i % 3 == 0 {
+                Value::from(format!("ab{i}"))
+            } else {
+                Value::from(format!("zz{i}"))
+            }
+        })
+        .collect();
+    let originals: Vec<Arc<str>> = tags
+        .iter()
+        .map(|v| match v {
+            Value::String(s) => Arc::clone(s),
+            other => panic!("tag: {other:?}"),
+        })
+        .collect();
+    let mut ctx = Context::default();
+    ctx.add_variable_from_value("tags", Value::list(tags));
+
+    for (name, eval) in [
+        ("vm", eval_vm as fn(&str, &Context) -> Value),
+        ("walker", eval_walker),
+    ] {
+        let got = eval(r#"tags.filter(t, t.startsWith("ab"))"#, &ctx);
+        let Value::List(list) = &got else {
+            panic!("{name}: {got:?}");
+        };
+        assert!(!list.is_empty(), "{name} kept no tags");
+        for i in 0..list.len() {
+            let Value::String(s) = list.get(i).expect("tag") else {
+                panic!("{name} elt {i}");
+            };
+            assert!(
+                originals.iter().any(|orig| Arc::ptr_eq(orig, &s)),
+                "{name} kept tag {i} is not pointer-identical to an input string"
+            );
+        }
+    }
+}
