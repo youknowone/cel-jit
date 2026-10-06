@@ -19,13 +19,13 @@ use super::object::{
     mapdict_get, mapdict_layout_for_names, mapdict_name_at, new_bool, new_bytes, new_double,
     new_host_list, new_host_list_ints, new_host_list_window, new_int, new_map, new_map_mapdict,
     new_map_record, new_null, new_opaque, new_optional, new_optional_none, new_string, new_type,
-    new_uint, opaque_host_index, prebuilt_int, prebuilt_type, prepare_mapdict_rows, w_kind, w_type,
-    CelClass, CelKind, CelRef, ListStrategy, MapStrategy, W_BoolObject, W_BytesObject,
-    W_DoubleObject, W_FloatColumn, W_HostListObject, W_IntColumn, W_IntObject, W_ListObject,
-    W_MapObject, W_OptionalObject, W_StringObject, W_TypeObject, W_UIntObject, CEL_BOOL_CLASS,
-    CEL_BYTES_CLASS, CEL_DOUBLE_CLASS, CEL_HOST_LIST_CLASS, CEL_INT_CLASS, CEL_LIST_CLASS,
-    CEL_MAP_CLASS, CEL_NULL_CLASS, CEL_OPAQUE_CLASS, CEL_OPTIONAL_CLASS, CEL_STRING_CLASS,
-    CEL_TYPE_CLASS, CEL_UINT_CLASS, MAPDICT_MAX_ENTRIES,
+    new_uint, opaque_host_index, prebuilt_int, prebuilt_type, prepare_mapdict_rows,
+    string_payload_as_str, w_kind, w_type, CelClass, CelKind, CelRef, ListStrategy, MapStrategy,
+    W_BoolObject, W_BytesObject, W_DoubleObject, W_FloatColumn, W_HostListObject, W_IntColumn,
+    W_IntObject, W_ListObject, W_MapObject, W_OptionalObject, W_StringObject, W_TypeObject,
+    W_UIntObject, CEL_BOOL_CLASS, CEL_BYTES_CLASS, CEL_DOUBLE_CLASS, CEL_HOST_LIST_CLASS,
+    CEL_INT_CLASS, CEL_LIST_CLASS, CEL_MAP_CLASS, CEL_NULL_CLASS, CEL_OPAQUE_CLASS,
+    CEL_OPTIONAL_CLASS, CEL_STRING_CLASS, CEL_TYPE_CLASS, CEL_UINT_CLASS, MAPDICT_MAX_ENTRIES,
 };
 use super::object_array::{
     bytes_base, float_words_base, int_words_base, items_block_items_base, items_capacity,
@@ -794,10 +794,7 @@ unsafe fn fresh_key_allocs(w: CelRef) -> Option<usize> {
                 if base.is_null() {
                     return None;
                 }
-                let bytes = std::slice::from_raw_parts(base, n);
-                if std::str::from_utf8(bytes).is_err() {
-                    return None;
-                }
+                debug_assert!(std::str::from_utf8(std::slice::from_raw_parts(base, n)).is_ok());
                 Some(1)
             }
             _ => None,
@@ -1605,8 +1602,7 @@ fn string_from_leaf(leaf: &W_StringObject) -> Result<Arc<str>, ConvertError> {
         return Err(ConvertError::Corrupt("string"));
     }
     let bytes = unsafe { std::slice::from_raw_parts(base, n) };
-    let s = std::str::from_utf8(bytes).map_err(|_| ConvertError::Corrupt("string"))?;
-    Ok(Arc::from(s))
+    Ok(Arc::from(unsafe { string_payload_as_str(bytes) }))
 }
 
 /// Rebuild the `Arc<str>` a leaf's `public` word names. `len` is the leaf's

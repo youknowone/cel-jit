@@ -465,8 +465,8 @@ pub fn new_bytes_concat(left: &[u8], right: &[u8]) -> *mut W_BytesObject {
 /// two are different CEL types with different operations, and a shared leaf
 /// would make the class word the only thing separating them at every use site.
 ///
-/// The payload is UTF-8, so `byte_len` is what indexes the block and is not the
-/// character count.
+/// `chars` is valid UTF-8 by construction (`W_UnicodeObject`); `byte_len`
+/// indexes the block and is not the character count.
 #[cfg_attr(feature = "jit", majit_macros::jit_immutable_fields(chars, byte_len))]
 #[repr(C)]
 #[allow(non_camel_case_types)]
@@ -496,6 +496,8 @@ fn alloc_fresh_string(nbytes: usize) -> (*mut W_StringObject, *mut u8) {
 }
 
 /// [`alloc_fresh_string`] on a heap the caller already resolved.
+///
+/// The caller writes `nbytes` of valid UTF-8 at the returned base.
 ///
 /// ```text
 /// [hdr = W_StringObject::TYPE_ID][leaf][pad to 8]
@@ -588,8 +590,8 @@ pub fn string_from_int_in(heap: &super::heap::CelHeap, n: i64) -> *mut W_StringO
     leaf
 }
 
-/// Box the concatenation of two UTF-8 slices as a CEL `string`.
-pub fn new_string_concat(left: &[u8], right: &[u8]) -> *mut W_StringObject {
+/// Box the concatenation of two UTF-8 strings as a CEL `string`.
+pub fn new_string_concat(left: &str, right: &str) -> *mut W_StringObject {
     let n = left.len() + right.len();
     let (leaf, base) = alloc_fresh_string(n);
     unsafe {
@@ -873,6 +875,18 @@ pub unsafe fn string_byte_len(w: CelRef) -> i64 {
     (*w.cast::<W_StringObject>()).byte_len
 }
 
+/// Interpret a [`W_StringObject`] payload as text.
+///
+/// # Safety
+///
+/// `bytes` are the live `chars` of a [`W_StringObject`]: valid UTF-8 by
+/// construction (`W_UnicodeObject`).
+#[inline]
+pub(crate) unsafe fn string_payload_as_str(bytes: &[u8]) -> &str {
+    debug_assert!(std::str::from_utf8(bytes).is_ok());
+    unsafe { std::str::from_utf8_unchecked(bytes) }
+}
+
 /// Borrow the UTF-8 payload of a string leaf.
 ///
 /// # Safety
@@ -888,7 +902,7 @@ pub unsafe fn string_as_str<'a>(w: CelRef) -> Option<&'a str> {
     if base.is_null() {
         return Some("");
     }
-    std::str::from_utf8(std::slice::from_raw_parts(base, n)).ok()
+    Some(string_payload_as_str(std::slice::from_raw_parts(base, n)))
 }
 
 /// Live length of a bytes leaf.
@@ -3071,7 +3085,7 @@ mod tests {
         let w = string_from_int(42);
         assert_eq!(objects(), before + 1);
         let s = new_string("hi");
-        let cat = new_string_concat(b"ab", b"c");
+        let cat = new_string_concat("ab", "c");
         let empty = new_string("");
         assert_eq!(objects(), before + 4);
         unsafe {

@@ -59,10 +59,10 @@ use super::error::{raise, CelErrCode, ERROR_SENTINEL};
 use super::object::{
     list_ints_slice, mapdict_pair_refs, new_bool, new_bytes_concat, new_double, new_duration,
     new_int, new_list, new_list_ints, new_null, new_string_concat, new_timestamp, new_uint,
-    CelClass, CelRef, W_BytesObject, W_MapObject, W_StringObject, CEL_BOOL_CLASS, CEL_BYTES_CLASS,
-    CEL_DOUBLE_CLASS, CEL_DURATION_CLASS, CEL_HOST_LIST_CLASS, CEL_INT_CLASS, CEL_LIST_CLASS,
-    CEL_MAP_CLASS, CEL_NULL_CLASS, CEL_OPAQUE_CLASS, CEL_OPTIONAL_CLASS, CEL_STRING_CLASS,
-    CEL_TIMESTAMP_CLASS, CEL_TYPE_CLASS, CEL_UINT_CLASS,
+    string_payload_as_str, CelClass, CelRef, W_BytesObject, W_MapObject, W_StringObject,
+    CEL_BOOL_CLASS, CEL_BYTES_CLASS, CEL_DOUBLE_CLASS, CEL_DURATION_CLASS, CEL_HOST_LIST_CLASS,
+    CEL_INT_CLASS, CEL_LIST_CLASS, CEL_MAP_CLASS, CEL_NULL_CLASS, CEL_OPAQUE_CLASS,
+    CEL_OPTIONAL_CLASS, CEL_STRING_CLASS, CEL_TIMESTAMP_CLASS, CEL_TYPE_CLASS, CEL_UINT_CLASS,
 };
 use super::object_array::{bytes_base, items_block_items_base};
 
@@ -214,7 +214,7 @@ fn cmp_bytes(l: &[u8], r: &[u8]) -> i64 {
 pub unsafe fn w_string_add(a: CelRef, b: CelRef) -> CelRef {
     let left = string_bytes(a);
     let right = string_bytes(b);
-    new_string_concat(left, right) as CelRef
+    new_string_concat(string_payload_as_str(left), string_payload_as_str(right)) as CelRef
 }
 
 /// # Safety

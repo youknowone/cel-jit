@@ -3355,7 +3355,10 @@ fn concat_text(a: *mut CelObject, b: *mut CelObject) -> *mut CelObject {
     let Some(right) = (unsafe { str_bytes(b) }) else {
         return core::ptr::null_mut();
     };
-    crate::runtime::object::new_string_concat(left, right) as *mut CelObject
+    crate::runtime::object::new_string_concat(
+        unsafe { crate::runtime::object::string_payload_as_str(left) },
+        unsafe { crate::runtime::object::string_payload_as_str(right) },
+    ) as *mut CelObject
 }
 
 /// `W_StringObject` + `W_StringObject`. [`concat_text`] is the fresh leaf.
