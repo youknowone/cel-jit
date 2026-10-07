@@ -2619,7 +2619,23 @@ pub unsafe fn reset_cel_frame(frame: *mut W_CelFrame, n_slots: i64) {
     if cap > 0 {
         let base =
             crate::runtime::object_array::items_block_items_base((*frame).locals_stack_w.block);
-        core::ptr::write_bytes(base, 0, cap);
+        // Small path: unrolled stores, not a libc memset/bzero.
+        macro_rules! null_cells {
+            ($($i:expr),*) => {{
+                $(base.add($i).write(core::ptr::null_mut());)*
+            }};
+        }
+        match cap {
+            1 => null_cells!(0),
+            2 => null_cells!(0, 1),
+            3 => null_cells!(0, 1, 2),
+            4 => null_cells!(0, 1, 2, 3),
+            5 => null_cells!(0, 1, 2, 3, 4),
+            6 => null_cells!(0, 1, 2, 3, 4, 5),
+            7 => null_cells!(0, 1, 2, 3, 4, 5, 6),
+            8 => null_cells!(0, 1, 2, 3, 4, 5, 6, 7),
+            _ => core::ptr::write_bytes(base, 0, cap),
+        }
     }
 }
 
