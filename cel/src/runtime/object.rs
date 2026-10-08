@@ -59,7 +59,7 @@
 use core::mem::{align_of, offset_of};
 
 use super::lltype;
-use super::object_array::{self, CelBytesBlock, CelItemsBlock};
+use super::object_array::{self, CelBytesBlock, CelInt2Storage, CelItemsBlock, CelLeafStorage};
 
 /// The coarse family a value belongs to.
 ///
@@ -2484,9 +2484,15 @@ const _: () = {
 
 /// The activation record, `pyframe.py` `PyFrame` virtualizable subset.
 ///
-/// `_virtualizable_ = ['last_instr', 'valuestackdepth', 'locals_stack_w[*]']`
-/// (`interp_jit.py`). The JIT driver names this object `virtualizables =
-/// ['frame']`. Slots are a fixed [`CelItemsBlock`] — `make_sure_not_resized`.
+/// `_virtualizable_ = ['last_instr', 'valuestackdepth', 'locals_stack_w[*]',
+/// 'vm', 'ctx', 'map', 'block', 'registry_map', 'entries']`
+/// (`interp_jit.py` `PyPyJitDriver`, `virtualizables = ['frame']`). Slots
+/// are a fixed [`CelItemsBlock`] — `make_sure_not_resized`.
+///
+/// `vm` / `ctx` / `map` / `block` / `registry_map` / `entries` are the
+/// `pyframe.py` `get_w_globals` shape: the portal reads them off the live
+/// frame. A reused frame is rebound for each execute, so they are
+/// virtualizable static fields, not `_immutable_fields_`.
 #[repr(C)]
 #[allow(non_camel_case_types)]
 pub struct W_CelFrame {
@@ -2503,6 +2509,18 @@ pub struct W_CelFrame {
     /// instead of `Option<Box<_>>`. Not part of the input list; it changes
     /// when a residual hydrates.
     pub scratch_bits: i64,
+    /// Evaluator bits for this execute (`interp_jit.py` `PyPyJitDriver` `ec`).
+    pub vm: i64,
+    /// Context bits (`pyframe.py` `get_w_globals`).
+    pub ctx: i64,
+    /// Scope map pointer (`mapdict.py` `_get_mapdict_map`).
+    pub map: i64,
+    /// Interned-leaf storage (`mapdict.py` `_mapdict_read_storage`).
+    pub block: *mut CelLeafStorage,
+    /// Root registry map pointer (`mapdict.py` `_get_mapdict_map`).
+    pub registry_map: i64,
+    /// Two-int entry storage of the root registry.
+    pub entries: *mut CelInt2Storage,
 }
 
 /// The `locals_cells_stack_w[*]` array: a pointer that indexes as a slice.
@@ -2567,6 +2585,12 @@ pub const CELFRAME_LAST_INSTR_OFFSET: usize = offset_of!(W_CelFrame, last_instr)
 pub const CELFRAME_VALUESTACKDEPTH_OFFSET: usize = offset_of!(W_CelFrame, valuestackdepth);
 pub const CELFRAME_LOCALS_STACK_OFFSET: usize = offset_of!(W_CelFrame, locals_stack_w);
 pub const CELFRAME_SCRATCH_BITS_OFFSET: usize = offset_of!(W_CelFrame, scratch_bits);
+pub const CELFRAME_VM_OFFSET: usize = offset_of!(W_CelFrame, vm);
+pub const CELFRAME_CTX_OFFSET: usize = offset_of!(W_CelFrame, ctx);
+pub const CELFRAME_MAP_OFFSET: usize = offset_of!(W_CelFrame, map);
+pub const CELFRAME_BLOCK_OFFSET: usize = offset_of!(W_CelFrame, block);
+pub const CELFRAME_REGISTRY_MAP_OFFSET: usize = offset_of!(W_CelFrame, registry_map);
+pub const CELFRAME_ENTRIES_OFFSET: usize = offset_of!(W_CelFrame, entries);
 
 /// Allocate a frame whose array is `n_slots + max_stack` and never resized.
 pub fn new_cel_frame(n_slots: i64, max_stack: i64) -> *mut W_CelFrame {
@@ -2597,7 +2621,40 @@ pub fn new_cel_frame_in(
         locals_stack_w: VableStack::from_block(items),
         n_slots,
         scratch_bits: 0,
+        vm: 0,
+        ctx: 0,
+        map: 0,
+        block: core::ptr::null_mut(),
+        registry_map: 0,
+        entries: core::ptr::null_mut(),
     })
+}
+
+/// Bind the per-execute words the portal reads off the frame
+/// (`pyframe.py` `get_w_globals`).
+///
+/// Written once when the frame is set up for an execution. A reused
+/// frame is rebound, so these are virtualizable static fields.
+///
+/// # Safety
+///
+/// `frame` is a live [`W_CelFrame`].
+#[inline]
+pub unsafe fn bind_cel_frame_portal(
+    frame: *mut W_CelFrame,
+    vm: i64,
+    ctx: i64,
+    map: i64,
+    block: *mut CelLeafStorage,
+    registry_map: i64,
+    entries: *mut CelInt2Storage,
+) {
+    (*frame).vm = vm;
+    (*frame).ctx = ctx;
+    (*frame).map = map;
+    (*frame).block = block;
+    (*frame).registry_map = registry_map;
+    (*frame).entries = entries;
 }
 
 /// Reset a reused frame so the next execute sees the same initial state as
@@ -2969,13 +3026,19 @@ const _: () = {
     assert!(offset_of!(W_MapObject, public_kind) == 48);
     assert!(offset_of!(W_MapObject, public_len) == 52);
     assert!(offset_of!(W_MapObject, layout) == 56);
-    assert!(size_of::<W_CelFrame>() == 56);
+    assert!(size_of::<W_CelFrame>() == 104);
     assert!(offset_of!(W_CelFrame, vable_token) == 8);
     assert!(offset_of!(W_CelFrame, last_instr) == 16);
     assert!(offset_of!(W_CelFrame, valuestackdepth) == 24);
     assert!(offset_of!(W_CelFrame, locals_stack_w) == 32);
     assert!(offset_of!(W_CelFrame, n_slots) == 40);
     assert!(offset_of!(W_CelFrame, scratch_bits) == 48);
+    assert!(offset_of!(W_CelFrame, vm) == 56);
+    assert!(offset_of!(W_CelFrame, ctx) == 64);
+    assert!(offset_of!(W_CelFrame, map) == 72);
+    assert!(offset_of!(W_CelFrame, block) == 80);
+    assert!(offset_of!(W_CelFrame, registry_map) == 88);
+    assert!(offset_of!(W_CelFrame, entries) == 96);
     assert!(size_of::<W_OpaqueObject>() == 24);
     assert!(offset_of!(W_OpaqueObject, w_type) == 8);
     assert!(offset_of!(W_OpaqueObject, host_index) == 16);
@@ -3238,6 +3301,15 @@ mod tests {
                 CELFRAME_LOCALS_STACK_OFFSET,
                 offset_of!(W_CelFrame, locals_stack_w)
             );
+            assert_eq!(CELFRAME_VM_OFFSET, offset_of!(W_CelFrame, vm));
+            assert_eq!(CELFRAME_CTX_OFFSET, offset_of!(W_CelFrame, ctx));
+            assert_eq!(CELFRAME_MAP_OFFSET, offset_of!(W_CelFrame, map));
+            assert_eq!(CELFRAME_BLOCK_OFFSET, offset_of!(W_CelFrame, block));
+            assert_eq!(
+                CELFRAME_REGISTRY_MAP_OFFSET,
+                offset_of!(W_CelFrame, registry_map)
+            );
+            assert_eq!(CELFRAME_ENTRIES_OFFSET, offset_of!(W_CelFrame, entries));
         }
     }
 

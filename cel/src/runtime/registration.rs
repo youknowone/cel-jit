@@ -565,6 +565,58 @@ pub static CEL_CLASS_LAYOUTS: &[ClassLayout] = &[
                 true,
                 false,
             ),
+            field(
+                "vm",
+                offset_of!(W_CelFrame, vm),
+                WORD,
+                Type::Int,
+                true,
+                false,
+            ),
+            field(
+                "ctx",
+                offset_of!(W_CelFrame, ctx),
+                WORD,
+                Type::Int,
+                true,
+                false,
+            ),
+            field(
+                "map",
+                offset_of!(W_CelFrame, map),
+                WORD,
+                Type::Int,
+                true,
+                false,
+            ),
+            // Ref for intern_var_pure (ref_params, inline_ref getfield).
+            // CelLeafStorage is host memory: not in gc_ptr_offsets.
+            field(
+                "block",
+                offset_of!(W_CelFrame, block),
+                WORD,
+                Type::Ref,
+                false,
+                false,
+            ),
+            field(
+                "registry_map",
+                offset_of!(W_CelFrame, registry_map),
+                WORD,
+                Type::Int,
+                true,
+                false,
+            ),
+            // Ref for host_int2_cell (ref_params, inline_ref getfield).
+            // CelInt2Storage is host memory: not in gc_ptr_offsets.
+            field(
+                "entries",
+                offset_of!(W_CelFrame, entries),
+                WORD,
+                Type::Ref,
+                false,
+                false,
+            ),
         ],
     },
     ClassLayout {

@@ -1,10 +1,14 @@
 //! The JIT portal for [`super::interp::cel_eval_loop`].
 //!
-//! Greens are `(pc, program)`. The frame is the virtualizable
-//! (`virtualizable_fields`): `last_instr`, `valuestackdepth`, and
-//! `locals_stack_w[*]`. Its token is 0 outside the JIT (`TOKEN_NONE`,
-//! `virtualizable.py`). `jit_merge_point` is the first statement of the
-//! loop; `can_enter_jit` is only on a backward jump.
+//! Greens are `(pc, program)`. The one red is the frame
+//! (`interp_jit.py` `PyPyJitDriver`, `virtualizables = ['frame']`).
+//! Virtualizable fields: `last_instr`, `valuestackdepth`,
+//! `locals_stack_w[*]`, and the per-execute words the portal used to
+//! carry as reds (`vm`, `ctx`, `map`, `block`, `registry_map`,
+//! `entries`), read off the live frame (`pyframe.py` `get_w_globals`).
+//! Its token is 0 outside the JIT (`TOKEN_NONE`, `virtualizable.py`).
+//! `jit_merge_point` is the first statement of the loop; `can_enter_jit`
+//! is only on a backward jump.
 //!
 //! Interned arithmetic, comparison, local load/store, context load,
 //! field/index and return run on `frame.locals_stack_w[i]` — the
@@ -356,23 +360,6 @@ macro_rules! interned_arith_local_k_append {
 
 struct PortalState {
     frame: usize,
-    vm: i64,
-    /// Context address. Used by the residual storage read; the trace does
-    /// not promote it (`_mapdict_read_storage` against a fresh root).
-    ctx: i64,
-    /// Scope map pointer read from the context at entry
-    /// (`mapdict.py` `_get_mapdict_map`).
-    map: i64,
-    /// Interned-leaf storage, read from the context at entry. Red ref:
-    /// `intern_var_pure` hops `parent` and reads `items[storageindex]`.
-    block: usize,
-    /// Root registry map pointer, read at entry (`_get_mapdict_map`).
-    /// A child walks to the root once, outside the trace.
-    registry_map: i64,
-    /// Two-int entry storage of the root registry, read at entry.
-    /// `host_int2_cell` reads `items[storageindex]`.
-    entries: usize,
-    ret: i64,
 }
 
 /// One opcode as an integer, residual so the portal does not index a `Vec`.
@@ -1672,7 +1659,7 @@ fn call_portal(
     code: &CelCode,
     state: &mut PortalState,
 ) -> *mut CelObject {
-    let heap = portal_heap(state.vm);
+    let heap = portal_heap(unsafe { (*(state.frame as *mut W_CelFrame)).vm });
     let prev = unsafe {
         (*heap)
             .active_driver
@@ -1739,22 +1726,27 @@ pub(crate) fn eval_through_portal(
     vm: &mut Vm<'_>,
     code: &CelCode,
 ) -> Result<Value, ExecutionError> {
+    let vm_bits = vm as *mut Vm<'_> as i64;
+    unsafe {
+        crate::runtime::object::bind_cel_frame_portal(
+            vm.cel_frame,
+            vm_bits,
+            vm.ctx as *const crate::context::Context as usize as i64,
+            vm.ctx.portal_map(),
+            vm.ctx.portal_leaf_storage(),
+            vm.ctx.registry_map_bits(),
+            vm.ctx.portal_int2_entries(),
+        );
+    }
     let mut state = PortalState {
         frame: vm.cel_frame as usize,
-        vm: vm as *mut Vm<'_> as i64,
-        ctx: vm.ctx as *const crate::context::Context as usize as i64,
-        map: vm.ctx.portal_map(),
-        block: vm.ctx.portal_leaf_storage() as usize,
-        registry_map: vm.ctx.registry_map_bits(),
-        entries: vm.ctx.portal_int2_entries() as usize,
-        ret: 0,
     };
     // A host call can re-enter this function on the same thread. The nested
     // evaluation must not leave its VM in the heap slot, or the outer
     // `RETURN` parks on that VM and this one finishes with no result.
     // The heap pointer was resolved when the scope opened.
     let heap = vm.heap;
-    let prev_vm = unsafe { (*heap).portal_vm.replace(state.vm) };
+    let prev_vm = unsafe { (*heap).portal_vm.replace(vm_bits) };
     struct PortalVmGuard {
         heap: *const crate::runtime::heap::CelHeap,
         prev: i64,
@@ -1789,10 +1781,9 @@ pub(crate) fn eval_through_portal(
     } else {
         run_table_driver(code, &mut state)
     };
-    // Non-null is `DoneWithThisFrameDescrRef`. Null is not a leaf:
-    // `vm.portal_ret` was set by the exit (`residual_hydrate` /
-    // `vm_park_return`). `state.ret` is not read here — a compiled FINISH
-    // does not write it back (`warmstate.py execute_assembler`).
+    // Non-null is `compile.py` `DoneWithThisFrameDescrRef`. Null is not a
+    // leaf: `vm.portal_ret` was set by the exit (`residual_hydrate` /
+    // `vm_park_return`).
     if !leaf.is_null() {
         return Ok(Value::from_interned(leaf));
     }
@@ -4595,24 +4586,26 @@ fn host_call2_i(entry: i64, a: i64, b: i64) -> i64 {
     greens = [pc, program],
     state_fields = {
         frame: ref(W_CelFrame),
-        vm: int,
-        ctx: int,
-        map: int,
-        block: ref(crate::runtime::object_array::CelLeafStorage),
-        registry_map: int,
-        entries: ref(crate::runtime::object_array::CelInt2Storage),
-        ret: int,
     },
-    // `interp_jit.py` `_virtualizable_` on the frame, `virtualizables=['frame']`.
-    // The array is one pointer to a block whose length word is at offset 0
-    // and whose items begin at `CEL_ITEMS_BLOCK_ITEMS_OFFSET`
-    // (`jtransform.py` `getarrayitem_vable_*`, direct `Ptr` array).
+    // `interp_jit.py` `PyPyJitDriver` `_virtualizable_` on the frame,
+    // `virtualizables=['frame']`. The array is one pointer to a block
+    // whose length word is at offset 0 and whose items begin at
+    // `CEL_ITEMS_BLOCK_ITEMS_OFFSET` (`jtransform.py` `getarrayitem_vable_*`,
+    // direct `Ptr` array). Per-execute words live on the frame
+    // (`pyframe.py` `get_w_globals`); a reused frame is rebound, so they
+    // are virtualizable static fields, not `_immutable_fields_`.
     virtualizable_fields = {
         var: frame,
         token_offset: crate::runtime::object::CELFRAME_VABLE_TOKEN_OFFSET,
         fields: {
             last_instr: int @ crate::runtime::object::CELFRAME_LAST_INSTR_OFFSET,
             valuestackdepth: int @ crate::runtime::object::CELFRAME_VALUESTACKDEPTH_OFFSET,
+            vm: int @ crate::runtime::object::CELFRAME_VM_OFFSET,
+            ctx: int @ crate::runtime::object::CELFRAME_CTX_OFFSET,
+            map: int @ crate::runtime::object::CELFRAME_MAP_OFFSET,
+            block: ref @ crate::runtime::object::CELFRAME_BLOCK_OFFSET,
+            registry_map: int @ crate::runtime::object::CELFRAME_REGISTRY_MAP_OFFSET,
+            entries: ref @ crate::runtime::object::CELFRAME_ENTRIES_OFFSET,
         },
         arrays: {
             locals_stack_w: ref @ (crate::runtime::object::CELFRAME_LOCALS_STACK_OFFSET) {
@@ -4821,14 +4814,14 @@ fn run_cel_portal(
         match opcode {
             OP_LOAD_VAR => {
                 state.frame.last_instr = pc as i64;
-                let vm = state.vm;
+                let vm = state.frame.vm;
                 let here = pc as i64;
                 let w = intern_var_pure(
-                    state.block as *mut crate::runtime::object_array::CelLeafStorage,
+                    state.frame.block as *mut crate::runtime::object_array::CelLeafStorage,
                     vm,
                     program,
                     insn_a(program, pc),
-                    state.map,
+                    state.frame.map,
                 );
                 let next = if w.is_null() {
                     slow_pc(vm, here)
@@ -4846,12 +4839,11 @@ fn run_cel_portal(
                     pc = tgt;
                     continue;
                 }
-                state.ret = next;
                 return core::ptr::null_mut();
             }
             OP_LOAD_CONST => {
                 state.frame.last_instr = pc as i64;
-                let vm = state.vm;
+                let vm = state.frame.vm;
                 let here = pc as i64;
                 let w = intern_const(program, insn_a(program, pc));
                 let next = if w.is_null() {
@@ -4870,12 +4862,11 @@ fn run_cel_portal(
                     pc = tgt;
                     continue;
                 }
-                state.ret = next;
                 return core::ptr::null_mut();
             }
             OP_LOAD_LOCAL => {
                 state.frame.last_instr = pc as i64;
-                let vm = state.vm;
+                let vm = state.frame.vm;
                 let here = pc as i64;
                 let w = state.frame.locals_stack_w[insn_a(program, pc)];
                 let next = if w.is_null() {
@@ -4894,12 +4885,11 @@ fn run_cel_portal(
                     pc = tgt;
                     continue;
                 }
-                state.ret = next;
                 return core::ptr::null_mut();
             }
             OP_STORE_LOCAL => {
                 state.frame.last_instr = pc as i64;
-                let vm = state.vm;
+                let vm = state.frame.vm;
                 let here = pc as i64;
                 let depth = state.frame.valuestackdepth;
                 let w = state.frame.locals_stack_w[depth - 1];
@@ -4920,12 +4910,11 @@ fn run_cel_portal(
                     pc = tgt;
                     continue;
                 }
-                state.ret = next;
                 return core::ptr::null_mut();
             }
             OP_RETURN => {
                 state.frame.last_instr = pc as i64;
-                let vm = state.vm;
+                let vm = state.frame.vm;
                 let here = pc as i64;
                 let depth = state.frame.valuestackdepth;
                 let w = state.frame.locals_stack_w[depth - 1];
@@ -4942,13 +4931,12 @@ fn run_cel_portal(
                         pc = tgt;
                         continue;
                     }
-                    state.ret = next;
                 }
                 return w;
             }
             OP_ADD_K => {
                 state.frame.last_instr = pc as i64;
-                let vm = state.vm;
+                let vm = state.frame.vm;
                 let here = pc as i64;
                 let k = intern_const(program, insn_a(program, pc));
                 let depth = state.frame.valuestackdepth;
@@ -5004,12 +4992,11 @@ fn run_cel_portal(
                     pc = tgt;
                     continue;
                 }
-                state.ret = next;
                 return core::ptr::null_mut();
             }
             OP_MUL_K => {
                 state.frame.last_instr = pc as i64;
-                let vm = state.vm;
+                let vm = state.frame.vm;
                 let here = pc as i64;
                 let k = intern_const(program, insn_a(program, pc));
                 let depth = state.frame.valuestackdepth;
@@ -5053,12 +5040,11 @@ fn run_cel_portal(
                     pc = tgt;
                     continue;
                 }
-                state.ret = next;
                 return core::ptr::null_mut();
             }
             OP_ADD_LOCAL_K => {
                 state.frame.last_instr = pc as i64;
-                let vm = state.vm;
+                let vm = state.frame.vm;
                 let here = pc as i64;
                 let a = state.frame.locals_stack_w[insn_a(program, pc)];
                 let k = intern_const(program, insn_b(program, pc));
@@ -5103,12 +5089,11 @@ fn run_cel_portal(
                     pc = tgt;
                     continue;
                 }
-                state.ret = next;
                 return core::ptr::null_mut();
             }
             OP_MOD_K => {
                 state.frame.last_instr = pc as i64;
-                let vm = state.vm;
+                let vm = state.frame.vm;
                 let here = pc as i64;
                 let k = intern_const(program, insn_a(program, pc));
                 let depth = state.frame.valuestackdepth;
@@ -5158,12 +5143,11 @@ fn run_cel_portal(
                     pc = tgt;
                     continue;
                 }
-                state.ret = next;
                 return core::ptr::null_mut();
             }
             OP_EQ_LOCAL_K => {
                 state.frame.last_instr = pc as i64;
-                let vm = state.vm;
+                let vm = state.frame.vm;
                 let here = pc as i64;
                 let a = state.frame.locals_stack_w[insn_a(program, pc)];
                 let k = intern_const(program, insn_b(program, pc));
@@ -5209,12 +5193,11 @@ fn run_cel_portal(
                     pc = tgt;
                     continue;
                 }
-                state.ret = next;
                 return core::ptr::null_mut();
             }
             OP_GT_LOCAL_K => {
                 state.frame.last_instr = pc as i64;
-                let vm = state.vm;
+                let vm = state.frame.vm;
                 let here = pc as i64;
                 let a = state.frame.locals_stack_w[insn_a(program, pc)];
                 let k = intern_const(program, insn_b(program, pc));
@@ -5279,12 +5262,11 @@ fn run_cel_portal(
                     pc = tgt;
                     continue;
                 }
-                state.ret = next;
                 return core::ptr::null_mut();
             }
             OP_MUL_LOCAL_K_APPEND => {
                 state.frame.last_instr = pc as i64;
-                let vm = state.vm;
+                let vm = state.frame.vm;
                 let here = pc as i64;
                 let a = state.frame.locals_stack_w[insn_a(program, pc)];
                 let k = intern_const(program, insn_b(program, pc));
@@ -5335,12 +5317,11 @@ fn run_cel_portal(
                     pc = tgt;
                     continue;
                 }
-                state.ret = next;
                 return core::ptr::null_mut();
             }
             OP_ADD_LOCAL_K_APPEND => {
                 state.frame.last_instr = pc as i64;
-                let vm = state.vm;
+                let vm = state.frame.vm;
                 let here = pc as i64;
                 let a = state.frame.locals_stack_w[insn_a(program, pc)];
                 let k = intern_const(program, insn_b(program, pc));
@@ -5412,12 +5393,11 @@ fn run_cel_portal(
                     pc = tgt;
                     continue;
                 }
-                state.ret = next;
                 return core::ptr::null_mut();
             }
             OP_MOD_LOCAL_K_APPEND => {
                 state.frame.last_instr = pc as i64;
-                let vm = state.vm;
+                let vm = state.frame.vm;
                 let here = pc as i64;
                 let a = state.frame.locals_stack_w[insn_a(program, pc)];
                 let k = intern_const(program, insn_b(program, pc));
@@ -5468,12 +5448,11 @@ fn run_cel_portal(
                     pc = tgt;
                     continue;
                 }
-                state.ret = next;
                 return core::ptr::null_mut();
             }
             OP_INDEX => {
                 state.frame.last_instr = pc as i64;
-                let vm = state.vm;
+                let vm = state.frame.vm;
                 let here = pc as i64;
                 let depth = state.frame.valuestackdepth;
                 let key_i = depth - 1;
@@ -5512,12 +5491,11 @@ fn run_cel_portal(
                     pc = tgt;
                     continue;
                 }
-                state.ret = next;
                 return core::ptr::null_mut();
             }
             OP_JUMP_IF_FALSE => {
                 state.frame.last_instr = pc as i64;
-                let vm = state.vm;
+                let vm = state.frame.vm;
                 let here = pc as i64;
                 let depth = state.frame.valuestackdepth;
                 let i = depth - 1;
@@ -5546,7 +5524,6 @@ fn run_cel_portal(
                     pc = tgt;
                     continue;
                 }
-                state.ret = next;
                 return core::ptr::null_mut();
             }
             OP_JUMP_IF_OPT_NONE => {
@@ -5571,12 +5548,11 @@ fn run_cel_portal(
                     pc = tgt;
                     continue;
                 }
-                state.ret = next;
                 return core::ptr::null_mut();
             }
             OP_NEW_MAP => {
                 state.frame.last_instr = pc as i64;
-                let vm = state.vm;
+                let vm = state.frame.vm;
                 let here = pc as i64;
                 let w = alloc_map(vm, insn_a(program, pc));
                 let depth = state.frame.valuestackdepth;
@@ -5591,12 +5567,11 @@ fn run_cel_portal(
                     pc = tgt;
                     continue;
                 }
-                state.ret = next;
                 return core::ptr::null_mut();
             }
             OP_MAP_INSERT => {
                 state.frame.last_instr = pc as i64;
-                let vm = state.vm;
+                let vm = state.frame.vm;
                 let here = pc as i64;
                 let depth = state.frame.valuestackdepth;
                 let value = state.frame.locals_stack_w[depth - 1];
@@ -5630,12 +5605,11 @@ fn run_cel_portal(
                     pc = tgt;
                     continue;
                 }
-                state.ret = next;
                 return core::ptr::null_mut();
             }
             OP_ITER_ELEMS => {
                 state.frame.last_instr = pc as i64;
-                let vm = state.vm;
+                let vm = state.frame.vm;
                 let here = pc as i64;
                 let depth = state.frame.valuestackdepth;
                 let w = state.frame.locals_stack_w[depth - 1];
@@ -5660,12 +5634,11 @@ fn run_cel_portal(
                     pc = tgt;
                     continue;
                 }
-                state.ret = next;
                 return core::ptr::null_mut();
             }
             OP_NEW_LIST => {
                 state.frame.last_instr = pc as i64;
-                let vm = state.vm;
+                let vm = state.frame.vm;
                 let here = pc as i64;
                 let w = alloc_list(vm, insn_a(program, pc));
                 let depth = state.frame.valuestackdepth;
@@ -5680,12 +5653,11 @@ fn run_cel_portal(
                     pc = tgt;
                     continue;
                 }
-                state.ret = next;
                 return core::ptr::null_mut();
             }
             OP_LIST_APPEND => {
                 state.frame.last_instr = pc as i64;
-                let vm = state.vm;
+                let vm = state.frame.vm;
                 let here = pc as i64;
                 let depth = state.frame.valuestackdepth;
                 let item = state.frame.locals_stack_w[depth - 1];
@@ -5732,12 +5704,11 @@ fn run_cel_portal(
                     pc = tgt;
                     continue;
                 }
-                state.ret = next;
                 return core::ptr::null_mut();
             }
             OP_NEW_LIST_FROM_ARG => {
                 state.frame.last_instr = pc as i64;
-                let vm = state.vm;
+                let vm = state.frame.vm;
                 let here = pc as i64;
                 let src = state.frame.locals_stack_w[insn_a(program, pc)];
                 let next = if cell_kind(src) == CelKind::List as i64 {
@@ -5757,12 +5728,11 @@ fn run_cel_portal(
                     pc = tgt;
                     continue;
                 }
-                state.ret = next;
                 return core::ptr::null_mut();
             }
             OP_ITER_GUARD => {
                 state.frame.last_instr = pc as i64;
-                let vm = state.vm;
+                let vm = state.frame.vm;
                 let here = pc as i64;
                 let idx_w = state.frame.locals_stack_w[insn_a(program, pc)];
                 let src = state.frame.locals_stack_w[insn_b(program, pc)];
@@ -5789,12 +5759,11 @@ fn run_cel_portal(
                     pc = tgt;
                     continue;
                 }
-                state.ret = next;
                 return core::ptr::null_mut();
             }
             OP_ITER_BIND => {
                 state.frame.last_instr = pc as i64;
-                let vm = state.vm;
+                let vm = state.frame.vm;
                 let here = pc as i64;
                 let src = state.frame.locals_stack_w[insn_a(program, pc)];
                 let idx_w = state.frame.locals_stack_w[insn_b(program, pc)];
@@ -5823,12 +5792,11 @@ fn run_cel_portal(
                     pc = tgt;
                     continue;
                 }
-                state.ret = next;
                 return core::ptr::null_mut();
             }
             OP_ITER_ADVANCE => {
                 state.frame.last_instr = pc as i64;
-                let vm = state.vm;
+                let vm = state.frame.vm;
                 let here = pc as i64;
                 let slot = insn_a(program, pc);
                 let w = state.frame.locals_stack_w[slot];
@@ -5850,12 +5818,11 @@ fn run_cel_portal(
                     pc = tgt;
                     continue;
                 }
-                state.ret = next;
                 return core::ptr::null_mut();
             }
             OP_ACCU_LOOP_COND | OP_ACCU_LOOP_COND_NOT => {
                 state.frame.last_instr = pc as i64;
-                let vm = state.vm;
+                let vm = state.frame.vm;
                 let here = pc as i64;
                 let w = state.frame.locals_stack_w[insn_a(program, pc)];
                 let bit = cell_bool(w);
@@ -5877,12 +5844,11 @@ fn run_cel_portal(
                     pc = tgt;
                     continue;
                 }
-                state.ret = next;
                 return core::ptr::null_mut();
             }
             OP_AND_LOCAL | OP_OR_LOCAL => {
                 state.frame.last_instr = pc as i64;
-                let vm = state.vm;
+                let vm = state.frame.vm;
                 let here = pc as i64;
                 let slot = insn_a(program, pc);
                 let w = state.frame.locals_stack_w[slot];
@@ -5907,12 +5873,11 @@ fn run_cel_portal(
                     pc = tgt;
                     continue;
                 }
-                state.ret = next;
                 return core::ptr::null_mut();
             }
             OP_AND_MERGE | OP_OR_MERGE => {
                 state.frame.last_instr = pc as i64;
-                let vm = state.vm;
+                let vm = state.frame.vm;
                 let here = pc as i64;
                 let depth = state.frame.valuestackdepth;
                 let i = depth - 1;
@@ -5936,12 +5901,11 @@ fn run_cel_portal(
                     pc = tgt;
                     continue;
                 }
-                state.ret = next;
                 return core::ptr::null_mut();
             }
             OP_LOAD_LOCAL_APPEND => {
                 state.frame.last_instr = pc as i64;
-                let vm = state.vm;
+                let vm = state.frame.vm;
                 let here = pc as i64;
                 let w = state.frame.locals_stack_w[insn_a(program, pc)];
                 let depth = state.frame.valuestackdepth;
@@ -5991,13 +5955,12 @@ fn run_cel_portal(
                     pc = tgt;
                     continue;
                 }
-                state.ret = next;
                 return core::ptr::null_mut();
             }
             OP_ADD | OP_SUB | OP_MUL | OP_DIV | OP_MOD | OP_EQ | OP_NE | OP_LT | OP_LE | OP_GT
             | OP_GE => {
                 state.frame.last_instr = pc as i64;
-                let vm = state.vm;
+                let vm = state.frame.vm;
                 let here = pc as i64;
                 let depth = state.frame.valuestackdepth;
                 let bi = depth - 1;
@@ -6114,12 +6077,11 @@ fn run_cel_portal(
                     pc = tgt;
                     continue;
                 }
-                state.ret = next;
                 return core::ptr::null_mut();
             }
             OP_EQ_K | OP_NE_K | OP_LT_K | OP_GT_K | OP_GE_K => {
                 state.frame.last_instr = pc as i64;
-                let vm = state.vm;
+                let vm = state.frame.vm;
                 let here = pc as i64;
                 let k = intern_const(program, insn_a(program, pc));
                 let depth = state.frame.valuestackdepth;
@@ -6213,12 +6175,11 @@ fn run_cel_portal(
                     pc = tgt;
                     continue;
                 }
-                state.ret = next;
                 return core::ptr::null_mut();
             }
             OP_MOD_LOCAL_K | OP_LT_LOCAL_K | OP_NE_LOCAL_K | OP_GE_LOCAL_K => {
                 state.frame.last_instr = pc as i64;
-                let vm = state.vm;
+                let vm = state.frame.vm;
                 let here = pc as i64;
                 let a = state.frame.locals_stack_w[insn_a(program, pc)];
                 let k = intern_const(program, insn_b(program, pc));
@@ -6325,13 +6286,12 @@ fn run_cel_portal(
                     pc = tgt;
                     continue;
                 }
-                state.ret = next;
                 return core::ptr::null_mut();
             }
             OP_EQ_LOCAL_K_APPEND | OP_GT_LOCAL_K_APPEND | OP_LT_LOCAL_K_APPEND
             | OP_NE_LOCAL_K_APPEND | OP_GE_LOCAL_K_APPEND => {
                 state.frame.last_instr = pc as i64;
-                let vm = state.vm;
+                let vm = state.frame.vm;
                 let here = pc as i64;
                 let a = state.frame.locals_stack_w[insn_a(program, pc)];
                 let k = intern_const(program, insn_b(program, pc));
@@ -6471,12 +6431,11 @@ fn run_cel_portal(
                     pc = tgt;
                     continue;
                 }
-                state.ret = next;
                 return core::ptr::null_mut();
             }
             OP_NEGATE => {
                 state.frame.last_instr = pc as i64;
-                let vm = state.vm;
+                let vm = state.frame.vm;
                 let here = pc as i64;
                 let depth = state.frame.valuestackdepth;
                 let i = depth - 1;
@@ -6507,12 +6466,11 @@ fn run_cel_portal(
                     pc = tgt;
                     continue;
                 }
-                state.ret = next;
                 return core::ptr::null_mut();
             }
             OP_NOT => {
                 state.frame.last_instr = pc as i64;
-                let vm = state.vm;
+                let vm = state.frame.vm;
                 let here = pc as i64;
                 let depth = state.frame.valuestackdepth;
                 let i = depth - 1;
@@ -6538,7 +6496,6 @@ fn run_cel_portal(
                     pc = tgt;
                     continue;
                 }
-                state.ret = next;
                 return core::ptr::null_mut();
             }
             OP_JUMP => {
@@ -6552,12 +6509,11 @@ fn run_cel_portal(
                     pc = tgt;
                     continue;
                 }
-                state.ret = next;
                 return core::ptr::null_mut();
             }
             OP_AND | OP_OR => {
                 state.frame.last_instr = pc as i64;
-                let vm = state.vm;
+                let vm = state.frame.vm;
                 let here = pc as i64;
                 let depth = state.frame.valuestackdepth;
                 let i = depth - 1;
@@ -6587,12 +6543,11 @@ fn run_cel_portal(
                     pc = tgt;
                     continue;
                 }
-                state.ret = next;
                 return core::ptr::null_mut();
             }
             OP_CALL_HOST => {
                 state.frame.last_instr = pc as i64;
-                let vm = state.vm;
+                let vm = state.frame.vm;
                 let here = pc as i64;
                 let arity = insn_b(program, pc);
                 let name = insn_a(program, pc);
@@ -6667,8 +6622,8 @@ fn run_cel_portal(
                                 if cell_kind(left) == CelKind::Int as i64 {
                                     if cell_kind(right) == CelKind::Int as i64 {
                                         let r = host_int2_cell(
-                                            state.registry_map,
-                                            state.entries
+                                            state.frame.registry_map,
+                                            state.frame.entries
                                                 as *mut crate::runtime::object_array::CelInt2Storage,
                                             vm,
                                             program,
@@ -6711,12 +6666,11 @@ fn run_cel_portal(
                     pc = tgt;
                     continue;
                 }
-                state.ret = next;
                 return core::ptr::null_mut();
             }
             OP_CALL_METHOD => {
                 state.frame.last_instr = pc as i64;
-                let vm = state.vm;
+                let vm = state.frame.vm;
                 let here = pc as i64;
                 let arity = insn_b(program, pc);
                 let name = insn_a(program, pc);
@@ -6836,12 +6790,11 @@ fn run_cel_portal(
                     pc = tgt;
                     continue;
                 }
-                state.ret = next;
                 return core::ptr::null_mut();
             }
             OP_IN => {
                 state.frame.last_instr = pc as i64;
-                let vm = state.vm;
+                let vm = state.frame.vm;
                 let here = pc as i64;
                 let depth = state.frame.valuestackdepth;
                 let box_i = depth - 2;
@@ -6886,12 +6839,11 @@ fn run_cel_portal(
                     pc = tgt;
                     continue;
                 }
-                state.ret = next;
                 return core::ptr::null_mut();
             }
             OP_CALL_QUALIFIED => {
                 state.frame.last_instr = pc as i64;
-                let vm = state.vm;
+                let vm = state.frame.vm;
                 let here = pc as i64;
                 let name = insn_a(program, pc);
                 let kind = interned_qualified_kind(program, name);
@@ -6904,7 +6856,7 @@ fn run_cel_portal(
                     if arity == 0 {
                         here + 1
                     } else {
-                        let callable = qualified_name_is_callable(state.ctx, program, name);
+                        let callable = qualified_name_is_callable(state.frame.ctx, program, name);
                         if callable == 0 {
                             here + 1
                         } else {
@@ -6922,12 +6874,11 @@ fn run_cel_portal(
                     pc = tgt;
                     continue;
                 }
-                state.ret = next;
                 return core::ptr::null_mut();
             }
             OP_HAS_FIELD => {
                 state.frame.last_instr = pc as i64;
-                let vm = state.vm;
+                let vm = state.frame.vm;
                 let here = pc as i64;
                 let depth = state.frame.valuestackdepth;
                 let i = depth - 1;
@@ -6967,12 +6918,11 @@ fn run_cel_portal(
                     pc = tgt;
                     continue;
                 }
-                state.ret = next;
                 return core::ptr::null_mut();
             }
             OP_GET_FIELD => {
                 state.frame.last_instr = pc as i64;
-                let vm = state.vm;
+                let vm = state.frame.vm;
                 let here = pc as i64;
                 let depth = state.frame.valuestackdepth;
                 let i = depth - 1;
@@ -7009,12 +6959,11 @@ fn run_cel_portal(
                     pc = tgt;
                     continue;
                 }
-                state.ret = next;
                 return core::ptr::null_mut();
             }
             OP_MUL_LOCAL_K => {
                 state.frame.last_instr = pc as i64;
-                let vm = state.vm;
+                let vm = state.frame.vm;
                 let here = pc as i64;
                 let a = state.frame.locals_stack_w[insn_a(program, pc)];
                 let k = intern_const(program, insn_b(program, pc));
@@ -7035,12 +6984,11 @@ fn run_cel_portal(
                     pc = tgt;
                     continue;
                 }
-                state.ret = next;
                 return core::ptr::null_mut();
             }
             OP_GET_FIELD_LOCAL => {
                 state.frame.last_instr = pc as i64;
-                let vm = state.vm;
+                let vm = state.frame.vm;
                 let here = pc as i64;
                 let recv = state.frame.locals_stack_w[insn_a(program, pc)];
                 let name = field_name_cell(program, insn_b(program, pc));
@@ -7061,12 +7009,11 @@ fn run_cel_portal(
                     pc = tgt;
                     continue;
                 }
-                state.ret = next;
                 return core::ptr::null_mut();
             }
             OP_HAS_FIELD_LOCAL => {
                 state.frame.last_instr = pc as i64;
-                let vm = state.vm;
+                let vm = state.frame.vm;
                 let here = pc as i64;
                 let recv = state.frame.locals_stack_w[insn_a(program, pc)];
                 let name = field_name_cell(program, insn_b(program, pc));
@@ -7087,12 +7034,11 @@ fn run_cel_portal(
                     pc = tgt;
                     continue;
                 }
-                state.ret = next;
                 return core::ptr::null_mut();
             }
             OP_GET_FIELD_LOCAL_APPEND => {
                 state.frame.last_instr = pc as i64;
-                let vm = state.vm;
+                let vm = state.frame.vm;
                 let here = pc as i64;
                 let recv = state.frame.locals_stack_w[insn_a(program, pc)];
                 let depth = state.frame.valuestackdepth;
@@ -7116,12 +7062,11 @@ fn run_cel_portal(
                     pc = tgt;
                     continue;
                 }
-                state.ret = next;
                 return core::ptr::null_mut();
             }
             OP_HAS_FIELD_LOCAL_APPEND => {
                 state.frame.last_instr = pc as i64;
-                let vm = state.vm;
+                let vm = state.frame.vm;
                 let here = pc as i64;
                 let recv = state.frame.locals_stack_w[insn_a(program, pc)];
                 let depth = state.frame.valuestackdepth;
@@ -7145,12 +7090,11 @@ fn run_cel_portal(
                     pc = tgt;
                     continue;
                 }
-                state.ret = next;
                 return core::ptr::null_mut();
             }
             OP_ITER_KEYS => {
                 state.frame.last_instr = pc as i64;
-                let vm = state.vm;
+                let vm = state.frame.vm;
                 let here = pc as i64;
                 let depth = state.frame.valuestackdepth;
                 let w = state.frame.locals_stack_w[depth - 1];
@@ -7181,12 +7125,11 @@ fn run_cel_portal(
                     pc = tgt;
                     continue;
                 }
-                state.ret = next;
                 return core::ptr::null_mut();
             }
             OP_LIST_APPEND_OPTIONAL => {
                 state.frame.last_instr = pc as i64;
-                let vm = state.vm;
+                let vm = state.frame.vm;
                 let here = pc as i64;
                 let depth = state.frame.valuestackdepth;
                 let item_i = depth - 1;
@@ -7212,12 +7155,11 @@ fn run_cel_portal(
                     pc = tgt;
                     continue;
                 }
-                state.ret = next;
                 return core::ptr::null_mut();
             }
             OP_MAP_INSERT_OPTIONAL => {
                 state.frame.last_instr = pc as i64;
-                let vm = state.vm;
+                let vm = state.frame.vm;
                 let here = pc as i64;
                 let depth = state.frame.valuestackdepth;
                 let value_i = depth - 1;
@@ -7244,12 +7186,11 @@ fn run_cel_portal(
                     pc = tgt;
                     continue;
                 }
-                state.ret = next;
                 return core::ptr::null_mut();
             }
             OP_OPT_INDEX => {
                 state.frame.last_instr = pc as i64;
-                let vm = state.vm;
+                let vm = state.frame.vm;
                 let here = pc as i64;
                 let depth = state.frame.valuestackdepth;
                 let key_i = depth - 1;
@@ -7284,12 +7225,11 @@ fn run_cel_portal(
                     pc = tgt;
                     continue;
                 }
-                state.ret = next;
                 return core::ptr::null_mut();
             }
             OP_OPT_SELECT => {
                 state.frame.last_instr = pc as i64;
-                let vm = state.vm;
+                let vm = state.frame.vm;
                 let here = pc as i64;
                 let depth = state.frame.valuestackdepth;
                 let i = depth - 1;
@@ -7317,7 +7257,6 @@ fn run_cel_portal(
                     pc = tgt;
                     continue;
                 }
-                state.ret = next;
                 return core::ptr::null_mut();
             }
             _ => {
@@ -7330,7 +7269,6 @@ fn run_cel_portal(
                     pc = tgt;
                     continue;
                 }
-                state.ret = next;
                 return core::ptr::null_mut();
             }
         }
@@ -7338,7 +7276,6 @@ fn run_cel_portal(
     // The merge point's compiled-run close `break`s out of this loop.
     // A ref FINISH was already returned by `take_single_pass_finish_ref`.
     // What reaches here is not a leaf: the caller reads `vm.portal_ret`.
-    // `state.ret` stays for the interpreter path that still reads it.
     core::ptr::null_mut()
 }
 
