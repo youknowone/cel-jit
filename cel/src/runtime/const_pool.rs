@@ -31,7 +31,7 @@ pub struct ConstPool {
     /// Keeps the `Arc` named by a string leaf's `public` word alive for the
     /// pool's lifetime. The leaf is immortal; the pointer is written once
     /// here, before the pool is shared.
-    strings: Vec<Arc<String>>,
+    strings: Vec<Arc<str>>,
 }
 
 struct Block {
@@ -131,7 +131,7 @@ impl ConstPool {
             Value::Bool(_) | Value::Null => core::ptr::null_mut(),
             Value::String(s) => {
                 let chars = self.alloc_bytes_block(s.as_bytes());
-                let public = Arc::as_ptr(s) as *const ();
+                let public = crate::objects::arc_str_thin(s);
                 self.strings.push(Arc::clone(s));
                 self.alloc(W_StringObject {
                     ob_header: CelObject {
@@ -337,7 +337,7 @@ impl ConstPool {
             if value.is_null() {
                 return core::ptr::null_mut();
             }
-            rows.push((s.as_str(), value));
+            rows.push((s.as_ref(), value));
         }
         // Key-byte order, so the same key set shares one layout
         // (`mapdict.py` `_get_new_attr`).
@@ -370,7 +370,7 @@ impl ConstPool {
     fn object_map_from_string_rows(&mut self, rows: &[(&str, CelRef)]) -> CelRef {
         let mut pairs = Vec::with_capacity(rows.len());
         for (name, value) in rows {
-            let key = self.intern(&Value::String(Arc::new((*name).to_owned())));
+            let key = self.intern(&Value::String(Arc::from(*name)));
             if key.is_null() {
                 return core::ptr::null_mut();
             }

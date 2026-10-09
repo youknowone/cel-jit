@@ -170,13 +170,13 @@ fn exists_one_macro_expander(
     let mut arguments = vec![args.remove(1)];
     let v = extract_ident(args.remove(0), helper)?;
 
-    let init = helper.next_expr(Expr::Literal(LiteralValue::Int(0.into())));
+    let init = helper.next_expr(Expr::Literal(LiteralValue::Int(0)));
     let result_binding = "@result".to_string();
     let condition = helper.next_expr(Expr::Literal(LiteralValue::Boolean(true)));
 
     let args = vec![
         helper.next_expr(Expr::Ident(result_binding.clone())),
-        helper.next_expr(Expr::Literal(LiteralValue::Int(1.into()))),
+        helper.next_expr(Expr::Literal(LiteralValue::Int(1))),
     ];
     arguments.push(helper.next_expr(Expr::Call(CallExpr {
         func_name: operators::ADD.to_string(),
@@ -192,7 +192,7 @@ fn exists_one_macro_expander(
     }));
 
     let accu = helper.next_expr(Expr::Ident(result_binding.clone()));
-    let one = helper.next_expr(Expr::Literal(LiteralValue::Int(1.into())));
+    let one = helper.next_expr(Expr::Literal(LiteralValue::Int(1)));
     let result = helper.next_expr(Expr::Call(CallExpr {
         func_name: operators::EQUALS.to_string(),
         target: None,

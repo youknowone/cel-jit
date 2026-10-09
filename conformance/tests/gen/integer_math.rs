@@ -452,7 +452,6 @@ mod int64_math {
     }
 
     // Test: int64_min_negate
-    #[should_panic]
     #[test]
     fn int64_min_negate() {
         run_test(&dedent!(

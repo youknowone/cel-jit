@@ -23,6 +23,54 @@ bytes = { version = "1", optional = true }
 thiserror = "2"
 pastey = "0.2.1"
 
+# PoC meta-tracing JIT tier (feature `jit`). The `majit` crates live in the
+# pyre repository, pinned by revision.
+#
+# They are `optional`, but cargo resolves a dependency's SOURCE while parsing
+# this manifest, before it knows which features are on. As path deps into a
+# sibling checkout that made every cargo command — `fmt --check` included —
+# fail on a clean clone. A git revision resolves for anyone.
+#
+# `rev` is pyre `main` at 3d901bd9c0d (2026-10-08), which already carries
+# PR #2231's raw DONE entry (`execute_token_done_{int,ref}_raw`) that cel's
+# portal entry uses. Resume borrows the guard's decoded virtual infos and
+# reads off-heap fail args in place. cel's `CelGc` registers typed headers
+# through `GcAllocator`.
+#
+# Bump it deliberately: it is the only thing pinning the JIT tier's behaviour —
+# and a stale pin is silent. Two measured instances of that silence, both found
+# long after the fact:
+#
+#   - `c05bccff72` (PR 834) sat 95 majit commits behind, and the first commit
+#     past it was the one that made the retrace path work, so every measurement
+#     taken against it described machinery that had since been fixed: sweeping
+#     `retrace_limit` on a shape-changing batch aborted every retrace at 834 and
+#     none at 960.
+#   - `2c86af5168` (PR 960) sat 107 commits behind `main`, 49 of them touching
+#     `majit/`.
+#
+# Neither the distance nor what it covers is observable from inside this repo:
+# a cohabiting checkout carries a `[patch]` in `.cargo/config.toml` that
+# redirects these four crates to the enclosing worktree, which is what every
+# local measurement then runs against. So the pin's own effect is only ever
+# tested where that file is absent — a clean clone, and CI.
+# `main` carries
+# `Census::compiled_opcode_log` (`majit/majit-metainterp/src/embed.rs`),
+# which `majit_trace_evidence.rs` and the two `rca_*` examples read, and
+# the `GcAllocator` surface cel's `CelGc` uses to register typed headers.
+# `jit-audits`: majit-ir gates `opref_audit`/`reg_write_audit` out of production
+# builds (#1215); `majit_trace_evidence.rs` consumes both, and an integration
+# test does not see majit-ir's own `cfg(test)`.
+majit-ir = { git = "https://github.com/youknowone/pyre.git", rev = "3d901bd9c0d29fa398dd7e7b5b50b89a94617c1e", optional = true, features = ["jit-audits"] }
+# Direct, not through `majit-metainterp`: it depends on `majit-gc` but re-exports
+# none of it, and `MiniMarkGC` / `TypeInfo` / the `GcAllocator` trait are what
+# class registration is spelled in. Same revision as its siblings — a different
+# one would give `set_gc_allocator` a `Box<dyn GcAllocator>` from a second copy
+# of the trait, which does not typecheck.
+majit-gc = { git = "https://github.com/youknowone/pyre.git", rev = "3d901bd9c0d29fa398dd7e7b5b50b89a94617c1e", optional = true }
+majit-macros = { git = "https://github.com/youknowone/pyre.git", rev = "3d901bd9c0d29fa398dd7e7b5b50b89a94617c1e", optional = true }
+majit-metainterp = { git = "https://github.com/youknowone/pyre.git", rev = "3d901bd9c0d29fa398dd7e7b5b50b89a94617c1e", default-features = false, optional = true }
+
 [dev-dependencies]
 criterion = { version = "0.5.1", features = ["html_reports"] }
 serde_bytes = "0.11.14"
@@ -82,6 +130,71 @@ __drop-arm-probe = []
 # not a faster number. Off by default.
 __elem-attr-probe = []
 
+# The second measurement probe, and never a shipping feature either. It makes
+# the function-entry door's yield probe choose its key form at run time --
+# the resolved cell key it uses now, or the bare bucket hash it used before --
+# so what that resolution costs per call is a difference taken inside ONE
+# binary rather than between two builds.
+#
+# Off by default. Both arms DECIDE the same thing on every
+# bucket holding one cell or none, which is every bucket a program here has
+# produced; see `float_bank::LoopKeyArm`.
+__loop-key-arm-probe = []
+
+# The fourth measurement probe, and never a shipping feature either. It gives
+# `float_bank::run_jit_persistent_f` a per-stage repeat count, read once per
+# call out of a thread-local, so what one named stage of the JIT entry costs is
+# a difference taken inside ONE binary -- the same call against itself, once
+# with every count at zero and once with one stage repeated k extra times.
+#
+# Repetition and not a clock: the entry is ~100 ns whole (`batch::JIT_ENTRY_PS`)
+# across five stages, and `Instant::now()` costs 20-25 ns here, so a clock per
+# stage would report itself. Not every stage repeats, either -- `check_out`
+# takes the driver OUT of its slot, so it is amplified together with `check_in`
+# as one round trip, and the run that follows cannot be repeated at all and is
+# reported as a residual rather than measured. See `float_bank::EntryStageRepeats`.
+#
+# The residual that leaves is the compiled entry itself, and it is four fifths
+# of the whole -- so this feature also arms majit's own split of it,
+# `back-edge-stage-probe`, which amplifies three stages inside the warm arm of
+# `JitDriver::back_edge_internal` under the same discipline. A weak dependency
+# feature (`?/`): it must not be what pulls the optional `majit-metainterp` in,
+# since a non-JIT build has no entry to split.
+#
+# Off by default.
+# A build carrying it pays one thread-local read and five zero-trip loop tests
+# per JIT call that a default build does not, plus one relaxed atomic load and
+# four more zero-trip tests per compiled entry on the majit side, so an absolute
+# figure taken from such a build is not what the shipping door costs; only
+# differences are claims.
+__entry-stage-probe = [
+    "majit-metainterp?/__back-edge-stage-probe",
+    "majit-metainterp?/__execute-stage-probe",
+    "majit-metainterp?/__yield-stage-probe",
+]
+
+# The fifth measurement probe, and never a shipping feature either. It gives
+# `prepare_batch_reduce` a per-stage repeat count, read once per bind out of a
+# thread-local, so what one named stage of the columnar ENCODE costs is a
+# difference taken inside ONE binary -- the same bind against itself, once with
+# every count at zero and once with one stage repeated k extra times.
+#
+# Repetition and not a clock, for the reason `__entry-stage-probe` gives: `bind`
+# is 44-770 ns across the shapes that matter and `Instant::now()` costs 20-25 ns
+# here, so a clock per stage would report itself.
+#
+# Encode is where the cost is. `bind` splits into a resolution (one map lookup
+# per declared path) and this encoding, and the encoding is 62-97% of it --
+# 94-97% on the CHEAPEST expressions, which carry no list and no string and so
+# should have the least to encode. That is the question this feature exists to
+# answer.
+#
+# Off by default.
+# A build carrying it pays one thread-local read and seven zero-trip loop tests
+# per bind that a default build does not, so an absolute figure taken from such
+# a build is not what the shipping door costs; only differences are claims.
+__encode-stage-probe = []
+
 # Route `Program::execute` through the bytecode VM instead of the tree walker.
 #
 # On by default, so the VM is what a caller gets. The tree walker is not
@@ -95,6 +208,43 @@ __elem-attr-probe = []
 # the non-default configuration, and it is the only way `Program::execute`
 # reaches the walker. `.github/workflows/rust.yml` runs a test leg for it.
 vm = []
+
+# PoC: meta-tracing JIT tier built on the in-repo `majit` framework (cell-majit,
+# issue #357). Additive and off by default. Applies majit's RPython-style
+# meta-tracer to a traceable CEL evaluation mainloop.
+#
+# `jit` deliberately names NO backend. Cargo features are additive, so a `jit`
+# that named one could never un-name it, and every measurement would silently
+# describe that one backend. `majit-metainterp` is taken with
+# `default-features = false` above, so selecting the backend is the caller's
+# job — the same split pyre uses (`--no-default-features --features dynasm`).
+#
+# Building with a bare `--features jit` is a hard error, not a silent no-JIT
+# build: `majit-metainterp/src/pyjitpl.rs:40-41` has
+# `#[cfg(not(any(feature = "cranelift", feature = "dynasm", target_arch =
+# "wasm32")))] compile_error!(...)`. That matters here — the JIT tier failing
+# open is exactly how a whole backend went unmeasured before.
+jit = [
+    "dep:majit-ir",
+    "dep:majit-gc",
+    # The scalar tier's only managed value is a thread-confined JITFRAME, so
+    # each execution thread owns a tiny collector instead of joining a
+    # process-global language heap and its GIL.
+    "majit-gc/gc_box",
+    "dep:majit-macros",
+    "dep:majit-metainterp",
+    # The temporal columnar subset (timestamp/duration) lowers to i64-nanos
+    # columns and constructs `Value::Timestamp`/`Value::Duration` oracles, both
+    # of which require chrono.
+    "chrono",
+]
+# Backend selectors. Use one of these, not bare `jit`:
+#   cargo test  -p cel --features jit-dynasm
+#   cargo test  -p cel --features jit-cranelift
+# They are mutually exclusive in intent but additive in Cargo; enabling both
+# lets `majit-metainterp` pick, which is not a configuration to measure from.
+jit-dynasm = ["jit", "majit-metainterp/dynasm"]
+jit-cranelift = ["jit", "majit-metainterp/cranelift"]
 
 # `Value` and list buffers are `!Send + !Sync` (`ListBuf`'s
 # `PhantomData<*const ()>`). Shared buffers are still `Arc`: clone and drop

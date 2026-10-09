@@ -44,7 +44,7 @@ fn day_of_year(args: Vec<Value>) -> Result<Value, ExecutionError> {
 fn timestamp(args: Vec<Value>) -> Result<Value, ExecutionError> {
     let unpacked = args[0].unpack();
     let text = match &unpacked {
-        Value::String(s) => s.as_str(),
+        Value::String(s) => s.as_ref(),
         other => return Err(super::type_error(other, &super::STRING_TYPE)),
     };
     let parsed = chrono::DateTime::parse_from_rfc3339(text)

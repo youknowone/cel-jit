@@ -72,6 +72,11 @@ const SEGMENT_BYTES: usize = 64 * 1024;
 /// without `majit_gc` stores the same `u64`.
 pub const GC_HEADER_SIZE: usize = 8;
 
+#[cfg(feature = "jit")]
+const _: () = {
+    assert!(GC_HEADER_SIZE == majit_gc::header::GcHeader::SIZE);
+};
+
 /// `GC_HEADER_SIZE + size`, rounded up to a multiple of 8 so a nursery
 /// bump leaves `nursery_free` 8-aligned. The compiled inline bump does
 /// not realign.
@@ -538,6 +543,20 @@ pub struct CelHeap {
     next_region_id: Cell<u32>,
     /// Detached, rewound regions waiting for the next Context on this thread.
     spare_regions: RefCell<Vec<NonNull<BindRegion>>>,
+    /// VM word [`crate::vm::portal`] publishes for a re-entering step.
+    /// The heap is already resolved for the call; this is not a second
+    /// thread-local.
+    pub(crate) portal_vm: Cell<i64>,
+    /// Driver [`crate::vm::portal`] is inside, so a `may_force` residual
+    /// can reach it without another thread-local.
+    pub(crate) active_driver: Cell<usize>,
+    /// Outermost frame for a Context with no bind region.
+    ///
+    /// Nursery memory. Reused only while [`Self::young_payload_live`] still
+    /// covers the pointer; rewind nulls it and does not read it. An
+    /// old-space frame is never stored: old space is not rewound.
+    eval_frame: Cell<*mut u8>,
+    eval_frame_cap: Cell<usize>,
 }
 
 impl CelHeap {
@@ -562,6 +581,10 @@ impl CelHeap {
             regions: RefCell::new(Vec::new()),
             next_region_id: Cell::new(0),
             spare_regions: RefCell::new(Vec::new()),
+            portal_vm: Cell::new(0),
+            active_driver: Cell::new(0),
+            eval_frame: Cell::new(null_mut()),
+            eval_frame_cap: Cell::new(0),
         }
     }
 
@@ -701,6 +724,9 @@ impl CelHeap {
         self.nursery.bytes.set(self.snap_bytes.get());
         self.nursery.objects.set(self.snap_objects.get());
         self.publish_nursery_bounds();
+        // The cached frame, if any, sat in the rewound range or in a hole
+        // the next bump may reuse. Drop the pointer; do not read it.
+        self.invalidate_young_frame();
     }
 
     /// Bytes handed out of the open nursery segment.
@@ -761,6 +787,7 @@ impl CelHeap {
         self.nursery.bytes.set(self.snap_bytes.get());
         self.nursery.objects.set(self.snap_objects.get());
         self.publish_nursery_bounds();
+        self.invalidate_young_frame();
     }
 
     fn reset_nursery(&self) {
@@ -796,6 +823,7 @@ impl CelHeap {
         drop(segs);
         self.nursery.sync_open();
         self.publish_nursery_bounds();
+        self.invalidate_young_frame();
     }
 
     /// Allocate `value` in this heap and return a pointer to the payload.
@@ -879,6 +907,12 @@ impl CelHeap {
     /// cursor back before a rewind, a reset, or a new segment.
     #[inline(always)]
     fn bump_nursery(&self, size: usize, align: usize) -> *mut u8 {
+        // incminimark.py `malloc_varsize` / `malloc_fixedsize` oversized arm:
+        // `external_malloc`. A request the nursery cannot hold is a raw
+        // malloc into old space, not a second nursery segment sized to it.
+        if size >= SEGMENT_BYTES {
+            return self.alloc_old_raw(size, align);
+        }
         let free = self.nursery_free.get() as usize;
         let top = self.nursery_top.get() as usize;
         if free != 0 {
@@ -1083,6 +1117,61 @@ impl CelHeap {
         self.nursery_contains(ptr as usize)
     }
 
+    /// A cached unbound frame whose item cap is at least `need`, or null.
+    ///
+    /// A pointer the nursery no longer contains is forgotten. The test does
+    /// not dereference it: rewind poisons or frees those bytes, and the
+    /// next bump may hand the same address out again.
+    #[inline]
+    pub(crate) fn cached_young_frame(&self, need: usize) -> *mut u8 {
+        let p = self.eval_frame.get();
+        if p.is_null() {
+            return null_mut();
+        }
+        if !self.young_payload_live(p) {
+            self.invalidate_young_frame();
+            return null_mut();
+        }
+        if self.eval_frame_cap.get() < need {
+            return null_mut();
+        }
+        p
+    }
+
+    /// Remember `ptr` when it is live nursery. Old space is left uncached.
+    #[inline]
+    pub(crate) fn store_young_frame(&self, ptr: *mut u8, cap: usize) {
+        if ptr.is_null() || !self.young_payload_live(ptr) {
+            return;
+        }
+        self.eval_frame.set(ptr);
+        self.eval_frame_cap.set(cap);
+    }
+
+    #[inline]
+    fn invalidate_young_frame(&self) {
+        self.eval_frame.set(null_mut());
+        self.eval_frame_cap.set(0);
+    }
+
+    /// `ptr` is a live nursery payload. Does not dereference `ptr`.
+    ///
+    /// The open segment is `[open_base, nursery_free)`. Older segments are
+    /// still live until [`Self::reset_nursery`] drops them.
+    #[inline]
+    pub(crate) fn young_payload_live(&self, ptr: *const u8) -> bool {
+        let p = ptr as usize;
+        if p == 0 {
+            return false;
+        }
+        let base = self.nursery.open_base.get() as usize;
+        let free = self.nursery_free.get() as usize;
+        if base != 0 && p >= base && p < free {
+            return true;
+        }
+        self.nursery_contains(p)
+    }
+
     fn nursery_contains(&self, p: usize) -> bool {
         let segs = self.nursery.segments.borrow();
         let last = segs.len().saturating_sub(1);
@@ -1149,6 +1238,392 @@ pub(crate) fn heap_ptr() -> *const CelHeap {
 #[inline]
 pub fn with_heap<R>(f: impl FnOnce(&CelHeap) -> R) -> R {
     HEAP.with(f)
+}
+
+/// Framework GC descr (`gc.py GcLLDescr_framework`) over this thread's
+/// [`CelHeap`].
+///
+/// Every object carries a type-id word at `payload - GcHeader::SIZE`.
+/// `supports_guard_gc_type` is true, so a portal loop may unroll.
+/// `gc.py get_nursery_free_addr` / `get_nursery_top_addr` name the two
+/// cells on the heap. Allocation bumps the nursery and never collects.
+/// `JITFRAME` is registered after the cel types (`jitframe.py`
+/// `jitframe_allocate`): a type table cannot be installed without that id.
+/// The frame itself is a nursery object, reclaimed with the rest of the
+/// evaluation's young objects.
+#[cfg(feature = "jit")]
+pub struct CelGc {
+    types: majit_gc::trace::TypeRegistry,
+    jitframe_type_id: Option<u32>,
+}
+
+#[cfg(feature = "jit")]
+impl Default for CelGc {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(feature = "jit")]
+impl CelGc {
+    /// Register the root, every class and every block, then freeze.
+    ///
+    /// Ids are the [`super::lltype::CelGcType`] literals.
+    /// [`super::registration::register_cel_classes_unfrozen`] checks that.
+    pub fn new() -> CelGc {
+        let mut gc = CelGc {
+            types: majit_gc::trace::TypeRegistry::new(),
+            jitframe_type_id: None,
+        };
+        let _ids = super::registration::register_cel_classes_unfrozen(&mut gc);
+        // After the cel types, so [`super::lltype::CelGcType::TYPE_ID`]
+        // stays the literal. `check_jitframe_descr` refuses the install
+        // when this id is missing.
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            majit_metainterp::register_active_backend_jitframe_gc_type(&mut gc);
+        }
+        majit_gc::GcAllocator::freeze_types(&mut gc);
+        gc
+    }
+
+    /// Payload of `payload` bytes. `header` is the word at `payload - 8`.
+    ///
+    /// `0` is a zero header: the compiled nursery slow path stores the
+    /// type id itself. A nonzero word is `u64::from(type_id)`, which is
+    /// what `GcHeader::new` stores.
+    fn bump_payload(&mut self, header: u64, payload: usize) -> majit_ir::GcRef {
+        let Some(total) = try_headered_total(payload) else {
+            return fail_memory_error();
+        };
+        let raw = unsafe { (*heap_ptr()).bump_nursery(total, GC_HEADER_SIZE) };
+        unsafe { (raw as *mut u64).write(header) };
+        majit_ir::GcRef(unsafe { raw.add(GC_HEADER_SIZE) } as usize)
+    }
+
+    fn bump_typed(&mut self, type_id: u32, payload: usize) -> majit_ir::GcRef {
+        // Frames are nursery objects (`jitframe.py jitframe_allocate`),
+        // reclaimed with the rest of the evaluation's young objects.
+        self.bump_payload(u64::from(type_id), payload)
+    }
+}
+
+/// `incminimark.py` `collect_and_reserve` / `external_malloc`: a failed
+/// size computation is MemoryError. The compiled slow path still sees
+/// NULL; `set_memory_error` is the breaker bit the dispatch loop reads.
+#[cfg(feature = "jit")]
+fn fail_memory_error() -> majit_ir::GcRef {
+    majit_ir::eval_breaker_word::set_memory_error();
+    majit_ir::GcRef(0)
+}
+
+#[cfg(feature = "jit")]
+impl majit_gc::GcAllocator for CelGc {
+    fn alloc_nursery(&mut self, size: usize) -> majit_ir::GcRef {
+        self.bump_payload(0, size)
+    }
+
+    fn alloc_nursery_no_collect(&mut self, size: usize) -> majit_ir::GcRef {
+        self.bump_payload(0, size)
+    }
+
+    fn alloc_nursery_typed(&mut self, type_id: u32, size: usize) -> majit_ir::GcRef {
+        self.bump_typed(type_id, size)
+    }
+
+    fn alloc_nursery_no_collect_typed(&mut self, type_id: u32, size: usize) -> majit_ir::GcRef {
+        self.bump_typed(type_id, size)
+    }
+
+    fn try_alloc_nursery_no_collect_typed(&mut self, type_id: u32, size: usize) -> majit_ir::GcRef {
+        self.bump_typed(type_id, size)
+    }
+
+    unsafe fn try_alloc_nursery_no_collect_typed_with_placement(
+        &mut self,
+        type_id: u32,
+        size: usize,
+        needs_write_barrier: *mut bool,
+    ) -> majit_ir::GcRef {
+        // Every result is nursery. A young pointer stored into it needs
+        // no creation barrier, and this descr never collects.
+        unsafe { *needs_write_barrier = false };
+        self.try_alloc_nursery_no_collect_typed(type_id, size)
+    }
+
+    unsafe fn alloc_nursery_collecting_typed_rooted(
+        &mut self,
+        type_id: u32,
+        size: usize,
+        _root: *mut majit_ir::GcRef,
+        needs_write_barrier: *mut bool,
+    ) -> majit_ir::GcRef {
+        unsafe { *needs_write_barrier = false };
+        self.alloc_nursery_typed(type_id, size)
+    }
+
+    unsafe fn alloc_fast_nursery_collecting_typed_roots(
+        &mut self,
+        type_id: u32,
+        size: usize,
+        _roots: *mut majit_ir::GcRef,
+        _root_count: usize,
+        needs_write_barrier: *mut bool,
+    ) -> majit_ir::GcRef {
+        unsafe { *needs_write_barrier = false };
+        self.alloc_nursery_typed(type_id, size)
+    }
+
+    fn alloc_varsize(
+        &mut self,
+        base_size: usize,
+        item_size: usize,
+        length: usize,
+    ) -> majit_ir::GcRef {
+        let Some(bytes) = item_size
+            .checked_mul(length)
+            .and_then(|n| base_size.checked_add(n))
+        else {
+            return fail_memory_error();
+        };
+        // Untyped: header word stays 0, and the length word is not written.
+        self.bump_payload(0, bytes)
+    }
+
+    fn alloc_varsize_no_collect(
+        &mut self,
+        base_size: usize,
+        item_size: usize,
+        length: usize,
+    ) -> majit_ir::GcRef {
+        self.alloc_varsize(base_size, item_size, length)
+    }
+
+    fn alloc_varsize_typed(
+        &mut self,
+        type_id: u32,
+        base_size: usize,
+        item_size: usize,
+        length: usize,
+    ) -> majit_ir::GcRef {
+        let Some(payload) = item_size
+            .checked_mul(length)
+            .and_then(|n| base_size.checked_add(n))
+        else {
+            return fail_memory_error();
+        };
+        // MiniMark `alloc_varsize_typed`: an unregistered tid is not a
+        // layout. `init_array_descr` stamps `descr.tid` from
+        // `layoutbuilder.get_type_id(ARRAY)`, so the allocator never sees
+        // one. Catch a future miss here rather than stamping a header the
+        // registry cannot name.
+        debug_assert!(
+            (type_id as usize) < self.types.len(),
+            "unregistered varsize tid {type_id}"
+        );
+        if (type_id as usize) >= self.types.len() {
+            return fail_memory_error();
+        }
+        let info = self.types.get(type_id);
+        let registered_varsize = info.item_size != 0;
+        let length_offset = info.length_offset;
+        let obj = self.bump_typed(type_id, payload);
+        // `malloc_varsize` writes the length when the registered shape is
+        // varsize. A fixed type leaves its first word to the caller.
+        if !obj.is_null() && registered_varsize {
+            unsafe { *((obj.0 + length_offset) as *mut usize) = length };
+        }
+        obj
+    }
+
+    fn alloc_oldgen_typed(&mut self, type_id: u32, size: usize) -> majit_ir::GcRef {
+        self.bump_typed(type_id, size)
+    }
+
+    fn alloc_young_nonmoving_typed(&mut self, type_id: u32, size: usize) -> majit_ir::GcRef {
+        self.bump_typed(type_id, size)
+    }
+
+    fn write_barrier(&mut self, _obj: majit_ir::GcRef) {}
+
+    fn jit_remember_young_pointer(&mut self, _obj: majit_ir::GcRef) {}
+
+    fn jit_remember_young_pointer_from_array(&mut self, _obj: majit_ir::GcRef) {}
+
+    fn remember_young_pointer_from_array2(
+        &mut self,
+        _obj: majit_ir::GcRef,
+        _index: usize,
+        _card_page_shift: u32,
+    ) {
+    }
+
+    fn collect_nursery(&mut self) {}
+
+    fn collect_full(&mut self) {}
+
+    /// Nothing moves, and [`Self::collect_nursery`] / [`Self::collect_full`]
+    /// are no-ops, so no walker has to find live jitframes.
+    /// `assembler.py` `_call_header_shadowstack` stays off when
+    /// `gcrootmap` is missing.
+    fn has_gcrootmap(&self) -> bool {
+        false
+    }
+
+    fn nursery_free(&self) -> *mut u8 {
+        unsafe { (*heap_ptr()).nursery_free.get() }
+    }
+
+    fn nursery_free_addr(&self) -> usize {
+        unsafe { core::ptr::addr_of!((*heap_ptr()).nursery_free) as usize }
+    }
+
+    fn nursery_top(&self) -> *const u8 {
+        unsafe { (*heap_ptr()).nursery_top.get() }
+    }
+
+    fn nursery_top_addr(&self) -> usize {
+        unsafe { core::ptr::addr_of!((*heap_ptr()).nursery_top) as usize }
+    }
+
+    fn max_nursery_object_size(&self) -> usize {
+        SEGMENT_BYTES
+    }
+
+    /// `gc.py GcLLDescr_framework.supports_guard_gc_type`.
+    fn supports_guard_gc_type(&self) -> bool {
+        true
+    }
+
+    fn register_type(&mut self, info: majit_gc::TypeInfo) -> u32 {
+        self.types.register(info)
+    }
+
+    fn freeze_types(&mut self) {
+        self.types.freeze_types();
+    }
+
+    fn assign_inheritance_ids_now(&mut self) {
+        self.types.assign_inheritance_ids_now();
+    }
+
+    fn types_frozen(&self) -> bool {
+        self.types.is_frozen()
+    }
+
+    fn has_type_registry(&self) -> bool {
+        true
+    }
+
+    fn set_jitframe_type_id(&mut self, id: u32) {
+        assert!(
+            (id as usize) < self.types.len(),
+            "JITFRAME type id {id} is not registered on this collector"
+        );
+        self.jitframe_type_id = Some(id);
+    }
+
+    fn jitframe_type_id(&self) -> Option<u32> {
+        self.jitframe_type_id
+    }
+
+    fn type_count(&self) -> usize {
+        self.types.len()
+    }
+
+    fn type_size(&self, type_id: u32) -> Option<usize> {
+        if (type_id as usize) < self.types.len() {
+            Some(self.types.get(type_id).size)
+        } else {
+            None
+        }
+    }
+
+    fn varsize_layout(&self, obj: majit_ir::GcRef) -> Option<majit_gc::GcVarSizeLayout> {
+        let type_id = self.get_actual_typeid(obj)?;
+        if type_id as usize >= self.types.len() {
+            return None;
+        }
+        let info = self.types.get(type_id);
+        (info.item_size != 0).then_some(majit_gc::GcVarSizeLayout {
+            base_size: info.size,
+            item_size: info.item_size,
+            items_have_gc_ptrs: info.items_have_gc_ptrs,
+        })
+    }
+
+    fn get_typeid_from_classptr_if_gcremovetypeptr(&self, classptr: usize) -> Option<u32> {
+        super::registration::type_id_for_classptr(classptr)
+    }
+
+    fn get_translated_info_for_typeinfo(&self) -> (usize, u8, usize) {
+        let table = self.types.type_info_table();
+        (
+            table.as_ptr() as usize,
+            majit_gc::trace::TypeEntry::SHIFT_BY,
+            majit_gc::trace::TypeInfoLayout::SIZE_OF_TI,
+        )
+    }
+
+    /// `gc.py _setup_guard_is_object` then
+    /// `get_translated_info_for_guard_is_object`: the infobits byte that
+    /// holds `T_IS_RPYTHON_INSTANCE`.
+    fn get_translated_info_for_guard_is_object(&self) -> (usize, u8) {
+        let infobits_offset = majit_gc::trace::TypeInfoLayout::INFOBITS_OFFSET;
+        let mask = majit_gc::trace::TypeInfoLayout::T_IS_RPYTHON_INSTANCE.to_le_bytes();
+        let mut plus = 0usize;
+        while plus < mask.len() && mask[plus] == 0 {
+            plus += 1;
+        }
+        (infobits_offset + plus, mask[plus])
+    }
+
+    fn check_is_object(&self, gcref: majit_ir::GcRef) -> bool {
+        if gcref.is_null() {
+            return false;
+        }
+        let Some(typeid) = self.get_actual_typeid(gcref) else {
+            return false;
+        };
+        let (base_type_info, shift_by, _sizeof_ti) = self.get_translated_info_for_typeinfo();
+        let (infobits_offset, is_object_flag) = self.get_translated_info_for_guard_is_object();
+        let typeid = typeid as usize;
+        if typeid >= self.types.len() {
+            return false;
+        }
+        let p = base_type_info + (typeid << shift_by) + infobits_offset;
+        let byte = unsafe { *(p as *const u8) };
+        (byte & is_object_flag) != 0
+    }
+
+    fn get_actual_typeid(&self, gcref: majit_ir::GcRef) -> Option<u32> {
+        if gcref.is_null() {
+            return None;
+        }
+        let header_addr = gcref.0.wrapping_sub(majit_gc::header::GcHeader::SIZE);
+        let header = unsafe { *(header_addr as *const majit_gc::header::GcHeader) };
+        Some(header.type_id())
+    }
+
+    fn typeid_is_object(&self, typeid: u32) -> Option<bool> {
+        if (typeid as usize) >= self.types.len() {
+            return None;
+        }
+        Some(self.types.get(typeid).is_object)
+    }
+
+    fn subclassrange_min_offset(&self) -> usize {
+        core::mem::offset_of!(super::object::CelClass, subclassrange_min)
+    }
+
+    fn subclass_range(&self, classptr: usize) -> Option<(i64, i64)> {
+        let cls = super::registration::class_at_ptr(classptr)?;
+        Some((cls.subclassrange_min, cls.subclassrange_max))
+    }
+
+    fn typeid_subclass_range(&self, typeid: u32) -> Option<(i64, i64)> {
+        super::registration::class_subclass_range(typeid)
+    }
 }
 
 /// Nursery bump captured at outermost entry. Leave compares [`Self::used`]
@@ -1770,5 +2245,53 @@ mod tests {
         drop(slot);
         assert!(!heap.contains(p as *const u8));
         assert_eq!(heap.allocated_objects(), 0);
+    }
+
+    /// `GcHeader::new` stores the type id in the low bits and nothing else.
+    #[cfg(feature = "jit")]
+    #[test]
+    fn gc_header_word_is_the_type_id() {
+        let id = crate::runtime::object::W_IntObject::TYPE_ID;
+        let header = majit_gc::header::GcHeader::new(id);
+        assert_eq!(header.tid_and_flags, u64::from(id));
+        assert_eq!(header.type_id(), id);
+        assert_eq!(GC_HEADER_SIZE, majit_gc::header::GcHeader::SIZE);
+    }
+
+    /// `incminimark.py` `malloc_varsize` oversized arm: a registered tid
+    /// whose total is past a nursery segment is `external_malloc`.
+    #[cfg(feature = "jit")]
+    #[test]
+    fn a_large_registered_varsize_is_external_malloced() {
+        use majit_gc::GcAllocator;
+        let mut gc = CelGc::new();
+        let n = 8192usize;
+        let known =
+            gc.alloc_varsize_typed(crate::runtime::object_array::CelIntWords::TYPE_ID, 8, 8, n);
+        assert!(!known.is_null());
+        assert!(
+            !is_young(known.0 as *const u8),
+            "incminimark.py external_malloc: oversized, not a nursery bump"
+        );
+    }
+
+    /// An unregistered tid is a defect: debug names it, release is MemoryError.
+    #[cfg(all(feature = "jit", debug_assertions))]
+    #[test]
+    #[should_panic(expected = "unregistered varsize tid")]
+    fn an_unregistered_varsize_tid_panics_in_debug() {
+        use majit_gc::GcAllocator;
+        let mut gc = CelGc::new();
+        let _ = gc.alloc_varsize_typed(u32::MAX, 8, 8, 4);
+    }
+
+    #[cfg(all(feature = "jit", not(debug_assertions)))]
+    #[test]
+    fn an_unregistered_varsize_tid_is_memory_error() {
+        use majit_gc::GcAllocator;
+        let mut gc = CelGc::new();
+        let unknown = gc.alloc_varsize_typed(u32::MAX, 8, 8, 4);
+        assert!(unknown.is_null());
+        assert!(majit_ir::eval_breaker_word::take_memory_error());
     }
 }

@@ -74,6 +74,7 @@ pub struct ArrayToken {
 /// second header between the length word and item 0.
 // `capacity` is fixed for the block's lifetime (a grow allocates a fresh
 // block). `listobject.py` array length words are `_immutable_fields_`.
+#[cfg_attr(feature = "jit", majit_macros::jit_immutable_fields(capacity))]
 #[repr(C)]
 #[allow(non_camel_case_types)]
 pub struct CelItemsBlock {
@@ -105,6 +106,51 @@ impl CelGcType for CelItemsBlock {
     const TYPE_ID: u32 = 20;
     #[cfg(feature = "structs")]
     const TYPE_ID: u32 = 21;
+}
+
+#[cfg(feature = "jit")]
+impl majit_metainterp::HasGcTypeId for CelItemsBlock {
+    const GC_TYPE_ID: u32 = Self::TYPE_ID;
+}
+
+/// Per-scope interned-leaf storage the portal reads (`_mapdict_read_storage`).
+///
+/// `items` is a [`CelItemsBlock`] indexed by `PlainAttribute.storageindex`.
+/// `parent` is the enclosing scope (`f_back`). The struct sits inline on
+/// [`crate::context::Context`]; the items block is allocated in that
+/// Context's bind region for the Context's lifetime.
+#[repr(C)]
+pub struct CelLeafStorage {
+    pub parent: *mut CelLeafStorage,
+    pub items: *mut CelItemsBlock,
+}
+
+impl CelLeafStorage {
+    pub(crate) const fn empty() -> Self {
+        Self {
+            parent: core::ptr::null_mut(),
+            items: core::ptr::null_mut(),
+        }
+    }
+}
+
+/// Per-registry two-int entry words the portal reads (`_mapdict_read_storage`).
+///
+/// `items` is a [`CelIntWords`] indexed by `PlainAttribute.storageindex`.
+/// The struct sits inline on [`crate::magic::FunctionRegistry`]; the words
+/// block is allocated in that registry's bind region for the registry's
+/// lifetime. A missing two-int fast path stores `0`.
+#[repr(C)]
+pub struct CelInt2Storage {
+    pub items: *mut CelIntWords,
+}
+
+impl CelInt2Storage {
+    pub(crate) const fn empty() -> Self {
+        Self {
+            items: core::ptr::null_mut(),
+        }
+    }
 }
 
 /// A block of bytes: `capacity`, then the bytes.
@@ -139,10 +185,16 @@ impl CelGcType for CelBytesBlock {
     const TYPE_ID: u32 = 22;
 }
 
+#[cfg(feature = "jit")]
+impl majit_metainterp::HasGcTypeId for CelBytesBlock {
+    const GC_TYPE_ID: u32 = Self::TYPE_ID;
+}
+
 /// Unboxed `i64`s for an int column: capacity word, then the words.
 ///
 /// Same body as [`CelItemsBlock`]. `new_array` can build it; a raw
 /// `*mut i64` cannot, because the array descr needs the length word.
+#[cfg_attr(feature = "jit", majit_macros::jit_immutable_fields(capacity))]
 #[repr(C)]
 #[allow(non_camel_case_types)]
 pub struct CelIntWords {
@@ -170,10 +222,16 @@ impl CelGcType for CelIntWords {
     const TYPE_ID: u32 = 23;
 }
 
+#[cfg(feature = "jit")]
+impl majit_metainterp::HasGcTypeId for CelIntWords {
+    const GC_TYPE_ID: u32 = Self::TYPE_ID;
+}
+
 /// Unboxed `f64`s for a float column: capacity word, then the words.
 ///
 /// Same body as [`CelIntWords`]. The array descr reads the length at
 /// offset 0, so the payload cannot be a raw `*mut f64`.
+#[cfg_attr(feature = "jit", majit_macros::jit_immutable_fields(capacity))]
 #[repr(C)]
 #[allow(non_camel_case_types)]
 pub struct CelFloatWords {
@@ -199,6 +257,11 @@ impl CelGcType for CelFloatWords {
     const TYPE_ID: u32 = 23;
     #[cfg(feature = "structs")]
     const TYPE_ID: u32 = 24;
+}
+
+#[cfg(feature = "jit")]
+impl majit_metainterp::HasGcTypeId for CelFloatWords {
+    const GC_TYPE_ID: u32 = Self::TYPE_ID;
 }
 
 /// Word 0 of an int-words block, or null.
@@ -227,6 +290,115 @@ pub fn new_int_words_in(heap: &super::heap::CelHeap, cap: usize) -> *mut CelIntW
             cap,
         ) as *mut CelIntWords
     }
+}
+
+/// An int-words block of `cap` zero slots on this thread's heap.
+pub fn new_int_words_zeroed(cap: usize) -> *mut CelIntWords {
+    super::heap::with_heap(|h| new_int_words_zeroed_in(h, cap))
+}
+
+/// An int-words block of `cap` zero slots on `heap`.
+pub fn new_int_words_zeroed_in(heap: &super::heap::CelHeap, cap: usize) -> *mut CelIntWords {
+    let block = new_int_words_in(heap, cap);
+    if cap > 0 {
+        unsafe {
+            let base = int_words_base(block);
+            let mut i = 0;
+            while i < cap {
+                *base.add(i) = 0;
+                i += 1;
+            }
+        }
+    }
+    block
+}
+
+/// The capacity word of an int-words block, or 0 for a null block.
+///
+/// # Safety
+///
+/// `block` is null or points at a live [`CelIntWords`].
+#[inline]
+pub unsafe fn int_words_capacity(block: *mut CelIntWords) -> usize {
+    if block.is_null() {
+        return 0;
+    }
+    unsafe { (*block).capacity }
+}
+
+/// Store `word` at `index` when `block` already has that slot. `false` if
+/// the block is missing or too small; the caller then grows.
+///
+/// # Safety
+///
+/// `block` is null or points at a live [`CelIntWords`].
+pub unsafe fn int_words_store_existing(block: *mut CelIntWords, index: usize, word: i64) -> bool {
+    let cap = unsafe { int_words_capacity(block) };
+    if block.is_null() || index >= cap {
+        return false;
+    }
+    unsafe {
+        *int_words_base(block).add(index) = word;
+    }
+    true
+}
+
+/// Store `word` at `index`, growing `block` when the index is past capacity.
+///
+/// A grow allocates a fresh block and copies the live prefix; the old block
+/// stays in the owner until that owner drops. Call from
+/// [`super::heap::with_bind_region`] so the new block has the registry's
+/// bind-region lifetime.
+///
+/// # Safety
+///
+/// `block` is null or points at a live [`CelIntWords`].
+pub unsafe fn int_words_store(
+    block: *mut CelIntWords,
+    index: usize,
+    word: i64,
+) -> *mut CelIntWords {
+    super::heap::with_heap(|h| unsafe { int_words_store_in(h, block, index, word) })
+}
+
+/// [`int_words_store`] on `heap`.
+///
+/// # Safety
+///
+/// As [`int_words_store`].
+pub unsafe fn int_words_store_in(
+    heap: &super::heap::CelHeap,
+    block: *mut CelIntWords,
+    index: usize,
+    word: i64,
+) -> *mut CelIntWords {
+    let cap = unsafe { int_words_capacity(block) };
+    let block = if block.is_null() || index >= cap {
+        let new_cap = if cap == 0 {
+            index.saturating_add(1).max(4)
+        } else {
+            cap.saturating_mul(2).max(index.saturating_add(1))
+        };
+        let grown = new_int_words_zeroed_in(heap, new_cap);
+        if !block.is_null() && cap > 0 {
+            unsafe {
+                let src = int_words_base(block);
+                let dst = int_words_base(grown);
+                let mut i = 0;
+                while i < cap {
+                    *dst.add(i) = *src.add(i);
+                    i += 1;
+                }
+            }
+        }
+        grown
+    } else {
+        block
+    };
+    unsafe {
+        *int_words_base(block).add(index) = word;
+    }
+    block
 }
 
 /// Word 0 of a float-words block, or null.
@@ -430,6 +602,93 @@ pub fn new_items_block_zeroed(cap: usize) -> *mut CelItemsBlock {
     super::heap::with_heap(|h| new_items_block_zeroed_in(h, cap))
 }
 
+/// Write `leaf` at `index` when `block` already has that slot.
+///
+/// `false` when the block is missing or too short; the caller then grows
+/// through [`items_block_store`]. An in-place store does not allocate.
+///
+/// # Safety
+///
+/// `block` is null or points at a live [`CelItemsBlock`].
+#[inline]
+pub unsafe fn items_block_store_existing(
+    block: *mut CelItemsBlock,
+    index: usize,
+    leaf: CelRef,
+) -> bool {
+    let cap = unsafe { items_capacity(block) };
+    if block.is_null() || index >= cap {
+        return false;
+    }
+    unsafe {
+        *items_block_items_base(block).add(index) = leaf;
+    }
+    true
+}
+
+/// Store `leaf` at `index`, growing `block` when the index is past capacity.
+///
+/// A grow allocates a fresh block and copies the live prefix; the old block
+/// stays in the owner until that owner drops. Call from
+/// [`super::heap::with_bind_region`] so the new block has the Context's
+/// bind-region lifetime.
+///
+/// The store is a raw slot write. `CelGc::write_barrier` is a no-op and
+/// nursery alloc sets `needs_write_barrier = false`: this collector does
+/// not run, and bind-region blocks are old. Compiled `setarrayitem_gc_r`
+/// takes the same path.
+///
+/// # Safety
+///
+/// `block` is null or points at a live [`CelItemsBlock`].
+pub unsafe fn items_block_store(
+    block: *mut CelItemsBlock,
+    index: usize,
+    leaf: CelRef,
+) -> *mut CelItemsBlock {
+    super::heap::with_heap(|h| unsafe { items_block_store_in(h, block, index, leaf) })
+}
+
+/// [`items_block_store`] on `heap`.
+///
+/// # Safety
+///
+/// As [`items_block_store`].
+pub unsafe fn items_block_store_in(
+    heap: &super::heap::CelHeap,
+    block: *mut CelItemsBlock,
+    index: usize,
+    leaf: CelRef,
+) -> *mut CelItemsBlock {
+    let cap = unsafe { items_capacity(block) };
+    let block = if block.is_null() || index >= cap {
+        let new_cap = if cap == 0 {
+            index.saturating_add(1).max(4)
+        } else {
+            cap.saturating_mul(2).max(index.saturating_add(1))
+        };
+        let grown = new_items_block_zeroed_in(heap, new_cap);
+        if !block.is_null() && cap > 0 {
+            unsafe {
+                let src = items_block_items_base(block);
+                let dst = items_block_items_base(grown);
+                let mut i = 0;
+                while i < cap {
+                    *dst.add(i) = *src.add(i);
+                    i += 1;
+                }
+            }
+        }
+        grown
+    } else {
+        block
+    };
+    unsafe {
+        *items_block_items_base(block).add(index) = leaf;
+    }
+    block
+}
+
 /// A byte block of `len` uninitialised bytes on `heap`.
 ///
 /// The capacity word is written. The bytes are not: `ll_int2dec` stores
@@ -602,6 +861,41 @@ mod tests {
     }
 
     #[test]
+    fn int_words_store_grows_and_keeps_the_prefix() {
+        unsafe {
+            let block = int_words_store(core::ptr::null_mut(), 0, 11);
+            assert_eq!(int_words_capacity(block), 4);
+            assert_eq!(*int_words_base(block), 11);
+            let grown = int_words_store(block, 4, 55);
+            assert!(int_words_capacity(grown) >= 5);
+            assert_eq!(*int_words_base(grown), 11);
+            assert_eq!(*int_words_base(grown).add(4), 55);
+        }
+    }
+
+    #[test]
+    fn items_block_store_grows_and_keeps_the_prefix() {
+        unsafe {
+            let first = new_int(1) as CelRef;
+            let block = items_block_store(core::ptr::null_mut(), 0, first);
+            assert_eq!(items_capacity(block), 4);
+            assert_eq!(*items_block_items_base(block), first);
+            let fifth = new_int(5) as CelRef;
+            let grown = items_block_store(block, 4, fifth);
+            assert!(items_capacity(grown) >= 5);
+            assert_eq!(*items_block_items_base(grown), first);
+            assert_eq!(*items_block_items_base(grown).add(4), fifth);
+            assert!(items_block_store_existing(grown, 0, fifth));
+            assert_eq!(*items_block_items_base(grown), fifth);
+            assert!(!items_block_store_existing(
+                grown,
+                items_capacity(grown),
+                fifth
+            ));
+        }
+    }
+
+    #[test]
     fn a_bytes_block_round_trips_its_bytes() {
         unsafe {
             let block = new_bytes_block(b"hello");
@@ -637,6 +931,7 @@ mod tests {
             assert!(float_words_base(core::ptr::null_mut()).is_null());
             assert_eq!(items_capacity(core::ptr::null_mut()), 0);
             assert_eq!(bytes_capacity(core::ptr::null_mut()), 0);
+            assert_eq!(int_words_capacity(core::ptr::null_mut()), 0);
         }
     }
 }

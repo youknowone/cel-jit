@@ -7,7 +7,7 @@ use std::sync::Arc;
 /// Reads an argument the overload declared as `string`.
 fn expect_string(value: &Value) -> Result<&str, ExecutionError> {
     match value {
-        Value::String(s) => Ok(s.as_str()),
+        Value::String(s) => Ok(s.as_ref()),
         Value::Interned(w) => unsafe { crate::runtime::object::string_as_str(*w) }
             .ok_or_else(|| super::type_error(value, &super::STRING_TYPE)),
         other => Err(super::type_error(other, &super::STRING_TYPE)),
@@ -66,7 +66,7 @@ fn string(mut args: Vec<Value>) -> Result<Value, ExecutionError> {
             })
         }
     };
-    Ok(Value::String(Arc::new(converted)))
+    Ok(Value::String(Arc::from(converted)))
 }
 
 pub(crate) fn stdlib(env: &mut crate::Env) {
