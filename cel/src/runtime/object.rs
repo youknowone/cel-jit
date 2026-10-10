@@ -410,11 +410,11 @@ pub fn new_timestamp(nanos: i64, off_s: i64) -> *mut W_TimestampObject {
 #[allow(non_camel_case_types)]
 pub struct W_BytesObject {
     pub ob_header: CelObject,
-    /// The payload, or null for a value whose block has not been built. Its
-    /// offset-0 word is the allocated capacity, not this length.
+    /// The payload, or null for a value whose block has not been built.
+    /// [`CelBytesBlock`] is `STR`: hash, then the `chars` length, then the
+    /// bytes and the extra NUL.
     pub data: *mut CelBytesBlock,
-    /// Live length in bytes. Upstream's `("length", Signed)` on the wrapper:
-    /// the block's word is a capacity and a shrink must not move it.
+    /// Live length in bytes. Upstream's `("length", Signed)` on the wrapper.
     pub length: i64,
     /// Non-owning pointer at the public `Arc<Vec<u8>>` this leaf was wrapped
     /// from, or null if the bytes were allocated by the VM.
@@ -472,6 +472,7 @@ pub fn new_bytes_concat(left: &[u8], right: &[u8]) -> *mut W_BytesObject {
 #[allow(non_camel_case_types)]
 pub struct W_StringObject {
     pub ob_header: CelObject,
+    /// Payload laid out as `STR`. Shared block type with [`W_BytesObject`].
     pub chars: *mut CelBytesBlock,
     pub byte_len: i64,
     /// Non-owning thin pointer at the data of the public `Arc<str>` this leaf
@@ -501,7 +502,7 @@ fn alloc_fresh_string(nbytes: usize) -> (*mut W_StringObject, *mut u8) {
 ///
 /// ```text
 /// [hdr = W_StringObject::TYPE_ID][leaf][pad to 8]
-///     [hdr = CelBytesBlock::TYPE_ID][block: capacity, bytes]
+///     [hdr = CelBytesBlock::TYPE_ID][block: hash, length, chars, extra NUL]
 /// ```
 fn alloc_fresh_string_in(
     heap: &super::heap::CelHeap,
@@ -512,7 +513,7 @@ fn alloc_fresh_string_in(
     let block_align = align_of::<CelBytesBlock>();
     let block_hdr = (header + leaf_size + block_align - 1) & !(block_align - 1);
     let chars_off = block_hdr + header;
-    let block_bytes = object_array::CEL_BYTES_BLOCK_ITEMS_OFFSET + nbytes;
+    let block_bytes = object_array::CEL_BYTES_BLOCK_TOKEN.base_size + nbytes;
     let total = chars_off + block_bytes;
     let align = align_of::<W_StringObject>().max(block_align).max(header);
     let raw = heap.alloc_raw(total, align);
@@ -521,7 +522,7 @@ fn alloc_fresh_string_in(
         (raw.add(block_hdr) as *mut u64)
             .write(u64::from(<CelBytesBlock as lltype::CelGcType>::TYPE_ID));
         let chars = raw.add(chars_off) as *mut CelBytesBlock;
-        (*chars).capacity = nbytes;
+        object_array::init_bytes_block(chars, nbytes);
         let leaf = raw.add(header) as *mut W_StringObject;
         leaf.write(W_StringObject {
             ob_header: CelObject {
@@ -3185,14 +3186,17 @@ mod tests {
                 *(((*w).chars as *const u8).sub(GC_HEADER_SIZE) as *const u64),
                 u64::from(CelBytesBlock::TYPE_ID)
             );
-            assert_eq!((*(*w).chars).capacity, 2);
+            assert_eq!((*(*w).chars).hash, 0);
+            assert_eq!((*(*w).chars).length, 2);
             assert_eq!((*s).byte_len, 2);
             assert_eq!((*cat).byte_len, 3);
             assert_eq!(bytes_capacity((*cat).chars), 3);
             let base = bytes_base((*cat).chars);
             assert_eq!(core::slice::from_raw_parts(base, 3), b"abc");
+            assert_eq!(*base.add(3), 0);
             assert_eq!((*empty).byte_len, 0);
             assert_eq!(bytes_capacity((*empty).chars), 0);
+            assert_eq!(*bytes_base((*empty).chars), 0);
             crate::runtime::heap::with_heap(|h| {
                 assert!(h.contains(w as *const u8));
                 assert!(h.contains((*w).chars as *const u8));
@@ -3208,9 +3212,9 @@ mod tests {
     }
 
     /// The variable-length leaves keep their live length on the leaf and their
-    /// payload in the block, and the two must agree at construction. A block's
-    /// own word is a CAPACITY, so the pair is the only place the distinction is
-    /// observable while every block is still exact-sized.
+    /// payload in the block, and the two must agree at construction. An items
+    /// block's own word is a CAPACITY; a bytes block's length word is `STR.chars`
+    /// length and matches the leaf while every block is still exact-sized.
     #[test]
     fn a_variable_length_leaf_and_its_block_agree_on_length() {
         use crate::runtime::object_array::{

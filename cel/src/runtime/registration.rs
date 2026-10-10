@@ -223,9 +223,18 @@ pub static CEL_CLASS_LAYOUTS: &[ClassLayout] = &[
     ClassLayout {
         class: &CEL_STRING_CLASS,
         size: size_of::<W_StringObject>(),
-        gc_ptr_offsets: &[],
+        // `chars` is the `STR` payload (`rstr.STR`); `public` is a host
+        // buffer, not a heap cel object.
+        gc_ptr_offsets: &[offset_of!(W_StringObject, chars)],
         fields: &[
-            scalar("chars", WORD, Type::Int, false),
+            field(
+                "chars",
+                offset_of!(W_StringObject, chars),
+                WORD,
+                Type::Ref,
+                false,
+                true,
+            ),
             FieldLayout {
                 name: "byte_len",
                 offset: HEADER + WORD,
@@ -742,8 +751,9 @@ impl CelTypeIds {
 /// bytes. The token carries the item *size*; nothing in it carries the item's
 /// kind.
 ///
-/// No `gc_ptr_offsets`. A block's fixed part is the length word alone, which is
-/// an integer — every managed edge a block has is an item.
+/// No `gc_ptr_offsets`. A block's fixed part is integers (`capacity`, or
+/// `STR.hash` plus the `chars` length word) — every managed edge a block has
+/// is an item.
 fn varsize_block(token: &ArrayToken, items_have_gc_ptrs: bool) -> TypeInfo {
     TypeInfo::varsize(
         token.base_size,
@@ -766,9 +776,9 @@ fn varsize_block(token: &ArrayToken, items_have_gc_ptrs: bool) -> TypeInfo {
 /// against those literals. Blocks come after the classes so that adding one
 /// renumbers nothing: `register_type` hands out ids by position, and
 /// [`publish_cel_descrs`] zips `CEL_CLASS_LAYOUTS` against `classes` by
-/// position too. Blocks take no `register_vtable_for_type` — a block has a
-/// length word at offset 0, not a class word, so an address-to-id lookup
-/// over blocks would be reading a capacity as a class pointer.
+/// position too. Blocks take no `register_vtable_for_type` — offset 0 is a
+/// length or `STR.hash`, not a class word, so an address-to-id lookup
+/// over blocks would be reading an integer as a class pointer.
 ///
 /// The reference block's items are managed edges. The byte, int-word and
 /// float-word blocks are not. Separate type ids, because one id carries one
@@ -811,6 +821,9 @@ pub(crate) fn register_cel_classes_unfrozen(gc: &mut dyn GcAllocator) -> CelType
     assert_eq!(bytes_block, CelBytesBlock::TYPE_ID, "bytes block type id");
     assert_eq!(int_words, CelIntWords::TYPE_ID, "int words type id");
     assert_eq!(float_words, CelFloatWords::TYPE_ID, "float words type id");
+    // `NEWSTR` allocates through this tid with the builtin STR token
+    // (hash, length, chars, extra NUL). Bytes and str share the block.
+    majit_gc::set_lowlevel_str_type_id(bytes_block);
     CelTypeIds {
         root,
         classes,
@@ -1345,6 +1358,7 @@ mod tests {
         assert_eq!(ids.root, CelObject::TYPE_ID);
         assert_eq!(ids.items_block, CelItemsBlock::TYPE_ID);
         assert_eq!(ids.bytes_block, CelBytesBlock::TYPE_ID);
+        assert_eq!(majit_gc::lowlevel_str_type_id(), ids.bytes_block);
         assert_eq!(ids.int_words, CelIntWords::TYPE_ID);
         assert_eq!(ids.float_words, CelFloatWords::TYPE_ID);
         assert_eq!(ids.classes.len(), statics.len());

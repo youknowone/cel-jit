@@ -15,8 +15,9 @@ use super::object::{
     MAPDICT_MAX_ENTRIES,
 };
 use super::object_array::{
-    bytes_base, int_words_base, items_block_items_base, CelBytesBlock, CelIntWords, CelItemsBlock,
-    CEL_BYTES_BLOCK_ITEMS_OFFSET, CEL_INT_WORDS_ITEMS_OFFSET, CEL_ITEMS_BLOCK_ITEMS_OFFSET,
+    bytes_base, init_bytes_block, int_words_base, items_block_items_base, CelBytesBlock,
+    CelIntWords, CelItemsBlock, CEL_BYTES_BLOCK_TOKEN, CEL_INT_WORDS_ITEMS_OFFSET,
+    CEL_ITEMS_BLOCK_ITEMS_OFFSET,
 };
 use crate::objects::{Key, ListRef, Map, MapStorage};
 use crate::Value;
@@ -87,13 +88,14 @@ impl ConstPool {
 
     fn alloc_bytes_block(&mut self, bytes: &[u8]) -> *mut CelBytesBlock {
         let cap = bytes.len();
-        let size = CEL_BYTES_BLOCK_ITEMS_OFFSET
+        let size = CEL_BYTES_BLOCK_TOKEN
+            .base_size
             .checked_add(cap)
             .expect("bytes block fits");
         let raw = self.alloc_raw_typed(CelBytesBlock::TYPE_ID, size, align_of::<CelBytesBlock>());
         let block = raw as *mut CelBytesBlock;
         unsafe {
-            (*block).capacity = cap;
+            init_bytes_block(block, cap);
             let dest = bytes_base(block);
             if cap != 0 {
                 core::ptr::copy_nonoverlapping(bytes.as_ptr(), dest, cap);

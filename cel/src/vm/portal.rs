@@ -51,10 +51,11 @@ use crate::runtime::object::{
     list_promote_empty_to_ints, list_resize_ge, list_store_int, list_try_append, map_len,
     map_try_insert, new_bool, new_double_in, new_int, new_int_in, string_as_str, string_byte_len,
     w_kind, w_type, CelKind, CelObject, CelRef, ListStrategy, W_BoolObject, W_DoubleObject,
-    W_IntObject, W_OptionalObject, CEL_DOUBLE_CLASS, CEL_INT_CLASS, CEL_INT_COLUMN_CLASS,
-    CEL_LIST_CLASS, CEL_MAP_CLASS, CEL_STRING_CLASS,
+    W_IntObject, W_OptionalObject, W_StringObject, CEL_DOUBLE_CLASS, CEL_INT_CLASS,
+    CEL_INT_COLUMN_CLASS, CEL_LIST_CLASS, CEL_MAP_CLASS, CEL_STRING_CLASS,
 };
 use crate::runtime::object::{force_virtualizable_if_necessary, W_CelFrame};
+use crate::runtime::object_array::{self, CelBytesBlock};
 use crate::runtime::optional::{
     cel_optional_has_value, cel_optional_none, cel_optional_of, cel_optional_of_non_zero_value,
     cel_optional_or, cel_optional_or_value, cel_optional_value,
@@ -1571,6 +1572,72 @@ pub(crate) fn driver_table_len() -> usize {
     PORTAL_DRIVER.with(|cell| cell.borrow().entries.len())
 }
 
+/// `resume.py ResumeDataDirectReader.concat_strings` calls
+/// `callinfocollection.funcptr_for_oopspec(OS_STR_CONCAT)`. Pyre's
+/// `PyreBlackholeAllocator::os_str_concat` is that funcptr;
+/// `LlmodelBlackholeAllocator` leaves the trait default (returns 0).
+struct CelBlackholeAllocator;
+
+impl majit_metainterp::resume::BlackholeAllocator for CelBlackholeAllocator {
+    fn allocate_with_vtable(&self, descr: &majit_ir::DescrRef, vtable: usize) -> i64 {
+        majit_metainterp::resume::LlmodelBlackholeAllocator.allocate_with_vtable(descr, vtable)
+    }
+    fn bh_new(&self, typedescr: &majit_ir::DescrRef) -> i64 {
+        majit_metainterp::resume::LlmodelBlackholeAllocator.bh_new(typedescr)
+    }
+    fn bh_new_array(&self, length: usize, arraydescr: &majit_ir::DescrRef) -> i64 {
+        majit_metainterp::resume::LlmodelBlackholeAllocator.bh_new_array(length, arraydescr)
+    }
+    fn bh_new_array_clear(&self, length: usize, arraydescr: &majit_ir::DescrRef) -> i64 {
+        majit_metainterp::resume::LlmodelBlackholeAllocator.bh_new_array_clear(length, arraydescr)
+    }
+    fn bh_setfield_gc_i(&self, struct_ptr: i64, value: i64, descr_info: &majit_ir::FieldDescrInfo) {
+        majit_metainterp::resume::LlmodelBlackholeAllocator
+            .bh_setfield_gc_i(struct_ptr, value, descr_info)
+    }
+    fn bh_setfield_gc_r(&self, struct_ptr: i64, value: i64, descr_info: &majit_ir::FieldDescrInfo) {
+        majit_metainterp::resume::LlmodelBlackholeAllocator
+            .bh_setfield_gc_r(struct_ptr, value, descr_info)
+    }
+    fn bh_setfield_gc_f(&self, struct_ptr: i64, value: i64, descr_info: &majit_ir::FieldDescrInfo) {
+        majit_metainterp::resume::LlmodelBlackholeAllocator
+            .bh_setfield_gc_f(struct_ptr, value, descr_info)
+    }
+    fn bh_setarrayitem_gc_i(
+        &self,
+        array: i64,
+        index: usize,
+        value: i64,
+        descr: &majit_ir::DescrRef,
+    ) {
+        majit_metainterp::resume::LlmodelBlackholeAllocator
+            .bh_setarrayitem_gc_i(array, index, value, descr)
+    }
+    fn bh_setarrayitem_gc_r(
+        &self,
+        array: i64,
+        index: usize,
+        value: i64,
+        descr: &majit_ir::DescrRef,
+    ) {
+        majit_metainterp::resume::LlmodelBlackholeAllocator
+            .bh_setarrayitem_gc_r(array, index, value, descr)
+    }
+    fn bh_setarrayitem_gc_f(
+        &self,
+        array: i64,
+        index: usize,
+        value: i64,
+        descr: &majit_ir::DescrRef,
+    ) {
+        majit_metainterp::resume::LlmodelBlackholeAllocator
+            .bh_setarrayitem_gc_f(array, index, value, descr)
+    }
+    fn os_str_concat(&self, str1: i64, str2: i64) -> i64 {
+        object_array::ll_strconcat(str1 as *mut CelBytesBlock, str2 as *mut CelBytesBlock) as i64
+    }
+}
+
 fn fresh_portal_driver(state: &mut PortalState, code: &CelCode) -> JitDriver<PortalState> {
     let mut driver = JitDriver::new(portal_threshold());
     driver.set_param("function_threshold", i64::from(portal_function_threshold()));
@@ -1593,6 +1660,24 @@ fn fresh_portal_driver(state: &mut PortalState, code: &CelCode) -> JitDriver<Por
     )));
     crate::runtime::registration::publish_cel_descrs_once();
     driver.set_gc_allocator(Box::new(crate::runtime::heap::CelGc::new()));
+    driver.register_blackhole_allocator(CelBlackholeAllocator);
+    // `jtransform.py` `_handle_stroruni_call` / `_handle_oopspec_call`
+    // adds `OS_STR_CONCAT` to `callinfocollection`. Seed the row here so
+    // `vstring.py` force_box (`NEWSTR` + `COPYSTRCONTENT`) and
+    // `resume.py concat_strings` can run without a prior trace.
+    {
+        let descr = majit_metainterp::make_call_descr_with_effect(
+            &[majit_ir::Type::Ref, majit_ir::Type::Ref],
+            majit_ir::Type::Ref,
+            majit_metainterp::str_concat_effect_info(),
+        );
+        driver.meta_interp_mut().ensure_oopspec_callinfo(
+            majit_ir::OopSpecIndex::StrConcat,
+            descr,
+            object_array::ll_strconcat as *const () as u64,
+            "ll_strconcat",
+        );
+    }
     {
         use majit_metainterp::JitState as _;
         state
@@ -3327,44 +3412,120 @@ fn int_to_text(vm: i64, n: i64) -> *mut CelObject {
 /// takes the class on the int bank (`record_exact_class/ri`).
 const STRING_CLASS_PTR: *const crate::runtime::object::CelClass = &CEL_STRING_CLASS;
 
-/// Two string leaves as one fresh string (`new_string_concat`).
+/// Concrete `struct_allocs` target for [`wrap_string`].
 ///
-/// One bump holds the leaf and its byte block. Null declines: a null,
-/// a non-string, or a negative length. Payloads are immutable UTF-8.
-#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
-fn concat_text(a: *mut CelObject, b: *mut CelObject) -> *mut CelObject {
-    if a.is_null()
-        || b.is_null()
-        || unsafe { w_kind(a) } != CelKind::Str
-        || unsafe { w_kind(b) } != CelKind::Str
-    {
-        return core::ptr::null_mut();
-    }
-    let Some(left) = (unsafe { str_bytes(a) }) else {
-        return core::ptr::null_mut();
-    };
-    let Some(right) = (unsafe { str_bytes(b) }) else {
-        return core::ptr::null_mut();
-    };
-    crate::runtime::object::new_string_concat(
-        unsafe { crate::runtime::object::string_payload_as_str(left) },
-        unsafe { crate::runtime::object::string_payload_as_str(right) },
-    ) as *mut CelObject
+/// `W_UnicodeObject(self._utf8 + w_other._utf8, self._len() + w_other._len())`
+/// after `ll_strconcat`. `public` is null: the leaf is VM-allocated.
+fn alloc_traced_string(
+    header: CelObject,
+    chars: *mut CelBytesBlock,
+    byte_len: i64,
+    public: *const (),
+) -> *mut W_StringObject {
+    crate::runtime::heap::with_heap(|heap| {
+        heap.alloc(W_StringObject {
+            ob_header: header,
+            chars,
+            byte_len,
+            public,
+        })
+    })
 }
 
-/// `W_StringObject` + `W_StringObject`. [`concat_text`] is the fresh leaf.
-/// Null declines.
-#[majit_macros::jit_inline(calls = {
-    // Fresh string only. Empty write sets, so cached fields stay.
-    concat_text => alloc_ref,
-})]
+/// Wrap a `STR` payload as a `W_StringObject`.
+///
+/// Traced body is `new_with_vtable` of `CEL_STRING_CLASS` plus
+/// `setfield_gc` of `chars` / `byte_len` (`rewrite_op_malloc`). Length
+/// is the wrappers' `_len()+_len()`, not a getfield of the concat
+/// result (that `STRLEN` would force the virtual string).
+#[cfg_attr(
+    feature = "jit",
+    majit_macros::jit_inline(
+        inlined_prefix = {
+            W_StringObject::ob_header => crate::runtime::object::CelObject,
+        },
+        ref_params = {
+            chars: ref(crate::runtime::object_array::CelBytesBlock),
+        },
+        ref_fields = {
+            W_StringObject::chars => crate::runtime::object_array::CelBytesBlock,
+        },
+        int_fields = {
+            W_StringObject::byte_len => i64,
+        },
+        struct_allocs = {
+            W_StringObject => alloc_traced_string,
+        },
+    )
+)]
+#[allow(unused_variables)]
+fn wrap_string(chars: *mut CelBytesBlock, byte_len: i64) -> *mut CelObject {
+    let w = W_StringObject {
+        ob_header: CelObject {
+            ob_type: &CEL_STRING_CLASS,
+        },
+        chars,
+        byte_len,
+        public: core::ptr::null(),
+    };
+    w as *mut W_StringObject as *mut CelObject
+}
+
+/// `W_StringObject` + `W_StringObject`.
+///
+/// `descr_add`: getfield `_utf8` / `chars`, `ll_strconcat`
+/// (`@jit.oopspec('stroruni.concat')`), wrap. Null declines: a null,
+/// a non-string, or a negative length. Payloads are immutable UTF-8.
+#[majit_macros::jit_inline(
+    ref_params = {
+        a: ref(W_StringObject),
+        b: ref(W_StringObject),
+    },
+    ref_fields = {
+        W_StringObject::chars => crate::runtime::object_array::CelBytesBlock,
+    },
+    int_fields = {
+        W_StringObject::byte_len => i64,
+    },
+    calls = {
+        cell_kind => inline_int,
+        crate::runtime::object_array::ll_strconcat => str_concat,
+        wrap_string => inline_ref,
+    },
+)]
 fn string_add_cell(a: *mut CelObject, b: *mut CelObject) -> *mut CelObject {
-    let text = concat_text(a, b);
-    if !text.is_null() {
-        // Fresh `W_StringObject` (`new_string_concat`).
-        majit_metainterp::jit::record_exact_class(text, STRING_CLASS_PTR as usize);
+    if cell_kind(a) != CelKind::Str as i64 {
+        core::ptr::null_mut()
+    } else if cell_kind(b) != CelKind::Str as i64 {
+        core::ptr::null_mut()
+    } else {
+        let n1 = a.byte_len;
+        let n2 = b.byte_len;
+        if n1 < 0 {
+            core::ptr::null_mut()
+        } else if n2 < 0 {
+            core::ptr::null_mut()
+        } else {
+            let s1 = a.chars as *mut CelBytesBlock;
+            let s2 = b.chars as *mut CelBytesBlock;
+            if (s1 as *mut u8) == core::ptr::null_mut() {
+                core::ptr::null_mut()
+            } else if (s2 as *mut u8) == core::ptr::null_mut() {
+                core::ptr::null_mut()
+            } else {
+                let chars = crate::runtime::object_array::ll_strconcat(s1, s2);
+                if (chars as *mut u8) == core::ptr::null_mut() {
+                    core::ptr::null_mut()
+                } else {
+                    let text = wrap_string(chars, n1 + n2);
+                    if (text as *mut u8) != core::ptr::null_mut() {
+                        majit_metainterp::jit::record_exact_class(text, STRING_CLASS_PTR as usize);
+                    }
+                    text
+                }
+            }
+        }
     }
-    text
 }
 
 /// Two doubles: `cel_div` / ordered compare. Residual so the leaves are
@@ -4627,10 +4788,12 @@ fn host_call2_i(entry: i64, a: i64, b: i64) -> i64 {
         crate::runtime::object::W_ListObject::start => i64,
         crate::runtime::object::W_IntColumn::length => i64,
         crate::runtime::object::W_FloatColumn::length => i64,
+        crate::runtime::object::W_StringObject::byte_len => i64,
     },
     ref_fields = {
         crate::runtime::object::W_ListObject::storage => crate::runtime::object::CelObject,
         crate::runtime::object::W_ListObject::items => crate::runtime::object_array::CelItemsBlock,
+        crate::runtime::object::W_StringObject::chars => crate::runtime::object_array::CelBytesBlock,
     },
     // `append_cell` / `list_resize_ge_i` are `dont_look_inside`, so their
     // calldescr would otherwise be `can_raise_effect_info` (empty write
@@ -4694,8 +4857,9 @@ fn host_call2_i(entry: i64, a: i64, b: i64) -> i64 {
         int_to_text => alloc_ref,
         string_from_cell => inline_ref,
         double_binop_cell => residual_ref,
-        // `new_string_concat`: writes only the string it just allocated.
-        concat_text => alloc_ref,
+        // `ll_strconcat` (`rstr.py`, `OS_STR_CONCAT`); wrap is `newutf8`.
+        crate::runtime::object_array::ll_strconcat => str_concat,
+        wrap_string => inline_ref,
         string_add_cell => inline_ref,
         map_store_pair => inline_int,
         cell_map_len => inline_int,
