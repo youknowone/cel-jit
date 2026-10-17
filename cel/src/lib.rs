@@ -22,6 +22,9 @@ mod macros;
 #[cfg(feature = "jit")]
 pub mod majit;
 
+#[cfg(all(test, feature = "jit"))]
+mod test_support;
+
 pub mod common;
 pub mod context;
 mod env;
@@ -286,6 +289,8 @@ mod tests {
 
     /// Tests the provided script and returns the result. An optional context can be provided.
     pub(crate) fn test_script(script: &str, ctx: Option<Context>) -> ResolveResult {
+        #[cfg(feature = "jit")]
+        let _intern = crate::test_support::shared();
         let program = match Program::compile(script) {
             Ok(p) => p,
             Err(e) => panic!("{}", e),

@@ -189,6 +189,12 @@ mod tests {
     use crate::{Context, ExecutionError, Program, Value};
     use std::collections::HashMap;
 
+    /// Shared intern-table lock. JIT helpers intern ConstPtrs into a
+    /// thread-local `CelGc`; MiniMark collection tests take the exclusive side.
+    fn intern_table() -> crate::test_support::SharedGuard {
+        crate::test_support::shared()
+    }
+
     #[derive(Debug, Clone, Copy)]
     enum Bind {
         Int(i64),
@@ -211,6 +217,7 @@ mod tests {
     /// one-row batch is the single-row program on this machine — the loop runs
     /// once and the accumulator holds the row's value.
     fn check(expr_src: &str, binds: &[(&str, Bind)]) {
+        let _intern = intern_table();
         // A `bool` binding builds a BOOL column, not an int one holding `0`/`1`:
         // the machine reads a bool slot with a one-byte load, so the two are not
         // interchangeable on the way in any more than they are in CEL.
@@ -289,6 +296,7 @@ mod tests {
     /// tree-walker raises.
     #[test]
     fn overflow_deopt_on_compiled_trace() {
+        let _intern = intern_table();
         use super::bytecode::float_bank::{clean_interp_f, jit_stats, run_jit_f};
         use super::bytecode::{
             OP_ADD, OP_ADD_OVF, OP_JUMP_IF_ABOVE, OP_LOAD_CONST, OP_RETURN, OP_TRAP_STORE,
@@ -446,6 +454,7 @@ mod tests {
     /// has already resolved the index.
     #[test]
     fn list_index_constant() {
+        let _intern = intern_table();
         let program = Program::compile("list[0] + list[2] + list[4]").unwrap();
         let schema: Schema = [
             ("list[0]".to_string(), ValType::Int),
@@ -612,6 +621,7 @@ mod tests {
     /// before the lowerer emits it. clean == jit-off == jit-on, jit-on compiles.
     #[test]
     fn float_vm_count_ge() {
+        let _intern = intern_table();
         use super::bytecode::float_bank::{clean_interp_f, jit_stats, run_jit_f};
         use super::bytecode::{
             OP_ADD, OP_COL_LOAD_F, OP_FGE, OP_JUMP_IF_ABOVE, OP_LOAD_CONST, OP_MUL, OP_RETURN,
@@ -821,6 +831,7 @@ mod tests {
     /// reached the driver. The compiled tier must still trace the loop:
     /// refusing is a guard exit taken on some row, not a failure to compile.
     fn check_batch_f_refuses(expr_src: &str, cols: &[(&str, ColData)]) {
+        let _intern = intern_table();
         use super::bytecode::float_bank::jit_stats;
 
         let program =
@@ -880,6 +891,7 @@ mod tests {
     /// the compiled tier must all equal the stock tree-walker's per-row sum, and
     /// the compiled run must actually trace the hot loop.
     fn check_batch_f(expr_src: &str, cols: &[(&str, ColData)]) {
+        let _intern = intern_table();
         use super::bytecode::float_bank::jit_stats;
 
         let program =
@@ -974,6 +986,7 @@ mod tests {
     /// reproduce that sum bit for bit (float addition is order-sensitive, so
     /// compare bits, never a tolerance). The compiled run must trace the loop.
     fn check_batch_float(expr_src: &str, cols: &[(&str, ColData)]) {
+        let _intern = intern_table();
         use super::bytecode::eval_batch_sum_float;
         use super::bytecode::float_bank::jit_stats;
 
@@ -1095,6 +1108,7 @@ mod tests {
     /// / compiled tiers must all equal the stock tree-walker's per-row bool/int
     /// sum, and the compiled run must trace the loop.
     fn check_batch_str(expr_src: &str, cols: &[(&str, ColData)]) {
+        let _intern = intern_table();
         use super::bytecode::float_bank::jit_stats;
 
         let program =
@@ -1309,6 +1323,7 @@ mod tests {
         lists: &[(&str, ListCol)],
         expect_refusal: bool,
     ) {
+        let _intern = intern_table();
         use super::bytecode::float_bank::jit_stats;
         use super::lower::{
             elem_slot_path, elem_slot_source, offset_slot_source, size_slot_path, SlotKind,
@@ -1683,6 +1698,7 @@ mod tests {
     /// ever cached across batches.
     #[test]
     fn a_literals_rank_moves_with_the_batch_and_the_answer_does_not() {
+        let _intern = intern_table();
         use super::batch::{Batch, BatchProgram, ColumnRef};
         let schema: Schema = [("role".to_string(), ValType::Str)].into_iter().collect();
         let program = BatchProgram::compile("role < \"m\"", &schema).expect("string `<` lowers");
@@ -1822,6 +1838,7 @@ mod tests {
 
     /// A LIST-valued expression's per-row result, against the tree-walker's.
     fn check_collect_list(expr_src: &str, rows: &[(&str, ColData)], lists: &[(&str, ListCol)]) {
+        let _intern = intern_table();
         use super::batch::{Batch, BatchProgram, Tier};
         use super::bytecode::float_bank::jit_stats;
 
@@ -1896,6 +1913,7 @@ mod tests {
     /// `string` comes back through its rank, a `timestamp` and a `duration`
     /// through their nanoseconds.
     fn check_collect(expr_src: &str, cols: &[(&str, ColData)]) {
+        let _intern = intern_table();
         use super::batch::{Batch, BatchProgram, Tier};
         use super::bytecode::float_bank::jit_stats;
         let n = cols[0].1.len();
@@ -1952,6 +1970,7 @@ mod tests {
     /// is what materializes the derived `string(x)` and `concat#k` columns —
     /// the harnesses that build columns by hand cannot.
     fn check_bound_batch(expr_src: &str, cols: &[(&str, ColData)]) {
+        let _intern = intern_table();
         use super::batch::{Batch, BatchProgram, Tier};
         let n = cols[0].1.len();
         let schema: Schema = cols
@@ -2661,6 +2680,7 @@ mod tests {
         row: usize,
         want: Result<Value, (&str, &str)>,
     ) {
+        let _intern = intern_table();
         let got = program.execute(&row_context(cols, row));
         match want {
             Ok(v) => assert_eq!(got.as_ref().ok(), Some(&v), "`{expr}` row {row}"),
@@ -3084,6 +3104,7 @@ mod tests {
     /// has to be real: a column outside it must REFUSE, not answer.
     #[test]
     fn temporal_arithmetic_refuses_a_batch_outside_its_domain() {
+        let _intern = intern_table();
         use super::batch::{Batch, BatchError, BatchProgram, ColumnRef};
         let schema: Schema = [
             ("a".to_string(), ValType::Duration),
@@ -3360,6 +3381,7 @@ mod tests {
     /// failing inside compiled code and not merely from the interpreter tier.
     #[test]
     fn batch_int_overflow_refuses() {
+        let _intern = intern_table();
         use super::bytecode::float_bank::jit_stats;
         let n = 3000;
         let base_a = gen_i64(n, 0x3141_5926_5358_9793, 1, 1000);
@@ -3974,6 +3996,7 @@ mod tests {
     /// change turning the trap into an answer is caught.
     #[test]
     fn batch_chain_eager_fold_traps() {
+        let _intern = intern_table();
         use super::batch::{Batch, BatchError, BatchProgram, Tier};
         let n = 64;
         let lens = gen_lens(n, 0xEA6E_0F01_D000_0001, 3);
@@ -4546,6 +4569,7 @@ mod tests {
     /// Run one sweep expression through both evaluators and check the parity
     /// property. Panics with the expression on any divergence.
     fn sweep_case(expr_src: &str, cols: &[(&str, ColData)]) -> SweepVerdict {
+        let _intern = intern_table();
         let n = cols[0].1.len();
 
         let program =
@@ -5530,6 +5554,7 @@ mod tests {
     /// index at all would be a JIT-only answer — the tree-walker raises there.
     #[test]
     fn constant_index_reads_the_rows_own_list() {
+        let _intern = intern_table();
         use super::batch::{Batch, BatchProgram, ColumnRef, Tier};
 
         // Jagged: row 0 = [5, 6], row 1 = [7], row 2 = [8, 9, 10]. Only row 1
@@ -5662,6 +5687,7 @@ mod tests {
     /// neighbouring row's storage rather than refusing them.
     #[test]
     fn runtime_index_reads_the_rows_own_list() {
+        let _intern = intern_table();
         use super::batch::{Batch, BatchProgram, ColumnRef, Tier};
         use super::bytecode::float_bank::jit_stats;
 
@@ -5775,6 +5801,7 @@ mod tests {
     /// with a short row.
     #[test]
     fn constant_index_float_elements() {
+        let _intern = intern_table();
         use super::batch::{Batch, BatchProgram, ColumnRef, Tier};
         use super::bytecode::float_bank::{abort_reasons, abort_reasons_since, jit_stats};
 

@@ -1949,6 +1949,10 @@ mod tests {
         LOCK.lock().unwrap_or_else(|p| p.into_inner())
     }
 
+    fn intern_table() -> crate::test_support::SharedGuard {
+        crate::test_support::shared()
+    }
+
     fn schema(pairs: &[(&str, ValType)]) -> Schema {
         pairs.iter().map(|(p, t)| (p.to_string(), *t)).collect()
     }
@@ -1958,6 +1962,7 @@ mod tests {
     /// runs the float convention; the arity-one cases run the other two.
     #[test]
     fn a_user_function_in_scalar_form_is_called_on_every_tier() {
+        let _intern = intern_table();
         let mut ctx = Context::default();
         ctx.add_function("add", |a: i64, b: i64| a + b);
         ctx.add_function("multiply", |a: i64, b: i64| a * b);
@@ -2010,6 +2015,7 @@ mod tests {
     /// and a user function under a name the stdlib declares an overload for.
     #[test]
     fn a_user_function_call_declines_outside_the_scalar_forms() {
+        let _intern = intern_table();
         let mut ctx = Context::default();
         ctx.add_function("add", |a: i64, b: i64| a + b);
         ctx.add_function("fallible", |a: i64| -> Result<i64, crate::ExecutionError> {
@@ -2050,6 +2056,7 @@ mod tests {
     /// have, trapping included: an overflow or a zero divisor is NOT folded.
     #[test]
     fn a_literal_comprehension_body_folds_its_constant_arithmetic() {
+        let _intern = intern_table();
         use crate::majit::bytecode::{
             OPERANDS, OP_ADD_OVF, OP_ADD_OVF_K, OP_DIV_CHK, OP_DIV_CHK_K, OP_GT, OP_GT_K,
             OP_MUL_OVF, OP_MUL_OVF_K,
@@ -2129,6 +2136,7 @@ mod tests {
     /// complement is the only thing in any of these bodies that takes one.
     #[test]
     fn a_single_column_collect_appends_in_one_instruction() {
+        let _intern = intern_table();
         use crate::majit::bytecode::{OPERANDS, OP_COL_PUSH, OP_COL_PUSH_IF, OP_COL_STORE, OP_NOT};
         let opcodes = |code: &[i64]| -> Vec<i64> {
             let mut pc = 0;
@@ -2208,6 +2216,7 @@ mod tests {
     /// answer. It must still trap.
     #[test]
     fn a_zero_test_on_a_power_of_two_modulus_masks_and_agrees_with_the_walker() {
+        let _intern = intern_table();
         use crate::majit::bytecode::{OPERANDS, OP_AND_K, OP_MOD_CHK_K};
         let opcodes = |code: &[i64]| -> Vec<i64> {
             let mut pc = 0;
@@ -2291,6 +2300,7 @@ mod tests {
     /// took the WHOLE expression to the tree-walker, not just the read.
     #[test]
     fn a_runtime_index_reads_in_one_instruction_and_agrees_with_the_walker() {
+        let _intern = intern_table();
         use crate::majit::bytecode::{OPERANDS, OP_INDEX_K, OP_INDEX_R, OP_INDEX_R_F};
         let opcodes = |code: &[i64]| -> Vec<i64> {
             let mut pc = 0;
@@ -2374,6 +2384,7 @@ mod tests {
 
     #[test]
     fn a_one_row_batch_runs_the_straight_line_form_and_agrees_with_the_loop() {
+        let _intern = intern_table();
         let s = schema(&[
             ("x", ValType::Int),
             ("f", ValType::Float),
@@ -2440,6 +2451,7 @@ mod tests {
 
     #[test]
     fn bool_column_is_declared_and_encoded_as_bool() {
+        let _intern = intern_table();
         let s = schema(&[
             ("balance", ValType::Int),
             ("amount", ValType::Int),
@@ -2465,6 +2477,7 @@ mod tests {
     /// door and through all three tiers by name.
     #[test]
     fn the_auto_route_answers_what_every_named_tier_answers() {
+        let _intern = intern_table();
         let s = schema(&[("x", ValType::Int)]);
         let program = BatchProgram::compile("x * 2 + 1", &s).unwrap();
         for rows in [1usize, 4, 1_000] {
@@ -2486,6 +2499,7 @@ mod tests {
     /// asked on every tier, through both doors.
     #[test]
     fn collect_into_answers_what_collect_answers() {
+        let _intern = intern_table();
         let ints = [7i64, -1, 0, 5];
         let floats = [1.5f64, -0.25, 0.0, 8.0];
         let bools = [true, false, false, true];
@@ -2567,6 +2581,7 @@ mod tests {
     /// nothing.
     #[test]
     fn a_reused_buffer_holds_exactly_the_latest_run() {
+        let _intern = intern_table();
         let long: Vec<i64> = (0..64).collect();
         let short = [9i64, 4];
         let words: Vec<String> = ["fig", "pear", "fig"]
@@ -2624,6 +2639,7 @@ mod tests {
     /// the values that tier wrote over it.
     #[test]
     fn a_projection_answers_what_the_loop_it_replaces_answers() {
+        let _intern = intern_table();
         let strs: Vec<String> = ["pear", "fig", "apple", "fig"]
             .iter()
             .map(|s| s.to_string())
@@ -2675,6 +2691,7 @@ mod tests {
     /// the reason the word-count route is — the decision is the contract.
     #[test]
     fn a_projection_stays_clean_however_tall_the_batch() {
+        let _intern = intern_table();
         let s = schema(&[("x", ValType::Int)]);
         let projection = BatchProgram::compile("x", &s).unwrap();
         let computed = BatchProgram::compile("x * 2 + 1", &s).unwrap();
@@ -2703,6 +2720,7 @@ mod tests {
     /// stands in for would have stored the column unchanged.
     #[test]
     fn an_expression_with_a_body_is_not_a_projection() {
+        let _intern = intern_table();
         let s = schema(&[("x", ValType::Int), ("y", ValType::Int)]);
         for src in ["x * 2", "x + y", "x == 1", "-x"] {
             assert!(
@@ -2720,6 +2738,7 @@ mod tests {
     /// what it is filled with agrees with the tiers that do run it.
     #[test]
     fn a_constant_program_answers_what_the_loop_it_replaces_answers() {
+        let _intern = intern_table();
         let s = schema(&[("x", ValType::Int)]);
         let xs = [1i64, 2, 3, 4];
         let cases = [
@@ -2752,6 +2771,7 @@ mod tests {
     /// reading a column has a body, so neither is a constant program.
     #[test]
     fn a_seeded_or_computed_result_is_not_a_constant_program() {
+        let _intern = intern_table();
         let s = schema(&[("x", ValType::Int)]);
         for src in ["x", "x + 1", "'a'"] {
             assert_eq!(
@@ -2775,6 +2795,7 @@ mod tests {
     /// what the machine happens to cost today and the decision is the contract.
     #[test]
     fn the_route_follows_what_a_run_saves_by_being_compiled() {
+        let _intern = intern_table();
         let s = schema(&[("x", ValType::Int)]);
         let program = BatchProgram::compile("x * 2 + 1", &s).unwrap();
         let lowered = program.lowered();
@@ -2842,6 +2863,7 @@ mod tests {
     /// and survives a re-measurement that moves the level.
     #[test]
     fn a_thin_row_body_is_compiled_where_a_larger_dense_one_is_not() {
+        let _intern = intern_table();
         let s = schema(&[("x", ValType::Int), ("y", ValType::Int)]);
         let thin = BatchProgram::compile("x + 1", &s).unwrap();
         let dense = BatchProgram::compile("x*2 + x*3 + y*4 + y*5 + x*6 + y*7", &s).unwrap();
@@ -2890,6 +2912,7 @@ mod tests {
     /// the test above.
     #[test]
     fn a_thin_element_body_is_compiled_where_a_larger_dense_one_is_not() {
+        let _intern = intern_table();
         let s = schema(&[("list", ValType::Int), ("list[]", ValType::Int)]);
         let thin = BatchProgram::compile("list.map(e, e + 1)", &s).unwrap();
         let dense = BatchProgram::compile("list.map(e, (e + 1) * (e + 2) + e * 3)", &s).unwrap();
@@ -2933,6 +2956,7 @@ mod tests {
     /// exactly what they say.
     #[test]
     fn naming_a_tier_overrides_the_route() {
+        let _intern = intern_table();
         let s = schema(&[("x", ValType::Int)]);
         let program = BatchProgram::compile("x * 2 + 1", &s).unwrap();
         let one = vec![7i64];
@@ -2946,6 +2970,7 @@ mod tests {
 
     #[test]
     fn a_bool_column_declared_int_is_rejected_rather_than_answered() {
+        let _intern = intern_table();
         // The whole point of `ValType::Bool`: this expression cannot lower at
         // all under an `int` declaration, so there is no way to reach the
         // bitwise `&&` that used to answer here.
@@ -2965,6 +2990,7 @@ mod tests {
     /// a wrong answer in exactly one shape.
     #[test]
     fn resolving_first_answers_what_binding_in_one_step_answers() {
+        let _intern = intern_table();
         let ints = [7i64, -1, 0, 5];
         let strs: Vec<String> = ["pear", "fig", "apple", "fig"]
             .iter()
@@ -3055,6 +3081,7 @@ mod tests {
     /// every call after the first measure something else.
     #[test]
     fn one_resolution_encodes_the_same_answer_every_time() {
+        let _intern = intern_table();
         let ints = [3i64, 9, -2];
         let s = schema(&[("x", ValType::Int)]);
         let batch = Batch::new(ints.len()).column("x", ColumnRef::Int(&ints));
@@ -3069,6 +3096,7 @@ mod tests {
 
     #[test]
     fn a_column_of_the_wrong_type_is_an_error_not_a_reinterpretation() {
+        let _intern = intern_table();
         let s = schema(&[("x", ValType::Int)]);
         let program = BatchProgram::compile("x > 0", &s).unwrap();
         let wrong = vec![1.5f64];
@@ -3081,6 +3109,7 @@ mod tests {
 
     #[test]
     fn a_missing_column_is_an_error() {
+        let _intern = intern_table();
         let s = schema(&[("x", ValType::Int)]);
         let program = BatchProgram::compile("x > 0", &s).unwrap();
         let batch = Batch::new(1);
@@ -3092,6 +3121,7 @@ mod tests {
 
     #[test]
     fn a_short_column_is_an_error() {
+        let _intern = intern_table();
         let s = schema(&[("x", ValType::Int)]);
         let program = BatchProgram::compile("x > 0", &s).unwrap();
         let x = vec![1i64, 2];
@@ -3104,6 +3134,7 @@ mod tests {
 
     #[test]
     fn overflow_refuses_rather_than_wrapping() {
+        let _intern = intern_table();
         let s = schema(&[("x", ValType::Int)]);
         let program = BatchProgram::compile("x + x", &s).unwrap();
         let x = vec![i64::MAX];
@@ -3119,6 +3150,7 @@ mod tests {
     /// needs per-distinct ids refuses it.
     #[test]
     fn literal_scan_licenses_exactly_the_literal_equality_shapes() {
+        let _intern = intern_table();
         let s = schema(&[("name", ValType::Str), ("other", ValType::Str)]);
         let gate = |src: &str| {
             BatchProgram::compile(src, &s)
@@ -3143,6 +3175,7 @@ mod tests {
     /// the empty string and a superstring of the literal.
     #[test]
     fn literal_scan_equality_matches_the_ranked_answer() {
+        let _intern = intern_table();
         let s = schema(&[("name", ValType::Str)]);
         let name: Vec<String> = ["ab", "cd", "ef", "ab", "", "abc"]
             .iter()
@@ -3168,6 +3201,7 @@ mod tests {
 
     #[test]
     fn string_equality_goes_through_ranked_ids() {
+        let _intern = intern_table();
         let s = schema(&[("name", ValType::Str)]);
         let program = BatchProgram::compile("name == \"ab\"", &s).unwrap();
         let name: Vec<String> = ["ab", "cd", "ab", "ab"]
@@ -3188,6 +3222,7 @@ mod tests {
     /// wrong encoding or a wrong layout on its own.
     #[test]
     fn raw_output_is_the_machines_own_column() {
+        let _intern = intern_table();
         let s = schema(&[
             ("x", ValType::Int),
             ("f", ValType::Float),
@@ -3280,6 +3315,7 @@ mod tests {
     /// packed across the batch. Nothing per row is allocated.
     #[test]
     fn raw_output_of_a_list_result_is_arrow_shaped() {
+        let _intern = intern_table();
         let s = schema(&[("nums[]", ValType::Int)]);
         let lens = vec![3i64, 0, 2];
         let flat = vec![1i64, -2, 3, 4, -5];
@@ -3341,6 +3377,7 @@ mod tests {
     /// count is not something the test suite can assert, so the sharing itself
     /// is.
     fn every_row_of_a_list_output_windows_one_shared_buffer() {
+        let _intern = intern_table();
         let elems = [1i64, 2, 3, 4, 5, 6];
         let lens = vec![2i64, 3, 1];
         // The scalar-element arm and the record arm build different storages,
@@ -3388,6 +3425,7 @@ mod tests {
 
     #[test]
     fn a_record_list_collected_as_values_reads_back_every_field() {
+        let _intern = intern_table();
         use crate::objects::KeyRef;
 
         fn record(fields: &[(&str, i64)]) -> Value {
@@ -3479,6 +3517,7 @@ mod tests {
     /// temporal tests all use a scalar column.
     #[test]
     fn a_temporal_element_list_decodes_from_the_shared_column() {
+        let _intern = intern_table();
         let lens = vec![2i64, 1];
         let nanos = vec![1_000_000_000i64, 2_500_000_000, 7_000_000_000];
 
@@ -3539,6 +3578,7 @@ mod tests {
     /// one an equality check alone would not catch.
     #[test]
     fn a_string_list_collected_as_values_shares_one_arc_per_distinct_string() {
+        let _intern = intern_table();
         let s = schema(&[("tags[]", ValType::Str)]);
         let lens = vec![3i64, 1];
         let tags: Vec<String> = ["a", "b", "a", "c"].iter().map(|t| t.to_string()).collect();
@@ -3590,6 +3630,7 @@ mod tests {
     /// per row, so a row reading the wrong rank cannot pass by coincidence.
     #[test]
     fn a_scalar_string_result_still_reads_its_interned_table() {
+        let _intern = intern_table();
         let s = schema(&[("name", ValType::Str)]);
         let names: Vec<String> = ["ada", "grace", "ada"]
             .iter()
@@ -3616,6 +3657,7 @@ mod tests {
     /// interned table, read back through the map accessors.
     #[test]
     fn a_record_lists_string_field_reads_back_from_the_interned_table() {
+        let _intern = intern_table();
         use crate::objects::KeyRef;
 
         let s = schema(&[
@@ -3678,6 +3720,7 @@ mod tests {
     /// of taking a `Value::Map` per element.
     #[test]
     fn raw_output_of_a_record_list_is_one_buffer_per_field() {
+        let _intern = intern_table();
         let s = schema(&[
             ("items[].price", ValType::Int),
             ("items[].qty", ValType::Int),
@@ -3724,6 +3767,7 @@ mod tests {
     /// compute the address by their own route.
     #[test]
     fn a_bool_column_is_read_a_byte_at_a_time() {
+        let _intern = intern_table();
         let s = schema(&[("b", ValType::Bool), ("x", ValType::Int)]);
         // 24 rows: more than one 8-byte stride, and `true` in positions that a
         // stride-8 read would land on `false` for.
@@ -3757,6 +3801,7 @@ mod tests {
     /// `active` pattern is chosen so a stride-8 read agrees only on element 0.
     #[test]
     fn a_bool_list_field_is_read_a_byte_at_a_time() {
+        let _intern = intern_table();
         let s = schema(&[
             ("items[].price", ValType::Int),
             ("items[].active", ValType::Bool),
@@ -3824,6 +3869,7 @@ mod tests {
     /// expression the machine can answer.
     #[test]
     fn a_string_concatenation_is_not_hidden_by_a_float_slot_at_the_same_index() {
+        let _intern = intern_table();
         let s = schema(&[
             ("f0", ValType::Float),
             ("f1", ValType::Float),
@@ -3851,6 +3897,7 @@ mod tests {
     /// field already spells, and answer with that field.
     #[test]
     fn a_literal_map_key_lowers_to_what_its_dotted_spelling_lowers_to() {
+        let _intern = intern_table();
         let s = schema(&[("m.a", ValType::Int), ("n.x.y", ValType::Int)]);
         let slots = |src: &str| {
             BatchProgram::compile(src, &s)
@@ -3880,6 +3927,7 @@ mod tests {
     /// merely checked for a refusal.
     #[test]
     fn the_type_of_a_declared_list_is_a_constant_its_iteration_variable_shadows() {
+        let _intern = intern_table();
         let s = schema(&[("xs", ValType::Int), ("xs[]", ValType::Int)]);
         let lens = vec![3i64];
         let flat = vec![10i64, 20, 30];
@@ -3918,6 +3966,7 @@ mod tests {
     /// what keeps the batch from paying a `Program::execute` per row for it.
     #[test]
     fn a_trap_no_condition_selects_is_retried_rather_than_walked() {
+        let _intern = intern_table();
         let base = Context::default();
         let run = |xs: &[i64], src: &str| {
             let lens = vec![xs.len() as i64];
@@ -4125,6 +4174,7 @@ mod tests {
     /// tests. The other is stepped only when something reads its value.
     #[test]
     fn the_row_counter_is_stepped_only_where_something_reads_it() {
+        let _intern = intern_table();
         use crate::majit::bytecode::{OPERANDS, OP_ADD_IMM, OP_DIVN_K, OP_MUL_IMM, OP_RETURN};
         // None of the expressions below multiplies or adds a constant, so every
         // `OP_MUL_IMM` and `OP_ADD_IMM` counted here belongs to the loop.
@@ -4222,6 +4272,7 @@ mod tests {
     /// test of the BASE rather than of any one accessor.
     #[test]
     fn the_civil_accessors_pay_for_the_base_they_answer_in() {
+        let _intern = intern_table();
         let s = schema(&[("at", ValType::Timestamp)]);
         let words = |src: &str| {
             BatchProgram::compile(src, &s)
@@ -4253,6 +4304,7 @@ mod tests {
     /// oracle rather than another tier.
     #[test]
     fn a_literal_operand_compares_the_same_on_either_side() {
+        let _intern = intern_table();
         let s = schema(&[("x", ValType::Int), ("t", ValType::Timestamp)]);
         let xs: Vec<i64> = (-4..8).collect();
         let ts: Vec<i64> = (0..xs.len() as i64)
@@ -4341,6 +4393,7 @@ mod tests {
     /// the same flag when it is out of range.
     #[test]
     fn a_program_that_cannot_trap_publishes_no_trap() {
+        let _intern = intern_table();
         use crate::majit::bytecode::{OPERANDS, OP_TRAP_STORE};
         let s = schema(&[("x", ValType::Int), ("nums[]", ValType::Int)]);
         let publishes = |src: &str| {
@@ -4384,6 +4437,7 @@ mod tests {
     /// behind after its reader took the immediate.
     #[test]
     fn a_compared_literal_costs_no_register() {
+        let _intern = intern_table();
         let s = schema(&[("x", ValType::Int)]);
         let width = |src: &str| {
             BatchProgram::compile(src, &s)
@@ -4434,6 +4488,7 @@ mod tests {
     /// because it has no cursor to read one off, and must not lose it.
     #[test]
     fn a_collected_comprehension_keeps_no_count_an_element() {
+        let _intern = intern_table();
         let s = schema(&[("items[].price", ValType::Int)]);
         let elem_words = |src: &str| {
             BatchProgram::compile(src, &s)
@@ -4473,6 +4528,7 @@ mod tests {
     /// EVERY comprehension, so a difference of differences cancels it.
     #[test]
     fn a_loop_reserves_one_preamble_word_for_whichever_close_it_takes() {
+        let _intern = intern_table();
         let s = schema(&[
             ("items[].a", ValType::Int),
             ("items[].b", ValType::Bool),
@@ -4508,6 +4564,7 @@ mod tests {
     /// advances the byte offset and closes, and nothing else.
     #[test]
     fn a_minted_step_writes_the_accumulator_without_a_move() {
+        let _intern = intern_table();
         let s = schema(&[("items[].a", ValType::Int)]);
         let lowered = BatchProgram::compile("items.all(i, i.a > 0)", &s)
             .unwrap()
@@ -4531,6 +4588,7 @@ mod tests {
     /// advance the byte one obliges.
     #[test]
     fn only_a_byte_column_read_makes_its_loop_advance_an_index() {
+        let _intern = intern_table();
         let s = schema(&[("items[].a", ValType::Int), ("items[].b", ValType::Bool)]);
         let elem_words = |src: &str| {
             BatchProgram::compile(src, &s)
@@ -4565,6 +4623,7 @@ mod tests {
     /// and let the tree-walker answer.
     #[test]
     fn a_bool_element_reached_without_its_loop_declines() {
+        let _intern = intern_table();
         let s = schema(&[
             ("items[].price", ValType::Int),
             ("items[].active", ValType::Bool),
@@ -4591,6 +4650,7 @@ mod tests {
     /// refuses it instead.
     #[test]
     fn an_int_column_cannot_back_a_bool_slot() {
+        let _intern = intern_table();
         let s = schema(&[("b", ValType::Bool)]);
         let program = BatchProgram::compile("b", &s).unwrap();
         let as_ints = vec![1i64, 0, 1, 0];
@@ -4603,6 +4663,7 @@ mod tests {
 
     #[test]
     fn float_result_comes_back_as_a_float() {
+        let _intern = intern_table();
         let s = schema(&[("f", ValType::Float)]);
         let program = BatchProgram::compile("f * 2.0", &s).unwrap();
         assert_eq!(program.result_type(), ValType::Float);
@@ -4616,6 +4677,7 @@ mod tests {
 
     #[test]
     fn a_list_column_feeds_a_comprehension() {
+        let _intern = intern_table();
         let s = schema(&[("limit", ValType::Int), ("items[]", ValType::Int)]);
         let program = BatchProgram::compile("items.all(i, i > limit)", &s).unwrap();
         // Rows: [3,4] > 2 yes; [1] > 2 no; [] > 5 vacuously yes.
@@ -4653,6 +4715,7 @@ mod tests {
     /// anything here that decides it.
     #[test]
     fn the_row_by_row_door_answers_what_the_batch_refuses() {
+        let _intern = intern_table();
         let s = schema(&[
             ("x", ValType::Int),
             ("obj.nested.value", ValType::Int),
@@ -4725,6 +4788,7 @@ mod tests {
     /// walker's own error surfaces as a row error rather than as a fallback.
     #[test]
     fn a_trap_falls_back_and_a_real_error_surfaces() {
+        let _intern = intern_table();
         let s = schema(&[("a", ValType::Int), ("b", ValType::Int)]);
         let a = vec![10i64, 20, 30, 40, 50, 60, 70, 80, 90, 100];
         let base = Context::default();
@@ -4758,6 +4822,7 @@ mod tests {
     /// loop the first compiled and not mint another.
     #[test]
     fn a_second_bind_of_the_same_program_reuses_the_compiled_loop() {
+        let _intern = intern_table();
         let _serial = serial();
         let s = schema(&[("x", ValType::Int)]);
         let program = BatchProgram::compile("x * 2 + 1", &s).unwrap();
@@ -4793,6 +4858,7 @@ mod tests {
     /// share a green key, so the second program compiles its own loop.
     #[test]
     fn two_compiles_of_the_same_source_do_not_share_a_loop() {
+        let _intern = intern_table();
         let s = schema(&[("x", ValType::Int)]);
         let p1 = BatchProgram::compile("x * 2 + 1", &s).unwrap();
         let p2 = BatchProgram::compile("x * 2 + 1", &s).unwrap();
@@ -4807,6 +4873,7 @@ mod tests {
     /// a later [`Tier::Jit`] run stays on that loop and matches [`Tier::Clean`].
     #[test]
     fn eager_compile_waits_until_the_loop_is_entered() {
+        let _intern = intern_table();
         use crate::majit::bytecode::float_bank::reset_persistent_state;
         reset_persistent_state();
         let s = schema(&[("x", ValType::Int)]);
@@ -4838,6 +4905,7 @@ mod tests {
     /// own loop is compiled, even if the other thread enters compiled code first.
     #[test]
     fn eager_compile_on_two_threads_compiles_each_program() {
+        let _intern = intern_table();
         use std::sync::{Arc, Barrier};
         let barrier = Arc::new(Barrier::new(2));
         let spawn = |src: &'static str, x: i64, barrier: Arc<Barrier>| {
@@ -4874,6 +4942,7 @@ mod tests {
     /// caller's own mistake, not something the fallback can rescue.
     #[test]
     fn a_missing_column_is_not_fallen_back_on() {
+        let _intern = intern_table();
         let s = schema(&[("a", ValType::Int)]);
         let batch = Batch::new(2);
         let p = Program::compile("a + 1").unwrap();

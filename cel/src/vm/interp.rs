@@ -4448,7 +4448,13 @@ mod tests {
 
     fn run(source: &str, ctx: &Context) -> Result<Value, ExecutionError> {
         let code = compile(&parse(source)).unwrap_or_else(|e| panic!("compile {source}: {e}"));
-        cel_eval_loop(&code, ctx)
+        eval_loop(&code, ctx)
+    }
+
+    fn eval_loop(code: &CelCode, ctx: &Context) -> Result<Value, ExecutionError> {
+        #[cfg(feature = "jit")]
+        let _intern = crate::test_support::shared();
+        super::cel_eval_loop(code, ctx)
     }
 
     /// The probe's recogniser finds the per-element block, and every arm
@@ -4751,7 +4757,7 @@ mod tests {
                 code.disassemble()
             );
             assert_eq!(
-                cel_eval_loop(&code, &ctx),
+                eval_loop(&code, &ctx),
                 crate::Value::resolve_value(&expr, &ctx),
                 "{source}"
             );
@@ -4803,7 +4809,7 @@ mod tests {
                 code.disassemble()
             );
             assert_eq!(
-                cel_eval_loop(&code, &ctx),
+                eval_loop(&code, &ctx),
                 crate::Value::resolve_value(&expr, &ctx),
                 "{source}"
             );
@@ -4865,7 +4871,7 @@ mod tests {
                 code.disassemble()
             );
             assert_eq!(
-                cel_eval_loop(&code, &ctx),
+                eval_loop(&code, &ctx),
                 crate::Value::resolve_value(&expr, &ctx),
                 "{source}"
             );
@@ -4930,7 +4936,7 @@ mod tests {
                 code.disassemble()
             );
             assert_eq!(
-                cel_eval_loop(&code, &ctx),
+                eval_loop(&code, &ctx),
                 crate::Value::resolve_value(&expr, &ctx),
                 "{source}"
             );
@@ -5048,7 +5054,7 @@ mod tests {
         let expr = parse("1 + 2");
         let code = compile(&expr).expect("compile");
         let ctx = Context::default();
-        let value = cel_eval_loop(&code, &ctx).expect("eval");
+        let value = eval_loop(&code, &ctx).expect("eval");
         assert_eq!(value, Value::Int(3));
         assert_eq!(
             crate::runtime::convert::intern_leaf(&value),
@@ -5063,14 +5069,14 @@ mod tests {
         let uint = {
             let expr = parse("1u + 2u");
             let code = compile(&expr).expect("compile");
-            cel_eval_loop(&code, &ctx).expect("eval")
+            eval_loop(&code, &ctx).expect("eval")
         };
         assert_eq!(uint, Value::UInt(3));
         assert!(crate::runtime::convert::intern_leaf(&uint).is_some());
         let float = {
             let expr = parse("1.5 + 2.25");
             let code = compile(&expr).expect("compile");
-            cel_eval_loop(&code, &ctx).expect("eval")
+            eval_loop(&code, &ctx).expect("eval")
         };
         assert_eq!(float, Value::Float(3.75));
         assert!(crate::runtime::convert::intern_leaf(&float).is_some());
@@ -5081,7 +5087,7 @@ mod tests {
         let expr = parse("{'a': 1} == {'a': 1}");
         let code = compile(&expr).expect("compile");
         let ctx = Context::default();
-        let value = cel_eval_loop(&code, &ctx).expect("eval");
+        let value = eval_loop(&code, &ctx).expect("eval");
         assert_eq!(value, Value::Bool(true));
     }
 
@@ -5092,19 +5098,19 @@ mod tests {
         let field = {
             let expr = parse("{'a': 7}.a");
             let code = compile(&expr).expect("compile");
-            cel_eval_loop(&code, &ctx).expect("eval")
+            eval_loop(&code, &ctx).expect("eval")
         };
         assert_eq!(field, Value::Int(7));
         let missing = {
             let expr = parse("has({'a': 7}.b)");
             let code = compile(&expr).expect("compile");
-            cel_eval_loop(&code, &ctx).expect("eval")
+            eval_loop(&code, &ctx).expect("eval")
         };
         assert_eq!(missing, Value::Bool(false));
         let item = {
             let expr = parse("[10, 20, 30][1]");
             let code = compile(&expr).expect("compile");
-            cel_eval_loop(&code, &ctx).expect("eval")
+            eval_loop(&code, &ctx).expect("eval")
         };
         assert_eq!(item, Value::Int(20));
         assert_eq!(
@@ -5119,31 +5125,31 @@ mod tests {
         let contained = {
             let expr = parse("2 in [1, 2, 3]");
             let code = compile(&expr).expect("compile");
-            cel_eval_loop(&code, &ctx).expect("eval")
+            eval_loop(&code, &ctx).expect("eval")
         };
         assert_eq!(contained, Value::Bool(true));
         let missing = {
             let expr = parse("9 in [1, 2, 3]");
             let code = compile(&expr).expect("compile");
-            cel_eval_loop(&code, &ctx).expect("eval")
+            eval_loop(&code, &ctx).expect("eval")
         };
         assert_eq!(missing, Value::Bool(false));
         let sized = {
             let expr = parse("size([1, 2, 3])");
             let code = compile(&expr).expect("compile");
-            cel_eval_loop(&code, &ctx).expect("eval")
+            eval_loop(&code, &ctx).expect("eval")
         };
         assert_eq!(sized, Value::Int(3));
         let method = {
             let expr = parse("[1, 2, 3].size()");
             let code = compile(&expr).expect("compile");
-            cel_eval_loop(&code, &ctx).expect("eval")
+            eval_loop(&code, &ctx).expect("eval")
         };
         assert_eq!(method, Value::Int(3));
         let keyed = {
             let expr = parse("{'a': 7}['a']");
             let code = compile(&expr).expect("compile");
-            cel_eval_loop(&code, &ctx).expect("eval")
+            eval_loop(&code, &ctx).expect("eval")
         };
         assert_eq!(keyed, Value::Int(7));
         assert_eq!(
@@ -5153,11 +5159,11 @@ mod tests {
         let sized_bytes = {
             let expr = parse("size(b'foo')");
             let code = compile(&expr).expect("compile");
-            cel_eval_loop(&code, &ctx).expect("eval")
+            eval_loop(&code, &ctx).expect("eval")
         };
         assert_eq!(sized_bytes, Value::Int(3));
         assert_eq!(
-            cel_eval_loop(
+            eval_loop(
                 &compile(&parse("'foobar'.startsWith('foo')")).expect("compile"),
                 &ctx
             )
@@ -5166,8 +5172,8 @@ mod tests {
         );
         let mut max_ctx = Context::default();
         max_ctx.add_function("max", crate::functions::max);
-        let maxed = cel_eval_loop(&compile(&parse("max(1, 3, 2)")).expect("compile"), &max_ctx)
-            .expect("eval");
+        let maxed =
+            eval_loop(&compile(&parse("max(1, 3, 2)")).expect("compile"), &max_ctx).expect("eval");
         assert_eq!(maxed, Value::Int(3));
         assert_eq!(
             crate::runtime::convert::intern_leaf(&maxed),
@@ -5182,10 +5188,10 @@ mod tests {
         let opt = {
             let expr = parse("optional.of(3) == optional.of(3)");
             let code = compile(&expr).expect("compile");
-            cel_eval_loop(&code, &ctx).expect("eval")
+            eval_loop(&code, &ctx).expect("eval")
         };
         assert_eq!(opt, Value::Bool(true));
-        let unwrapped = cel_eval_loop(
+        let unwrapped = eval_loop(
             &compile(&parse("optional.of(3).value()")).expect("compile"),
             &ctx,
         )
@@ -5196,7 +5202,7 @@ mod tests {
             Some(crate::runtime::object::new_int(3) as crate::runtime::object::CelRef)
         );
         assert_eq!(
-            cel_eval_loop(
+            eval_loop(
                 &compile(&parse("optional.none().hasValue()")).expect("compile"),
                 &ctx
             )
@@ -5204,7 +5210,7 @@ mod tests {
             Value::Bool(false)
         );
         assert_eq!(
-            cel_eval_loop(
+            eval_loop(
                 &compile(&parse("optional.ofNonZeroValue(0).hasValue()")).expect("compile"),
                 &ctx
             )
@@ -5212,7 +5218,7 @@ mod tests {
             Value::Bool(false)
         );
         assert_eq!(
-            cel_eval_loop(
+            eval_loop(
                 &compile(&parse("optional.none().orValue(9)")).expect("compile"),
                 &ctx
             )
@@ -5224,7 +5230,7 @@ mod tests {
             let dur = {
                 let expr = parse("duration(\"1s\") + duration(\"2s\")");
                 let code = compile(&expr).expect("compile");
-                cel_eval_loop(&code, &ctx).expect("eval")
+                eval_loop(&code, &ctx).expect("eval")
             };
             assert_eq!(dur, Value::Duration(chrono::Duration::seconds(3)));
             assert!(crate::runtime::convert::intern_leaf(&dur).is_some());
@@ -5234,33 +5240,32 @@ mod tests {
     #[test]
     fn interned_type_and_conversions_through_the_vm() {
         let ctx = Context::default();
-        let ty = cel_eval_loop(&compile(&parse("type(1)")).expect("compile"), &ctx).expect("eval");
+        let ty = eval_loop(&compile(&parse("type(1)")).expect("compile"), &ctx).expect("eval");
         assert_eq!(
             ty,
-            cel_eval_loop(&compile(&parse("type(2)")).expect("compile"), &ctx).expect("eval")
+            eval_loop(&compile(&parse("type(2)")).expect("compile"), &ctx).expect("eval")
         );
         assert!(crate::runtime::convert::intern_leaf(&ty).is_some());
         assert_eq!(
-            cel_eval_loop(
+            eval_loop(
                 &compile(&parse("type(type(1)) == type(string)")).expect("compile"),
                 &ctx
             )
             .expect("eval"),
             Value::Bool(true)
         );
-        let as_int =
-            cel_eval_loop(&compile(&parse("int(1.9)")).expect("compile"), &ctx).expect("eval");
+        let as_int = eval_loop(&compile(&parse("int(1.9)")).expect("compile"), &ctx).expect("eval");
         assert_eq!(as_int, Value::Int(1));
         assert_eq!(
             crate::runtime::convert::intern_leaf(&as_int),
             Some(crate::runtime::object::new_int(1) as crate::runtime::object::CelRef)
         );
         let as_string =
-            cel_eval_loop(&compile(&parse("string(7)")).expect("compile"), &ctx).expect("eval");
+            eval_loop(&compile(&parse("string(7)")).expect("compile"), &ctx).expect("eval");
         assert_eq!(as_string, Value::String(Arc::from("7")));
         assert!(crate::runtime::convert::intern_leaf(&as_string).is_some());
         let as_bytes =
-            cel_eval_loop(&compile(&parse("bytes('ab')")).expect("compile"), &ctx).expect("eval");
+            eval_loop(&compile(&parse("bytes('ab')")).expect("compile"), &ctx).expect("eval");
         assert_eq!(as_bytes, Value::Bytes(Arc::new(b"ab".to_vec())));
     }
 
@@ -5270,7 +5275,7 @@ mod tests {
         let ctx = Context::default();
         #[cfg(feature = "chrono")]
         {
-            let hours = cel_eval_loop(
+            let hours = eval_loop(
                 &compile(&parse("duration('3661s').getHours()")).expect("compile"),
                 &ctx,
             )
@@ -5281,7 +5286,7 @@ mod tests {
                 Some(crate::runtime::object::new_int(1) as crate::runtime::object::CelRef)
             );
             assert_eq!(
-                cel_eval_loop(
+                eval_loop(
                     &compile(&parse("duration('3661s').getMinutes()")).expect("compile"),
                     &ctx
                 )
@@ -5289,7 +5294,7 @@ mod tests {
                 Value::Int(61)
             );
             assert_eq!(
-                cel_eval_loop(
+                eval_loop(
                     &compile(&parse("duration('1s').getMilliseconds()")).expect("compile"),
                     &ctx
                 )
@@ -5301,7 +5306,7 @@ mod tests {
         {
             let ts = "timestamp('2020-01-02T03:04:05.006Z')";
             assert_eq!(
-                cel_eval_loop(
+                eval_loop(
                     &compile(&parse(&format!("{ts}.getFullYear()"))).expect("compile"),
                     &ctx
                 )
@@ -5309,7 +5314,7 @@ mod tests {
                 Value::Int(2020)
             );
             assert_eq!(
-                cel_eval_loop(
+                eval_loop(
                     &compile(&parse(&format!("{ts}.getMonth()"))).expect("compile"),
                     &ctx
                 )
@@ -5317,7 +5322,7 @@ mod tests {
                 Value::Int(0)
             );
             assert_eq!(
-                cel_eval_loop(
+                eval_loop(
                     &compile(&parse(&format!("{ts}.getDate()"))).expect("compile"),
                     &ctx
                 )
@@ -5325,7 +5330,7 @@ mod tests {
                 Value::Int(2)
             );
             assert_eq!(
-                cel_eval_loop(
+                eval_loop(
                     &compile(&parse(&format!("{ts}.getHours()"))).expect("compile"),
                     &ctx
                 )
@@ -5333,7 +5338,7 @@ mod tests {
                 Value::Int(3)
             );
             assert_eq!(
-                cel_eval_loop(
+                eval_loop(
                     &compile(&parse(&format!("{ts}.getDayOfYear()"))).expect("compile"),
                     &ctx
                 )
@@ -5343,7 +5348,7 @@ mod tests {
         }
         #[cfg(feature = "regex")]
         {
-            let matched = cel_eval_loop(
+            let matched = eval_loop(
                 &compile(&parse("'abc'.matches('a.*')")).expect("compile"),
                 &ctx,
             )
@@ -5351,7 +5356,7 @@ mod tests {
             assert_eq!(matched, Value::Bool(true));
             assert!(crate::runtime::convert::intern_leaf(&matched).is_some());
             assert_eq!(
-                cel_eval_loop(
+                eval_loop(
                     &compile(&parse("'abc'.matches('z+')")).expect("compile"),
                     &ctx
                 )
@@ -5367,7 +5372,7 @@ mod tests {
         let expr = parse("'he' + 'llo'");
         let code = compile(&expr).expect("compile");
         let ctx = Context::default();
-        let value = cel_eval_loop(&code, &ctx).expect("eval");
+        let value = eval_loop(&code, &ctx).expect("eval");
         assert_eq!(value, Value::String(std::sync::Arc::from("hello")));
     }
 
@@ -5377,7 +5382,7 @@ mod tests {
         let expr = parse("[0, 1, 2].map(x, x + 1)");
         let code = compile(&expr).expect("compile");
         let ctx = Context::default();
-        let value = cel_eval_loop(&code, &ctx).expect("eval");
+        let value = eval_loop(&code, &ctx).expect("eval");
         assert_eq!(
             value,
             Value::list(vec![Value::Int(1), Value::Int(2), Value::Int(3)])
@@ -5475,7 +5480,7 @@ mod tests {
             .expect("compiles");
 
             assert_eq!(
-                cel_eval_loop(&code, &ctx),
+                eval_loop(&code, &ctx),
                 want,
                 "{source} with an integer accumulator:\n{}",
                 code.disassemble()
@@ -5761,7 +5766,7 @@ mod tests {
 
         let mut ctx = Context::default();
         ctx.add_variable_from_value("xs", Value::list(vec![Value::Int(7), Value::Int(8)]));
-        assert_eq!(cel_eval_loop(&code, &ctx), Ok(Value::Bool(true)));
+        assert_eq!(eval_loop(&code, &ctx), Ok(Value::Bool(true)));
     }
 
     /// `IterAt` trusts nothing in its two slots, because an instruction stream
@@ -5792,16 +5797,16 @@ mod tests {
         };
 
         // A sequence slot that is not a list.
-        assert!(cel_eval_loop(&program(vec![Value::Int(7), Value::Int(0)]), &ctx).is_err());
+        assert!(eval_loop(&program(vec![Value::Int(7), Value::Int(0)]), &ctx).is_err());
         // An index slot that is not an integer.
-        assert!(cel_eval_loop(
+        assert!(eval_loop(
             &program(vec![Value::list(vec![Value::Int(1)]), Value::Bool(true)]),
             &ctx
         )
         .is_err());
         // An index past the end, and a negative one.
         for out_of_range in [Value::Int(1), Value::Int(-1)] {
-            assert!(cel_eval_loop(
+            assert!(eval_loop(
                 &program(vec![Value::list(vec![Value::Int(1)]), out_of_range]),
                 &ctx
             )
@@ -5809,7 +5814,7 @@ mod tests {
         }
         // ... and the in-range case still answers.
         assert_eq!(
-            cel_eval_loop(
+            eval_loop(
                 &program(vec![Value::list(vec![Value::Int(9)]), Value::Int(0)]),
                 &ctx
             ),
@@ -5844,16 +5849,16 @@ mod tests {
         };
 
         // A sequence slot that is not a list.
-        assert!(cel_eval_loop(&program(vec![Value::Int(7), Value::Int(0)]), &ctx).is_err());
+        assert!(eval_loop(&program(vec![Value::Int(7), Value::Int(0)]), &ctx).is_err());
         // An index slot that is not an integer.
-        assert!(cel_eval_loop(
+        assert!(eval_loop(
             &program(vec![Value::list(vec![Value::Int(1)]), Value::Bool(true)]),
             &ctx
         )
         .is_err());
         // An index past the end, and a negative one.
         for out_of_range in [Value::Int(1), Value::Int(-1)] {
-            assert!(cel_eval_loop(
+            assert!(eval_loop(
                 &program(vec![Value::list(vec![Value::Int(1)]), out_of_range]),
                 &ctx
             )
@@ -5861,7 +5866,7 @@ mod tests {
         }
         // ... and the in-range case binds the element into the slot.
         assert_eq!(
-            cel_eval_loop(
+            eval_loop(
                 &program(vec![Value::list(vec![Value::Int(9)]), Value::Int(0)]),
                 &ctx
             ),
@@ -5901,7 +5906,7 @@ mod tests {
         };
         let one = || Value::list(vec![Value::Int(1)]);
         let guard = |sequence: Value, counter: Value| {
-            cel_eval_loop(
+            eval_loop(
                 &program(vec![
                     sequence,
                     counter,

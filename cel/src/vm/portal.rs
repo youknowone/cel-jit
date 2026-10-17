@@ -7453,6 +7453,7 @@ mod tests {
 
     #[test]
     fn the_portal_evaluates_the_same_as_the_public_door() {
+        let _intern = crate::test_support::shared();
         let expr = Parser::default().parse("1 + 2").unwrap();
         let code = compile(&expr).expect("compile");
         let ctx = Context::default();
@@ -7736,6 +7737,7 @@ mod tests {
         ctx: &Context,
         f: impl FnOnce(crate::runtime::object::CelRef) -> R,
     ) -> Result<R, crate::ExecutionError> {
+        let _intern = crate::test_support::shared();
         let scope = crate::runtime::heap::enter_eval_for(ctx);
         let mut vm = crate::vm::interp::Vm::new(code, ctx, scope.heap(), scope.is_outermost());
         let result = eval_through_portal(&mut vm, code);

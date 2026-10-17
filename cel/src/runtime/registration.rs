@@ -1419,6 +1419,7 @@ mod tests {
     /// no header to read this type id back out of.
     #[test]
     fn a_minor_collection_walks_an_items_blocks_slots() {
+        let _const_ptr_table = crate::test_support::exclusive();
         let (mut gc, ids) = fresh_gc();
         let int_tid = ids.type_id_of(&CEL_INT_CLASS).expect("int is registered");
 
