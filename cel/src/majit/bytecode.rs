@@ -2950,14 +2950,6 @@ pub mod float_bank {
             })
         }
 
-        /// The typed key these greens build, for the bucket walk that needs it.
-        fn green_key(&self) -> majit_ir::GreenKey {
-            majit_ir::GreenKey::with_types(
-                self.slots.iter().map(|slot| slot.0).collect::<Vec<_>>(),
-                self.slots.iter().map(|slot| slot.1).collect::<Vec<_>>(),
-            )
-        }
-
         /// [`Self::resolve`] and the resolved cell's runnable token, from ONE
         /// bucket walk.
         ///
@@ -2970,15 +2962,17 @@ pub mod float_bank {
         /// The other half is the frontend's `compiled_loops` map, which the walk
         /// leaves to its caller because a door that goes on to run reads that
         /// map's value anyway; a door that only asks reads it once here.
+        ///
+        /// Greens stay on the stack (`JitCell.comparekey(*greenargs2)`); the
+        /// walk never builds a `GreenKey`.
         fn resolve_runnable(
             &self,
             driver: &majit_metainterp::JitDriver<VmStateF>,
         ) -> (u64, Option<std::sync::Arc<majit_metainterp::JitCellToken>>) {
-            let make_green_key = || self.green_key();
-            let (cell_key, token) = driver.resolved_entry_procedure_token(
-                self.hash,
-                Some(&make_green_key as &dyn Fn() -> majit_ir::GreenKey),
-            );
+            let values = self.slots.map(|s| s.0);
+            let types = self.slots.map(|s| s.1);
+            let (cell_key, token) =
+                driver.resolved_entry_procedure_token(self.hash, Some((&values, &types)));
             let token = token.filter(|_| driver.get_compiled_meta(cell_key).is_some());
             (cell_key, token)
         }
