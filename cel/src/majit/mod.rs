@@ -1525,6 +1525,21 @@ mod tests {
         check_batch_str("size([1, 2, 3]) + size(s)", &[("s", ColData::Str(s))]);
     }
 
+    /// Compile a loop, run further evals until the nursery is rewound and
+    /// refilled, then fail a guard on that loop.
+    ///
+    /// `resumecode.py` `NUMBERING` is stored as `compile.py`
+    /// `ResumeGuardDescr.rd_numb` for the descr's whole life. Cel rewinds the
+    /// nursery after an eval, so a later guard failure must still decode it.
+    /// `batch_size` is the same shape at a larger mix of expressions.
+    #[test]
+    fn numbering_survives_nursery_rewind() {
+        let n = 3000;
+        let words = ["a", "bb", "ccc", "", "héllo", "日본어", "🎉"];
+        let s = gen_str(n, 0x5EED_1234_ABCD_9876, &words);
+        check_batch_str("size(s) > 2", &[("s", ColData::Str(s))]);
+    }
+
     #[test]
     fn size_bails() {
         // Only a `string` or `list` column has a materialized length column,

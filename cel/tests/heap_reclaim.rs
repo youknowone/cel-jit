@@ -57,7 +57,12 @@ fn ten_thousand_maps_leave_old_space_flat() {
     ctx.add_variable_from_value("list", (1..=1000i64).collect::<Vec<i64>>());
     let program = Program::compile("list.map(v, v * 2)").expect("compiles");
 
-    program.execute(&ctx).expect("warms");
+    // The map loop is compiled after the portal trace threshold. Each
+    // compiled guard's NUMBERING (`resumecode.py` / `ResumeGuardDescr.rd_numb`)
+    // lives in old space for the descr's whole life.
+    for _ in 0..1000 {
+        program.execute(&ctx).expect("warms");
+    }
     let old_bytes = with_heap(|h| h.old_allocated_bytes());
     let old_segs = with_heap(|h| h.old_segments());
     let water = with_heap(|h| h.nursery_high_water());

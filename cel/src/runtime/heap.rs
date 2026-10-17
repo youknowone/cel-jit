@@ -1304,7 +1304,24 @@ impl CelGc {
     fn bump_typed(&mut self, type_id: u32, payload: usize) -> majit_ir::GcRef {
         // Frames are nursery objects (`jitframe.py jitframe_allocate`),
         // reclaimed with the rest of the evaluation's young objects.
+        //
+        // `resumecode.py` `NUMBERING` is stored as `compile.py`
+        // `ResumeGuardDescr.rd_numb` for the descr's whole life — it outlives
+        // any single interpretation. Cel never collects and rewinds the nursery
+        // after an eval, so this tid goes to old space.
+        if type_id == majit_metainterp::opencoder::numbering_gc_type_id() {
+            return self.bump_old_typed(type_id, payload);
+        }
         self.bump_payload(u64::from(type_id), payload)
+    }
+
+    fn bump_old_typed(&mut self, type_id: u32, payload: usize) -> majit_ir::GcRef {
+        let Some(total) = try_headered_total(payload) else {
+            return fail_memory_error();
+        };
+        let raw = unsafe { (*heap_ptr()).alloc_old_raw(total, GC_HEADER_SIZE) };
+        unsafe { (raw as *mut u64).write(u64::from(type_id)) };
+        majit_ir::GcRef(unsafe { raw.add(GC_HEADER_SIZE) } as usize)
     }
 }
 
