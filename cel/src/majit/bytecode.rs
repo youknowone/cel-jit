@@ -2929,7 +2929,7 @@ pub mod float_bank {
         /// split into parallel arrays because that is the shape the generated
         /// builder hands back, and re-splitting it here would be a second place
         /// for a slot to move.
-        slots: [(i64, majit_ir::GreenType); 3],
+        slots: [(i64, majit_ir::GreenType); 2],
     }
 
     impl PooledGreenKey {
@@ -3057,9 +3057,9 @@ pub mod float_bank {
 
     /// The green key a door arming at `pc` in `program` files under.
     ///
-    /// The slots are the ones `can_enter_jit!` builds for this mainloop — the
-    /// marker's own position argument, then each declared green with the arming
-    /// position substituted for `pc` — and they are no longer spelled twice.
+    /// The slots are the ones `can_enter_jit!` builds for this mainloop — each
+    /// declared green, with the arming position substituted for `pc` — and they
+    /// are no longer spelled twice.
     /// `#[jit_interp]` emits the builder from the same `greens` list it lowers
     /// the merge point from, so the two cannot drift; this used to write the
     /// seed and the per-slot fold out by hand next to a comment saying they had

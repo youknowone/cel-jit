@@ -31,11 +31,16 @@ pastey = "0.2.1"
 # sibling checkout that made every cargo command — `fmt --check` included —
 # fail on a clean clone. A git revision resolves for anyone.
 #
-# `rev` is pyre `main` at 3d901bd9c0d (2026-10-08), which already carries
-# PR #2231's raw DONE entry (`execute_token_done_{int,ref}_raw`) that cel's
-# portal entry uses. Resume borrows the guard's decoded virtual infos and
-# reads off-heap fail args in place. cel's `CelGc` registers typed headers
-# through `GcAllocator`.
+# `rev` is pyre `main` at cace3c4b79b (2026-10-17); it carries PR #2231's
+# raw DONE entry (`execute_token_done_{int,ref}_raw`) that cel's portal
+# entry uses, PR #2253's `str_concat` call policy (`OS_STR_CONCAT`) that
+# string `+` through `ll_strconcat` relies on, and PR #2385, which clears
+# `JC_TRACING` on the start cell when a root-loop compile is cancelled
+# after the trace was taken (`warmstate.py` `bound_reached` `finally`),
+# and makes `numbering_gc_type_id` public for cel's NUMBERING allocation.
+# The repository moved to `pyre-lang/pyre`. Resume borrows the guard's
+# decoded virtual infos and reads off-heap fail args in place. cel's
+# `CelGc` registers typed headers through `GcAllocator`.
 #
 # Bump it deliberately: it is the only thing pinning the JIT tier's behaviour —
 # and a stale pin is silent. Two measured instances of that silence, both found
@@ -61,15 +66,15 @@ pastey = "0.2.1"
 # `jit-audits`: majit-ir gates `opref_audit`/`reg_write_audit` out of production
 # builds (#1215); `majit_trace_evidence.rs` consumes both, and an integration
 # test does not see majit-ir's own `cfg(test)`.
-majit-ir = { git = "https://github.com/youknowone/pyre.git", rev = "3d901bd9c0d29fa398dd7e7b5b50b89a94617c1e", optional = true, features = ["jit-audits"] }
+majit-ir = { git = "https://github.com/pyre-lang/pyre.git", rev = "cace3c4b79bef07dca1960aad0ba5b1bf80ed405", optional = true, features = ["jit-audits"] }
 # Direct, not through `majit-metainterp`: it depends on `majit-gc` but re-exports
 # none of it, and `MiniMarkGC` / `TypeInfo` / the `GcAllocator` trait are what
 # class registration is spelled in. Same revision as its siblings — a different
 # one would give `set_gc_allocator` a `Box<dyn GcAllocator>` from a second copy
 # of the trait, which does not typecheck.
-majit-gc = { git = "https://github.com/youknowone/pyre.git", rev = "3d901bd9c0d29fa398dd7e7b5b50b89a94617c1e", optional = true }
-majit-macros = { git = "https://github.com/youknowone/pyre.git", rev = "3d901bd9c0d29fa398dd7e7b5b50b89a94617c1e", optional = true }
-majit-metainterp = { git = "https://github.com/youknowone/pyre.git", rev = "3d901bd9c0d29fa398dd7e7b5b50b89a94617c1e", default-features = false, optional = true }
+majit-gc = { git = "https://github.com/pyre-lang/pyre.git", rev = "cace3c4b79bef07dca1960aad0ba5b1bf80ed405", optional = true }
+majit-macros = { git = "https://github.com/pyre-lang/pyre.git", rev = "cace3c4b79bef07dca1960aad0ba5b1bf80ed405", optional = true }
+majit-metainterp = { git = "https://github.com/pyre-lang/pyre.git", rev = "cace3c4b79bef07dca1960aad0ba5b1bf80ed405", default-features = false, optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.5.1", features = ["html_reports"] }
