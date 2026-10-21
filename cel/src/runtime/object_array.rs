@@ -768,7 +768,10 @@ pub fn new_bytes_block(bytes: &[u8]) -> *mut CelBytesBlock {
 /// `elidable_or_memerror` is `rstr.py` `@jit.elidable` with MemoryError
 /// as the only raise (`call.py` `cr == "mem"`). The call site's
 /// `str_concat` policy stamps `OS_STR_CONCAT` so `OptString` sees it.
+///
+/// The arguments are GC `Ptr(STR)` references (`rstr.py LLHelpers.ll_strconcat(s1, s2)`) that compiled code passes through the residual's function pointer, so this stays a safe `fn`.
 #[cfg_attr(feature = "jit", majit_macros::elidable_or_memerror)]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub fn ll_strconcat(s1: *mut CelBytesBlock, s2: *mut CelBytesBlock) -> *mut CelBytesBlock {
     if s1.is_null() || s2.is_null() {
         return core::ptr::null_mut();
