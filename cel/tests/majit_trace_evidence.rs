@@ -296,43 +296,18 @@ fn flat_row_loop_stays_in_compiled_code() {
     );
 }
 
-/// Whether a ONE-row batch reaches compiled code on a driver that has already
-/// compiled the row loop from a big batch.
+/// A ONE-row batch reaches compiled code on a driver that has already compiled
+/// the row loop from a big batch.
 ///
-/// This is the question a single-activation benchmark has to answer before it
-/// can print a compiled-tier number, and until `compiled_entries` existed
-/// nothing could answer it: the artifact is minted either way, and the answers
-/// are identical because the interpreter produces them.
-///
-/// The answer is still NO, and it is worth being exact about which of two very
-/// different reasons now gives it.
-///
-/// It used to be structural and unconditional. The row loop's back edge was the
-/// only door; the loop is bottom-tested, so an `n`-row batch takes `n - 1` back
-/// edges and a one-row batch takes none, and nothing a one-row call executed
-/// ever consulted the JIT. There is now a second door, ahead of the first
-/// instruction and counted per CALL
-/// (`float_bank::try_function_entry_jit_f`), and
-/// [`repeated_one_row_calls_reach_the_compiled_tier`] is a one-row workload that
-/// does reach compiled code through it.
-///
-/// What shuts it here is the 50 000-row warm-up, deliberately. The door declines
-/// for any program whose own loop is already compiled, because on such a program
-/// it does not add a way in — it takes one away. Measured on
-/// `items.all(i, i.price > 10)` over repeated 20 000-row calls: with the decline
-/// removed, an entry artifact was minted and from then on every call entered the
-/// ENTRY key exactly once and the loop header not at all, where before it
-/// entered the loop header and ran the batch there. Both answer correctly, and
-/// `majit_shape_change`'s "never worse than the untraced VM" bound fired on the
-/// difference.
-///
-/// So this pins the boundary between the two doors rather than the absence of
-/// one, and a mixed workload — big batches and single rows through one driver —
-/// gets the row loop's door only. Lifting that would need the two artifacts to
-/// coexist without the entry one displacing the loop's, which is a majit-side
-/// question, not one this crate can answer by keying differently.
+/// The row loop's back edge is a bottom-tested loop, so an `n`-row batch takes
+/// `n - 1` of them and a one-row batch takes none. The generated portal runner
+/// (`ll_portal_runner` prefix of `run_mainloop_f`) consults the JIT at every
+/// call, keyed on `ENTRY_PC`. A function-entry trace that reaches an already
+/// compiled loop header closes into that loop's target token, so a mixed
+/// workload — big batches and single rows through one driver — still enters
+/// compiled code on the one-row calls.
 #[test]
-fn a_compiled_row_loop_shuts_the_entry_door() {
+fn a_one_row_call_reaches_a_compiled_row_loop() {
     let _serial = serial();
     let schema: Schema = [
         ("price".to_string(), ValType::Int),
@@ -357,8 +332,8 @@ fn a_compiled_row_loop_shuts_the_entry_door() {
     );
     assert!(warm.compiled_entries >= 1, "warm-up must enter it");
 
-    // Same driver, same expression, one row — for longer than the entry door's
-    // threshold, so a door that were open would be warm several times over.
+    // Same driver, same expression, one row — for longer than the portal's
+    // threshold, so a door that is open is warm several times over.
     const ONE_ROW_CALLS: usize = 64;
     let one_cols = [Column::Int(&price[..1]), Column::Int(&qty[..1])];
     reset_jit_stats();
@@ -374,20 +349,13 @@ fn a_compiled_row_loop_shuts_the_entry_door() {
         "[one-row] warm_entries={} one_row_entries={} one_row_compiles={}",
         warm.compiled_entries, one.compiled_entries, one.loops_compiled
     );
-    assert_eq!(
-        one.compiled_entries, 0,
-        "a one-row batch entered compiled code {} time(s) on a driver whose row \
-         loop is already compiled. The entry door declines exactly there, and \
-         the decline is what keeps a batch workload entering its row loop; if \
-         this fires, the door opened on a program that has a hot loop and the \
-         batch tier's ns/row is the thing to re-measure",
+    assert!(
+        one.compiled_entries >= 1,
+        "{ONE_ROW_CALLS} one-row calls on a driver whose row loop is already \
+         compiled entered compiled code {} time(s). The portal runs at every \
+         call; a function-entry trace that reaches the compiled loop header \
+         closes into it",
         one.compiled_entries
-    );
-    assert_eq!(
-        one.loops_compiled, 0,
-        "{ONE_ROW_CALLS} one-row calls minted {} more loop(s) on a driver whose \
-         row loop is compiled. Nothing should trace here at all",
-        one.loops_compiled
     );
 }
 
@@ -453,31 +421,22 @@ fn repeated_one_row_calls_reach_the_compiled_tier() {
     );
 }
 
-/// The entry door must not read its OWN artifact as evidence that another door
-/// exists.
+/// A one-row literal-list map still reaches compiled code through the portal.
 ///
-/// `float_bank::loop_header_keys` finds a program's loop headers by scanning for
-/// `OP_JUMP_IF_ABOVE`'s value word-wise, so an OPERAND holding that value
-/// contributes a position that is not an instruction. That is harmless for every
-/// spurious position but one: `ENTRY_PC`, which is the position the entry door
-/// itself arms at. `[1, 2, 3, 4, 5].map(x, x * 2)` produces exactly that — the
-/// unrolled body's `OP_MUL_OVF` reads register 16 (`OP_JUMP_IF_ABOVE`'s value)
-/// and traps to register 0, so its four words read as a back edge to 0 — and the
-/// door then declines from the call after the one that minted its artifact,
-/// forever. Measured before the exclusion: `loops_compiled=1`,
-/// `compiled_entries=0` over 4096 calls, every answer out of the interpreter.
+/// `[1, 2, 3, 4, 5].map(x, x * 2)` unrolls to a body whose `OP_MUL_OVF` reads
+/// register 16 (`OP_JUMP_IF_ABOVE`'s value) and traps to register 0, so a
+/// word-wise scan of the program reads a spurious back edge to `ENTRY_PC`.
+/// The portal is keyed on that same pc; this pins that the call still compiles
+/// and enters rather than treating the portal's own artifact as a sibling loop.
 ///
 /// The expression is load-bearing and not an example: it is one of the few
-/// spellings measured to fail. What selects the defect is a numeric
-/// coincidence in the word stream — an operand holding 16 with a 0 three words
-/// later — and no property of the source decides that. `.map` over a literal
-/// unrolls on a six-register stride from a base of 4, so its THIRD element
-/// takes first operand 16 and its `OP_MUL_OVF` traps to register 0; three
-/// elements already suffice, and `[1, 2].map(x, x * 2)` stops at 10 and is
-/// healthy. Neighbours that look like they should fail do not: `.all` over a
-/// literal does not unroll at all, and `.filter` with the same multiply
-/// allocates on a different stride and lands its 16 three words ahead of an
-/// 18. `examples/rca_listmap.rs` runs that whole census.
+/// spellings measured to fail when a yield scan included `ENTRY_PC`. What
+/// selects the coincidence is a numeric pattern in the word stream — an
+/// operand holding 16 with a 0 three words later — and no property of the
+/// source decides that. `.map` over a literal unrolls on a six-register stride
+/// from a base of 4, so its THIRD element takes first operand 16 and its
+/// `OP_MUL_OVF` traps to register 0; three elements already suffice, and
+/// `[1, 2].map(x, x * 2)` stops at 10 and is healthy.
 #[test]
 fn a_spurious_back_edge_to_entry_pc_does_not_shut_the_entry_door() {
     use cel::majit::batch::{Batch, BatchProgram, Tier};
@@ -515,9 +474,8 @@ fn a_spurious_back_edge_to_entry_pc_does_not_shut_the_entry_door() {
     assert!(
         stats.compiled_entries >= 1,
         "{CALLS} one-row calls compiled {} artifact(s) and entered none. The \
-         entry key is in this program's scanned loop-header keys, so the door's \
-         `has_compiled_loop` decline fires on the artifact the door itself just \
-         minted",
+         portal is keyed on ENTRY_PC; a call that minted an artifact there must \
+         enter it",
         stats.loops_compiled
     );
 }
@@ -588,14 +546,16 @@ fn a_second_bound_batch_reuses_the_compiled_loop() {
         b.collect_on(Tier::Jit).unwrap(),
         vec![Value::Int(3), Value::Int(5), Value::Int(7), Value::Int(9)]
     );
-    assert_eq!(
-        jit_stats().loops_compiled,
-        compiled,
-        "second bind compiled a new loop; the green key did not survive the rebind"
-    );
+    // The portal at ENTRY_PC is a different green from the row-loop header, so
+    // a later bind may compile an entry artifact that closes into the loop
+    // already filed. `loops_compiled` can therefore move; the green key of the
+    // first bind still survived if compiled code ran and the answers match.
     assert!(
         jit_stats().compiled_entries > entries,
-        "second bind did not enter the loop the first bind compiled"
+        "second bind did not enter compiled code; the first bind's green key \
+         did not survive the rebind (loops_compiled {} -> {})",
+        compiled,
+        jit_stats().loops_compiled
     );
 }
 

@@ -31,10 +31,12 @@ pastey = "0.2.1"
 # sibling checkout that made every cargo command — `fmt --check` included —
 # fail on a clean clone. A git revision resolves for anyone.
 #
-# `rev` is pyre `main` at cace3c4b79b (2026-10-17); it carries PR #2231's
-# raw DONE entry (`execute_token_done_{int,ref}_raw`) that cel's portal
-# entry uses, PR #2253's `str_concat` call policy (`OS_STR_CONCAT`) that
-# string `+` through `ll_strconcat` relies on, and PR #2385, which clears
+# `rev` is pyre `main` at 7847a5eca2f (2026-10-22); it carries PR #2457's
+# deletion of `JitDriver::suppress_function_entry` (`warmspot.py` has no
+# equivalent: a portal has one runner), PR #2231's raw DONE entry
+# (`execute_token_done_{int,ref}_raw`) that cel's portal entry uses, PR
+# #2253's `str_concat` call policy (`OS_STR_CONCAT`) that string `+`
+# through `ll_strconcat` relies on, and PR #2385, which clears
 # `JC_TRACING` on the start cell when a root-loop compile is cancelled
 # after the trace was taken (`warmstate.py` `bound_reached` `finally`),
 # and makes `numbering_gc_type_id` public for cel's NUMBERING allocation.
@@ -66,15 +68,15 @@ pastey = "0.2.1"
 # `jit-audits`: majit-ir gates `opref_audit`/`reg_write_audit` out of production
 # builds (#1215); `majit_trace_evidence.rs` consumes both, and an integration
 # test does not see majit-ir's own `cfg(test)`.
-majit-ir = { git = "https://github.com/pyre-lang/pyre.git", rev = "cace3c4b79bef07dca1960aad0ba5b1bf80ed405", optional = true, features = ["jit-audits"] }
+majit-ir = { git = "https://github.com/pyre-lang/pyre.git", rev = "7847a5eca2f684f3ffa012e8d8227e15f142c685", optional = true, features = ["jit-audits"] }
 # Direct, not through `majit-metainterp`: it depends on `majit-gc` but re-exports
 # none of it, and `MiniMarkGC` / `TypeInfo` / the `GcAllocator` trait are what
 # class registration is spelled in. Same revision as its siblings — a different
 # one would give `set_gc_allocator` a `Box<dyn GcAllocator>` from a second copy
 # of the trait, which does not typecheck.
-majit-gc = { git = "https://github.com/pyre-lang/pyre.git", rev = "cace3c4b79bef07dca1960aad0ba5b1bf80ed405", optional = true }
-majit-macros = { git = "https://github.com/pyre-lang/pyre.git", rev = "cace3c4b79bef07dca1960aad0ba5b1bf80ed405", optional = true }
-majit-metainterp = { git = "https://github.com/pyre-lang/pyre.git", rev = "cace3c4b79bef07dca1960aad0ba5b1bf80ed405", default-features = false, optional = true }
+majit-gc = { git = "https://github.com/pyre-lang/pyre.git", rev = "7847a5eca2f684f3ffa012e8d8227e15f142c685", optional = true }
+majit-macros = { git = "https://github.com/pyre-lang/pyre.git", rev = "7847a5eca2f684f3ffa012e8d8227e15f142c685", optional = true }
+majit-metainterp = { git = "https://github.com/pyre-lang/pyre.git", rev = "7847a5eca2f684f3ffa012e8d8227e15f142c685", default-features = false, optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.5.1", features = ["html_reports"] }
@@ -134,17 +136,6 @@ __drop-arm-probe = []
 # any timing, so an arm that removed work it should not have is a failure and
 # not a faster number. Off by default.
 __elem-attr-probe = []
-
-# The second measurement probe, and never a shipping feature either. It makes
-# the function-entry door's yield probe choose its key form at run time --
-# the resolved cell key it uses now, or the bare bucket hash it used before --
-# so what that resolution costs per call is a difference taken inside ONE
-# binary rather than between two builds.
-#
-# Off by default. Both arms DECIDE the same thing on every
-# bucket holding one cell or none, which is every bucket a program here has
-# produced; see `float_bank::LoopKeyArm`.
-__loop-key-arm-probe = []
 
 # The fourth measurement probe, and never a shipping feature either. It gives
 # `float_bank::run_jit_persistent_f` a per-stage repeat count, read once per

@@ -1841,6 +1841,14 @@ pub mod float_bank {
             host_call2_f => residual_int_cannot_raise,
         },
     )]
+    /// The two-bank interpreter body, and the function-entry door.
+    ///
+    /// The generated portal runner (`ll_portal_runner` prefix) consults the JIT
+    /// once per call before the first instruction, keyed on [`ENTRY_PC`]. The
+    /// row loop's `can_enter_jit!` is the other door: a back edge on a
+    /// bottom-tested loop, so an `n`-row batch takes `n - 1` of them and a
+    /// one-row batch takes none. Warmup counted only there counts rows; this
+    /// portal restores the counting a call-shaped workload needs.
     // Generated entry runner shares this signature and does not use `mut`; the portal body does.
     #[allow(unused_mut)]
     fn run_mainloop_f(
@@ -2978,77 +2986,6 @@ pub mod float_bank {
         }
     }
 
-    /// Which key form the yield probe in [`try_function_entry_jit_f`] asks on.
-    ///
-    /// A measurement probe, not a feature. The two variants are the door before
-    /// and after the resolution landed, and they exist as two branches of ONE
-    /// compiled function so that what the resolution costs is a difference
-    /// taken inside a single binary. Two builds cannot answer that: they admit
-    /// compile drift and stale binaries, and neither is visible in the numbers
-    /// they produce.
-    ///
-    /// The two agree on every bucket that holds one cell or none, which is
-    /// every bucket a real program has ever produced here —
-    /// [`PooledGreenKey::resolve`] answers such a bucket from the walk alone
-    /// and returns the raw hash. So this is a cost probe, not a behaviour
-    /// switch: the arms differ in what they DO, not in what they decide.
-    #[cfg(feature = "__loop-key-arm-probe")]
-    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-    pub enum LoopKeyArm {
-        /// The bare bucket hash, which is what the probe asked before the
-        /// resolution landed. No walk, no cell read — the hash is already in
-        /// the pool.
-        BareHash,
-        /// What the door does without the probe: one bucket walk per loop key,
-        /// through [`PooledGreenKey::resolve`].
-        Resolved,
-    }
-
-    #[cfg(feature = "__loop-key-arm-probe")]
-    std::thread_local! {
-        /// The arm the next call on this thread takes at the yield probe.
-        ///
-        /// Read once per CALL — not once per loop key — and identically by both
-        /// arms, so it is a constant that cancels out of any difference between
-        /// them. It does mean no arm's ABSOLUTE figure is what the shipping
-        /// door costs; only differences are claims.
-        static LOOP_KEY_ARM: core::cell::Cell<LoopKeyArm> =
-            const { core::cell::Cell::new(LoopKeyArm::Resolved) };
-    }
-
-    /// [`run_jit_persistent_f`] with the yield probe's key form chosen
-    /// explicitly.
-    ///
-    /// Announced through a thread-local rather than threaded down as an
-    /// argument, because the door is reached through the pool's `with` closure
-    /// and a parameter would have to be spelled in the shipping signature too.
-    /// Saved and restored around the one call, so two arms interleaved in one
-    /// process never observe each other's setting.
-    #[cfg(feature = "__loop-key-arm-probe")]
-    pub fn run_jit_persistent_probe_f(
-        program: &std::sync::Arc<Code>,
-        init_regs: &[i64],
-        num_fregs: usize,
-        threshold: u32,
-        arm: LoopKeyArm,
-    ) -> i64 {
-        let previous = LOOP_KEY_ARM.with(|slot| slot.replace(arm));
-        let out = run_jit_persistent_f(program, init_regs, num_fregs, threshold);
-        LOOP_KEY_ARM.with(|slot| slot.set(previous));
-        out
-    }
-
-    /// How many loop keys the yield probe walks for `program` on every call.
-    ///
-    /// The divisor a per-key figure needs. Exposed for the probe only: a
-    /// caller quoting a per-key cost has to divide by the count the door
-    /// actually walks, and that count is [`loop_header_keys`]'s answer rather
-    /// than the number of loops a reader would count in the source.
-    #[cfg(feature = "__loop-key-arm-probe")]
-    pub fn loop_key_count(program: &Code) -> usize {
-        loop_header_keys(program).len()
-    }
-
     /// The green key a door arming at `pc` in `program` files under.
     ///
     /// The slots are the ones `can_enter_jit!` builds for this mainloop — each
@@ -3078,17 +3015,11 @@ pub mod float_bank {
     /// would contribute no spurious position; the scan is kept because it is
     /// the cheaper of two answers this caller cannot tell apart.
     ///
-    /// [`ENTRY_PC`] is excluded, and that exclusion is what makes the paragraph
-    /// above true rather than nearly true. A spurious position CAN be
-    /// [`ENTRY_PC`] — `[1, 2, 3, 4, 5].map(x, x * 2)` unrolls to a body whose
-    /// `OP_MUL_OVF` reads register 16 and traps to register 0, so its `[.., 16,
-    /// 17, 18, 0, ..]` words read as a back edge to 0 — and that position does
-    /// NOT answer no, because it is the key the function-entry door itself
-    /// files under. Left in, the door reads its own artifact as evidence that
-    /// some other door exists and declines from the call after the one that
-    /// minted it, permanently: `compiles=1`, `compiled_entries=0`. Excluding it
-    /// costs nothing a real loop header at 0 would have provided, since a door
-    /// there and this door are one key and the caller is that door.
+    /// [`ENTRY_PC`] is excluded: a spurious position CAN be 0 — `[1, 2, 3, 4,
+    /// 5].map(x, x * 2)` unrolls to a body whose `OP_MUL_OVF` reads register 16
+    /// and traps to register 0, so its `[.., 16, 17, 18, 0, ..]` words read as
+    /// a back edge to 0 — and that position is the portal's own key, not a loop
+    /// header. A real loop header at 0 would be the same key as the portal.
     fn loop_header_keys(program: &Code) -> Vec<PooledGreenKey> {
         let mut targets: Vec<usize> = Vec::new();
         for pc in 0..program.len().saturating_sub(3) {
@@ -3111,143 +3042,6 @@ pub mod float_bank {
             .into_iter()
             .map(|target| green_key_at(program, target))
             .collect()
-    }
-
-    /// The function-entry door: consult the JIT once per CALL, before the first
-    /// instruction runs.
-    ///
-    /// The row loop's `can_enter_jit!` is the only other door, and it is a back
-    /// edge on a bottom-tested loop — an `n`-row batch takes `n - 1` of them and
-    /// a ONE-row batch takes none. Warmup counted there counts rows, so a
-    /// program evaluated a million times at one row per call never warms, and a
-    /// program whose loop is already compiled never enters it at one row either.
-    /// That is the ordinary way CEL is used: compile the expression once,
-    /// evaluate it per record with fresh bindings. This door restores the
-    /// counting a call-shaped workload needs, and it is the same driver call the
-    /// back edge makes — only keyed on [`ENTRY_PC`] instead of the loop header.
-    ///
-    /// `Some(value)` means compiled code ran the whole call and FINISHed, so the
-    /// value is this call's result and nothing else runs. `None` means the call
-    /// is to be interpreted, and the state and pc it must start from come back
-    /// through the out-parameters: the door may have already run compiled code
-    /// that deopted, in which case the blackhole has recovered `state` to the
-    /// guard's resume point and interpretation continues from there rather than
-    /// from the top. Re-entering at the top instead would re-run the rows the
-    /// compiled prefix already ran, and would record any bridge the deopt
-    /// started against the wrong live-ins.
-    ///
-    /// The branches are ordered by what each costs, because this runs on EVERY
-    /// call including the overwhelming majority that do nothing. Only the
-    /// compiled-entry branch touches the driver's trace machinery — which builds
-    /// the trace metadata and extracts the live values, two allocations, before
-    /// it ever consults a counter. A call that is nowhere near the threshold
-    /// must not pay for that and throw it away: warming through
-    /// `back_edge_structured` alone cost ~10ns per row on a two-row batch,
-    /// enough for `majit_shape_change`'s "never worse than the untraced VM"
-    /// bound to fire. The counter is what decides here, and it is a hash lookup
-    /// and an add.
-    fn try_function_entry_jit_f(
-        driver: &mut majit_metainterp::JitDriver<VmStateF>,
-        _program: &Code,
-        pooled: &PooledProgram,
-        _state: &mut VmStateF,
-        pc: &mut usize,
-    ) -> Option<i64> {
-        // A program whose own loop is compiled already has a door, at that
-        // loop's back edge, and takes it on the first row. A second door in
-        // front of it does not add a way in — it takes one AWAY. Measured on
-        // `items.all(i, i.price > 10)` over 20 000-row calls: with an entry
-        // artifact minted, every later call entered the ENTRY key once and the
-        // loop header not at all, where before it entered the loop header once
-        // and ran the whole batch there. Both answer correctly; they are not the
-        // same code. The calls this door exists for are the ones the loop's door
-        // cannot serve, and those are exactly the calls whose loop never gets
-        // hot — a bottom-tested loop at one row takes no back edge at all.
-        //
-        // `has_runnable_compiled_loop`, not `has_compiled_loop`, because the
-        // question this asks is whether the OTHER door can serve the call — a
-        // cell carrying only a `compile_tmp_callback` token has a compiled body
-        // and no frontend meta, so the generic entry runner cannot execute it
-        // and the loop's back edge would keep counting rather than run. Yielding
-        // to a door that cannot open would leave the call with no door at all.
-        //
-        // That this rule makes the two doors mutually exclusive for a program at
-        // all is the review's §1-third / §2-first finding (the artifacts do not
-        // coexist); resolving it needs majit-side artifact coexistence and is
-        // not attempted here.
-        //
-        // The predicate and not the token form, unlike the entry decision
-        // below: this probe asks about a cell some OTHER door runs, and the
-        // only outcome here is to decline, so there is no run to hand a token
-        // to. It costs one cell read per key either way — the predicate is that
-        // read with its answer collapsed to a bool.
-        //
-        // On the RESOLVED key, like the entry decision below. A loop header's
-        // greens are `pc` and the program address, the same shape
-        // [`green_key_at`] builds, and the pool now keeps them
-        // ([`PooledGreenKey`]) rather than the hash alone — so a chained bucket
-        // no longer lets this answer for whichever cell heads the chain.
-        //
-        // It costs one bucket walk per loop key per call, on a path that runs
-        // on every call. Proportionate rather than free: the entry decision
-        // below already pays exactly this walk once per call, so the door was
-        // already built to afford one, and a program with no backward jump has
-        // no loop key to walk for. What it buys is smaller than the entry fix —
-        // the outcome here is a yield-or-not decision about a door that is not
-        // this one, not an entry into someone else's compiled code — but the
-        // two probes now decide on the same footing, which is what stops the
-        // weaker one from being read as evidence about the stronger.
-        //
-        // Under `__loop-key-arm-probe` the key form is selected at RUN time, so
-        // this walk and the bare-hash probe that preceded it are two branches
-        // of one compiled door. See [`LoopKeyArm`]; the default build has
-        // neither the branch nor the read.
-        #[cfg(feature = "__loop-key-arm-probe")]
-        let arm = LOOP_KEY_ARM.with(core::cell::Cell::get);
-        //
-        // One walk per key, not two. The resolve and the token read the
-        // predicate is made of are about the same cell, and asking for them in
-        // two steps walked the bucket once for each; `resolve_runnable` reads
-        // the token off the cell the walk already found. Both probe arms carry
-        // the same fusion, so what the probe prices stays the resolution
-        // itself rather than a walk one arm pays and the other does not.
-        #[cfg(feature = "__loop-key-arm-probe")]
-        let sibling_runnable = pooled.loop_keys.iter().any(|key| match arm {
-            LoopKeyArm::BareHash => driver.has_runnable_compiled_loop(key.hash),
-            LoopKeyArm::Resolved => key.resolve_runnable(driver).1.is_some(),
-        });
-        // Walked once per change, not once per call. The answer is a property
-        // of which cells hold runnable code, and `runnable_generation` moves
-        // at every event that can alter that — a compile, an invalidation, a
-        // cell dropped or filed, a token let go — so a call that reads the
-        // same number the last scan read gets the last scan's answer. The
-        // probe arm above keeps walking, since the walk is what it prices.
-        #[cfg(not(feature = "__loop-key-arm-probe"))]
-        let sibling_runnable = {
-            let generation = driver.runnable_generation();
-            match pooled.sibling_runnable.get() {
-                Some((seen, answer)) if seen == generation => answer,
-                _ => {
-                    let answer = pooled
-                        .loop_keys
-                        .iter()
-                        .any(|key| key.resolve_runnable(driver).1.is_some());
-                    pooled.sibling_runnable.set(Some((generation, answer)));
-                    answer
-                }
-            }
-        };
-        // The door itself is generated in `run_mainloop_f` (`ll_portal_runner`
-        // prefix). This wrapper only yields when a sibling loop-header artifact
-        // can already serve the call — two artifacts for one program do not
-        // yet coexist, and entering the entry key would steal the batch from
-        // the loop. `warmspot.py` has no equivalent; remove this when majit
-        // can hold both.
-        if sibling_runnable {
-            driver.suppress_function_entry();
-        }
-        let _ = pc;
-        None
     }
 
     /// Reference two-bank interpreter — correctness oracle for the float path.
@@ -4126,10 +3920,9 @@ pub mod float_bank {
         // `i64`, already copied out before that leave.
         let _eval = crate::runtime::heap::enter_eval();
         let mut driver = new_driver_f(threshold, init_regs.len(), num_fregs);
-        // No entry door here, and the driver is the reason: it dies with the
-        // call, so an entry artifact this call minted could never be entered by
-        // another one. The door is on [`run_jit_persistent_f`], whose driver
-        // outlives the call.
+        // The portal in [`run_mainloop_f`] still runs, but this driver dies
+        // with the call, so an entry artifact this call minted cannot be
+        // entered by another one. Reuse is [`run_jit_persistent_f`].
         let result = run_mainloop_from_start_f(&mut driver, program, init_regs, num_fregs);
         // This driver may have published the per-thread state-field store, and
         // it is about to die. Telling the pool who holds the store now is what
@@ -4206,8 +3999,8 @@ pub mod float_bank {
         state: VmStateF,
     }
 
-    /// One program the pool holds alive, with what the entry door needs to know
-    /// about it.
+    /// One program the pool holds alive, with the green keys a compiled-loop
+    /// status query needs.
     ///
     /// Every field but `words` is a pure function of the words, and the words
     /// cannot change under an address the pool is pinning, so all of it is
@@ -4216,20 +4009,13 @@ pub mod float_bank {
         /// The words. Held for exactly as long as a compiled loop can be keyed
         /// on their address — see [`PooledDriver`].
         words: std::sync::Arc<Code>,
-        /// [`loop_header_keys`] for those words — the keys of the doors that
-        /// are NOT this one, which the entry door yields to.
+        /// [`loop_header_keys`] for those words — the keys of the row-loop
+        /// doors [`persistent_loop_status`] asks about.
         loop_keys: Vec<PooledGreenKey>,
-        /// [`green_key_at`] at [`ENTRY_PC`] — the key the function-entry door
+        /// [`green_key_at`] at [`ENTRY_PC`] — the key the function-entry portal
         /// files under. The hash folds the program POINTER, so it is a property
         /// of this pinned address and not of the words alone.
         entry_key: PooledGreenKey,
-        /// The yield scan's last answer — whether any of `loop_keys` had
-        /// runnable code — with the driver's `runnable_generation` it was
-        /// taken at. The scan walks one cell chain per loop key on every call,
-        /// and its answer changes only at the events that generation counts,
-        /// so a call that finds the generation unchanged reads this instead.
-        /// `None` until the first scan.
-        sibling_runnable: core::cell::Cell<Option<(u64, bool)>>,
     }
 
     impl PooledProgram {
@@ -4238,7 +4024,6 @@ pub mod float_bank {
                 words: std::sync::Arc::clone(program),
                 loop_keys: loop_header_keys(program),
                 entry_key: green_key_at(program, ENTRY_PC),
-                sibling_runnable: core::cell::Cell::new(None),
             }
         }
     }
@@ -4415,8 +4200,8 @@ pub mod float_bank {
     /// How many EXTRA times each stage of [`run_jit_persistent_f`] runs before
     /// the call does its own.
     ///
-    /// A measurement probe, never a shipping feature, and the third of its kind
-    /// in this file after [`LoopKeyArm`]. What it itemises is the fixed cost of
+    /// A measurement probe, never a shipping feature. What it itemises is the
+    /// fixed cost of
     /// arriving in compiled code -- `batch::JIT_ENTRY_PS`, ~100 ns whole --
     /// across the named stages the call is made of, so the ranking of those
     /// stages is a difference taken inside ONE binary.
@@ -4457,14 +4242,7 @@ pub mod float_bank {
         pub pool: u32,
         /// Extra [`reseed_state_f`] calls.
         pub reseed: u32,
-        /// Extra yield scans -- `has_runnable_compiled_loop` on the resolved
-        /// key of every loop header the program has, which is what the entry
-        /// door opens with.
-        ///
-        /// Always the RESOLVED form, so under `__loop-key-arm-probe` this prices
-        /// the shipping scan whichever arm the door itself is taking.
-        pub loop_keys: u32,
-        /// Extra passes of the yield scan's WALK half alone: `key.resolve`,
+        /// Extra passes of the loop-header key WALK: `key.resolve`,
         /// with neither table lookup after it.
         ///
         /// `resolve_cell_key` answers an empty or single-cell bucket from the
@@ -4472,17 +4250,16 @@ pub mod float_bank {
         /// this is one celltable walk and nothing else -- no allocation, and
         /// the answer it returns is the raw hash.
         pub loop_walk: u32,
-        /// Extra passes of the yield scan's TOKEN half: `has_compiled_loop`,
+        /// Extra passes of the loop-header TOKEN half: `has_compiled_loop`,
         /// which is `entry_procedure_token(..).is_some()` -- a celltable
         /// lookup, a `Weak::upgrade`, the `invalidated` and `has_compiled_code`
         /// loads, and the drop of the `Arc` the upgrade produced.
         ///
         /// Asked on `key.hash`, not on `key.resolve`, so that the walk this
         /// splits out is not paid twice and the arm prices the lookup alone.
-        /// The two agree on every bucket holding one cell or none -- the same
-        /// equivalence `LoopKeyArm` is built on.
+        /// The two agree on every bucket holding one cell or none.
         pub loop_token: u32,
-        /// Extra passes of the yield scan's UPGRADE half:
+        /// Extra passes of the loop-header UPGRADE half:
         /// `probe_cell_token_upgrades` -- the celltable lookup, the
         /// `Weak::upgrade`, and the drop of the `Arc` it produced, with NO
         /// flag read after it.
@@ -4497,7 +4274,7 @@ pub mod float_bank {
         /// ⚠ Its answer is deliberately WEAKER than the door's: an
         /// invalidated token still upgrades. A cost probe, never a decision.
         pub loop_upgrade: u32,
-        /// Extra passes of the yield scan's META half: `get_compiled_meta`,
+        /// Extra passes of the loop-header META half: `get_compiled_meta`,
         /// one `compiled_loops` hash and probe. Asked on `key.hash` for the
         /// same reason as [`Self::loop_token`].
         pub loop_meta: u32,
@@ -4516,7 +4293,6 @@ pub mod float_bank {
                 tls: 0,
                 pool: 0,
                 reseed: 0,
-                loop_keys: 0,
                 loop_walk: 0,
                 loop_token: 0,
                 loop_upgrade: 0,
@@ -4528,16 +4304,16 @@ pub mod float_bank {
 
     #[cfg(feature = "__entry-stage-probe")]
     std::thread_local! {
-        /// How many loop keys the yield scan last walked.
+        /// How many loop keys the last amplified loop-header walk used.
         ///
         /// The divisor a per-key figure needs, published by the door rather
         /// than recounted outside it, where a caller would have to rediscover
         /// which backward jumps [`loop_header_keys`] admits. Written only while
-        /// the scan is being amplified, so the arm the difference is taken
-        /// against does not carry the store.
+        /// a loop-header arm is being amplified, so the arm the difference is
+        /// taken against does not carry the store.
         static ENTRY_STAGE_LOOP_KEYS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
 
-        /// Passes run by the sub-arms of the yield scan, in the order
+        /// Passes run by the sub-arms of the loop-header probe, in the order
         /// `[walk, token, upgrade, meta]`, plus a fifth slot that is NOT a
         /// pass count -- see below.
         ///
@@ -4564,10 +4340,10 @@ pub mod float_bank {
     /// Set the repeat counts for subsequent calls on this thread, answering
     /// what they were.
     ///
-    /// A setter rather than a wrapper around one call, unlike
-    /// [`run_jit_persistent_probe_f`]: the entry's whole-cost figure is read
-    /// through `BoundBatch::collect_into_on`, so the stages have to be read
-    /// through it too, or the parts and the whole are about different doors.
+    /// A setter rather than a wrapper around one call: the entry's whole-cost
+    /// figure is read through `BoundBatch::collect_into_on`, so the stages have
+    /// to be read through it too, or the parts and the whole are about
+    /// different doors.
     #[cfg(feature = "__entry-stage-probe")]
     pub fn set_entry_stage_repeats(repeats: EntryStageRepeats) -> EntryStageRepeats {
         ENTRY_STAGE_REPEATS.with(|slot| slot.replace(repeats))
@@ -4580,7 +4356,7 @@ pub mod float_bank {
         ENTRY_STAGE_LOOP_KEYS.with(core::cell::Cell::get)
     }
 
-    /// Passes run by the yield scan's `[walk, token, upgrade, meta]` sub-arms
+    /// Passes run by the loop-header `[walk, token, upgrade, meta]` sub-arms
     /// since the last [`reset_entry_stage_sub_passes`], and in slot 4 the
     /// number of loop keys whose `resolve` disagreed with their raw hash --
     /// zero on every bucket holding one cell or none.
@@ -4601,9 +4377,8 @@ pub mod float_bank {
     /// code.
     ///
     /// `runnable` is the cell-owned procedure token on this program's entry or
-    /// loop-header green key, plus frontend meta — the same question the yield
-    /// probe asks. `compiled_entries` is this driver's compiled-entry tally,
-    /// not the process-global census.
+    /// loop-header green key, plus frontend meta. `compiled_entries` is this
+    /// driver's compiled-entry tally, not the process-global census.
     #[derive(Clone, Copy, Debug)]
     pub struct PersistentLoopStatus {
         pub runnable: bool,
@@ -4745,16 +4520,16 @@ pub mod float_bank {
                     fresh
                 }
             };
-            // Split so the entry door can read this program's cached keys while
-            // it drives the driver; the three are separate fields and their
-            // borrows do not overlap.
             let PooledDriver {
                 driver,
                 programs,
                 state,
                 ..
             } = &mut *pooled;
+            #[cfg(feature = "__entry-stage-probe")]
             let pooled_program = &programs[program_index];
+            #[cfg(not(feature = "__entry-stage-probe"))]
+            let _ = programs;
             // The store majit decodes guard and resume metadata through is one
             // slot per thread, written when a driver registers its dispatch
             // jitcode. We keep a driver per shape, so aim it back at this one
@@ -4781,43 +4556,15 @@ pub mod float_bank {
                 std::hint::black_box(&mut *state);
             }
             reseed_state_f(state, init_regs, num_fregs);
-            // The yield scan the entry door opens with. Amplified here rather
-            // than inside [`try_function_entry_jit_f`] because both of its
-            // inputs are already in hand at this point, which leaves that
-            // door's signature the shipping one.
-            #[cfg(feature = "__entry-stage-probe")]
-            if repeats.loop_keys != 0 {
-                ENTRY_STAGE_LOOP_KEYS.with(|slot| slot.set(pooled_program.loop_keys.len()));
-                for _ in 0..repeats.loop_keys {
-                    // The shipping predicate verbatim. It used to be spelled
-                    // here as a resolve followed by a separate token read, and
-                    // stayed that way after the door fused the two, which left
-                    // this arm pricing a walk the door no longer pays.
-                    let yielded = pooled_program
-                        .loop_keys
-                        .iter()
-                        .any(|key| key.resolve_runnable(driver).1.is_some());
-                    // Reading the answer is what keeps the walk, and the
-                    // barrier inside that read is what stops the next pass
-                    // reusing this one's bucket loads.
-                    std::hint::black_box(yielded);
-                }
-            }
-            // The three halves the scan above is made of, each amplified on its
-            // own so which of them carries the stage is a measurement rather
-            // than a reading of the code.
+            // Loop-header key halves, each amplified on its own so which of
+            // them carries the stage is a measurement rather than a reading of
+            // the code.
             //
-            // All three are pure reads and answer the same thing every pass, so
-            // all three amplify honestly -- none of the single-shot treatment
-            // `E3c` needs applies here.
-            //
-            // ⚠ These are three INDEPENDENT arms, not a cumulative ladder, so
-            // `walk + token + meta` against the whole scan is a CHECK on the
-            // split rather than an assumption behind it. It is expected to be
-            // close, not exact: the shipping scan short-circuits, asking
-            // `get_compiled_meta` only where a token was found, whereas the
-            // `meta` arm asks unconditionally. Warm, where a token is always
-            // present, the short-circuit never fires and the two agree.
+            // All four are pure reads and answer the same thing every pass, so
+            // they amplify honestly -- none of the single-shot treatment `E3c`
+            // needs applies here. They are independent arms, not a cumulative
+            // ladder: `walk + token + meta` is a check on the split rather
+            // than an assumption behind it.
             #[cfg(feature = "__entry-stage-probe")]
             if repeats.loop_walk != 0 {
                 ENTRY_STAGE_LOOP_KEYS.with(|slot| slot.set(pooled_program.loop_keys.len()));
@@ -4900,15 +4647,10 @@ pub mod float_bank {
                     }
                 }
             }
-            // The call-counted door, ahead of the first instruction. It answers
-            // the whole call when the entry key already has compiled code;
-            // otherwise it hands back where interpretation is to pick up.
-            let mut pc = ENTRY_PC;
-            let result =
-                match try_function_entry_jit_f(driver, program, pooled_program, state, &mut pc) {
-                    Some(value) => value,
-                    None => run_mainloop_f(driver, program, state, pc),
-                };
+            // The generated portal runner (`ll_portal_runner` prefix of
+            // [`run_mainloop_f`]) is the call-counted door, keyed on
+            // [`ENTRY_PC`].
+            let result = run_mainloop_f(driver, program, state, ENTRY_PC);
             // ── check in ───────────────────────────────────────────────────
             // Wholesale over the bound, and that is the whole point: the loops
             // and the words they are keyed on go together, so no key can
