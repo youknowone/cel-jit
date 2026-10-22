@@ -877,6 +877,8 @@ pub fn publish_cel_descrs(ids: &CelTypeIds) {
                 flag: array_flag(field.ty, field.signed),
                 virtualizable: false,
                 index_in_parent,
+                // cel's CelObject fields are plain, non-atomic fields.
+                load_is_acquire: false,
             })
             .collect();
 
