@@ -63,7 +63,83 @@ macro_rules! impl_conversions {
 
 #[macro_export]
 macro_rules! impl_handler {
-    ($($t:ty),*) => {
+    () => {
+        impl<F, R> IntoFunction<()> for F
+        where
+            F: Fn() -> R + 'static,
+            R: IntoResolveResult + 'static,
+        {
+            fn into_function(self) -> Function {
+                $crate::magic::handler0(self)
+            }
+        }
+
+        impl<F, R> IntoFunction<(WithFunctionContext,)> for F
+        where
+            F: Fn(&FunctionContext) -> R + 'static,
+            R: IntoResolveResult,
+        {
+            fn into_function(self) -> Function {
+                Function::erased(Box::new(move |_ftx| self(_ftx).into_resolve_result()))
+            }
+        }
+    };
+    ($c1:ident) => {
+        impl<F, $c1, R> IntoFunction<($c1,)> for F
+        where
+            F: Fn($c1) -> R + 'static,
+            $c1: for<'a, 'context, 'call> $crate::FromContext<'a, 'context, 'call> + 'static,
+            R: IntoResolveResult + 'static,
+        {
+            fn into_function(self) -> Function {
+                $crate::magic::handler1::<F, $c1, R>(self)
+            }
+        }
+
+        impl<F, $c1, R> IntoFunction<(WithFunctionContext, $c1)> for F
+        where
+            F: Fn(&FunctionContext, $c1) -> R + 'static,
+            $c1: for<'a, 'context, 'call> $crate::FromContext<'a, 'context, 'call>,
+            R: IntoResolveResult,
+        {
+            fn into_function(self) -> Function {
+                Function::erased(Box::new(move |_ftx| {
+                    let arg = $c1::from_context(_ftx)?;
+                    self(_ftx, arg).into_resolve_result()
+                }))
+            }
+        }
+    };
+    ($c1:ident, $c2:ident) => {
+        impl<F, $c1, $c2, R> IntoFunction<($c1, $c2)> for F
+        where
+            F: Fn($c1, $c2) -> R + 'static,
+            $c1: for<'a, 'context, 'call> $crate::FromContext<'a, 'context, 'call> + 'static,
+            $c2: for<'a, 'context, 'call> $crate::FromContext<'a, 'context, 'call> + 'static,
+            R: IntoResolveResult + 'static,
+        {
+            fn into_function(self) -> Function {
+                $crate::magic::handler2::<F, $c1, $c2, R>(self)
+            }
+        }
+
+        impl<F, $c1, $c2, R> IntoFunction<(WithFunctionContext, $c1, $c2)> for F
+        where
+            F: Fn(&FunctionContext, $c1, $c2) -> R + 'static,
+            $c1: for<'a, 'context, 'call> $crate::FromContext<'a, 'context, 'call>,
+            $c2: for<'a, 'context, 'call> $crate::FromContext<'a, 'context, 'call>,
+            R: IntoResolveResult,
+        {
+            fn into_function(self) -> Function {
+                Function::erased(Box::new(move |_ftx| {
+                    let a = $c1::from_context(_ftx)?;
+                    let b = $c2::from_context(_ftx)?;
+                    self(_ftx, a, b).into_resolve_result()
+                }))
+            }
+        }
+    };
+    ($($t:ty),+) => {
         pastey::paste! {
             impl<F, $($t,)* R> IntoFunction<($($t,)*)> for F
             where
@@ -72,22 +148,12 @@ macro_rules! impl_handler {
                 R: IntoResolveResult + 'static,
             {
                 fn into_function(self) -> Function {
-                    let f = ::std::sync::Arc::new(self);
-                    let erased: $crate::magic::ErasedFunction = Box::new({
-                        let f = f.clone();
-                        move |_ftx| {
-                            $(
-                                let [<arg_ $t:lower>] = $t::from_context(_ftx)?;
-                            )*
-                            f($([<arg_ $t:lower>],)*).into_resolve_result()
-                        }
-                    });
-                    // The same closure in its own signature, offered for the
-                    // scalar form; `Function::with_typed` keeps it only if the
-                    // signature is one the batch machine calls directly.
-                    let typed: Box<dyn Fn($($t,)*) -> R> =
-                        Box::new(move |$([<arg_ $t:lower>],)*| f($([<arg_ $t:lower>],)*));
-                    Function::with_typed(erased, Box::new(typed))
+                    Function::erased(Box::new(move |_ftx| {
+                        $(
+                            let [<arg_ $t:lower>] = $t::from_context(_ftx)?;
+                        )*
+                        self($([<arg_ $t:lower>],)*).into_resolve_result()
+                    }))
                 }
             }
 

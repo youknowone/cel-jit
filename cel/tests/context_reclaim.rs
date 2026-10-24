@@ -13,8 +13,8 @@ use cel::{Context, Program, Value};
 
 fn sample_map() -> Value {
     let mut m = HashMap::new();
-    m.insert(Key::String(Arc::new("k".to_string())), Value::Int(1));
-    m.insert(Key::String(Arc::new("v".to_string())), Value::Int(2));
+    m.insert(Key::String(Arc::from("k")), Value::Int(1));
+    m.insert(Key::String(Arc::from("v")), Value::Int(2));
     Value::Map(Map::object(Arc::new(m)))
 }
 

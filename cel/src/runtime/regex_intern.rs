@@ -17,6 +17,7 @@ static TABLE: Mutex<Option<HashMap<String, Arc<regex::Regex>>>> = Mutex::new(Non
 /// The key is the pattern text and the value is determined by it, so
 /// identity of the `Arc` is not load-bearing — two tables would still
 /// match the same strings.
+#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
 pub fn intern_regex(pattern: &str) -> Result<Arc<regex::Regex>, String> {
     let mut guard = TABLE.lock().unwrap_or_else(|p| p.into_inner());
     let table = guard.get_or_insert_with(HashMap::new);

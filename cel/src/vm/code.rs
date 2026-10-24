@@ -1,5 +1,8 @@
 //! The code object: a compiled expression.
-use std::sync::atomic::{AtomicU64, Ordering};
+
+#[cfg(feature = "jit")]
+use std::cell::{Cell, UnsafeCell};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use super::error::NameId;
@@ -8,8 +11,61 @@ use crate::Value;
 
 static NEXT_CODE_ID: AtomicU64 = AtomicU64::new(1);
 
+/// JIT driver this code object owns for ONE thread.
+///
+/// `owner` is claimed once by compare-exchange of a per-thread token.
+/// That thread reaches the driver through one load; every other thread
+/// uses the portal's per-thread table. Nested evaluations on the owner
+/// thread reuse the same driver.
+///
+/// The pointer is a `Box<JitDriver<PortalState>>`. The portal installs the
+/// drop glue; this type does not name that driver.
+#[cfg(feature = "jit")]
+pub(crate) struct CodeJit {
+    pub(crate) owner: AtomicUsize,
+    pub(crate) driver: UnsafeCell<usize>,
+    pub(crate) drop_fn: Cell<Option<unsafe fn(usize)>>,
+}
+
+// SAFETY: `owner` is atomic. `driver` is accessed only by the thread whose
+// token equals `owner` (the winner of the compare-exchange), or by `Drop`
+// when the last `Arc` is gone and no evaluation can hold a borrow of the
+// driver. Other threads never touch that field; they keep their own driver
+// in the per-thread table. Nested evaluations on the owner thread reuse the
+// same driver.
+#[cfg(feature = "jit")]
+unsafe impl Send for CodeJit {}
+#[cfg(feature = "jit")]
+unsafe impl Sync for CodeJit {}
+
+#[cfg(feature = "jit")]
+impl Default for CodeJit {
+    fn default() -> Self {
+        CodeJit {
+            owner: AtomicUsize::new(0),
+            driver: UnsafeCell::new(0),
+            drop_fn: Cell::new(None),
+        }
+    }
+}
+
+#[cfg(feature = "jit")]
+impl Drop for CodeJit {
+    fn drop(&mut self) {
+        let ptr = *self.driver.get_mut();
+        if ptr != 0 {
+            if let Some(drop_fn) = *self.drop_fn.get_mut() {
+                unsafe { drop_fn(ptr) };
+            }
+        }
+    }
+}
+
 /// Shared by every clone of one compiled bytecode object.
-pub(crate) struct CodeLive;
+pub(crate) struct CodeLive {
+    #[cfg(feature = "jit")]
+    pub(crate) jit: CodeJit,
+}
 
 /// Process-wide identity of one compiled bytecode object.
 ///
@@ -20,7 +76,6 @@ pub(crate) struct CodeLive;
 #[derive(Clone)]
 pub(crate) struct CodeIdentity {
     pub(crate) id: u64,
-    #[allow(dead_code)]
     pub(crate) live: Arc<CodeLive>,
 }
 
@@ -28,7 +83,10 @@ impl CodeIdentity {
     fn new() -> Self {
         CodeIdentity {
             id: NEXT_CODE_ID.fetch_add(1, Ordering::Relaxed),
-            live: Arc::new(CodeLive),
+            live: Arc::new(CodeLive {
+                #[cfg(feature = "jit")]
+                jit: CodeJit::default(),
+            }),
         }
     }
 }

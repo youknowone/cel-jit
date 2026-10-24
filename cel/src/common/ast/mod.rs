@@ -46,7 +46,7 @@ pub enum LiteralValue {
     Double(f64),
     Int(i64),
     Null,
-    String(Arc<String>),
+    String(Arc<str>),
     UInt(u64),
 }
 
@@ -55,7 +55,8 @@ impl LiteralValue {
     ///
     /// A refcount bump for the two owning variants, a copy for the rest. The
     /// literal holds the same representation [`Value`] does so that evaluating
-    /// one allocates nothing.
+    /// one allocates nothing. A string is an `Arc<str>`: the bytes and the
+    /// header are one allocation.
     pub fn to_value(&self) -> Value {
         match self {
             LiteralValue::Boolean(b) => Value::Bool(*b),

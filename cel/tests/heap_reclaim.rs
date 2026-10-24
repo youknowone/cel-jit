@@ -57,7 +57,12 @@ fn ten_thousand_maps_leave_old_space_flat() {
     ctx.add_variable_from_value("list", (1..=1000i64).collect::<Vec<i64>>());
     let program = Program::compile("list.map(v, v * 2)").expect("compiles");
 
-    program.execute(&ctx).expect("warms");
+    // The map loop is compiled after the portal trace threshold. Each
+    // compiled guard's NUMBERING (`resumecode.py` / `ResumeGuardDescr.rd_numb`)
+    // lives in old space for the descr's whole life.
+    for _ in 0..1000 {
+        program.execute(&ctx).expect("warms");
+    }
     let old_bytes = with_heap(|h| h.old_allocated_bytes());
     let old_segs = with_heap(|h| h.old_segments());
     let water = with_heap(|h| h.nursery_high_water());
@@ -99,7 +104,7 @@ fn a_kept_result_survives_later_evaluations() {
     ctx.add_variable_from_value("list", vec![1i64, 2, 3]);
     ctx.add_variable_from_value("n", 7i64);
     let mut m = HashMap::new();
-    m.insert(Key::String(Arc::new("a".to_string())), Value::Int(1));
+    m.insert(Key::String(Arc::from("a")), Value::Int(1));
     ctx.add_variable_from_value("map", Value::Map(Map::object(Arc::new(m))));
     ctx.add_variable_from_value("s", "hello");
     ctx.add_variable_from_value("b", Value::Bytes(Arc::new(vec![1, 2, 3])));
@@ -111,11 +116,11 @@ fn a_kept_result_survives_later_evaluations() {
         ),
         ("{'x': n, 'y': n + 1}", {
             let mut got = HashMap::new();
-            got.insert(Key::String(Arc::new("x".to_string())), Value::Int(7));
-            got.insert(Key::String(Arc::new("y".to_string())), Value::Int(8));
+            got.insert(Key::String(Arc::from("x")), Value::Int(7));
+            got.insert(Key::String(Arc::from("y")), Value::Int(8));
             Value::Map(Map::object(Arc::new(got)))
         }),
-        ("s + s", Value::String(Arc::new("hellohello".to_string()))),
+        ("s + s", Value::String(Arc::from("hellohello"))),
         ("b + b", Value::Bytes(Arc::new(vec![1, 2, 3, 1, 2, 3]))),
         (
             "optional.of(n)",
@@ -123,7 +128,7 @@ fn a_kept_result_survives_later_evaluations() {
         ),
         ("[{'k': n}]", {
             let mut inner = HashMap::new();
-            inner.insert(Key::String(Arc::new("k".to_string())), Value::Int(7));
+            inner.insert(Key::String(Arc::from("k")), Value::Int(7));
             Value::list(vec![Value::Map(Map::object(Arc::new(inner)))])
         }),
         (

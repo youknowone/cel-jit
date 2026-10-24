@@ -59,7 +59,7 @@
 use core::mem::{align_of, offset_of};
 
 use super::lltype;
-use super::object_array::{self, CelBytesBlock, CelItemsBlock};
+use super::object_array::{self, CelBytesBlock, CelInt2Storage, CelItemsBlock, CelLeafStorage};
 
 /// The coarse family a value belongs to.
 ///
@@ -113,6 +113,9 @@ pub struct CelClass {
     pub subclassrange_max: i64,
     pub name: &'static str,
     pub kind: CelKind,
+    /// Immortal [`W_TypeObject`] denoting this class. Filled once by
+    /// [`prebuilt_type`]; null until then.
+    type_leaf: core::sync::atomic::AtomicPtr<()>,
 }
 
 impl CelClass {
@@ -123,6 +126,7 @@ impl CelClass {
             subclassrange_max: subclassrange_min + 1,
             name,
             kind,
+            type_leaf: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
         }
     }
 }
@@ -132,6 +136,7 @@ impl CelClass {
 /// One word, and declaring no class word beyond it is what admits the fuse's
 /// base-type arm — see the module documentation.
 // Written once, at allocation. A read off a constant object folds.
+#[cfg_attr(feature = "jit", majit_macros::jit_immutable_fields(ob_type))]
 #[repr(C)]
 pub struct CelObject {
     pub ob_type: *const CelClass,
@@ -204,6 +209,7 @@ macro_rules! scalar_leaf {
         // reads may fold to a pure getfield. The attribute leaves the
         // `_immutable_fields_<Struct>` marker Charon extracts; spelling it by
         // hand here is what the marker's own consumer stopped needing.
+        #[cfg_attr(feature = "jit", majit_macros::jit_immutable_fields($payload))]
         #[repr(C)]
         #[allow(non_camel_case_types)]
         pub struct $leaf {
@@ -358,6 +364,7 @@ pub fn new_null() -> *mut W_NullObject {
 /// the value was written with — so it does not go through [`scalar_leaf`]
 /// either. CEL compares timestamps by instant and formats them by offset, so
 /// dropping the offset would be lossy at the boundary.
+#[cfg_attr(feature = "jit", majit_macros::jit_immutable_fields(nanos, off_s))]
 #[repr(C)]
 #[allow(non_camel_case_types)]
 pub struct W_TimestampObject {
@@ -398,15 +405,16 @@ pub fn new_timestamp(nanos: i64, off_s: i64) -> *mut W_TimestampObject {
 // delete.
 
 /// A CEL `bytes`.
+#[cfg_attr(feature = "jit", majit_macros::jit_immutable_fields(data, length))]
 #[repr(C)]
 #[allow(non_camel_case_types)]
 pub struct W_BytesObject {
     pub ob_header: CelObject,
-    /// The payload, or null for a value whose block has not been built. Its
-    /// offset-0 word is the allocated capacity, not this length.
+    /// The payload, or null for a value whose block has not been built.
+    /// [`CelBytesBlock`] is `STR`: hash, then the `chars` length, then the
+    /// bytes and the extra NUL.
     pub data: *mut CelBytesBlock,
-    /// Live length in bytes. Upstream's `("length", Signed)` on the wrapper:
-    /// the block's word is a capacity and a shrink must not move it.
+    /// Live length in bytes. Upstream's `("length", Signed)` on the wrapper.
     pub length: i64,
     /// Non-owning pointer at the public `Arc<Vec<u8>>` this leaf was wrapped
     /// from, or null if the bytes were allocated by the VM.
@@ -457,16 +465,18 @@ pub fn new_bytes_concat(left: &[u8], right: &[u8]) -> *mut W_BytesObject {
 /// two are different CEL types with different operations, and a shared leaf
 /// would make the class word the only thing separating them at every use site.
 ///
-/// The payload is UTF-8, so `byte_len` is what indexes the block and is not the
-/// character count.
+/// `chars` is valid UTF-8 by construction (`W_UnicodeObject`); `byte_len`
+/// indexes the block and is not the character count.
+#[cfg_attr(feature = "jit", majit_macros::jit_immutable_fields(chars, byte_len))]
 #[repr(C)]
 #[allow(non_camel_case_types)]
 pub struct W_StringObject {
     pub ob_header: CelObject,
+    /// Payload laid out as `STR`. Shared block type with [`W_BytesObject`].
     pub chars: *mut CelBytesBlock,
     pub byte_len: i64,
-    /// Non-owning pointer at the public `Arc<String>` this leaf was wrapped
-    /// from, or null if the string was allocated by the VM.
+    /// Non-owning thin pointer at the data of the public `Arc<str>` this leaf
+    /// was wrapped from, or null if the string was allocated by the VM.
     pub public: *const (),
 }
 
@@ -488,9 +498,11 @@ fn alloc_fresh_string(nbytes: usize) -> (*mut W_StringObject, *mut u8) {
 
 /// [`alloc_fresh_string`] on a heap the caller already resolved.
 ///
+/// The caller writes `nbytes` of valid UTF-8 at the returned base.
+///
 /// ```text
 /// [hdr = W_StringObject::TYPE_ID][leaf][pad to 8]
-///     [hdr = CelBytesBlock::TYPE_ID][block: capacity, bytes]
+///     [hdr = CelBytesBlock::TYPE_ID][block: hash, length, chars, extra NUL]
 /// ```
 fn alloc_fresh_string_in(
     heap: &super::heap::CelHeap,
@@ -501,7 +513,7 @@ fn alloc_fresh_string_in(
     let block_align = align_of::<CelBytesBlock>();
     let block_hdr = (header + leaf_size + block_align - 1) & !(block_align - 1);
     let chars_off = block_hdr + header;
-    let block_bytes = object_array::CEL_BYTES_BLOCK_ITEMS_OFFSET + nbytes;
+    let block_bytes = object_array::CEL_BYTES_BLOCK_TOKEN.base_size + nbytes;
     let total = chars_off + block_bytes;
     let align = align_of::<W_StringObject>().max(block_align).max(header);
     let raw = heap.alloc_raw(total, align);
@@ -510,7 +522,7 @@ fn alloc_fresh_string_in(
         (raw.add(block_hdr) as *mut u64)
             .write(u64::from(<CelBytesBlock as lltype::CelGcType>::TYPE_ID));
         let chars = raw.add(chars_off) as *mut CelBytesBlock;
-        (*chars).capacity = nbytes;
+        object_array::init_bytes_block(chars, nbytes);
         let leaf = raw.add(header) as *mut W_StringObject;
         leaf.write(W_StringObject {
             ob_header: CelObject {
@@ -579,8 +591,8 @@ pub fn string_from_int_in(heap: &super::heap::CelHeap, n: i64) -> *mut W_StringO
     leaf
 }
 
-/// Box the concatenation of two UTF-8 slices as a CEL `string`.
-pub fn new_string_concat(left: &[u8], right: &[u8]) -> *mut W_StringObject {
+/// Box the concatenation of two UTF-8 strings as a CEL `string`.
+pub fn new_string_concat(left: &str, right: &str) -> *mut W_StringObject {
     let n = left.len() + right.len();
     let (leaf, base) = alloc_fresh_string(n);
     unsafe {
@@ -626,6 +638,7 @@ pub enum ListStrategy {
 /// column and stores it in [`W_ListObject::storage`] (`_ll_list_resize_really`
 /// replaces `l.items`; the array's length is not rewritten in place), so both
 /// fields are `_immutable_fields_`.
+#[cfg_attr(feature = "jit", majit_macros::jit_immutable_fields(data, length))]
 #[repr(C)]
 #[allow(non_camel_case_types)]
 pub struct W_IntColumn {
@@ -641,6 +654,7 @@ pub static CEL_INT_COLUMN_CLASS: CelClass = CelClass::new("int_column", CelKind:
 /// An unboxed float column. `FloatListStrategy` storage: raw `f64`s, not
 /// `W_DoubleObject`s. `data` and `length` are write-once, same as
 /// [`W_IntColumn`].
+#[cfg_attr(feature = "jit", majit_macros::jit_immutable_fields(data, length))]
 #[repr(C)]
 #[allow(non_camel_case_types)]
 pub struct W_FloatColumn {
@@ -779,6 +793,10 @@ pub(crate) unsafe fn list_clear_public_link(w: CelRef) {
 /// change, and `rewrite_op_getarrayitem` reads the `CelRef`s with
 /// `getarrayitem_gc_pure`. The block is a `GcArray` (`CelItemsBlock`):
 /// length word, then the items. Only `In` consumes one; it is not a CEL value.
+#[cfg_attr(
+    feature = "jit",
+    majit_macros::jit_immutable_fields(length, "items[*]")
+)]
 #[repr(C)]
 #[allow(non_camel_case_types)]
 pub struct W_TupleObject {
@@ -849,13 +867,25 @@ pub unsafe fn map_len(w: CelRef) -> i64 {
     (*w.cast::<W_MapObject>()).length
 }
 
-/// UTF-8 byte length of a string leaf. Matches `Arc<String>::len`.
+/// UTF-8 byte length of a string leaf. Matches `Arc<str>::len`.
 ///
 /// # Safety
 ///
 /// `w` is a live [`W_StringObject`].
 pub unsafe fn string_byte_len(w: CelRef) -> i64 {
     (*w.cast::<W_StringObject>()).byte_len
+}
+
+/// Interpret a [`W_StringObject`] payload as text.
+///
+/// # Safety
+///
+/// `bytes` are the live `chars` of a [`W_StringObject`]: valid UTF-8 by
+/// construction (`W_UnicodeObject`).
+#[inline]
+pub(crate) unsafe fn string_payload_as_str(bytes: &[u8]) -> &str {
+    debug_assert!(std::str::from_utf8(bytes).is_ok());
+    unsafe { std::str::from_utf8_unchecked(bytes) }
 }
 
 /// Borrow the UTF-8 payload of a string leaf.
@@ -873,7 +903,7 @@ pub unsafe fn string_as_str<'a>(w: CelRef) -> Option<&'a str> {
     if base.is_null() {
         return Some("");
     }
-    std::str::from_utf8(std::slice::from_raw_parts(base, n)).ok()
+    Some(string_payload_as_str(std::slice::from_raw_parts(base, n)))
 }
 
 /// Live length of a bytes leaf.
@@ -1826,6 +1856,10 @@ pub enum MapStrategy {
 ///
 /// `strategy`, `storage`, `items`, and `layout` are written only by the
 /// allocating constructors. `length` and the `public*` words change on insert.
+#[cfg_attr(
+    feature = "jit",
+    majit_macros::jit_immutable_fields(strategy, storage, items, layout)
+)]
 #[repr(C)]
 #[allow(non_camel_case_types)]
 pub struct W_MapObject {
@@ -2376,6 +2410,10 @@ pub(crate) unsafe fn mapdict_pair_refs(leaf: &W_MapObject) -> Vec<CelRef> {
 /// ⚠ The strategy tag is absent for the same reason [`W_ListObject`] omits
 /// it: a discriminant is only meaningful once there is a second strategy.
 #[cfg(feature = "structs")]
+#[cfg_attr(
+    feature = "jit",
+    majit_macros::jit_immutable_fields(name, fields, length)
+)]
 #[repr(C)]
 #[allow(non_camel_case_types)]
 pub struct W_StructObject {
@@ -2430,6 +2468,7 @@ pub fn new_struct(name: *mut W_StringObject, fields: &[(CelRef, CelRef)]) -> *mu
 /// `type(type(1)) == type(string)` hold, and it is why the two spellings must
 /// not be collapsed: `(*type_value).cls` is a class, `(*any_value).ob_type` is
 /// a class, and only the type value itself is an allocated object.
+#[cfg_attr(feature = "jit", majit_macros::jit_immutable_fields(cls))]
 #[repr(C)]
 #[allow(non_camel_case_types)]
 pub struct W_TypeObject {
@@ -2446,9 +2485,15 @@ const _: () = {
 
 /// The activation record, `pyframe.py` `PyFrame` virtualizable subset.
 ///
-/// `_virtualizable_ = ['last_instr', 'valuestackdepth', 'locals_stack_w[*]']`
-/// (`interp_jit.py`). The JIT driver names this object `virtualizables =
-/// ['frame']`. Slots are a fixed [`CelItemsBlock`] — `make_sure_not_resized`.
+/// `_virtualizable_ = ['last_instr', 'valuestackdepth', 'locals_stack_w[*]',
+/// 'vm', 'ctx', 'map', 'block', 'registry_map', 'entries']`
+/// (`interp_jit.py` `PyPyJitDriver`, `virtualizables = ['frame']`). Slots
+/// are a fixed [`CelItemsBlock`] — `make_sure_not_resized`.
+///
+/// `vm` / `ctx` / `map` / `block` / `registry_map` / `entries` are the
+/// `pyframe.py` `get_w_globals` shape: the portal reads them off the live
+/// frame. A reused frame is rebound for each execute, so they are
+/// virtualizable static fields, not `_immutable_fields_`.
 #[repr(C)]
 #[allow(non_camel_case_types)]
 pub struct W_CelFrame {
@@ -2465,6 +2510,18 @@ pub struct W_CelFrame {
     /// instead of `Option<Box<_>>`. Not part of the input list; it changes
     /// when a residual hydrates.
     pub scratch_bits: i64,
+    /// Evaluator bits for this execute (`interp_jit.py` `PyPyJitDriver` `ec`).
+    pub vm: i64,
+    /// Context bits (`pyframe.py` `get_w_globals`).
+    pub ctx: i64,
+    /// Scope map pointer (`mapdict.py` `_get_mapdict_map`).
+    pub map: i64,
+    /// Interned-leaf storage (`mapdict.py` `_mapdict_read_storage`).
+    pub block: *mut CelLeafStorage,
+    /// Root registry map pointer (`mapdict.py` `_get_mapdict_map`).
+    pub registry_map: i64,
+    /// Two-int entry storage of the root registry.
+    pub entries: *mut CelInt2Storage,
 }
 
 /// The `locals_cells_stack_w[*]` array: a pointer that indexes as a slice.
@@ -2529,6 +2586,12 @@ pub const CELFRAME_LAST_INSTR_OFFSET: usize = offset_of!(W_CelFrame, last_instr)
 pub const CELFRAME_VALUESTACKDEPTH_OFFSET: usize = offset_of!(W_CelFrame, valuestackdepth);
 pub const CELFRAME_LOCALS_STACK_OFFSET: usize = offset_of!(W_CelFrame, locals_stack_w);
 pub const CELFRAME_SCRATCH_BITS_OFFSET: usize = offset_of!(W_CelFrame, scratch_bits);
+pub const CELFRAME_VM_OFFSET: usize = offset_of!(W_CelFrame, vm);
+pub const CELFRAME_CTX_OFFSET: usize = offset_of!(W_CelFrame, ctx);
+pub const CELFRAME_MAP_OFFSET: usize = offset_of!(W_CelFrame, map);
+pub const CELFRAME_BLOCK_OFFSET: usize = offset_of!(W_CelFrame, block);
+pub const CELFRAME_REGISTRY_MAP_OFFSET: usize = offset_of!(W_CelFrame, registry_map);
+pub const CELFRAME_ENTRIES_OFFSET: usize = offset_of!(W_CelFrame, entries);
 
 /// Allocate a frame whose array is `n_slots + max_stack` and never resized.
 pub fn new_cel_frame(n_slots: i64, max_stack: i64) -> *mut W_CelFrame {
@@ -2559,7 +2622,40 @@ pub fn new_cel_frame_in(
         locals_stack_w: VableStack::from_block(items),
         n_slots,
         scratch_bits: 0,
+        vm: 0,
+        ctx: 0,
+        map: 0,
+        block: core::ptr::null_mut(),
+        registry_map: 0,
+        entries: core::ptr::null_mut(),
     })
+}
+
+/// Bind the per-execute words the portal reads off the frame
+/// (`pyframe.py` `get_w_globals`).
+///
+/// Written once when the frame is set up for an execution. A reused
+/// frame is rebound, so these are virtualizable static fields.
+///
+/// # Safety
+///
+/// `frame` is a live [`W_CelFrame`].
+#[inline]
+pub unsafe fn bind_cel_frame_portal(
+    frame: *mut W_CelFrame,
+    vm: i64,
+    ctx: i64,
+    map: i64,
+    block: *mut CelLeafStorage,
+    registry_map: i64,
+    entries: *mut CelInt2Storage,
+) {
+    (*frame).vm = vm;
+    (*frame).ctx = ctx;
+    (*frame).map = map;
+    (*frame).block = block;
+    (*frame).registry_map = registry_map;
+    (*frame).entries = entries;
 }
 
 /// Reset a reused frame so the next execute sees the same initial state as
@@ -2581,7 +2677,23 @@ pub unsafe fn reset_cel_frame(frame: *mut W_CelFrame, n_slots: i64) {
     if cap > 0 {
         let base =
             crate::runtime::object_array::items_block_items_base((*frame).locals_stack_w.block);
-        core::ptr::write_bytes(base, 0, cap);
+        // Small path: unrolled stores, not a libc memset/bzero.
+        macro_rules! null_cells {
+            ($($i:expr),*) => {{
+                $(base.add($i).write(core::ptr::null_mut());)*
+            }};
+        }
+        match cap {
+            1 => null_cells!(0),
+            2 => null_cells!(0, 1),
+            3 => null_cells!(0, 1, 2),
+            4 => null_cells!(0, 1, 2, 3),
+            5 => null_cells!(0, 1, 2, 3, 4),
+            6 => null_cells!(0, 1, 2, 3, 4, 5),
+            7 => null_cells!(0, 1, 2, 3, 4, 5, 6),
+            8 => null_cells!(0, 1, 2, 3, 4, 5, 6, 7),
+            _ => core::ptr::write_bytes(base, 0, cap),
+        }
     }
 }
 
@@ -2605,9 +2717,34 @@ pub unsafe fn cel_frame_slot(frame: *mut W_CelFrame, i: i64) -> *mut CelRef {
 /// # Safety
 ///
 /// `frame` is a live [`W_CelFrame`].
-pub unsafe fn force_virtualizable_if_necessary(_frame: *mut W_CelFrame) {}
+#[cfg_attr(feature = "jit", majit_macros::dont_look_inside)]
+pub unsafe fn force_virtualizable_if_necessary(frame: *mut W_CelFrame) {
+    // `virtualizable.py` `force_now`: a residual helper that writes the
+    // frame must clear `TOKEN_TRACING_RESCALL` so `vable_after_residual_call`
+    // reloads the boxes. Leaving the token set tells the tracer the
+    // helper did not touch the frame.
+    let token = (*frame).vable_token;
+    if token == 0 {
+        return;
+    }
+    #[cfg(feature = "jit")]
+    {
+        let tracing = majit_metainterp::virtualizable::token_tracing_rescall() as usize;
+        if token == tracing {
+            (*frame).vable_token = 0;
+        } else {
+            // `compile.py ResumeGuardForcedDescr.force_now`: write the
+            // compiled virtual fields back and mark the guard forced.
+            crate::vm::portal::force_portal_driver_token(token as u64);
+            assert_eq!((*frame).vable_token, 0, "force_now must leave TOKEN_NONE");
+        }
+    }
+}
 
 /// The type value denoting `cls`.
+///
+/// A fresh nursery leaf. [`prebuilt_type`] is the interned singleton an
+/// elidable load folds to.
 pub fn new_type(cls: &'static CelClass) -> *mut W_TypeObject {
     lltype::malloc_typed(W_TypeObject {
         ob_header: CelObject {
@@ -2617,11 +2754,44 @@ pub fn new_type(cls: &'static CelClass) -> *mut W_TypeObject {
     })
 }
 
+/// Immortal type value denoting `cls`.
+///
+/// One leaf per class, owned by that class, process-lifetime. An elidable
+/// identifier load (`intern_type_ident`) folds to this pointer; a nursery
+/// [`new_type`] would not survive the compiled loop. `cls` is a static
+/// vtable, not a GC edge, so the immortal allocator accepts the payload.
+pub fn prebuilt_type(cls: &'static CelClass) -> *mut W_TypeObject {
+    use core::sync::atomic::Ordering;
+    let existing = cls.type_leaf.load(Ordering::Acquire);
+    if !existing.is_null() {
+        return existing.cast();
+    }
+    let w = lltype::malloc_typed_immortal(W_TypeObject {
+        ob_header: CelObject {
+            ob_type: &CEL_TYPE_CLASS,
+        },
+        cls,
+    });
+    match cls.type_leaf.compare_exchange(
+        core::ptr::null_mut(),
+        w.cast(),
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => w,
+        Err(winner) => winner.cast(),
+    }
+}
+
 /// A foreign host object.
 ///
 /// `w_type` is a type value ([`W_TypeObject`]); `host_index` is a slot in
 /// this thread's heap table. D12: the host lives as long as the heap — no
 /// finalizer, no `Drop` on the leaf.
+#[cfg_attr(
+    feature = "jit",
+    majit_macros::jit_immutable_fields(w_type, host_index)
+)]
 #[repr(C)]
 #[allow(non_camel_case_types)]
 pub struct W_OpaqueObject {
@@ -2857,13 +3027,19 @@ const _: () = {
     assert!(offset_of!(W_MapObject, public_kind) == 48);
     assert!(offset_of!(W_MapObject, public_len) == 52);
     assert!(offset_of!(W_MapObject, layout) == 56);
-    assert!(size_of::<W_CelFrame>() == 56);
+    assert!(size_of::<W_CelFrame>() == 104);
     assert!(offset_of!(W_CelFrame, vable_token) == 8);
     assert!(offset_of!(W_CelFrame, last_instr) == 16);
     assert!(offset_of!(W_CelFrame, valuestackdepth) == 24);
     assert!(offset_of!(W_CelFrame, locals_stack_w) == 32);
     assert!(offset_of!(W_CelFrame, n_slots) == 40);
     assert!(offset_of!(W_CelFrame, scratch_bits) == 48);
+    assert!(offset_of!(W_CelFrame, vm) == 56);
+    assert!(offset_of!(W_CelFrame, ctx) == 64);
+    assert!(offset_of!(W_CelFrame, map) == 72);
+    assert!(offset_of!(W_CelFrame, block) == 80);
+    assert!(offset_of!(W_CelFrame, registry_map) == 88);
+    assert!(offset_of!(W_CelFrame, entries) == 96);
     assert!(size_of::<W_OpaqueObject>() == 24);
     assert!(offset_of!(W_OpaqueObject, w_type) == 8);
     assert!(offset_of!(W_OpaqueObject, host_index) == 16);
@@ -2989,7 +3165,7 @@ mod tests {
         let w = string_from_int(42);
         assert_eq!(objects(), before + 1);
         let s = new_string("hi");
-        let cat = new_string_concat(b"ab", b"c");
+        let cat = new_string_concat("ab", "c");
         let empty = new_string("");
         assert_eq!(objects(), before + 4);
         unsafe {
@@ -3010,14 +3186,17 @@ mod tests {
                 *(((*w).chars as *const u8).sub(GC_HEADER_SIZE) as *const u64),
                 u64::from(CelBytesBlock::TYPE_ID)
             );
-            assert_eq!((*(*w).chars).capacity, 2);
+            assert_eq!((*(*w).chars).hash, 0);
+            assert_eq!((*(*w).chars).length, 2);
             assert_eq!((*s).byte_len, 2);
             assert_eq!((*cat).byte_len, 3);
             assert_eq!(bytes_capacity((*cat).chars), 3);
             let base = bytes_base((*cat).chars);
             assert_eq!(core::slice::from_raw_parts(base, 3), b"abc");
+            assert_eq!(*base.add(3), 0);
             assert_eq!((*empty).byte_len, 0);
             assert_eq!(bytes_capacity((*empty).chars), 0);
+            assert_eq!(*bytes_base((*empty).chars), 0);
             crate::runtime::heap::with_heap(|h| {
                 assert!(h.contains(w as *const u8));
                 assert!(h.contains((*w).chars as *const u8));
@@ -3033,9 +3212,9 @@ mod tests {
     }
 
     /// The variable-length leaves keep their live length on the leaf and their
-    /// payload in the block, and the two must agree at construction. A block's
-    /// own word is a CAPACITY, so the pair is the only place the distinction is
-    /// observable while every block is still exact-sized.
+    /// payload in the block, and the two must agree at construction. An items
+    /// block's own word is a CAPACITY; a bytes block's length word is `STR.chars`
+    /// length and matches the leaf while every block is still exact-sized.
     #[test]
     fn a_variable_length_leaf_and_its_block_agree_on_length() {
         use crate::runtime::object_array::{
@@ -3126,6 +3305,15 @@ mod tests {
                 CELFRAME_LOCALS_STACK_OFFSET,
                 offset_of!(W_CelFrame, locals_stack_w)
             );
+            assert_eq!(CELFRAME_VM_OFFSET, offset_of!(W_CelFrame, vm));
+            assert_eq!(CELFRAME_CTX_OFFSET, offset_of!(W_CelFrame, ctx));
+            assert_eq!(CELFRAME_MAP_OFFSET, offset_of!(W_CelFrame, map));
+            assert_eq!(CELFRAME_BLOCK_OFFSET, offset_of!(W_CelFrame, block));
+            assert_eq!(
+                CELFRAME_REGISTRY_MAP_OFFSET,
+                offset_of!(W_CelFrame, registry_map)
+            );
+            assert_eq!(CELFRAME_ENTRIES_OFFSET, offset_of!(W_CelFrame, entries));
         }
     }
 
@@ -3237,13 +3425,20 @@ mod tests {
             );
         }
 
-        let prebuilts: [*const u8; 6] = [
+        assert_eq!(prebuilt_type(&CEL_INT_CLASS), prebuilt_type(&CEL_INT_CLASS));
+        assert_ne!(
+            prebuilt_type(&CEL_INT_CLASS),
+            prebuilt_type(&CEL_STRING_CLASS)
+        );
+
+        let prebuilts: [*const u8; 7] = [
             new_bool(true) as *const u8,
             new_bool(false) as *const u8,
             new_null() as *const u8,
             new_int(-5) as *const u8,
             new_int(0) as *const u8,
             new_int(256) as *const u8,
+            prebuilt_type(&CEL_INT_CLASS) as *const u8,
         ];
         for p in prebuilts {
             assert!(

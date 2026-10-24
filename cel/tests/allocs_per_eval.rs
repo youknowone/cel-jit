@@ -671,8 +671,499 @@ fn iter_elems_group(out: &mut Vec<Row>) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// group: the register machine's own cases (design §12 item 10)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "jit")]
+fn regvm_group(out: &mut Vec<Row>) {
+    use cel::majit::bytecode::float_bank::{
+        clean_interp_seeded_f, clean_interp_seeded_f_in, jit_stats, reset_jit_stats,
+        reset_persistent_state, run_jit_persistent_f, Banks,
+    };
+    use cel::majit::lower::{lower_typed, Schema, ValType};
+
+    /// A column of the batch, kept alive for the whole measurement so the
+    /// base addresses seeded into the register bank stay valid.
+    enum Col {
+        Int(Vec<i64>),
+        Float(Vec<f64>),
+    }
+
+    impl Col {
+        fn base(&self) -> i64 {
+            match self {
+                Col::Int(v) => v.as_ptr() as i64,
+                Col::Float(v) => v.as_ptr() as i64,
+            }
+        }
+    }
+
+    // Threshold the in-tree tests use. Small enough that an `n`-row loop traces
+    // within one call at n >= 8, and within a handful of calls at n == 1.
+    const JIT_ON: u32 = 8;
+
+    struct Case {
+        label: &'static str,
+        src: &'static str,
+        schema: &'static [(&'static str, ValType)],
+    }
+
+    // Three shapes, chosen so the int bank, the comparison/boolean path and the
+    // float bank are each represented. No bool COLUMN: a bool column is a
+    // one-byte read and getting its stride wrong would measure a different
+    // program than the one named here.
+    const CASES: &[Case] = &[
+        Case {
+            label: "arith",
+            src: "a * 2 + b",
+            schema: &[("a", ValType::Int), ("b", ValType::Int)],
+        },
+        Case {
+            label: "policy",
+            src: "balance >= amount && balance % 2 == 0",
+            schema: &[("balance", ValType::Int), ("amount", ValType::Int)],
+        },
+        Case {
+            label: "float",
+            src: "x * 1.5 + y",
+            schema: &[("x", ValType::Float), ("y", ValType::Float)],
+        },
+    ];
+
+    for case in CASES {
+        let program =
+            Program::compile(case.src).unwrap_or_else(|e| panic!("{}: {e:?}", case.label));
+        let schema: Schema = case
+            .schema
+            .iter()
+            .map(|(n, t)| (n.to_string(), *t))
+            .collect();
+        let lowered = lower_typed(program.expression(), &schema)
+            .unwrap_or_else(|e| panic!("{}: lower_typed: {e}", case.label));
+
+        for n in [1usize, 1_000] {
+            // Build the columns in the lowering's OWN slot order. The schema is
+            // a `HashMap`, so an order taken from the literal above would be
+            // whatever the hasher produced.
+            let cols: Vec<Col> = lowered
+                .slots
+                .iter()
+                .map(|slot| match slot.ty {
+                    ValType::Float => Col::Float((0..n).map(|k| (k % 97) as f64 * 0.5).collect()),
+                    _ => Col::Int((0..n as i64).map(|k| (k * 7) % 97).collect()),
+                })
+                .collect();
+            let bases: Vec<i64> = cols.iter().map(Col::base).collect();
+            let (shape, regs) = lowered.batch_sum_program(&bases, n as i64);
+            let nf = shape.num_float_regs;
+            // A refcount bump on words the lowering owns. The `#[jit_interp]`
+            // green key is the program POINTER, so what matters is that this is
+            // the same allocation on every call — which it is, because the
+            // `LoweredF` built it once and still holds it.
+            let code = shape.code.clone();
+
+            let expected = clean_interp_seeded_f(&code, &regs, nf);
+            bench(
+                out,
+                format!("regvm/clean/{}/n={n}", case.label),
+                4,
+                8,
+                || {
+                    black_box(clean_interp_seeded_f(&code, &regs, nf));
+                },
+            );
+
+            // The same interpreter over banks the caller keeps, which is how the
+            // batch machine reaches it. The pair is the measurement: the row
+            // above IS the per-execute bank allocation (one for the int bank,
+            // plus one more where `nf > 0`), and this row is what is left when
+            // it is gone. Anything other than 0.000 here means the clean tier
+            // still allocates per execute.
+            //
+            // Primed once outside the window rather than relying on `bench`'s
+            // warm-up, so the row does not depend on how the harness orders
+            // warm-up against arming the counter: the banks reach their
+            // capacity here and never grow again.
+            let mut banks = Banks::default();
+            let banked = clean_interp_seeded_f_in(&code, &regs, nf, &mut banks);
+            assert_eq!(
+                banked, expected,
+                "regvm/{}/n={n}: the banked clean interpreter diverged from the allocating one",
+                case.label
+            );
+            bench(
+                out,
+                format!("regvm/clean-banked/{}/n={n}", case.label),
+                4,
+                8,
+                || {
+                    black_box(clean_interp_seeded_f_in(&code, &regs, nf, &mut banks));
+                },
+            );
+
+            // The JIT arm runs on a driver that outlives the call, so a loop
+            // compiled during warm-up is still compiled inside the window.
+            reset_persistent_state();
+            let got = run_jit_persistent_f(&code, &regs, nf, JIT_ON);
+            assert_eq!(
+                got, expected,
+                "regvm/{}/n={n}: compiled tier diverged from the clean VM",
+                case.label
+            );
+            // A long warm-up on purpose: at n == 1 the inner loop runs once per
+            // CALL, so the merge point needs many calls to get hot (task #83).
+            //
+            // The tier's own counters are read across the whole `bench` call so
+            // the number above can be READ AT ALL: an allocation figure taken
+            // while the tier is still tracing is the cost of COMPILING, and one
+            // taken after it is warm is the cost of ENTERING compiled code.
+            // Those are different facts and the table must not conflate them.
+            const WARMUP: u32 = 64;
+            const ITERS: u32 = 8;
+            reset_jit_stats();
+            let before = jit_stats();
+            let first = out.len();
+            bench(
+                out,
+                format!("regvm/jit/{}/n={n}", case.label),
+                WARMUP,
+                ITERS,
+                || {
+                    black_box(run_jit_persistent_f(&code, &regs, nf, JIT_ON));
+                },
+            );
+            let after = jit_stats();
+            // The counters span the warm-up AND the measured windows — `bench`
+            // owns the warm-up, so there is no seam to reset at. Saying so, and
+            // giving the call count, is the difference between a readable
+            // number and a misleading one.
+            let calls = WARMUP + ITERS * ROUNDS as u32;
+            let compiled = after.loops_compiled - before.loops_compiled;
+            // `bridges` is here because it was not, and its absence was a hole:
+            // a bridge compiled inside the window is compile-side work, and a
+            // note column reporting only `compiled`/`aborted` reads it as WARM.
+            // #116 measured that the first guard bridge lands at call 200 --
+            // past this window, which ends at call 89 -- so the rows below are
+            // pre-bridge by 111 calls. That is a fact about where the window
+            // sits, not a property of the tier, and it stops being true if
+            // WARMUP or ITERS grows.
+            let bridges = after.bridges_compiled - before.bridges_compiled;
+            // The comment above ends "that stops being true if WARMUP or ITERS
+            // grows", and this is what makes that enforceable rather than
+            // advisory. Note it cannot be spelled as a consistency check
+            // between the label and `bridges`: the label is DEFINED as
+            // `compiled == 0 && bridges == 0` three lines down, so asserting
+            // that a WARM row has `bridges == 0` restates the definition and
+            // can never fail. What is not definitional is that the WINDOW is
+            // sized to end before the first bridge -- a property of WARMUP,
+            // ITERS and ROUNDS, not of the label.
+            //
+            // Testing the effect rather than `calls < 200` keeps this correct
+            // if the schedule itself moves (CEL_TRACE_EAGERNESS).
+            //
+            // A numeric drift here can be silenced by re-blessing; this cannot.
+            assert_eq!(
+                bridges, 0,
+                "regvm/jit/{}/n={n} is documented and blessed as a PRE-BRIDGE row, \
+                 but its {calls}-call window now spans {bridges} guard bridge(s). \
+                 The row no longer measures the regime its baseline records. \
+                 Shrink the window (WARMUP={WARMUP} ITERS={ITERS} ROUNDS={ROUNDS}) \
+                 or move the row to regvm/jit-steady/*, which measures post-bridge \
+                 on purpose. Do not re-bless: the number would be right for a \
+                 different regime than the row's name and comment claim.",
+                case.label
+            );
+            out[first].detail = format!(
+                "over {calls} calls: compiled={compiled} bridges={bridges} aborted={} \
+                 guard_fails={} — {}",
+                after.loops_aborted - before.loops_aborted,
+                after.guard_failures - before.guard_failures,
+                if compiled == 0 && bridges == 0 {
+                    "WARM (compiled before this, or never)"
+                } else {
+                    "NOT WARM: the tier compiled during the measurement"
+                }
+            );
+            reset_persistent_state();
+
+            // The same persistent path at a threshold it can never reach, so
+            // nothing traces, nothing compiles and no call enters compiled
+            // code. What is left is the call machinery around the interpreter:
+            // the pooled-driver lookup, the program lookup, the entry door's
+            // compiled-check and counter, and the register-bank seed. Every one
+            // of those is either resolved on a first sighting and memoised or
+            // done in place, so the whole call is expected to allocate NOTHING.
+            //
+            // Asserted rather than blessed, and that is the point of the row.
+            // A blessed number records what the code did; this records what it
+            // is FOR. Zero allocations is the whole reason the driver location,
+            // the program entry, the entry green key and the two register banks
+            // stopped being per-call work, and a baseline drift can be
+            // re-blessed away while an assertion cannot.
+            //
+            // ONE ROW ONLY, because the claim is about per-CALL cost and one
+            // row is what isolates it. The same measurement over 1000 rows
+            // reports ~3 allocations per ROW — a property of interpreting a row
+            // at this tier, which no amount of work on the call path moves, and
+            // which would swamp the fixed cost this row exists to pin.
+            const JIT_OFF: u32 = u32::MAX;
+            if n == 1 {
+                reset_persistent_state();
+                let idle = run_jit_persistent_f(&code, &regs, nf, JIT_OFF);
+                assert_eq!(
+                    idle, expected,
+                    "regvm/jit-idle/{}/n={n}: the untraced persistent tier diverged from the \
+                     clean VM",
+                    case.label
+                );
+                let first = out.len();
+                bench(
+                    out,
+                    format!("regvm/jit-idle/{}/n={n}", case.label),
+                    WARMUP,
+                    ITERS,
+                    || {
+                        black_box(run_jit_persistent_f(&code, &regs, nf, JIT_OFF));
+                    },
+                );
+                out[first].detail = String::from(
+                    "one-row call, JIT unreachable — the fixed call cost, asserted to be \
+                     allocation-free",
+                );
+                let worst = *out[first].samples.iter().max().unwrap();
+                assert_eq!(
+                    worst, 0,
+                    "regvm/jit-idle/{}/n={n}: the persistent call path allocated {worst} \
+                     time(s) across {ITERS} one-row calls, and it is expected to allocate \
+                     nothing. The pooled driver and the program are resolved once and \
+                     memoised, the register banks are reused across calls, and the entry door \
+                     reads a cached green key — so a non-zero here names a per-call allocation \
+                     that has come back, not a number to re-bless.",
+                    case.label
+                );
+                reset_persistent_state();
+            }
+
+            // #127. The row above measures calls 65..89. The artifact leaves
+            // that plateau at call 200, when its first guard bridge compiles,
+            // and never returns: measured over 750 windows to call 6065
+            // (`examples/rca116.rs`), the tail from call 401 is 708 windows of
+            // 22978.000 (cranelift) / 19981.000 (dynasm) allocations per call
+            // with no further bridge. So the corpus had NO row in the regime the
+            // artifact occupies for all but its first 400 calls, and a
+            // regression there would move nothing.
+            //
+            // The n = 1 twin of this row is below and is a different regime,
+            // not a duplicate: at one row the loop takes no back edge, so
+            // nothing there is post-BRIDGE — the artifact is the function-entry
+            // door's, minted off the call counter, and what the row measures is
+            // entering it.
+            if n == 1_000 {
+                /// Past both bridges — the second lands in calls 393..401 — and
+                /// inside the measured tail, which runs to at least call 6065.
+                const STEADY_WARMUP: u32 = 448;
+
+                reset_persistent_state();
+                let got = run_jit_persistent_f(&code, &regs, nf, JIT_ON);
+                assert_eq!(
+                    got, expected,
+                    "regvm/jit-steady/{}/n={n}: compiled tier diverged from the clean VM",
+                    case.label
+                );
+                reset_jit_stats();
+                // Warmed by hand rather than through `bench`, to get the seam
+                // `bench` cannot give: every compile is behind us when the meter
+                // opens, so `bridges` in the window means "none happened here"
+                // and not "we could not tell warm-up from measurement".
+                for _ in 0..STEADY_WARMUP {
+                    black_box(run_jit_persistent_f(&code, &regs, nf, JIT_ON));
+                }
+                let at_seam = jit_stats();
+                let first = out.len();
+                bench(
+                    out,
+                    format!("regvm/jit-steady/{}/n={n}", case.label),
+                    0,
+                    ITERS,
+                    || {
+                        black_box(run_jit_persistent_f(&code, &regs, nf, JIT_ON));
+                    },
+                );
+                let after = jit_stats();
+                // `bridges_before` is the discriminator between this row and the
+                // one above: both windows see zero bridges, and only the count
+                // ALREADY compiled says which side of the threshold the window
+                // sits on. Reading it is the difference between a row that
+                // describes its regime and one that merely has a name.
+                out[first].detail = format!(
+                    "warmed to call {}, then {} calls: bridges_before={} in_window={} \
+                     compiled_in_window={} guard_fails={} — {}",
+                    STEADY_WARMUP + 1,
+                    ITERS * ROUNDS as u32,
+                    at_seam.bridges_compiled,
+                    after.bridges_compiled - at_seam.bridges_compiled,
+                    after.loops_compiled - at_seam.loops_compiled,
+                    after.guard_failures - at_seam.guard_failures,
+                    if at_seam.bridges_compiled == 0 {
+                        "NO BRIDGE EVER COMPILED — this case has no post-bridge regime"
+                    } else {
+                        "STEADY: past every bridge"
+                    }
+                );
+                reset_persistent_state();
+            }
+
+            // The WARM one-row call: compile once, then evaluate a record per
+            // call, which is the regime `examples/majit_percall_steady.rs`
+            // times and the one the per-call fixed cost was measured on. The
+            // `regvm/jit/*/n=1` row above cannot report it, because its window
+            // spans the call that compiles and a compile amortized over 88
+            // calls swamps what entering costs.
+            if n == 1 {
+                /// Past the entry artifact, which `regvm/jit/*/n=1` shows being
+                /// minted inside its own 88-call window.
+                const STEADY_WARMUP: u32 = 256;
+
+                reset_persistent_state();
+                let got = run_jit_persistent_f(&code, &regs, nf, JIT_ON);
+                assert_eq!(
+                    got, expected,
+                    "regvm/jit-steady/{}/n={n}: compiled tier diverged from the clean VM",
+                    case.label
+                );
+                reset_jit_stats();
+                for _ in 0..STEADY_WARMUP {
+                    black_box(run_jit_persistent_f(&code, &regs, nf, JIT_ON));
+                }
+                let at_seam = jit_stats();
+                let first = out.len();
+                bench(
+                    out,
+                    format!("regvm/jit-steady/{}/n={n}", case.label),
+                    0,
+                    ITERS,
+                    || {
+                        black_box(run_jit_persistent_f(&code, &regs, nf, JIT_ON));
+                    },
+                );
+                let after = jit_stats();
+                // `entries_in_window` is what makes the row readable: a one-row
+                // call that never enters compiled code costs what the idle row
+                // costs, and only this counter separates "warm and entering"
+                // from "warm and interpreting anyway".
+                //
+                // The verdict is stated against the CALL COUNT, not against
+                // zero. A window whose entry count merely grew is compatible
+                // with one call entering and the rest interpreting, so calling
+                // that "every call enters" claimed more than the counter
+                // proves. This is still an aggregate — one call entering twice
+                // covers for one entering not at all — so the strongest verdict
+                // here says "at least one entry per call on average", and the
+                // per-call form of the evidence lives in
+                // `examples/majit_percall_steady.rs`.
+                let calls = ITERS * ROUNDS as u32;
+                let entered = after.compiled_entries - at_seam.compiled_entries;
+                let verdict = if entered >= calls as usize {
+                    "STEADY: at least one compiled entry per call, on average over the window"
+                } else if entered > 0 {
+                    "PARTIAL — fewer entries than calls: some calls in this window were \
+                     interpreted, so the number mixes two tiers"
+                } else {
+                    "NEVER ENTERS — this row measures the interpreter, not the artifact"
+                };
+                out[first].detail = format!(
+                    "warmed to call {}, then {calls} calls: compiled_before={} \
+                     entries_in_window={entered} compiled_in_window={} guard_fails={} — {verdict}",
+                    STEADY_WARMUP + 1,
+                    at_seam.loops_compiled,
+                    after.loops_compiled - at_seam.loops_compiled,
+                    after.guard_failures - at_seam.guard_failures,
+                );
+                reset_persistent_state();
+            }
+        }
+    }
+}
+
+#[cfg(not(feature = "jit"))]
 fn regvm_group(_out: &mut Vec<Row>) {}
 
+/// The register banks are a fixed-width register FILE, not an accumulator: their
+/// width is a property of the lowered program, so a steady-state evaluation must
+/// allocate the same number of times whatever the row's element count is.
+///
+/// Asserted directly rather than blessed as rows, because the claim is a
+/// relation between two measurements and not a number. A per-element allocation
+/// would be invisible to a baseline row — the row would simply carry a bigger
+/// figure and keep matching itself — but it shows up here as two sizes
+/// disagreeing.
+///
+/// The shape is the chained one on purpose. It is the widest bank the ladder
+/// builds, so a growth introduced anywhere in the bank path reaches it first.
+#[cfg(feature = "jit")]
+fn bank_growth_probe() {
+    use cel::majit::batch::{Batch, BatchProgram, ColumnRef, Tier};
+    use cel::majit::bytecode::float_bank::reset_persistent_state;
+    use cel::majit::lower::{Schema, ValType};
+
+    /// Enough calls past the entry door that nothing is still compiling.
+    const WARMUP: usize = 600;
+    /// Calls the meter is open over. A per-element allocation at the smaller
+    /// size alone would already exceed the whole measured count here.
+    const CALLS: usize = 200;
+
+    const SRC: &str = "items.filter(x, x % 2 == 0).map(x, x * 2)";
+
+    let measure = |n: i64| -> u64 {
+        let schema: Schema = [("items[]".to_string(), ValType::Int)]
+            .into_iter()
+            .collect();
+        let program = BatchProgram::compile(SRC, &schema).expect("the ladder shape lowers");
+        let elems: Vec<i64> = (1..=n).collect();
+        let lens = vec![n];
+        let batch = Batch::new(1).column(
+            "items".to_string(),
+            ColumnRef::List {
+                lens: &lens,
+                fields: vec![(None, ColumnRef::Int(&elems))],
+            },
+        );
+        let bound = program
+            .bind_per_row(&batch)
+            .expect("one int list column binds");
+        reset_persistent_state();
+        for _ in 0..WARMUP {
+            black_box(bound.collect_raw_on(Tier::Jit, |out| {
+                let _ = black_box(&out);
+            }))
+            .expect("the compiled tier answers");
+        }
+        let meter = Meter::start();
+        for _ in 0..CALLS {
+            black_box(bound.collect_raw_on(Tier::Jit, |out| {
+                let _ = black_box(&out);
+            }))
+            .expect("the compiled tier answers");
+        }
+        meter.stop().0
+    };
+
+    let small = measure(100);
+    let large = measure(500);
+    assert_eq!(
+        small, large,
+        "bank-growth probe: {CALLS} steady-state calls allocated {small} time(s) at 100 \
+         elements and {large} at 500. The two are expected to be equal: the banks are \
+         sized from the lowered program, reused across calls, and re-established in \
+         place, so nothing in the call path may allocate per ELEMENT. A difference of \
+         about 400 names a bank that now grows as the row is walked — an exact-length \
+         block reallocates on every growth step, which is a per-element heap allocation \
+         in the hot path rather than a number to re-bless."
+    );
+}
+
+#[cfg(not(feature = "jit"))]
 fn bank_growth_probe() {}
 
 // ---------------------------------------------------------------------------
@@ -699,6 +1190,9 @@ fn bank_growth_probe() {}
 /// comparison outright under `CEL_ALLOCS_GATE=1`.
 fn baseline_path() -> std::path::PathBuf {
     let mut name = String::from("tests/allocs_per_eval");
+    if cfg!(feature = "jit") {
+        name.push_str(".jit");
+    }
     if cfg!(feature = "vm") {
         name.push_str(".vm");
     }
@@ -766,6 +1260,9 @@ fn features() -> String {
     // accepted by walker runs without a word.
     if cfg!(feature = "vm") {
         on.push("vm");
+    }
+    if cfg!(feature = "jit") {
+        on.push("jit");
     }
     on.join(",")
 }
@@ -1272,6 +1769,9 @@ fn main() {
         );
         for label in &missing {
             println!("  {label}");
+        }
+        if !cfg!(feature = "jit") {
+            println!("  (build with `--features jit-cranelift` or `jit-dynasm` for `regvm/*`)");
         }
     }
 

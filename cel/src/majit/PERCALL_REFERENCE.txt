@@ -1,0 +1,233 @@
+cel-jit per-call scoreboard -- PER-CASE REFERENCE
+==============================================================================
+
+commit        96c83fd  (branch `majit`; working tree carried another session's
+              uncommitted edits to the instrument -- additive cases and output
+              text only, 377 insertions / 31 deletions, no timing code touched)
+instrument    cel/examples/majit_vs_cometkim_percall.rs
+profile       --profile bench  ([profile.bench]: lto = true, codegen-units = 1)
+              NOT --release. The example's own header and bench.sh both mandate
+              bench for this file, because its numbers are meant to be read
+              beside cometkim's criterion bench.
+backend       --features jit-cranelift
+measured      2026-08-21
+estimator     median of 3 rounds, A/B interleaved vm/walker/vm/walker/vm/walker
+              (each round is itself the harness's best-of-30 batches of >= 20 ms
+              of USER CPU on the measuring thread -- not wall clock)
+              *** The `ratio` column is PER-ROUND RATIOS, THEN THE MEDIAN OF
+              THOSE -- not the ratio of the two medians. See RATIO ESTIMATOR
+              below before recomputing anything from the ns columns. ***
+generator     scratchpad/gen_reference.py -- every figure below, prose included,
+              is derived from the six board files; nothing is hardcoded
+
+WHAT stock AND exec ARE
+------------------------------------------------------------------------------
+Both columns come from ONE binary, the default-features (`vm` on) build, timed
+on the SAME activation in the SAME process:
+
+  stock ns   `Value::resolve_value` -- the tree walker, called DIRECTLY
+  exec ns    `Program::execute` -- what a caller who names no features gets,
+             which under the default `vm` feature is `cel::vm::cel_eval_loop`,
+             the bytecode VM
+
+So `ratio` = exec/stock is one activation through TWO evaluators under one
+weather sample. It is not a difference between two builds, and it carries no
+compile drift and no stale-binary risk. Each binary was verified by the
+harness's own printed legend, not by filename.
+
+CONTROL: in the `vm`-OFF build (`--no-default-features --features
+regex,chrono,jit-cranelift`), where `exec` reaches the walker too, exec/stock
+over all 54 rows is median 1.001x (range 0.942-1.041x). The
+`Program::execute` wrapper therefore costs nothing measurable, and none of the
+ratio below is the door rather than the VM.
+
+*** THIS IS NOT A GATE ***
+------------------------------------------------------------------------------
+Do not diff the ns columns run-to-run and call a difference a regression.
+Absolute nanoseconds do NOT reproduce on this box -- the same measurement has
+moved +/-10% between runs, and this run was taken under a load average of 17
+rising to 41 on 18 cores. RATIOS reproduce: across the three rounds here, most
+rows held within 2-3% and no row's sign or ranking moved.
+
+The file exists for ONE purpose: so the NEXT re-measure can compute per-case
+deltas. The 2026-08-21 re-measure could not. Its baseline (commit d69a40b) had
+survived only as three summary numbers -- median 3.68x, min 1.57x
+(nested_expression), max 8.14x (map_body/x) -- so of 33 rows exactly TWO could
+be differenced, and every other per-case claim had to be withheld. Compare
+ratios against this table; treat the ns columns as scale, not as a baseline.
+
+HOW TO READ THIS FILE MECHANICALLY -- one trap, it has already fired
+------------------------------------------------------------------------------
+A board file (`board_vm_r*.txt`) contains FOUR tables, and four separate lines
+begin with `case ` (at lines 21, 90, 170 and 556 of a 583-line board). A
+whitespace split over the whole file scrapes rows from all four and silently
+mixes populations: it yields 62 rows instead of 54, and `nested_expression`
+comes out as 275.3 / 157.8 -- which is `bind ns` / `resolve ns` from the
+bind-split table, not stock/exec at all. That produces ratios below 1.0x and
+a board on which the VM appears to WIN. It does not win anywhere.
+
+Parse only the table whose header matches BOTH `stock ns` and `exec ns`, and
+stop at the first blank line after its rows. Assert the row count.
+
+GROUPS -- and why a row can change group without changing measurement
+------------------------------------------------------------------------------
+  base  33  present at d69a40b, the commit the 3.68x baseline was taken on
+  cmit   6  added since d69a40b and COMMITTED at 96c83fd
+  drty  15  present only in another session's uncommitted working tree; these
+            may vanish, or be re-labelled, when that session lands
+  ---------- 33 + 6 + 15 = 54, and the board printed 54 rows
+
+The `d69a40b` set is 33 rows. Task #29 inherited '32 of 32' and that figure is
+WRONG -- it was never enumerated. This harness's denominator has now been
+miscounted three times (29 cases built, vs '18 benchmark expressions' in the
+file's own doc comment, vs 'N/28' in an earlier note). Count it from a run.
+
+A ROW CAN CHANGE GROUP BY LABEL WHILE BEING THE SAME MEASUREMENT.
+`record_exists_int` and `record_exists_str` are committed at 96c83fd with BARE
+labels -- they never call `.in_ladder`. The uncommitted tree turns each into a
+ladder, so the same expression, field set and element count now print as
+`record_exists_int/1000` and `record_exists_str/1000`. By label they are `drty`;
+by measurement they are unchanged from the committed version. Grouping here is
+BY LABEL, because that is what a parser can check.
+
+COLUMNS
+------------------------------------------------------------------------------
+  stock ns / exec ns   median of the 3 rounds, independently per column
+  ratio                median of the 3 rounds' OWN exec/stock ratios.
+                       NOT median(exec)/median(stock) -- see below.
+  lo / hi              min and max of those 3 per-round ratios: this row's
+                       observed reproducibility, and the bar a future delta
+                       must clear to mean anything.
+
+RATIO ESTIMATOR -- the ns columns do NOT determine the ratio column
+------------------------------------------------------------------------------
+Recomputing exec/stock from the two published ns columns gives a DIFFERENT
+number from the `ratio` column, and the difference is not rounding:
+
+  case                        ratio (published)   exec_med/stock_med
+  nested_expression                       1.65x                1.61x
+  variable_access/resolver                6.86x                7.06x
+
+Each round is a PAIRED observation: `stock` and `exec` are timed on the same
+activation in the same process under one weather sample, and the pairing is
+what makes the ratio meaningful. Taking the median of the per-round ratios
+preserves it. Dividing two independently-taken medians discards it -- the two
+medians need not even come from the same round, so the quotient describes no
+run that was ever executed.
+
+⚠ The wrong estimator can land ON this table's `lo` value and so LOOK like
+agreement. For nested_expression, exec_med/stock_med = 1.61x, which is exactly
+this row's `lo`. That is a coincidence, not a cross-check.
+
+⚠ An assertion over rows and signs cannot catch this. `54 rows` and `every
+ratio > 1.0` both PASS under either estimator: they check the population and
+the direction, and neither can see which statistic produced the number. The
+`lo`/`hi` columns are what make a wrong estimator visible at all -- a lone
+ratio column would bury the disagreement in the third digit.
+
+==============================================================================
+case                          grp    stock ns     exec ns    ratio      lo      hi
+------------------------------------------------------------------------------
+simple_arithmetic            base        43.4       113.0    2.56x   2.38x   2.60x
+comparison                   base        30.4        92.9    3.06x   3.02x   3.10x
+conditional                  base        30.6        91.6    2.99x   2.84x   3.13x
+nested_expression            base       155.8       250.5    1.65x   1.61x   1.67x
+variable_access/hashmap      base         5.0        35.3    6.79x   6.74x   7.96x
+variable_access/resolver     base         4.7        33.2    6.86x   6.74x   7.06x
+member_access                base        87.2       162.1    1.76x   1.72x   1.87x
+list_indexing                base        66.2       163.8    2.44x   2.41x   2.47x
+list_filter                  base       472.1      1206.2    2.59x   2.54x   2.74x
+list_map                     base       315.3       688.8    2.15x   2.14x   2.18x
+all_comprehension            base       367.4       824.1    2.20x   2.13x   2.24x
+exists_comprehension         base       303.7       651.5    2.16x   2.15x   2.24x
+map_list_scaling/1           base       150.9       211.1    1.48x   1.40x   1.50x
+map_list_scaling/10          base       389.1       999.7    2.54x   2.54x   2.62x
+map_list_scaling/100         base      2370.5      8735.6    3.50x   3.49x   3.69x
+map_list_scaling/1000        base     20640.8     78564.8    3.80x   3.73x   3.81x
+map_list_scaling/10000       base    211800.8    793006.7    3.74x   3.70x   3.78x
+filter_list_scaling/1        base       158.5       237.7    1.52x   1.50x   1.55x
+filter_list_scaling/10       base       446.0      1241.1    2.75x   2.75x   2.80x
+filter_list_scaling/100      base      3463.1     11824.1    3.41x   3.35x   3.50x
+filter_list_scaling/1000     base     33550.8    120254.6    3.54x   3.40x   3.58x
+filter_list_scaling/10000    base    303570.2   1136001.3    3.61x   3.58x   3.74x
+comprehension_scaling/10     base       751.5      1782.7    2.44x   2.31x   2.45x
+comprehension_scaling/50     base      2511.7      8188.5    3.09x   3.08x   3.29x
+comprehension_scaling/100    base      4846.6     15820.4    3.29x   3.26x   3.36x
+comprehension_scaling/500    base     20841.7     75152.0    3.61x   3.57x   3.64x
+string_operations            base       161.0       231.7    1.46x   1.40x   1.48x
+custom_function              base       125.5       185.9    1.48x   1.47x   1.49x
+real_world_policy            base       354.4       553.9    1.58x   1.54x   1.62x
+map_body/x                   base     12499.4     57948.3    4.89x   4.64x   5.00x
+map_body/x*2                 base     20948.4     82430.3    3.86x   3.82x   3.97x
+map_body/x*2+1               base     30776.1    103037.6    3.27x   3.26x   3.35x
+map_body/x*2+1-3             base     42054.7    139899.4    2.94x   2.92x   3.33x
+record_map_scaling/1         cmit       170.5       239.6    1.41x   1.41x   1.45x
+record_map_scaling/10        cmit       540.0      1148.3    2.19x   2.13x   2.27x
+record_map_scaling/100       cmit      4066.1     10115.8    2.49x   2.49x   2.49x
+record_map_scaling/1000      cmit     37785.8     94649.5    2.50x   2.49x   2.60x
+record_map_scaling/10000     cmit    382758.8    973708.3    2.54x   2.48x   2.55x
+record_filter                cmit     56851.6    137631.1    2.45x   2.34x   2.47x
+record_exists_int/1          drty       158.3       286.8    1.83x   1.75x   1.91x
+record_exists_int/10         drty       798.2      1722.2    2.27x   2.16x   2.27x
+record_exists_int/100        drty      7226.6     17109.6    2.34x   2.32x   2.37x
+record_exists_int/1000       drty     70681.9    160098.1    2.27x   2.20x   2.44x
+record_exists_int/10000      drty    713023.1   1611812.5    2.25x   2.24x   2.26x
+record_exists_str/1          drty       146.5       272.2    1.86x   1.85x   1.88x
+record_exists_str/10         drty       744.2      1667.2    2.24x   2.15x   2.31x
+record_exists_str/100        drty      6585.9     15723.8    2.31x   2.24x   2.39x
+record_exists_str/1000       drty     63710.2    153551.3    2.33x   2.32x   2.41x
+record_exists_str/10000      drty    667277.2   1532583.4    2.30x   2.18x   2.36x
+scalar_exists/1              drty       126.7       225.9    1.81x   1.78x   1.87x
+scalar_exists/10             drty       552.9      1267.2    2.41x   2.29x   2.46x
+scalar_exists/100            drty      5096.6     12659.5    2.64x   2.48x   2.64x
+scalar_exists/1000           drty     45245.0    116870.2    2.58x   2.57x   2.61x
+scalar_exists/10000          drty    450914.8   1209030.1    2.59x   2.51x   2.72x
+------------------------------------------------------------------------------
+rows: 33 base + 6 cmit + 15 drty = 54   (assert 33 + 6 + 15 = 54)
+
+SUMMARY
+------------------------------------------------------------------------------
+  baseline set (d69a40b)     n=33  VM slower 33/33  median 2.94x
+                             min 1.46x (string_operations)   max 6.86x (variable_access/resolver)
+  committed since baseline   n=6   VM slower 6/6  median 2.47x
+                             min 1.41x (record_map_scaling/1)   max 2.54x (record_map_scaling/10000)
+  dirty-tree-only            n=15  VM slower 15/15  median 2.30x
+                             min 1.81x (scalar_exists/1)   max 2.64x (scalar_exists/100)
+  ALL ROWS                   n=54 VM slower 54/54  median 2.47x
+
+The VM is slower on every row of every group. No row's MEDIAN is below 1.41x,
+and no single per-round reading on any row is below 1.40x.
+
+Against the baseline, over the base-33 only:
+      median 3.68x -> 2.94x   min 1.57x -> 1.46x   max 8.14x -> 6.86x
+  i.e. the median row's EXCESS over the walker went 2.68x -> 1.94x, so about
+  28% of the excess was removed and roughly three quarters remains.
+
+FOOTNOTE ON THE TWO variable_access ROWS
+------------------------------------------------------------------------------
+They are the worst rows on this board (hashmap 6.79x, resolver 6.86x), having
+displaced map_body/x at the top. CONVERGENCE.md records an earlier probe of
+`variable_access/hashmap` under this same bench profile at 9.4 walker / 41.1 VM
+= 4.4x (measured at cel-jit d60a60c -- a DIFFERENT commit, not the d69a40b
+baseline). Against that: VM 41.1 -> 35.3 (-14%), walker 9.4 -> 5.0 (-47%).
+The ratio worsened because THE WALKER GOT FASTER, not because the VM regressed.
+A rising ratio is not by itself evidence of a regression in its numerator.
+
+PROVENANCE
+------------------------------------------------------------------------------
+  cd /Users/youknowone/Projects/pyre-wasmi/cel-jit
+  # VM arm (default features: regex, chrono, vm)
+  cargo build --profile bench --package cel --features jit-cranelift \
+      --example majit_vs_cometkim_percall
+  # walker control (vm OFF, everything else identical)
+  cargo build --profile bench --package cel --no-default-features \
+      --features regex,chrono,jit-cranelift --example majit_vs_cometkim_percall
+
+Each build's binary was copied out before the next build overwrote the shared
+`target/release/examples/` path, and the COPIES were timed -- there are ~40
+libcel*.rlib and several hash-suffixed example binaries in that tree with
+nothing in the filename saying which feature configuration produced them.
+All six boards printed identical coverage (53/54 lower to the compiled tier;
+54/54 answered; custom_function declining on `call add`) and were 583 lines.
+
+UNTRACKED ON PURPOSE. Generated, not hand-edited; regenerate rather than patch.

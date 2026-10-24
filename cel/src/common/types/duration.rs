@@ -25,7 +25,7 @@ duration_accessor!(hours, num_hours);
 fn duration(args: Vec<Value>) -> Result<Value, ExecutionError> {
     let unpacked = args[0].unpack();
     let text = match &unpacked {
-        Value::String(s) => s.as_str(),
+        Value::String(s) => s.as_ref(),
         other => return Err(super::type_error(other, &super::STRING_TYPE)),
     };
     let (_, parsed) = crate::duration::parse_duration(text)

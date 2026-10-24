@@ -71,7 +71,7 @@ fn arbitrary_value(
             2u64 => Value::Int(arbitrary::Arbitrary::arbitrary(u)?),
             3u64 => Value::UInt(arbitrary::Arbitrary::arbitrary(u)?),
             4u64 => Value::Float(arbitrary::Arbitrary::arbitrary(u)?),
-            5u64 => Value::String(arbitrary::Arbitrary::arbitrary(u)?),
+            5u64 => Value::String(Arc::from(<String as arbitrary::Arbitrary>::arbitrary(u)?)),
             6u64 => Value::Bytes(arbitrary::Arbitrary::arbitrary(u)?),
             7u64 => Value::Bool(arbitrary::Arbitrary::arbitrary(u)?),
             8u64 => Value::Duration(chrono::Duration::nanoseconds(
@@ -94,7 +94,7 @@ fn arbitrary_key(u: &mut arbitrary::Unstructured<'_>) -> arbitrary::Result<Key> 
             0u64 => Key::Int(arbitrary::Arbitrary::arbitrary(u)?),
             1u64 => Key::Uint(arbitrary::Arbitrary::arbitrary(u)?),
             2u64 => Key::Bool(arbitrary::Arbitrary::arbitrary(u)?),
-            3u64 => Key::String(Arc::new(arbitrary::Arbitrary::arbitrary(u)?)),
+            3u64 => Key::String(Arc::from(<String as arbitrary::Arbitrary>::arbitrary(u)?)),
             _ => unreachable!(),
         },
     )

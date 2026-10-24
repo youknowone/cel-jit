@@ -28,7 +28,7 @@ fn ctx() -> Context<'static> {
         Value::list(vec![Value::Int(1), Value::Int(2), Value::Int(3)]),
     );
     let mut m = std::collections::HashMap::new();
-    m.insert(Key::String(Arc::new("a".to_string())), Value::Int(1));
+    m.insert(Key::String(Arc::from("a")), Value::Int(1));
     ctx.add_variable_from_value("m", Value::Map(cel::objects::Map::object(Arc::new(m))));
     ctx.add_variable_from_value(
         "opt_some",

@@ -301,7 +301,7 @@ fn fixed_context() -> Context<'static> {
     ctx.add_variable_from_value("u", Value::UInt(7));
     ctx.add_variable_from_value("d", Value::Float(1.5));
     ctx.add_variable_from_value("b", Value::Bool(true));
-    ctx.add_variable_from_value("s", Value::String(Arc::new("hello".to_string())));
+    ctx.add_variable_from_value("s", Value::String(Arc::from("hello")));
     ctx.add_variable_from_value("by", Value::Bytes(Arc::new(b"hi".to_vec())));
     ctx.add_variable_from_value("nil", Value::Null);
 
@@ -317,23 +317,23 @@ fn fixed_context() -> Context<'static> {
     ctx.add_variable_from_value(
         "strs",
         Value::list(vec![
-            Value::String(Arc::new("a".to_string())),
-            Value::String(Arc::new("bb".to_string())),
-            Value::String(Arc::new("ccc".to_string())),
+            Value::String(Arc::from("a")),
+            Value::String(Arc::from("bb")),
+            Value::String(Arc::from("ccc")),
         ]),
     );
     ctx.add_variable_from_value("empty", Value::list(Vec::<Value>::new()));
 
     let mut m = std::collections::HashMap::new();
-    m.insert(Key::String(Arc::new("a".to_string())), Value::Int(1));
-    m.insert(Key::String(Arc::new("b".to_string())), Value::Int(2));
+    m.insert(Key::String(Arc::from("a")), Value::Int(1));
+    m.insert(Key::String(Arc::from("b")), Value::Int(2));
     ctx.add_variable_from_value("m", Value::Map(cel::objects::Map::object(Arc::new(m))));
 
     let mut inner = std::collections::HashMap::new();
-    inner.insert(Key::String(Arc::new("k".to_string())), Value::Int(5));
+    inner.insert(Key::String(Arc::from("k")), Value::Int(5));
     let mut outer = std::collections::HashMap::new();
     outer.insert(
-        Key::String(Arc::new("inner".to_string())),
+        Key::String(Arc::from("inner")),
         Value::Map(cel::objects::Map::object(Arc::new(inner))),
     );
     ctx.add_variable_from_value(
@@ -344,10 +344,10 @@ fn fixed_context() -> Context<'static> {
     let person = |name: &str, age: i64| {
         let mut p = std::collections::HashMap::new();
         p.insert(
-            Key::String(Arc::new("name".to_string())),
-            Value::String(Arc::new(name.to_string())),
+            Key::String(Arc::from("name")),
+            Value::String(Arc::from(name)),
         );
-        p.insert(Key::String(Arc::new("age".to_string())), Value::Int(age));
+        p.insert(Key::String(Arc::from("age")), Value::Int(age));
         Value::Map(cel::objects::Map::object(Arc::new(p)))
     };
     ctx.add_variable_from_value(

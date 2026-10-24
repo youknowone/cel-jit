@@ -54,3 +54,5 @@ pub mod object_array;
 pub mod optional;
 #[cfg(feature = "regex")]
 pub mod regex_intern;
+#[cfg(feature = "jit")]
+pub mod registration;

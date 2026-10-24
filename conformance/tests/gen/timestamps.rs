@@ -500,7 +500,6 @@ mod timestamp_arithmetic {
     }
 
     // Test: add_time_to_duration
-    #[should_panic]
     #[test]
     fn add_time_to_duration() {
         run_test(&dedent!(

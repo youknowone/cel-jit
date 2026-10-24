@@ -268,7 +268,7 @@ impl ser::Serializer for Serializer {
     }
 
     fn serialize_str(self, v: &str) -> Result<Value> {
-        Ok(Value::String(Arc::new(v.to_string())))
+        Ok(Value::String(Arc::from(v)))
     }
 
     fn serialize_bytes(self, v: &[u8]) -> Result<Value> {
@@ -659,7 +659,7 @@ impl ser::Serializer for KeySerializer {
     }
 
     fn serialize_str(self, v: &str) -> Result<Key> {
-        Ok(Key::String(Arc::new(v.to_string())))
+        Ok(Key::String(Arc::from(v)))
     }
 
     fn serialize_bytes(self, _v: &[u8]) -> Result<Key> {
@@ -699,7 +699,7 @@ impl ser::Serializer for KeySerializer {
         _variant_index: u32,
         variant: &'static str,
     ) -> Result<Key> {
-        Ok(Key::String(Arc::new(variant.to_string())))
+        Ok(Key::String(Arc::from(variant)))
     }
 
     fn serialize_newtype_struct<T>(self, _name: &'static str, value: &T) -> Result<Key>
@@ -1046,30 +1046,30 @@ mod tests {
 
         let serialized = to_value(test).unwrap();
         let expected: Value = HashMap::from_iter([
-            (Key::String(Arc::new("bool".to_string())), Value::Bool(true)),
-            (Key::String(Arc::new("int8".to_string())), Value::Int(8)),
-            (Key::String(Arc::new("int16".to_string())), Value::Int(16)),
-            (Key::String(Arc::new("int32".to_string())), Value::Int(32)),
-            (Key::String(Arc::new("int64".to_string())), Value::Int(64)),
-            (Key::String(Arc::new("u8".to_string())), Value::UInt(8)),
-            (Key::String(Arc::new("u16".to_string())), Value::UInt(16)),
-            (Key::String(Arc::new("u32".to_string())), Value::UInt(32)),
-            (Key::String(Arc::new("u64".to_string())), Value::UInt(64)),
+            (Key::String(Arc::from("bool")), Value::Bool(true)),
+            (Key::String(Arc::from("int8")), Value::Int(8)),
+            (Key::String(Arc::from("int16")), Value::Int(16)),
+            (Key::String(Arc::from("int32")), Value::Int(32)),
+            (Key::String(Arc::from("int64")), Value::Int(64)),
+            (Key::String(Arc::from("u8")), Value::UInt(8)),
+            (Key::String(Arc::from("u16")), Value::UInt(16)),
+            (Key::String(Arc::from("u32")), Value::UInt(32)),
+            (Key::String(Arc::from("u64")), Value::UInt(64)),
             (
-                Key::String(Arc::new("f32".to_string())),
+                Key::String(Arc::from("f32")),
                 Value::Float(f64::from(0.32_f32)),
             ),
-            (Key::String(Arc::new("f64".to_string())), Value::Float(0.64)),
+            (Key::String(Arc::from("f64")), Value::Float(0.64)),
             (
-                Key::String(Arc::new("char".to_string())),
-                Value::String(Arc::new("a".to_string())),
+                Key::String(Arc::from("char")),
+                Value::String(Arc::from("a")),
             ),
             (
-                Key::String(Arc::new("string".to_string())),
-                Value::String(Arc::new("string".to_string())),
+                Key::String(Arc::from("string")),
+                Value::String(Arc::from("string")),
             ),
             (
-                Key::String(Arc::new("bytes".to_string())),
+                Key::String(Arc::from("bytes")),
                 Value::Bytes(Arc::new(vec![1, 1, 1, 1])),
             ),
         ])

@@ -85,7 +85,8 @@ fn stdlib_overload_wins_over_a_registered_int2() {
     bind_xy(&mut ctx);
     ctx.add_function("add", |a: i64, b: i64| a + b);
     agree(&ctx, "add(1, 2)");
-    // The miss is cached. A second call still takes the overload.
+    // The miss is stored on the registry entry. A second call still
+    // takes the overload.
     agree(&ctx, "add(x, y)");
 }
 
@@ -105,7 +106,8 @@ fn reregister_takes_effect_on_the_next_call() {
         Value::resolve_value(program.expression(), &ctx).unwrap(),
         Value::Int(30)
     );
-    // Filling the cache, then bumping the generation from another name.
+    // Registering another name. The map grows; `add`'s storage slot
+    // is unchanged.
     assert_eq!(program.execute(&ctx).unwrap(), Value::Int(30));
     ctx.add_function("other", |a: i64, b: i64| a - b);
     assert_eq!(program.execute(&ctx).unwrap(), Value::Int(30));
@@ -119,4 +121,146 @@ fn reregister_takes_effect_on_the_next_call() {
         Err(ExecutionError::function_error("add", "replaced"))
     });
     agree(&ctx, "add(x, y)");
+}
+
+/// Past the function-entry door the host lookup folds to a storage index.
+/// `add_function` writes that slot, so later calls run the new body. A
+/// second context shares the map and reads its own storage.
+#[test]
+fn compiled_host_call_observes_reregister() {
+    let mut ctx = Context::default();
+    bind_xy(&mut ctx);
+    ctx.add_function("add", |a: i64, b: i64| a + b);
+    ctx.add_function("multiply", |a: i64, b: i64| a * b);
+    let program = Program::compile("add(x, y) + multiply(a, b)").unwrap();
+    for i in 0..400 {
+        assert_eq!(program.execute(&ctx).unwrap(), Value::Int(45), "warm {i}");
+    }
+
+    ctx.add_function("add", |a: i64, b: i64| a.wrapping_mul(b));
+    let replaced = Value::Int(10 * 20 + 5 * 3);
+    for i in 0..8 {
+        assert_eq!(
+            program.execute(&ctx).unwrap(),
+            replaced,
+            "after re-register {i}"
+        );
+    }
+
+    let mut other = Context::default();
+    bind_xy(&mut other);
+    other.add_function("add", |a: i64, b: i64| a.wrapping_sub(b));
+    other.add_function("multiply", |a: i64, b: i64| a * b);
+    assert_eq!(
+        program.execute(&other).unwrap(),
+        Value::Int(10 - 20 + 5 * 3)
+    );
+    assert_eq!(program.execute(&ctx).unwrap(), replaced);
+}
+
+/// One root registry serves every fresh child. A fresh root is a new registry.
+///
+/// Each evaluation binds a different `x`. The child case shares the root
+/// registry, so compiled loops and bridges stay bounded when the portal
+/// is on.
+#[cfg(feature = "vm")]
+#[test]
+fn compiled_host_call_across_fresh_scopes() {
+    let expr = Parser::default()
+        .parse("add(x, y) + multiply(a, b)")
+        .unwrap();
+    let code = cel::vm::compile(&expr).unwrap();
+    let mut root = Context::default();
+    root.add_function("add", |a: i64, b: i64| a + b);
+    root.add_function("multiply", |a: i64, b: i64| a * b);
+
+    const N: i64 = 5000;
+    for i in 0..N {
+        let x = 10 + (i % 17);
+        let mut child = root.new_inner_scope();
+        child.add_variable_from_value("x", x);
+        child.add_variable_from_value("y", 20i64);
+        child.add_variable_from_value("a", 5i64);
+        child.add_variable_from_value("b", 3i64);
+        let got = cel::vm::cel_eval_loop(&code, &child).unwrap();
+        assert_eq!(got, Value::Int(x + 20 + 5 * 3), "child {i}");
+    }
+
+    #[cfg(feature = "jit")]
+    let child_counts = cel::vm::portal::portal_compile_counts(&code);
+
+    for i in 0..N {
+        let x = 10 + (i % 17);
+        let mut ctx = Context::default();
+        ctx.add_function("add", |a: i64, b: i64| a + b);
+        ctx.add_function("multiply", |a: i64, b: i64| a * b);
+        ctx.add_variable_from_value("x", x);
+        ctx.add_variable_from_value("y", 20i64);
+        ctx.add_variable_from_value("a", 5i64);
+        ctx.add_variable_from_value("b", 3i64);
+        let got = cel::vm::cel_eval_loop(&code, &ctx).unwrap();
+        assert_eq!(got, Value::Int(x + 20 + 5 * 3), "root {i}");
+    }
+
+    #[cfg(feature = "jit")]
+    {
+        let (loops, bridges, retraces, guards) = child_counts;
+        assert!(
+            loops >= 1 && loops + bridges <= 8,
+            "child compiled loops+bridges grew with N={N}: loops={loops} bridges={bridges} retraces={retraces} guards={guards}"
+        );
+        assert_eq!(
+            guards, 0,
+            "child guard failures scaled with N={N}: loops={loops} bridges={bridges} retraces={retraces} guards={guards}"
+        );
+        let (_, _, _, guards_after_root) = cel::vm::portal::portal_compile_counts(&code);
+        let root_guards = guards_after_root.saturating_sub(guards);
+        assert_eq!(
+            root_guards, 0,
+            "root guard failures scaled with N={N}: child_guards={guards} after_root={guards_after_root} root_guards={root_guards}"
+        );
+    }
+}
+
+/// Straight-line code compiles at the function entry once the driver's
+/// threshold is crossed. The replacement has to be visible in that code.
+#[cfg(feature = "jit")]
+#[test]
+fn reregister_after_the_portal_compiles() {
+    // SAFETY: read when this program's driver is created, which is its
+    // first execute below. Same knob `portal_reentry` uses.
+    unsafe { std::env::set_var("CEL_PORTAL_THRESHOLD", "100") };
+
+    let mut ctx = Context::default();
+    bind_xy(&mut ctx);
+    ctx.add_function("add", |a: i64, b: i64| a + b);
+    ctx.add_function("multiply", |a: i64, b: i64| a * b);
+    let program = Program::compile("add(x, y) + multiply(a, b)").unwrap();
+    for i in 0..200 {
+        let vm = program.execute(&ctx);
+        assert_eq!(vm.unwrap(), Value::Int(45), "warm {i}");
+    }
+
+    ctx.add_function("add", |a: i64, b: i64| a.wrapping_mul(b));
+    let walker = Value::resolve_value(program.expression(), &ctx).unwrap();
+    assert_eq!(walker, Value::Int(10 * 20 + 5 * 3));
+    for i in 0..5 {
+        assert_eq!(
+            program.execute(&ctx).unwrap(),
+            walker,
+            "after re-register {i}"
+        );
+    }
+
+    ctx.add_function(
+        "multiply",
+        |a: i64, b: i64| -> Result<i64, ExecutionError> {
+            let _ = (a, b);
+            Err(ExecutionError::function_error("multiply", "replaced"))
+        },
+    );
+    let walker = Value::resolve_value(program.expression(), &ctx);
+    let vm = program.execute(&ctx);
+    assert_eq!(show(&walker), show(&vm));
+    assert!(vm.is_err(), "erased replacement must run");
 }

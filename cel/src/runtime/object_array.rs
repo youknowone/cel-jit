@@ -40,6 +40,11 @@
 //! The live length lives on the owning leaf, as `("length", Signed)` does
 //! upstream. A block is never resized in place; growing allocates a fresh one.
 //!
+//! [`CelBytesBlock`] is the exception: it is `STR` (`hash`, then the `chars`
+//! array with `extra_item_after_alloc`), so `NEWSTR` / `STRLEN` / `STRGETITEM`
+//! / `COPYSTRCONTENT` can address it. Bytes and str share that block; only the
+//! `W_` wrapper differs.
+//!
 //! # Registered, and allocated under that registration
 //!
 //! [`super::registration`] registers every block as a varsize type, from its
@@ -74,6 +79,7 @@ pub struct ArrayToken {
 /// second header between the length word and item 0.
 // `capacity` is fixed for the block's lifetime (a grow allocates a fresh
 // block). `listobject.py` array length words are `_immutable_fields_`.
+#[cfg_attr(feature = "jit", majit_macros::jit_immutable_fields(capacity))]
 #[repr(C)]
 #[allow(non_camel_case_types)]
 pub struct CelItemsBlock {
@@ -107,27 +113,85 @@ impl CelGcType for CelItemsBlock {
     const TYPE_ID: u32 = 21;
 }
 
-/// A block of bytes: `capacity`, then the bytes.
+#[cfg(feature = "jit")]
+impl majit_metainterp::HasGcTypeId for CelItemsBlock {
+    const GC_TYPE_ID: u32 = Self::TYPE_ID;
+}
+
+/// Per-scope interned-leaf storage the portal reads (`_mapdict_read_storage`).
 ///
-/// Its own type and its own token rather than a generic one over the item type.
-/// The item size is the whole difference between the two blocks, and the token
-/// exists precisely so that size travels with the offsets that depend on it.
+/// `items` is a [`CelItemsBlock`] indexed by `PlainAttribute.storageindex`.
+/// `parent` is the enclosing scope (`f_back`). The struct sits inline on
+/// [`crate::context::Context`]; the items block is allocated in that
+/// Context's bind region for the Context's lifetime.
+#[repr(C)]
+pub struct CelLeafStorage {
+    pub parent: *mut CelLeafStorage,
+    pub items: *mut CelItemsBlock,
+}
+
+impl CelLeafStorage {
+    pub(crate) const fn empty() -> Self {
+        Self {
+            parent: core::ptr::null_mut(),
+            items: core::ptr::null_mut(),
+        }
+    }
+}
+
+/// Per-registry two-int entry words the portal reads (`_mapdict_read_storage`).
+///
+/// `items` is a [`CelIntWords`] indexed by `PlainAttribute.storageindex`.
+/// The struct sits inline on [`crate::magic::FunctionRegistry`]; the words
+/// block is allocated in that registry's bind region for the registry's
+/// lifetime. A missing two-int fast path stores `0`.
+#[repr(C)]
+pub struct CelInt2Storage {
+    pub items: *mut CelIntWords,
+}
+
+impl CelInt2Storage {
+    pub(crate) const fn empty() -> Self {
+        Self {
+            items: core::ptr::null_mut(),
+        }
+    }
+}
+
+/// A block of bytes laid out as `STR`.
+///
+/// `STR` is `GcStruct('rpy_string', ('hash', Signed), ('chars', Array(Char,
+/// hints={'immutable': True, 'extra_item_after_alloc': 1})))`: after the GC
+/// header, `hash`, then the array length, then the chars, plus one extra NUL
+/// allocated after the items. Bytes and str share this block; only the `W_`
+/// wrapper differs.
+#[cfg_attr(feature = "jit", majit_macros::jit_immutable_fields(length))]
 #[repr(C)]
 #[allow(non_camel_case_types)]
 pub struct CelBytesBlock {
-    pub capacity: usize,
-    items: [u8; 0],
+    /// `STR.hash`. 0 means unset (`ll_strhash`).
+    pub hash: isize,
+    /// `STR.chars` length word. Exact-sized: the live length on the owning leaf.
+    pub length: usize,
+    chars: [u8; 0],
 }
 
-pub const CEL_BYTES_BLOCK_ITEMS_OFFSET: usize = core::mem::offset_of!(CelBytesBlock, items);
-pub const CEL_BYTES_BLOCK_LEN_OFFSET: usize = core::mem::offset_of!(CelBytesBlock, capacity);
+pub const CEL_BYTES_BLOCK_HASH_OFFSET: usize = core::mem::offset_of!(CelBytesBlock, hash);
+pub const CEL_BYTES_BLOCK_ITEMS_OFFSET: usize = core::mem::offset_of!(CelBytesBlock, chars);
+pub const CEL_BYTES_BLOCK_LEN_OFFSET: usize = core::mem::offset_of!(CelBytesBlock, length);
+
+/// `get_array_token(STR)` basesize: hash + length + `extra_item_after_alloc`.
+pub const CEL_BYTES_BLOCK_BASE_SIZE: usize = CEL_BYTES_BLOCK_ITEMS_OFFSET + 1;
 
 const _: () = {
-    assert!(CEL_BYTES_BLOCK_LEN_OFFSET == 0);
+    assert!(CEL_BYTES_BLOCK_HASH_OFFSET == 0);
+    assert!(CEL_BYTES_BLOCK_LEN_OFFSET == core::mem::size_of::<usize>());
+    assert!(CEL_BYTES_BLOCK_ITEMS_OFFSET == 2 * core::mem::size_of::<usize>());
+    assert!(CEL_BYTES_BLOCK_BASE_SIZE == CEL_BYTES_BLOCK_ITEMS_OFFSET + 1);
 };
 
 pub const CEL_BYTES_BLOCK_TOKEN: ArrayToken = ArrayToken {
-    base_size: CEL_BYTES_BLOCK_ITEMS_OFFSET,
+    base_size: CEL_BYTES_BLOCK_BASE_SIZE,
     item_size: 1,
     len_offset: CEL_BYTES_BLOCK_LEN_OFFSET,
 };
@@ -139,10 +203,16 @@ impl CelGcType for CelBytesBlock {
     const TYPE_ID: u32 = 22;
 }
 
+#[cfg(feature = "jit")]
+impl majit_metainterp::HasGcTypeId for CelBytesBlock {
+    const GC_TYPE_ID: u32 = Self::TYPE_ID;
+}
+
 /// Unboxed `i64`s for an int column: capacity word, then the words.
 ///
 /// Same body as [`CelItemsBlock`]. `new_array` can build it; a raw
 /// `*mut i64` cannot, because the array descr needs the length word.
+#[cfg_attr(feature = "jit", majit_macros::jit_immutable_fields(capacity))]
 #[repr(C)]
 #[allow(non_camel_case_types)]
 pub struct CelIntWords {
@@ -170,10 +240,16 @@ impl CelGcType for CelIntWords {
     const TYPE_ID: u32 = 23;
 }
 
+#[cfg(feature = "jit")]
+impl majit_metainterp::HasGcTypeId for CelIntWords {
+    const GC_TYPE_ID: u32 = Self::TYPE_ID;
+}
+
 /// Unboxed `f64`s for a float column: capacity word, then the words.
 ///
 /// Same body as [`CelIntWords`]. The array descr reads the length at
 /// offset 0, so the payload cannot be a raw `*mut f64`.
+#[cfg_attr(feature = "jit", majit_macros::jit_immutable_fields(capacity))]
 #[repr(C)]
 #[allow(non_camel_case_types)]
 pub struct CelFloatWords {
@@ -201,6 +277,11 @@ impl CelGcType for CelFloatWords {
     const TYPE_ID: u32 = 24;
 }
 
+#[cfg(feature = "jit")]
+impl majit_metainterp::HasGcTypeId for CelFloatWords {
+    const GC_TYPE_ID: u32 = Self::TYPE_ID;
+}
+
 /// Word 0 of an int-words block, or null.
 ///
 /// # Safety
@@ -221,12 +302,120 @@ pub fn new_int_words_in(heap: &super::heap::CelHeap, cap: usize) -> *mut CelIntW
         alloc_block_in(
             heap,
             CelIntWords::TYPE_ID,
-            CEL_INT_WORDS_ITEMS_OFFSET,
-            core::mem::size_of::<i64>(),
+            &CEL_INT_WORDS_TOKEN,
             core::mem::align_of::<CelIntWords>(),
             cap,
         ) as *mut CelIntWords
     }
+}
+
+/// An int-words block of `cap` zero slots on this thread's heap.
+pub fn new_int_words_zeroed(cap: usize) -> *mut CelIntWords {
+    super::heap::with_heap(|h| new_int_words_zeroed_in(h, cap))
+}
+
+/// An int-words block of `cap` zero slots on `heap`.
+pub fn new_int_words_zeroed_in(heap: &super::heap::CelHeap, cap: usize) -> *mut CelIntWords {
+    let block = new_int_words_in(heap, cap);
+    if cap > 0 {
+        unsafe {
+            let base = int_words_base(block);
+            let mut i = 0;
+            while i < cap {
+                *base.add(i) = 0;
+                i += 1;
+            }
+        }
+    }
+    block
+}
+
+/// The capacity word of an int-words block, or 0 for a null block.
+///
+/// # Safety
+///
+/// `block` is null or points at a live [`CelIntWords`].
+#[inline]
+pub unsafe fn int_words_capacity(block: *mut CelIntWords) -> usize {
+    if block.is_null() {
+        return 0;
+    }
+    unsafe { (*block).capacity }
+}
+
+/// Store `word` at `index` when `block` already has that slot. `false` if
+/// the block is missing or too small; the caller then grows.
+///
+/// # Safety
+///
+/// `block` is null or points at a live [`CelIntWords`].
+pub unsafe fn int_words_store_existing(block: *mut CelIntWords, index: usize, word: i64) -> bool {
+    let cap = unsafe { int_words_capacity(block) };
+    if block.is_null() || index >= cap {
+        return false;
+    }
+    unsafe {
+        *int_words_base(block).add(index) = word;
+    }
+    true
+}
+
+/// Store `word` at `index`, growing `block` when the index is past capacity.
+///
+/// A grow allocates a fresh block and copies the live prefix; the old block
+/// stays in the owner until that owner drops. Call from
+/// [`super::heap::with_bind_region`] so the new block has the registry's
+/// bind-region lifetime.
+///
+/// # Safety
+///
+/// `block` is null or points at a live [`CelIntWords`].
+pub unsafe fn int_words_store(
+    block: *mut CelIntWords,
+    index: usize,
+    word: i64,
+) -> *mut CelIntWords {
+    super::heap::with_heap(|h| unsafe { int_words_store_in(h, block, index, word) })
+}
+
+/// [`int_words_store`] on `heap`.
+///
+/// # Safety
+///
+/// As [`int_words_store`].
+pub unsafe fn int_words_store_in(
+    heap: &super::heap::CelHeap,
+    block: *mut CelIntWords,
+    index: usize,
+    word: i64,
+) -> *mut CelIntWords {
+    let cap = unsafe { int_words_capacity(block) };
+    let block = if block.is_null() || index >= cap {
+        let new_cap = if cap == 0 {
+            index.saturating_add(1).max(4)
+        } else {
+            cap.saturating_mul(2).max(index.saturating_add(1))
+        };
+        let grown = new_int_words_zeroed_in(heap, new_cap);
+        if !block.is_null() && cap > 0 {
+            unsafe {
+                let src = int_words_base(block);
+                let dst = int_words_base(grown);
+                let mut i = 0;
+                while i < cap {
+                    *dst.add(i) = *src.add(i);
+                    i += 1;
+                }
+            }
+        }
+        grown
+    } else {
+        block
+    };
+    unsafe {
+        *int_words_base(block).add(index) = word;
+    }
+    block
 }
 
 /// Word 0 of a float-words block, or null.
@@ -248,15 +437,14 @@ pub fn new_float_words_in(heap: &super::heap::CelHeap, cap: usize) -> *mut CelFl
         alloc_block_in(
             heap,
             CelFloatWords::TYPE_ID,
-            CEL_FLOAT_WORDS_ITEMS_OFFSET,
-            core::mem::size_of::<f64>(),
+            &CEL_FLOAT_WORDS_TOKEN,
             core::mem::align_of::<CelFloatWords>(),
             cap,
         ) as *mut CelFloatWords
     }
 }
 
-/// Allocate a block and write its length word.
+/// Allocate a block and write its length word at `token.len_offset`.
 ///
 /// Deliberately NOT in [`super::lltype`] and deliberately not named
 /// `malloc_typed`: the fuse matcher keys on that module path and on a
@@ -264,7 +452,8 @@ pub fn new_float_words_in(heap: &super::heap::CelHeap, cap: usize) -> *mut CelFl
 /// be a call the matcher inspects and silently declines. Here it cannot be
 /// mistaken for one.
 ///
-/// Reserved on this thread's value heap.
+/// Reserved on this thread's value heap. Size is `token.base_size +
+/// token.item_size * cap`, so a `STR` token's extra NUL is in the reservation.
 ///
 /// # Safety
 ///
@@ -273,28 +462,21 @@ pub fn new_float_words_in(heap: &super::heap::CelHeap, cap: usize) -> *mut CelFl
 unsafe fn alloc_block_in(
     heap: &super::heap::CelHeap,
     type_id: u32,
-    base: usize,
-    item_size: usize,
+    token: &ArrayToken,
     align: usize,
     cap: usize,
 ) -> *mut u8 {
-    let size = base + item_size * cap;
+    let size = token.base_size + token.item_size * cap;
     let raw = heap.alloc_raw_typed(type_id, size, align);
     // The length word first, so a block is never observable without one.
     // The item bytes are left uninitialised: callers write every live
     // byte, and zeroing here is a per-call `memset` the readers never need.
-    unsafe { (raw as *mut usize).write(cap) };
+    unsafe { (raw.add(token.len_offset) as *mut usize).write(cap) };
     raw
 }
 
-unsafe fn alloc_block(
-    type_id: u32,
-    base: usize,
-    item_size: usize,
-    align: usize,
-    cap: usize,
-) -> *mut u8 {
-    super::heap::with_heap(|h| alloc_block_in(h, type_id, base, item_size, align, cap))
+unsafe fn alloc_block(type_id: u32, token: &ArrayToken, align: usize, cap: usize) -> *mut u8 {
+    super::heap::with_heap(|h| alloc_block_in(h, type_id, token, align, cap))
 }
 
 /// A block holding `values` on `heap`.
@@ -303,8 +485,7 @@ pub fn new_items_block_in(heap: &super::heap::CelHeap, values: &[CelRef]) -> *mu
         alloc_block_in(
             heap,
             CelItemsBlock::TYPE_ID,
-            CEL_ITEMS_BLOCK_TOKEN.base_size,
-            CEL_ITEMS_BLOCK_TOKEN.item_size,
+            &CEL_ITEMS_BLOCK_TOKEN,
             core::mem::align_of::<CelItemsBlock>(),
             values.len(),
         )
@@ -397,8 +578,7 @@ pub fn new_items_block_with_zeroed_prefix_in(
         alloc_block_in(
             heap,
             CelItemsBlock::TYPE_ID,
-            CEL_ITEMS_BLOCK_TOKEN.base_size,
-            CEL_ITEMS_BLOCK_TOKEN.item_size,
+            &CEL_ITEMS_BLOCK_TOKEN,
             core::mem::align_of::<CelItemsBlock>(),
             cap,
         )
@@ -430,22 +610,128 @@ pub fn new_items_block_zeroed(cap: usize) -> *mut CelItemsBlock {
     super::heap::with_heap(|h| new_items_block_zeroed_in(h, cap))
 }
 
-/// A byte block of `len` uninitialised bytes on `heap`.
+/// Write `leaf` at `index` when `block` already has that slot.
 ///
-/// The capacity word is written. The bytes are not: `ll_int2dec` stores
+/// `false` when the block is missing or too short; the caller then grows
+/// through [`items_block_store`]. An in-place store does not allocate.
+///
+/// # Safety
+///
+/// `block` is null or points at a live [`CelItemsBlock`].
+#[inline]
+pub unsafe fn items_block_store_existing(
+    block: *mut CelItemsBlock,
+    index: usize,
+    leaf: CelRef,
+) -> bool {
+    let cap = unsafe { items_capacity(block) };
+    if block.is_null() || index >= cap {
+        return false;
+    }
+    unsafe {
+        *items_block_items_base(block).add(index) = leaf;
+    }
+    true
+}
+
+/// Store `leaf` at `index`, growing `block` when the index is past capacity.
+///
+/// A grow allocates a fresh block and copies the live prefix; the old block
+/// stays in the owner until that owner drops. Call from
+/// [`super::heap::with_bind_region`] so the new block has the Context's
+/// bind-region lifetime.
+///
+/// The store is a raw slot write. `CelGc::write_barrier` is a no-op and
+/// nursery alloc sets `needs_write_barrier = false`: this collector does
+/// not run, and bind-region blocks are old. Compiled `setarrayitem_gc_r`
+/// takes the same path.
+///
+/// # Safety
+///
+/// `block` is null or points at a live [`CelItemsBlock`].
+pub unsafe fn items_block_store(
+    block: *mut CelItemsBlock,
+    index: usize,
+    leaf: CelRef,
+) -> *mut CelItemsBlock {
+    super::heap::with_heap(|h| unsafe { items_block_store_in(h, block, index, leaf) })
+}
+
+/// [`items_block_store`] on `heap`.
+///
+/// # Safety
+///
+/// As [`items_block_store`].
+pub unsafe fn items_block_store_in(
+    heap: &super::heap::CelHeap,
+    block: *mut CelItemsBlock,
+    index: usize,
+    leaf: CelRef,
+) -> *mut CelItemsBlock {
+    let cap = unsafe { items_capacity(block) };
+    let block = if block.is_null() || index >= cap {
+        let new_cap = if cap == 0 {
+            index.saturating_add(1).max(4)
+        } else {
+            cap.saturating_mul(2).max(index.saturating_add(1))
+        };
+        let grown = new_items_block_zeroed_in(heap, new_cap);
+        if !block.is_null() && cap > 0 {
+            unsafe {
+                let src = items_block_items_base(block);
+                let dst = items_block_items_base(grown);
+                let mut i = 0;
+                while i < cap {
+                    *dst.add(i) = *src.add(i);
+                    i += 1;
+                }
+            }
+        }
+        grown
+    } else {
+        block
+    };
+    unsafe {
+        *items_block_items_base(block).add(index) = leaf;
+    }
+    block
+}
+
+/// Write the `STR` header: `hash = 0`, the `chars` length, and the extra NUL.
+///
+/// `mallocstr` stores `r.hash = 0` when the allocator did not clear the
+/// block; `extra_item_after_alloc` is the trailing NUL.
+///
+/// # Safety
+///
+/// `block` points at a live [`CelBytesBlock`] of at least
+/// `CEL_BYTES_BLOCK_TOKEN.base_size + len` bytes.
+#[inline]
+pub unsafe fn init_bytes_block(block: *mut CelBytesBlock, len: usize) {
+    unsafe {
+        (*block).hash = 0;
+        (*block).length = len;
+        *bytes_base(block).add(len) = 0;
+    }
+}
+
+/// A byte block of `len` uninitialised chars on `heap`.
+///
+/// The `STR` header is written. The chars are not: `ll_int2dec` stores
 /// each digit itself, and a `memcpy` from a stack buffer is the copy
 /// this exists to avoid.
 #[inline(always)]
 pub fn new_bytes_block_uninit_in(heap: &super::heap::CelHeap, len: usize) -> *mut CelBytesBlock {
     unsafe {
-        alloc_block_in(
+        let block = alloc_block_in(
             heap,
             CelBytesBlock::TYPE_ID,
-            CEL_BYTES_BLOCK_TOKEN.base_size,
-            CEL_BYTES_BLOCK_TOKEN.item_size,
+            &CEL_BYTES_BLOCK_TOKEN,
             core::mem::align_of::<CelBytesBlock>(),
             len,
-        ) as *mut CelBytesBlock
+        ) as *mut CelBytesBlock;
+        init_bytes_block(block, len);
+        block
     }
 }
 
@@ -455,13 +741,13 @@ pub fn new_bytes_block_in(heap: &super::heap::CelHeap, bytes: &[u8]) -> *mut Cel
         alloc_block_in(
             heap,
             CelBytesBlock::TYPE_ID,
-            CEL_BYTES_BLOCK_TOKEN.base_size,
-            CEL_BYTES_BLOCK_TOKEN.item_size,
+            &CEL_BYTES_BLOCK_TOKEN,
             core::mem::align_of::<CelBytesBlock>(),
             bytes.len(),
         )
     } as *mut CelBytesBlock;
     unsafe {
+        init_bytes_block(block, bytes.len());
         core::ptr::copy_nonoverlapping(bytes.as_ptr(), bytes_base(block), bytes.len());
     }
     block
@@ -472,6 +758,42 @@ pub fn new_bytes_block(bytes: &[u8]) -> *mut CelBytesBlock {
     super::heap::with_heap(|h| new_bytes_block_in(h, bytes))
 }
 
+/// `rstr.py LLHelpers.ll_strconcat` — join two `STR` payloads.
+///
+/// `@jit.elidable` + `@jit.oopspec('stroruni.concat(s1, s2)')`. The
+/// result is a fresh [`CelBytesBlock`] (`{ hash, len, chars }`), not a
+/// [`super::object::W_StringObject`]. The wrapper's `+` reads `chars`,
+/// calls this, then wraps (`descr_add` / `space.newutf8`).
+///
+/// `elidable_or_memerror` is `rstr.py` `@jit.elidable` with MemoryError
+/// as the only raise (`call.py` `cr == "mem"`). The call site's
+/// `str_concat` policy stamps `OS_STR_CONCAT` so `OptString` sees it.
+///
+/// The arguments are GC `Ptr(STR)` references (`rstr.py LLHelpers.ll_strconcat(s1, s2)`) that compiled code passes through the residual's function pointer, so this stays a safe `fn`.
+#[cfg_attr(feature = "jit", majit_macros::elidable_or_memerror)]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub fn ll_strconcat(s1: *mut CelBytesBlock, s2: *mut CelBytesBlock) -> *mut CelBytesBlock {
+    if s1.is_null() || s2.is_null() {
+        return core::ptr::null_mut();
+    }
+    let n1 = unsafe { (*s1).length };
+    let n2 = unsafe { (*s2).length };
+    // "a single '+' like this is allowed to overflow: it gets a negative
+    // result, and the gc will complain" — MemoryError upstream.
+    let n = n1
+        .checked_add(n2)
+        .expect("ll_strconcat length overflow; MemoryError propagation is not ported yet");
+    super::heap::with_heap(|heap| {
+        let block = new_bytes_block_uninit_in(heap, n);
+        unsafe {
+            let dest = bytes_base(block);
+            core::ptr::copy_nonoverlapping(bytes_base(s1), dest, n1);
+            core::ptr::copy_nonoverlapping(bytes_base(s2), dest.add(n1), n2);
+        }
+        block
+    })
+}
+
 /// A block holding `a` then `b`, written in place so concat does not
 /// allocate a temporary `String` / `Vec`.
 pub fn new_bytes_block_concat(a: &[u8], b: &[u8]) -> *mut CelBytesBlock {
@@ -479,14 +801,14 @@ pub fn new_bytes_block_concat(a: &[u8], b: &[u8]) -> *mut CelBytesBlock {
     let block = unsafe {
         alloc_block(
             CelBytesBlock::TYPE_ID,
-            CEL_BYTES_BLOCK_TOKEN.base_size,
-            CEL_BYTES_BLOCK_TOKEN.item_size,
+            &CEL_BYTES_BLOCK_TOKEN,
             core::mem::align_of::<CelBytesBlock>(),
             n,
         )
     } as *mut CelBytesBlock;
     // The block has `n` live bytes; `a` and `b` are the two halves.
     unsafe {
+        init_bytes_block(block, n);
         let dest = bytes_base(block);
         core::ptr::copy_nonoverlapping(a.as_ptr(), dest, a.len());
         core::ptr::copy_nonoverlapping(b.as_ptr(), dest.add(a.len()), b.len());
@@ -559,7 +881,7 @@ pub unsafe fn bytes_capacity(block: *mut CelBytesBlock) -> usize {
     if block.is_null() {
         return 0;
     }
-    unsafe { (*block).capacity }
+    unsafe { (*block).length }
 }
 
 #[cfg(test)]
@@ -575,9 +897,11 @@ mod tests {
         assert_eq!(CEL_ITEMS_BLOCK_TOKEN.base_size, size_of::<usize>());
         assert_eq!(CEL_ITEMS_BLOCK_TOKEN.item_size, size_of::<CelRef>());
 
-        assert_eq!(CEL_BYTES_BLOCK_TOKEN.len_offset, 0);
-        assert_eq!(CEL_BYTES_BLOCK_TOKEN.base_size, size_of::<usize>());
+        assert_eq!(CEL_BYTES_BLOCK_TOKEN.len_offset, size_of::<usize>());
+        assert_eq!(CEL_BYTES_BLOCK_TOKEN.base_size, 2 * size_of::<usize>() + 1);
         assert_eq!(CEL_BYTES_BLOCK_TOKEN.item_size, 1);
+        assert_eq!(CEL_BYTES_BLOCK_HASH_OFFSET, 0);
+        assert_eq!(CEL_BYTES_BLOCK_ITEMS_OFFSET, 2 * size_of::<usize>());
 
         assert_eq!(CEL_INT_WORDS_TOKEN.len_offset, 0);
         assert_eq!(CEL_INT_WORDS_TOKEN.base_size, size_of::<usize>());
@@ -602,12 +926,50 @@ mod tests {
     }
 
     #[test]
+    fn int_words_store_grows_and_keeps_the_prefix() {
+        unsafe {
+            let block = int_words_store(core::ptr::null_mut(), 0, 11);
+            assert_eq!(int_words_capacity(block), 4);
+            assert_eq!(*int_words_base(block), 11);
+            let grown = int_words_store(block, 4, 55);
+            assert!(int_words_capacity(grown) >= 5);
+            assert_eq!(*int_words_base(grown), 11);
+            assert_eq!(*int_words_base(grown).add(4), 55);
+        }
+    }
+
+    #[test]
+    fn items_block_store_grows_and_keeps_the_prefix() {
+        unsafe {
+            let first = new_int(1) as CelRef;
+            let block = items_block_store(core::ptr::null_mut(), 0, first);
+            assert_eq!(items_capacity(block), 4);
+            assert_eq!(*items_block_items_base(block), first);
+            let fifth = new_int(5) as CelRef;
+            let grown = items_block_store(block, 4, fifth);
+            assert!(items_capacity(grown) >= 5);
+            assert_eq!(*items_block_items_base(grown), first);
+            assert_eq!(*items_block_items_base(grown).add(4), fifth);
+            assert!(items_block_store_existing(grown, 0, fifth));
+            assert_eq!(*items_block_items_base(grown), fifth);
+            assert!(!items_block_store_existing(
+                grown,
+                items_capacity(grown),
+                fifth
+            ));
+        }
+    }
+
+    #[test]
     fn a_bytes_block_round_trips_its_bytes() {
         unsafe {
             let block = new_bytes_block(b"hello");
             assert_eq!(bytes_capacity(block), 5);
+            assert_eq!((*block).hash, 0);
+            assert_eq!((*block).length, 5);
             let base = bytes_base(block);
             assert_eq!(core::slice::from_raw_parts(base, 5), b"hello");
+            assert_eq!(*base.add(5), 0);
         }
     }
 
@@ -623,6 +985,8 @@ mod tests {
             let bytes = new_bytes_block(b"");
             assert!(!bytes.is_null());
             assert_eq!(bytes_capacity(bytes), 0);
+            assert_eq!((*bytes).hash, 0);
+            assert_eq!(*bytes_base(bytes), 0);
         }
     }
 
@@ -637,6 +1001,7 @@ mod tests {
             assert!(float_words_base(core::ptr::null_mut()).is_null());
             assert_eq!(items_capacity(core::ptr::null_mut()), 0);
             assert_eq!(bytes_capacity(core::ptr::null_mut()), 0);
+            assert_eq!(int_words_capacity(core::ptr::null_mut()), 0);
         }
     }
 }

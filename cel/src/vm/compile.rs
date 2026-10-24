@@ -13,7 +13,7 @@ use crate::common::ast::{
     operators, CallExpr, ComprehensionExpr, EntryExpr, Expr, IdedExpr, ListExpr, LiteralValue,
     MapExpr, SelectExpr, StructExpr,
 };
-use crate::objects::{ListStorage, Map};
+use crate::objects::{binary_values, ListStorage, Map};
 use crate::runtime::object::{map_try_insert, CelRef};
 use crate::Value;
 
@@ -150,7 +150,7 @@ impl Compiler {
             .iter()
             .map(|n| {
                 self.const_pool
-                    .intern(&Value::String(std::sync::Arc::new(n.to_string())))
+                    .intern(&Value::String(std::sync::Arc::<str>::from(&**n)))
             })
             .collect();
         Ok(CelCode {
@@ -246,7 +246,7 @@ impl Compiler {
         // heap. Immutable after compile; freed only when the pool drops.
         let leaf = self.const_pool.intern(&value);
         if !leaf.is_null() {
-            crate::runtime::convert::link_public_handle(leaf, &value);
+            crate::runtime::convert::link_public_tree(leaf, &value);
         }
         self.consts.push(value);
         self.const_leaves.push(leaf);
@@ -292,7 +292,7 @@ impl Compiler {
                 if leaf.is_null() {
                     return None;
                 }
-                crate::runtime::convert::link_public_handle(leaf, &value);
+                crate::runtime::convert::link_public_tree(leaf, &value);
                 Some((value, leaf))
             }
             Expr::List(list) => {
@@ -301,10 +301,19 @@ impl Compiler {
                 if leaf.is_null() {
                     return None;
                 }
-                crate::runtime::convert::link_public_handle(leaf, &value);
+                crate::runtime::convert::link_public_tree(leaf, &value);
                 Some((value, leaf))
             }
             Expr::Map(map) => self.intern_const_map(map),
+            Expr::Call(call) => {
+                let value = const_operator_value(call)?;
+                let leaf = self.const_pool.intern_elem(&value);
+                if leaf.is_null() {
+                    return None;
+                }
+                crate::runtime::convert::link_public_tree(leaf, &value);
+                Some((value, leaf))
+            }
             _ => None,
         }
     }
@@ -331,7 +340,7 @@ impl Compiler {
             pairs.push((crate::objects::value_key(key).ok()?, value));
         }
         let value = Value::Map(Map::ordered(pairs.into_boxed_slice()));
-        crate::runtime::convert::link_public_handle(leaf, &value);
+        crate::runtime::convert::link_public_tree(leaf, &value);
         Some((value, leaf))
     }
 
@@ -677,8 +686,31 @@ fn const_expr(expr: &Expr) -> Option<Value> {
     match expr {
         Expr::Literal(literal) => Some(literal.to_value()),
         Expr::List(list) => const_list(list),
+        Expr::Call(call) => const_operator_value(call),
         _ => None,
     }
+}
+
+/// A pure arithmetic operator whose operands are themselves constant.
+///
+/// Overflow, a zero divisor, and a type mismatch decline. The program then
+/// raises that failure when it runs, which is the same answer an unfolded
+/// operator gives.
+fn const_operator_value(call: &CallExpr) -> Option<Value> {
+    if call.target.is_some() || call.args.len() != 2 {
+        return None;
+    }
+    let op = match call.func_name.as_str() {
+        operators::ADD => "add",
+        operators::SUBSTRACT => "sub",
+        operators::MULTIPLY => "mul",
+        operators::DIVIDE => "div",
+        operators::MODULO => "rem",
+        _ => return None,
+    };
+    let lhs = const_expr(&call.args[0].expr)?;
+    let rhs = const_expr(&call.args[1].expr)?;
+    binary_values(op, lhs, rhs).ok()
 }
 
 /// The producer recognisers.
@@ -829,6 +861,11 @@ impl Compiler {
         // An operator name can only be an operator: the parser mints these
         // and they are not valid identifiers.
         if call.target.is_none() {
+            if let Some(value) = const_operator_value(call) {
+                let index = self.add_const(value, id)?;
+                self.emit(OpCode::LoadConst, &[index], id)?;
+                return Ok(());
+            }
             if let Some((op, arity)) = simple_operator(&call.func_name) {
                 self.check_arity(call, arity, id)?;
                 // A literal right operand is one `LoadConst` whose only
@@ -1493,6 +1530,76 @@ mod tests {
         assert_eq!(err.id, 7);
     }
 
+    /// `"a" + "b" + "c"` is one `LoadConst`. A bound operand keeps the add,
+    /// and an overflow stays an add so the failure is still raised at run time.
+    #[test]
+    fn a_constant_addition_is_one_load_const() {
+        let code = code_of(r#""a" + "b" + "c" + "d""#);
+        assert_eq!(count(&code, OpCode::Add), 0, "{}", code.disassemble());
+        assert_eq!(count(&code, OpCode::AddConst), 0, "{}", code.disassemble());
+        assert_eq!(count(&code, OpCode::LoadConst), 1, "{}", code.disassemble());
+
+        let mixed = code_of(r#""a" + s"#);
+        assert_eq!(
+            count(&mixed, OpCode::LoadConst),
+            1,
+            "{}",
+            mixed.disassemble()
+        );
+        assert_eq!(
+            count(&mixed, OpCode::Add) + count(&mixed, OpCode::AddConst),
+            1,
+            "{}",
+            mixed.disassemble()
+        );
+
+        let overflow = code_of("9223372036854775807 + 1");
+        assert_eq!(
+            count(&overflow, OpCode::Add) + count(&overflow, OpCode::AddConst),
+            1,
+            "{}",
+            overflow.disassemble()
+        );
+
+        let summed = code_of("[1 + 2, 3]");
+        assert_eq!(
+            count(&summed, OpCode::NewList),
+            0,
+            "{}",
+            summed.disassemble()
+        );
+        assert_eq!(
+            count(&summed, OpCode::LoadConst),
+            1,
+            "{}",
+            summed.disassemble()
+        );
+
+        let ctx = crate::Context::default();
+        assert_eq!(
+            crate::Program::compile(r#""a" + "b" + "c" + "d""#)
+                .unwrap()
+                .execute(&ctx)
+                .unwrap(),
+            Value::from("abcd")
+        );
+        assert_eq!(
+            crate::Program::compile("[1 + 2, 3]")
+                .unwrap()
+                .execute(&ctx)
+                .unwrap(),
+            Value::from(vec![3_i64, 3])
+        );
+        assert!(crate::Program::compile("9223372036854775807 + 1")
+            .unwrap()
+            .execute(&ctx)
+            .is_err());
+        assert!(crate::Program::compile("1 / 0")
+            .unwrap()
+            .execute(&ctx)
+            .is_err());
+    }
+
     /// A map whose keys and values are literals is one `LoadConst`, the same
     /// shape as an all-constant list. A bound value in an entry keeps NewMap.
     #[test]
@@ -1786,12 +1893,12 @@ mod tests {
 
     /// Every `CallQualified` is followed by a `CallMethod` of the SAME arity.
     ///
-    /// That pairing is what lets `Vm::call_qualified`'s miss hand its popped
-    /// arguments straight to `Vm::call_member`, and it is why the probe pops
-    /// with the receiver's slot already reserved: on a miss that vector is the
-    /// one the receiver gets prepended to, and on a hit the spare slot is not
-    /// an allocation. A probe emitted without its member call would make both
-    /// claims false, so the pairing is asserted rather than assumed.
+    /// On a miss that popped, `Vm::call_qualified` hands that vector to
+    /// `Vm::call_member`, and the probe reserves the receiver's slot because
+    /// that vector is the one the receiver is prepended to. A hit never fills
+    /// the spare slot, and arity 0 reserves nothing. A probe emitted without
+    /// its member call would make both claims false, so the pairing is
+    /// asserted rather than assumed.
     #[test]
     fn a_probe_and_its_member_call_agree_on_arity() {
         for source in [

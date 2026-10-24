@@ -134,16 +134,16 @@ fn values_equal(a: &CelValue, b: &CelValue) -> bool {
             if a.len() != b.len() {
                 return false;
             }
-            a.iter().zip(b.iter()).all(|(a, b)| values_equal(a, b))
+            a.iter().zip(b.iter()).all(|(a, b)| values_equal(&a, &b))
         }
         (Map(a), Map(b)) => {
-            if a.map.len() != b.map.len() {
+            if a.len() != b.len() {
                 return false;
             }
-            for (key, a_val) in a.map.iter() {
-                match b.map.get(key) {
+            for (key, a_val) in a.iter() {
+                match b.get(key) {
                     Some(b_val) => {
-                        if !values_equal(a_val, b_val) {
+                        if !values_equal(a_val.as_ref(), b_val.as_ref()) {
                             return false;
                         }
                     }
@@ -154,6 +154,7 @@ fn values_equal(a: &CelValue, b: &CelValue) -> bool {
         }
         (Timestamp(a), Timestamp(b)) => a == b,
         (Duration(a), Duration(b)) => a == b,
+        (Opaque(a), Opaque(b)) => a.opaque_eq(b.as_ref()),
         _ => false,
     }
 }

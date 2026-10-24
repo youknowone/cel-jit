@@ -29,7 +29,7 @@ fn compiled_on_a_thread_that_exits_then_executed_on_main() {
         assert_eq!(
             got,
             Value::list(vec![
-                Value::String(Arc::new("hello".to_string())),
+                Value::String(Arc::from("hello")),
                 Value::Float(2.5),
                 Value::Bytes(Arc::new(b"xyz".to_vec())),
             ])
@@ -46,7 +46,7 @@ fn compiled_on_a_thread_that_exits_then_executed_on_main() {
         assert_eq!(
             got,
             Value::list(vec![
-                Value::String(Arc::new("hello".to_string())),
+                Value::String(Arc::from("hello")),
                 Value::Float(2.5),
                 Value::Bytes(Arc::new(b"xyz".to_vec())),
             ])

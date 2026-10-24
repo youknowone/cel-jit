@@ -62,8 +62,8 @@ fn bound_list_agrees_with_inline_literal() {
 fn bound_map_agrees_with_inline_literal() {
     let mut ctx = Context::default();
     let mut m = HashMap::new();
-    m.insert(Key::String(Arc::new("a".to_string())), Value::Int(1));
-    m.insert(Key::String(Arc::new("b".to_string())), Value::Int(2));
+    m.insert(Key::String(Arc::from("a")), Value::Int(1));
+    m.insert(Key::String(Arc::from("b")), Value::Int(2));
     ctx.add_variable_from_value("v", Value::Map(Map::object(Arc::new(m))));
     agree("size(v)", "size({'a': 1, 'b': 2})", &ctx);
     agree("v['a']", "{'a': 1, 'b': 2}['a']", &ctx);
@@ -93,7 +93,7 @@ fn get_variable_compares_equal_and_debugs_like_the_bound_value() {
     let original_list: Value = vec![1i64, 2, 3].into();
     let original_map = {
         let mut m = HashMap::new();
-        m.insert(Key::String(Arc::new("a".to_string())), Value::Int(1));
+        m.insert(Key::String(Arc::from("a")), Value::Int(1));
         Value::Map(Map::object(Arc::new(m)))
     };
     let original_str: Value = "hello".into();

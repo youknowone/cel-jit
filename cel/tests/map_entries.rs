@@ -66,7 +66,7 @@ fn three_entry_entries_agrees_with_object() {
     let pairs = vec![
         (Key::Int(1), Value::Int(10)),
         (Key::Uint(2), Value::Float(2.5)),
-        (Key::String(Arc::new("k".into())), Value::Bool(true)),
+        (Key::String(Arc::from("k")), Value::Bool(true)),
     ];
     assert_storages_agree(&pairs);
 }
@@ -91,7 +91,7 @@ fn const_map_literal_is_entries_in_source_order() {
     let keys: Vec<&str> = map
         .iter()
         .map(|(k, _)| match k {
-            Key::String(s) => s.as_str(),
+            Key::String(s) => s.as_ref(),
             other => panic!("expected string key, got {other:?}"),
         })
         .collect();
@@ -113,7 +113,7 @@ fn vm_map_result_is_entries_in_source_order() {
     let keys: Vec<&str> = map
         .iter()
         .map(|(k, _)| match k {
-            Key::String(s) => s.as_str(),
+            Key::String(s) => s.as_ref(),
             other => panic!("expected string key, got {other:?}"),
         })
         .collect();
@@ -128,14 +128,16 @@ fn vm_map_result_is_entries_in_source_order() {
         let Value::Map(inner) = list.get(i).expect("elt") else {
             panic!("expected map element");
         };
-        assert!(matches!(inner.storage(), MapStorage::Entries(_)));
+        // Three same-shaped rows finish as one record block. A row is an
+        // index into that block, and its fields stay in schema order.
+        assert!(matches!(inner.storage(), MapStorage::Record { .. }));
         let pairs: Vec<(Key, Value)> = inner
             .iter()
             .map(|(k, v)| (k.clone(), v.into_owned()))
             .collect();
         assert_eq!(
             pairs,
-            vec![(Key::String(Arc::new("k".into())), Value::Int(i as i64 + 1))]
+            vec![(Key::String(Arc::from("k")), Value::Int(i as i64 + 1))]
         );
     }
 }
@@ -143,8 +145,8 @@ fn vm_map_result_is_entries_in_source_order() {
 #[test]
 fn bound_entries_map_round_trips_as_ptr_eq() {
     let original = entries_map(vec![
-        (Key::String(Arc::new("a".into())), Value::Int(1)),
-        (Key::String(Arc::new("b".into())), Value::Int(2)),
+        (Key::String(Arc::from("a")), Value::Int(1)),
+        (Key::String(Arc::from("b")), Value::Int(2)),
         (Key::Int(3), Value::Float(1.5)),
     ]);
     let mut ctx = Context::default();
@@ -173,8 +175,8 @@ fn assert_replace_keeps_first_position(input: Vec<(Key, Value)>, unique: &[(Key,
 
 #[test]
 fn new_replaces_duplicate_keys_on_a_scanned_table() {
-    let a = Key::String(Arc::new("a".into()));
-    let b = Key::String(Arc::new("b".into()));
+    let a = Key::String(Arc::from("a"));
+    let b = Key::String(Arc::from("b"));
     let input = vec![
         (a.clone(), Value::Int(1)),
         (b.clone(), Value::Int(2)),
@@ -249,7 +251,7 @@ fn twenty_entry_vm_and_walker_are_object_and_equal() {
     assert_eq!(walker, door);
     let object = object_map(
         &(0..20)
-            .map(|i| (Key::String(Arc::new(format!("k{i}"))), Value::Int(7)))
+            .map(|i| (Key::String(Arc::from(format!("k{i}"))), Value::Int(7)))
             .collect::<Vec<_>>(),
     );
     assert_eq!(*walker_map, object);
@@ -293,7 +295,7 @@ fn walker_map_literal_is_entries_in_source_order() {
     let keys: Vec<&str> = map
         .iter()
         .map(|(k, _)| match k {
-            Key::String(s) => s.as_str(),
+            Key::String(s) => s.as_ref(),
             other => panic!("expected string key, got {other:?}"),
         })
         .collect();

@@ -11,9 +11,9 @@ use crate::runtime::convert::{
 };
 use crate::runtime::error::{take_error, CelErrCode, ERROR_SENTINEL};
 use crate::runtime::object::{
-    bytes_len, list_int_at, list_len, map_len, string_byte_len, tuple_item, tuple_len, w_kind,
-    w_type, CelKind, CelRef, ListStrategy, W_BoolObject, W_DoubleObject, W_IntColumn, W_IntObject,
-    W_ListObject, W_OptionalObject, W_UIntObject,
+    bytes_len, list_int_at, list_len, map_len, new_optional, new_optional_none, string_byte_len,
+    tuple_item, tuple_len, w_kind, w_type, CelKind, CelRef, ListStrategy, W_BoolObject,
+    W_DoubleObject, W_IntColumn, W_IntObject, W_ListObject, W_OptionalObject, W_UIntObject,
 };
 use crate::runtime::object_array::{items_block_items_base, items_capacity};
 use crate::ExecutionError::NoSuchOverload;
@@ -67,7 +67,7 @@ static MIN_TIMESTAMP: LazyLock<chrono::DateTime<chrono::FixedOffset>> = LazyLock
 
 /// Tables this small are scanned as [`MapStorage::Entries`]; larger tables
 /// are [`MapStorage::Object`].
-const ORDERED_SCAN_LIMIT: usize = 8;
+pub(crate) const ORDERED_SCAN_LIMIT: usize = 8;
 
 /// Insertion-ordered pairs in one `Arc` allocation. Used when the table is
 /// small enough to scan.
@@ -292,10 +292,7 @@ pub enum MapStorage {
     /// One row of a record batch. The field names and the column banks live in
     /// `schema` and are shared with every other row, so this row is an index
     /// into them and a field is boxed only when it is read.
-    Record {
-        schema: Arc<RecordSchema>,
-        index: usize,
-    },
+    Record { schema: RecordRows, index: usize },
 }
 
 /// The field names and column banks shared by every row of a record batch. One
@@ -306,17 +303,59 @@ pub struct RecordSchema {
     columns: Vec<ValueColumn>,
 }
 
+/// One scalar column inside a packed record block: `len` words at
+/// `words[origin]`.
+#[derive(Clone, Copy)]
+struct ColumnMeta {
+    bank: ScalarBank,
+    origin: u32,
+    len: u32,
+}
+
+/// Up to [`ORDERED_SCAN_LIMIT`] field names stored in the record block.
+pub(crate) struct InlineKeys {
+    n: u8,
+    keys: [MaybeUninit<Key>; ORDERED_SCAN_LIMIT],
+}
+
+impl InlineKeys {
+    pub(crate) fn empty() -> InlineKeys {
+        InlineKeys {
+            n: 0,
+            keys: std::array::from_fn(|_| MaybeUninit::uninit()),
+        }
+    }
+
+    pub(crate) fn push(&mut self, key: Key) {
+        let index = self.n as usize;
+        self.keys[index].write(key);
+        self.n = index as u8 + 1;
+    }
+
+    fn as_slice(&self) -> &[Key] {
+        unsafe { std::slice::from_raw_parts(self.keys.as_ptr().cast::<Key>(), self.n as usize) }
+    }
+}
+
+impl Drop for InlineKeys {
+    fn drop(&mut self) {
+        for slot in &mut self.keys[..self.n as usize] {
+            unsafe { slot.assume_init_drop() }
+        }
+    }
+}
+
 /// A string column: order-preserving ranks into the batch's distinct strings,
 /// which are interned once so a value costs a reference count. The rank
 /// encoding exists so a string column compares as an integer, and rebuilding
 /// the `String` per value gave that back.
 pub struct StrBank {
     codes: Arc<[i64]>,
-    interned: Arc<[Arc<String>]>,
+    interned: Arc<[Arc<str>]>,
 }
 
 impl StrBank {
-    pub fn new(codes: Arc<[i64]>, interned: Arc<[Arc<String>]>) -> StrBank {
+    pub fn new(codes: Arc<[i64]>, interned: Arc<[Arc<str>]>) -> StrBank {
         StrBank { codes, interned }
     }
 
@@ -340,10 +379,20 @@ impl StrBank {
 /// per row while the int column cost 1.
 ///
 /// Cloning one is a reference count per bank, not a copy of the buffer.
+///
+/// [`ValueColumn::Range`] names `len` rows at `words[origin..]` so every
+/// field of one record list can share a single word allocation.
 #[derive(Clone)]
 pub enum ValueColumn {
-    /// Raw words, read through `bank`.
+    /// Raw words, read through `bank`. The buffer is exactly this column.
     Scalar { bank: ScalarBank, words: Arc<[i64]> },
+    /// `len` words at `words[origin..]`, sharing `words` with other columns.
+    Range {
+        bank: ScalarBank,
+        words: Arc<[i64]>,
+        origin: usize,
+        len: usize,
+    },
     /// Ranks into an interned string table.
     Str(Arc<StrBank>),
 }
@@ -369,23 +418,51 @@ pub enum ScalarBank {
 }
 
 impl ValueColumn {
+    /// `len` rows of `bank` beginning at `origin` in a shared word buffer.
+    pub(crate) fn range(
+        bank: ScalarBank,
+        words: Arc<[i64]>,
+        origin: usize,
+        len: usize,
+    ) -> ValueColumn {
+        debug_assert!(origin
+            .checked_add(len)
+            .is_some_and(|end| end <= words.len()));
+        ValueColumn::Range {
+            bank,
+            words,
+            origin,
+            len,
+        }
+    }
+
+    fn scalar_value(bank: ScalarBank, word: i64) -> Value {
+        match bank {
+            ScalarBank::Int => Value::Int(word),
+            ScalarBank::UInt => Value::UInt(word as u64),
+            ScalarBank::Bool => Value::Bool(word != 0),
+            ScalarBank::Float => Value::Float(f64::from_bits(word as u64)),
+            #[cfg(feature = "chrono")]
+            ScalarBank::Timestamp => {
+                Value::Timestamp(chrono::DateTime::from_timestamp_nanos(word).fixed_offset())
+            }
+            #[cfg(feature = "chrono")]
+            ScalarBank::Duration => Value::Duration(chrono::Duration::nanoseconds(word)),
+            ScalarBank::Type => crate::common::types::type_const_value(word),
+        }
+    }
+
     pub fn value_at(&self, index: usize) -> Value {
         match self {
-            ValueColumn::Scalar { bank, words } => {
-                let word = words[index];
-                match bank {
-                    ScalarBank::Int => Value::Int(word),
-                    ScalarBank::UInt => Value::UInt(word as u64),
-                    ScalarBank::Bool => Value::Bool(word != 0),
-                    ScalarBank::Float => Value::Float(f64::from_bits(word as u64)),
-                    #[cfg(feature = "chrono")]
-                    ScalarBank::Timestamp => Value::Timestamp(
-                        chrono::DateTime::from_timestamp_nanos(word).fixed_offset(),
-                    ),
-                    #[cfg(feature = "chrono")]
-                    ScalarBank::Duration => Value::Duration(chrono::Duration::nanoseconds(word)),
-                    ScalarBank::Type => crate::common::types::type_const_value(word),
-                }
+            ValueColumn::Scalar { bank, words } => Self::scalar_value(*bank, words[index]),
+            ValueColumn::Range {
+                bank,
+                words,
+                origin,
+                len,
+            } => {
+                assert!(index < *len, "column index {index} past {len}");
+                Self::scalar_value(*bank, words[*origin + index])
             }
             ValueColumn::Str(bank) => bank.value_at(index),
         }
@@ -394,6 +471,7 @@ impl ValueColumn {
     pub fn len(&self) -> usize {
         match self {
             ValueColumn::Scalar { words, .. } => words.len(),
+            ValueColumn::Range { len, .. } => *len,
             ValueColumn::Str(bank) => bank.len(),
         }
     }
@@ -432,11 +510,106 @@ impl RecordSchema {
         &self.keys
     }
 
-    /// A record carries a handful of fields, so a scan over the shared names
-    /// beats hashing and needs no table of its own.
+    fn value_at(&self, field: usize, row: usize) -> Value {
+        self.columns[field].value_at(row)
+    }
+}
+
+/// Shared rows of one record list. An owned [`RecordSchema`], or the single
+/// block a packed scalar record list is stored in. A row holds this handle
+/// and an index; cloning bumps a reference count.
+pub struct RecordRows {
+    ptr: NonNull<u8>,
+}
+
+const RECORD_BLOCK_BIT: usize = 1;
+
+impl RecordRows {
+    fn from_schema(schema: Arc<RecordSchema>) -> Self {
+        let raw = Arc::into_raw(schema) as *mut u8;
+        debug_assert_eq!(raw.addr() & RECORD_BLOCK_BIT, 0);
+        RecordRows {
+            ptr: unsafe { NonNull::new_unchecked(raw) },
+        }
+    }
+
+    fn from_block(buf: ListBuf) -> Self {
+        debug_assert!(!buf.is_shared() && !buf.is_word_view());
+        debug_assert_eq!(buf.tag(), LIST_TAG_RECORD);
+        let raw = buf.ptr.as_ptr();
+        debug_assert_eq!(raw.addr() & RECORD_BLOCK_BIT, 0);
+        std::mem::forget(buf);
+        RecordRows {
+            ptr: unsafe { NonNull::new_unchecked(raw.map_addr(|a| a | RECORD_BLOCK_BIT)) },
+        }
+    }
+
+    fn is_block(&self) -> bool {
+        self.ptr.as_ptr().addr() & RECORD_BLOCK_BIT != 0
+    }
+
+    fn block_header(&self) -> NonNull<RcSliceHeader> {
+        debug_assert!(self.is_block());
+        let p = self.ptr.as_ptr().map_addr(|a| a & !RECORD_BLOCK_BIT);
+        unsafe { NonNull::new_unchecked(p.cast()) }
+    }
+
+    fn as_schema(&self) -> Option<&RecordSchema> {
+        if self.is_block() {
+            None
+        } else {
+            Some(unsafe { &*self.ptr.as_ptr().cast::<RecordSchema>() })
+        }
+    }
+
+    fn same_allocation(&self, other: &Self) -> bool {
+        self.is_block() == other.is_block()
+            && self.ptr.as_ptr().map_addr(|a| a & !RECORD_BLOCK_BIT)
+                == other.ptr.as_ptr().map_addr(|a| a & !RECORD_BLOCK_BIT)
+    }
+
+    fn field_count(&self) -> usize {
+        self.keys().len()
+    }
+
+    fn keys(&self) -> &[Key] {
+        if let Some(schema) = self.as_schema() {
+            return schema.keys();
+        }
+        record_prefix(self.block_header()).keys.as_slice()
+    }
+
+    fn value_at(&self, field: usize, row: usize) -> Value {
+        if let Some(schema) = self.as_schema() {
+            return schema.value_at(field, row);
+        }
+        record_value_at(self.block_header(), field, row)
+    }
+
     fn position(&self, key: &(dyn AsKeyRef + '_)) -> Option<usize> {
         let key = key.as_keyref();
-        self.keys.iter().position(|k| k.as_keyref() == key)
+        self.keys().iter().position(|k| k.as_keyref() == key)
+    }
+}
+
+impl Clone for RecordRows {
+    fn clone(&self) -> Self {
+        if self.is_block() {
+            rc_header_inc(unsafe { self.block_header().as_ref() });
+        } else {
+            unsafe { Arc::increment_strong_count(self.ptr.as_ptr().cast::<RecordSchema>()) };
+        }
+        RecordRows { ptr: self.ptr }
+    }
+}
+
+impl Drop for RecordRows {
+    fn drop(&mut self) {
+        if self.is_block() {
+            rc_header_dec(self.block_header());
+            return;
+        }
+        unsafe { Arc::decrement_strong_count(self.ptr.as_ptr().cast::<RecordSchema>()) };
     }
 }
 
@@ -504,7 +677,20 @@ impl Map {
     pub fn record(schema: Arc<RecordSchema>, index: usize) -> Map {
         debug_assert!(index < schema.rows(), "record index is past the columns");
         Map {
-            storage: MapStorage::Record { schema, index },
+            storage: MapStorage::Record {
+                schema: RecordRows::from_schema(schema),
+                index,
+            },
+        }
+    }
+
+    fn from_record_block(buf: ListBuf, index: usize) -> Map {
+        debug_assert!(index < buf.len());
+        Map {
+            storage: MapStorage::Record {
+                schema: RecordRows::from_block(buf),
+                index,
+            },
         }
     }
 
@@ -529,7 +715,7 @@ impl Map {
                     schema: sb,
                     index: ib,
                 },
-            ) => Arc::ptr_eq(sa, sb) && ia == ib,
+            ) => sa.same_allocation(sb) && ia == ib,
             _ => false,
         }
     }
@@ -586,7 +772,7 @@ impl Map {
             MapStorage::Entries(e) => pairs_get(&e.entries, key).map(Cow::Borrowed),
             MapStorage::Record { schema, index } => {
                 let field = schema.position(key)?;
-                Some(Cow::Owned(schema.columns[field].value_at(*index)))
+                Some(Cow::Owned(schema.value_at(field, *index)))
             }
         }
     }
@@ -623,7 +809,7 @@ pub enum MapIter<'a> {
     Object(std::collections::hash_map::Iter<'a, Key, Value>),
     Entries(std::slice::Iter<'a, (Key, Value)>),
     Record {
-        schema: &'a RecordSchema,
+        schema: &'a RecordRows,
         index: usize,
         field: usize,
     },
@@ -642,9 +828,9 @@ impl<'a> Iterator for MapIter<'a> {
                 field,
             } => {
                 let at = *field;
-                let key = schema.keys.get(at)?;
+                let key = schema.keys().get(at)?;
                 *field += 1;
-                Some((key, Cow::Owned(schema.columns[at].value_at(*index))))
+                Some((key, Cow::Owned(schema.value_at(at, *index))))
             }
         }
     }
@@ -688,7 +874,7 @@ pub enum Key {
     Int(i64),
     Uint(u64),
     Bool(bool),
-    String(Arc<String>),
+    String(Arc<str>),
 }
 
 /// A borrowed version of [`Key`] that avoids allocating for lookups.
@@ -711,7 +897,7 @@ impl AsKeyRef for Key {
             Key::Int(i) => KeyRef::Int(*i),
             Key::Uint(u) => KeyRef::Uint(*u),
             Key::Bool(b) => KeyRef::Bool(*b),
-            Key::String(s) => KeyRef::String(s.as_str()),
+            Key::String(s) => KeyRef::String(s.as_ref()),
         }
     }
 }
@@ -791,13 +977,19 @@ impl From<String> for Key {
 
 impl From<Arc<String>> for Key {
     fn from(v: Arc<String>) -> Self {
+        Key::String(Arc::from(v.as_str()))
+    }
+}
+
+impl From<Arc<str>> for Key {
+    fn from(v: Arc<str>) -> Self {
         Key::String(v)
     }
 }
 
 impl<'a> From<&'a str> for Key {
     fn from(v: &'a str) -> Self {
-        Key::String(Arc::new(v.into()))
+        Key::String(Arc::from(v))
     }
 }
 
@@ -880,7 +1072,7 @@ impl<'a> TryFrom<&'a Value> for KeyRef<'a> {
         match value {
             Value::Int(v) => Ok(KeyRef::Int(*v)),
             Value::UInt(v) => Ok(KeyRef::Uint(*v)),
-            Value::String(v) => Ok(KeyRef::String(v.as_str())),
+            Value::String(v) => Ok(KeyRef::String(v.as_ref())),
             Value::Bool(v) => Ok(KeyRef::Bool(*v)),
             _ => Err(value.clone()),
         }
@@ -1086,10 +1278,12 @@ impl TryIntoValue for Value {
 /// `len` elements. `Arc<[T]>` is a fat pointer (16 bytes); putting one in
 /// [`ListRef`] would make [`Value`] 32.
 ///
-/// Every list buffer — object, ints, and shared column/record — starts with
-/// this header so [`ListBuf::clone`] / [`ListBuf::drop`] bump the count at
-/// the untagged address with no kind test. The static empty header starts
-/// at 1 and is never released: [`RcSlice::empty`] takes an extra count.
+/// Every list buffer starts with this header so [`ListBuf::clone`] /
+/// [`ListBuf::drop`] bump the count at the untagged address with no kind
+/// test. Object lists, int lists, packed record lists, and scalar-row lists
+/// are that header plus their payload. A shared column or an owned record
+/// list is a tagged `Arc` instead. The static empty header starts at 1 and
+/// is never released: [`RcSlice::empty`] takes an extra count.
 ///
 /// # Safety
 ///
@@ -1111,12 +1305,22 @@ struct RcSliceHeader {
 const LIST_TAG_OBJECT: usize = 0;
 const LIST_TAG_INTS: usize = 1;
 const LIST_TAG_SHARED: usize = 2;
+/// Packed scalar record: header, inline keys, then column-major `i64` words.
+const LIST_TAG_RECORD: usize = 3;
+/// Scalar rows: header, per-row start and length, then `i64` words.
+/// A handle with [`LIST_WORD_BIT`] set reads those words as one row.
+const LIST_TAG_ROWS: usize = 4;
 /// Low bit on a [`ListBuf`] pointer: set for a tagged `Arc<ListStorage>`.
 const LIST_SHARED_BIT: usize = 1;
+/// Second low bit on a [`ListBuf`] pointer. Set on a scalar window of a
+/// [`LIST_TAG_ROWS`] block and clear on the row list, so
+/// [`ListRef::shares_storage_with`] matches scalar windows of one block.
+const LIST_WORD_BIT: usize = 2;
 
 const _: () = {
-    assert!(core::mem::align_of::<ListStorage>() >= 2);
-    assert!(core::mem::align_of::<RcSliceHeader>() >= 2);
+    assert!(core::mem::align_of::<ListStorage>() >= 4);
+    assert!(core::mem::align_of::<RcSliceHeader>() >= 4);
+    assert!(core::mem::align_of::<RecordSchema>() >= 2);
 };
 
 static EMPTY_OBJECT: RcSliceHeader = RcSliceHeader {
@@ -1142,6 +1346,16 @@ fn rc_header_inc(header: &RcSliceHeader) {
     if old > (isize::MAX as usize) {
         std::process::abort();
     }
+}
+
+fn rc_header_dec(header: NonNull<RcSliceHeader>) {
+    // SAFETY: `header` is a live [`RcSliceHeader`]. The slow path runs only
+    // for the last owner of a heap buffer.
+    if unsafe { header.as_ref().strong.fetch_sub(1, AtomicOrdering::Release) } != 1 {
+        return;
+    }
+    std::sync::atomic::fence(AtomicOrdering::Acquire);
+    unsafe { list_buf_drop_slow(header) };
 }
 
 fn is_empty_header(ptr: *const RcSliceHeader) -> bool {
@@ -1434,7 +1648,7 @@ impl ListBuf {
         let raw = Arc::into_raw(arc) as *mut u8;
         debug_assert_eq!(raw.addr() & LIST_SHARED_BIT, 0);
         ListBuf {
-            // SAFETY: `Arc::into_raw` is aligned to `ListStorage` (>= 2), so
+            // SAFETY: `Arc::into_raw` is aligned to `ListStorage` (>= 4), so
             // setting the low bit does not collide with a live address.
             // `map_addr` keeps the allocation's provenance.
             ptr: unsafe { NonNull::new_unchecked(raw.map_addr(|a| a | LIST_SHARED_BIT)) },
@@ -1450,12 +1664,38 @@ impl ListBuf {
         self.ptr.as_ptr().map_addr(|a| a & !LIST_SHARED_BIT) as *const ListStorage
     }
 
+    fn is_word_view(&self) -> bool {
+        !self.is_shared() && self.ptr.as_ptr().addr() & LIST_WORD_BIT != 0
+    }
+
+    /// Header address. Clears [`LIST_WORD_BIT`]; the shared-arc bit is not
+    /// set on this handle.
+    fn header(&self) -> NonNull<RcSliceHeader> {
+        debug_assert!(!self.is_shared());
+        let p = self.ptr.as_ptr().map_addr(|a| a & !LIST_WORD_BIT);
+        unsafe { NonNull::new_unchecked(p.cast()) }
+    }
+
+    fn set_word_bit(&mut self) {
+        debug_assert!(!self.is_shared());
+        debug_assert_eq!(self.ptr.as_ptr().addr() & LIST_WORD_BIT, 0);
+        self.ptr =
+            unsafe { NonNull::new_unchecked(self.ptr.as_ptr().map_addr(|a| a | LIST_WORD_BIT)) };
+    }
+
+    fn row_window(&self, row: usize) -> ListRef {
+        let (start, len) = row_bounds(self.header(), row);
+        let mut buf = self.clone();
+        buf.set_word_bit();
+        ListRef { buf, start, len }
+    }
+
     fn tag(&self) -> usize {
         if self.is_shared() {
             return LIST_TAG_SHARED;
         }
-        // SAFETY: untagged pointer is a live [`RcSliceHeader`].
-        unsafe { (*self.ptr.as_ptr().cast::<RcSliceHeader>()).kind as usize }
+        // SAFETY: header address is a live [`RcSliceHeader`].
+        unsafe { self.header().as_ref().kind as usize }
     }
 
     fn raw(&self) -> NonNull<u8> {
@@ -1491,6 +1731,7 @@ impl ListBuf {
             LIST_TAG_OBJECT => self.object_slice().map_or(0, <[Value]>::len),
             LIST_TAG_INTS => self.ints_slice().map_or(0, <[i64]>::len),
             LIST_TAG_SHARED => self.shared().map_or(0, ListStorage::len),
+            LIST_TAG_RECORD | LIST_TAG_ROWS => unsafe { self.header().as_ref().len as usize },
             _ => 0,
         }
     }
@@ -1498,7 +1739,7 @@ impl ListBuf {
     fn object_slice(&self) -> Option<&[Value]> {
         match self.tag() {
             // SAFETY: tag names an object [`RcSlice<Value>`] header.
-            LIST_TAG_OBJECT => Some(unsafe { rc_slice_as_slice(self.ptr.cast()) }),
+            LIST_TAG_OBJECT => Some(unsafe { rc_slice_as_slice(self.header()) }),
             LIST_TAG_SHARED => match self.shared()? {
                 ListStorage::Object(v) => Some(v.as_slice()),
                 _ => None,
@@ -1510,7 +1751,7 @@ impl ListBuf {
     fn ints_slice(&self) -> Option<&[i64]> {
         match self.tag() {
             // SAFETY: tag names an int [`RcSlice<i64>`] header.
-            LIST_TAG_INTS => Some(unsafe { rc_slice_as_slice(self.ptr.cast()) }),
+            LIST_TAG_INTS => Some(unsafe { rc_slice_as_slice(self.header()) }),
             LIST_TAG_SHARED => match self.shared()? {
                 ListStorage::Ints(v) => Some(v.as_slice()),
                 _ => None,
@@ -1533,15 +1774,22 @@ impl ListBuf {
     }
 
     fn element_at(&self, index: usize) -> Value {
+        if self.is_word_view() {
+            return row_word(self.header(), index);
+        }
         if let Some(v) = self.object_slice() {
             return v[index].clone();
         }
         if let Some(v) = self.ints_slice() {
             return Value::Int(v[index]);
         }
-        match self.shared() {
-            Some(s) => s.element_at(index),
-            None => panic!("list buffer has no element at {index}"),
+        if let Some(s) = self.shared() {
+            return s.element_at(index);
+        }
+        match self.tag() {
+            LIST_TAG_RECORD => Value::Map(Map::from_record_block(self.clone(), index)),
+            LIST_TAG_ROWS => Value::List(self.row_window(index)),
+            _ => panic!("list buffer has no element at {index}"),
         }
     }
 }
@@ -1553,8 +1801,9 @@ impl Clone for ListBuf {
             // is live.
             unsafe { Arc::increment_strong_count(self.shared_ptr()) };
         } else {
-            // SAFETY: untagged pointer is a live [`RcSliceHeader`].
-            rc_header_inc(unsafe { self.ptr.cast::<RcSliceHeader>().as_ref() });
+            // SAFETY: header address is a live [`RcSliceHeader`]. The word
+            // bit, when set, stays on the cloned handle.
+            rc_header_inc(unsafe { self.header().as_ref() });
         }
         ListBuf {
             ptr: self.ptr,
@@ -1571,15 +1820,168 @@ impl Drop for ListBuf {
             unsafe { Arc::decrement_strong_count(self.shared_ptr()) };
             return;
         }
-        let header = self.ptr.cast::<RcSliceHeader>();
-        // SAFETY: untagged pointer is a live [`RcSliceHeader`].
-        if unsafe { header.as_ref().strong.fetch_sub(1, AtomicOrdering::Release) } != 1 {
-            return;
-        }
-        std::sync::atomic::fence(AtomicOrdering::Acquire);
-        // SAFETY: last owner of this owned buffer.
-        unsafe { list_buf_drop_slow(header) };
+        // SAFETY: header address is a live [`RcSliceHeader`].
+        rc_header_dec(self.header());
     }
+}
+
+fn bank_tag(bank: ScalarBank) -> u8 {
+    match bank {
+        ScalarBank::Int => 0,
+        ScalarBank::UInt => 1,
+        ScalarBank::Bool => 2,
+        ScalarBank::Float => 3,
+        #[cfg(feature = "chrono")]
+        ScalarBank::Timestamp => 4,
+        #[cfg(feature = "chrono")]
+        ScalarBank::Duration => 5,
+        ScalarBank::Type => 6,
+    }
+}
+
+fn bank_from_tag(tag: u8) -> ScalarBank {
+    match tag {
+        0 => ScalarBank::Int,
+        1 => ScalarBank::UInt,
+        2 => ScalarBank::Bool,
+        3 => ScalarBank::Float,
+        #[cfg(feature = "chrono")]
+        4 => ScalarBank::Timestamp,
+        #[cfg(feature = "chrono")]
+        5 => ScalarBank::Duration,
+        6 => ScalarBank::Type,
+        _ => unreachable!("scalar bank tag"),
+    }
+}
+
+/// Header of a [`LIST_TAG_RECORD`] block, followed by column-major `i64` words.
+#[repr(C)]
+struct RecordPrefix {
+    header: RcSliceHeader,
+    nfields: u8,
+    keys: InlineKeys,
+    metas: [ColumnMeta; ORDERED_SCAN_LIMIT],
+}
+
+/// Header of a [`LIST_TAG_ROWS`] block. `starts`, `lens`, and `i64` words follow.
+#[repr(C)]
+struct RowPrefix {
+    header: RcSliceHeader,
+    bank: u8,
+    nwords: u32,
+}
+
+fn record_layout(nrows: usize, nfields: usize) -> Option<(Layout, usize)> {
+    let total = nrows.checked_mul(nfields)?;
+    let words = Layout::array::<i64>(total).ok()?;
+    let (layout, offset) = Layout::new::<RecordPrefix>().extend(words).ok()?;
+    Some((layout.pad_to_align(), offset))
+}
+
+fn rows_layout(nrows: usize, nwords: usize) -> Option<(Layout, usize, usize, usize)> {
+    let starts = Layout::array::<u32>(nrows).ok()?;
+    let lens = Layout::array::<u32>(nrows).ok()?;
+    let words = Layout::array::<i64>(nwords).ok()?;
+    let (with_starts, starts_off) = Layout::new::<RowPrefix>().extend(starts).ok()?;
+    let (with_lens, lens_off) = with_starts.extend(lens).ok()?;
+    let (layout, words_off) = with_lens.extend(words).ok()?;
+    Some((layout.pad_to_align(), starts_off, lens_off, words_off))
+}
+
+fn record_prefix<'a>(header: NonNull<RcSliceHeader>) -> &'a RecordPrefix {
+    // SAFETY: `header` is the first field of a live [`RecordPrefix`].
+    unsafe { &*header.as_ptr().cast::<RecordPrefix>() }
+}
+
+fn record_value_at(header: NonNull<RcSliceHeader>, field: usize, row: usize) -> Value {
+    let (bank, origin, len, nrows, nfields) = {
+        let prefix = record_prefix(header);
+        let meta = prefix.metas[field];
+        (
+            meta.bank,
+            meta.origin as usize,
+            meta.len as usize,
+            prefix.header.len as usize,
+            prefix.nfields as usize,
+        )
+    };
+    assert!(row < len, "column index {row} past {len}");
+    let (_, words_off) = record_layout(nrows, nfields).expect("record layout");
+    // SAFETY: `origin + row` addresses an initialized word in the tail.
+    let word = unsafe {
+        *header
+            .as_ptr()
+            .cast::<u8>()
+            .add(words_off)
+            .cast::<i64>()
+            .add(origin + row)
+    };
+    ValueColumn::scalar_value(bank, word)
+}
+
+fn row_prefix<'a>(header: NonNull<RcSliceHeader>) -> &'a RowPrefix {
+    // SAFETY: `header` is the first field of a live [`RowPrefix`].
+    unsafe { &*header.as_ptr().cast::<RowPrefix>() }
+}
+
+fn row_bounds(header: NonNull<RcSliceHeader>, row: usize) -> (u32, u32) {
+    let (nrows, nwords) = {
+        let prefix = row_prefix(header);
+        (prefix.header.len as usize, prefix.nwords as usize)
+    };
+    let (_, starts_off, lens_off, _) = rows_layout(nrows, nwords).expect("row layout");
+    // SAFETY: `row` is below `nrows`. Both arrays were written for every row.
+    unsafe {
+        let base = header.as_ptr().cast::<u8>();
+        let start = *base.add(starts_off).cast::<u32>().add(row);
+        let len = *base.add(lens_off).cast::<u32>().add(row);
+        (start, len)
+    }
+}
+
+fn row_word(header: NonNull<RcSliceHeader>, index: usize) -> Value {
+    let (nrows, nwords, bank) = {
+        let prefix = row_prefix(header);
+        (
+            prefix.header.len as usize,
+            prefix.nwords as usize,
+            bank_from_tag(prefix.bank),
+        )
+    };
+    debug_assert!(index < nwords);
+    let (_, _, _, words_off) = rows_layout(nrows, nwords).expect("row layout");
+    // SAFETY: `index` addresses an initialized word in the tail.
+    let word = unsafe {
+        *header
+            .as_ptr()
+            .cast::<u8>()
+            .add(words_off)
+            .cast::<i64>()
+            .add(index)
+    };
+    ValueColumn::scalar_value(bank, word)
+}
+
+fn drop_record_block(ptr: NonNull<RcSliceHeader>) {
+    let prefix = ptr.as_ptr().cast::<RecordPrefix>();
+    // SAFETY: unique [`LIST_TAG_RECORD`] block. `nfields` is read before the
+    // keys are dropped. The word tail is plain `i64`.
+    let (nrows, nfields) = unsafe { ((*ptr.as_ptr()).len as usize, (*prefix).nfields as usize) };
+    let (layout, _) = record_layout(nrows, nfields).expect("record layout");
+    unsafe {
+        std::ptr::drop_in_place(prefix);
+        dealloc(ptr.as_ptr().cast(), layout);
+    }
+}
+
+fn drop_rows_block(ptr: NonNull<RcSliceHeader>) {
+    // SAFETY: unique [`LIST_TAG_ROWS`] block. The tail is `u32` and `i64`.
+    let (nrows, nwords) = unsafe {
+        let prefix = &*ptr.as_ptr().cast::<RowPrefix>();
+        (prefix.header.len as usize, prefix.nwords as usize)
+    };
+    let (layout, _, _, _) = rows_layout(nrows, nwords).expect("row layout");
+    unsafe { dealloc(ptr.as_ptr().cast(), layout) };
 }
 
 /// Last-owner drop: dispatch on [`RcSliceHeader::kind`], drop elements /
@@ -1605,6 +2007,8 @@ unsafe fn list_buf_drop_slow(ptr: NonNull<RcSliceHeader>) {
             // SAFETY: int buffer; unique owner; `len` elements follow.
             unsafe { rc_slice_drop_in_place::<i64>(ptr) };
         }
+        LIST_TAG_RECORD => drop_record_block(ptr),
+        LIST_TAG_ROWS => drop_rows_block(ptr),
         _ => unreachable!("list buffer kind"),
     }
 }
@@ -1716,9 +2120,10 @@ impl FromIterator<Value> for ListStorage {
 /// allocation at all, where a list that owned its own storage cost one per row.
 ///
 /// An owned object or int list is one allocation: a reference-counted header
-/// followed by the inline element array. Column and record lists keep a
-/// shared [`ListStorage`] so a batch of windows still shares one buffer:
-/// [`ListRef::window`] tags that `Arc` and does not allocate.
+/// followed by the inline element array. A packed scalar record list and a
+/// shared scalar-row list are that same shape. Batch columns, and record
+/// lists with more than [`ORDERED_SCAN_LIMIT`] fields, keep a shared
+/// [`ListStorage`]: [`ListRef::window`] tags that `Arc` and does not allocate.
 ///
 /// Neither `Send` nor `Sync`. A list owns [`Value`]s, which are neither.
 ///
@@ -1766,8 +2171,22 @@ impl ListRef {
         self.buf.ints_slice().is_some()
     }
 
+    /// True when this list is a record batch: a packed block, or a window
+    /// onto [`ListStorage::Record`].
+    #[cfg(test)]
+    pub(crate) fn is_record(&self) -> bool {
+        if self.buf.is_word_view() {
+            return false;
+        }
+        match self.buf.tag() {
+            LIST_TAG_RECORD => true,
+            LIST_TAG_SHARED => matches!(self.buf.shared(), Some(ListStorage::Record(_))),
+            _ => false,
+        }
+    }
+
     pub(crate) fn is_whole(&self) -> bool {
-        self.start == 0 && self.len() == self.buf.len()
+        !self.buf.is_word_view() && self.start == 0 && self.len() == self.buf.len()
     }
 
     /// Reconstruct a window from a bind-time public link. The offsets were
@@ -1943,6 +2362,215 @@ impl ListRef {
     }
 }
 
+/// One in-progress [`LIST_TAG_RECORD`] block. Drop releases initialized keys
+/// and the allocation. [`PackedRecordBuf::finish`] publishes it as a [`ListRef`].
+pub(crate) struct PackedRecordBuf {
+    ptr: NonNull<RecordPrefix>,
+    nrows: usize,
+    nfields: usize,
+    words_off: usize,
+}
+
+impl PackedRecordBuf {
+    pub(crate) fn alloc(nrows: usize, nfields: usize) -> Option<Self> {
+        if nrows == 0 || nfields == 0 || nfields > ORDERED_SCAN_LIMIT {
+            return None;
+        }
+        let nrows_u = u32::try_from(nrows).ok()?;
+        let (layout, words_off) = record_layout(nrows, nfields)?;
+        // SAFETY: `layout` is non-zero (`nrows` and `nfields` are non-zero)
+        // and aligned for [`RecordPrefix`] plus the word tail.
+        let raw = unsafe { alloc(layout) };
+        if raw.is_null() {
+            handle_alloc_error(layout);
+        }
+        // The word tail is initialized so a partial fill still drops cleanly.
+        unsafe { std::ptr::write_bytes(raw, 0, layout.size()) };
+        let prefix = raw.cast::<RecordPrefix>();
+        // SAFETY: `raw` is a unique allocation of `layout`.
+        unsafe {
+            prefix.write(RecordPrefix {
+                header: RcSliceHeader {
+                    strong: AtomicUsize::new(1),
+                    len: nrows_u,
+                    kind: LIST_TAG_RECORD as u8,
+                },
+                nfields: nfields as u8,
+                keys: InlineKeys::empty(),
+                metas: [ColumnMeta {
+                    bank: ScalarBank::Int,
+                    origin: 0,
+                    len: 0,
+                }; ORDERED_SCAN_LIMIT],
+            });
+        }
+        Some(PackedRecordBuf {
+            ptr: unsafe { NonNull::new_unchecked(prefix) },
+            nrows,
+            nfields,
+            words_off,
+        })
+    }
+
+    pub(crate) fn push_key(&mut self, key: Key) {
+        // SAFETY: unique block; `keys.n` stays within `nfields`.
+        unsafe { (*self.ptr.as_ptr()).keys.push(key) };
+    }
+
+    pub(crate) fn set_column(&mut self, field: usize, bank: ScalarBank) {
+        let origin = u32::try_from(field * self.nrows).expect("column origin fits in u32");
+        // SAFETY: unique block; `field` is below `nfields` <= [`ORDERED_SCAN_LIMIT`].
+        unsafe {
+            (*self.ptr.as_ptr()).metas[field] = ColumnMeta {
+                bank,
+                origin,
+                len: self.nrows as u32,
+            };
+        }
+    }
+
+    pub(crate) fn write_word(&mut self, index: usize, word: i64) {
+        debug_assert!(index < self.nrows * self.nfields);
+        // SAFETY: unique block; `index` addresses the word tail.
+        unsafe {
+            let words = self
+                .ptr
+                .as_ptr()
+                .cast::<u8>()
+                .add(self.words_off)
+                .cast::<i64>();
+            *words.add(index) = word;
+        }
+    }
+
+    pub(crate) fn finish(self) -> ListRef {
+        debug_assert_eq!(
+            unsafe { self.ptr.as_ref().keys.as_slice().len() },
+            self.nfields
+        );
+        let ptr = self.ptr;
+        let nrows = u32::try_from(self.nrows).expect("packed record nrows fit in u32");
+        std::mem::forget(self);
+        ListRef {
+            buf: ListBuf::from_header(ptr.cast()),
+            start: 0,
+            len: nrows,
+        }
+    }
+}
+
+impl Drop for PackedRecordBuf {
+    fn drop(&mut self) {
+        let (layout, _) = record_layout(self.nrows, self.nfields).expect("record layout");
+        // SAFETY: unique block. Keys written through [`PackedRecordBuf::push_key`]
+        // are dropped with the prefix; the word tail is plain `i64`.
+        unsafe {
+            std::ptr::drop_in_place(self.ptr.as_ptr());
+            dealloc(self.ptr.as_ptr().cast(), layout);
+        }
+    }
+}
+
+/// One in-progress [`LIST_TAG_ROWS`] block. The tail is `u32` starts, `u32`
+/// lengths, and `i64` words, all in this allocation.
+pub(crate) struct ScalarRowsBuf {
+    ptr: NonNull<RowPrefix>,
+    nrows: usize,
+    nwords: usize,
+    starts_off: usize,
+    lens_off: usize,
+    words_off: usize,
+}
+
+impl ScalarRowsBuf {
+    pub(crate) fn alloc(nrows: usize, nwords: usize, bank: ScalarBank) -> Option<Self> {
+        if nrows == 0 || nwords == 0 {
+            return None;
+        }
+        let nrows_u = u32::try_from(nrows).ok()?;
+        let nwords_u = u32::try_from(nwords).ok()?;
+        let (layout, starts_off, lens_off, words_off) = rows_layout(nrows, nwords)?;
+        // SAFETY: `layout` is non-zero and aligned for [`RowPrefix`] plus the tail.
+        let raw = unsafe { alloc(layout) };
+        if raw.is_null() {
+            handle_alloc_error(layout);
+        }
+        // Starts, lengths, and words are initialized before any row is written.
+        unsafe { std::ptr::write_bytes(raw, 0, layout.size()) };
+        let prefix = raw.cast::<RowPrefix>();
+        // SAFETY: `raw` is a unique allocation of `layout`.
+        unsafe {
+            prefix.write(RowPrefix {
+                header: RcSliceHeader {
+                    strong: AtomicUsize::new(1),
+                    len: nrows_u,
+                    kind: LIST_TAG_ROWS as u8,
+                },
+                bank: bank_tag(bank),
+                nwords: nwords_u,
+            });
+        }
+        Some(ScalarRowsBuf {
+            ptr: unsafe { NonNull::new_unchecked(prefix) },
+            nrows,
+            nwords,
+            starts_off,
+            lens_off,
+            words_off,
+        })
+    }
+
+    pub(crate) fn set_row(&mut self, row: usize, start: u32, len: u32) {
+        debug_assert!(row < self.nrows);
+        debug_assert!(start as usize + len as usize <= self.nwords);
+        // SAFETY: unique block; `row` is below `nrows`.
+        unsafe {
+            let base = self.ptr.as_ptr().cast::<u8>();
+            *base.add(self.starts_off).cast::<u32>().add(row) = start;
+            *base.add(self.lens_off).cast::<u32>().add(row) = len;
+        }
+    }
+
+    pub(crate) fn word_slot(&mut self, at: usize, len: usize) -> &mut [MaybeUninit<i64>] {
+        if len == 0 {
+            return &mut [];
+        }
+        assert!(
+            at.checked_add(len).is_some_and(|end| end <= self.nwords),
+            "row word range runs past the buffer"
+        );
+        // SAFETY: unique block; the range sits in the word tail.
+        unsafe {
+            let base = self
+                .ptr
+                .as_ptr()
+                .cast::<u8>()
+                .add(self.words_off)
+                .cast::<MaybeUninit<i64>>();
+            std::slice::from_raw_parts_mut(base.add(at), len)
+        }
+    }
+
+    pub(crate) fn finish(self) -> ListRef {
+        let ptr = self.ptr;
+        let nrows = u32::try_from(self.nrows).expect("scalar rows fit in u32");
+        std::mem::forget(self);
+        ListRef {
+            buf: ListBuf::from_header(ptr.cast()),
+            start: 0,
+            len: nrows,
+        }
+    }
+}
+
+impl Drop for ScalarRowsBuf {
+    fn drop(&mut self) {
+        let (layout, _, _, _) = rows_layout(self.nrows, self.nwords).expect("row layout");
+        // SAFETY: unique block. The tail has no drop glue.
+        unsafe { dealloc(self.ptr.as_ptr().cast(), layout) };
+    }
+}
+
 #[inline(never)]
 fn concat_int_lists(left: &ListRef, right: &ListRef) -> Option<ListRef> {
     let n = left.len() + right.len();
@@ -2041,7 +2669,7 @@ pub enum Value {
     Int(i64),
     UInt(u64),
     Float(f64),
-    String(Arc<String>),
+    String(Arc<str>),
     Bytes(Arc<Vec<u8>>),
     Bool(bool),
     #[cfg(feature = "chrono")]
@@ -2391,13 +3019,13 @@ impl From<&::bytes::Bytes> for Value {
 // Convert String to Value
 impl From<String> for Value {
     fn from(v: String) -> Self {
-        Value::String(v.into())
+        Value::String(Arc::from(v))
     }
 }
 
 impl From<&str> for Value {
     fn from(v: &str) -> Self {
-        Value::String(v.to_string().into())
+        Value::String(Arc::from(v))
     }
 }
 
@@ -2741,17 +3369,22 @@ fn resolve_inner(expr: &Expression, ctx: &Context) -> Result<Value, ExecutionErr
                                 ))
                             }
                         };
-                        return Ok(match optional_view(&operand) {
-                            // `Optional::map` keeps the outer `Some` and
-                            // substitutes `optional.none` for a missing
-                            // field, so a miss nests one optional inside
-                            // another. Mirrored, not corrected, here.
-                            OptView::Empty => optional_none(),
-                            OptView::Present(inner) => optional_of(
-                                value_index(&inner, &field).unwrap_or_else(|_| optional_none()),
-                            ),
-                            OptView::Plain => optional_of(value_index(&operand, &field)?),
-                        });
+                        // A missing key/field maps to `optional.none()`, the
+                        // same as OPT_INDEX. Any other index error
+                        // (`NoSuchOverload`, `UnsupportedIndex`, …)
+                        // propagates. An empty optional short-circuits; a
+                        // present optional is unwrapped before the lookup,
+                        // so a miss is `none` rather than `of(none)`.
+                        let target = match optional_view(&operand) {
+                            OptView::Empty => return Ok(optional_none()),
+                            OptView::Present(inner) => inner,
+                            OptView::Plain => operand,
+                        };
+                        return match value_index(&target, &field) {
+                            Ok(v) => Ok(optional_of(v)),
+                            Err(ExecutionError::NoSuchKey(_)) => Ok(optional_none()),
+                            Err(e) => Err(e),
+                        };
                     }
                     operators::ADD => return binary_op("add", call, ctx),
                     operators::SUBSTRACT => return binary_op("sub", call, ctx),
@@ -3554,7 +4187,7 @@ fn interned_or_public_map_key(key: &Value) -> Option<KeyRef<'_>> {
         Value::Int(i) => Some(KeyRef::Int(*i)),
         Value::UInt(u) => Some(KeyRef::Uint(*u)),
         Value::Bool(b) => Some(KeyRef::Bool(*b)),
-        Value::String(s) => Some(KeyRef::String(s.as_str())),
+        Value::String(s) => Some(KeyRef::String(s.as_ref())),
         Value::Interned(w) => unsafe { interned_as_keyref(*w) },
         _ => None,
     }
@@ -3720,7 +4353,7 @@ pub(crate) fn value_field(container: &Value, field: &str) -> Result<Value, Execu
                 want: format!("{}|{}", ValueType::Int, ValueType::UInt),
             }),
             #[cfg(feature = "structs")]
-            CelKind::Struct => value_index(container, &Value::String(Arc::new(field.to_string()))),
+            CelKind::Struct => value_index(container, &Value::String(Arc::from(field))),
             _ => Err(ExecutionError::NoSuchOverload),
         };
     }
@@ -3734,7 +4367,7 @@ pub(crate) fn value_field(container: &Value, field: &str) -> Result<Value, Execu
             want: format!("{}|{}", ValueType::Int, ValueType::UInt),
         }),
         #[cfg(feature = "structs")]
-        Value::Struct(_) => value_index(container, &Value::String(Arc::new(field.to_string()))),
+        Value::Struct(_) => value_index(container, &Value::String(Arc::from(field))),
         _ => Err(ExecutionError::NoSuchOverload),
     }
 }
@@ -3776,7 +4409,7 @@ pub(crate) fn value_index(container: &Value, key: &Value) -> Result<Value, Execu
             Value::String(field) => s
                 .field_value(field)
                 .cloned()
-                .ok_or_else(|| ExecutionError::NoSuchKey(Arc::new(field.as_str().to_owned()))),
+                .ok_or_else(|| ExecutionError::NoSuchKey(Arc::new(field.to_string()))),
             other => Err(ExecutionError::UnsupportedIndex(
                 other.clone(),
                 container.clone(),
@@ -3796,7 +4429,7 @@ fn map_keys(map: &Map) -> Vec<Value> {
             .iter()
             .map(|(k, _)| key_value(k))
             .collect(),
-        MapStorage::Record { schema, .. } => schema.keys.iter().map(key_value).collect(),
+        MapStorage::Record { schema, .. } => schema.keys().iter().map(key_value).collect(),
     }
 }
 
@@ -3814,7 +4447,7 @@ fn key_display(key: &Key) -> String {
         Key::Int(i) => i.to_string(),
         Key::Uint(u) => u.to_string(),
         Key::Bool(b) => b.to_string(),
-        Key::String(s) => s.as_str().to_string(),
+        Key::String(s) => s.to_string(),
     }
 }
 
@@ -3865,6 +4498,34 @@ pub(crate) fn interned_contains(container: CelRef, needle: CelRef) -> Result<boo
             Ok(unsafe { map_contains_key(container, needle) })
         }
         _ => Err(ExecutionError::NoSuchOverload),
+    }
+}
+
+/// `a?.b` on an interned receiver.
+///
+/// A miss on a map/struct is `optional.none()`, whether the receiver was a
+/// plain container or an optional wrapping one. An empty optional
+/// short-circuits to `none`. Anything else is `NoSuchOverload` so the
+/// caller can decline.
+pub(crate) fn interned_opt_select(w: CelRef, field: &str) -> Result<CelRef, ExecutionError> {
+    let inner = if unsafe { w_kind(w) } == CelKind::Optional {
+        let inner = unsafe { (*w.cast::<W_OptionalObject>()).w_value };
+        if inner.is_null() {
+            return Ok(new_optional_none() as CelRef);
+        }
+        inner
+    } else {
+        w
+    };
+    let found = match unsafe { w_kind(inner) } {
+        CelKind::Map => unsafe { interned_map_lookup_string(inner, field) },
+        #[cfg(feature = "structs")]
+        CelKind::Struct => unsafe { crate::runtime::object::struct_lookup_field(inner, field) },
+        _ => return Err(ExecutionError::NoSuchOverload),
+    };
+    match found {
+        Some(item) => Ok(new_optional(item) as CelRef),
+        None => Ok(new_optional_none() as CelRef),
     }
 }
 
@@ -4075,6 +4736,39 @@ fn interned_list_item(w: CelRef, index: i64) -> Option<Value> {
     }
 }
 
+/// Data address of an `Arc<str>`, the thin pointer a string leaf stores.
+/// Rebuild with [`crate::runtime::convert`] using the leaf's `byte_len`.
+pub(crate) fn arc_str_thin(s: &Arc<str>) -> *const () {
+    Arc::as_ptr(s) as *const u8 as *const ()
+}
+
+/// `*const str` naming `len` UTF-8 bytes at `data`.
+///
+/// `data` addresses an allocation that stays live across this call. The
+/// returned pointer is that allocation's data address with `len` as metadata.
+pub(crate) unsafe fn str_ptr_from_thin(data: *const u8, len: usize) -> *const str {
+    let bytes = unsafe { std::slice::from_raw_parts(data, len) };
+    let s = unsafe { std::str::from_utf8_unchecked(bytes) };
+    s as *const str
+}
+
+/// One allocation holding `left` then `right`.
+pub(crate) fn concat_arc_str(left: &str, right: &str) -> Arc<str> {
+    let n = left.len() + right.len();
+    let mut buf = Arc::<[u8]>::new_uninit_slice(n);
+    {
+        let slot = Arc::get_mut(&mut buf).expect("fresh string");
+        unsafe {
+            let dest = slot.as_mut_ptr().cast::<u8>();
+            std::ptr::copy_nonoverlapping(left.as_ptr(), dest, left.len());
+            std::ptr::copy_nonoverlapping(right.as_ptr(), dest.add(left.len()), right.len());
+        }
+    }
+    let bytes: Arc<[u8]> = unsafe { buf.assume_init() };
+    let raw = Arc::into_raw(bytes);
+    unsafe { Arc::from_raw(str_ptr_from_thin(raw as *const u8, n)) }
+}
+
 impl ops::Add<Value> for Value {
     type Output = ResolveResult;
 
@@ -4108,17 +4802,7 @@ impl ops::Add<Value> for Value {
             (Value::Float(l), Value::Float(r)) => Value::Float(l + r).into(),
 
             (Value::List(l), Value::List(r)) => Ok(Value::List(l.concat(&r))),
-            (Value::String(mut l), Value::String(r)) => {
-                if let Some(s) = Arc::get_mut(&mut l) {
-                    s.push_str(&r);
-                    Ok(Value::String(l))
-                } else {
-                    let mut out = String::with_capacity(l.len() + r.len());
-                    out.push_str(&l);
-                    out.push_str(&r);
-                    Ok(Value::String(Arc::new(out)))
-                }
-            }
+            (Value::String(l), Value::String(r)) => Ok(Value::String(concat_arc_str(&l, &r))),
             (Value::Bytes(mut l), Value::Bytes(r)) => {
                 if let Some(s) = Arc::get_mut(&mut l) {
                     s.extend_from_slice(&r);
@@ -4339,9 +5023,9 @@ mod tests {
         let again = crate::runtime::object::new_string("zz") as crate::runtime::object::CelRef;
         let other = crate::runtime::object::new_string("n3") as crate::runtime::object::CelRef;
         let empty = crate::runtime::object::new_string("") as crate::runtime::object::CelRef;
-        let public_zz = Value::String(Arc::new("zz".to_string()));
-        let public_n3 = Value::String(Arc::new("n3".to_string()));
-        let public_empty = Value::String(Arc::new(String::new()));
+        let public_zz = Value::String(Arc::from("zz"));
+        let public_n3 = Value::String(Arc::from("n3"));
+        let public_empty = Value::String(Arc::from(""));
         assert_eq!(Value::from_interned(zz), public_zz.clone());
         assert_eq!(public_zz, Value::from_interned(again));
         assert_eq!(Value::from_interned(zz), Value::from_interned(zz));
@@ -4352,7 +5036,7 @@ mod tests {
         let number = Value::from_interned(
             crate::runtime::object::new_int(1) as crate::runtime::object::CelRef
         );
-        assert_ne!(number, Value::String(Arc::new("1".to_string())));
+        assert_ne!(number, Value::String(Arc::from("1")));
     }
 
     #[test]
@@ -4470,7 +5154,7 @@ mod tests {
 
     #[test]
     fn list_fill_drops_prefix_on_error() {
-        let s = Arc::new("keep".to_string());
+        let s: Arc<str> = Arc::from("keep");
         let err = ListRef::try_fill_values::<&'static str>(2, |i| {
             if i == 0 {
                 Ok(Some(Value::String(s.clone())))
@@ -4619,6 +5303,73 @@ mod tests {
         drop(shared);
         assert_eq!(hits.load(std::sync::atomic::Ordering::Relaxed), 1);
         assert_eq!(hits2.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn packed_record_block_is_one_allocation_and_drops_its_key() {
+        let key = Arc::from("k");
+        let mut block = super::PackedRecordBuf::alloc(3, 1).expect("block");
+        block.push_key(Key::String(Arc::clone(&key)));
+        assert_eq!(Arc::strong_count(&key), 2);
+        drop(block);
+        assert_eq!(Arc::strong_count(&key), 1);
+
+        let mut block = super::PackedRecordBuf::alloc(3, 1).expect("block");
+        block.push_key(Key::String(Arc::clone(&key)));
+        block.set_column(0, super::ScalarBank::Int);
+        block.write_word(0, 1);
+        block.write_word(1, 2);
+        block.write_word(2, 3);
+        let list = block.finish();
+        assert!(list.is_record());
+        assert!(list.storage().is_none());
+        let Value::Map(row) = list.get(1).expect("row") else {
+            panic!("map");
+        };
+        let Value::Map(again) = list.get(1).expect("row") else {
+            panic!("map");
+        };
+        assert!(row.ptr_eq(&again));
+        assert_eq!(
+            row.get(&Key::String(Arc::clone(&key))).as_deref(),
+            Some(&Value::Int(2))
+        );
+        assert_eq!(Arc::strong_count(&key), 2);
+        drop(row);
+        drop(again);
+        drop(list);
+        assert_eq!(Arc::strong_count(&key), 1);
+    }
+
+    #[test]
+    fn scalar_row_block_windows_share_one_allocation() {
+        let mut block = super::ScalarRowsBuf::alloc(3, 4, super::ScalarBank::Int).expect("rows");
+        for (index, word) in [1i64, 2, 3, 4].into_iter().enumerate() {
+            block.word_slot(index, 1)[0].write(word);
+        }
+        block.set_row(0, 0, 2);
+        block.set_row(1, 2, 0);
+        block.set_row(2, 2, 2);
+        let list = block.finish();
+        assert!(!list.is_record());
+        let Value::List(a) = list.get(0).expect("row") else {
+            panic!("list");
+        };
+        let Value::List(b) = list.get(1).expect("row") else {
+            panic!("list");
+        };
+        let Value::List(c) = list.get(2).expect("row") else {
+            panic!("list");
+        };
+        assert!(a.shares_storage_with(&c));
+        assert!(a.shares_storage_with(&b));
+        assert!(!list.shares_storage_with(&a));
+        assert!(!a.is_ints());
+        assert_eq!(a.to_vec(), vec![Value::Int(1), Value::Int(2)]);
+        assert!(b.is_empty());
+        assert_eq!(c.to_vec(), vec![Value::Int(3), Value::Int(4)]);
+        drop(list);
+        assert_eq!(c.get(1), Some(Value::Int(4)));
     }
 
     /// `math.max(x)` and `s.startsWith(x)` parse the same, so the walker asks
@@ -4814,13 +5565,13 @@ mod tests {
     fn reference_to_value() {
         let test = "example".to_string();
         let direct: Value = test.as_str().into();
-        assert_eq!(direct, Value::String(Arc::new(String::from("example"))));
+        assert_eq!(direct, Value::String(Arc::from("example")));
 
         let vec = vec![test.as_str()];
         let indirect: Value = vec.into();
         assert_eq!(
             indirect,
-            Value::list(vec![Value::String(Arc::new(String::from("example")))])
+            Value::list(vec![Value::String(Arc::from("example"))])
         );
     }
 
@@ -4995,10 +5746,7 @@ mod tests {
             ctx.add_variable_from_value("mine", Value::Opaque(value.clone()));
             ctx.add_function("myFn", my_fn);
             let prog = Program::compile("mine.myFn()").unwrap();
-            assert_eq!(
-                Ok(Value::String(Arc::new("value".into()))),
-                prog.execute(&ctx)
-            );
+            assert_eq!(Ok(Value::String(Arc::from("value"))), prog.execute(&ctx));
         }
 
         #[test]
@@ -5185,7 +5933,7 @@ mod tests {
             assert_eq!(
                 Value::resolve(&expr, &ctx),
                 Ok(Value::Opaque(Arc::new(OptionalValue::of(Value::String(
-                    Arc::new("value".to_string())
+                    Arc::from("value")
                 )))))
             );
 
@@ -5196,7 +5944,7 @@ mod tests {
             assert_eq!(
                 Value::resolve(&expr, &ctx),
                 Ok(Value::Opaque(Arc::new(OptionalValue::of(Value::String(
-                    Arc::new("value".to_string())
+                    Arc::from("value")
                 )))))
             );
 
@@ -5215,7 +5963,7 @@ mod tests {
                 .expect("Must parse");
             assert_eq!(
                 Value::resolve(&expr, &ctx),
-                Ok(Value::String(Arc::new("value".to_string())))
+                Ok(Value::String(Arc::from("value")))
             );
 
             let expr = Parser::default()
@@ -5224,7 +5972,7 @@ mod tests {
                 .expect("Must parse");
             assert_eq!(
                 Value::resolve(&expr, &ctx),
-                Ok(Value::String(Arc::new("default".to_string())))
+                Ok(Value::String(Arc::from("default")))
             );
 
             let mut map_ctx = Context::default();
@@ -5457,8 +6205,8 @@ mod tests {
                     .parse(source)
                     .expect("Must parse")
             };
-            let some_field = Value::Opaque(Arc::new(OptionalValue::of(Value::String(Arc::new(
-                "value".to_string(),
+            let some_field = Value::Opaque(Arc::new(OptionalValue::of(Value::String(Arc::from(
+                "value",
             )))));
             assert_eq!(
                 Value::resolve(&parse("optional.of(msg).field"), &ctx),
@@ -5494,12 +6242,57 @@ mod tests {
                 Program::compile("optional.of(msg).missing.orValue('default')")
                     .unwrap()
                     .execute(&ctx),
-                Ok(Value::String(Arc::new("default".to_string())))
+                Ok(Value::String(Arc::from("default")))
             );
             assert!(Program::compile("optional.of(1).field")
                 .unwrap()
                 .execute(&ctx)
                 .is_err());
+        }
+
+        fn parse_optional(source: &str) -> crate::parser::Expression {
+            Parser::default()
+                .enable_optional_syntax(true)
+                .parse(source)
+                .expect("Must parse")
+        }
+
+        fn eval_optional(source: &str) -> crate::ResolveResult {
+            let expr = parse_optional(source);
+            let walker = Value::resolve(&expr, &Context::default());
+            let vm = Program::from_expression(expr).execute(&Context::default());
+            assert_eq!(walker, vm, "`{source}` walker and vm diverged");
+            walker
+        }
+
+        /// `{}.?x` is `optional.none()`, not `NoSuchKey`. OPT_INDEX already
+        /// maps a miss that way; OPT_SELECT on a plain container used to
+        /// propagate the error. A receiver that is not a map/struct stays an
+        /// error: `1.?x` is `NoSuchOverload`.
+        #[test]
+        fn opt_select_on_a_plain_map_miss_is_none() {
+            let none = Value::Opaque(Arc::new(OptionalValue::none()));
+            assert_eq!(eval_optional("{}.?x"), Ok(none));
+            assert_eq!(eval_optional("{}.?x.hasValue()"), Ok(Value::Bool(false)));
+            assert_eq!(eval_optional("has({}.?x.y)"), Ok(Value::Bool(false)));
+            assert_eq!(eval_optional("1.?x"), Err(ExecutionError::NoSuchOverload));
+        }
+
+        /// `optional.of({}).?x` is `optional.none()`, not `of(none)`. The
+        /// nested none made `hasValue()` true. Unwrapping a non-container
+        /// stays an error: `optional.of(1).?x` is `NoSuchOverload`.
+        #[test]
+        fn opt_select_on_an_optional_map_miss_is_none() {
+            let none = Value::Opaque(Arc::new(OptionalValue::none()));
+            assert_eq!(eval_optional("optional.of({}).?x"), Ok(none));
+            assert_eq!(
+                eval_optional("optional.of({}).?x.hasValue()"),
+                Ok(Value::Bool(false))
+            );
+            assert_eq!(
+                eval_optional("optional.of(1).?x"),
+                Err(ExecutionError::NoSuchOverload)
+            );
         }
     }
 
@@ -5564,7 +6357,7 @@ mod tests {
             );
             let program = Program::compile("cel.MyStruct { some: 'value' }.some").unwrap();
             let value = program.execute(&Context::with_env(env.into())).unwrap();
-            assert_eq!(value, Value::String(Arc::new("value".to_owned())));
+            assert_eq!(value, Value::String(Arc::from("value")));
         }
 
         #[test]
@@ -5590,14 +6383,11 @@ mod tests {
             env.add_struct(
                 StructDef::new(String::from("cel.MyStruct"))
                     .add_field("some".into(), types::STRING_TYPE)
-                    .add_field_with_default(
-                        "here".into(),
-                        Value::String(Arc::new("yes".to_owned())),
-                    ),
+                    .add_field_with_default("here".into(), Value::String(Arc::from("yes"))),
             );
             let program = Program::compile("cel.MyStruct { some: 'value' }.here").unwrap();
             let result = program.execute(&Context::with_env(env.into()));
-            assert_eq!(result, Ok(Value::String(Arc::new(String::from("yes")))));
+            assert_eq!(result, Ok(Value::String(Arc::from("yes"))));
         }
 
         #[test]
@@ -5606,15 +6396,12 @@ mod tests {
             env.add_struct(
                 StructDef::new(String::from("cel.MyStruct"))
                     .add_field("some".into(), types::STRING_TYPE)
-                    .add_field_with_default(
-                        "here".into(),
-                        Value::String(Arc::new("yes".to_owned())),
-                    ),
+                    .add_field_with_default("here".into(), Value::String(Arc::from("yes"))),
             );
             let program =
                 Program::compile("cel.MyStruct { some: 'value', here: 'totally' }.here").unwrap();
             let result = program.execute(&Context::with_env(env.into()));
-            assert_eq!(result, Ok(Value::String(Arc::new(String::from("totally")))));
+            assert_eq!(result, Ok(Value::String(Arc::from("totally"))));
         }
 
         #[test]
@@ -5627,10 +6414,7 @@ mod tests {
             );
 
             let mut my_struct = CelStruct::new("cel.MyStruct".to_owned());
-            my_struct.add_field_value(
-                "name".to_owned(),
-                Value::String(Arc::new("test".to_owned())),
-            );
+            my_struct.add_field_value("name".to_owned(), Value::String(Arc::from("test")));
             my_struct.add_field_value("value".to_owned(), Value::Int(42));
 
             let mut context = Context::with_env(Arc::new(env));
@@ -5694,10 +6478,7 @@ mod tests {
             );
 
             let mut my_struct = CelStruct::new("cel.MyStruct".to_owned());
-            my_struct.add_field_value(
-                "name".to_owned(),
-                Value::String(Arc::new("test".to_owned())),
-            );
+            my_struct.add_field_value("name".to_owned(), Value::String(Arc::from("test")));
             my_struct.add_field_value("value".to_owned(), Value::Int(42));
 
             let mut context = Context::with_env(Arc::new(env));
@@ -5707,7 +6488,7 @@ mod tests {
 
             let program = Program::compile("my_var.name + ' ' + string(my_var.value)").unwrap();
             let result = program.execute(&context).unwrap();
-            assert_eq!(result, Value::String(Arc::new("test 42".to_owned())));
+            assert_eq!(result, Value::String(Arc::from("test 42")));
         }
     }
 }
